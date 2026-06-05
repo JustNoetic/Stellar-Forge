@@ -46,30 +46,32 @@ class PerfTracker:
     def __init__(self):
         self.sections = {}  # name -> dict
         self.frame_times = []  # list of seconds (per-frame deltas)
-        self._open_time = None
-        self._open_name = None
+        import threading
+        self._local = threading.local()
 
     def begin(self, name):
         # Auto-close any open section so timings are not lost on a missed end().
-        if self._open_name is not None:
+        open_name = getattr(self._local, 'open_name', None)
+        if open_name is not None:
             self.end()
-        self._open_name = name
-        self._open_time = time.perf_counter()
+        self._local.open_name = name
+        self._local.open_time = time.perf_counter()
 
     def end(self):
-        if self._open_name is None:
+        open_name = getattr(self._local, 'open_name', None)
+        if open_name is None:
             return
-        dt = time.perf_counter() - self._open_time
-        s = self.sections.get(self._open_name)
+        dt = time.perf_counter() - self._local.open_time
+        s = self.sections.get(open_name)
         if s is None:
             s = {'total': 0.0, 'count': 0, 'min': float('inf'), 'max': 0.0, 'last': 0.0}
-            self.sections[self._open_name] = s
+            self.sections[open_name] = s
         s['total'] += dt
         s['count'] += 1
         s['min'] = min(s['min'], dt)
         s['max'] = max(s['max'], dt)
         s['last'] = dt
-        self._open_name = None
+        self._local.open_name = None
 
     def record_frame(self, dt):
         self.frame_times.append(dt)
@@ -186,6 +188,7 @@ def main():
         elapsed = now - warmup_start
         if not warmup_done[0] and elapsed >= warmup:
             warmup_done[0] = True
+            tracker.sections.clear()  # Clear JIT stalls accumulated during warmup
             print(f"[Perf] Warmup complete at {elapsed:.1f}s")
             print(f"[Perf] Starting measurement window of {measure}s ...")
         if warmup_done[0] and elapsed >= total_runtime:

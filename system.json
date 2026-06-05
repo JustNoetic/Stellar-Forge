@@ -65,13 +65,13 @@
     "pole_dec": 67.16,
     "atmosphere": {
       "height": 180,
-      "rayleighCoefficients": [7.4e-6, 17.3e-6, 42.2e-6],
+      "rayleighCoefficients": [25.0e-6, 22.0e-6, 15.0e-6],
       "rayleighScaleHeight": 15.9,
-      "mieCoefficient": 30.0e-6,
-      "mieScaleHeight": 2.5,
-      "mieAsymmetry": 0.76,
-      "absorptionCoefficients": [0, 0, 0],
-      "intensity": 15.0
+      "mieCoefficient": 20.0e-6,
+      "mieScaleHeight": 10.0,
+      "mieAsymmetry": 0.8,
+      "absorptionCoefficients": [1.0e-6, 5.0e-6, 15.0e-6],
+      "intensity": 25.0
     },
     "sv": {
       "x": -0.6862753867814427,
@@ -145,7 +145,7 @@
   {
     "name": "Mars",
     "type": "Terrestrial",
-    "color": "#f0ceb7",
+    "color": "#cfaf86",
     "parentId": "Sun",
     "m": 3.2271560375549945e-07,
     "r": 0.0048,
@@ -239,14 +239,22 @@
     "rotation_period": 9.925,
     "oblateness": 0.06487,
     "atmosphere": {
-      "height": 300,
-      "rayleighCoefficients": [1.2e-6, 2.7e-6, 6.6e-6],
-      "rayleighScaleHeight": 27.0,
-      "mieCoefficient": 3.0e-6,
-      "mieScaleHeight": 12.0,
-      "mieAsymmetry": 0.75,
-      "absorptionCoefficients": [0, 0, 0],
-      "intensity": 15.0
+      "height": 300.0,
+        "rayleighCoefficients": [
+            9.999999974752427e-07,
+            1.1000000768035534e-06,
+            1.2000000424450263e-06
+        ],
+        "rayleighScaleHeight": 30.399999618530273,
+        "mieCoefficient": 1.600000023841858e-06,
+        "mieScaleHeight": 1.7999999523162842,
+        "mieAsymmetry": 0.9750000238418579,
+      "absorptionCoefficients": [
+            6.999999868639861e-07,
+            8.999999749903509e-07,
+            1.1000000768035534e-06
+        ],
+      "intensity": 18.0
     },
     "sv": {
       "x": -2.753807105137047,
@@ -444,7 +452,7 @@
   {
     "name": "Saturn",
     "type": "Gas Giant",
-    "color": "#d9c491",
+    "color": "#e6cf9e",
     "parentId": "Sun",
     "m": 0.00028581501242847386,
     "r": 0.0837,
@@ -462,7 +470,7 @@
       {
         "inner": 1.11,
         "outer": 1.374,
-        "color": "#bdaa7d",
+        "color": "#c4b99f",
         "opacity": 0.4,
         "scatter": 0.16,
         "asymmetry": 0.46,
@@ -488,7 +496,7 @@
       {
         "inner": 1.378,
         "outer": 1.477,
-        "color": "#bdaa7d",
+        "color": "#c9bda1",
         "opacity": 0.4,
         "scatter": 0.17,
         "asymmetry": 0.43,
@@ -506,7 +514,7 @@
       {
         "inner": 1.477,
         "outer": 1.951,
-        "color": "#c9b78b",
+        "color": "#dbcda9",
         "opacity": 0.94,
         "scatter": 0.04,
         "asymmetry": 0.4,
@@ -532,7 +540,7 @@
       {
         "inner": 2.027,
         "outer": 2.269,
-        "color": "#bdaa7d",
+        "color": "#c2b493",
         "opacity": 0.8,
         "scatter": 0.11,
         "asymmetry": 0.42,
@@ -588,8 +596,9 @@
         "inner": 2.33,
         "outer": 3.31,
         "color": "#a2bbe8",
-        "opacity": 0.07,
+        "opacity": 0.045,
         "scatter": 0.7,
+        "asymmetry": 0.8,
         "gradient": [
           {
             "p": 0,
@@ -617,8 +626,9 @@
         "inner": 3.34,
         "outer": 5.8,
         "color": "#78a1eb",
-        "opacity": 0.06,
-        "scatter": 0.8,
+        "opacity": 0.04,
+        "scatter": 0.6,
+        "asymmetry": 0.83,
         "gradient": [
           {
             "p": 0,
@@ -649,13 +659,13 @@
     ],
     "atmosphere": {
       "height": 400,
-      "rayleighCoefficients": [0.8e-6, 1.9e-6, 4.6e-6],
-      "rayleighScaleHeight": 35.5,
+      "rayleighCoefficients": [0.8e-6, 1.2e-6, 2.1e-6],
+      "rayleighScaleHeight": 25.5,
       "mieCoefficient": 2.0e-6,
-      "mieScaleHeight": 15.0,
-      "mieAsymmetry": 0.75,
-      "absorptionCoefficients": [0.0, 3.0e-6, 8.0e-6],
-      "intensity": 15.0
+      "mieScaleHeight": 2.0,
+      "mieAsymmetry": 0.45,
+      "absorptionCoefficients": [1.0e-6, 3.0e-6, 7.0e-6],
+      "intensity": 23.0
     },
     "oblateness": 0.09796,
     "sv": {
@@ -797,14 +807,22 @@
     "M": 11.7,
     "orbitRef": "equatorial",
     "atmosphere": {
-      "height": 600,
-      "rayleighCoefficients": [0.6e-6, 1.4e-6, 3.4e-6],
-      "rayleighScaleHeight": 40.0,
-      "mieCoefficient": 20.0e-6,
-      "mieScaleHeight": 20.0,
-      "mieAsymmetry": 0.75,
-      "absorptionCoefficients": [0.5e-6, 0.3e-6, 0.1e-6],
-      "intensity": 15.0
+        "height": 600.0,
+        "rayleighCoefficients": [
+            4.999999987376214e-07,
+            8.999999749903509e-07,
+            1.3999999737279722e-06
+        ],
+        "rayleighScaleHeight": 57.900001525878906,
+        "mieCoefficient": 4.000000059604645e-07,
+        "mieScaleHeight": 31.600000381469727,
+        "mieAsymmetry": 0.9200000166893005,
+        "absorptionCoefficients": [
+            4.0000000467443897e-07,
+            3.000000106112566e-07,
+            2.0000000233721948e-07
+        ],
+        "intensity": 10.5
     },
     "sv": {
       "x": -0.007593980088340922,
@@ -1026,13 +1044,13 @@
     ],
     "atmosphere": {
       "height": 300,
-      "rayleighCoefficients": [1.5e-6, 3.6e-6, 8.7e-6],
+      "rayleighCoefficients": [0.6e-6, 1.5e-6, 3.5e-6],
       "rayleighScaleHeight": 21.3,
-      "mieCoefficient": 2.0e-6,
-      "mieScaleHeight": 10.0,
-      "mieAsymmetry": 0.75,
+      "mieCoefficient": 1.5e-6,
+      "mieScaleHeight": 2.5,
+      "mieAsymmetry": 0.82,
       "absorptionCoefficients": [8.0e-6, 2.0e-6, 5.0e-8],
-      "intensity": 15.0
+      "intensity": 25.0
     },
     "sv": {
       "x": 9.34980820909636,
@@ -1200,13 +1218,13 @@
     "rotation_period": 16.11,
     "atmosphere": {
       "height": 300,
-      "rayleighCoefficients": [2.1e-6, 5.0e-6, 12.1e-6],
+      "rayleighCoefficients": [0.5e-6, 1.8e-6, 5.0e-6],
       "rayleighScaleHeight": 40.0,
-      "mieCoefficient": 2.5e-6,
-      "mieScaleHeight": 12.0,
-      "mieAsymmetry": 0.75,
+      "mieCoefficient": 2.0e-6,
+      "mieScaleHeight": 2.5,
+      "mieAsymmetry": 0.82,
       "absorptionCoefficients": [12.0e-6, 3.0e-6, 1.0e-7],
-      "intensity": 15.0
+      "intensity": 25.0
     },
     "sv": {
       "x": 29.85569064946169,

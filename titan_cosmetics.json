@@ -1,0 +1,21 @@
+{
+    "color": "#fbbf24",
+    "atmosphere": {
+        "height": 600.0,
+        "rayleighCoefficients": [
+            4.999999987376214e-07,
+            8.999999749903509e-07,
+            1.3999999737279722e-06
+        ],
+        "rayleighScaleHeight": 57.900001525878906,
+        "mieCoefficient": 4.000000059604645e-07,
+        "mieScaleHeight": 31.600000381469727,
+        "mieAsymmetry": 0.9200000166893005,
+        "absorptionCoefficients": [
+            4.0000000467443897e-07,
+            3.000000106112566e-07,
+            2.0000000233721948e-07
+        ],
+        "intensity": 10.5
+    }
+}
