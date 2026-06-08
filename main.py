@@ -1624,7 +1624,7 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
 
 def main():
     if _PERF_ENABLED:
-        from perf_test import PerfTracker as _BootTracker
+        from scripts.perf_test import PerfTracker as _BootTracker
         _BootTracker().__class__
         if _PERF_TRACKER is None:
             _PERF_INSTALL_TRACKER(_BootTracker())
