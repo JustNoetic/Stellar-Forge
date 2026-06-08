@@ -29,6 +29,13 @@ HORIZONS_IDS = {
     "Uranus":     "799",
     "Neptune":    "899",
     "Pluto":      "999",
+    # Dwarf Planets / Major Asteroids
+    "Ceres":      "1;",
+    "Pallas":     "2;",
+    "Vesta":      "4;",
+    "Haumea":     "136108",
+    "Eris":       "136199",
+    "Makemake":   "136472",
     # Earth's moon
     "Moon":       "301",
     # Mars moons
@@ -103,8 +110,37 @@ def get_parent_center(body_name, parent_name):
     return "500@10"  # fallback to Sun
 
 
-def query_horizons(body_id, center, max_retries=3):
+import os
+
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../data/horizons_cache.json')
+_cache = None
+
+def _load_cache():
+    global _cache
+    if _cache is None:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r") as f:
+                try:
+                    _cache = json.load(f)
+                except json.JSONDecodeError:
+                    _cache = {}
+        else:
+            _cache = {}
+    return _cache
+
+def _save_cache():
+    if _cache is not None:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(_cache, f)
+
+def query_horizons(body_id, center, start_time="2026-06-03 12:00", stop_time="2026-06-04", max_retries=3):
     """Query JPL Horizons API for state vector at J2000 epoch."""
+    cache = _load_cache()
+    cache_key = f"{body_id}_{center}_{start_time}_{stop_time}"
+    
+    if cache_key in cache:
+        return cache[cache_key]
+        
     params = {
         "format":      "text",
         "COMMAND":     f"'{body_id}'",
@@ -114,8 +150,8 @@ def query_horizons(body_id, center, max_retries=3):
         "CENTER":      f"'{center}'",
         "REF_PLANE":   "'ECLIPTIC'",
         "REF_SYSTEM":  "'J2000'",
-        "START_TIME":  "'2026-06-03 12:00'",
-        "STOP_TIME":   "'2026-06-04'",
+        "START_TIME":  f"'{start_time}'",
+        "STOP_TIME":   f"'{stop_time}'",
         "STEP_SIZE":   "'1 d'",
         "VEC_TABLE":   "'2'",
         "OUT_UNITS":   "'AU-D'",
@@ -129,6 +165,8 @@ def query_horizons(body_id, center, max_retries=3):
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=30) as resp:
                 text = resp.read().decode('utf-8')
+                cache[cache_key] = text
+                _save_cache()
             return text
         except Exception as e:
             if attempt < max_retries - 1:
@@ -175,7 +213,8 @@ def parse_state_vector(response_text):
 
 def main():
     # Load system.json
-    with open("system.json", "r") as f:
+    data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../data/system.json')
+    with open(data_path, "r") as f:
         bodies = json.load(f)
     
     print("=" * 70)
@@ -215,7 +254,7 @@ def main():
         print(f"  [{name:12s}] Querying Horizons (ID={body_id}, CENTER={center})...", end="", flush=True)
         
         try:
-            response = query_horizons(body_id, center)
+            response = query_horizons(body_id, center, start_time="2026-01-01 12:00", stop_time="2026-01-01 12:01")
             sv = parse_state_vector(response)
             
             if sv:
@@ -248,7 +287,8 @@ def main():
     
     if success > 0:
         # Write updated system.json
-        with open("system.json", "w") as f:
+        data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../data/system.json')
+        with open(data_path, "w") as f:
             json.dump(bodies, f, indent=2)
         print(f"\nUpdated system.json with {success} state vectors.")
         
