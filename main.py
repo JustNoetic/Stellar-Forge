@@ -705,13 +705,14 @@ def compute_culling_masks(
     star_idx, 
     n_casters, caster_indices, 
     n_rings, ring_centers, ring_normals, ring_outer_radii,
-    num_bodies
+    num_bodies,
+    caster_mask_lo, caster_mask_hi, ring_mask, ring_caster_lo, ring_caster_hi
 ):
-    caster_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
-    caster_mask_hi = np.zeros(num_bodies, dtype=np.uint32)
-    ring_mask = np.zeros(num_bodies, dtype=np.uint32)
-    ring_caster_lo = np.zeros(n_rings, dtype=np.uint32)
-    ring_caster_hi = np.zeros(n_rings, dtype=np.uint32)
+    caster_mask_lo[:] = 0
+    caster_mask_hi[:] = 0
+    ring_mask[:] = 0
+    ring_caster_lo[:] = 0
+    ring_caster_hi[:] = 0
     
     star_pos = pos_rel_all[star_idx]
     star_r = body_radii[star_idx]
@@ -820,7 +821,7 @@ def compute_culling_masks(
         ring_caster_lo[k] = mask_lo
         ring_caster_hi[k] = mask_hi
 
-    return caster_mask_lo, caster_mask_hi, ring_mask, ring_caster_lo, ring_caster_hi
+    return
 
 @njit(cache=True)
 def compute_frustum_culling(pos_rel_all, body_radii, planes, num_bodies):
@@ -835,15 +836,15 @@ def compute_frustum_culling(pos_rel_all, body_radii, planes, num_bodies):
                 break
     return visible
 
-def extract_frustum_planes(view, proj):
-    vp = view @ proj
-    planes = np.zeros((6, 4), dtype=np.float32)
-    planes[0] = vp[:, 3] + vp[:, 0] # Left
-    planes[1] = vp[:, 3] - vp[:, 0] # Right
-    planes[2] = vp[:, 3] + vp[:, 1] # Bottom
-    planes[3] = vp[:, 3] - vp[:, 1] # Top
-    planes[4] = vp[:, 3] + vp[:, 2] # Near
-    planes[5] = vp[:, 3] - vp[:, 2] # Far
+@njit(cache=True)
+def extract_frustum_planes(vp):
+    planes = np.empty((6, 4), dtype=np.float32)
+    planes[0, :] = vp[:, 3] + vp[:, 0] # Left
+    planes[1, :] = vp[:, 3] - vp[:, 0] # Right
+    planes[2, :] = vp[:, 3] + vp[:, 1] # Bottom
+    planes[3, :] = vp[:, 3] - vp[:, 1] # Top
+    planes[4, :] = vp[:, 3] + vp[:, 2] # Near
+    planes[5, :] = vp[:, 3] - vp[:, 2] # Far
     for i in range(6):
         x, y, z = planes[i, 0], planes[i, 1], planes[i, 2]
         length = math.sqrt(x*x + y*y + z*z)
@@ -3271,6 +3272,11 @@ def main():
     ring_normals_buf = np.zeros((16, 3), dtype='f4')
     ring_params_buf = np.zeros((16, 3), dtype='f4')
     all_instances = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
+    cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
+    cull_mask_hi = np.zeros(num_bodies, dtype=np.uint32)
+    cull_ring_mask = np.zeros(num_bodies, dtype=np.uint32)
+    cull_ring_caster_lo = np.zeros(16, dtype=np.uint32)
+    cull_ring_caster_hi = np.zeros(16, dtype=np.uint32)
 
     pos_snap = np.zeros((num_bodies, 3), dtype='f8')
     vel_snap = np.zeros((num_bodies, 3), dtype='f8')
@@ -3333,7 +3339,11 @@ def main():
                         body_radii = np.append(body_radii, r_au)
                         
                         new_inst = np.zeros(INSTANCE_FLOATS, dtype='f4')
+                        num_bodies += 1
                         all_instances = np.vstack([all_instances, new_inst])
+                        cull_mask_lo = np.append(cull_mask_lo, 0)
+                        cull_mask_hi = np.append(cull_mask_hi, 0)
+                        cull_ring_mask = np.append(cull_ring_mask, 0)
                         
                         subsys_pos_buf = np.vstack([subsys_pos_buf, pos])
                         subsys_vel_buf = np.vstack([subsys_vel_buf, vel])
@@ -3371,7 +3381,11 @@ def main():
                         pos_snap_render = np.delete(pos_snap_render, idx, axis=0)
                         vel_snap_render = np.delete(vel_snap_render, idx, axis=0)
                         body_radii = np.delete(body_radii, idx)
+                        num_bodies -= 1
                         all_instances = np.delete(all_instances, idx, axis=0)
+                        cull_mask_lo = np.delete(cull_mask_lo, idx)
+                        cull_mask_hi = np.delete(cull_mask_hi, idx)
+                        cull_ring_mask = np.delete(cull_ring_mask, idx)
                         subsys_pos_buf = np.delete(subsys_pos_buf, idx, axis=0)
                         subsys_vel_buf = np.delete(subsys_vel_buf, idx, axis=0)
                         subsys_mass_buf = np.delete(subsys_mass_buf, idx)
@@ -3538,6 +3552,7 @@ def main():
         ring_normals_buf[:] = 0
         ring_params_buf[:] = 0
         
+        ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
         for ring in ring_precomputed:
             if n_ring_planes >= 16:
                 break
@@ -3552,14 +3567,16 @@ def main():
         caster_indices = non_star_indices
         n_casters_fixed = min(len(caster_indices), 64)
         
-        caster_mask_lo, caster_mask_hi, ring_mask, ring_caster_lo, ring_caster_hi = compute_culling_masks(
+        compute_culling_masks(
             pos_rel_all, body_radii, star_idx,
             n_casters_fixed, caster_indices[:n_casters_fixed],
             n_ring_planes, ring_centers_buf, ring_normals_buf, ring_params_buf[:, 1],
-            num_bodies
+            num_bodies,
+            cull_mask_lo, cull_mask_hi, cull_ring_mask, cull_ring_caster_lo, cull_ring_caster_hi
         )
         
-        frustum_planes = extract_frustum_planes(view, projection)
+        vp_matrix = np.asarray(view, dtype=np.float32) @ np.asarray(projection, dtype=np.float32)
+        frustum_planes = extract_frustum_planes(vp_matrix)
         visible_mask = compute_frustum_culling(pos_rel_all, body_radii, frustum_planes, num_bodies)
 
         all_instances[:, 0:3] = pos_rel_all
@@ -3567,9 +3584,9 @@ def main():
         all_instances[:, 8] = is_star_arr
         all_instances[:, 9:12] = visual_arr[:, 5:8]
         all_instances[:, 12] = visual_arr[:, 8]
-        all_instances[:, 13] = caster_mask_lo.view(np.float32)
-        all_instances[:, 14] = caster_mask_hi.view(np.float32)
-        all_instances[:, 15] = ring_mask.view(np.float32)
+        all_instances[:, 13] = cull_mask_lo.view(np.float32)
+        all_instances[:, 14] = cull_mask_hi.view(np.float32)
+        all_instances[:, 15] = cull_ring_mask.view(np.float32)
         
         final_hi_mask = focused_mask & visible_mask
         final_lo_mask = (~focused_mask) & visible_mask
@@ -3680,7 +3697,7 @@ def main():
             ctx.depth_mask = False
             u_ring_clip_mode.value = 1
             
-            ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
+
             
             for group in ring_render_groups:
                 bi = group['body_idx']
@@ -3696,8 +3713,8 @@ def main():
                 )
                 k = ring_idx_by_body.get(bi)
                 if k is not None:
-                    u_ring_caster_mask_lo_uni.value = int(ring_caster_lo[k])
-                    u_ring_caster_mask_hi_uni.value = int(ring_caster_hi[k])
+                    u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
+                    u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
                 group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
             ctx.depth_mask = True
 
@@ -3728,13 +3745,13 @@ def main():
                 dz = pos_rel_all[atmo['body_idx'], 2] - cam_pos[2]
                 atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo))
                 
-            sorted_atmos = [a for _, a in sorted(atmo_dists, key=lambda x: x[0], reverse=True)]
+            sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
 
-            for atmo in sorted_atmos:
+            for sq_dist, atmo in sorted_atmos:
                 bi = atmo['body_idx']
                 body_pos_rel = pos_rel_all[bi]
 
-                dist_to_body = float(np.linalg.norm(body_pos_rel - cam_pos))
+                dist_to_body = math.sqrt(sq_dist)
                 apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * fb_height * fov_factor
                 if apparent_px < 2.0:
                     continue
@@ -3767,9 +3784,9 @@ def main():
                     float(all_instances[bi, 11]),
                     float(all_instances[bi, 12])
                 )
-                u_atmo_caster_mask_lo_uni.value = int(caster_mask_lo[bi])
-                u_atmo_caster_mask_hi_uni.value = int(caster_mask_hi[bi])
-                u_atmo_ring_mask_uni.value = int(ring_mask[bi])
+                u_atmo_caster_mask_lo_uni.value = int(cull_mask_lo[bi])
+                u_atmo_caster_mask_hi_uni.value = int(cull_mask_hi[bi])
+                u_atmo_ring_mask_uni.value = int(cull_ring_mask[bi])
 
                 vao_atmo.render(moderngl.TRIANGLES)
 
@@ -3784,7 +3801,7 @@ def main():
             ctx.depth_mask = False
             u_ring_clip_mode.value = 2
             
-            ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
+
             
             for group in ring_render_groups:
                 bi = group['body_idx']
@@ -3800,8 +3817,8 @@ def main():
                 )
                 k = ring_idx_by_body.get(bi)
                 if k is not None:
-                    u_ring_caster_mask_lo_uni.value = int(ring_caster_lo[k])
-                    u_ring_caster_mask_hi_uni.value = int(ring_caster_hi[k])
+                    u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
+                    u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
                 group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
             ctx.depth_mask = True
             
