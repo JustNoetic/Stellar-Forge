@@ -15,6 +15,7 @@ from imgui.integrations.glfw import GlfwRenderer
 import warnings
 from numba import njit
 import datetime
+from system_manager import SystemManager, SystemSnapshot, derive_star_properties, temperature_to_rgb, rgb_to_hex
 
 SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
 C_AU_YR = 63197.79
@@ -1271,12 +1272,163 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
         now = time.time()
         dt_real = min(now - last_time, 0.1)
         last_time = now
+        # ── System Switch Handling ──
+        switch_req = None
+        with shared_state["lock"]:
+            switch_req = shared_state.get("system_switch_request")
+            if switch_req is not None:
+                shared_state["system_switch_request"] = None
+
+        if switch_req is not None:
+            # Save current system as snapshot
+            snapshot = SystemSnapshot()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                snapshot.sim_copy = sim.copy()
+            snapshot.num_bodies = num_bodies
+            snapshot.bodies_data = switch_req.get("old_bodies_data", [])
+            snapshot.visual_data = switch_req.get("old_visual_data", [])
+            snapshot.atmo_bodies = switch_req.get("old_atmo_bodies", [])
+            snapshot.ring_bodies = switch_req.get("old_ring_bodies", [])
+            snapshot.oblate_physics_list = list(shared_state.get("oblate_physics_list", []))
+            snapshot.has_j2 = shared_state.get("has_j2", False)
+            snapshot.has_gr = shared_state.get("has_gr", False)
+            snapshot.phys_star_idx = shared_state.get("phys_star_idx", -1)
+            snapshot.star_idx = switch_req.get("old_star_idx", 0)
+            snapshot.parent_indices = shared_state["parent_indices"].copy()
+            snapshot.sim_time = sim.t
+            snapshot.time_multiplier = time_ctrl["multiplier"]
+            snapshot.was_paused = time_ctrl["paused"]
+
+            # Build new system
+            new_bundle = switch_req.get("new_bundle")
+            if new_bundle is None:
+                # Load from snapshot
+                restore_snap = switch_req.get("restore_snapshot")
+                if restore_snap and restore_snap.sim_copy is not None:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        sim = restore_snap.sim_copy.copy()
+                    setup_reboundx(sim, restore_snap.has_j2, restore_snap.has_gr, restore_snap.phys_star_idx, restore_snap.oblate_physics_list)
+                    if restore_snap.has_j2 and len(restore_snap.oblate_physics_list) > 0:
+                        print(f"[System] Restored J2 precession for {len(restore_snap.oblate_physics_list)} oblate bodies")
+                    if restore_snap.has_gr and restore_snap.phys_star_idx >= 0:
+                        print(f"[System] Restored 1PN GR precession (star index {restore_snap.phys_star_idx})")
+                    num_bodies = restore_snap.num_bodies
+                    new_bundle_info = {
+                        "bodies_data": restore_snap.bodies_data,
+                        "visual_data": restore_snap.visual_data,
+                        "atmo_bodies": restore_snap.atmo_bodies,
+                        "ring_bodies": restore_snap.ring_bodies,
+                        "oblate_physics_list": restore_snap.oblate_physics_list,
+                        "has_j2": restore_snap.has_j2,
+                        "has_gr": restore_snap.has_gr,
+                        "phys_star_idx": restore_snap.phys_star_idx,
+                        "star_idx": restore_snap.star_idx,
+                        "num_bodies": restore_snap.num_bodies,
+                    }
+                    time_ctrl["multiplier"] = restore_snap.time_multiplier
+                    time_ctrl["paused"] = restore_snap.was_paused
+                else:
+                    # Load from disk via load_system_from_data
+                    new_bundle = load_system_from_data(switch_req["bodies_data_raw"])
+            
+            if new_bundle is not None:
+                sim = new_bundle["sim"]
+                num_bodies = new_bundle["num_bodies"]
+                new_bundle_info = {
+                    "bodies_data": new_bundle["bodies_data"],
+                    "visual_data": new_bundle["visual_data"],
+                    "atmo_bodies": new_bundle["atmo_bodies"],
+                    "ring_bodies": new_bundle["ring_bodies"],
+                    "oblate_physics_list": new_bundle["oblate_physics_list"],
+                    "has_j2": new_bundle["has_j2"],
+                    "has_gr": new_bundle["has_gr"],
+                    "phys_star_idx": new_bundle["phys_star_idx"],
+                    "star_idx": new_bundle["star_idx"],
+                    "num_bodies": new_bundle["num_bodies"],
+                }
+                time_ctrl["paused"] = True
+                time_ctrl["multiplier"] = 1.0
+
+            # Update shared state arrays for new system
+            opl = new_bundle_info.get("oblate_physics_list", [])
+            with shared_state["lock"]:
+                shared_state["has_j2"] = new_bundle_info["has_j2"]
+                shared_state["has_gr"] = new_bundle_info["has_gr"]
+                shared_state["phys_star_idx"] = new_bundle_info["phys_star_idx"]
+                shared_state["oblate_physics_list"] = opl
+                shared_state["t"] = sim.t
+                shared_state["pos"] = np.zeros((num_bodies, 3), dtype='f8')
+                shared_state["vel"] = np.zeros((num_bodies, 3), dtype='f8')
+                shared_state["mass"] = np.zeros(num_bodies, dtype='f8')
+                shared_state["parent_indices"] = np.full(num_bodies, -1, dtype=np.int32)
+                shared_state["tree_indices"] = np.zeros(num_bodies, dtype=np.int32)
+                shared_state["tree_depths"] = np.zeros(num_bodies, dtype=np.int32)
+                shared_state["timeline_active"] = False
+                shared_state["timeline_progress"] = 0.0
+                shared_state["timeline_pos"] = np.zeros((0, num_bodies, 3), dtype='f4')
+                shared_state["timeline_vel"] = np.zeros((0, num_bodies, 3), dtype='f4')
+                shared_state["timeline_times"] = np.zeros(0, dtype='f8')
+                shared_state["crud_queue"] = []
+                shared_state["crud_completed"] = []
+                shared_state["rebuild_flag"] = False
+
+                if new_bundle_info["has_j2"] and opl:
+                    shared_state["oblate_indices"] = np.array([x[0] for x in opl], dtype=np.int32)
+                    shared_state["oblate_j2"] = np.array([x[1] for x in opl], dtype=np.float64)
+                    shared_state["oblate_req"] = np.array([x[3] for x in opl], dtype=np.float64)
+                    shared_state["oblate_poles"] = np.array([x[4] for x in opl], dtype=np.float64)
+                    shared_state["oblate_masses"] = np.array([x[5] for x in opl], dtype=np.float64)
+                else:
+                    shared_state["oblate_indices"] = None
+                    shared_state["oblate_j2"] = None
+                    shared_state["oblate_req"] = None
+                    shared_state["oblate_poles"] = None
+                    shared_state["oblate_masses"] = None
+
+            # Extract initial state
+            local_pos = np.empty((num_bodies, 3), dtype=np.float64)
+            local_vel = np.empty((num_bodies, 3), dtype=np.float64)
+            _extract_render_state(sim, num_bodies, local_pos, local_vel)
+            _init_arr_sw = _get_particle_array(sim, num_bodies)
+
+            current_parents = new_bundle_info.get("parent_indices",
+                np.full(num_bodies, -1, dtype=np.int32)).copy() if "parent_indices" in new_bundle_info else np.full(num_bodies, -1, dtype=np.int32)
+            # Rebuild parent indices from bodies_data if not from snapshot
+            bd = new_bundle_info["bodies_data"]
+            nti = {b['name']: i for i, b in enumerate(bd)}
+            for i, body in enumerate(bd):
+                if 'parentId' in body and body['parentId'] in nti:
+                    current_parents[i] = nti[body['parentId']]
+            current_parents = update_hierarchy(sim, num_bodies, current_parents)
+            positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
+            tree_indices, tree_depths = build_tree_order(current_parents, num_bodies, positions)
+
+            with shared_state["lock"]:
+                np.copyto(shared_state["pos"], local_pos)
+                np.copyto(shared_state["vel"], local_vel)
+                shared_state["mass"][:] = _init_arr_sw[:, 9]
+                shared_state["parent_indices"][:] = current_parents
+                shared_state["tree_indices"][:] = tree_indices
+                shared_state["tree_depths"][:] = tree_depths
+                shared_state["hierarchy_version"] += 1
+
+                # Signal render thread
+                shared_state["system_snapshot_out"] = snapshot
+                shared_state["system_new_bundle"] = new_bundle_info
+                shared_state["system_switch_complete"] = True
+
+            frame_count = 0
+            last_time = time.time()
+            continue
 
         crud_ops = []
         with shared_state["lock"]:
             if shared_state["crud_queue"]:
                 crud_ops = shared_state["crud_queue"][:]
                 shared_state["crud_queue"].clear()
+
         
         if crud_ops:
             for op in crud_ops:
@@ -1320,9 +1472,9 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                             shared_state["mass"][idx] = op["mass"]
                             shared_state["rebuild_flag"] = True
                         if "pos" in op:
-                            shared_state["pos"][idx] = op["pos"]
+                            shared_state["pos"][idx] = [op["pos"][0], op["pos"][2], -op["pos"][1]]
                         if "vel" in op:
-                            shared_state["vel"][idx] = op["vel"]
+                            shared_state["vel"][idx] = [op["vel"][0], op["vel"][2], -op["vel"][1]]
                         if "radius" in op:
                             r_au = op["radius"] / 1.496e8
                             if shared_state.get("oblate_indices") is not None:
@@ -1345,8 +1497,10 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     
                     with shared_state["lock"]:
                         shared_state["timeline_active"] = False
-                        shared_state["pos"] = np.vstack([shared_state["pos"], pos])
-                        shared_state["vel"] = np.vstack([shared_state["vel"], vel])
+                        pos_ogl = [pos[0], pos[2], -pos[1]]
+                        vel_ogl = [vel[0], vel[2], -vel[1]]
+                        shared_state["pos"] = np.vstack([shared_state["pos"], pos_ogl])
+                        shared_state["vel"] = np.vstack([shared_state["vel"], vel_ogl])
                         shared_state["mass"] = np.append(shared_state["mass"], mass)
                         shared_state["parent_indices"] = np.append(shared_state["parent_indices"], np.int32(parent_idx))
                         op["idx"] = num_bodies - 1
@@ -1723,55 +1877,58 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
         ring_gradient_data[j, :] = ring['shadow_grad']
     ring_gradient_tex.write(ring_gradient_data.tobytes())
 
-def main():
-    if _PERF_ENABLED:
-        from scripts.perf_test import PerfTracker as _BootTracker
-        _BootTracker().__class__
-        if _PERF_TRACKER is None:
-            _PERF_INSTALL_TRACKER(_BootTracker())
+def load_system_from_data(bodies_data_raw):
+    """Build a REBOUND simulation and all associated state from raw bodies data.
+    
+    This is the core system loading function, called both at startup and when
+    switching to a different star system.
+    
+    Args:
+        bodies_data_raw: list of body dicts loaded from a system.json file
+    
+    Returns:
+        dict with sim, num_bodies, bodies_data (sorted), visual_data,
+        atmo_bodies, ring_bodies, oblate_physics_list, parent_indices,
+        name_to_idx, has_j2, has_gr, phys_star_idx, star_idx, and more.
+    """
+    G_const = 4.0 * math.pi ** 2
 
+    # ── Topological sort (parents before children) ──
+    name_to_idx = {b['name']: i for i, b in enumerate(bodies_data_raw)}
+    sorted_order = []
+    _visited = set()
+    def _topo(idx):
+        if idx in _visited: return
+        _visited.add(idx)
+        body = bodies_data_raw[idx]
+        if 'parentId' in body:
+            p = name_to_idx.get(body['parentId'])
+            if p is not None: _topo(p)
+        sorted_order.append(idx)
+    for i in range(len(bodies_data_raw)):
+        _topo(i)
+    bodies_data = [bodies_data_raw[i] for i in sorted_order]
+    name_to_idx = {b['name']: i for i, b in enumerate(bodies_data)}
+
+    # ── Create REBOUND simulation ──
     sim = rebound.Simulation()
     sim.softening = 1e-6
     sim.integrator = "ias15"
     sim.units = ('AU', 'Msun', 'yr')
-    
-    with open('data/system.json', 'r') as file:
-        bodies_data = json.load(file)
 
-    name_to_idx = {b['name']: i for i, b in enumerate(bodies_data)}
-    sorted_order = []
-    _topo_visited = set()
-    def _topo_visit(idx):
-        if idx in _topo_visited:
-            return
-        _topo_visited.add(idx)
-        body = bodies_data[idx]
-        if 'parentId' in body:
-            parent_local_idx = name_to_idx.get(body['parentId'])
-            if parent_local_idx is not None:
-                _topo_visit(parent_local_idx)
-        sorted_order.append(idx)
-    
-    for i in range(len(bodies_data)):
-        _topo_visit(i)
-    
-    bodies_data = [bodies_data[i] for i in sorted_order]
-    name_to_idx = {b['name']: i for i, b in enumerate(bodies_data)}
-
+    # ── Process each body ──
     visual_data = []
-    parent_indices = []
     pole_dirs = {}
     ring_bodies = []
     oblate_physics_list = []
-    G_const = 4.0 * math.pi**2
 
     for body in bodies_data:
         name = body['name']
         idx = name_to_idx[name]
         mass = body.get('m', 0.0)
         color = hex_to_rgb(body.get('color', '#ffffff'))
-        radius_au = body.get('r', 1.0) * 0.00465 
-        
+        radius_au = body.get('r', 1.0) * 0.00465
+
         obj_type = body.get('type', 'Unknown')
         if obj_type == "Star": min_px = 3.0
         elif obj_type == "Moon": min_px = 1.0
@@ -1784,28 +1941,25 @@ def main():
             pole_render = np.array([pole_ecl[0], pole_ecl[2], -pole_ecl[1]], dtype='f8')
             pole_dirs[idx] = pole_render
         obl = body.get('oblateness', 0.0)
-        visual_data.append([color[0], color[1], color[2], radius_au, min_px, pole_render[0], pole_render[1], pole_render[2], obl])
-        
+        visual_data.append([color[0], color[1], color[2], radius_au, min_px,
+                            pole_render[0], pole_render[1], pole_render[2], obl])
+
         j2 = body.get('J2', 0.0)
         if j2 > 0.0:
             j4 = body.get('j4', 0.0)
-            
             r_mean = body.get('r', 1.0)
             f = body.get('oblateness', 0.0)
-            if f > 0:
-                req_solar = r_mean / ((1.0 - f)**(1.0/3.0))
-            else:
-                req_solar = r_mean
+            req_solar = r_mean / ((1.0 - f) ** (1.0 / 3.0)) if f > 0 else r_mean
             req_au = req_solar * 0.00465
-            
             rot_period = body.get('rotation_period', 0.0)
             oblate_physics_list.append((idx, j2, j4, req_au, pole_ecl, mass, name, rot_period))
-        
+
         if 'rings' in body:
             parent_pole_ecl = pole_to_ecliptic(body.get('pole_ra', 0), body.get('pole_dec', 90))
             pole_r = np.array([parent_pole_ecl[0], parent_pole_ecl[2], -parent_pole_ecl[1]])
             ring_bodies.append((idx, body['rings'], pole_r, radius_au))
 
+        # ── Add particle to simulation ──
         if 'parentId' in body:
             parent_name = body['parentId']
             if 'sv' in body:
@@ -1818,8 +1972,8 @@ def main():
             elif body.get('orbitRef') == 'equatorial':
                 parent_body_data = next((b for b in bodies_data if b['name'] == parent_name), None)
                 if parent_body_data and 'pole_ra' in parent_body_data:
-                    pole_ecl = pole_to_ecliptic(parent_body_data['pole_ra'], parent_body_data['pole_dec'])
-                    R = build_equatorial_frame(pole_ecl)
+                    pole_ecl_p = pole_to_ecliptic(parent_body_data['pole_ra'], parent_body_data['pole_dec'])
+                    R = build_equatorial_frame(pole_ecl_p)
                     primary = sim.particles[parent_name]
                     mu = G_const * (mass + primary.m)
                     pos_eq, vel_eq = orbital_to_cartesian(
@@ -1828,23 +1982,23 @@ def main():
                         math.radians(body.get('Omega', 0.0)),
                         math.radians(body.get('omega', 0.0)),
                         math.radians(body.get('M', 0.0)), mu)
-                    pos_ecl = R @ pos_eq
-                    vel_ecl = R @ vel_eq
+                    pos_ecl_v = R @ pos_eq
+                    vel_ecl_v = R @ vel_eq
                     sim.add(m=mass,
-                            x=primary.x + pos_ecl[0], y=primary.y + pos_ecl[1], z=primary.z + pos_ecl[2],
-                            vx=primary.vx + vel_ecl[0], vy=primary.vy + vel_ecl[1], vz=primary.vz + vel_ecl[2],
+                            x=primary.x + pos_ecl_v[0], y=primary.y + pos_ecl_v[1], z=primary.z + pos_ecl_v[2],
+                            vx=primary.vx + vel_ecl_v[0], vy=primary.vy + vel_ecl_v[1], vz=primary.vz + vel_ecl_v[2],
                             hash=name)
                 else:
-                    sim.add(m=mass, primary=sim.particles[parent_name], 
-                            a=body.get('a', 0.0), e=body.get('e', 0.0), 
-                            inc=math.radians(body.get('inc', 0.0)), Omega=math.radians(body.get('Omega', 0.0)), 
-                            omega=math.radians(body.get('omega', 0.0)), M=math.radians(body.get('M', 0.0)), 
+                    sim.add(m=mass, primary=sim.particles[parent_name],
+                            a=body.get('a', 0.0), e=body.get('e', 0.0),
+                            inc=math.radians(body.get('inc', 0.0)), Omega=math.radians(body.get('Omega', 0.0)),
+                            omega=math.radians(body.get('omega', 0.0)), M=math.radians(body.get('M', 0.0)),
                             hash=name)
             else:
-                sim.add(m=mass, primary=sim.particles[parent_name], 
-                        a=body.get('a', 0.0), e=body.get('e', 0.0), 
-                        inc=math.radians(body.get('inc', 0.0)), Omega=math.radians(body.get('Omega', 0.0)), 
-                        omega=math.radians(body.get('omega', 0.0)), M=math.radians(body.get('M', 0.0)), 
+                sim.add(m=mass, primary=sim.particles[parent_name],
+                        a=body.get('a', 0.0), e=body.get('e', 0.0),
+                        inc=math.radians(body.get('inc', 0.0)), Omega=math.radians(body.get('Omega', 0.0)),
+                        omega=math.radians(body.get('omega', 0.0)), M=math.radians(body.get('M', 0.0)),
                         hash=name)
         elif 'sv' in body:
             sv = body['sv']
@@ -1855,10 +2009,10 @@ def main():
 
     sim.move_to_com()
 
+    # ── Atmospheres ──
     atmo_bodies = []
     SOLAR_RADIUS_KM = 696340.0
     AU_TO_KM = 149597870.7
-
     for i, body in enumerate(bodies_data):
         if 'atmosphere' in body:
             atmo = body['atmosphere']
@@ -1868,7 +2022,6 @@ def main():
             atmo_height_km = atmo['height']
             atmo_radius_km = planet_radius_km + atmo_height_km
             atmo_radius_au = atmo_radius_km / AU_TO_KM
-
             atmo_bodies.append({
                 'body_idx': i,
                 'planet_radius_km': planet_radius_km,
@@ -1884,10 +2037,79 @@ def main():
                 'intensity': float(atmo['intensity']),
             })
 
-    if atmo_bodies:
-        print(f"[Atmosphere] Parsed atmosphere data for {len(atmo_bodies)} bodies")
-
+    # ── J2 / GR setup ──
     has_j2 = bool(oblate_physics_list)
+    phys_star_idx = -1
+    star_idx = 0
+    for i, body in enumerate(bodies_data):
+        if body.get('type') == 'Star':
+            phys_star_idx = i
+            star_idx = i
+            break
+    has_gr = phys_star_idx >= 0
+
+    rebx_obj = None
+    if has_j2 or has_gr:
+        rebx_obj = setup_reboundx(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)
+        if has_j2:
+            print(f"[System] Attached J2 precession for {len(oblate_physics_list)} oblate bodies")
+        if has_gr:
+            print(f"[System] Attached 1PN GR precession (star index {phys_star_idx})")
+        sim.force_is_velocity_dependent = 1
+
+    num_bodies = len(sim.particles)
+
+    # ── Parent indices ──
+    parent_indices = np.full(num_bodies, -1, dtype=np.int32)
+    for i, body in enumerate(bodies_data):
+        if 'parentId' in body:
+            parent_indices[i] = name_to_idx[body['parentId']]
+
+    print(f"[System] Loaded {num_bodies} bodies")
+
+    return {
+        "sim": sim,
+        "rebx": rebx_obj,
+        "num_bodies": num_bodies,
+        "bodies_data": bodies_data,
+        "name_to_idx": name_to_idx,
+        "visual_data": visual_data,
+        "parent_indices": parent_indices,
+        "pole_dirs": pole_dirs,
+        "ring_bodies": ring_bodies,
+        "oblate_physics_list": oblate_physics_list,
+        "atmo_bodies": atmo_bodies,
+        "has_j2": has_j2,
+        "has_gr": has_gr,
+        "phys_star_idx": phys_star_idx,
+        "star_idx": star_idx,
+    }
+
+def main():
+    if _PERF_ENABLED:
+        from scripts.perf_test import PerfTracker as _BootTracker
+        _BootTracker().__class__
+        if _PERF_TRACKER is None:
+            _PERF_INSTALL_TRACKER(_BootTracker())
+
+    # ── Initialize SystemManager ──
+    sys_mgr = SystemManager()
+    active_system_name = SystemManager.SOLAR_SYSTEM_NAME
+    bodies_data_raw = sys_mgr.load_default_system()
+    bundle = load_system_from_data(bodies_data_raw)
+
+    sim = bundle["sim"]
+    num_bodies = bundle["num_bodies"]
+    bodies_data = bundle["bodies_data"]
+    name_to_idx = bundle["name_to_idx"]
+    visual_data = bundle["visual_data"]
+    atmo_bodies = bundle["atmo_bodies"]
+    ring_bodies = bundle["ring_bodies"]
+    oblate_physics_list = bundle["oblate_physics_list"]
+    has_j2 = bundle["has_j2"]
+    has_gr = bundle["has_gr"]
+    phys_star_idx = bundle["phys_star_idx"]
+
     if has_j2:
         oblate_indices = np.array([x[0] for x in oblate_physics_list], dtype=np.int32)
         oblate_j2 = np.array([x[1] for x in oblate_physics_list], dtype=np.float64)
@@ -1895,25 +2117,9 @@ def main():
         oblate_poles = np.array([x[4] for x in oblate_physics_list], dtype=np.float64)
         oblate_masses = np.array([x[5] for x in oblate_physics_list], dtype=np.float64)
 
-    phys_star_idx = -1
-    phys_star_mass = 0.0
-    for i, body in enumerate(bodies_data):
-        if body.get('type') == 'Star':
-            phys_star_idx = i
-            phys_star_mass = body.get('m', 0.0)
-            break
-    has_gr = phys_star_idx >= 0
+    if atmo_bodies:
+        print(f"[Atmosphere] Parsed atmosphere data for {len(atmo_bodies)} bodies")
 
-    if has_j2 or has_gr:
-        rebx = setup_reboundx(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)
-        if has_j2:
-            print(f"[J2] Attached J2 precession for {len(oblate_physics_list)} oblate bodies via REBOUNDx")
-        if has_gr:
-            print(f"[GR] Attached 1PN relativistic precession (star index {phys_star_idx}) via REBOUNDx")
-        sim.force_is_velocity_dependent = 1
-
-    num_bodies = len(sim.particles)
-    
     shared_state = {
         "lock": threading.Lock(),
         "has_j2": has_j2,
@@ -1942,6 +2148,11 @@ def main():
         "oblate_poles": oblate_poles if has_j2 else None,
         "oblate_masses": oblate_masses if has_j2 else None,
         "phys_star_idx": phys_star_idx,
+        # ── System switching infrastructure ──
+        "system_switch_request": None,       # set to dict with system bundle to trigger switch
+        "system_switch_complete": False,      # physics thread sets True when switch is done
+        "system_new_bundle": None,            # physics thread puts new system info here
+        "system_snapshot_out": None,          # physics thread puts saved snapshot here
     }
     
     _init_arr = _get_particle_array(sim, num_bodies)
@@ -1953,11 +2164,7 @@ def main():
     shared_state["vel"][:, 2] = -_init_arr[:, 4]
     shared_state["mass"][:] = _init_arr[:, 9]
         
-    parent_indices = np.full(num_bodies, -1, dtype=np.int32)
-    for i, body in enumerate(bodies_data):
-        if 'parentId' in body:
-            parent_indices[i] = name_to_idx[body['parentId']]
-            
+    parent_indices = bundle["parent_indices"].copy()
     parent_indices = update_hierarchy(sim, num_bodies, parent_indices)
     init_positions = _init_arr[:, 0:3]
     tree_indices_init, tree_depths_init = build_tree_order(parent_indices, num_bodies, init_positions)
@@ -1979,6 +2186,7 @@ def main():
     running = [True]
     physics_thread = threading.Thread(target=physics_loop, args=(sim, num_bodies, shared_state, time_ctrl, running), daemon=True)
     physics_thread.start()
+
 
     def _glfw_error_callback(code, msg):
         print(f"[GLFW Error {code}] {msg}")
@@ -3449,6 +3657,7 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
     visual_colors_f8 = np.ascontiguousarray(visual_arr[:, 0:3], dtype='f8')
     cached_children_map = {}
     cached_hierarchy_ver = -1
+    switch_req_name = active_system_name
 
     last_render_time = time.time()
     show_orbits = True
@@ -3469,8 +3678,169 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
     n_orbits_low = 0
 
     while not glfw.window_should_close(window):
+        # ── System Switch — render-side rebuild ──
+        with shared_state["lock"]:
+            switch_complete = shared_state.get("system_switch_complete", False)
+        if switch_complete:
+            with shared_state["lock"]:
+                new_info = shared_state["system_new_bundle"]
+                saved_snap = shared_state["system_snapshot_out"]
+                shared_state["system_switch_complete"] = False
+                shared_state["system_new_bundle"] = None
+                shared_state["system_snapshot_out"] = None
+
+            # Store snapshot of old system in SystemManager
+            old_name = active_system_name
+            if saved_snap is not None:
+                sys_mgr.store_snapshot(old_name, saved_snap)
+
+            # Update active system name
+            active_system_name = switch_req_name
+
+            # Rebuild ALL render-side state from new system info
+            bodies_data = new_info["bodies_data"]
+            visual_data = new_info["visual_data"]
+            atmo_bodies = new_info["atmo_bodies"]
+            ring_bodies = new_info["ring_bodies"]
+            num_bodies = new_info["num_bodies"]
+            star_idx = new_info["star_idx"]
+
+            visual_arr = np.array(visual_data, dtype='f4')
+            body_radii = np.array([v[3] for v in visual_data], dtype='f4')
+            body_colors = np.array([v[0:3] for v in visual_data], dtype='f4')
+            is_star_arr = np.zeros(num_bodies, dtype='f4')
+            is_star_arr[star_idx] = 1.0
+            non_star_mask = np.ones(num_bodies, dtype=bool)
+            non_star_mask[star_idx] = False
+            non_star_indices = np.where(non_star_mask)[0][:64]
+            n_casters_fixed = len(non_star_indices)
+            star_radius_au = visual_data[star_idx][3] if star_idx < len(visual_data) else 0.00465
+
+            pos_snap = np.zeros((num_bodies, 3), dtype='f8')
+            vel_snap = np.zeros((num_bodies, 3), dtype='f8')
+            mass_snap = np.zeros(num_bodies, dtype='f8')
+            parent_snap = np.zeros(num_bodies, dtype=np.int32)
+            tree_indices_snap = np.zeros(num_bodies, dtype=np.int32)
+            tree_depths_snap = np.zeros(num_bodies, dtype=np.int32)
+
+            all_instances = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
+            inst_data_lo = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
+            inst_data_hi = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
+            focused_mask = np.zeros(num_bodies, dtype=np.bool_)
+            visual_colors_f8 = np.ascontiguousarray(visual_arr[:, 0:3], dtype='f8')
+
+            max_orbits = MAX_BODIES * 2
+            orbit_data_buf = np.zeros((max_orbits, 20), dtype='f8')
+            subsys_pos_buf = np.zeros((num_bodies, 3), dtype='f8')
+            subsys_vel_buf = np.zeros((num_bodies, 3), dtype='f8')
+            subsys_mass_buf = np.zeros(num_bodies, dtype='f8')
+            caster_data_buf = np.zeros((64, 4), dtype='f4')
+            caster_poles_obl_buf = np.zeros((64, 4), dtype='f4')
+            caster_colors_buf = np.zeros((64, 4), dtype='f4')
+            caster_atmos_buf = np.zeros((64, 4), dtype='f4')
+            ring_centers_buf = np.zeros((16, 3), dtype='f4')
+            ring_normals_buf = np.zeros((16, 3), dtype='f4')
+            ring_params_buf = np.zeros((16, 3), dtype='f4')
+            ring_colors_buf = np.zeros((16, 3), dtype='f4')
+            cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
+            cull_mask_hi = np.zeros(num_bodies, dtype=np.uint32)
+            cull_ring_mask = np.zeros(num_bodies, dtype=np.uint32)
+            cull_ring_caster_lo = np.zeros(16, dtype=np.uint32)
+            cull_ring_caster_hi = np.zeros(16, dtype=np.uint32)
+
+            # Release old ring GL objects and rebuild
+            for g in ring_render_groups:
+                g['vao'].release()
+            ring_render_groups = []
+            ring_precomputed = []
+
+            # Rebuild ring precomputed data for new system
+            RING_SEGMENTS_SW = 128
+            for body_idx_r, rings_data_r, pole_render_r, body_radius_au_r in ring_bodies:
+                pole_n_r = pole_render_r / np.linalg.norm(pole_render_r)
+                ref_r = np.array([0., 0., 1.])
+                tangent_r = np.cross(pole_n_r, ref_r)
+                if np.linalg.norm(tangent_r) < 1e-10:
+                    ref_r = np.array([1., 0., 0.])
+                    tangent_r = np.cross(pole_n_r, ref_r)
+                tangent_r /= np.linalg.norm(tangent_r)
+                bitangent_r = np.cross(pole_n_r, tangent_r)
+                R_ring_sw = np.column_stack([tangent_r, pole_n_r, bitangent_r])
+                for ring_seg in rings_data_r:
+                    inner_r = ring_seg['inner'] * body_radius_au_r
+                    outer_r = ring_seg['outer'] * body_radius_au_r
+                    r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
+                    r_opacity = ring_seg.get('opacity', 1.0)
+                    r_scatter = ring_seg.get('scatter', 0.0)
+                    r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                    RADIAL_SUBDIVISIONS = 32
+                    sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
+                    verts_r, indices_r, norm_r, colors_r, shadow_grad_r = generate_ring_arrays(
+                        pole_render_r, inner_r, outer_r, r_color, r_opacity, r_scatter, r_asymmetry, sorted_gradient)
+                    ring_precomputed.append({
+                        'body_idx': body_idx_r, 'verts': verts_r, 'indices': indices_r,
+                        'normal': norm_r, 'colors': colors_r, 'inner_r': inner_r, 'outer_r': outer_r,
+                        'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry,
+                        'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
+                    })
+
+            # Rebuild ring render groups
+            ring_gradient_data_sw = np.zeros((16, 256), dtype='f4')
+            for j, ring in enumerate(ring_precomputed):
+                if j >= 16: break
+                ring_gradient_data_sw[j, :] = ring['shadow_grad']
+            ring_gradient_tex.write(ring_gradient_data_sw.tobytes())
+
+            rings_by_body_sw = {}
+            for ring in ring_precomputed:
+                bi_r = ring['body_idx']
+                rings_by_body_sw.setdefault(bi_r, []).append(ring)
+            for bi_r, rings_r in rings_by_body_sw.items():
+                all_ring_verts_sw = []
+                all_ring_indices_sw = []
+                vert_offset_sw = 0
+                for ring in rings_r:
+                    n_v = len(ring['verts'])
+                    ring_packed = np.zeros((n_v, 12), dtype='f4')
+                    ring_packed[:, 0:3] = ring['verts']
+                    ring_packed[:, 3:6] = ring['normal']
+                    ring_packed[:, 6:10] = ring['colors']
+                    ring_packed[:, 10] = ring['scatter']
+                    ring_packed[:, 11] = ring['asymmetry']
+                    all_ring_verts_sw.append(ring_packed)
+                    all_ring_indices_sw.append(ring['indices'] + vert_offset_sw)
+                    vert_offset_sw += n_v
+                all_v_sw = np.concatenate(all_ring_verts_sw, axis=0)
+                all_i_sw = np.concatenate(all_ring_indices_sw, axis=0)
+                ring_vbo_sw = ctx.buffer(all_v_sw.tobytes())
+                ring_ibo_sw = ctx.buffer(all_i_sw.tobytes())
+                ring_vao_sw = ctx.vertex_array(
+                    prog_rings,
+                    [(ring_vbo_sw, '3f 3f 4f 1f 1f', 'in_position', 'in_normal', 'in_color', 'in_scatter', 'in_asymmetry')],
+                    index_buffer=ring_ibo_sw)
+                ring_render_groups.append({'body_idx': bi_r, 'vao': ring_vao_sw, 'num_indices': len(all_i_sw)})
+
+            # Reset camera and UI state
+            camera["tracking_idx"] = 0
+            camera["inspected_idx"] = None
+            camera["inspect_bary"] = False
+            camera["edit_mode"] = False
+            camera["target"] = np.array([0.0, 0.0, 0.0], dtype='f8')
+            camera["target_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
+            camera["pan_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
+            camera["distance"] = 45.0
+
+            cached_hierarchy_ver = -1
+            last_orbit_pos_snap = None
+            last_cam_origin = None
+            n_orbits = 0
+            scrub_index[0] = 0
+
+            print(f"[System] Switched to '{active_system_name}' ({num_bodies} bodies)")
+
         with shared_state["lock"]:
             if shared_state.get("rebuild_flag", False):
+
                 for op in shared_state["crud_completed"]:
                     if op["action"] == "CREATE":
                         name = op.get("name", "New Body")
@@ -3485,9 +3855,18 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                         bodies_data.append({
                             "name": name,
                             "type": btype,
-                            "color": color,
-                            "r": radius / 696340.0,
-                            "mass": mass
+                            "color": f"#{int(color[0]*255):02x}{int(color[1]*255):02x}{int(color[2]*255):02x}",
+                            "r": float(radius / 696340.0),
+                            "m": float(mass),
+                            "parentId": bodies_data[parent_idx]["name"],
+                            "sv": {
+                                "x": float(pos[0] - pos_snap[parent_idx][0]),
+                                "y": float(pos[1] - pos_snap[parent_idx][1]),
+                                "z": float(pos[2] - pos_snap[parent_idx][2]),
+                                "vx": float(vel[0] - vel_snap[parent_idx][0]),
+                                "vy": float(vel[1] - vel_snap[parent_idx][1]),
+                                "vz": float(vel[2] - vel_snap[parent_idx][2])
+                            }
                         })
                         
                         pos_snap = np.vstack([pos_snap, pos])
@@ -3520,6 +3899,7 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                         visual_colors_f8 = np.vstack([visual_colors_f8, np.array(color, dtype='f8')])
                         body_colors = np.vstack([body_colors, np.array(color, dtype='f4')])
                         is_star_arr = np.append(is_star_arr, 0.0)
+                        visual_data.append([color[0], color[1], color[2], r_au, 1.0, 0, 1, 0, 0])
                         
                         inst_data_lo = np.vstack([inst_data_lo, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                         inst_data_hi = np.vstack([inst_data_hi, np.zeros(INSTANCE_FLOATS, dtype='f4')])
@@ -3558,6 +3938,7 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                         visual_colors_f8 = np.delete(visual_colors_f8, idx, axis=0)
                         body_colors = np.delete(body_colors, idx, axis=0)
                         is_star_arr = np.delete(is_star_arr, idx)
+                        visual_data.pop(idx)
                         inst_data_lo = np.delete(inst_data_lo, idx, axis=0)
                         inst_data_hi = np.delete(inst_data_hi, idx, axis=0)
                         focused_mask = np.delete(focused_mask, idx)
@@ -3596,8 +3977,33 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                     elif op["action"] == "UPDATE":
                         idx = op["idx"]
                         if "mass" in op:
-                            bodies_data[idx]["mass"] = op["mass"]
-                            
+                            bodies_data[idx]["m"] = float(op["mass"])
+                        if "radius" in op:
+                            bodies_data[idx]["r"] = float(op["radius"] / 696340.0)
+                            r_au = op["radius"] / 1.496e8
+                            body_radii[idx] = r_au
+                            visual_arr[idx][3] = r_au
+                            visual_data[idx][3] = r_au
+                        if "color" in op:
+                            c = op["color"]
+                            bodies_data[idx]["color"] = f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}"
+                            visual_arr[idx][0:3] = c
+                            visual_colors_f8[idx] = np.array(c, dtype='f8')
+                            body_colors[idx] = np.array(c, dtype='f4')
+                            visual_data[idx][0:3] = c
+                        if "pos" in op:
+                            pidx = parent_snap[idx]
+                            if pidx >= 0 and pidx != idx:
+                                bodies_data[idx]["sv"] = {
+                                    "x": float(op["pos"][0] - pos_snap[pidx][0]),
+                                    "y": float(op["pos"][1] - pos_snap[pidx][1]),
+                                    "z": float(op["pos"][2] - pos_snap[pidx][2]),
+                                    "vx": float(op["vel"][0] - vel_snap[pidx][0]),
+                                    "vy": float(op["vel"][1] - vel_snap[pidx][1]),
+                                    "vz": float(op["vel"][2] - vel_snap[pidx][2])
+                                }
+
+                sys_mgr.save_system_data(active_system_name, bodies_data)
                 shared_state["crud_completed"].clear()
                 shared_state["rebuild_flag"] = False
                 cached_hierarchy_ver = -1
@@ -3975,6 +4381,7 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
 
             u_atmo_quality_uniform.value = atmo_quality
             u_atmo_camera_pos.write(cam_pos)
+            AU_TO_KM = 149597870.7
             u_atmo_au_to_km.value = AU_TO_KM
         
             u_atmo_num_ring_planes.value = n_ring_planes
@@ -4188,7 +4595,63 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
         imgui.set_next_window_size(230, min(600, fb_height - 380), imgui.ALWAYS)
         imgui.begin("System Hierarchy")
         
+        # ── System Selector ──
+        imgui.text_colored(active_system_name, 0.6, 0.9, 1.0)
+        imgui.same_line()
+        imgui.set_cursor_pos_x(imgui.get_window_width() - 45)
+        if imgui.button("...##sys_menu"):
+            imgui.open_popup("SystemMenuPopup")
+            
+        if imgui.begin_popup("SystemMenuPopup"):
+            imgui.text_colored("Switch System:", 0.6, 0.9, 1.0)
+            imgui.separator()
+            system_list = sys_mgr.list_systems()
+            for si, sname in enumerate(system_list):
+                is_selected = (sname == active_system_name)
+                if imgui.selectable(sname, is_selected)[0]:
+                    if sname != active_system_name:
+                        target_name = sname
+                        switch_req_name = target_name
+                        existing_snap = sys_mgr.get_snapshot(target_name)
+                        if existing_snap is not None:
+                            req = {
+                                "old_bodies_data": bodies_data,
+                                "old_visual_data": visual_data,
+                                "old_atmo_bodies": atmo_bodies,
+                                "old_ring_bodies": ring_bodies,
+                                "old_star_idx": star_idx,
+                                "restore_snapshot": existing_snap,
+                            }
+                        else:
+                            raw_data = sys_mgr.load_system_data(target_name)
+                            new_bndl = load_system_from_data(raw_data)
+                            req = {
+                                "old_bodies_data": bodies_data,
+                                "old_visual_data": visual_data,
+                                "old_atmo_bodies": atmo_bodies,
+                                "old_ring_bodies": ring_bodies,
+                                "old_star_idx": star_idx,
+                                "new_bundle": new_bndl,
+                            }
+                        with shared_state["lock"]:
+                            shared_state["system_switch_request"] = req
+
+            imgui.separator()
+            if imgui.selectable("+ Create New System")[0]:
+                camera["show_create_system"] = True
+                camera["create_sys_data"] = {
+                    "system_name": "New System",
+                    "star_name": "Star",
+                    "mass": 1.0,
+                    "metallicity": 0.0,
+                    "age": 4.6,
+                }
+            imgui.end_popup()
+
+        imgui.separator()
+        
         for k in range(len(tree_indices_snap)):
+
             idx = int(tree_indices_snap[k])
             depth = int(tree_depths_snap[k])
             indent = depth * 15
@@ -4810,8 +5273,96 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                         shared_state["crud_queue"].append(payload)
                     camera["add_mode"] = False
             imgui.end()
+        # ── Create New Star System Dialog ──
+        if camera.get("show_create_system", False):
+            imgui.set_next_window_size(380, 480, imgui.FIRST_USE_EVER)
+            imgui.set_next_window_position(fb_width // 2 - 190, fb_height // 2 - 240, imgui.FIRST_USE_EVER)
+            expanded_cs, camera["show_create_system"] = imgui.begin("Create New Star System", True)
+            if expanded_cs:
+                cd = camera["create_sys_data"]
+
+                imgui.text_colored("System", 0.6, 0.9, 1.0)
+                _, cd["system_name"] = imgui.input_text("System Name", cd["system_name"], 256)
+                
+                imgui.separator()
+                imgui.text_colored("Star Properties", 1.0, 0.85, 0.4)
+                _, cd["star_name"] = imgui.input_text("Star Name", cd["star_name"], 256)
+                
+                imgui.spacing()
+                imgui.text_colored("The Big Three", 0.4, 1.0, 0.7)
+                _, cd["mass"] = imgui.input_double("Mass (M\u2609)", cd["mass"], format="%.4f")
+                _, cd["metallicity"] = imgui.input_double("[Fe/H] (dex)", cd["metallicity"], format="%.3f")
+                _, cd["age"] = imgui.input_double("Age (Gyr)", cd["age"], format="%.3f")
+                
+                # Live preview of derived properties
+                imgui.separator()
+                imgui.text_colored("Derived Properties (Preview)", 0.7, 0.7, 0.7)
+                preview = derive_star_properties(cd["mass"], cd["metallicity"], cd["age"])
+                pr, pg, pb = temperature_to_rgb(preview["temperature"])
+                
+                imgui.text(f"  Temperature:    {preview['temperature']:,.0f} K")
+                imgui.text(f"  Luminosity:     {preview['luminosity']:.4f} L\u2609")
+                imgui.text(f"  Radius:         {preview['radius']:.4f} R\u2609")
+                imgui.text(f"  Spectral Class: {preview['spectral_class']}")
+                imgui.text(f"  Stage:          {preview['stage']}")
+                imgui.text(f"  MS Lifetime:    {preview['ms_lifetime']:.2f} Gyr")
+                imgui.text(f"  MS Progress:    {preview['progress']:.1f}%")
+                
+                # Color preview
+                imgui.spacing()
+                imgui.text("Star Color:")
+                imgui.same_line()
+                imgui.color_button("##star_color_preview", pr, pg, pb, 1.0, 0, 20, 20)
+                
+                imgui.separator()
+                
+                # Validation
+                name_ok = len(cd["system_name"].strip()) > 0
+                name_exists = sys_mgr.system_exists(cd["system_name"].strip())
+                mass_ok = cd["mass"] > 0.01
+                age_ok = cd["age"] >= 0
+                
+                if not name_ok:
+                    imgui.text_colored("System name required", 1.0, 0.3, 0.3)
+                elif name_exists:
+                    imgui.text_colored("System already exists!", 1.0, 0.3, 0.3)
+                elif not mass_ok:
+                    imgui.text_colored("Mass must be > 0.01 M\u2609", 1.0, 0.3, 0.3)
+                elif not age_ok:
+                    imgui.text_colored("Age must be >= 0", 1.0, 0.3, 0.3)
+                
+                can_create = name_ok and not name_exists and mass_ok and age_ok
+                
+                if can_create:
+                    if imgui.button("Create System", width=-1):
+                        sys_name = cd["system_name"].strip()
+                        star_name_c = cd["star_name"].strip() or "Star"
+                        
+                        # Create system on disk
+                        new_bodies = sys_mgr.create_new_system(
+                            sys_name, star_name_c, cd["mass"], cd["metallicity"], cd["age"]
+                        )
+                        
+                        # Build REBOUND sim and trigger switch
+                        new_bndl = load_system_from_data(new_bodies)
+                        switch_req_name = sys_name
+                        req = {
+                            "old_bodies_data": bodies_data,
+                            "old_visual_data": visual_data,
+                            "old_atmo_bodies": atmo_bodies,
+                            "old_ring_bodies": ring_bodies,
+                            "old_star_idx": star_idx,
+                            "new_bundle": new_bndl,
+                        }
+                        with shared_state["lock"]:
+                            shared_state["system_switch_request"] = req
+                        
+                        camera["show_create_system"] = False
+                        print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
+            imgui.end()
 
         imgui.render()
+
         impl.render(imgui.get_draw_data())
         glfw.swap_buffers(window)
         
