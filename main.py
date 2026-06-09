@@ -66,8 +66,7 @@ def fast_cross(a, b):
 def fast_norm(v):
     return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
 
-# ---------- Zero-copy REBOUND particle extraction via ctypes ----------
-_PARTICLE_STRIDE = None  # lazily initialized
+_PARTICLE_STRIDE = None
 
 def _get_particle_array(sim, num_bodies):
     """Get a NumPy view of REBOUND's internal C particle array (zero-copy).
@@ -77,7 +76,7 @@ def _get_particle_array(sim, num_bodies):
     """
     global _PARTICLE_STRIDE
     if _PARTICLE_STRIDE is None:
-        _PARTICLE_STRIDE = ctypes.sizeof(rebound.Particle) // 8  # doubles per particle
+        _PARTICLE_STRIDE = ctypes.sizeof(rebound.Particle) // 8
     n = _PARTICLE_STRIDE
     addr = ctypes.addressof(sim._particles.contents)
     raw = (ctypes.c_double * (num_bodies * n)).from_address(addr)
@@ -86,12 +85,12 @@ def _get_particle_array(sim, num_bodies):
 def _extract_render_state(sim, num_bodies, out_pos, out_vel):
     """Extract particle positions/velocities with render coordinate swap (x, z, -y)."""
     arr = _get_particle_array(sim, num_bodies)
-    out_pos[:, 0] = arr[:, 0]    # x
-    out_pos[:, 1] = arr[:, 2]    # z
-    out_pos[:, 2] = -arr[:, 1]   # -y
-    out_vel[:, 0] = arr[:, 3]    # vx
-    out_vel[:, 1] = arr[:, 5]    # vz
-    out_vel[:, 2] = -arr[:, 4]   # -vy
+    out_pos[:, 0] = arr[:, 0]
+    out_pos[:, 1] = arr[:, 2]
+    out_pos[:, 2] = -arr[:, 1]
+    out_vel[:, 0] = arr[:, 3]
+    out_vel[:, 1] = arr[:, 5]
+    out_vel[:, 2] = -arr[:, 4]
 
 def setup_reboundx(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list):
     import reboundx
@@ -106,20 +105,18 @@ def setup_reboundx(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list):
         j2_force = rebx.load_force("gravitational_harmonics")
         rebx.add_force(j2_force)
         
-        for i, j2, j4, req, pole, _, name in oblate_physics_list:
+        for i, j2, j4, req, pole, _, name, rot_period in oblate_physics_list:
             p = sim.particles[i]
             p.params["J2"] = j2
             if j4 != 0.0:
                 p.params["J4"] = j4
             p.params["R_eq"] = req
                 
-            omega_mag = 1.0 # default 1 rad/yr
-            if name == "Earth":
+            omega_mag = 1.0
+            if rot_period > 0:
+                omega_mag = (365.25 * 24.0 / rot_period) * 2 * np.pi
+            elif name == "Earth":
                 omega_mag = 365.25 * 2 * np.pi
-            elif name == "Jupiter":
-                omega_mag = (365.25 * 24.0 / 9.925) * 2 * np.pi
-            elif name == "Saturn":
-                omega_mag = (365.25 * 24.0 / 10.656) * 2 * np.pi
                 
             p.params["Omega"] = [pole[0]*omega_mag, pole[1]*omega_mag, pole[2]*omega_mag]
             
@@ -395,7 +392,7 @@ def compute_barycenters(pos, vel, mass, parent_indices,
 @njit(cache=True)
 def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                              subsys_pos, subsys_vel, subsys_mass,
-                             visual_colors, cam_origin, G, max_orbits, orbit_buf):
+                             visual_colors, cam_origin, G, max_orbits, orbit_buf, lod_levels):
     """Compute all orbital elements (child + reflex) in one Numba-accelerated batch.
     Returns number of valid orbits written to orbit_buf."""
     n_orbits = 0
@@ -413,6 +410,8 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
     rel_pos = np.empty(3, dtype=np.float64)
     rel_vel = np.empty(3, dtype=np.float64)
     parent_bary_ref = np.empty(3, dtype=np.float64)
+    eff_parent_pos = np.empty(3, dtype=np.float64)
+    eff_parent_vel = np.empty(3, dtype=np.float64)
 
     for i in range(num_bodies):
         p_idx = parent_indices[i]
@@ -430,17 +429,47 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
             
         parent_m = mass[p_idx]
         orb_m = subsys_mass[i]
-        total_m = parent_m + orb_m
+        
+        eff_parent_m = parent_m
+        for k in range(3):
+            eff_parent_pos[k] = parent_m * pos[p_idx, k]
+            eff_parent_vel[k] = parent_m * vel[p_idx, k]
+            
+        dist_i_sq = 0.0
+        for k in range(3):
+            dx = pos[i, k] - pos[p_idx, k]
+            dist_i_sq += dx*dx
+            
+        for j in range(num_bodies):
+            if j != i and parent_indices[j] == p_idx:
+                cm = mass[j]
+                # Only account for moons that have at least 1/1,000,000th the mass of the primary
+                if cm > 1e-6 * parent_m:
+                    dist_j_sq = 0.0
+                    for k in range(3):
+                        dx = pos[j, k] - pos[p_idx, k]
+                        dist_j_sq += dx*dx
+                    if dist_j_sq < dist_i_sq:
+                        eff_parent_m += cm
+                        for k in range(3):
+                            eff_parent_pos[k] += cm * pos[j, k]
+                            eff_parent_vel[k] += cm * vel[j, k]
+                        
+        for k in range(3):
+            eff_parent_pos[k] /= eff_parent_m
+            eff_parent_vel[k] /= eff_parent_m
+
+        total_m = eff_parent_m + orb_m
         if total_m <= 0.0:
             continue
             
-        q = parent_m / total_m
+        q = eff_parent_m / total_m
         mu = G * total_m
         
         for k in range(3):
-            orb_rel_pos[k] = subsys_pos[i, k] - pos[p_idx, k]
-            orb_rel_vel[k] = subsys_vel[i, k] - vel[p_idx, k]
-            bary[k] = (parent_m * pos[p_idx, k] + orb_m * subsys_pos[i, k]) / total_m
+            orb_rel_pos[k] = subsys_pos[i, k] - eff_parent_pos[k]
+            orb_rel_vel[k] = subsys_vel[i, k] - eff_parent_vel[k]
+            bary[k] = (eff_parent_m * eff_parent_pos[k] + orb_m * subsys_pos[i, k]) / total_m
             
         e_hat, q_hat, bary_rel, sl_p, e_mag, theta0, is_valid = compute_orbit_elements(
             orb_rel_pos, orb_rel_vel, mu, q, bary, cam_origin,
@@ -494,8 +523,12 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                         E0_curr = math.atan2(math.sqrt(1.0 - e_mag * e_mag) * math.sin(theta0_curr), math.cos(theta0_curr) + e_mag)
                         t_curr = (E0_curr + E_exit) / delta_angle if delta_angle > 0 else 0.0
                 elif e_mag >= 1.0:
+                    r_max = max(300.0, (sl_p / (1.0 + e_mag)) * 10.0)
+                    cos_th_max = (sl_p / r_max - 1.0) / e_mag
+                    cos_th_max = max(-1.0, min(1.0, cos_th_max))
+                    theta_dist = math.acos(cos_th_max)
                     theta_asymp = math.acos(-1.0 / e_mag)
-                    theta_max = theta_asymp * 0.95
+                    theta_max = min(theta_asymp * 0.999, theta_dist)
                     delta_angle = 2.0 * theta_max
                     theta0 = -theta_max
                     t_curr = (theta0_curr + theta_max) / delta_angle if delta_angle > 0 else 0.0
@@ -527,34 +560,99 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                 orbit_buf[n_orbits, 16] = t_curr
                 orbit_buf[n_orbits, 17] = delta_angle
                 orbit_buf[n_orbits, 18] = 0.0
-                orbit_buf[n_orbits, 19] = 0.0
+                orbit_buf[n_orbits, 19] = lod_levels[i]
                 n_orbits += 1
                 
                 if is_escape and gp_idx >= 0 and n_orbits < max_orbits:
                     gp_mu = G * (mass[gp_idx] + orb_m)
+                    
+                    c_exit_r = sl_p / (1.0 + e_mag * math.cos(theta_exit))
+                    c_exit_x = c_exit_r * math.cos(theta_exit)
+                    c_exit_y = c_exit_r * math.sin(theta_exit)
+                    
+                    v_fac = math.sqrt(mu / sl_p)
+                    v_exit_x = -v_fac * math.sin(theta_exit)
+                    v_exit_y = v_fac * (e_mag + math.cos(theta_exit))
+                    
+                    dt = 0.0
+                    if e_mag >= 1.0:
+                        a = sl_p / (e_mag * e_mag - 1.0)
+                        if a > 0:
+                            n = math.sqrt(mu / (a * a * a))
+                            cosh_F0 = (e_mag + math.cos(theta0_curr)) / (1.0 + e_mag * math.cos(theta0_curr))
+                            sinh_F0 = math.sqrt(e_mag * e_mag - 1.0) * math.sin(theta0_curr) / (1.0 + e_mag * math.cos(theta0_curr))
+                            F0 = math.log(max(1e-10, cosh_F0 + sinh_F0))
+                            M0 = e_mag * sinh_F0 - F0
+                            
+                            cosh_F_exit = (e_mag + math.cos(theta_exit)) / (1.0 + e_mag * math.cos(theta_exit))
+                            sinh_F_exit = math.sqrt(e_mag * e_mag - 1.0) * math.sin(theta_exit) / (1.0 + e_mag * math.cos(theta_exit))
+                            F_exit = math.log(max(1e-10, cosh_F_exit + sinh_F_exit))
+                            M_exit = e_mag * sinh_F_exit - F_exit
+                            dt = (M_exit - M0) / n
+                    else:
+                        a = sl_p / (1.0 - e_mag * e_mag)
+                        if a > 0:
+                            n = math.sqrt(mu / (a * a * a))
+                            sin_E0 = math.sqrt(1.0 - e_mag * e_mag) * math.sin(theta0_curr) / (1.0 + e_mag * math.cos(theta0_curr))
+                            cos_E0 = (e_mag + math.cos(theta0_curr)) / (1.0 + e_mag * math.cos(theta0_curr))
+                            E0 = math.atan2(sin_E0, cos_E0)
+                            M0 = E0 - e_mag * sin_E0
+                            
+                            sin_E_exit = math.sqrt(1.0 - e_mag * e_mag) * math.sin(theta_exit) / (1.0 + e_mag * math.cos(theta_exit))
+                            cos_E_exit = (e_mag + math.cos(theta_exit)) / (1.0 + e_mag * math.cos(theta_exit))
+                            E_exit = math.atan2(sin_E_exit, cos_E_exit)
+                            M_exit = E_exit - e_mag * sin_E_exit
+                            if M_exit < M0:
+                                M_exit += 2.0 * math.pi
+                            dt = (M_exit - M0) / n
+                    
+                    if dt < 0: dt = 0.0
+                    
+                    parent_mu = G * (mass[gp_idx] + eff_parent_m)
+                    p_rel_x = eff_parent_pos[0] - pos[gp_idx, 0]
+                    p_rel_y = eff_parent_pos[1] - pos[gp_idx, 1]
+                    p_rel_z = eff_parent_pos[2] - pos[gp_idx, 2]
+                    p_rel_vx = eff_parent_vel[0] - vel[gp_idx, 0]
+                    p_rel_vy = eff_parent_vel[1] - vel[gp_idx, 1]
+                    p_rel_vz = eff_parent_vel[2] - vel[gp_idx, 2]
+                    
+                    pa, pe, pinc_d, pOmega_d, pomega_d, pnu_d, pM_d, pperiod = compute_keplerian_elements(
+                        p_rel_x, p_rel_y, p_rel_z, p_rel_vx, p_rel_vy, p_rel_vz, parent_mu)
+                    
+                    if dt > 0 and pa > 0 and pe < 1.0:
+                        pn = math.sqrt(parent_mu / max(pa**3, 1e-30))
+                        pM_new = (pM_d * math.pi / 180.0) + pn * dt
+                        p_pos_new, p_vel_new = orbital_to_cartesian(
+                            pa, pe, pinc_d * math.pi / 180.0, pOmega_d * math.pi / 180.0,
+                            pomega_d * math.pi / 180.0, pM_new, parent_mu)
+                    else:
+                        p_pos_new = np.array([p_rel_x, p_rel_y, p_rel_z], dtype=np.float64)
+                        p_vel_new = np.array([p_rel_vx, p_rel_vy, p_rel_vz], dtype=np.float64)
+                    
                     for k in range(3):
-                        gp_rel_pos[k] = subsys_pos[i, k] - pos[gp_idx, k]
-                        gp_rel_vel[k] = subsys_vel[i, k] - vel[gp_idx, k]
-                        gp_bary[k] = (mass[gp_idx] * pos[gp_idx, k] + orb_m * subsys_pos[i, k]) / (mass[gp_idx] + orb_m)
+                        c_exit_rel_pos = e_hat[k]*c_exit_x + q_hat[k]*c_exit_y
+                        c_exit_rel_vel = e_hat[k]*v_exit_x + q_hat[k]*v_exit_y
+                        
+                        gp_rel_pos[k] = p_pos_new[k] + c_exit_rel_pos
+                        gp_rel_vel[k] = p_vel_new[k] + c_exit_rel_vel
+                        
+                        abs_pos = p_pos_new[k] + pos[gp_idx, k] + c_exit_rel_pos
+                        gp_bary[k] = (mass[gp_idx] * pos[gp_idx, k] + orb_m * abs_pos) / (mass[gp_idx] + orb_m)
                     
                     ge_hat, gq_hat, gbary_rel, gsl_p, ge_mag, gtheta0, gis_valid = compute_orbit_elements(
                         gp_rel_pos, gp_rel_vel, gp_mu, mass[gp_idx] / (mass[gp_idx] + orb_m), gp_bary, cam_origin,
                         False, False, gp_rel_pos)
                         
                     if gis_valid:
-                        c_exit_r = sl_p / (1.0 + e_mag * math.cos(theta_exit)) if e_mag < 0.999 else sl_p / (1.0 + e_mag * math.cos(theta_exit))
-                        gx = 0.0; gy = 0.0
-                        for k in range(3):
-                            c_exit_rel = (e_hat[k]*math.cos(theta_exit) + q_hat[k]*math.sin(theta_exit)) * c_exit_r
-                            c_exit_abs = pos[p_idx, k] + c_exit_rel
-                            g_rel = c_exit_abs - gp_bary[k]
-                            gx += g_rel * ge_hat[k]
-                            gy += g_rel * gq_hat[k]
-                        gtheta_start = math.atan2(gy, gx)
+                        gtheta_start = gtheta0
                         
                         if ge_mag >= 1.0:
+                            r_max = max(300.0, (gsl_p / (1.0 + ge_mag)) * 10.0)
+                            cos_th_max = (gsl_p / r_max - 1.0) / ge_mag
+                            cos_th_max = max(-1.0, min(1.0, cos_th_max))
+                            theta_dist = math.acos(cos_th_max)
                             theta_asymp = math.acos(-1.0 / ge_mag)
-                            theta_max = theta_asymp * 0.95
+                            theta_max = min(theta_asymp * 0.999, theta_dist)
                             if gtheta_start < theta_max:
                                 gdelta = theta_max - gtheta_start
                             else:
@@ -588,7 +686,7 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                         orbit_buf[n_orbits, 16] = 0.0
                         orbit_buf[n_orbits, 17] = gdelta
                         orbit_buf[n_orbits, 18] = 1.0
-                        orbit_buf[n_orbits, 19] = 0.0
+                        orbit_buf[n_orbits, 19] = lod_levels[i]
                         n_orbits += 1
                         
     for parent_idx in range(num_bodies):
@@ -622,10 +720,12 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
             delta_angle = 10.0
             t_curr = 0.0
             if e_mag >= 1.0:
-                cos_asym = -1.0 / e_mag
-                cos_max = cos_asym + 0.05
-                if cos_max > 1.0: cos_max = 1.0
-                theta_max = math.acos(cos_max)
+                r_max = max(300.0, (sl_p / (1.0 + e_mag)) * 10.0)
+                cos_th_max = (sl_p / r_max - 1.0) / e_mag
+                cos_th_max = max(-1.0, min(1.0, cos_th_max))
+                theta_dist = math.acos(cos_th_max)
+                theta_asymp = math.acos(-1.0 / e_mag)
+                theta_max = min(theta_asymp * 0.999, theta_dist)
                 delta_angle = 2.0 * theta_max
                 theta0 = -theta_max
                 t_curr = (theta0_curr + theta_max) / delta_angle if delta_angle > 0 else 0.0
@@ -656,7 +756,7 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
             orbit_buf[n_orbits, 16] = t_curr
             orbit_buf[n_orbits, 17] = delta_angle
             orbit_buf[n_orbits, 18] = 0.0
-            orbit_buf[n_orbits, 19] = 0.0
+            orbit_buf[n_orbits, 19] = lod_levels[parent_idx]
             n_orbits += 1
             
     return n_orbits
@@ -770,7 +870,6 @@ def compute_culling_masks(
                 
                 dist_centers = math.sqrt(vec_c[0]*vec_c[0] + vec_c[1]*vec_c[1] + vec_c[2]*vec_c[2])
                 if dist_centers < 1e-6:
-                    # Ring belongs to this planet, it will definitely cast a shadow on the planet
                     rmask |= np.uint32(1) << np.uint32(k)
                 else:
                     s = (vec_c[0]*N_k[0] + vec_c[1]*N_k[1] + vec_c[2]*N_k[2]) / denom
@@ -839,12 +938,12 @@ def compute_frustum_culling(pos_rel_all, body_radii, planes, num_bodies):
 @njit(cache=True)
 def extract_frustum_planes(vp):
     planes = np.empty((6, 4), dtype=np.float32)
-    planes[0, :] = vp[:, 3] + vp[:, 0] # Left
-    planes[1, :] = vp[:, 3] - vp[:, 0] # Right
-    planes[2, :] = vp[:, 3] + vp[:, 1] # Bottom
-    planes[3, :] = vp[:, 3] - vp[:, 1] # Top
-    planes[4, :] = vp[:, 3] + vp[:, 2] # Near
-    planes[5, :] = vp[:, 3] - vp[:, 2] # Far
+    planes[0, :] = vp[:, 3] + vp[:, 0]
+    planes[1, :] = vp[:, 3] - vp[:, 0]
+    planes[2, :] = vp[:, 3] + vp[:, 1]
+    planes[3, :] = vp[:, 3] - vp[:, 1]
+    planes[4, :] = vp[:, 3] + vp[:, 2]
+    planes[5, :] = vp[:, 3] - vp[:, 2]
     for i in range(6):
         x, y, z = planes[i, 0], planes[i, 1], planes[i, 2]
         length = math.sqrt(x*x + y*y + z*z)
@@ -912,12 +1011,12 @@ def update_hierarchy(sim, num_bodies, current_parents):
     to prevent flickering at boundaries.
     """
     arr = _get_particle_array(sim, num_bodies)
-    positions = np.ascontiguousarray(arr[:, 0:3])  # x, y, z (ecliptic)
-    masses = arr[:, 9].copy()                      # m
+    positions = np.ascontiguousarray(arr[:, 0:3])
+    masses = arr[:, 9].copy()
     
     return _update_hierarchy_core(positions, masses, current_parents, num_bodies)
 
-def build_tree_order(parent_indices, num_bodies):
+def build_tree_order(parent_indices, num_bodies, positions=None):
     """Return (tree_indices, tree_depths) numpy arrays in depth-first tree-traversal order."""
     children = {i: [] for i in range(num_bodies)}
     roots = []
@@ -927,6 +1026,11 @@ def build_tree_order(parent_indices, num_bodies):
             roots.append(i)
         else:
             children[pi].append(i)
+            
+    if positions is not None:
+        for p in children:
+            if len(children[p]) > 1:
+                children[p].sort(key=lambda c: np.linalg.norm(positions[c] - positions[p]))
     
     result = []
     visited = set()
@@ -1140,14 +1244,12 @@ def resize_callback(window, width, height):
 
 
 def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
-    # On Windows, set 1ms timer resolution (default is ~15ms which makes
-    # time.sleep() wildly inaccurate for sub-16ms intervals).
     _timer_set = False
     try:
         ctypes.windll.winmm.timeBeginPeriod(1)
         _timer_set = True
     except (AttributeError, OSError):
-        pass  # Not Windows or winmm unavailable
+        pass
 
     last_time = time.time()
     
@@ -1155,7 +1257,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
         current_parents = shared_state["parent_indices"].copy()
     
     current_parents = update_hierarchy(sim, num_bodies, current_parents)
-    tree_indices, tree_depths = build_tree_order(current_parents, num_bodies)
+    positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
+    tree_indices, tree_depths = build_tree_order(current_parents, num_bodies, positions)
     
     with shared_state["lock"]:
         shared_state["parent_indices"][:] = current_parents
@@ -1195,15 +1298,20 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         p.vx, p.vy, p.vz = op["vel"]
                         
                         parents = shared_state["parent_indices"]
+                        children_to_update = []
                         for i in range(num_bodies):
                             curr = parents[i]
                             while curr != -1 and curr != idx:
                                 curr = parents[curr]
                             if curr == idx and i != idx:
-                                dp = sim.particles[i]
-                                dp.x += dx; dp.y += dy; dp.z += dz
-                                dp.vx += dvx; dp.vy += dvy; dp.vz += dvz
-                                with shared_state["lock"]:
+                                children_to_update.append(i)
+                                
+                        if children_to_update:
+                            with shared_state["lock"]:
+                                for i in children_to_update:
+                                    dp = sim.particles[i]
+                                    dp.x += dx; dp.y += dy; dp.z += dz
+                                    dp.vx += dvx; dp.vy += dvy; dp.vz += dvz
                                     shared_state["pos"][i] = (dp.x, dp.y, dp.z)
                                     shared_state["vel"][i] = (dp.vx, dp.vy, dp.vz)
                         
@@ -1215,6 +1323,16 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                             shared_state["pos"][idx] = op["pos"]
                         if "vel" in op:
                             shared_state["vel"][idx] = op["vel"]
+                        if "radius" in op:
+                            r_au = op["radius"] / 1.496e8
+                            if shared_state.get("oblate_indices") is not None:
+                                mask = shared_state["oblate_indices"] == idx
+                                if np.any(mask):
+                                    shared_state["oblate_req"][mask] = r_au
+                                for i, obl in enumerate(shared_state["oblate_physics_list"]):
+                                    if obl[0] == idx:
+                                        shared_state["oblate_physics_list"][i] = (obl[0], obl[1], obl[2], r_au, obl[4], obl[5], obl[6], obl[7])
+                        shared_state["crud_completed"].append(op)
                             
                 elif op["action"] == "CREATE":
                     mass = op["mass"]
@@ -1226,10 +1344,11 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     num_bodies += 1
                     
                     with shared_state["lock"]:
+                        shared_state["timeline_active"] = False
                         shared_state["pos"] = np.vstack([shared_state["pos"], pos])
                         shared_state["vel"] = np.vstack([shared_state["vel"], vel])
                         shared_state["mass"] = np.append(shared_state["mass"], mass)
-                        shared_state["parent_indices"] = np.append(shared_state["parent_indices"], parent_idx)
+                        shared_state["parent_indices"] = np.append(shared_state["parent_indices"], np.int32(parent_idx))
                         op["idx"] = num_bodies - 1
                         shared_state["crud_completed"].append(op)
                             
@@ -1239,6 +1358,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     num_bodies -= 1
                     
                     with shared_state["lock"]:
+                        shared_state["timeline_active"] = False
                         shared_state["pos"] = np.delete(shared_state["pos"], idx, axis=0)
                         shared_state["vel"] = np.delete(shared_state["vel"], idx, axis=0)
                         shared_state["mass"] = np.delete(shared_state["mass"], idx)
@@ -1257,6 +1377,15 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                             shared_state["oblate_masses"] = shared_state["oblate_masses"][j2_mask]
                             shared_state["oblate_indices"][shared_state["oblate_indices"] > idx] -= 1
                             
+                            new_opl = []
+                            for obl in shared_state["oblate_physics_list"]:
+                                new_idx = obl[0]
+                                if new_idx == idx: continue
+                                if new_idx > idx: new_idx -= 1
+                                new_opl.append((new_idx, obl[1], obl[2], obl[3], obl[4], obl[5], obl[6], obl[7]))
+                            shared_state["oblate_physics_list"] = new_opl
+                            shared_state["has_j2"] = len(new_opl) > 0
+                            
                         if shared_state["phys_star_idx"] == idx:
                             shared_state["phys_star_idx"] = -1
                         elif shared_state["phys_star_idx"] > idx:
@@ -1267,7 +1396,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             with shared_state["lock"]:
                 current_parents = shared_state["parent_indices"].copy()
             current_parents = update_hierarchy(sim, num_bodies, current_parents)
-            tree_indices, tree_depths = build_tree_order(current_parents, num_bodies)
+            positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
+            tree_indices, tree_depths = build_tree_order(current_parents, num_bodies, positions)
             
             with shared_state["lock"]:
                 shared_state["parent_indices"][:] = current_parents
@@ -1278,64 +1408,23 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
 
         if time_ctrl.get("sync_t") is not None:
             sync_time = time_ctrl["sync_t"]
+            sync_idx = time_ctrl.get("sync_idx")
             time_ctrl["sync_t"] = None
+            time_ctrl["sync_idx"] = None
             
-            if sync_time < sim.t and 'tl_snapshots' in locals() and len(tl_snapshots) > 0:
-                best_s = None
-                for s in tl_snapshots:
-                    if s.t <= sync_time + 1e-4:
-                        best_s = s
-                    else:
-                        break
-                
-                if best_s is not None:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        sim = best_s.copy()
-                    setup_reboundx(sim, shared_state["has_j2"], shared_state["has_gr"], shared_state["phys_star_idx"], shared_state["oblate_physics_list"])
-                elif 'sim_timeline_base' in locals() and sync_time >= sim_timeline_base.t:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        sim = sim_timeline_base.copy()
-                    setup_reboundx(sim, shared_state["has_j2"], shared_state["has_gr"], shared_state["phys_star_idx"], shared_state["oblate_physics_list"])
-            elif sync_time < sim.t and 'sim_timeline_base' in locals() and sync_time >= sim_timeline_base.t:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    sim = sim_timeline_base.copy()
-                setup_reboundx(sim, shared_state["has_j2"], shared_state["has_gr"], shared_state["phys_star_idx"], shared_state["oblate_physics_list"])
-            
-            diff = sync_time - sim.t
-            if diff > 0.001:
-                with shared_state["lock"]:
-                    shared_state["syncing"] = True
-                    shared_state["sync_progress"] = 0.0
-                
-                steps = max(10, int(diff / 0.1)) # About 100 steps per 10 years
-                step_dt = diff / steps
-                start_t = sim.t
-                
-                for i in range(steps):
-                    if not running[0]: break
-                    sim.integrate(start_t + (i + 1) * step_dt)
-                    do_sync = (i % 10 == 0)
-                    if do_sync:
-                        local_pos = np.empty((num_bodies, 3), dtype=np.float64)
-                        local_vel = np.empty((num_bodies, 3), dtype=np.float64)
-                        _extract_render_state(sim, num_bodies, local_pos, local_vel)
-                        sim_t = sim.t
-                    with shared_state["lock"]:
-                        shared_state["sync_progress"] = (i + 1.0) / steps
-                        # Periodically update rendering so the screen doesn't freeze completely
-                        if do_sync:
-                            np.copyto(shared_state["pos"], local_pos)
-                            np.copyto(shared_state["vel"], local_vel)
-                            shared_state["t"] = sim_t
-                            
-                with shared_state["lock"]:
-                    shared_state["syncing"] = False
+            if sync_idx is not None and "timeline_raw" in shared_state:
+                raw_arr = shared_state["timeline_raw"][sync_idx]
+                sim.t = sync_time
+                for i in range(num_bodies):
+                    sim.particles[i].x = raw_arr[i, 0]
+                    sim.particles[i].y = raw_arr[i, 1]
+                    sim.particles[i].z = raw_arr[i, 2]
+                    sim.particles[i].vx = raw_arr[i, 3]
+                    sim.particles[i].vy = raw_arr[i, 4]
+                    sim.particles[i].vz = raw_arr[i, 5]
             else:
                 sim.integrate(sync_time)
-            
+                
             local_pos = np.empty((num_bodies, 3), dtype=np.float64)
             local_vel = np.empty((num_bodies, 3), dtype=np.float64)
             _extract_render_state(sim, num_bodies, local_pos, local_vel)
@@ -1361,8 +1450,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             
             tl_pos = np.zeros((num_steps, num_bodies, 3), dtype='f4')
             tl_vel = np.zeros((num_steps, num_bodies, 3), dtype='f4')
+            tl_raw_arr = np.zeros((num_steps, num_bodies, 6), dtype=np.float64)
             tl_times = np.zeros(num_steps, dtype='f8')
-            tl_snapshots_temp = []
             
             with shared_state["lock"]:
                 shared_state["timeline_active"] = True
@@ -1390,22 +1479,18 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 tl_vel[step, :, 2] = -_tl_arr[:, 4]
                 tl_times[step] = sim_start_copy.t
                 
-                if step % 10 == 0:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        tl_snapshots_temp.append(sim_start_copy.copy())
+                tl_raw_arr[step] = _tl_arr[:, 0:6]
                 
                 if step % 20 == 0:
                     current_real_time = time.time()
                     elapsed = current_real_time - render_start_time
-                    rate = (sim.t - start_t) / max(elapsed, 0.001)
+                    rate = (sim_start_copy.t - start_t) * SECONDS_PER_YEAR / max(elapsed, 0.001)
                     with shared_state["lock"]:
                         shared_state["timeline_progress"] = float(step) / num_steps
                         shared_state["timeline_rate"] = rate
                 valid_steps = step + 1
             
             if valid_steps > 0:
-                tl_snapshots = tl_snapshots_temp
                 local_pos = np.empty((num_bodies, 3), dtype=np.float64)
                 local_vel = np.empty((num_bodies, 3), dtype=np.float64)
                 _extract_render_state(sim_start_copy, num_bodies, local_pos, local_vel)
@@ -1413,6 +1498,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 with shared_state["lock"]:
                     shared_state["timeline_pos"] = tl_pos[:valid_steps]
                     shared_state["timeline_vel"] = tl_vel[:valid_steps]
+                    shared_state["timeline_raw"] = tl_raw_arr[:valid_steps]
                     shared_state["timeline_times"] = tl_times[:valid_steps]
                     shared_state["timeline_progress"] = 1.0
                     np.copyto(shared_state["pos"], local_pos)
@@ -1427,16 +1513,31 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             time_ctrl["cancel_render"] = False
             time_ctrl["paused"] = True
             continue
-        
         if not time_ctrl["paused"]:
             dt_sim = dt_real * time_ctrl["multiplier"] / SECONDS_PER_YEAR
             sim.integrate(sim.t + dt_sim)
             
             frame_count += 1
             if frame_count % 30 == 0:
-                current_parents = update_hierarchy(sim, num_bodies, current_parents)
-                tree_indices, tree_depths = build_tree_order(current_parents, num_bodies)
+                new_parents = update_hierarchy(sim, num_bodies, current_parents)
+                positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
+                new_tree_indices, new_tree_depths = build_tree_order(new_parents, num_bodies, positions)
                 
+                with shared_state["lock"]:
+                    changed = False
+                    if not np.array_equal(new_parents, shared_state["parent_indices"]):
+                        changed = True
+                    elif not np.array_equal(new_tree_indices, shared_state["tree_indices"]):
+                        changed = True
+                        
+                    if changed:
+                        current_parents = new_parents
+                        shared_state["parent_indices"][:] = new_parents
+                        shared_state["tree_indices"] = new_tree_indices
+                        shared_state["tree_depths"] = new_tree_depths
+                        shared_state["hierarchy_version"] += 1
+                        shared_state["rebuild_flag"] = True
+            
             local_pos = np.empty((num_bodies, 3), dtype=np.float64)
             local_vel = np.empty((num_bodies, 3), dtype=np.float64)
             _extract_render_state(sim, num_bodies, local_pos, local_vel)
@@ -1455,7 +1556,6 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
         sleep_time = max(0.001, 0.016 - elapsed)
         time.sleep(sleep_time)
 
-    # Restore default timer resolution on exit
     if _timer_set:
         try:
             ctypes.windll.winmm.timeEndPeriod(1)
@@ -1480,16 +1580,16 @@ def rotate_equatorial_to_ecliptic(pos, vel, pole_ecl):
     if abs(px) < 1e-8 and abs(py) < 1e-8 and pz > 0:
         return pos, vel
         
-    N = np.array([-py, px, 0.0])
+    N = np.array([-py, px, 0.0], dtype=np.float64)
     n_mag = np.linalg.norm(N)
     
     if n_mag < 1e-8:
-        X = np.array([1.0, 0.0, 0.0])
-        Y = np.array([0.0, -1.0, 0.0])
-        Z = np.array([0.0, 0.0, -1.0])
+        X = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        Y = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        Z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
     else:
         X = N / n_mag
-        Z = np.array([px, py, pz])
+        Z = np.array([px, py, pz], dtype=np.float64)
         Z = Z / np.linalg.norm(Z)
         Y = np.cross(Z, X)
         
@@ -1503,16 +1603,16 @@ def rotate_ecliptic_to_equatorial(pos, vel, pole_ecl):
     if abs(px) < 1e-8 and abs(py) < 1e-8 and pz > 0:
         return pos, vel
         
-    N = np.array([-py, px, 0.0])
+    N = np.array([-py, px, 0.0], dtype=np.float64)
     n_mag = np.linalg.norm(N)
     
     if n_mag < 1e-8:
-        X = np.array([1.0, 0.0, 0.0])
-        Y = np.array([0.0, -1.0, 0.0])
-        Z = np.array([0.0, 0.0, -1.0])
+        X = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        Y = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        Z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
     else:
         X = N / n_mag
-        Z = np.array([px, py, pz])
+        Z = np.array([px, py, pz], dtype=np.float64)
         Z = Z / np.linalg.norm(Z)
         Y = np.cross(Z, X)
         
@@ -1689,7 +1789,17 @@ def main():
         j2 = body.get('J2', 0.0)
         if j2 > 0.0:
             j4 = body.get('j4', 0.0)
-            oblate_physics_list.append((idx, j2, j4, radius_au, pole_ecl, mass, name))
+            
+            r_mean = body.get('r', 1.0)
+            f = body.get('oblateness', 0.0)
+            if f > 0:
+                req_solar = r_mean / ((1.0 - f)**(1.0/3.0))
+            else:
+                req_solar = r_mean
+            req_au = req_solar * 0.00465
+            
+            rot_period = body.get('rotation_period', 0.0)
+            oblate_physics_list.append((idx, j2, j4, req_au, pole_ecl, mass, name, rot_period))
         
         if 'rings' in body:
             parent_pole_ecl = pole_to_ecliptic(body.get('pole_ra', 0), body.get('pole_dec', 90))
@@ -1781,9 +1891,9 @@ def main():
     if has_j2:
         oblate_indices = np.array([x[0] for x in oblate_physics_list], dtype=np.int32)
         oblate_j2 = np.array([x[1] for x in oblate_physics_list], dtype=np.float64)
-        oblate_req = np.array([x[2] for x in oblate_physics_list], dtype=np.float64)
-        oblate_poles = np.array([x[3] for x in oblate_physics_list], dtype=np.float64)
-        oblate_masses = np.array([x[4] for x in oblate_physics_list], dtype=np.float64)
+        oblate_req = np.array([x[3] for x in oblate_physics_list], dtype=np.float64)
+        oblate_poles = np.array([x[4] for x in oblate_physics_list], dtype=np.float64)
+        oblate_masses = np.array([x[5] for x in oblate_physics_list], dtype=np.float64)
 
     phys_star_idx = -1
     phys_star_mass = 0.0
@@ -1835,13 +1945,13 @@ def main():
     }
     
     _init_arr = _get_particle_array(sim, num_bodies)
-    shared_state["pos"][:, 0] = _init_arr[:, 0]    # x
-    shared_state["pos"][:, 1] = _init_arr[:, 2]    # z
-    shared_state["pos"][:, 2] = -_init_arr[:, 1]   # -y
-    shared_state["vel"][:, 0] = _init_arr[:, 3]    # vx
-    shared_state["vel"][:, 1] = _init_arr[:, 5]    # vz
-    shared_state["vel"][:, 2] = -_init_arr[:, 4]   # -vy
-    shared_state["mass"][:] = _init_arr[:, 9]      # m
+    shared_state["pos"][:, 0] = _init_arr[:, 0]
+    shared_state["pos"][:, 1] = _init_arr[:, 2]
+    shared_state["pos"][:, 2] = -_init_arr[:, 1]
+    shared_state["vel"][:, 0] = _init_arr[:, 3]
+    shared_state["vel"][:, 1] = _init_arr[:, 5]
+    shared_state["vel"][:, 2] = -_init_arr[:, 4]
+    shared_state["mass"][:] = _init_arr[:, 9]
         
     parent_indices = np.full(num_bodies, -1, dtype=np.int32)
     for i, body in enumerate(bodies_data):
@@ -1849,7 +1959,8 @@ def main():
             parent_indices[i] = name_to_idx[body['parentId']]
             
     parent_indices = update_hierarchy(sim, num_bodies, parent_indices)
-    tree_indices_init, tree_depths_init = build_tree_order(parent_indices, num_bodies)
+    init_positions = _init_arr[:, 0:3]
+    tree_indices_init, tree_depths_init = build_tree_order(parent_indices, num_bodies, init_positions)
     shared_state["parent_indices"][:] = parent_indices
     shared_state["tree_indices"][:] = tree_indices_init
     shared_state["tree_depths"][:] = tree_depths_init
@@ -1858,11 +1969,10 @@ def main():
     try:
         _update_hierarchy_core(np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), 2)
         
-        # Physics math functions are now offloaded to REBOUNDx C-extension
             
         compute_keplerian_elements(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0)
         compute_barycenters(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2))
-        compute_all_orbits_batch(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.zeros((2, 3), dtype=np.float64), np.zeros(3), 1.0, 10, np.zeros((10, 20), dtype=np.float64))
+        compute_all_orbits_batch(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.zeros((2, 3), dtype=np.float64), np.zeros(3), 1.0, 10, np.zeros((10, 20), dtype=np.float64), np.zeros(2, dtype=np.float64))
     except Exception as e:
         print(f"[Init] Warmup warning: {e}")
         
@@ -1879,7 +1989,7 @@ def main():
     glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
     glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 
-    window = glfw.create_window(window_width, window_height, "3D Scale Orbit Sim", None, None)
+    window = glfw.create_window(window_width, window_height, "Stellar Forge", None, None)
     if not window:
         glfw.terminate()
         raise Exception("GLFW failed to create window. Your GPU may not support OpenGL 4.6.")
@@ -1928,6 +2038,7 @@ def main():
         vec4 u_casters[MAX_CASTERS];
         vec4 u_caster_poles_obl[MAX_CASTERS];
         vec4 u_caster_colors[MAX_CASTERS];
+        vec4 u_caster_atmos[MAX_CASTERS];
     };
     uniform float screen_height;
     uniform float fov_factor;
@@ -1994,12 +2105,14 @@ def main():
         vec4 u_casters[MAX_CASTERS];
         vec4 u_caster_poles_obl[MAX_CASTERS];
         vec4 u_caster_colors[MAX_CASTERS];
+        vec4 u_caster_atmos[MAX_CASTERS];
     };
     
     // Ring shadow planes (sphere-only)
     uniform vec3 u_ring_center[MAX_RING_PLANES];
     uniform vec3 u_ring_normal[MAX_RING_PLANES];
     uniform vec3 u_ring_params[MAX_RING_PLANES];
+    uniform vec3 u_ring_colors[MAX_RING_PLANES];
     uniform sampler2D u_ring_gradients;
     uniform int u_num_ring_planes;
     uniform int u_atmo_quality;
@@ -2041,7 +2154,7 @@ def main():
             float diffuse = clamp((NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
             
             // === Analytical eclipse shadows ===
-            float shadow = 1.0;
+            vec3 shadow = vec3(1.0);
             for (int j = 0; j < u_num_casters; j++) {
                 if (j < 32) { if ((f_caster_mask.x & (1u << j)) == 0u) continue; }
                 else        { if ((f_caster_mask.y & (1u << (j - 32))) == 0u) continue; }
@@ -2084,7 +2197,21 @@ def main():
                 
                 // Smooth transition from max_occlusion (at umbra) to 0 (at penumbra)
                 float occlusion = max_occlusion * (1.0 - smoothstep(r_umbra, r_penumbra, perp));
-                shadow *= (1.0 - occlusion);
+                
+                vec3 caster_shadow = vec3(1.0 - occlusion);
+                
+                float atmo_h = u_caster_atmos[j].w;
+                if (atmo_h > 0.0 && occlusion > 0.0) {
+                    float depth_into_umbra = clamp(1.0 - (perp / caster_r), 0.0, 1.0);
+                    vec3 atmo_tint = u_caster_atmos[j].xyz;
+                    // Much gentler tint deepening
+                    vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
+                    // Gentler exponential falloff so light reaches deep into the umbra without turning black
+                    float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
+                    caster_shadow += deep_tint * refraction_intensity * occlusion;
+                }
+                
+                shadow *= caster_shadow;
             }
             
             // === Ring shadow on planet surface ===
@@ -2122,11 +2249,11 @@ def main():
                     float p = (dist_from_center - inner_r) / max(1e-6, outer_r - inner_r);
                     float alpha_mult = texture(u_ring_gradients, vec2(p, (float(k) + 0.5) / 16.0)).r;
                     float ring_shadow = inner_fade * outer_fade * opacity * alpha_mult;
-                    shadow *= (1.0 - ring_shadow);
+                    shadow *= vec3(1.0 - ring_shadow);
                 }
             }
             
-            diffuse *= shadow;
+            vec3 diffuse_color = vec3(diffuse) * shadow;
             
             // === Moonshine / Planetshine ===
             vec3 bounce_light = vec3(0.0);
@@ -2149,7 +2276,8 @@ def main():
                 float NdotC = max(0.0, dot(normalize(f_normal), dir_to_caster));
                 
                 // Simple form factor & intensity multiplier
-                float intensity = phase * solid_angle * NdotC * 1.5;
+                // Boosted moonshine/planetshine intensity to make dark sides glow beautifully
+                float intensity = phase * solid_angle * NdotC * 4.0;
                 bounce_light += u_caster_colors[j].rgb * intensity;
             }
             
@@ -2198,22 +2326,21 @@ def main():
                 float shine_intensity = 0.0;
                 if (same_hemisphere > 0.0) {
                     // Reflected ringshine (same side as sun)
-                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 2.0;
+                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 2.5;
                 } else {
                     // Transmitted ringshine (bleeds through to the other side)
-                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 0.4;
+                    // Boosted to make the bleeding effect more prominent on the night side
+                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 1.2;
                 }
                 
                 // Apply shadow occlusion
                 shine_intensity *= shadow_occlusion;
                 
-                // Base ring color is roughly the fragment color or white-ish for icy rings. 
-                // We'll use a warm slightly scattered tint.
-                vec3 ring_tint = vec3(0.9, 0.85, 0.8);
+                vec3 ring_tint = u_ring_colors[k] * 1.2;
                 ring_shine += ring_tint * shine_intensity;
             }
             
-            vec3 final_color = f_color * diffuse + f_color * bounce_light + f_color * ring_shine;
+            vec3 final_color = f_color * diffuse_color + f_color * bounce_light + f_color * ring_shine;
             
             out_color = vec4(final_color, 1.0);
         }
@@ -2243,14 +2370,14 @@ def main():
     uniform dvec4 u_cam_pos_double;
     uniform float u_fade_dir;
     uniform float u_min_alpha;
+    uniform int u_orbit_res;
+    uniform int u_base_instance;
     
     out vec4 f_color;
     out float f_clip_z;
     
-    const int ORBIT_RES = 1001;
-    
     void main() {
-        OrbitData od = orbits[gl_InstanceID];
+        OrbitData od = orbits[gl_InstanceID + u_base_instance];
         
         dvec3 e_hat = od.d0.xyz;
         double sl_p = od.d0.w;
@@ -2264,7 +2391,7 @@ def main():
         float delta_angle = float(od.d4.y);
         float is_patched = float(od.d4.z);
         
-        float t = float(gl_VertexID) / float(ORBIT_RES - 1);
+        float t = float(gl_VertexID) / float(u_orbit_res - 1);
         float angle_B;
         if (delta_angle > 9.0) {
             angle_B = t * 2.0 * 3.14159265358979;
@@ -2282,7 +2409,7 @@ def main():
             double cos_B;
             double sin_B;
             
-            if (gl_VertexID == ORBIT_RES - 1 && delta_angle > 9.0) {
+            if (gl_VertexID == u_orbit_res - 1 && delta_angle > 9.0) {
                 // GLSL 4.30 lacks 64-bit transcendental functions (cos/sin). 
                 // The 32-bit float evaluation of cos(2.0 * PI) introduces a tiny gap.
                 // We force the last vertex to perfectly close the loop!
@@ -2318,7 +2445,7 @@ def main():
         
         dvec3 eye_pos = pos - u_cam_pos_double.xyz;
         
-        float t_val = float(gl_VertexID) / float(ORBIT_RES - 1);
+        float t_val = float(gl_VertexID) / float(u_orbit_res - 1);
         float t_curr = float(od.d4.x);
         
         float alpha = 1.0;
@@ -2346,6 +2473,15 @@ def main():
             float dash = fract(float(gl_VertexID) / 10.0);
             if (dash > 0.5) alpha = 0.0;
             else alpha = mix(1.0, u_min_alpha, t_val);
+        }
+        
+        if (e_mag >= 0.999) {
+            float dist_from_bary = float(length(pos - bary_rel));
+            float q = float(sl_p / (1.0lf + e_mag));
+            float r_max_draw = max(300.0, q * 10.0);
+            float fade_start = max(150.0, r_max_draw * 0.5);
+            float fade_out = 1.0 - smoothstep(fade_start, r_max_draw, dist_from_bary);
+            alpha *= fade_out;
         }
         
         f_color = vec4(color * 0.4, alpha);
@@ -2388,6 +2524,7 @@ def main():
         vec4 u_casters[MAX_CASTERS];
         vec4 u_caster_poles_obl[MAX_CASTERS];
         vec4 u_caster_colors[MAX_CASTERS];
+        vec4 u_caster_atmos[MAX_CASTERS];
     };
     uniform vec3 u_body_offset;
     
@@ -2431,6 +2568,7 @@ def main():
         vec4 u_casters[MAX_CASTERS];
         vec4 u_caster_poles_obl[MAX_CASTERS];
         vec4 u_caster_colors[MAX_CASTERS];
+        vec4 u_caster_atmos[MAX_CASTERS];
     };
     
     // Per-ring-body uniforms
@@ -2531,7 +2669,7 @@ def main():
         float direct_illum = mix(transmitted, reflected, same_side);
         
         // Eclipse shadows from other bodies
-        float shadow = 1.0;
+        vec3 shadow = vec3(1.0);
         for (int j = 0; j < u_num_casters; j++) {
             if (j < 32) { if ((u_caster_mask_lo & (1u << j)) == 0u) continue; }
             else        { if ((u_caster_mask_hi & (1u << (j - 32))) == 0u) continue; }
@@ -2558,7 +2696,19 @@ def main():
             
             float max_occlusion = (caster_r >= r_star_proj) ? 1.0 : (caster_r * caster_r) / (r_star_proj * r_star_proj);
             float occlusion = max_occlusion * (1.0 - smoothstep(r_umbra, r_penumbra, perp));
-            shadow *= (1.0 - occlusion);
+            
+            vec3 caster_shadow = vec3(1.0 - occlusion);
+            float atmo_h = u_caster_atmos[j].w;
+            if (atmo_h > 0.0 && occlusion > 0.0) {
+                float depth_into_umbra = clamp(1.0 - (perp / caster_r), 0.0, 1.0);
+                vec3 atmo_tint = u_caster_atmos[j].xyz;
+                // Much gentler tint deepening
+                vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
+                // Gentler exponential falloff so light reaches deep into the umbra without turning black
+                float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
+                caster_shadow += deep_tint * refraction_intensity * occlusion;
+            }
+            shadow *= caster_shadow;
         }
         
         // === Host planet shadow on its own ring ===
@@ -2587,11 +2737,17 @@ def main():
                 
                 float max_occlusion = (host_r >= r_star_proj) ? 1.0 : (host_r * host_r) / (r_star_proj * r_star_proj);
                 float occlusion = max_occlusion * (1.0 - smoothstep(r_umbra, r_penumbra, perp));
-                shadow *= (1.0 - occlusion);
+                
+                vec3 caster_shadow = vec3(1.0 - occlusion);
+                // Host planet atmosphere on ring shadow
+                float atmo_h = u_caster_atmos[0].w; // Assuming host is near the start, but actually we don't have j for host.
+                // We'll just leave it uncolored for ring shadows or use generic. 
+                // Actually, let's keep it simple for host shadows on rings and use black for now.
+                shadow *= caster_shadow;
             }
         }
         
-        direct_illum *= shadow; // solar_elevation was applied specifically to rock earlier
+        vec3 direct_illum_color = vec3(direct_illum) * shadow; // solar_elevation was applied specifically to rock earlier
         
         // === Planetshine on Rings ===
         float planetshine = 0.0;
@@ -2622,10 +2778,10 @@ def main():
         
         // No artificial ambient glow - shadow and unlit sides should be physically black 
         // unless illuminated by planetshine (calculated above).
-        float illumination = direct_illum + planetshine;
+        vec3 illumination = direct_illum_color + vec3(planetshine);
         
         // Boost alpha when backlit - dust_transmit already factors in f_color.a to preserve gradients.
-        float scattered_alpha_boost = dust_transmit * shadow * is_backlit * 1.0;
+        float scattered_alpha_boost = dust_transmit * shadow.r * is_backlit * 1.0;
         // With premultiplied alpha, the alpha channel strictly represents OCCLUSION of the background.
         // Dust forward-scattering (boost) does NOT increase occlusion, it only increases brightness!
         // So we strictly use the base opacity (f_color.a) as the occlusion value, allowing dust rings to glow 
@@ -2664,6 +2820,7 @@ def main():
         vec4 u_casters[MAX_CASTERS];
         vec4 u_caster_poles_obl[MAX_CASTERS];
         vec4 u_caster_colors[MAX_CASTERS];
+        vec4 u_caster_atmos[MAX_CASTERS];
     };
 
     uniform vec3 u_body_offset;
@@ -2702,6 +2859,7 @@ def main():
         vec4 u_casters[MAX_CASTERS];
         vec4 u_caster_poles_obl[MAX_CASTERS];
         vec4 u_caster_colors[MAX_CASTERS];
+        vec4 u_caster_atmos[MAX_CASTERS];
     };
 
     uniform vec3  u_body_offset;
@@ -2928,7 +3086,7 @@ def main():
 
             for (int j = 0; j < u_num_light_samples; j++) {
                 float t_l = (float(j) + 0.5) * light_step;
-                vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
+vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                 float light_alt = length(light_pos_sph) - u_planet_radius_km;
 
                 if (light_alt < 0.0) {
@@ -3179,7 +3337,7 @@ def main():
     orbit_ssbo.bind_to_storage_buffer(binding=0)
     vao_gpu_orbits = ctx.vertex_array(prog_gpu_orbits, [])
 
-    UBO_SIZE = 3232
+    UBO_SIZE = 4256
     scene_ubo = ctx.buffer(reserve=UBO_SIZE)
     scene_ubo.bind_to_uniform_block(1)
     ubo_staging = np.zeros(UBO_SIZE // 4, dtype=np.float32)
@@ -3197,6 +3355,7 @@ def main():
     uniform_ring_centers = prog_spheres['u_ring_center']
     uniform_ring_normals = prog_spheres['u_ring_normal']
     uniform_ring_params = prog_spheres['u_ring_params']
+    uniform_ring_colors = prog_spheres.get('u_ring_colors', None)
     uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
     if 'u_ring_gradients' in prog_spheres:
         prog_spheres['u_ring_gradients'].value = 0
@@ -3268,9 +3427,11 @@ def main():
     caster_data_buf = np.zeros((64, 4), dtype='f4')
     caster_poles_obl_buf = np.zeros((64, 4), dtype='f4')
     caster_colors_buf = np.zeros((64, 4), dtype='f4')
+    caster_atmos_buf = np.zeros((64, 4), dtype='f4')
     ring_centers_buf = np.zeros((16, 3), dtype='f4')
     ring_normals_buf = np.zeros((16, 3), dtype='f4')
     ring_params_buf = np.zeros((16, 3), dtype='f4')
+    ring_colors_buf = np.zeros((16, 3), dtype='f4')
     all_instances = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
     cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
     cull_mask_hi = np.zeros(num_bodies, dtype=np.uint32)
@@ -3301,6 +3462,11 @@ def main():
 
     last_orbit_pos_snap = None
     last_cam_origin = None
+    
+    n_orbits = 0
+    n_orbits_hi = 0
+    n_orbits_med = 0
+    n_orbits_low = 0
 
     while not glfw.window_should_close(window):
         with shared_state["lock"]:
@@ -3327,10 +3493,10 @@ def main():
                         pos_snap = np.vstack([pos_snap, pos])
                         vel_snap = np.vstack([vel_snap, vel])
                         mass_snap = np.append(mass_snap, mass)
-                        parent_snap = np.append(parent_snap, parent_idx)
+                        parent_snap = np.append(parent_snap, np.int32(parent_idx))
                         
-                        tree_indices_snap = np.append(tree_indices_snap, 0)
-                        tree_depths_snap = np.append(tree_depths_snap, 0)
+                        tree_indices_snap = np.append(tree_indices_snap, np.int32(0))
+                        tree_depths_snap = np.append(tree_depths_snap, np.int32(0))
                         
                         pos_snap_render = np.vstack([pos_snap_render, pos])
                         vel_snap_render = np.vstack([vel_snap_render, vel])
@@ -3341,9 +3507,9 @@ def main():
                         new_inst = np.zeros(INSTANCE_FLOATS, dtype='f4')
                         num_bodies += 1
                         all_instances = np.vstack([all_instances, new_inst])
-                        cull_mask_lo = np.append(cull_mask_lo, 0)
-                        cull_mask_hi = np.append(cull_mask_hi, 0)
-                        cull_ring_mask = np.append(cull_ring_mask, 0)
+                        cull_mask_lo = np.append(cull_mask_lo, np.uint32(0))
+                        cull_mask_hi = np.append(cull_mask_hi, np.uint32(0))
+                        cull_ring_mask = np.append(cull_ring_mask, np.uint32(0))
                         
                         subsys_pos_buf = np.vstack([subsys_pos_buf, pos])
                         subsys_vel_buf = np.vstack([subsys_vel_buf, vel])
@@ -3352,13 +3518,12 @@ def main():
                         new_vis = np.array([color[0], color[1], color[2], r_au, 1.0, 0, 1, 0, 0], dtype='f4')
                         visual_arr = np.vstack([visual_arr, new_vis])
                         visual_colors_f8 = np.vstack([visual_colors_f8, np.array(color, dtype='f8')])
+                        body_colors = np.vstack([body_colors, np.array(color, dtype='f4')])
                         is_star_arr = np.append(is_star_arr, 0.0)
                         
                         inst_data_lo = np.vstack([inst_data_lo, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                         inst_data_hi = np.vstack([inst_data_hi, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                         focused_mask = np.append(focused_mask, False)
-                        
-                        num_bodies += 1
                         
                         non_star_indices = np.array([i for i in range(num_bodies) if i != star_idx][:64], dtype=np.int32)
                         n_casters_fixed = len(non_star_indices)
@@ -3391,12 +3556,11 @@ def main():
                         subsys_mass_buf = np.delete(subsys_mass_buf, idx)
                         visual_arr = np.delete(visual_arr, idx, axis=0)
                         visual_colors_f8 = np.delete(visual_colors_f8, idx, axis=0)
+                        body_colors = np.delete(body_colors, idx, axis=0)
                         is_star_arr = np.delete(is_star_arr, idx)
                         inst_data_lo = np.delete(inst_data_lo, idx, axis=0)
                         inst_data_hi = np.delete(inst_data_hi, idx, axis=0)
                         focused_mask = np.delete(focused_mask, idx)
-                        
-                        num_bodies -= 1
                         
                         if star_idx == idx:
                             star_idx = 0
@@ -3429,26 +3593,15 @@ def main():
                         for g in ring_render_groups:
                             if g['body_idx'] > idx: g['body_idx'] -= 1
                             
+                    elif op["action"] == "UPDATE":
+                        idx = op["idx"]
+                        if "mass" in op:
+                            bodies_data[idx]["mass"] = op["mass"]
+                            
                 shared_state["crud_completed"].clear()
                 shared_state["rebuild_flag"] = False
+                cached_hierarchy_ver = -1
 
-        now = time.time()
-        dt_render = min(now - last_render_time, 0.1)
-        last_render_time = now
-        
-        glfw.poll_events()
-        
-        impl.process_inputs()
-        imgui.new_frame()
-        
-        if fb_width <= 0 or fb_height <= 0:
-            imgui.end_frame()
-            continue
-        
-        ctx.viewport = (0, 0, fb_width, fb_height)
-        ctx.clear(0.02, 0.02, 0.03, 1.0) 
-
-        with shared_state["lock"]:
             if len(pos_snap) == len(shared_state["pos"]):
                 np.copyto(pos_snap, shared_state["pos"])
                 np.copyto(vel_snap, shared_state["vel"])
@@ -3465,6 +3618,22 @@ def main():
             tl_times = shared_state["timeline_times"]
             tl_pos_buf = shared_state["timeline_pos"]
             tl_vel_buf = shared_state["timeline_vel"]
+
+        now = time.time()
+        dt_render = min(now - last_render_time, 0.1)
+        last_render_time = now
+        
+        glfw.poll_events()
+        
+        impl.process_inputs()
+        imgui.new_frame()
+        
+        if fb_width <= 0 or fb_height <= 0:
+            imgui.end_frame()
+            continue
+        
+        ctx.viewport = (0, 0, fb_width, fb_height)
+        ctx.clear(0.02, 0.02, 0.03, 1.0) 
 
         is_scrubbing = tl_active and tl_prog >= 1.0
 
@@ -3551,6 +3720,7 @@ def main():
         ring_centers_buf[:] = 0
         ring_normals_buf[:] = 0
         ring_params_buf[:] = 0
+        ring_colors_buf[:] = 0
         
         ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
         for ring in ring_precomputed:
@@ -3562,6 +3732,7 @@ def main():
             ring_params_buf[n_ring_planes, 0] = ring['inner_r']
             ring_params_buf[n_ring_planes, 1] = ring['outer_r']
             ring_params_buf[n_ring_planes, 2] = ring['opacity']
+            ring_colors_buf[n_ring_planes, 0:3] = ring['raw_color']
             n_ring_planes += 1
 
         caster_indices = non_star_indices
@@ -3600,6 +3771,9 @@ def main():
 
         if not show_orbits:
             n_orbits = 0
+            n_orbits_hi = 0
+            n_orbits_med = 0
+            n_orbits_low = 0
         else:
             recompute_orbits = True
             if last_orbit_pos_snap is not None and time_ctrl.get("paused"):
@@ -3608,20 +3782,56 @@ def main():
                         recompute_orbits = False
             
             if recompute_orbits:
+                lod_levels = np.full(num_bodies, 2.0, dtype=np.float64)
+                for i in range(num_bodies):
+                    if parent_snap[i] == star_idx:
+                        lod_levels[i] = 1.0
+                
+                t_idx = camera.get("tracking_idx")
+                if t_idx is not None and t_idx != star_idx:
+                    primary_idx = t_idx
+                    if parent_snap[t_idx] >= 0 and parent_snap[parent_snap[t_idx]] == star_idx:
+                        primary_idx = parent_snap[t_idx]
+                    
+                    lod_levels[primary_idx] = 0.0
+                    for i in range(num_bodies):
+                        if parent_snap[i] == primary_idx:
+                            lod_levels[i] = 1.0
+                            
                 n_orbits = compute_all_orbits_batch(
                     pos_snap_render, vel_snap_render, mass_snap, parent_snap,
                     subsys_pos_buf, subsys_vel_buf, subsys_mass_buf,
-                    visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf)
+                    visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels)
                 last_orbit_pos_snap = pos_snap_render.copy()
                 last_cam_origin = cam_origin.copy()
+                
+                if n_orbits > 0:
+                    valid_orbits = orbit_data_buf[:n_orbits]
+                    lod_col = valid_orbits[:, 19]
+                    
+                    mask_hi = lod_col == 0.0
+                    mask_med = lod_col == 1.0
+                    mask_low = lod_col == 2.0
+                    
+                    orbits_hi = valid_orbits[mask_hi]
+                    orbits_med = valid_orbits[mask_med]
+                    orbits_low = valid_orbits[mask_low]
+                    
+                    n_orbits_hi = len(orbits_hi)
+                    n_orbits_med = len(orbits_med)
+                    n_orbits_low = len(orbits_low)
+                    
+                    if n_orbits_hi > 0:
+                        orbit_ssbo.write(orbits_hi, offset=0)
+                    if n_orbits_med > 0:
+                        orbit_ssbo.write(orbits_med, offset=n_orbits_hi * 160)
+                    if n_orbits_low > 0:
+                        orbit_ssbo.write(orbits_low, offset=(n_orbits_hi + n_orbits_med) * 160)
 
         if n_lo > 0:
             vbo_instances_lo.write(inst_data_lo[:n_lo])
         if n_hi > 0:
             vbo_instances_hi.write(inst_data_hi[:n_hi])
-        
-        if n_orbits > 0:
-            orbit_ssbo.write(orbit_data_buf[:n_orbits])
             
         star_cam_rel = (pos_snap[star_idx] - cam_origin).astype('f4')
         
@@ -3639,6 +3849,25 @@ def main():
         caster_colors_buf[:n_casters_fixed, 3] = 1.0
         if n_casters_fixed < 64:
             caster_colors_buf[n_casters_fixed:] = 0
+            
+        for i_c in range(n_casters_fixed):
+            b_idx = caster_indices[i_c]
+            atmo = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
+            if atmo:
+                beta_r = atmo['beta_rayleigh']
+                beta_m = atmo['beta_mie']
+                h_r = atmo['h_rayleigh']
+                h_m = atmo['h_mie']
+                R_km = atmo['planet_radius_km']
+                od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
+                od_m = beta_m * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
+                transmittance = np.exp(-(od_r + od_m) * 0.5)
+                caster_atmos_buf[i_c, 0:3] = transmittance
+                caster_atmos_buf[i_c, 3] = atmo['atmo_radius_au'] - atmo['surface_radius_au']
+            else:
+                caster_atmos_buf[i_c] = 0.0
+        if n_casters_fixed < 64:
+            caster_atmos_buf[n_casters_fixed:] = 0
 
         ubo_staging[0:16] = projection.ravel()
         ubo_staging[16:32] = view.ravel()
@@ -3650,6 +3879,7 @@ def main():
         ubo_staging[40:296] = caster_data_buf.ravel()
         ubo_staging[296:552] = caster_poles_obl_buf.ravel()
         ubo_staging[552:808] = caster_colors_buf.ravel()
+        ubo_staging[808:1064] = caster_atmos_buf.ravel()
         scene_ubo.write(ubo_staging)
         
         fov_factor = 1.0 / math.tan(math.radians(camera["fov"] / 2.0))
@@ -3660,6 +3890,8 @@ def main():
             uniform_ring_centers.write(ring_centers_buf)
             uniform_ring_normals.write(ring_normals_buf)
             uniform_ring_params.write(ring_params_buf)
+            if uniform_ring_colors:
+                uniform_ring_colors.write(ring_colors_buf)
         
         view_rot = view.copy()
         view_rot[3, 0:3] = 0.0
@@ -3689,7 +3921,21 @@ def main():
             prog_gpu_orbits['u_fade_dir'].value = orbit_fade_dir
             prog_gpu_orbits['u_min_alpha'].value = orbit_min_alpha
             prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
-            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=1001, instances=n_orbits)
+            
+            if n_orbits_hi > 0:
+                prog_gpu_orbits['u_orbit_res'].value = 4000
+                prog_gpu_orbits['u_base_instance'].value = 0
+                vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
+                
+            if n_orbits_med > 0:
+                prog_gpu_orbits['u_orbit_res'].value = 500
+                prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
+                vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
+                
+            if n_orbits_low > 0:
+                prog_gpu_orbits['u_orbit_res'].value = 100
+                prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
         if ring_render_groups:
             ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -3737,7 +3983,6 @@ def main():
                 u_atmo_ring_normals.write(ring_normals_buf)
                 u_atmo_ring_params.write(ring_params_buf)
 
-            # Precalculate distances for sorting without closure
             atmo_dists = []
             for atmo in atmo_bodies:
                 dx = pos_rel_all[atmo['body_idx'], 0] - cam_pos[0]
@@ -3823,8 +4068,8 @@ def main():
             ctx.depth_mask = True
             
         ctx.disable(moderngl.BLEND)
-        imgui.set_next_window_position(fb_width - 250, 20, imgui.ONCE)
-        imgui.set_next_window_size(230, min(320, fb_height - 40), imgui.ONCE)
+        imgui.set_next_window_position(fb_width - 250, 20, imgui.ALWAYS)
+        imgui.set_next_window_size(230, min(320, fb_height - 40), imgui.ALWAYS)
         imgui.begin("Simulation Controls")
         
         imgui.text("Current Date:")
@@ -3885,6 +4130,7 @@ def main():
             
             if imgui.button("Resume Here"):
                 time_ctrl["sync_t"] = tl_times[scrub_index[0]]
+                time_ctrl["sync_idx"] = scrub_index[0]
                 time_ctrl["paused"] = False
                 time_ctrl["timeline_playing"] = False
             imgui.same_line()
@@ -3938,8 +4184,8 @@ def main():
         if imgui.button("Reset FOV"): camera["fov"] = 45.0
         imgui.end()
 
-        imgui.set_next_window_position(fb_width - 250, 360, imgui.ONCE)
-        imgui.set_next_window_size(230, min(600, fb_height - 380), imgui.ONCE)
+        imgui.set_next_window_position(fb_width - 250, 360, imgui.ALWAYS)
+        imgui.set_next_window_size(230, min(600, fb_height - 380), imgui.ALWAYS)
         imgui.begin("System Hierarchy")
         
         for k in range(len(tree_indices_snap)):
@@ -3953,7 +4199,7 @@ def main():
                 label += " *"
                 
             avail_w = imgui.get_content_region_available()[0]
-            clicked = imgui.selectable(label, is_inspected, 0, max(10.0, avail_w - 65.0))[0]
+            clicked = imgui.selectable(label + f"##{idx}", is_inspected, 0, max(10.0, avail_w - 65.0))[0]
             
             rect_min_y = imgui.get_item_rect_min()[1]
             rect_max_y = imgui.get_item_rect_max()[1]
@@ -3961,8 +4207,6 @@ def main():
             rect_max_x = rect_min_x + imgui.get_window_width()
             mouse_x, mouse_y = imgui.get_io().mouse_pos
             
-            # Do not use imgui.is_window_hovered() here because clicking the button makes the button active,
-            # which causes is_window_hovered() to become false mid-click, making the button vanish and cancelling the click!
             show_buttons = (rect_min_y <= mouse_y <= rect_max_y) and (rect_min_x <= mouse_x <= rect_max_x)
                 
             if clicked:
@@ -3979,21 +4223,23 @@ def main():
             if show_buttons:
                 imgui.same_line()
                 imgui.set_cursor_pos_x(imgui.get_window_width() - 65)
-                # Ensure it perfectly matches line height and text is centered
                 imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 0))
                 
                 current_y = imgui.get_cursor_pos_y()
                 imgui.set_cursor_pos_y(current_y - 2)
                 if imgui.button(f"+##add_{idx}", 18, 17):
+                    is_moon = mass_snap[idx] < 0.01
                     camera["add_mode"] = True
                     camera["add_data"] = {
-                        "name": f"Moon of {bodies_data[idx]['name']}",
-                        "mass": 3e-6,
-                        "radius": 1737.0,
-                        "color": [0.7, 0.7, 0.7],
-                        "a": 0.0025,
+                        "name": f"{'Moon' if is_moon else 'Planet'} of {bodies_data[idx]['name']}",
+                        "mass": 1.0,
+                        "radius": 1737.0 if is_moon else 6371.0,
+                        "color": [0.7, 0.7, 0.7] if is_moon else [0.2, 0.5, 0.8],
+                        "a": 384400.0 if is_moon else 1.0,
                         "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
-                        "frame": 0
+                        "frame": 0,
+                        "is_moon": is_moon,
+                        "parent_idx": idx
                     }
                 
                 if idx > 0:
@@ -4221,7 +4467,8 @@ def main():
                         payload = {
                             "action": "UPDATE",
                             "idx": insp_idx,
-                            "mass": ed["mass"]
+                            "mass": ed["mass"],
+                            "radius": ed["radius"]
                         }
                         if parent_idx >= 0:
                             p_pos = pos_snap_render[parent_idx]
@@ -4295,7 +4542,6 @@ def main():
                         camera["tracking_idx"] = None
                         camera["tracking_mode"] = "body"
                         
-                # Editor tools moved to System Hierarchy
                 
                 if not inspect_bary:
                     imgui.separator()
@@ -4491,15 +4737,25 @@ def main():
             expanded, camera["add_mode"] = imgui.begin("Add Orbiting Body", True)
             if expanded:
                 ad = camera["add_data"]
+                is_moon = ad.get("is_moon", False)
                 _, ad["name"] = imgui.input_text("Name", ad["name"], 256)
                 _, ad["color"] = imgui.color_edit3("Color", *ad["color"])
-                _, ad["mass"] = imgui.input_double("Mass (M_sun)", ad["mass"], format="%e")
+                
+                if is_moon:
+                    _, ad["mass"] = imgui.input_double("Mass (Lunar Mass)", ad["mass"], format="%.4f")
+                else:
+                    _, ad["mass"] = imgui.input_double("Mass (Earth Mass)", ad["mass"], format="%.4f")
+                    
                 _, ad["radius"] = imgui.input_double("Radius (km)", ad["radius"], format="%.1f")
                 
                 imgui.separator()
                 imgui.text_colored("Orbital Elements", 1.0, 0.85, 0.4)
                 _, ad["frame"] = imgui.combo("Reference Frame", ad["frame"], ["Ecliptic", "Equatorial"])
-                _, ad["a"] = imgui.input_double("Semi-Major Axis (AU)", ad["a"], format="%.6f")
+                
+                if is_moon:
+                    _, ad["a"] = imgui.input_double("Semi-Major Axis (km)", ad["a"], format="%.1f")
+                else:
+                    _, ad["a"] = imgui.input_double("Semi-Major Axis (AU)", ad["a"], format="%.6f")
                 _, ad["e"] = imgui.input_double("Eccentricity", ad["e"], format="%.6f")
                 _, ad["inc"] = imgui.input_double("Inclination (deg)", ad["inc"], format="%.3f")
                 _, ad["Omega"] = imgui.input_double("Long Asc Node (deg)", ad["Omega"], format="%.3f")
@@ -4508,15 +4764,21 @@ def main():
                 
                 imgui.separator()
                 if imgui.button("Spawn Body", width=-1):
-                    insp_idx = camera["inspected_idx"]
+                    insp_idx = ad.get("parent_idx", 0)
+                    if insp_idx >= num_bodies:
+                        insp_idx = 0
                     parent_m = mass_snap[insp_idx]
                     p_pos = pos_snap_render[insp_idx]
                     p_vel = vel_snap_render[insp_idx]
                     ppx, ppy, ppz = p_pos[0], -p_pos[2], p_pos[1]
                     pvx, pvy, pvz = p_vel[0], -p_vel[2], p_vel[1]
                     
+                    is_moon = ad.get("is_moon", False)
+                    real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
+                    real_a = ad["a"] / 1.496e8 if is_moon else ad["a"]
+                    
                     c_pos, c_vel = get_cartesian_from_keplerian(
-                        parent_m, ad["mass"], ad["a"], ad["e"], 
+                        parent_m, real_mass, real_a, ad["e"], 
                         ad["inc"], ad["Omega"], ad["omega"], ad["M"]
                     )
                     
@@ -4537,7 +4799,7 @@ def main():
                         "action": "CREATE",
                         "name": ad["name"],
                         "radius": ad["radius"],
-                        "mass": ad["mass"],
+                        "mass": real_mass,
                         "color": list(ad["color"]),
                         "type": "Moon" if parent_m < 0.01 else "Planet",
                         "parent_idx": insp_idx,
