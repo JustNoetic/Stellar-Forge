@@ -1,0 +1,19 @@
+{
+    "naif0012.tls": true,
+    "pck00010.tpc": true,
+    "de440s.bsp": true,
+    "jup347.bsp": true,
+    "jup348.bsp": true,
+    "jup349.bsp": true,
+    "jup365.bsp": true,
+    "sat455.bsp": true,
+    "sat456.bsp": true,
+    "sat457.bsp": true,
+    "sat459.bsp": true,
+    "sat441.bsp": true,
+    "ura116xl.bsp": true,
+    "nep104.bsp": true,
+    "nep105.bsp": true,
+    "plu060.bsp": true,
+    "mar099s.bsp": true
+}

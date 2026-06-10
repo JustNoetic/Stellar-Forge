@@ -89,3 +89,5 @@ diff_utf8.txt
 perf_report.txt
 perf_test_output.txt
 exports/
+kernels/
+systems/

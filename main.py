@@ -16,6 +16,7 @@ import warnings
 from numba import njit
 import datetime
 from system_manager import SystemManager, SystemSnapshot, derive_star_properties, temperature_to_rgb, rgb_to_hex
+from spice_manager import SpiceManager
 
 SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
 C_AU_YR = 63197.79
@@ -764,31 +765,47 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
 
 def format_time_speed(multiplier):
     """Convert a speed multiplier (in seconds/second) to a human-readable string."""
+    sign_str = "-" if multiplier < 0 else ""
+    multiplier = abs(multiplier)
     if multiplier < 1.5:
-        return "Realtime"
+        return f"{sign_str}Realtime" if multiplier > 0.5 else "Paused"
     elif multiplier < 60:
-        return f"{multiplier:.1f} sec/s"
+        return f"{sign_str}{multiplier:.1f} sec/s"
     elif multiplier < 3600:
-        return f"{multiplier / 60:.1f} min/s"
+        return f"{sign_str}{multiplier / 60:.1f} min/s"
     elif multiplier < 86400:
-        return f"{multiplier / 3600:.1f} hr/s"
+        return f"{sign_str}{multiplier / 3600:.1f} hr/s"
     elif multiplier < 604800:
-        return f"{multiplier / 86400:.1f} days/s"
+        return f"{sign_str}{multiplier / 86400:.1f} days/s"
     elif multiplier < 2629800:
-        return f"{multiplier / 604800:.1f} weeks/s"
+        return f"{sign_str}{multiplier / 604800:.1f} weeks/s"
     elif multiplier < 31557600:
-        return f"{multiplier / 2629800:.1f} months/s"
+        return f"{sign_str}{multiplier / 2629800:.1f} months/s"
     else:
-        return f"{multiplier / 31557600:.1f} years/s"
+        return f"{sign_str}{multiplier / 31557600:.1f} years/s"
 
 def format_sim_time(t_years):
+    try:
+        _mgr = globals().get('sys_mgr_spice')
+        if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
+            import spiceypy as spice
+            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+            et_epoch = _mgr.datetime_to_et(epoch_dt)
+            et = et_epoch + t_years * 365.25 * 86400.0
+            utc_str = spice.et2utc(et, 'C', 0)
+            dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+            dt_local = dt_utc.astimezone()
+            return dt_local.year, dt_local.month, dt_local.day, dt_local.hour, dt_local.minute
+    except:
+        pass
+
     epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
     delta_seconds = t_years * 365.25 * 86400
     try:
         dt_utc = epoch + datetime.timedelta(seconds=delta_seconds)
         dt_local = dt_utc.astimezone()
         return dt_local.year, dt_local.month, dt_local.day, dt_local.hour, dt_local.minute
-    except OverflowError:
+    except (OverflowError, OSError, ValueError):
         return 9999, 12, 31, 23, 59
 
 def sim_time_from_date(y, m, d, h=0, mn=0):
@@ -1348,8 +1365,14 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     "star_idx": new_bundle["star_idx"],
                     "num_bodies": new_bundle["num_bodies"],
                 }
-                time_ctrl["paused"] = True
-                time_ctrl["multiplier"] = 1.0
+                
+                if switch_req.get("preserve_state"):
+                    sim.t = switch_req["preserve_t"]
+                    time_ctrl["paused"] = switch_req["preserve_paused"]
+                    time_ctrl["multiplier"] = switch_req["preserve_speed"]
+                else:
+                    time_ctrl["paused"] = True
+                    time_ctrl["multiplier"] = 1.0
 
             # Update shared state arrays for new system
             opl = new_bundle_info.get("oblate_physics_list", [])
@@ -1418,7 +1441,14 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 shared_state["system_snapshot_out"] = snapshot
                 shared_state["system_new_bundle"] = new_bundle_info
                 shared_state["system_switch_complete"] = True
-
+                
+                if "ephemeris_enter" in switch_req:
+                    shared_state["ephemeris_enter"] = switch_req["ephemeris_enter"]
+                if "ephemeris_lines" in switch_req:
+                    shared_state["ephemeris_orbit_lines"] = switch_req["ephemeris_lines"]
+                if "ephemeris_exit" in switch_req:
+                    shared_state["ephemeris_exit"] = switch_req["ephemeris_exit"]
+                
             frame_count = 0
             last_time = time.time()
             continue
@@ -1669,7 +1699,11 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             continue
         if not time_ctrl["paused"]:
             dt_sim = dt_real * time_ctrl["multiplier"] / SECONDS_PER_YEAR
-            sim.integrate(sim.t + dt_sim)
+            
+            if shared_state.get("ephemeris_mode", False):
+                sim.t += dt_sim
+            else:
+                sim.integrate(sim.t + dt_sim)
             
             frame_count += 1
             if frame_count % 30 == 0:
@@ -1891,7 +1925,7 @@ def load_system_from_data(bodies_data_raw):
         atmo_bodies, ring_bodies, oblate_physics_list, parent_indices,
         name_to_idx, has_j2, has_gr, phys_star_idx, star_idx, and more.
     """
-    G_const = 4.0 * math.pi ** 2
+    G_const = 39.476926421373 # G for AU, Msun, Julian Year (365.25 days)
 
     # ── Topological sort (parents before children) ──
     name_to_idx = {b['name']: i for i, b in enumerate(bodies_data_raw)}
@@ -1914,7 +1948,7 @@ def load_system_from_data(bodies_data_raw):
     sim = rebound.Simulation()
     sim.softening = 1e-6
     sim.integrator = "ias15"
-    sim.units = ('AU', 'Msun', 'yr')
+    sim.G = G_const
 
     # ── Process each body ──
     visual_data = []
@@ -1964,7 +1998,12 @@ def load_system_from_data(bodies_data_raw):
             parent_name = body['parentId']
             if 'sv' in body:
                 sv = body['sv']
-                primary = sim.particles[parent_name]
+                try:
+                    primary = sim.particles[parent_name]
+                except rebound.ParticleNotFound:
+                    available = [p.hash.value for p in sim.particles if hasattr(p, 'hash')]
+                    print(f"[Error] Missing parent '{parent_name}' for body '{name}'. Available: {available}")
+                    raise
                 sim.add(m=mass,
                         x=primary.x + sv['x'], y=primary.y + sv['y'], z=primary.z + sv['z'],
                         vx=primary.vx + sv['vx'], vy=primary.vy + sv['vy'], vz=primary.vz + sv['vz'],
@@ -2094,6 +2133,8 @@ def main():
 
     # ── Initialize SystemManager ──
     sys_mgr = SystemManager()
+    sys_mgr_spice = SpiceManager()
+    ephemeris_mode_active = False
     active_system_name = SystemManager.SOLAR_SYSTEM_NAME
     bodies_data_raw = sys_mgr.load_default_system()
     bundle = load_system_from_data(bodies_data_raw)
@@ -2711,6 +2752,38 @@ def main():
     }
     """
     prog_gpu_orbits = ctx.program(vertex_shader=orbit_vertex_shader, fragment_shader=orbit_fragment_shader)
+
+    ephem_orbit_vertex_shader = """
+    #version 460 core
+    in vec3 in_pos;
+    uniform mat4 projection;
+    uniform mat4 view_rot;
+    uniform vec4 u_cam_pos_double;
+    uniform vec3 u_bary_pos;
+    uniform vec3 u_color;
+    out vec4 f_color;
+    out float f_clip_z;
+    void main() {
+        vec3 pos = in_pos + u_bary_pos;
+        vec3 eye_pos = pos - u_cam_pos_double.xyz;
+        f_color = vec4(u_color * 0.4, 1.0);
+        gl_Position = projection * view_rot * vec4(eye_pos, 1.0);
+        f_clip_z = gl_Position.w;
+    }
+    """
+    ephem_orbit_fragment_shader = """
+    #version 460 core
+    in vec4 f_color;
+    in float f_clip_z;
+    uniform float u_far;
+    uniform float u_depth_C;
+    out vec4 out_color;
+    void main() {
+        out_color = f_color;
+        gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
+    }
+    """
+    prog_ephem_orbits = ctx.program(vertex_shader=ephem_orbit_vertex_shader, fragment_shader=ephem_orbit_fragment_shader)
 
     ring_vertex_shader = """
     #version 460 core
@@ -3560,6 +3633,9 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
     uniform_orbit_far = prog_gpu_orbits['u_far']
     uniform_orbit_depth_C = prog_gpu_orbits['u_depth_C']
 
+    vbo_ephem_orbits = ctx.buffer(reserve=1000 * 12)
+    vao_ephem_orbits = ctx.vertex_array(prog_ephem_orbits, [(vbo_ephem_orbits, '3f', 'in_pos')])
+
     uniform_ring_centers = prog_spheres['u_ring_center']
     uniform_ring_normals = prog_spheres['u_ring_normal']
     uniform_ring_params = prog_spheres['u_ring_params']
@@ -3685,9 +3761,13 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
             with shared_state["lock"]:
                 new_info = shared_state["system_new_bundle"]
                 saved_snap = shared_state["system_snapshot_out"]
+                is_ephem_enter = shared_state.get("ephemeris_enter", False)
+                is_ephem_exit = shared_state.get("ephemeris_exit", False)
                 shared_state["system_switch_complete"] = False
                 shared_state["system_new_bundle"] = None
                 shared_state["system_snapshot_out"] = None
+                shared_state["ephemeris_enter"] = False
+                shared_state["ephemeris_exit"] = False
 
             # Store snapshot of old system in SystemManager
             old_name = active_system_name
@@ -3695,7 +3775,16 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
                 sys_mgr.store_snapshot(old_name, saved_snap)
 
             # Update active system name
-            active_system_name = switch_req_name
+            if is_ephem_enter:
+                ephemeris_mode_active = True
+                active_system_name = "Ephemeris Mode"
+                shared_state["ephemeris_mode"] = True
+            elif is_ephem_exit:
+                ephemeris_mode_active = False
+                active_system_name = switch_req_name
+                shared_state["ephemeris_mode"] = False
+            else:
+                active_system_name = switch_req_name
 
             # Rebuild ALL render-side state from new system info
             bodies_data = new_info["bodies_data"]
@@ -4055,6 +4144,24 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
 
         cur_y, cur_m, cur_d, cur_h, cur_mn = format_sim_time(display_t)
 
+        if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
+            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+            et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+            et = et_epoch + display_t * 365.25 * 86400.0
+            states = sys_mgr_spice.get_all_states(et)
+            sun_state = next((d for d in states.values() if d["info"]["name"] == "Sun"), None)
+            
+            for idx in range(num_bodies):
+                b_name = bodies_data[idx]["name"]
+                for sp_id, sp_data in states.items():
+                    if sp_data["info"]["name"] == b_name:
+                        pos = sp_data["state"]["pos"]
+                        vel = sp_data["state"]["vel"]
+                        # Swap coordinates: X=x, Y=z, Z=-y
+                        pos_snap_render[idx] = np.array([pos[0], pos[2], -pos[1]])
+                        vel_snap_render[idx] = np.array([vel[0], vel[2], -vel[1]])
+                        break
+
         lerp_factor = 1.0 - math.exp(-15.0 * dt_render)
         camera["distance_actual"] += (camera["distance"] - camera["distance_actual"]) * lerp_factor
         camera["yaw_actual"] += (camera["yaw"] - camera["yaw_actual"]) * lerp_factor
@@ -4323,25 +4430,26 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
         ctx.enable(moderngl.BLEND)
         ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
-        if show_orbits and n_orbits > 0:
-            prog_gpu_orbits['u_fade_dir'].value = orbit_fade_dir
-            prog_gpu_orbits['u_min_alpha'].value = orbit_min_alpha
-            prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
-            
-            if n_orbits_hi > 0:
-                prog_gpu_orbits['u_orbit_res'].value = 4000
-                prog_gpu_orbits['u_base_instance'].value = 0
-                vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
+        if show_orbits:
+            if n_orbits > 0:
+                prog_gpu_orbits['u_fade_dir'].value = orbit_fade_dir
+                prog_gpu_orbits['u_min_alpha'].value = orbit_min_alpha
+                prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
                 
-            if n_orbits_med > 0:
-                prog_gpu_orbits['u_orbit_res'].value = 500
-                prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
-                vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
-                
-            if n_orbits_low > 0:
-                prog_gpu_orbits['u_orbit_res'].value = 100
-                prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
-                vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
+                if n_orbits_hi > 0:
+                    prog_gpu_orbits['u_orbit_res'].value = 4000
+                    prog_gpu_orbits['u_base_instance'].value = 0
+                    vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
+                    
+                if n_orbits_med > 0:
+                    prog_gpu_orbits['u_orbit_res'].value = 500
+                    prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
+                    vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
+                    
+                if n_orbits_low > 0:
+                    prog_gpu_orbits['u_orbit_res'].value = 100
+                    prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                    vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
         if ring_render_groups:
             ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -4486,7 +4594,14 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
         imgui.text("Time Controls")
         _, time_ctrl["paused"] = imgui.checkbox("Paused", time_ctrl["paused"])
         imgui.text(f"Speed: {format_time_speed(time_ctrl['multiplier'])}")
-        _, time_ctrl["multiplier"] = imgui.slider_float("##speed", time_ctrl["multiplier"], 1.0, 1e9, "", flags=imgui.SLIDER_FLAGS_LOGARITHMIC)
+        
+        # 2-way logarithmic slider
+        sign = 1.0 if time_ctrl["multiplier"] >= 0 else -1.0
+        val_log = sign * math.log10(max(1.0, abs(time_ctrl["multiplier"])))
+        changed, new_log = imgui.slider_float("##speed", val_log, -9.0, 9.0, "")
+        if changed:
+            time_ctrl["multiplier"] = (1.0 if new_log >= 0 else -1.0) * (10 ** abs(new_log))
+                
         if imgui.button("Reset Speed"): time_ctrl["multiplier"] = 1.0
                 
         if shared_state.get("syncing", False):
@@ -4649,6 +4764,147 @@ vec3 light_pos_sph = sample_pos_sph + t_l * sun_dir_sph;
             imgui.end_popup()
 
         imgui.separator()
+        
+        # ── Ephemeris Mode UI ──
+        if active_system_name == SystemManager.SOLAR_SYSTEM_NAME and not ephemeris_mode_active:
+            
+            def _trigger_ephem_switch():
+                capture_t = display_t
+                capture_paused = time_ctrl["paused"]
+                capture_speed = time_ctrl["multiplier"]
+                import copy
+                capture_bodies = copy.deepcopy(bodies_data)
+                capture_visual = copy.deepcopy(visual_data)
+                capture_atmo = copy.deepcopy(atmo_bodies)
+                capture_ring = copy.deepcopy(ring_bodies)
+                capture_star_idx = star_idx
+                
+                def _on_spice_ready():
+                    epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                    et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                    et = et_epoch + capture_t * 365.25 * 86400.0
+                    ephem_bundle = sys_mgr_spice.build_ephemeris_system(et, template_bodies=capture_bodies)
+                    new_bndl = load_system_from_data(ephem_bundle)
+                    req = {
+                        "old_bodies_data": capture_bodies,
+                        "old_visual_data": capture_visual,
+                        "old_atmo_bodies": capture_atmo,
+                        "old_ring_bodies": capture_ring,
+                        "old_star_idx": capture_star_idx,
+                        "new_bundle": new_bndl,
+                        "ephemeris_enter": True,
+                        "preserve_state": True,
+                        "preserve_t": capture_t,
+                        "preserve_paused": capture_paused,
+                        "preserve_speed": capture_speed
+                    }
+                    with shared_state["lock"]:
+                        shared_state["system_switch_request"] = req
+                
+                sys_mgr_spice.download_kernels_async(on_complete=_on_spice_ready)
+
+            if imgui.button("Switch to Ephemeris Mode", width=-1):
+                if not sys_mgr_spice.settings_initialized:
+                    imgui.open_popup("Ephemeris Setup")
+                else:
+                    _trigger_ephem_switch()
+                    
+            if imgui.button("Ephemeris Kernel Settings", width=-1):
+                imgui.open_popup("Ephemeris Setup")
+                
+            if imgui.begin_popup_modal("Ephemeris Setup", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+                imgui.text("Select which SPICE kernels to download and load:")
+                imgui.text_colored("Warning: High resolution satellite kernels are large and take time to download.", 1.0, 0.5, 0.2)
+                imgui.separator()
+                
+                import os
+                for k_name in sys_mgr_spice.DEFAULT_KERNELS.keys():
+                    desc = sys_mgr_spice.KERNEL_DESCRIPTIONS.get(k_name, k_name)
+                    if os.path.exists(os.path.join(sys_mgr_spice.KERNEL_DIR, k_name)):
+                        desc += " [Downloaded]"
+                    is_enabled = sys_mgr_spice.enabled_kernels.get(k_name, False)
+                    changed, new_val = imgui.checkbox(desc, is_enabled)
+                    if changed:
+                        sys_mgr_spice.enabled_kernels[k_name] = new_val
+                        
+                imgui.separator()
+                if imgui.button("Save & Switch to Ephemeris Mode"):
+                    sys_mgr_spice.save_settings()
+                    imgui.close_current_popup()
+                    _trigger_ephem_switch()
+                imgui.same_line()
+                if imgui.button("Cancel"):
+                    imgui.close_current_popup()
+                imgui.end_popup()
+            
+            if sys_mgr_spice.is_downloading:
+                imgui.text_colored(sys_mgr_spice.download_status, 1.0, 0.8, 0.2)
+                imgui.progress_bar(sys_mgr_spice.download_progress, size=(-1, 0))
+            imgui.separator()
+            
+        elif ephemeris_mode_active:
+            imgui.text_colored("EPHEMERIS MODE ACTIVE", 0.3, 1.0, 0.3)
+            if imgui.button("Export to N-Body System", width=-1):
+                capture_t = display_t
+                capture_paused = time_ctrl["paused"]
+                capture_speed = time_ctrl["multiplier"]
+                
+                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                et = et_epoch + capture_t * 365.25 * 86400.0
+                ephem_bundle = sys_mgr_spice.build_ephemeris_system(et, template_bodies=bodies_data)
+                export_name = f"Solar System ({cur_y:04d}-{cur_m:02d}-{cur_d:02d})"
+                sys_mgr.save_system_data(export_name, ephem_bundle)
+                sys_mgr.save_meta(export_name, ephem_bundle)
+                
+                new_bndl = load_system_from_data(ephem_bundle)
+                switch_req_name = export_name
+                req = {
+                    "old_bodies_data": bodies_data,
+                    "old_visual_data": visual_data,
+                    "old_atmo_bodies": atmo_bodies,
+                    "old_ring_bodies": ring_bodies,
+                    "old_star_idx": star_idx,
+                    "new_bundle": new_bndl,
+                    "switch_req_name": export_name,
+                    "ephemeris_exit": True,
+                    "preserve_state": True,
+                    "preserve_t": capture_t,
+                    "preserve_paused": capture_paused,
+                    "preserve_speed": capture_speed
+                }
+                with shared_state["lock"]:
+                    shared_state["system_switch_request"] = req
+                
+            if imgui.button("Return to N-Body Mode", width=-1):
+                target_name = SystemManager.SOLAR_SYSTEM_NAME
+                switch_req_name = target_name
+                existing_snap = sys_mgr.get_snapshot(target_name)
+                if existing_snap is not None:
+                    req = {
+                        "old_bodies_data": bodies_data,
+                        "old_visual_data": visual_data,
+                        "old_atmo_bodies": atmo_bodies,
+                        "old_ring_bodies": ring_bodies,
+                        "old_star_idx": star_idx,
+                        "restore_snapshot": existing_snap,
+                        "ephemeris_exit": True
+                    }
+                else:
+                    raw_data = sys_mgr.load_system_data(target_name)
+                    new_bndl = load_system_from_data(raw_data)
+                    req = {
+                        "old_bodies_data": bodies_data,
+                        "old_visual_data": visual_data,
+                        "old_atmo_bodies": atmo_bodies,
+                        "old_ring_bodies": ring_bodies,
+                        "old_star_idx": star_idx,
+                        "new_bundle": new_bndl,
+                        "ephemeris_exit": True
+                    }
+                with shared_state["lock"]:
+                    shared_state["system_switch_request"] = req
+            imgui.separator()
         
         for k in range(len(tree_indices_snap)):
 
