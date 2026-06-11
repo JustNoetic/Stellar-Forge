@@ -322,6 +322,50 @@ class SpiceManager:
                 }
         return states
 
+    def get_body_mapping(self, bodies_data, test_et):
+        """Precomputes a list of SPICE IDs for a list of bodies_data dicts."""
+        mapping = []
+        for body in bodies_data:
+            b_name = body["name"]
+            found_id = None
+            for sp_id, info in self.SPICE_BODIES.items():
+                if info["name"] == b_name:
+                    if sp_id in [5, 6, 7, 8, 9]:
+                        com_id = sp_id * 100 + 99
+                        try:
+                            # Test if com_id is available
+                            spice.spkgeo(com_id, test_et, 'ECLIPJ2000', 0)
+                            found_id = com_id
+                            break
+                        except:
+                            pass
+                    found_id = sp_id
+                    break
+            mapping.append(found_id)
+        return mapping
+
+    def populate_states_fast(self, et, mapping, pos_out, vel_out):
+        """Fast method to populate pos/vel arrays for mapped SPICE bodies."""
+        if not self.kernels_loaded:
+            return
+            
+        km_to_au = self.KM_TO_AU
+        sec_to_yr = self.SEC_TO_YR
+        
+        for idx, sp_id in enumerate(mapping):
+            if sp_id is not None:
+                try:
+                    state, _ = spice.spkgeo(sp_id, et, 'ECLIPJ2000', 0)
+                    # Swap coordinates: X=x, Y=z, Z=-y
+                    pos_out[idx, 0] = state[0] * km_to_au
+                    pos_out[idx, 1] = state[2] * km_to_au
+                    pos_out[idx, 2] = -state[1] * km_to_au
+                    vel_out[idx, 0] = state[3] * km_to_au * sec_to_yr
+                    vel_out[idx, 1] = state[5] * km_to_au * sec_to_yr
+                    vel_out[idx, 2] = -state[4] * km_to_au * sec_to_yr
+                except:
+                    pass
+
     def _get_body_properties(self, body_id, fallback_mass_kg, fallback_radius_km):
         """Extracts exact GM and radius from SPICE PCK kernels if available."""
         mass_sun = fallback_mass_kg / 1.98847e30

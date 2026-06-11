@@ -1,0 +1,138 @@
+import math
+import numpy as np
+from numba import njit
+from constants import *
+
+@njit(cache=True)
+def fast_cross(a, b):
+    return np.array([
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0]
+    ], dtype=np.float64)
+
+@njit(cache=True)
+def fast_norm(v):
+    return math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2])
+
+@njit(cache=True)
+def pole_to_ecliptic(pole_ra_deg, pole_dec_deg):
+    """Convert pole RA/Dec (ICRF J2000) to unit vector in ecliptic coords."""
+    ra = math.radians(pole_ra_deg)
+    dec = math.radians(pole_dec_deg)
+    x = math.cos(dec) * math.cos(ra)
+    y = math.cos(dec) * math.sin(ra)
+    z = math.sin(dec)
+    cos_e, sin_e = math.cos(OBLIQUITY), math.sin(OBLIQUITY)
+    pole = np.array([x, y * cos_e + z * sin_e, -y * sin_e + z * cos_e])
+    n = np.linalg.norm(pole)
+    return pole / n if n > 0 else np.array([0., 0., 1.])
+
+@njit(cache=True)
+def build_equatorial_frame(pole_ecl):
+    """Build 3x3 rotation matrix from parent equatorial frame to ecliptic."""
+    z = pole_ecl / np.linalg.norm(pole_ecl)
+    ref = np.array([0., 0., 1.])
+    x = np.cross(ref, z)
+    if np.linalg.norm(x) < 1e-10:
+        x = np.array([1., 0., 0.])
+    else:
+        x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    return np.column_stack((x, y, z))
+
+@njit(cache=True)
+def kepler_solve(M, e, tol=1e-12):
+    """Solve Kepler's equation M = E - e*sin(E) for eccentric anomaly E."""
+    E = M
+    for _ in range(100):
+        dE = (E - e * math.sin(E) - M) / (1.0 - e * math.cos(E))
+        E -= dE
+        if abs(dE) < tol:
+            break
+    return E
+
+@njit(cache=True)
+def orbital_to_cartesian(a, e, inc, Omega, omega, M, mu):
+    """Convert orbital elements to Cartesian position/velocity."""
+    E = kepler_solve(M, e)
+    cos_E, sin_E = math.cos(E), math.sin(E)
+    r = a * (1.0 - e * cos_E)
+    cos_f = (cos_E - e) / (1.0 - e * cos_E)
+    sin_f = math.sqrt(max(0, 1.0 - e*e)) * sin_E / (1.0 - e * cos_E)
+    x_orb, y_orb = r * cos_f, r * sin_f
+    fac = math.sqrt(mu / max(a**3, 1e-30))
+    denom = 1.0 - e * cos_E
+    vx_orb = -fac * a * sin_E / denom
+    vy_orb = fac * a * math.sqrt(max(0, 1.0 - e*e)) * cos_E / denom
+    cos_O, sin_O = math.cos(Omega), math.sin(Omega)
+    cos_i, sin_i = math.cos(inc), math.sin(inc)
+    cos_w, sin_w = math.cos(omega), math.sin(omega)
+    Px = cos_O*cos_w - sin_O*sin_w*cos_i
+    Py = sin_O*cos_w + cos_O*sin_w*cos_i
+    Pz = sin_w*sin_i
+    Qx = -cos_O*sin_w - sin_O*cos_w*cos_i
+    Qy = -sin_O*sin_w + cos_O*cos_w*cos_i
+    Qz = cos_w*sin_i
+    pos = np.array([x_orb*Px + y_orb*Qx, x_orb*Py + y_orb*Qy, x_orb*Pz + y_orb*Qz])
+    vel = np.array([vx_orb*Px + vy_orb*Qx, vx_orb*Py + vy_orb*Qy, vx_orb*Pz + vy_orb*Qz])
+    return pos, vel
+
+def get_cartesian_from_keplerian(parent_m, child_m, a, e, inc_deg, Omega_deg, omega_deg, M_deg):
+    """Generate Cartesian state from Keplerian elements using a temporary Rebound simulation."""
+    import rebound
+    sim_tmp = rebound.Simulation()
+    sim_tmp.G = 4.0 * math.pi**2
+    sim_tmp.add(m=parent_m)
+    sim_tmp.add(m=child_m, a=a, e=e, inc=math.radians(inc_deg), Omega=math.radians(Omega_deg), omega=math.radians(omega_deg), M=math.radians(M_deg))
+    p0 = sim_tmp.particles[0]
+    p1 = sim_tmp.particles[1]
+    return np.array([p1.x - p0.x, p1.y - p0.y, p1.z - p0.z]), np.array([p1.vx - p0.vx, p1.vy - p0.vy, p1.vz - p0.vz])
+
+@njit(cache=True)
+def rotate_equatorial_to_ecliptic(pos, vel, pole_ecl):
+    """Rotate equatorial coordinates to ecliptic coordinates given a pole vector."""
+    px, py, pz = pole_ecl
+    if abs(px) < 1e-8 and abs(py) < 1e-8 and pz > 0:
+        return pos, vel
+        
+    N = np.array([-py, px, 0.0], dtype=np.float64)
+    n_mag = np.linalg.norm(N)
+    
+    if n_mag < 1e-8:
+        X = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        Y = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        Z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    else:
+        X = N / n_mag
+        Z = np.array([px, py, pz], dtype=np.float64)
+        Z = Z / np.linalg.norm(Z)
+        Y = np.cross(Z, X)
+        
+    R = np.column_stack((X, Y, Z))
+    return R @ pos, R @ vel
+
+@njit(cache=True)
+def rotate_ecliptic_to_equatorial(pos, vel, pole_ecl):
+    """Rotate ecliptic coordinates to equatorial coordinates given a pole vector."""
+    px, py, pz = pole_ecl
+    if abs(px) < 1e-8 and abs(py) < 1e-8 and pz > 0:
+        return pos, vel
+        
+    N = np.array([-py, px, 0.0], dtype=np.float64)
+    n_mag = np.linalg.norm(N)
+    
+    if n_mag < 1e-8:
+        X = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        Y = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        Z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    else:
+        X = N / n_mag
+        Z = np.array([px, py, pz], dtype=np.float64)
+        Z = Z / np.linalg.norm(Z)
+        Y = np.cross(Z, X)
+        
+    R = np.column_stack((X, Y, Z))
+    R_inv = R.T
+    return R_inv @ pos, R_inv @ vel
+
