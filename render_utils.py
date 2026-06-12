@@ -54,8 +54,7 @@ def format_sim_time(t_years):
             et = et_epoch + t_years * 365.25 * 86400.0
             utc_str = spice.et2utc(et, 'C', 0)
             dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-            dt_local = dt_utc.astimezone()
-            return dt_local.year, dt_local.month, dt_local.day, dt_local.hour, dt_local.minute
+            return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute
     except:
         pass
 
@@ -63,103 +62,32 @@ def format_sim_time(t_years):
     delta_seconds = t_years * 365.25 * 86400
     try:
         dt_utc = epoch + datetime.timedelta(seconds=delta_seconds)
-        dt_local = dt_utc.astimezone()
-        return dt_local.year, dt_local.month, dt_local.day, dt_local.hour, dt_local.minute
+        return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute
     except (OverflowError, OSError, ValueError):
         return 9999, 12, 31, 23, 59
 
 def sim_time_from_date(y, m, d, h=0, mn=0):
     epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
     try:
-        dt_local = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), 0).astimezone()
-        delta = dt_local - epoch
+        dt_utc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), 0, tzinfo=datetime.timezone.utc)
+        delta = dt_utc - epoch
         return delta.total_seconds() / (365.25 * 86400)
     except ValueError:
         return 0.0
 
 @njit(cache=True)
-def compute_culling_masks(
-    pos_rel_all, body_radii,
-    star_idx, 
+def compute_ring_culling(
+    pos_rel_all, body_radii, star_idx, 
     n_casters, caster_indices, 
     n_rings, ring_centers, ring_normals, ring_outer_radii,
-    num_bodies,
-    caster_mask_lo, caster_mask_hi, ring_mask, ring_caster_lo, ring_caster_hi
+    num_bodies, ring_caster_lo, ring_caster_hi
 ):
-    caster_mask_lo[:] = 0
-    caster_mask_hi[:] = 0
-    ring_mask[:] = 0
     ring_caster_lo[:] = 0
     ring_caster_hi[:] = 0
     
     star_pos = pos_rel_all[star_idx]
     star_r = body_radii[star_idx]
     
-    for i in range(num_bodies):
-        if i == star_idx:
-            continue
-            
-        p_i = pos_rel_all[i]
-        r_i = body_radii[i]
-        
-        L = star_pos - p_i
-        dist_star = math.sqrt(L[0]*L[0] + L[1]*L[1] + L[2]*L[2])
-        if dist_star < 1e-6:
-            continue
-        L_dir = L / dist_star
-        
-        mask_lo = np.uint32(0)
-        mask_hi = np.uint32(0)
-        
-        for c_idx in range(n_casters):
-            j = caster_indices[c_idx]
-            if j == i or j == star_idx:
-                continue
-                
-            p_j = pos_rel_all[j]
-            r_j = body_radii[j]
-            
-            vec = p_j - p_i
-            t = vec[0]*L_dir[0] + vec[1]*L_dir[1] + vec[2]*L_dir[2]
-            
-            if t > 0.0 and t < dist_star:
-                perp = vec - t * L_dir
-                d = math.sqrt(perp[0]*perp[0] + perp[1]*perp[1] + perp[2]*perp[2])
-                r_cone = r_j + star_r * (t / dist_star) + r_i
-                
-                if d < r_cone:
-                    if c_idx < 32:
-                        mask_lo |= np.uint32(1) << np.uint32(c_idx)
-                    else:
-                        mask_hi |= np.uint32(1) << np.uint32(c_idx - 32)
-                        
-        caster_mask_lo[i] = mask_lo
-        caster_mask_hi[i] = mask_hi
-        
-        rmask = np.uint32(0)
-        for k in range(n_rings):
-            C_k = ring_centers[k]
-            N_k = ring_normals[k]
-            r_out = ring_outer_radii[k]
-            
-            denom = L_dir[0]*N_k[0] + L_dir[1]*N_k[1] + L_dir[2]*N_k[2]
-            if abs(denom) > 1e-8:
-                vec_c = C_k - p_i
-                
-                dist_centers = math.sqrt(vec_c[0]*vec_c[0] + vec_c[1]*vec_c[1] + vec_c[2]*vec_c[2])
-                if dist_centers < 1e-6:
-                    rmask |= np.uint32(1) << np.uint32(k)
-                else:
-                    s = (vec_c[0]*N_k[0] + vec_c[1]*N_k[1] + vec_c[2]*N_k[2]) / denom
-                    if s > 0.0 and s < dist_star:
-                        hit = p_i + s * L_dir
-                        hit_vec = hit - C_k
-                        d = math.sqrt(hit_vec[0]*hit_vec[0] + hit_vec[1]*hit_vec[1] + hit_vec[2]*hit_vec[2])
-                        r_cone = star_r * (s / dist_star) + r_i
-                        if d < r_out + r_cone:
-                            rmask |= np.uint32(1) << np.uint32(k)
-        ring_mask[i] = rmask
-
     for k in range(n_rings):
         C_k = ring_centers[k]
         r_out = ring_outer_radii[k]
@@ -199,19 +127,6 @@ def compute_culling_masks(
         ring_caster_hi[k] = mask_hi
 
     return
-
-@njit(cache=True)
-def compute_frustum_culling(pos_rel_all, body_radii, planes, num_bodies):
-    visible = np.ones(num_bodies, dtype=np.bool_)
-    for i in range(num_bodies):
-        x, y, z = pos_rel_all[i]
-        r = body_radii[i]
-        for p in range(6):
-            dist = x*planes[p, 0] + y*planes[p, 1] + z*planes[p, 2] + planes[p, 3]
-            if dist < -r:
-                visible[i] = False
-                break
-    return visible
 
 @njit(cache=True)
 def extract_frustum_planes(vp):

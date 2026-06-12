@@ -280,23 +280,29 @@ class SpiceManager:
             # SPICE spkgeo returns (state, light_time). State is [x, y, z, vx, vy, vz] in km and km/s.
             # Reference frame 'ECLIPJ2000', observer is Solar System Barycenter (0).
             state, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', 0)
-            
-            # SPICE standard frame is J2000 (equatorial), but we requested ECLIPJ2000. 
-            # If the application uses ecliptic or a different mapping (like y-up),
-            # we need to rotate it. Assuming standard +Z up equatorial for now, or match existing app.
-            # Let's map it raw and apply scaling.
-            
-            x, y, z = state[0], state[1], state[2]
-            vx, vy, vz = state[3], state[4], state[5]
-            
-            return {
-                "pos": np.array([x, y, z]) * self.KM_TO_AU,
-                # Convert km/s to AU/yr
-                "vel": np.array([vx, vy, vz]) * self.KM_TO_AU * self.SEC_TO_YR
-            }
         except Exception as e:
-            # Body might not be in the loaded kernels
-            return None
+            # Fallback to barycenter for planets if specific body fails (e.g. Mars 499 kernel expires)
+            if body_id > 100 and body_id < 1000 and body_id % 100 == 99:
+                try:
+                    state, _ = spice.spkgeo(body_id // 100, et, 'ECLIPJ2000', 0)
+                except:
+                    return None
+            else:
+                return None
+        
+        # SPICE standard frame is J2000 (equatorial), but we requested ECLIPJ2000. 
+        # If the application uses ecliptic or a different mapping (like y-up),
+        # we need to rotate it. Assuming standard +Z up equatorial for now, or match existing app.
+        # Let's map it raw and apply scaling.
+        
+        x, y, z = state[0], state[1], state[2]
+        vx, vy, vz = state[3], state[4], state[5]
+        
+        return {
+            "pos": np.array([x, y, z]) * self.KM_TO_AU,
+            # Convert km/s to AU/yr
+            "vel": np.array([vx, vy, vz]) * self.KM_TO_AU * self.SEC_TO_YR
+        }
 
     def get_all_states(self, et):
         """Get states for all known SPICE bodies at a specific ET."""
@@ -344,7 +350,7 @@ class SpiceManager:
             mapping.append(found_id)
         return mapping
 
-    def populate_states_fast(self, et, mapping, pos_out, vel_out):
+    def populate_states_fast(self, et, mapping, pos_out, vel_out, valid_out=None):
         """Fast method to populate pos/vel arrays for mapped SPICE bodies."""
         if not self.kernels_loaded:
             return
@@ -356,15 +362,28 @@ class SpiceManager:
             if sp_id is not None:
                 try:
                     state, _ = spice.spkgeo(sp_id, et, 'ECLIPJ2000', 0)
-                    # Swap coordinates: X=x, Y=z, Z=-y
-                    pos_out[idx, 0] = state[0] * km_to_au
-                    pos_out[idx, 1] = state[2] * km_to_au
-                    pos_out[idx, 2] = -state[1] * km_to_au
-                    vel_out[idx, 0] = state[3] * km_to_au * sec_to_yr
-                    vel_out[idx, 1] = state[5] * km_to_au * sec_to_yr
-                    vel_out[idx, 2] = -state[4] * km_to_au * sec_to_yr
                 except:
-                    pass
+                    # Fallback to barycenter if needed (e.g. Mars 499 fails past 2050)
+                    if sp_id > 100 and sp_id < 1000 and sp_id % 100 == 99:
+                        try:
+                            state, _ = spice.spkgeo(sp_id // 100, et, 'ECLIPJ2000', 0)
+                        except:
+                            if valid_out is not None: valid_out[idx] = False
+                            continue
+                    else:
+                        if valid_out is not None: valid_out[idx] = False
+                        continue
+                
+                if valid_out is not None:
+                    valid_out[idx] = True
+                
+                # Swap coordinates: X=x, Y=z, Z=-y
+                pos_out[idx, 0] = state[0] * km_to_au
+                pos_out[idx, 1] = state[2] * km_to_au
+                pos_out[idx, 2] = -state[1] * km_to_au
+                vel_out[idx, 0] = state[3] * km_to_au * sec_to_yr
+                vel_out[idx, 1] = state[5] * km_to_au * sec_to_yr
+                vel_out[idx, 2] = -state[4] * km_to_au * sec_to_yr
 
     def _get_body_properties(self, body_id, fallback_mass_kg, fallback_radius_km):
         """Extracts exact GM and radius from SPICE PCK kernels if available."""

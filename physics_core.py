@@ -1132,7 +1132,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             time_ctrl["paused"] = True
             continue
         if not time_ctrl["paused"]:
-            dt_sim = dt_real * time_ctrl["multiplier"] / SECONDS_PER_YEAR
+            dt_sim = dt_real * time_ctrl["multiplier"] * time_ctrl.get("time_direction", 1) / SECONDS_PER_YEAR
             
             if shared_state.get("ephemeris_mode", False):
                 sim.t += dt_sim
