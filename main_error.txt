@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\main.py", line 10, in <module>
+    app.run()
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\app.py", line 759, in run
+    uniform_ring_centers = prog_spheres['u_ring_center']
+                           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 412, in __getitem__
+    return self._members[key]
+           ~~~~~~~~~~~~~^^^^^
+KeyError: 'u_ring_center'

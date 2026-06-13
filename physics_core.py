@@ -590,7 +590,7 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
     return n_orbits
 
 @njit(cache=True)
-def _update_hierarchy_core(positions, masses, current_parents, num_bodies):
+def _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_star_mask):
     """Numba-jitted core: recompute parents based on Hill sphere containment.
     No O(N²) memory allocation — distances computed inline as needed."""
     new_parents = current_parents.copy()
@@ -603,10 +603,18 @@ def _update_hierarchy_core(positions, masses, current_parents, num_bodies):
             root_idx = i
     new_parents[root_idx] = -1
     
+    # Enforce that stars always remain root nodes
+    for i in range(num_bodies):
+        if is_star_mask[i]:
+            new_parents[i] = -1
+    
     r_hill_array = np.zeros(num_bodies, dtype=np.float64)
     for j in range(num_bodies):
         if j == root_idx or masses[j] <= 0.0:
             continue
+        if is_star_mask[j]:
+            continue # Stars cannot be child nodes to other bodies
+            
         j_parent = current_parents[j] if current_parents[j] != -1 else root_idx
         if masses[j_parent] > 0.0:
             dx = positions[j, 0] - positions[j_parent, 0]
@@ -616,7 +624,7 @@ def _update_hierarchy_core(positions, masses, current_parents, num_bodies):
             r_hill_array[j] = dist_j_parent * (masses[j] / (3.0 * masses[j_parent])) ** (1.0 / 3.0)
     
     for i in range(num_bodies):
-        if i == root_idx:
+        if i == root_idx or is_star_mask[i]:
             continue
         
         best_parent = root_idx
@@ -642,7 +650,7 @@ def _update_hierarchy_core(positions, masses, current_parents, num_bodies):
     
     return new_parents
 
-def update_hierarchy(sim, num_bodies, current_parents):
+def update_hierarchy(sim, num_bodies, current_parents, is_star_mask):
     """Recompute parent_indices based on Hill sphere containment.
     
     Uses hysteresis: enter at < 0.9 * r_Hill, exit at > 1.0 * r_Hill
@@ -652,7 +660,7 @@ def update_hierarchy(sim, num_bodies, current_parents):
     positions = np.ascontiguousarray(arr[:, 0:3])
     masses = arr[:, 9].copy()
     
-    return _update_hierarchy_core(positions, masses, current_parents, num_bodies)
+    return _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_star_mask)
 
 def build_tree_order(parent_indices, num_bodies, positions=None):
     """Return (tree_indices, tree_depths) numpy arrays in depth-first tree-traversal order."""
@@ -707,8 +715,11 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
     
     with shared_state["lock"]:
         current_parents = shared_state["parent_indices"].copy()
+        is_star_mask = shared_state.get("is_star_mask")
+        if is_star_mask is None:
+            is_star_mask = np.zeros(num_bodies, dtype=np.bool_)
     
-    current_parents = update_hierarchy(sim, num_bodies, current_parents)
+    current_parents = update_hierarchy(sim, num_bodies, current_parents, is_star_mask)
     positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
     tree_indices, tree_depths = build_tree_order(current_parents, num_bodies, positions)
     
@@ -820,6 +831,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 shared_state["vel"] = np.zeros((num_bodies, 3), dtype='f8')
                 shared_state["mass"] = np.zeros(num_bodies, dtype='f8')
                 shared_state["parent_indices"] = np.full(num_bodies, -1, dtype=np.int32)
+                is_star_mask = np.array([b.get('type') == 'Star' for b in new_bundle_info["bodies_data"]], dtype=np.bool_)
+                shared_state["is_star_mask"] = is_star_mask
                 shared_state["tree_indices"] = np.zeros(num_bodies, dtype=np.int32)
                 shared_state["tree_depths"] = np.zeros(num_bodies, dtype=np.int32)
                 shared_state["timeline_active"] = False
@@ -858,7 +871,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             for i, body in enumerate(bd):
                 if 'parentId' in body and body['parentId'] in nti:
                     current_parents[i] = nti[body['parentId']]
-            current_parents = update_hierarchy(sim, num_bodies, current_parents)
+            current_parents = update_hierarchy(sim, num_bodies, current_parents, is_star_mask)
             positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
             tree_indices, tree_depths = build_tree_order(current_parents, num_bodies, positions)
 
@@ -948,6 +961,10 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                                 for i, obl in enumerate(shared_state["oblate_physics_list"]):
                                     if obl[0] == idx:
                                         shared_state["oblate_physics_list"][i] = (obl[0], obl[1], obl[2], r_au, obl[4], obl[5], obl[6], obl[7])
+                        if "type" in op:
+                            is_star = op["type"] == "Star"
+                            if shared_state.get("is_star_mask") is not None:
+                                shared_state["is_star_mask"][idx] = is_star
                         shared_state["crud_completed"].append(op)
                             
                 elif op["action"] == "CREATE":
@@ -967,6 +984,9 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         shared_state["vel"] = np.vstack([shared_state["vel"], vel_ogl])
                         shared_state["mass"] = np.append(shared_state["mass"], mass)
                         shared_state["parent_indices"] = np.append(shared_state["parent_indices"], np.int32(parent_idx))
+                        is_star = op.get("type") == "Star"
+                        if shared_state.get("is_star_mask") is not None:
+                            shared_state["is_star_mask"] = np.append(shared_state["is_star_mask"], is_star)
                         op["idx"] = num_bodies - 1
                         shared_state["crud_completed"].append(op)
                             
@@ -985,6 +1005,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         pi[pi == idx] = 0
                         pi[pi > idx] -= 1
                         shared_state["parent_indices"] = pi
+                        if shared_state.get("is_star_mask") is not None:
+                            shared_state["is_star_mask"] = np.delete(shared_state["is_star_mask"], idx)
                         
                         if shared_state.get("oblate_indices") is not None:
                             j2_mask = shared_state["oblate_indices"] != idx
@@ -1013,7 +1035,10 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             
             with shared_state["lock"]:
                 current_parents = shared_state["parent_indices"].copy()
-            current_parents = update_hierarchy(sim, num_bodies, current_parents)
+                is_star_mask = shared_state.get("is_star_mask")
+                if is_star_mask is None:
+                    is_star_mask = np.zeros(num_bodies, dtype=np.bool_)
+            current_parents = update_hierarchy(sim, num_bodies, current_parents, is_star_mask)
             positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
             tree_indices, tree_depths = build_tree_order(current_parents, num_bodies, positions)
             
@@ -1141,7 +1166,11 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             
             frame_count += 1
             if frame_count % 30 == 0:
-                new_parents = update_hierarchy(sim, num_bodies, current_parents)
+                with shared_state["lock"]:
+                    is_star_mask = shared_state.get("is_star_mask")
+                    if is_star_mask is None:
+                        is_star_mask = np.zeros(num_bodies, dtype=np.bool_)
+                new_parents = update_hierarchy(sim, num_bodies, current_parents, is_star_mask)
                 positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
                 new_tree_indices, new_tree_depths = build_tree_order(new_parents, num_bodies, positions)
                 
@@ -1374,7 +1403,9 @@ def load_system_from_data(bodies_data_raw):
     # ── Parent indices ──
     parent_indices = np.full(num_bodies, -1, dtype=np.int32)
     for i, body in enumerate(bodies_data):
-        if 'parentId' in body:
+        if body.get('type') == 'Star':
+            parent_indices[i] = -1
+        elif 'parentId' in body:
             parent_indices[i] = name_to_idx[body['parentId']]
 
     print(f"[System] Loaded {num_bodies} bodies")

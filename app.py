@@ -92,7 +92,7 @@ class App:
             "edit_data": {},
         }
         self.time_ctrl = {
-            "paused": False,
+            "paused": True,
             "multiplier": 1.0,
             "time_direction": 1,
             "render_timeline": False,
@@ -258,7 +258,9 @@ class App:
         self.body_radii_cmp = np.array([v[3] for v in visual_data_cmp], dtype='f4')
         self.body_colors_cmp = np.array([v[0:3] for v in visual_data_cmp], dtype='f4')
         self.is_star_arr_cmp = np.zeros(num_bodies_cmp, dtype='f4')
-        self.is_star_arr_cmp[self.star_idx_cmp] = 1.0
+        for i, b in enumerate(bundle_cmp["bodies_data"]):
+            if b.get('type') == 'Star':
+                self.is_star_arr_cmp[i] = 1.0
         
         self.pos_snap_cmp = np.zeros((num_bodies_cmp, 3), dtype='f8')
         self.vel_snap_cmp = np.zeros((num_bodies_cmp, 3), dtype='f8')
@@ -298,6 +300,7 @@ class App:
             "vel": np.zeros((num_bodies, 3), dtype='f8'),
             "mass": np.zeros(num_bodies, dtype='f8'),
             "parent_indices": np.full(num_bodies, -1, dtype=np.int32),
+            "is_star_mask": np.array([b.get('type') == 'Star' for b in bodies_data], dtype=np.bool_),
             "tree_indices": np.zeros(num_bodies, dtype=np.int32),
             "tree_depths": np.zeros(num_bodies, dtype=np.int32),
             "hierarchy_version": 0,
@@ -332,7 +335,8 @@ class App:
         self.shared_state["mass"][:] = _init_arr[:, 9]
             
         parent_indices = bundle["parent_indices"].copy()
-        parent_indices = update_hierarchy(sim, num_bodies, parent_indices)
+        is_star_mask = np.array([b.get('type') == 'Star' for b in bodies_data], dtype=np.bool_)
+        parent_indices = update_hierarchy(sim, num_bodies, parent_indices, is_star_mask)
         init_positions = _init_arr[:, 0:3]
         tree_indices_init, tree_depths_init = build_tree_order(parent_indices, num_bodies, init_positions)
         self.shared_state["parent_indices"][:] = parent_indices
@@ -363,6 +367,7 @@ class App:
             "vel": np.zeros((num_bodies_cmp, 3), dtype='f8'),
             "mass": np.zeros(num_bodies_cmp, dtype='f8'),
             "parent_indices": np.full(num_bodies_cmp, -1, dtype=np.int32),
+            "is_star_mask": np.array([b.get('type') == 'Star' for b in bodies_data_cmp], dtype=np.bool_),
             "tree_indices": np.zeros(num_bodies_cmp, dtype=np.int32),
             "tree_depths": np.zeros(num_bodies_cmp, dtype=np.int32),
             "hierarchy_version": 0,
@@ -395,7 +400,8 @@ class App:
         self.shared_state_cmp["mass"][:] = _init_arr_cmp[:, 9]
         
         parent_indices_cmp = bundle_cmp["parent_indices"].copy()
-        parent_indices_cmp = update_hierarchy(sim_cmp, num_bodies_cmp, parent_indices_cmp)
+        is_star_mask_cmp = np.array([b.get('type') == 'Star' for b in bodies_data_cmp], dtype=np.bool_)
+        parent_indices_cmp = update_hierarchy(sim_cmp, num_bodies_cmp, parent_indices_cmp, is_star_mask_cmp)
         init_positions_cmp = _init_arr_cmp[:, 0:3]
         tree_indices_init_cmp, tree_depths_init_cmp = build_tree_order(parent_indices_cmp, num_bodies_cmp, init_positions_cmp)
         self.shared_state_cmp["parent_indices"][:] = parent_indices_cmp
@@ -413,7 +419,7 @@ class App:
         self.visual_colors_f8_cmp = np.ascontiguousarray(self.visual_arr_cmp[:, 0:3], dtype='f8')
 
         self.time_ctrl_cmp = {
-            "paused": False,
+            "paused": True,
             "multiplier": 1.0,
             "time_direction": 1,
             "render_timeline": False,
@@ -442,7 +448,7 @@ class App:
         
         print("[Init] Warming up Numba JIT functions...")
         try:
-            _update_hierarchy_core(np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), 2)
+            _update_hierarchy_core(np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), 2, np.zeros(2, dtype=np.bool_))
             
                 
             compute_keplerian_elements(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0)
@@ -732,11 +738,12 @@ class App:
         orbit_ssbo_out.bind_to_storage_buffer(binding=1)
         vao_gpu_orbits = ctx.vertex_array(prog_gpu_orbits, [])
     
-        UBO_SIZE = 4256
+        UBO_SIZE = 4768
         scene_ubo = ctx.buffer(reserve=UBO_SIZE)
         scene_ubo.bind_to_uniform_block(1)
         ubo_staging = np.zeros(UBO_SIZE // 4, dtype=np.float32)
-        ubo_casters_int_view = ubo_staging[38:39].view(np.int32)
+        ubo_casters_int_view = ubo_staging[166:167].view(np.int32)
+        ubo_num_stars_int_view = ubo_staging[32:33].view(np.int32)
     
         uniform_screen_height = prog_spheres['screen_height']
         uniform_fov_factor = prog_spheres['fov_factor']
@@ -810,9 +817,10 @@ class App:
     
         visual_arr = np.array(visual_data, dtype='f4')
         is_star_arr = np.zeros(num_bodies, dtype='f4')
-        is_star_arr[star_idx] = 1.0
-        non_star_mask = np.ones(num_bodies, dtype=bool)
-        non_star_mask[star_idx] = False
+        for i, b in enumerate(bodies_data):
+            if b.get('type') == 'Star':
+                is_star_arr[i] = 1.0
+        non_star_mask = is_star_arr == 0.0
         non_star_indices = np.where(non_star_mask)[0][:64]
         n_casters_fixed = len(non_star_indices)
     
@@ -875,7 +883,10 @@ class App:
         orbits_med_cmp = np.zeros((0, 20), dtype='f8')
         orbits_low_cmp = np.zeros((0, 20), dtype='f8')
     
+        print("[Render Loop] Entering main render loop")
+        frame_counter = 0
         while not glfw.window_should_close(window):
+            frame_counter += 1
             # ── System Switch — render-side rebuild ──
             with self.shared_state["lock"]:
                 switch_complete = self.shared_state.get("system_switch_complete", False)
@@ -920,9 +931,10 @@ class App:
                 body_radii = np.array([v[3] for v in visual_data], dtype='f4')
                 body_colors = np.array([v[0:3] for v in visual_data], dtype='f4')
                 is_star_arr = np.zeros(num_bodies, dtype='f4')
-                is_star_arr[star_idx] = 1.0
-                non_star_mask = np.ones(num_bodies, dtype=bool)
-                non_star_mask[star_idx] = False
+                for i, b in enumerate(bodies_data):
+                    if b.get('type') == 'Star':
+                        is_star_arr[i] = 1.0
+                non_star_mask = is_star_arr == 0.0
                 non_star_indices = np.where(non_star_mask)[0][:64]
                 n_casters_fixed = len(non_star_indices)
                 star_radius_au = visual_data[star_idx][3] if star_idx < len(visual_data) else 0.00465
@@ -1072,7 +1084,9 @@ class App:
                 self.body_radii_cmp = np.array([v[3] for v in self.visual_data_cmp], dtype='f4')
                 self.body_colors_cmp = np.array([v[0:3] for v in self.visual_data_cmp], dtype='f4')
                 self.is_star_arr_cmp = np.zeros(self.num_bodies_cmp, dtype='f4')
-                self.is_star_arr_cmp[self.star_idx_cmp] = 1.0
+                for i, b in enumerate(self.bodies_data_cmp):
+                    if b.get('type') == 'Star':
+                        self.is_star_arr_cmp[i] = 1.0
                 
                 self.pos_snap_cmp = np.zeros((self.num_bodies_cmp, 3), dtype='f8')
                 self.vel_snap_cmp = np.zeros((self.num_bodies_cmp, 3), dtype='f8')
@@ -1207,18 +1221,20 @@ class App:
                             subsys_vel_buf = np.vstack([subsys_vel_buf, vel])
                             subsys_mass_buf = np.append(subsys_mass_buf, mass)
                             
-                            new_vis = np.array([color[0], color[1], color[2], r_au, 1.0, 0, 1, 0, 0], dtype='f4')
+                            min_px = 3.0 if btype == "Star" else (1.0 if btype == "Moon" else 2.0)
+                            new_vis = np.array([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0], dtype='f4')
                             visual_arr = np.vstack([visual_arr, new_vis])
                             visual_colors_f8 = np.vstack([visual_colors_f8, np.array(color, dtype='f8')])
                             body_colors = np.vstack([body_colors, np.array(color, dtype='f4')])
-                            is_star_arr = np.append(is_star_arr, 0.0)
-                            visual_data.append([color[0], color[1], color[2], r_au, 1.0, 0, 1, 0, 0])
+                            is_star_val = 1.0 if btype == "Star" else 0.0
+                            is_star_arr = np.append(is_star_arr, is_star_val)
+                            visual_data.append([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0])
                             
                             inst_data_lo = np.vstack([inst_data_lo, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                             inst_data_hi = np.vstack([inst_data_hi, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                             focused_mask = np.append(focused_mask, False)
                             
-                            non_star_indices = np.array([i for i in range(num_bodies) if i != star_idx][:64], dtype=np.int32)
+                            non_star_indices = np.where(is_star_arr == 0.0)[0][:64]
                             n_casters_fixed = len(non_star_indices)
     
                         elif op["action"] == "DELETE":
@@ -1261,7 +1277,7 @@ class App:
                             elif star_idx > idx:
                                 star_idx -= 1
                                 
-                            non_star_indices = np.array([i for i in range(num_bodies) if i != star_idx][:64], dtype=np.int32)
+                            non_star_indices = np.where(is_star_arr == 0.0)[0][:64]
                             n_casters_fixed = len(non_star_indices)
                             
                             if self.camera["tracking_idx"] == idx:
@@ -1315,6 +1331,14 @@ class App:
                                         "vy": float(op["vel"][1] - vel_snap[pidx][1]),
                                         "vz": float(op["vel"][2] - vel_snap[pidx][2])
                                     }
+                            if "type" in op:
+                                bodies_data[idx]["type"] = op["type"]
+                                is_star_arr[idx] = 1.0 if op["type"] == "Star" else 0.0
+                                min_px = 3.0 if op["type"] == "Star" else (1.0 if op["type"] == "Moon" else 2.0)
+                                visual_arr[idx][4] = min_px
+                                visual_data[idx][4] = min_px
+                                non_star_indices = np.where(is_star_arr == 0.0)[0][:64]
+                                n_casters_fixed = len(non_star_indices)
     
                     sys_mgr.save_system_data(active_system_name, bodies_data)
                     self.shared_state["crud_completed"].clear()
@@ -1687,6 +1711,8 @@ class App:
             focused_mask_buffer.bind_to_storage_buffer(binding=7)
             
             prog_culling_compute.run((total_render_bodies + 255) // 256, 1, 1)
+            ctx.memory_barrier()
+            cmds_after = draw_cmds_buffer.read()
     
             if not show_orbits:
                 n_orbits = 0
@@ -1795,7 +1821,27 @@ class App:
                             self.n_orbits_med_cmp = len(orbits_med_cmp)
                             self.n_orbits_low_cmp = len(orbits_low_cmp)
                 
-            star_cam_rel = (pos_snap[star_idx] - cam_origin).astype('f4')
+            # Gather all active stars in the unified scene (both primary and comparison)
+            stars_pos_radius = []
+            stars_colors = []
+            
+            for i in range(total_render_bodies):
+                if all_instances[i, 8] > 0.5:
+                    pos = all_instances[i, 0:3]
+                    radius = all_instances[i, 6]
+                    color = all_instances[i, 3:6]
+                    stars_pos_radius.append([pos[0], pos[1], pos[2], radius])
+                    stars_colors.append([color[0], color[1], color[2], 1.0])
+                    
+            num_stars = len(stars_pos_radius)
+            num_stars = min(num_stars, 16)
+            stars_pos_radius = stars_pos_radius[:num_stars]
+            stars_colors = stars_colors[:num_stars]
+            
+            if num_stars == 0:
+                num_stars = 1
+                stars_pos_radius = [[0.0, 0.0, 0.0, 0.00465]]
+                stars_colors = [[1.0, 1.0, 1.0, 1.0]]
             
             caster_data_buf[:n_casters_fixed, 0:3] = pos_rel_all[caster_indices[:n_casters_fixed]]
             caster_data_buf[:n_casters_fixed, 3] = body_radii[caster_indices[:n_casters_fixed]]
@@ -1833,15 +1879,32 @@ class App:
     
             ubo_staging[0:16] = projection.ravel()
             ubo_staging[16:32] = view.ravel()
-            ubo_staging[32:35] = star_cam_rel
-            ubo_staging[35] = star_radius_au
-            ubo_staging[36] = far
-            ubo_staging[37] = depth_C
+            
+            # Write num stars
+            ubo_num_stars_int_view[0] = num_stars
+            ubo_staging[33:36] = 0.0 # padding
+            
+            # Write stars arrays
+            stars_pos_radius_flat = np.zeros(64, dtype=np.float32)
+            stars_colors_flat = np.zeros(64, dtype=np.float32)
+            for s_idx in range(num_stars):
+                stars_pos_radius_flat[s_idx*4 : (s_idx+1)*4] = stars_pos_radius[s_idx]
+                stars_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_colors[s_idx]
+                
+            ubo_staging[36:100] = stars_pos_radius_flat
+            ubo_staging[100:164] = stars_colors_flat
+            
+            ubo_staging[164] = far
+            ubo_staging[165] = depth_C
             ubo_casters_int_view[0] = n_casters_fixed
-            ubo_staging[40:296] = caster_data_buf.ravel()
-            ubo_staging[296:552] = caster_poles_obl_buf.ravel()
-            ubo_staging[552:808] = caster_colors_buf.ravel()
-            ubo_staging[808:1064] = caster_atmos_buf.ravel()
+            # Note: ubo_casters_int_view maps to ubo_staging[166:167]
+            ubo_staging[167] = 0.0 # padding
+            
+            ubo_staging[168:424] = caster_data_buf.ravel()
+            ubo_staging[424:680] = caster_poles_obl_buf.ravel()
+            ubo_staging[680:936] = caster_colors_buf.ravel()
+            ubo_staging[936:1192] = caster_atmos_buf.ravel()
+            
             scene_ubo.write(ubo_staging.tobytes())
             
             fov_factor = 1.0 / math.tan(math.radians(self.camera["fov"] / 2.0))
@@ -1921,6 +1984,7 @@ class App:
                         prog_orbit_compute['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
                         prog_orbit_compute.run((n_orbits_low * 100 + 255) // 256, 1, 1)
 
+                    ctx.memory_barrier()
                     prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
                     
                     if n_orbits_hi > 0:
@@ -1974,6 +2038,8 @@ class App:
                         prog_orbit_compute['u_max_instances'].value = self.n_orbits_low_cmp
                         prog_orbit_compute['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         prog_orbit_compute.run((self.n_orbits_low_cmp * 100 + 255) // 256, 1, 1)
+                        
+                    ctx.memory_barrier()
 
                     prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
                     
@@ -2129,7 +2195,7 @@ class App:
                         float(all_instances[body_idx_in_unified, 12])
                     )
                     u_atmo_body_idx_uni.value = body_idx_in_unified
-    
+     
                     vao_atmo.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
@@ -2562,6 +2628,7 @@ class App:
                         self.camera["add_mode"] = True
                         self.camera["add_data"] = {
                             "name": f"{'Moon' if is_moon else 'Planet'} of {bodies_data[idx]['name']}",
+                            "type": "Moon" if is_moon else "Terrestrial",
                             "mass": 1.0,
                             "radius": 1737.0 if is_moon else 6371.0,
                             "color": [0.7, 0.7, 0.7] if is_moon else [0.2, 0.5, 0.8],
@@ -2703,6 +2770,7 @@ class App:
                                 self.camera["edit_data"] = {
                                     "mass": float(mass_snap[insp_idx]),
                                     "radius": float(body_info.get('r', 0.0) * 696340.0),
+                                    "type": body_info.get("type", "Moon"),
                                     "a": 0.0, "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
                                     "init_orbit": True
                                 }
@@ -2716,6 +2784,23 @@ class App:
                     if not insp_is_cmp and self.camera["edit_mode"] and not inspect_bary:
                         _, self.camera["edit_data"]["mass"] = imgui.input_double(u"Mass (M\u2609)", self.camera["edit_data"]["mass"], format="%e")
                         _, self.camera["edit_data"]["radius"] = imgui.input_double("Radius (km)", self.camera["edit_data"]["radius"], format="%.1f")
+                        edit_mass = self.camera["edit_data"]["mass"]
+                        edit_r_km = self.camera["edit_data"]["radius"]
+                        if edit_r_km > 0.0:
+                            g_m_s2 = (1.32712440018e14 * edit_mass) / (edit_r_km ** 2)
+                            g_earth = g_m_s2 / 9.80665
+                            if g_m_s2 >= 1e-4:
+                                imgui.text("  Surface G: {:.3f} m/s² ({:.3f} g)".format(g_m_s2, g_earth))
+                            else:
+                                imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
+                        
+                        types_list = ["Star", "Terrestrial", "Gas Giant", "Ice Giant", "Dwarf Planet", "Moon"]
+                        if "type" not in self.camera["edit_data"]:
+                            self.camera["edit_data"]["type"] = body_info.get("type", "Moon")
+                        type_idx = types_list.index(self.camera["edit_data"]["type"]) if self.camera["edit_data"]["type"] in types_list else 1
+                        changed_t, type_idx = imgui.combo("Type", type_idx, types_list)
+                        if changed_t:
+                            self.camera["edit_data"]["type"] = types_list[type_idx]
                     elif inspect_bary:
                         bary_mass = cur_subsys_mass_buf[insp_idx]
                         if bary_mass > 1e-4:
@@ -2744,6 +2829,13 @@ class App:
                             imgui.text(f"  Radius:  {body_r_km:,.0f} km")
                         elif body_r_km > 0.1:
                             imgui.text(f"  Radius:  {body_r_km:.1f} km")
+                        if body_r_km > 0.0:
+                            g_m_s2 = (1.32712440018e14 * body_mass) / (body_r_km ** 2)
+                            g_earth = g_m_s2 / 9.80665
+                            if g_m_s2 >= 1e-4:
+                                imgui.text("  Surface G: {:.3f} m/s² ({:.3f} g)".format(g_m_s2, g_earth))
+                            else:
+                                imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
                     
                     if parent_idx >= 0:
                         imgui.separator()
@@ -2886,7 +2978,8 @@ class App:
                                 "action": "UPDATE",
                                 "idx": insp_idx,
                                 "mass": ed["mass"],
-                                "radius": ed["radius"]
+                                "radius": ed["radius"],
+                                "type": ed["type"]
                             }
                             if parent_idx >= 0:
                                 p_pos = pos_snap_render[parent_idx]
@@ -3190,6 +3283,15 @@ class App:
                     ad = self.camera["add_data"]
                     is_moon = ad.get("is_moon", False)
                     _, ad["name"] = imgui.input_text("Name", ad["name"], 256)
+                    
+                    types_list = ["Star", "Terrestrial", "Gas Giant", "Ice Giant", "Dwarf Planet", "Moon"]
+                    if "type" not in ad:
+                        ad["type"] = "Moon" if is_moon else "Terrestrial"
+                    type_idx = types_list.index(ad["type"]) if ad["type"] in types_list else 1
+                    changed_t, type_idx = imgui.combo("Type", type_idx, types_list)
+                    if changed_t:
+                        ad["type"] = types_list[type_idx]
+                        
                     _, ad["color"] = imgui.color_edit3("Color", *ad["color"])
                     
                     if is_moon:
@@ -3199,6 +3301,15 @@ class App:
                         
                     _, ad["radius"] = imgui.input_double("Radius (km)", ad["radius"], format="%.1f")
                     
+                    if ad["radius"] > 0.0:
+                        real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
+                        g_m_s2 = (1.32712440018e14 * real_mass) / (ad["radius"] ** 2)
+                        g_earth = g_m_s2 / 9.80665
+                        if g_m_s2 >= 1e-4:
+                            imgui.text("  Surface G: {:.3f} m/s² ({:.3f} g)".format(g_m_s2, g_earth))
+                        else:
+                            imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
+                            
                     imgui.separator()
                     imgui.text_colored("Orbital Elements", 1.0, 0.85, 0.4)
                     _, ad["frame"] = imgui.combo("Reference Frame", ad["frame"], ["Ecliptic", "Equatorial"])
@@ -3252,7 +3363,7 @@ class App:
                             "radius": ad["radius"],
                             "mass": real_mass,
                             "color": list(ad["color"]),
-                            "type": "Moon" if parent_m < 0.01 else "Planet",
+                            "type": ad["type"],
                             "parent_idx": insp_idx,
                             "pos": [new_ecl_x, new_ecl_y, new_ecl_z],
                             "vel": [new_ecl_vx, new_ecl_vy, new_ecl_vz]
@@ -3350,7 +3461,7 @@ class App:
                 imgui.end()
     
             imgui.render()
-    
+     
             self.impl.render(imgui.get_draw_data())
             glfw.swap_buffers(window)
             
