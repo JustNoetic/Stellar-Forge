@@ -45,6 +45,7 @@ void main() {
     
     vec4 f0 = instances[idx * 6 + 0];
     vec4 f1 = instances[idx * 6 + 1];
+    vec4 f2 = instances[idx * 6 + 2];
     
     vec3 pos = f0.xyz;
     float r = f1.z;
@@ -127,7 +128,7 @@ void main() {
     // 3. Lodge into visible buffers
     if (visible) {
         bool is_ultra = (int(idx) == u_tracking_idx);
-        bool is_focused = (focused_mask[idx] > 0u);
+        bool is_focused = (focused_mask[idx] > 0u) || (f2.x > 0.5);
         
         if (is_ultra) {
             uint slot = atomicAdd(cmds[2].instanceCount, 1u);
@@ -421,33 +422,82 @@ void main() {
             // === Ring shadow on planet surface ===
             // Only compute ring shadows if the fragment is lit by this star
             if (NdotL > -sin_alpha) {
+                uint processed_mask = 0u;
                 for (int k = 0; k < u_num_ring_planes; k++) {
                     if ((f_ring_mask & (1u << k)) == 0u) continue;
+                    if ((processed_mask & (1u << k)) != 0u) continue;
                     
-                    vec3 ring_center = u_ring_center[k];
-                    vec3 ring_normal = u_ring_normal[k];
-                    float inner_r = u_ring_params[k].x;
-                    float outer_r = u_ring_params[k].y;
-                    float opacity = u_ring_params[k].z;
+                    vec3 plane_center = u_ring_center[k];
+                    vec3 plane_normal = u_ring_normal[k];
                     
-                    float denom = dot(L, ring_normal);
+                    uint coplanar_mask = 0u;
+                    for (int j = k; j < u_num_ring_planes; j++) {
+                        if ((f_ring_mask & (1u << j)) == 0u) continue;
+                        if (distance(plane_center, u_ring_center[j]) < 1e-6 && 
+                            dot(plane_normal, u_ring_normal[j]) > 0.999) {
+                            coplanar_mask |= (1u << j);
+                            processed_mask |= (1u << j);
+                        }
+                    }
+                    
+                    float denom = dot(L, plane_normal);
                     if (abs(denom) < 1e-8) continue;
                     
-                    float t = dot(ring_center - f_world_pos, ring_normal) / denom;
+                    float t = dot(plane_center - f_world_pos, plane_normal) / denom;
                     if (t <= 0.0 || t >= dist_to_star) continue;
                     
                     vec3 hit = f_world_pos + t * L;
-                    float dist_from_center = length(hit - ring_center);
+                    vec3 vec_radial = hit - plane_center;
+                    float d = length(vec_radial);
                     
-                    if (dist_from_center >= inner_r && dist_from_center <= outer_r) {
-                        float edge_width = (outer_r - inner_r) * 0.05;
-                        float inner_fade = smoothstep(inner_r, inner_r + edge_width, dist_from_center);
-                        float outer_fade = smoothstep(outer_r, outer_r - edge_width, dist_from_center);
-                        float p = (dist_from_center - inner_r) / max(1e-6, outer_r - inner_r);
-                        float alpha_mult = texture(u_ring_gradients, vec2(p, (float(k) + 0.5) / 16.0)).r;
-                        float ring_shadow = inner_fade * outer_fade * opacity * alpha_mult;
-                        shadow *= vec3(1.0 - ring_shadow);
+                    float r_star_proj = star_radius * t / dist_to_star;
+                    vec3 L_plane = L - denom * plane_normal;
+                    float L_plane_len = length(L_plane);
+                    
+                    float R_eff = r_star_proj;
+                    if (L_plane_len > 1e-5 && d > 1e-5) {
+                        vec3 L_proj = L_plane / L_plane_len;
+                        vec3 T = normalize(cross(plane_normal, L));
+                        vec3 dir_radial = vec_radial / d;
+                        float cos_theta = dot(dir_radial, L_proj);
+                        float sin_theta = dot(dir_radial, T);
+                        R_eff = r_star_proj * sqrt( pow(cos_theta / max(1e-6, abs(denom)), 2.0) + pow(sin_theta, 2.0) );
                     }
+                    
+                    float plane_occlusion = 0.0;
+                    
+                    for (int j = k; j < u_num_ring_planes; j++) {
+                        if ((coplanar_mask & (1u << j)) == 0u) continue;
+                        float inner_r = u_ring_params[j].x;
+                        float outer_r = u_ring_params[j].y;
+                        
+                        float overlap_min = max(inner_r, d - R_eff);
+                        float overlap_max = min(outer_r, d + R_eff);
+                        
+                        if (overlap_min >= overlap_max) continue;
+                        
+                        float v_min = clamp((overlap_min - d) / max(1e-6, R_eff), -1.0, 1.0);
+                        float v_max = clamp((overlap_max - d) / max(1e-6, R_eff), -1.0, 1.0);
+                        
+                        float f_max = (v_max * sqrt(max(0.0, 1.0 - v_max*v_max)) + asin(v_max)) / 3.14159265358979 + 0.5;
+                        float f_min = (v_min * sqrt(max(0.0, 1.0 - v_min*v_min)) + asin(v_min)) / 3.14159265358979 + 0.5;
+                        float fraction = max(0.0, f_max - f_min);
+                        
+                        float sum_alpha = 0.0;
+                        int tex_samples = 5;
+                        for(int s = 0; s < tex_samples; s++) {
+                            float u = (float(s) + 0.5) / float(tex_samples);
+                            float r = mix(overlap_min, overlap_max, u);
+                            float p = (r - inner_r) / max(1e-6, outer_r - inner_r);
+                            sum_alpha += texture(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0)).r;
+                        }
+                        float alpha_mult = sum_alpha / float(tex_samples);
+                        float opacity = u_ring_params[j].z;
+                        
+                        plane_occlusion += fraction * opacity * alpha_mult;
+                    }
+                    
+                    shadow *= vec3(1.0 - min(plane_occlusion, 1.0));
                 }
             }
             
@@ -1251,28 +1301,83 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         }
         shadow *= caster_shadow;
     }
+    uint processed_mask = 0u;
     for (int i = 0; i < g_num_local_rings; i++) {
         int k = g_local_rings[i];
-        vec3 ring_center = u_ring_center[k];
-        vec3 ring_normal = u_ring_normal[k];
-        float inner_r = u_ring_params[k].x;
-        float outer_r = u_ring_params[k].y;
-        float opacity = u_ring_params[k].z;
-        float denom = dot(L_dir, ring_normal);
-        if (abs(denom) < 1e-8) continue;
-        float t_ring = dot(ring_center - eval_render_pos, ring_normal) / denom;
-        if (t_ring <= 0.0 || t_ring >= dist_to_star) continue;
-        vec3 hit = eval_render_pos + t_ring * L_dir;
-        float dist_from_center = length(hit - ring_center);
-        if (dist_from_center >= inner_r && dist_from_center <= outer_r) {
-            float edge_width = (outer_r - inner_r) * 0.05;
-            float inner_fade = smoothstep(inner_r, inner_r + edge_width, dist_from_center);
-            float outer_fade = smoothstep(outer_r, outer_r - edge_width, dist_from_center);
-            float p = (dist_from_center - inner_r) / max(1e-6, outer_r - inner_r);
-            float alpha_mult = texture(u_ring_gradients, vec2(p, (float(k) + 0.5) / 16.0)).r;
-            float ring_shadow = inner_fade * outer_fade * opacity * alpha_mult;
-            shadow *= vec3(1.0 - ring_shadow);
+        if ((processed_mask & (1u << k)) != 0u) continue;
+        
+        vec3 plane_center = u_ring_center[k];
+        vec3 plane_normal = u_ring_normal[k];
+        
+        uint coplanar_mask = 0u;
+        for (int j = i; j < g_num_local_rings; j++) {
+            int ring_idx = g_local_rings[j];
+            if (distance(plane_center, u_ring_center[ring_idx]) < 1e-6 && 
+                dot(plane_normal, u_ring_normal[ring_idx]) > 0.999) {
+                coplanar_mask |= (1u << ring_idx);
+                processed_mask |= (1u << ring_idx);
+            }
         }
+        
+        float denom = dot(L_dir, plane_normal);
+        if (abs(denom) < 1e-8) continue;
+        
+        float t_ring = dot(plane_center - eval_render_pos, plane_normal) / denom;
+        if (t_ring <= 0.0 || t_ring >= dist_to_star) continue;
+        
+        vec3 hit = eval_render_pos + t_ring * L_dir;
+        vec3 vec_radial = hit - plane_center;
+        float d = length(vec_radial);
+        
+        float r_star_proj = star_radius * t_ring / dist_to_star;
+        vec3 L_plane = L_dir - denom * plane_normal;
+        float L_plane_len = length(L_plane);
+        
+        float R_eff = r_star_proj;
+        if (L_plane_len > 1e-5 && d > 1e-5) {
+            vec3 L_proj = L_plane / L_plane_len;
+            vec3 T = normalize(cross(plane_normal, L_dir));
+            vec3 dir_radial = vec_radial / d;
+            float cos_theta = dot(dir_radial, L_proj);
+            float sin_theta = dot(dir_radial, T);
+            R_eff = r_star_proj * sqrt( pow(cos_theta / max(1e-6, abs(denom)), 2.0) + pow(sin_theta, 2.0) );
+        }
+        
+        float plane_occlusion = 0.0;
+        
+        for (int j = i; j < g_num_local_rings; j++) {
+            int ring_idx = g_local_rings[j];
+            if ((coplanar_mask & (1u << ring_idx)) == 0u) continue;
+            float inner_r = u_ring_params[ring_idx].x;
+            float outer_r = u_ring_params[ring_idx].y;
+            
+            float overlap_min = max(inner_r, d - R_eff);
+            float overlap_max = min(outer_r, d + R_eff);
+            
+            if (overlap_min >= overlap_max) continue;
+            
+            float v_min = clamp((overlap_min - d) / max(1e-6, R_eff), -1.0, 1.0);
+            float v_max = clamp((overlap_max - d) / max(1e-6, R_eff), -1.0, 1.0);
+            
+            float f_max = (v_max * sqrt(max(0.0, 1.0 - v_max*v_max)) + asin(v_max)) / 3.14159265358979 + 0.5;
+            float f_min = (v_min * sqrt(max(0.0, 1.0 - v_min*v_min)) + asin(v_min)) / 3.14159265358979 + 0.5;
+            float fraction = max(0.0, f_max - f_min);
+            
+            float sum_alpha = 0.0;
+            int tex_samples = 5;
+            for(int s = 0; s < tex_samples; s++) {
+                float u = (float(s) + 0.5) / float(tex_samples);
+                float r = mix(overlap_min, overlap_max, u);
+                float p = (r - inner_r) / max(1e-6, outer_r - inner_r);
+                sum_alpha += texture(u_ring_gradients, vec2(p, (float(ring_idx) + 0.5) / 16.0)).r;
+            }
+            float alpha_mult = sum_alpha / float(tex_samples);
+            float opacity = u_ring_params[ring_idx].z;
+            
+            plane_occlusion += fraction * opacity * alpha_mult;
+        }
+        
+        shadow *= vec3(1.0 - min(plane_occlusion, 1.0));
     }
     return shadow;
 }
@@ -1472,16 +1577,16 @@ void main() {
             float h_norm = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
             float uv_x = light_cos_theta * 0.5 + 0.5;
             vec2 lut_uv = vec2(uv_x, h_norm);
+            
             vec4 od_light = texture(u_optical_depth_lut, lut_uv);
+            
+            // --- Soft terminator correction ---
+            float sin_planet_angle = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
+            float cos_horizon = -sqrt(max(0.0, 1.0 - sin_planet_angle * sin_planet_angle));
 
             float od_light_R = od_light.r;
             float od_light_M = od_light.g;
             float penumbra_factor = 1.0;
-            bool in_shadow = false;
-
-            // --- Soft terminator correction ---
-            float sin_planet_angle = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
-            float cos_horizon = -sqrt(max(0.0, 1.0 - sin_planet_angle * sin_planet_angle));
 
             float sin_star = u_star_angular_radius;
             if (sin_star > 1e-5) {
@@ -1489,17 +1594,23 @@ void main() {
                 float penumbra_width = sin_star * 2.0;
                 penumbra_factor = clamp(angular_dist / max(1e-6, penumbra_width) + 0.5, 0.0, 1.0);
                 
-                if (penumbra_factor < 0.001) {
-                    in_shadow = true;
+                if (penumbra_factor < 0.999) {
+                    vec2 horizon_uv = vec2((-cos_horizon) * 0.5 + 0.5, h_norm);
+                    vec4 od_horizon = texture(u_optical_depth_lut, horizon_uv);
+                    
+                    if (penumbra_factor < 0.5) {
+                        od_light_R = od_horizon.r;
+                        od_light_M = od_horizon.g;
+                    } else {
+                        float blend_t = (penumbra_factor - 0.5) / 0.5;
+                        od_light_R = mix(od_horizon.r, od_light.r, blend_t);
+                        od_light_M = mix(od_horizon.g, od_light.g, blend_t);
+                    }
                 }
             } else {
                 if (light_cos_theta < cos_horizon) {
-                    in_shadow = true;
+                    penumbra_factor = 0.0;
                 }
-            }
-
-            if (in_shadow) {
-                continue; // in planet shadow
             }
 
             // 7. Accumulate in-scattered light
@@ -1608,7 +1719,7 @@ void main() {
     
     float ray_len = t_atmo.y;
     if (t_planet.x > 0.0 && t_planet.x < t_atmo.y) {
-        // Ray hits the planet: integrate up to the surface
+        // Ray hits the planet — integrate to the surface
         ray_len = t_planet.x;
     }
     
