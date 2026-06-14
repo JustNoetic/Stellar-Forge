@@ -142,43 +142,46 @@ def main():
     if os.environ.get("STELLAR_FORGE_PERF") != "1":
         os.environ["STELLAR_FORGE_PERF"] = "1"
 
-    import main as m  # imports main, which detects STELLAR_FORGE_PERF and enables the tracker
+    import app as ap
+    import physics_core as pc
+    import glfw
 
     tracker = PerfTracker()
-    if getattr(m, "_PERF_TRACKER", None) is not None:
-        # Use the same tracker instance that main.py is now writing into.
-        tracker = m._PERF_TRACKER
+    if getattr(ap, "_PERF_TRACKER", None) is not None:
+        tracker = ap._PERF_TRACKER
     else:
-        # main.py did not pick up STELLAR_FORGE_PERF (e.g. it was set after import).
-        # Attach it now so the run is still instrumented.
-        m._PERF_TRACKER = tracker
-        if hasattr(m, "_PERF_INSTALL_TRACKER"):
-            m._PERF_INSTALL_TRACKER(tracker)
+        ap._PERF_TRACKER = tracker
+        if hasattr(ap, "_PERF_INSTALL_TRACKER"):
+            ap._PERF_INSTALL_TRACKER(tracker)
 
-    # Patch CPU hot-path functions on the main module. These are called by
-    # the render loop on the main thread, so they show up cleanly here.
+    # Patch CPU hot-path functions on both physics_core and app modules.
     patch_targets = [
         ("compute_barycenters", "compute_barycenters"),
         ("compute_all_orbits_batch", "compute_all_orbits_batch"),
         ("update_hierarchy", "update_hierarchy"),
     ]
-    if hasattr(m, "compute_j2_numba"):
+    if hasattr(pc, "compute_j2_numba"):
         patch_targets.append(("compute_j2_numba", "compute_j2_numba"))
     for fn_name, label in patch_targets:
-        if hasattr(m, fn_name):
-            patch_function(m, fn_name, tracker, label)
+        if hasattr(pc, fn_name):
+            patch_function(pc, fn_name, tracker, label)
+        if hasattr(ap, fn_name):
+            patch_function(ap, fn_name, tracker, label)
 
-    # Apply options to time_ctrl before main() starts the physics thread.
+    # Instantiate the application.
+    app_instance = ap.App()
+
+    # Apply options to time_ctrl before starting the app.
     if args.sim_speed != 1.0:
-        m.time_ctrl["multiplier"] = args.sim_speed
+        app_instance.time_ctrl["multiplier"] = args.sim_speed
     if args.no_physics:
-        m.time_ctrl["paused"] = True
+        app_instance.time_ctrl["paused"] = True
 
     # Set up frame-time capture by patching swap_buffers.
     warmup_done = [False]
     warmup_start = time.perf_counter()
     last_swap = [time.perf_counter()]
-    original_swap = m.glfw.swap_buffers
+    original_swap = glfw.swap_buffers
 
     def patched_swap(window):
         now = time.perf_counter()
@@ -194,28 +197,28 @@ def main():
             print(f"[Perf] Starting measurement window of {measure}s ...")
         if warmup_done[0] and elapsed >= total_runtime:
             print(f"[Perf] Measurement window complete ({measure}s). Stopping ...")
-            m.glfw.set_window_should_close(window, True)
+            glfw.set_window_should_close(window, True)
         return original_swap(window)
 
-    m.glfw.swap_buffers = patched_swap
+    glfw.swap_buffers = patched_swap
 
     # Optional FPS cap (sleep at the start of each frame).
     if args.fps_cap > 0:
         min_dt = 1.0 / args.fps_cap
-        original_poll = m.glfw.poll_events
+        original_poll = glfw.poll_events
         def capped_poll():
             now = time.perf_counter()
             wait = min_dt - (now - last_swap[0])
             if wait > 0:
                 time.sleep(wait)
             return original_poll()
-        m.glfw.poll_events = capped_poll
+        glfw.poll_events = capped_poll
 
-    # Run.
+    # Run the application.
     if args.profile:
         profiler = cProfile.Profile()
         profiler.enable()
-    m.main()
+    app_instance.run()
     if args.profile:
         profiler.disable()
         stats = pstats.Stats(profiler).sort_stats('tottime')

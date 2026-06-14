@@ -61,6 +61,256 @@ def _PERF_INSTALL_TRACKER(tracker):
     global _PERF_TRACKER
     _PERF_TRACKER = tracker
 
+import OpenGL.GL as gl
+import ctypes
+
+class ModernGLImGuiRenderer(object):
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.io = imgui.get_io()
+        self.textures = {}
+        
+        self.prog = ctx.program(
+            vertex_shader="""
+                #version 330 core
+                uniform mat4 ProjMtx;
+                in vec2 Position;
+                in vec2 UV;
+                in vec4 Color;
+                out vec2 Frag_UV;
+                out vec4 Frag_Color;
+                void main() {
+                    Frag_UV = UV;
+                    Frag_Color = Color;
+                    gl_Position = ProjMtx * vec4(Position.xy, 0.0, 1.0);
+                }
+            """,
+            fragment_shader="""
+                #version 330 core
+                uniform sampler2D Texture;
+                in vec2 Frag_UV;
+                in vec4 Frag_Color;
+                out vec4 Out_Color;
+                void main() {
+                    Out_Color = Frag_Color * texture(Texture, Frag_UV.st);
+                }
+            """
+        )
+        self.proj_mtx_uniform = self.prog['ProjMtx']
+        self.texture_uniform = self.prog['Texture']
+        self.texture_uniform.value = 0
+        
+        self.vbo = ctx.buffer(reserve=1024 * 1024)
+        self.ibo = ctx.buffer(reserve=1024 * 1024)
+        
+        self.vao = ctx.vertex_array(
+            self.prog,
+            [(self.vbo, '2f 2f 4f1', 'Position', 'UV', 'Color')],
+            index_buffer=self.ibo
+        )
+        
+        self.font_texture = None
+        self.refresh_font_texture()
+        
+    def refresh_font_texture(self):
+        width, height, pixels = self.io.fonts.get_tex_data_as_rgba32()
+        if self.font_texture:
+            if self.font_texture.glo in self.textures:
+                del self.textures[self.font_texture.glo]
+            self.font_texture.release()
+        self.font_texture = self.ctx.texture((width, height), 4, data=pixels)
+        self.font_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.io.fonts.texture_id = self.font_texture.glo
+        self.textures[self.font_texture.glo] = self.font_texture
+        self.io.fonts.clear_tex_data()
+        
+    def render(self, draw_data):
+        io = self.io
+        display_width, display_height = io.display_size
+        fb_width = int(display_width * io.display_fb_scale[0])
+        fb_height = int(display_height * io.display_fb_scale[1])
+        if fb_width == 0 or fb_height == 0:
+            return
+            
+        draw_data.scale_clip_rects(*io.display_fb_scale)
+        
+        ortho_projection = np.array([
+             [ 2.0/display_width,  0.0,                   0.0, 0.0],
+             [ 0.0,                2.0/-display_height,   0.0, 0.0],
+             [ 0.0,                0.0,                  -1.0, 0.0],
+             [-1.0,                1.0,                   0.0, 1.0]
+        ], dtype='f4')
+        self.proj_mtx_uniform.write(ortho_projection.tobytes())
+        
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.depth_mask = False
+        
+        self.ctx.viewport = (0, 0, fb_width, fb_height)
+        
+        for commands in draw_data.commands_lists:
+            vtx_bytes_size = commands.vtx_buffer_size * imgui.VERTEX_SIZE
+            idx_bytes_size = commands.idx_buffer_size * imgui.INDEX_SIZE
+            
+            vtx_data = ctypes.string_at(commands.vtx_buffer_data, vtx_bytes_size)
+            idx_data = ctypes.string_at(commands.idx_buffer_data, idx_bytes_size)
+            
+            if self.vbo.size < vtx_bytes_size:
+                self.vbo.orphan(vtx_bytes_size)
+            self.vbo.write(vtx_data)
+            
+            if self.ibo.size < idx_bytes_size:
+                self.ibo.orphan(idx_bytes_size)
+            self.ibo.write(idx_data)
+            
+            idx_buffer_offset = 0
+            for command in commands.commands:
+                texture = self.textures.get(command.texture_id)
+                if texture:
+                    texture.use(location=0)
+                else:
+                    gl.glBindTexture(gl.GL_TEXTURE_2D, command.texture_id)
+                
+                x, y, z, w = command.clip_rect
+                self.ctx.scissor = (int(x), int(fb_height - w), int(z - x), int(w - y))
+                
+                self.vao.render(moderngl.TRIANGLES, vertices=command.elem_count, first=idx_buffer_offset // imgui.INDEX_SIZE)
+                idx_buffer_offset += command.elem_count * imgui.INDEX_SIZE
+                
+        self.ctx.scissor = None
+        self.ctx.depth_mask = True
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        
+    def shutdown(self):
+        if self.vao:
+            self.vao.release()
+        if self.vbo:
+            self.vbo.release()
+        if self.ibo:
+            self.ibo.release()
+        if self.prog:
+            self.prog.release()
+        if self.font_texture:
+            self.font_texture.release()
+
+class ModernGLGlfwRenderer(GlfwRenderer):
+    def __init__(self, window, ctx, attach_callbacks=True):
+        self.modern_renderer = ModernGLImGuiRenderer(ctx)
+        super().__init__(window, attach_callbacks)
+        # Base class init calls refresh_font_texture which registers our ModernGL font texture.
+        # But _invalidate_device_objects resets io.fonts.texture_id to 0. We must restore it.
+        font_id = self.modern_renderer.font_texture.glo if self.modern_renderer.font_texture else 0
+        self._invalidate_device_objects()
+        self.io.fonts.texture_id = font_id
+        
+    def refresh_font_texture(self):
+        self.modern_renderer.refresh_font_texture()
+        self._font_texture = 0
+        
+    def render(self, draw_data):
+        self.modern_renderer.render(draw_data)
+        
+    def shutdown(self):
+        self.modern_renderer.shutdown()
+
+@njit
+def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors):
+    N = len(pos)
+    planetshine_dirs = np.zeros((N, 3), dtype=np.float32)
+    planetshine_colors = np.zeros((N, 3), dtype=np.float32)
+    
+    num_stars = len(star_positions)
+    if num_stars == 0:
+        return planetshine_dirs, planetshine_colors
+        
+    for i in range(N):
+        if is_star[i] > 0.5:
+            continue
+            
+        pos_i = pos[i]
+        
+        best_j = -1
+        best_val = -1.0
+        best_dir = np.zeros(3, dtype=np.float32)
+        best_color = np.zeros(3, dtype=np.float32)
+        
+        for j in range(N):
+            if i == j or is_star[j] > 0.5:
+                continue
+                
+            pos_j = pos[j]
+            r_j = radii[j]
+            
+            dx = pos_j[0] - pos_i[0]
+            dy = pos_j[1] - pos_i[1]
+            dz = pos_j[2] - pos_i[2]
+            dist_sq = dx*dx + dy*dy + dz*dz
+            
+            min_dist = r_j * 1.05
+            max_dist = r_j * 300.0
+            if dist_sq < min_dist * min_dist or dist_sq > max_dist * max_dist:
+                continue
+                
+            solid_angle = (r_j * r_j) / dist_sq
+            if solid_angle < 1e-8:
+                continue
+                
+            dist = np.sqrt(dist_sq)
+            dir_to_caster_x = dx / dist
+            dir_to_caster_y = dy / dist
+            dir_to_caster_z = dz / dist
+            
+            total_caster_light_r = 0.0
+            total_caster_light_g = 0.0
+            total_caster_light_b = 0.0
+            
+            for s in range(num_stars):
+                star_pos = star_positions[s]
+                star_col = star_colors[s]
+                
+                cx = star_pos[0] - pos_j[0]
+                cy = star_pos[1] - pos_j[1]
+                cz = star_pos[2] - pos_j[2]
+                c_dist = np.sqrt(cx*cx + cy*cy + cz*cz)
+                if c_dist > 1e-6:
+                    cx /= c_dist
+                    cy /= c_dist
+                    cz /= c_dist
+                else:
+                    cx = 0.0
+                    cy = 0.0
+                    cz = 0.0
+                    
+                phase = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
+                if phase < 0.0:
+                    phase = 0.0
+                    
+                total_caster_light_r += star_col[0] * phase
+                total_caster_light_g += star_col[1] * phase
+                total_caster_light_b += star_col[2] * phase
+                
+            bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * 2.0
+            bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * 2.0
+            bounce_b = colors[j, 2] * total_caster_light_b * solid_angle * 2.0
+            
+            val = bounce_r*bounce_r + bounce_g*bounce_g + bounce_b*bounce_b
+            if val > best_val:
+                best_val = val
+                best_j = j
+                best_dir[0] = dir_to_caster_x
+                best_dir[1] = dir_to_caster_y
+                best_dir[2] = dir_to_caster_z
+                best_color[0] = bounce_r
+                best_color[1] = bounce_g
+                best_color[2] = bounce_b
+                
+        if best_j != -1 and best_val > 1e-12:
+            planetshine_dirs[i] = best_dir
+            planetshine_colors[i] = best_color
+            
+    return planetshine_dirs, planetshine_colors
+
 class App:
     def __init__(self):
         self.window_width, self.window_height = 1280, 720
@@ -90,6 +340,9 @@ class App:
             "inspect_bary": False,
             "edit_mode": False,
             "edit_data": {},
+            "show_settings_modal": False,
+            "planetshine_enabled": True,
+            "ringshine_enabled": True,
         }
         self.time_ctrl = {
             "paused": True,
@@ -453,7 +706,7 @@ class App:
                 
             compute_keplerian_elements(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0)
             compute_barycenters(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2))
-            compute_all_orbits_batch(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.zeros((2, 3), dtype=np.float64), np.zeros(3), 1.0, 10, np.zeros((10, 20), dtype=np.float64), np.zeros(2, dtype=np.float64))
+            compute_all_orbits_batch(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.zeros((2, 3), dtype=np.float64), np.zeros(3), 1.0, 10, np.zeros((10, 20), dtype=np.float64), np.zeros(2, dtype=np.float64), np.zeros(3, dtype=np.float64))
         except Exception as e:
             print(f"[Init] Warmup warning: {e}")
             
@@ -510,7 +763,7 @@ class App:
         if os.path.exists(font_path):
             io.fonts.add_font_from_file_ttf(font_path, 13.0, font_config=font_config, glyph_ranges=ranges)
             
-        self.impl = GlfwRenderer(window, attach_callbacks=False)
+        self.impl = ModernGLGlfwRenderer(window, ctx, attach_callbacks=False)
         
         glfw.set_scroll_callback(window, self.scroll_callback)
         glfw.set_mouse_button_callback(window, self.mouse_button_callback)
@@ -635,6 +888,7 @@ class App:
                     'gradient': sorted_gradient,
                 })
     
+        ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
         ring_gradient_data = np.zeros((16, 256), dtype='f4')
         for j, ring in enumerate(ring_precomputed):
             if j >= 16: break
@@ -685,7 +939,7 @@ class App:
                 'num_indices': len(all_i),
             })
     
-        INSTANCE_FLOATS = 16
+        INSTANCE_FLOATS = 24
         MAX_BODIES = 1000
     
         mesh_lo_verts, mesh_lo_idx = create_icosphere_mesh(subdivisions=1)
@@ -700,7 +954,7 @@ class App:
         ibo_ultra = ctx.buffer(mesh_ultra_idx.tobytes())
     
         # Instead of vbo_instances, use SSBOs for GPU culling
-        all_instances_buffer = ctx.buffer(reserve=MAX_BODIES * 64) # 16 floats * 4 bytes
+        all_instances_buffer = ctx.buffer(reserve=MAX_BODIES * 96) # 24 floats * 4 bytes
         vis_lo_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_hi_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_ultra_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
@@ -783,6 +1037,7 @@ class App:
         u_ring_clip_mode = prog_rings['u_clip_mode']
         u_ring_caster_mask_lo_uni = prog_rings['u_caster_mask_lo']
         u_ring_caster_mask_hi_uni = prog_rings['u_caster_mask_hi']
+        u_ring_planetshine_enabled = prog_rings.get('u_planetshine_enabled', None)
 
         u_atmo_body_offset = prog_atmo['u_body_offset']
         if 'u_ring_gradients' in prog_atmo:
@@ -793,6 +1048,7 @@ class App:
         u_atmo_atmo_radius = prog_atmo['u_atmo_radius_km']
         u_atmo_radius_au_uniform = prog_atmo['u_atmo_radius_au']
         u_atmo_au_to_km = prog_atmo['u_au_to_km']
+        u_atmo_star_angular_radius = prog_atmo['u_star_angular_radius']
         u_atmo_beta_rayleigh = prog_atmo['u_beta_rayleigh']
         u_atmo_h_rayleigh = prog_atmo['u_h_rayleigh']
         u_atmo_beta_mie = prog_atmo['u_beta_mie']
@@ -810,6 +1066,11 @@ class App:
         u_atmo_ring_centers = prog_atmo['u_ring_center']
         u_atmo_ring_normals = prog_atmo['u_ring_normal']
         u_atmo_ring_params = prog_atmo['u_ring_params']
+        u_atmo_num_active_casters = prog_atmo['u_num_active_casters']
+        u_atmo_active_casters = prog_atmo['u_active_casters']
+        u_atmo_active_caster_poles_obl = prog_atmo['u_active_caster_poles_obl']
+        u_atmo_active_caster_atmos = prog_atmo['u_active_caster_atmos']
+        u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
 
 
     
@@ -1007,6 +1268,7 @@ class App:
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
                         })
     
+                ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
                 # Rebuild ring render groups
                 ring_gradient_data_sw = np.zeros((16, 256), dtype='f4')
                 for j, ring in enumerate(ring_precomputed):
@@ -1299,6 +1561,7 @@ class App:
                             for r in ring_precomputed:
                                 if r['body_idx'] > idx: r['body_idx'] -= 1
                                 
+                            ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
                             ring_render_groups = [g for g in ring_render_groups if g['body_idx'] != idx]
                             for g in ring_render_groups:
                                 if g['body_idx'] > idx: g['body_idx'] -= 1
@@ -1313,6 +1576,16 @@ class App:
                                 body_radii[idx] = r_au
                                 visual_arr[idx][3] = r_au
                                 visual_data[idx][3] = r_au
+                                for a in atmo_bodies:
+                                    if a['body_idx'] == idx:
+                                        a['planet_radius_km'] = float(op["radius"])
+                                        a['surface_radius_au'] = r_au
+                                        if a['atmo_radius_km'] < a['planet_radius_km']:
+                                            a['atmo_radius_km'] = a['planet_radius_km'] * 1.025
+                                            a['atmo_radius_au'] = a['atmo_radius_km'] / 1.496e8
+                                        if 'lut_tex' in a:
+                                            a['lut_tex'].release()
+                                            del a['lut_tex']
                             if "color" in op:
                                 c = op["color"]
                                 bodies_data[idx]["color"] = f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}"
@@ -1566,7 +1839,6 @@ class App:
             ring_params_buf[:] = 0
             ring_colors_buf[:] = 0
             
-            ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
             for ring in ring_precomputed:
                 if n_ring_planes >= 16:
                     break
@@ -1665,6 +1937,22 @@ class App:
                 all_instances[num_bodies:, 9:12] = self.visual_arr_cmp[:, 5:8]
                 all_instances[num_bodies:, 12] = self.visual_arr_cmp[:, 8]
             
+            # Precalculate planetshine bounce light direction & color on CPU using Numba
+            is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
+            star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
+            star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
+            
+            planetshine_dirs, planetshine_colors = compute_planetshine_numba(
+                all_instances[:total_render_bodies, 0:3],
+                all_instances[:total_render_bodies, 6],
+                all_instances[:total_render_bodies, 3:6],
+                all_instances[:total_render_bodies, 8],
+                star_positions,
+                star_colors
+            )
+            all_instances[:total_render_bodies, 16:19] = planetshine_dirs
+            all_instances[:total_render_bodies, 19:22] = planetshine_colors
+            
             all_instances_buffer.write(all_instances[:total_render_bodies].tobytes())
             
             cmds_data = np.array([
@@ -1712,7 +2000,6 @@ class App:
             
             prog_culling_compute.run((total_render_bodies + 255) // 256, 1, 1)
             ctx.memory_barrier()
-            cmds_after = draw_cmds_buffer.read()
     
             if not show_orbits:
                 n_orbits = 0
@@ -1723,12 +2010,13 @@ class App:
                 self.n_orbits_hi_cmp = 0
                 self.n_orbits_med_cmp = 0
                 self.n_orbits_low_cmp = 0
+                last_orbit_pos_snap = None
+                last_orbit_pos_snap_cmp = None
             else:
                 recompute_orbits = True
                 if last_orbit_pos_snap is not None and self.time_ctrl.get("paused"):
-                    if not self.camera.get("left_dragging") and not self.camera.get("right_dragging") and self.camera.get("tracking_idx") is None:
-                        if np.array_equal(pos_snap_render, last_orbit_pos_snap) and np.array_equal(cam_origin, last_cam_origin):
-                            recompute_orbits = False
+                    if np.array_equal(pos_snap_render, last_orbit_pos_snap):
+                        recompute_orbits = False
                 
                 if recompute_orbits:
                     lod_levels = np.full(num_bodies, 2.0, dtype=np.float64)
@@ -1754,9 +2042,9 @@ class App:
                     n_orbits = compute_all_orbits_batch(
                         pos_snap_render, vel_snap_render, mass_snap, parent_snap_render,
                         subsys_pos_buf, subsys_vel_buf, subsys_mass_buf,
-                        visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels)
+                        visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels,
+                        np.zeros(3, dtype='f8'))
                     last_orbit_pos_snap = pos_snap_render.copy()
-                    last_cam_origin = cam_origin.copy()
                     
                     if n_orbits > 0:
                         valid_orbits = orbit_data_buf[:n_orbits]
@@ -1777,9 +2065,8 @@ class App:
                 if self.comparison_enabled:
                     recompute_orbits_cmp = True
                     if last_orbit_pos_snap_cmp is not None and self.time_ctrl_cmp.get("paused"):
-                        if not self.camera.get("left_dragging") and not self.camera.get("right_dragging") and self.camera.get("tracking_idx") is None:
-                            if np.array_equal(self.pos_snap_cmp, last_orbit_pos_snap_cmp) and np.array_equal(cam_origin, last_cam_origin):
-                                recompute_orbits_cmp = False
+                        if np.array_equal(self.pos_snap_cmp, last_orbit_pos_snap_cmp):
+                            recompute_orbits_cmp = False
                                 
                     if recompute_orbits_cmp:
                         lod_levels_cmp = np.full(self.num_bodies_cmp, 2.0, dtype=np.float64)
@@ -1799,10 +2086,12 @@ class App:
                                     lod_levels_cmp[i] = 1.0
                         
                         cam_origin_cmp = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                        offset_vec = np.array([-self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                         self.n_orbits_cmp = compute_all_orbits_batch(
                             self.pos_snap_cmp, self.vel_snap_cmp, self.mass_snap_cmp, self.parent_snap_cmp,
                             self.subsys_pos_buf_cmp, self.subsys_vel_buf_cmp, self.subsys_mass_buf_cmp,
-                            self.visual_colors_f8_cmp, cam_origin_cmp, G, max_orbits, self.orbit_data_buf_cmp, lod_levels_cmp)
+                            self.visual_colors_f8_cmp, cam_origin_cmp, G, max_orbits, self.orbit_data_buf_cmp, lod_levels_cmp,
+                            offset_vec)
                         last_orbit_pos_snap_cmp = self.pos_snap_cmp.copy()
                         
                         if self.n_orbits_cmp > 0:
@@ -1858,9 +2147,11 @@ class App:
             if n_casters_fixed < 64:
                 caster_colors_buf[n_casters_fixed:] = 0
                 
+            # Build atmosphere lookup dict once per frame to avoid expensive generator allocations inside the loop
+            atmo_by_body = {a['body_idx']: a for a in atmo_bodies}
             for i_c in range(n_casters_fixed):
                 b_idx = caster_indices[i_c]
-                atmo = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
+                atmo = atmo_by_body.get(b_idx)
                 if atmo:
                     beta_r = atmo['beta_rayleigh']
                     beta_m = atmo['beta_mie']
@@ -1911,6 +2202,10 @@ class App:
             uniform_screen_height.value = self.fb_height
             uniform_fov_factor.value = fov_factor
             uniform_num_ring_planes.value = n_ring_planes
+            if 'u_planetshine_enabled' in prog_spheres:
+                prog_spheres['u_planetshine_enabled'].value = self.camera.get("planetshine_enabled", True)
+            if 'u_ringshine_enabled' in prog_spheres:
+                prog_spheres['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
             if n_ring_planes > 0:
                 uniform_ring_centers.write(ring_centers_buf)
                 uniform_ring_normals.write(ring_normals_buf)
@@ -1924,7 +2219,8 @@ class App:
             uniform_orbit_proj.write(projection)
             uniform_orbit_view_rot.write(view_rot)
             
-            cam_pos_dvec4 = np.array([cam_pos_f8[0], cam_pos_f8[1], cam_pos_f8[2], 0.0], dtype='f8')
+            cam_world_pos_f8 = cam_origin + cam_pos_f8
+            cam_pos_dvec4 = np.array([cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 0.0], dtype='f8')
             uniform_orbit_cam_pos.write(cam_pos_dvec4)
             
             uniform_orbit_far.value = far
@@ -1985,7 +2281,7 @@ class App:
                         prog_orbit_compute.run((n_orbits_low * 100 + 255) // 256, 1, 1)
 
                     ctx.memory_barrier()
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
+                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
                     
                     if n_orbits_hi > 0:
                         prog_gpu_orbits['u_orbit_res'].value = 4000
@@ -2041,7 +2337,7 @@ class App:
                         
                     ctx.memory_barrier()
 
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_pos[0], cam_pos[1], cam_pos[2], 1.0)
+                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
                     
                     if self.n_orbits_hi_cmp > 0:
                         prog_gpu_orbits['u_orbit_res'].value = 4000
@@ -2061,71 +2357,9 @@ class App:
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
     
-            if ring_render_groups or (self.comparison_enabled and self.ring_render_groups_cmp):
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-                u_ring_camera_pos.write(cam_pos)
-                ctx.depth_mask = False
-                u_ring_clip_mode.value = 1
-                
-                if ring_render_groups:
-                    for group in ring_render_groups:
-                        bi = group['body_idx']
-                        body_pos_rel = pos_rel_all[bi]
-                        u_ring_body_offset.write(body_pos_rel)
-                        u_ring_host_pos.write(body_pos_rel)
-                        u_ring_host_radius.value = float(body_radii[bi])
-                        u_ring_host_pole_obl.value = (
-                            float(all_instances[bi, 9]),
-                            float(all_instances[bi, 10]),
-                            float(all_instances[bi, 11]),
-                            float(all_instances[bi, 12])
-                        )
-                        k = ring_idx_by_body.get(bi)
-                        if k is not None:
-                            u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
-                            u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
-                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
-                
-                if self.comparison_enabled and self.ring_render_groups_cmp:
-                    for group in self.ring_render_groups_cmp:
-                        bi = group['body_idx']
-                        body_pos_rel = cmp_pos_rel[bi].astype('f4')
-                        u_ring_body_offset.write(body_pos_rel)
-                        u_ring_host_pos.write(body_pos_rel)
-                        u_ring_host_radius.value = float(self.body_radii_cmp[bi])
-                        
-                        body_idx_in_unified = num_bodies + bi
-                        u_ring_host_pole_obl.value = (
-                            float(all_instances[body_idx_in_unified, 9]),
-                            float(all_instances[body_idx_in_unified, 10]),
-                            float(all_instances[body_idx_in_unified, 11]),
-                            float(all_instances[body_idx_in_unified, 12])
-                        )
-                        u_ring_caster_mask_lo_uni.value = 0
-                        u_ring_caster_mask_hi_uni.value = 0
-                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
-                ctx.depth_mask = True
-            ctx.disable(moderngl.BLEND)
-    
+            # --- Prepare and sort atmosphere bodies ---
+            sorted_atmos = []
             if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-                # Keep depth test ENABLED (read-only) so atmosphere is occluded by opaque bodies
-                ctx.depth_func = '<='
-                ctx.enable(moderngl.CULL_FACE)
-                ctx.depth_mask = False
-    
-                u_atmo_quality_uniform.value = atmo_quality
-                u_atmo_camera_pos.write(cam_pos)
-                AU_TO_KM = 149597870.7
-                u_atmo_au_to_km.value = AU_TO_KM
-            
-                u_atmo_num_ring_planes.value = n_ring_planes
-                if n_ring_planes > 0:
-                    u_atmo_ring_centers.write(ring_centers_buf)
-                    u_atmo_ring_normals.write(ring_normals_buf)
-                    u_atmo_ring_params.write(ring_params_buf)
-    
                 atmo_dists = []
                 if atmo_bodies:
                     for atmo in atmo_bodies:
@@ -2143,6 +2377,29 @@ class App:
                         atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, True))
                     
                 sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
+
+            def render_atmosphere_pass(clip_mode):
+                if not sorted_atmos:
+                    return
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.depth_func = '<='
+                ctx.enable(moderngl.CULL_FACE)
+                ctx.depth_mask = False
+    
+                u_atmo_quality_uniform.value = atmo_quality
+                u_atmo_camera_pos.write(cam_pos)
+                AU_TO_KM = 149597870.7
+                u_atmo_au_to_km.value = AU_TO_KM
+            
+                u_atmo_num_ring_planes.value = n_ring_planes
+                if n_ring_planes > 0:
+                    u_atmo_ring_centers.write(ring_centers_buf)
+                    u_atmo_ring_normals.write(ring_normals_buf)
+                    u_atmo_ring_params.write(ring_params_buf)
+                
+                if u_atmo_clip_mode is not None:
+                    u_atmo_clip_mode.value = clip_mode
     
                 for sq_dist, atmo, is_cmp in sorted_atmos:
                     bi = atmo['body_idx']
@@ -2186,6 +2443,17 @@ class App:
                     u_atmo_mie_g.value = atmo['mie_g']
                     u_atmo_beta_absorption.write(atmo['beta_absorption'])
                     u_atmo_sun_intensity.value = scaled_intensity
+                    
+                    if num_stars > 0:
+                        star_pos = pos_rel_all[star_idx] if not is_cmp else cmp_pos_rel[self.star_idx_cmp]
+                        body_to_star = star_pos - body_pos_rel
+                        dist_to_star = np.linalg.norm(body_to_star)
+                        star_r_au = body_radii[star_idx] if not is_cmp else self.body_radii_cmp[self.star_idx_cmp]
+                        sin_star_angular = star_r_au / max(dist_to_star, 1e-12)
+                    else:
+                        sin_star_angular = 0.0
+                    u_atmo_star_angular_radius.value = float(sin_star_angular)
+
                     u_atmo_num_samples.value = n_samples
                     if u_atmo_num_light_samples: u_atmo_num_light_samples.value = n_light
                     u_atmo_pole_obl.value = (
@@ -2194,20 +2462,90 @@ class App:
                         float(all_instances[body_idx_in_unified, 11]),
                         float(all_instances[body_idx_in_unified, 12])
                     )
+                    
+                    # CPU-side active neighbor culling (parent and children)
+                    active_indices = []
+                    if is_cmp:
+                        p_snap = self.parent_snap_cmp
+                        p_idx = int(p_snap[bi]) if bi < len(p_snap) else -1
+                        if p_idx >= 0 and p_idx != self.star_idx_cmp:
+                            active_indices.append(num_bodies + p_idx)
+                        for child_bi in range(self.num_bodies_cmp):
+                            if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
+                                active_indices.append(num_bodies + child_bi)
+                    else:
+                        p_snap = parent_snap
+                        p_idx = int(p_snap[bi]) if bi < len(p_snap) else -1
+                        if p_idx >= 0 and p_idx != star_idx:
+                            active_indices.append(p_idx)
+                        for child_bi in range(num_bodies):
+                            if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
+                                active_indices.append(child_bi)
+                                
+                    n_active = min(len(active_indices), 8)
+                    active_indices = active_indices[:n_active]
+                    
+                    active_casters_buf = np.zeros((8, 4), dtype='f4')
+                    active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
+                    active_atmos_buf = np.zeros((8, 4), dtype='f4')
+                    
+                    atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
+                    atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
+                    
+                    for i_ac, idx_u in enumerate(active_indices):
+                        is_c_cmp = (idx_u >= num_bodies)
+                        c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
+                        
+                        pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
+                        rad_c = self.body_radii_cmp[c_local_idx] if is_c_cmp else body_radii[c_local_idx]
+                        
+                        active_casters_buf[i_ac, 0:3] = pos_c
+                        active_casters_buf[i_ac, 3] = rad_c
+                        
+                        active_poles_obl_buf[i_ac, 0:3] = all_instances[idx_u, 9:12]
+                        active_poles_obl_buf[i_ac, 3] = all_instances[idx_u, 12]
+                        
+                        lookup = atmo_lookup_cmp if is_c_cmp else atmo_lookup
+                        atmo_info = lookup.get(c_local_idx)
+                        if atmo_info:
+                            beta_r_c = atmo_info['beta_rayleigh']
+                            beta_m_c = atmo_info['beta_mie']
+                            h_r_c = atmo_info['h_rayleigh']
+                            h_m_c = atmo_info['h_mie']
+                            R_km_c = atmo_info['planet_radius_km']
+                            od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
+                            od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
+                            transmittance = np.exp(-(od_r_c + od_m_c) * 0.5)
+                            thickness = atmo_info['atmo_radius_au'] - atmo_info['surface_radius_au']
+                            active_atmos_buf[i_ac, 0:3] = transmittance
+                            active_atmos_buf[i_ac, 3] = thickness
+                            
+                    u_atmo_num_active_casters.value = n_active
+                    u_atmo_active_casters.write(active_casters_buf.tobytes())
+                    u_atmo_active_caster_poles_obl.write(active_poles_obl_buf.tobytes())
+                    u_atmo_active_caster_atmos.write(active_atmos_buf.tobytes())
+                    
                     u_atmo_body_idx_uni.value = body_idx_in_unified
-     
+                    
                     vao_atmo.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
                 ctx.disable(moderngl.CULL_FACE)
                 ctx.depth_func = '<'
-                
+                ctx.disable(moderngl.BLEND)
+
+            # --- Pass 1: Atmosphere behind rings ---
+            render_atmosphere_pass(1)
+    
+            # --- Render Rings ---
             if ring_render_groups or (self.comparison_enabled and self.ring_render_groups_cmp):
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                 u_ring_camera_pos.write(cam_pos)
                 ctx.depth_mask = False
-                u_ring_clip_mode.value = 2
+                u_ring_clip_mode.value = 0
+                if u_ring_planetshine_enabled is not None:
+                    u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
                 
                 if ring_render_groups:
                     for group in ring_render_groups:
@@ -2247,8 +2585,10 @@ class App:
                         u_ring_caster_mask_hi_uni.value = 0
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 ctx.depth_mask = True
-                
-            ctx.disable(moderngl.BLEND)
+                ctx.disable(moderngl.BLEND)
+    
+            # --- Pass 2: Atmosphere in front of rings ---
+            render_atmosphere_pass(2)
             imgui.set_next_window_position(self.fb_width - 250, 20, imgui.ALWAYS)
             imgui.set_next_window_size(230, min(340, self.fb_height - 40), imgui.ALWAYS)
             imgui.begin("Simulation Controls")
@@ -2359,25 +2699,47 @@ class App:
                 jump_date[3] = max(0, min(23, jump_date[3]))
                 jump_date[4] = max(0, min(59, jump_date[4]))
                 
-                if imgui.button("Render Timeline"):
-                    target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4])
-                    self.time_ctrl["target_t"] = target_t
-                    self.time_ctrl["render_timeline"] = True
+                if ephemeris_mode_active:
+                    if imgui.button("Jump to Date"):
+                        target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4])
+                        self.time_ctrl["sync_t"] = target_t
+                else:
+                    if imgui.button("Render Timeline"):
+                        target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4])
+                        self.time_ctrl["target_t"] = target_t
+                        self.time_ctrl["render_timeline"] = True
             
             imgui.separator()
-            imgui.text("Visual Settings")
-            _, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
-            _, orbit_fade_dir_idx = imgui.combo("Orbit Fade", orbit_fade_dir_idx, ["Bright Behind", "Bright Ahead"])
-            orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
-            _, orbit_min_alpha = imgui.slider_float("Min Alpha", orbit_min_alpha, 0.0, 1.0, "%.2f")
-            
-            imgui.spacing()
-            _, atmo_quality = imgui.combo("##atmo", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)"])
-            imgui.same_line()
-            imgui.text("Atmosphere Quality")
+            if imgui.button("Graphics & Quality Settings..."):
+                self.camera["show_settings_modal"] = True
+                
             imgui.text(f"FOV: {self.camera['fov']:.1f} deg")
             if imgui.button("Reset FOV"): self.camera["fov"] = 45.0
             imgui.end()
+            
+            if self.camera.get("show_settings_modal", False):
+                imgui.set_next_window_size(320, 240, imgui.FIRST_USE_EVER)
+                expanded, self.camera["show_settings_modal"] = imgui.begin("Graphics & Quality Settings", True)
+                if expanded:
+                    # Atmosphere Quality
+                    _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)"])
+                    
+                    # Orbit Lines
+                    _, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
+                    if show_orbits:
+                        _, orbit_fade_dir_idx = imgui.combo("Orbit Fade", orbit_fade_dir_idx, ["Bright Behind", "Bright Ahead"])
+                        orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
+                        _, orbit_min_alpha = imgui.slider_float("Min Alpha", orbit_min_alpha, 0.0, 1.0, "%.2f")
+                        
+                    imgui.separator()
+                    # Bounce lighting toggles
+                    _, self.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", self.camera.get("planetshine_enabled", True))
+                    _, self.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", self.camera.get("ringshine_enabled", True))
+                    
+                    imgui.separator()
+                    if imgui.button("Close"):
+                        self.camera["show_settings_modal"] = False
+                imgui.end()
     
             imgui.set_next_window_position(self.fb_width - 250, 360, imgui.ALWAYS)
             imgui.set_next_window_size(230, min(600, self.fb_height - 380), imgui.ALWAYS)
@@ -3141,30 +3503,49 @@ class App:
                         if imgui.collapsing_header("Atmosphere")[0]:
                             atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
                             if atmo_item:
-                                changed_r, new_r = imgui.drag_float("Atmosphere Radius (km)", atmo_item['atmo_radius_km'], 10.0, body_r_km, body_r_km * 100.0)
+                                current_height = atmo_item['atmo_radius_km'] - atmo_item['planet_radius_km']
+                                changed_r, new_height = imgui.drag_float("Atmosphere Height (km)", current_height, 1.0, 1.0, body_r_km * 10.0)
                                 if changed_r:
-                                    atmo_item['atmo_radius_km'] = new_r
-                                    atmo_item['atmo_radius_au'] = new_r / 1.496e8
+                                    atmo_item['atmo_radius_km'] = atmo_item['planet_radius_km'] + new_height
+                                    atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 1.496e8
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
                                 b_r = atmo_item['beta_rayleigh']
                                 changed_b, b_ray = imgui.drag_float3("Rayleigh Beta (x10^-6)", b_r[0]*1e6, b_r[1]*1e6, b_r[2]*1e6, 0.1)
                                 if changed_b:
                                     atmo_item['beta_rayleigh'] = np.array([b_ray[0]*1e-6, b_ray[1]*1e-6, b_ray[2]*1e-6], dtype='f4')
-                                _, atmo_item['h_rayleigh'] = imgui.drag_float("Rayleigh Scale (km)", atmo_item['h_rayleigh'], 0.1, 0.1, 1000.0)
+                                changed_hr, new_hr = imgui.drag_float("Rayleigh Scale (km)", atmo_item['h_rayleigh'], 0.1, 0.1, 1000.0)
+                                if changed_hr:
+                                    atmo_item['h_rayleigh'] = new_hr
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
                                 
                                 changed_m, b_mie = imgui.drag_float("Mie Beta (x10^-6)", atmo_item['beta_mie']*1e6, 0.1)
                                 if changed_m:
                                     atmo_item['beta_mie'] = b_mie * 1e-6
-                                _, atmo_item['h_mie'] = imgui.drag_float("Mie Scale (km)", atmo_item['h_mie'], 0.1, 0.1, 1000.0)
+                                changed_hm, new_hm = imgui.drag_float("Mie Scale (km)", atmo_item['h_mie'], 0.1, 0.1, 1000.0)
+                                if changed_hm:
+                                    atmo_item['h_mie'] = new_hm
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
                                 _, atmo_item['mie_g'] = imgui.slider_float("Mie Asymmetry", atmo_item['mie_g'], 0.0, 0.999)
                                 
                                 b_a = atmo_item['beta_absorption']
                                 changed_a, b_abs = imgui.drag_float3("Absorption Beta (x10^-6)", b_a[0]*1e6, b_a[1]*1e6, b_a[2]*1e6, 0.1)
                                 if changed_a:
                                     atmo_item['beta_absorption'] = np.array([b_abs[0]*1e-6, b_abs[1]*1e-6, b_abs[2]*1e-6], dtype='f4')
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
                                     
                                 _, atmo_item['intensity'] = imgui.drag_float("Intensity", atmo_item['intensity'], 0.5, 0.0, 1000.0)
                                 
                                 if imgui.button("Remove Atmosphere"):
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
                                     atmo_bodies.remove(atmo_item)
                             else:
                                 if imgui.button("Add Atmosphere"):

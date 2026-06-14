@@ -220,9 +220,14 @@ def compute_barycenters(pos, vel, mass, parent_indices,
 @njit(cache=True)
 def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                              subsys_pos, subsys_vel, subsys_mass,
-                             visual_colors, cam_origin, G, max_orbits, orbit_buf, lod_levels):
+                             visual_colors, cam_origin, G, max_orbits, orbit_buf, lod_levels,
+                             bary_offset):
     """Compute all orbital elements (child + reflex) in one Numba-accelerated batch.
-    Returns number of valid orbits written to orbit_buf."""
+    Returns number of valid orbits written to orbit_buf.
+
+    Optimized: sibling lookup uses a precomputed children-of-parent table (CSR)
+    instead of scanning all N bodies each iteration (O(N²) → O(N·k)).
+    """
     n_orbits = 0
     num_bodies = len(pos)
 
@@ -241,13 +246,27 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
     eff_parent_pos = np.empty(3, dtype=np.float64)
     eff_parent_vel = np.empty(3, dtype=np.float64)
 
+    # ── Precompute children-of-parent table (CSR format) ──
+    children_count = np.zeros(num_bodies, dtype=np.int64)
     for i in range(num_bodies):
         p_idx = parent_indices[i]
         if p_idx >= 0:
+            children_count[p_idx] += 1
             if mass[i] > best_child_mass[p_idx]:
                 best_child_mass[p_idx] = mass[i]
                 best_child[p_idx] = i
-                
+
+    children_offsets = np.zeros(num_bodies + 1, dtype=np.int64)
+    for p in range(1, num_bodies + 1):
+        children_offsets[p] = children_offsets[p - 1] + children_count[p - 1]
+    children_flat = np.zeros(children_offsets[num_bodies], dtype=np.int64)
+    fill_pos = children_offsets[:num_bodies].copy()
+    for i in range(num_bodies):
+        p_idx = parent_indices[i]
+        if p_idx >= 0:
+            children_flat[fill_pos[p_idx]] = i
+            fill_pos[p_idx] += 1
+
     for i in range(num_bodies):
         if n_orbits >= max_orbits:
             break
@@ -268,8 +287,12 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
             dx = pos[i, k] - pos[p_idx, k]
             dist_i_sq += dx*dx
             
-        for j in range(num_bodies):
-            if j != i and parent_indices[j] == p_idx:
+        # Iterate only over siblings (children of same parent) — O(k) not O(N)
+        c_start = children_offsets[p_idx]
+        c_end = children_offsets[p_idx + 1]
+        for ci in range(c_start, c_end):
+            j = children_flat[ci]
+            if j != i:
                 cm = mass[j]
                 # Only account for moons that have at least 1/1,000,000th the mass of the primary
                 if cm > 1e-6 * parent_m:
@@ -282,10 +305,15 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                         for k in range(3):
                             eff_parent_pos[k] += cm * pos[j, k]
                             eff_parent_vel[k] += cm * vel[j, k]
-                        
-        for k in range(3):
-            eff_parent_pos[k] /= eff_parent_m
-            eff_parent_vel[k] /= eff_parent_m
+                    
+        if eff_parent_m > 0.0:
+            for k in range(3):
+                eff_parent_pos[k] /= eff_parent_m
+                eff_parent_vel[k] /= eff_parent_m
+        else:
+            for k in range(3):
+                eff_parent_pos[k] = pos[p_idx, k]
+                eff_parent_vel[k] = vel[p_idx, k]
 
         total_m = eff_parent_m + orb_m
         if total_m <= 0.0:
@@ -369,9 +397,9 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                 orbit_buf[n_orbits, 5] = q_hat[1]
                 orbit_buf[n_orbits, 6] = q_hat[2]
                 orbit_buf[n_orbits, 7] = e_mag
-                orbit_buf[n_orbits, 8] = bary_rel[0]
-                orbit_buf[n_orbits, 9] = bary_rel[1]
-                orbit_buf[n_orbits, 10] = bary_rel[2]
+                orbit_buf[n_orbits, 8] = bary[0] + bary_offset[0]
+                orbit_buf[n_orbits, 9] = bary[1] + bary_offset[1]
+                orbit_buf[n_orbits, 10] = bary[2] + bary_offset[2]
                 
                 if e_mag < 0.999:
                     if not is_escape:
@@ -504,9 +532,9 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
                         orbit_buf[n_orbits, 5] = gq_hat[1]
                         orbit_buf[n_orbits, 6] = gq_hat[2]
                         orbit_buf[n_orbits, 7] = ge_mag
-                        orbit_buf[n_orbits, 8] = gbary_rel[0]
-                        orbit_buf[n_orbits, 9] = gbary_rel[1]
-                        orbit_buf[n_orbits, 10] = gbary_rel[2]
+                        orbit_buf[n_orbits, 8] = gp_bary[0] + bary_offset[0]
+                        orbit_buf[n_orbits, 9] = gp_bary[1] + bary_offset[1]
+                        orbit_buf[n_orbits, 10] = gp_bary[2] + bary_offset[2]
                             
                         orbit_buf[n_orbits, 12] = visual_colors[i, 0] * 0.5
                         orbit_buf[n_orbits, 13] = visual_colors[i, 1] * 0.5
@@ -566,9 +594,9 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
             orbit_buf[n_orbits, 5] = q_hat[1]
             orbit_buf[n_orbits, 6] = q_hat[2]
             orbit_buf[n_orbits, 7] = e_mag
-            orbit_buf[n_orbits, 8] = bary_rel[0]
-            orbit_buf[n_orbits, 9] = bary_rel[1]
-            orbit_buf[n_orbits, 10] = bary_rel[2]
+            orbit_buf[n_orbits, 8] = bary[0] + bary_offset[0]
+            orbit_buf[n_orbits, 9] = bary[1] + bary_offset[1]
+            orbit_buf[n_orbits, 10] = bary[2] + bary_offset[2]
             
             if e_mag < 0.999:
                 E0 = math.atan2(math.sqrt(1.0 - e_mag * e_mag) * math.sin(theta0), math.cos(theta0) + e_mag)
@@ -1066,7 +1094,10 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     sim.particles[i].vy = raw_arr[i, 4]
                     sim.particles[i].vz = raw_arr[i, 5]
             else:
-                sim.integrate(sync_time)
+                if shared_state.get("ephemeris_mode", False):
+                    sim.t = sync_time
+                else:
+                    sim.integrate(sync_time)
                 
             local_pos = np.empty((num_bodies, 3), dtype=np.float64)
             local_vel = np.empty((num_bodies, 3), dtype=np.float64)
