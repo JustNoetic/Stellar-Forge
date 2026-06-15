@@ -78,16 +78,7 @@ def orbital_to_cartesian(a, e, inc, Omega, omega, M, mu):
     vel = np.array([vx_orb*Px + vy_orb*Qx, vx_orb*Py + vy_orb*Qy, vx_orb*Pz + vy_orb*Qz])
     return pos, vel
 
-def get_cartesian_from_keplerian(parent_m, child_m, a, e, inc_deg, Omega_deg, omega_deg, M_deg):
-    """Generate Cartesian state from Keplerian elements using a temporary Rebound simulation."""
-    import rebound
-    sim_tmp = rebound.Simulation()
-    sim_tmp.G = 4.0 * math.pi**2
-    sim_tmp.add(m=parent_m)
-    sim_tmp.add(m=child_m, a=a, e=e, inc=math.radians(inc_deg), Omega=math.radians(Omega_deg), omega=math.radians(omega_deg), M=math.radians(M_deg))
-    p0 = sim_tmp.particles[0]
-    p1 = sim_tmp.particles[1]
-    return np.array([p1.x - p0.x, p1.y - p0.y, p1.z - p0.z]), np.array([p1.vx - p0.vx, p1.vy - p0.vy, p1.vz - p0.vz])
+
 
 @njit(cache=True)
 def rotate_equatorial_to_ecliptic(pos, vel, pole_ecl):
@@ -136,3 +127,13 @@ def rotate_ecliptic_to_equatorial(pos, vel, pole_ecl):
     R_inv = R.T
     return R_inv @ pos, R_inv @ vel
 
+
+
+@njit(cache=True, nogil=True)
+def get_cartesian_from_keplerian(parent_m, body_m, a, e, inc_deg, Omega_deg, omega_deg, M_deg):
+    mu = G * (parent_m + body_m)
+    inc = math.radians(inc_deg)
+    Omega = math.radians(Omega_deg)
+    omega = math.radians(omega_deg)
+    M = math.radians(M_deg)
+    return orbital_to_cartesian(a, e, inc, Omega, omega, M, mu)

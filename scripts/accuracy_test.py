@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + '/..'))
 
 import math
 import numpy as np
-import rebound
+from physics_core import Simulation
 from spice_manager import SpiceManager
 from physics_core import attach_custom_forces
 from constants import C_AU_YR
@@ -35,9 +35,9 @@ def main():
     with open(data_path, "r") as f:
         bodies = json.load(f)
     
-    sim = rebound.Simulation()
-    sim.units = ('AU', 'yr', 'Msun')
-    sim.integrator = "ias15"
+    sim = Simulation()
+    sim.G = 39.476926421373
+    
     
     print(f"\n--- Fetching 2015 Starting State Vectors from JPL Horizons ---")
     start_vectors = {}

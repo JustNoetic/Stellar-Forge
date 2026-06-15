@@ -4,7 +4,7 @@ import glfw
 import moderngl
 import numpy as np
 import ctypes
-import rebound
+
 import json
 import math
 import threading
@@ -24,7 +24,7 @@ from spice_manager import SpiceManager
 from constants import *
 from math_utils import *
 from physics_core import *
-from physics_core import _get_particle_array, _extract_render_state, _update_hierarchy_core
+from physics_core import _extract_render_state, _update_hierarchy_core
 from render_utils import *
 from shaders import *
 _PERF_ENABLED = _os.environ.get("STELLAR_FORGE_PERF") == "1"
@@ -577,7 +577,7 @@ class App:
             "system_snapshot_out": None,          # physics thread puts saved snapshot here
         }
         
-        _init_arr = _get_particle_array(sim, num_bodies)
+        _init_arr = sim.arr[:num_bodies]
         self.shared_state["pos"][:, 0] = _init_arr[:, 0]
         self.shared_state["pos"][:, 1] = _init_arr[:, 2]
         self.shared_state["pos"][:, 2] = -_init_arr[:, 1]
@@ -642,7 +642,7 @@ class App:
             "system_snapshot_out": None,
         }
         
-        _init_arr_cmp = _get_particle_array(sim_cmp, num_bodies_cmp)
+        _init_arr_cmp = sim_cmp.arr[:num_bodies_cmp]
         self.shared_state_cmp["pos"][:, 0] = _init_arr_cmp[:, 0]
         self.shared_state_cmp["pos"][:, 1] = _init_arr_cmp[:, 2]
         self.shared_state_cmp["pos"][:, 2] = -_init_arr_cmp[:, 1]
