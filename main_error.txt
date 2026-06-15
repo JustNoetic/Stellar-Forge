@@ -1,10 +1,16 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\app.py", line 1051, in run
-    u_atmo_star_angular_radius = prog_atmo['u_star_angular_radius']
-                                 ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 412, in __getitem__
-    return self._members[key]
-           ~~~~~~~~~~~~~^^^^^
-KeyError: 'u_star_angular_radius'
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\app.py", line 787, in run
+    prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 1978, in program
+    res.mglo, _members, res._subroutines, res._geom, res._glo = self.mglo.program(
+                                                                ^^^^^^^^^^^^^^^^^^
+_moderngl.Error: GLSL Compiler failed
+
+fragment_shader
+===============
+0(101) : error C1503: undefined variable "get_oblate_radius"
+
+

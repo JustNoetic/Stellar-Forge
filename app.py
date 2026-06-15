@@ -786,6 +786,34 @@ class App:
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
     
+        def build_eclipse_lut(ctx):
+            LUT_SIZE = 256
+            x_arr = np.linspace(0.0, 2.0, LUT_SIZE, dtype='f4')
+            y_arr = np.linspace(0.0, 1.0, LUT_SIZE, dtype='f4')
+            x_grid, y_grid = np.meshgrid(x_arr, y_arr, indexing='xy')
+            x_safe = np.maximum(x_grid, 1e-9)
+            d1 = (1.0 - y_grid**2 + x_grid**2) / (2.0 * x_safe)
+            d2 = x_grid - d1
+            theta1 = 2.0 * np.arccos(np.clip(d1, -1.0, 1.0))
+            theta2 = 2.0 * np.arccos(np.clip(d2 / np.maximum(y_grid, 1e-9), -1.0, 1.0))
+            area = 0.5 * ( (theta1 - np.sin(theta1)) + y_grid**2 * (theta2 - np.sin(theta2)) )
+            area = np.where(x_grid >= 1.0 + y_grid, 0.0, area)
+            area = np.where(x_grid <= 1.0 - y_grid, math.pi * y_grid**2, area)
+            area_frac = area / math.pi
+            lut_data = area_frac.astype('f4').tobytes()
+            lut_tex = ctx.texture((LUT_SIZE, LUT_SIZE), 1, lut_data, dtype='f4')
+            lut_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            lut_tex.repeat_x = False
+            lut_tex.repeat_y = False
+            return lut_tex
+            
+        eclipse_lut_tex = build_eclipse_lut(ctx)
+        eclipse_lut_tex.use(location=2)
+        
+        if 'u_eclipse_lut' in prog_spheres: prog_spheres['u_eclipse_lut'].value = 2
+        if 'u_eclipse_lut' in prog_rings: prog_rings['u_eclipse_lut'].value = 2
+        if 'u_eclipse_lut' in prog_atmo: prog_atmo['u_eclipse_lut'].value = 2
+
         prog_atmo_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=atmo_lut_fragment_shader)
         lut_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
         lut_vao = ctx.vertex_array(prog_atmo_lut, [(lut_vbo, '2f', 'in_position')])

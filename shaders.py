@@ -83,10 +83,10 @@ void main() {
                 
                 vec3 vec = p_j - pos;
                 float t = dot(vec, L_dir);
-                if (t > 0.0 && t < dist_star) {
+                if (t > -(r + r_j) && t < dist_star + r_j) {
                     vec3 perp = vec - t * L_dir;
                     float d = length(perp);
-                    float r_cone = r_j + star_r * (t / dist_star) + r;
+                    float r_cone = r_j + star_r * max(0.0, t) / dist_star + r;
                     if (d < r_cone) {
                         if (c < 32) mask_lo |= (1u << c);
                         else mask_hi |= (1u << (c - 32));
@@ -107,10 +107,10 @@ void main() {
                         r_mask |= (1u << k);
                     } else {
                         float s = dot(vec_c, N_k) / denom;
-                        if (s > 0.0 && s < dist_star) {
+                        if (s > -r && s < dist_star + r) {
                             vec3 hit = pos + s * L_dir;
                             float d = length(hit - C_k);
-                            float r_cone = star_r * (s / dist_star) + r;
+                            float r_cone = star_r * max(0.0, s) / dist_star + r;
                             if (d < r_out + r_cone) {
                                 r_mask |= (1u << k);
                             }
@@ -282,6 +282,7 @@ uniform int u_num_ring_planes;
 uniform int u_atmo_quality;
 uniform bool u_planetshine_enabled;
 uniform bool u_ringshine_enabled;
+uniform sampler2D u_eclipse_lut;
 
 out vec4 out_color;
 
@@ -323,7 +324,9 @@ void main() {
             vec3 L = frag_to_star / dist_to_star;
             
             // Angular radius of the star for soft penumbra at terminator
-            float sin_alpha = clamp(star_radius / dist_to_star, 0.0, 1.0);
+            float star_ang_radius = star_radius / dist_to_star;
+            float sin_alpha = clamp(star_ang_radius, 0.0, 1.0);
+            float alpha = asin(sin_alpha);
             
             // Lambert cosine law: brightness decreases with angle
             float NdotL = dot(N, L);
@@ -347,68 +350,35 @@ void main() {
                 // Skip self
                 if (dist_to_caster < caster_r * 1.02) continue;
                 
-                // Project caster onto the fragment-to-star ray
-                float t = dot(frag_to_caster, L);
-                
-                // Caster must be between fragment and star
-                if (t <= 0.0 || t >= dist_to_star) continue;
-                
-                // Perpendicular distance from caster center to the ray
-                vec3 perp_vec = frag_to_caster - t * L;
-                float perp_sq = dot(perp_vec, perp_vec);
-                
-                // Project star disc to the caster's distance along the ray
-                float r_star_proj = star_radius * t / dist_to_star;
+                vec3 V_c = frag_to_caster / dist_to_caster;
+                float t_proj = dot(frag_to_caster, L);
                 
                 // Account for oblateness
                 float oblateness = u_caster_poles_obl[j].w;
-                float perp;
                 if (oblateness > 0.0) {
                     vec3 pole = u_caster_poles_obl[j].xyz;
-                    perp = sqrt(perp_sq);
+                    vec3 perp_vec = frag_to_caster - t_proj * L;
                     caster_r = get_oblate_radius(caster_r, oblateness, pole, L, perp_vec);
-                } else {
-                    float r_penumbra = caster_r + r_star_proj;
-                    if (perp_sq >= r_penumbra * r_penumbra) continue;
-                    perp = sqrt(perp_sq);
                 }
                 
-                // Shadow boundaries
-                float r_penumbra = caster_r + r_star_proj;
-                float r_umbra = abs(caster_r - r_star_proj);
-                float occlusion = 0.0;
+                float sin_beta = clamp(caster_r / dist_to_caster, 0.0, 1.0);
+                float beta = asin(sin_beta);
                 
-                if (perp >= r_penumbra) {
-                    occlusion = 0.0;
-                } else if (perp <= r_umbra) {
-                    float div_denom = max(1e-9, r_star_proj * r_star_proj);
-                    occlusion = (caster_r >= r_star_proj) ? 1.0 : (caster_r * caster_r) / div_denom;
-                } else {
-                    float rc2 = caster_r * caster_r;
-                    float rs2 = r_star_proj * r_star_proj;
-                    float h = perp - caster_r;
-                    float denom_c = 2.0 * perp * caster_r;
-                    float denom_s = 2.0 * perp * r_star_proj;
-                    if (denom_c > 1e-7 && denom_s > 1e-7 && rs2 > 1e-9) {
-                        float eps_c = clamp((rs2 - h * h) / denom_c, 0.0, 2.0);
-                        float angle_c = 2.0 * asin(sqrt(clamp(eps_c * 0.5, 0.0, 1.0)));
-                        float sin_c = sqrt(clamp(eps_c * (2.0 - eps_c), 0.0, 1.0));
-                        float x_s = clamp((h * (perp + caster_r) + rs2) / denom_s, -1.0, 1.0);
-                        float angle_s = acos(x_s);
-                        float area = rc2 * angle_c + rs2 * angle_s - perp * caster_r * sin_c;
-                        occlusion = clamp(area / (3.14159265358979 * rs2), 0.0, 1.0);
-                    } else {
-                        occlusion = clamp((r_penumbra - perp) / max(1e-7, r_penumbra - r_umbra), 0.0, 1.0);
-                        float max_occ = (caster_r >= r_star_proj) ? 1.0 : (rc2 / max(1e-9, rs2));
-                        occlusion = clamp(occlusion * max_occ, 0.0, 1.0);
-                    }
-                }
+                float cos_gamma = dot(L, V_c);
+                float gamma = acos(clamp(cos_gamma, -1.0, 1.0));
+                float R_max = max(alpha, beta);
+                float R_min = min(alpha, beta);
+                float x_norm = gamma / max(1e-9, R_max);
+                float y_norm = R_min / max(1e-9, R_max);
+                float area_fraction = texture(u_eclipse_lut, vec2(x_norm * 0.5, y_norm)).r;
+                float occlusion = clamp(area_fraction * (R_max * R_max) / max(1e-9, alpha * alpha), 0.0, 1.0);
                 
                 vec3 caster_shadow = vec3(1.0 - occlusion);
                 
                 float atmo_h = u_caster_atmos[j].w;
                 if (atmo_h > 0.0 && occlusion > 0.0) {
-                    float depth_into_umbra = clamp((r_umbra - perp) / max(1e-6, r_umbra), 0.0, 1.0);
+                    float r_umbra = abs(alpha - beta);
+                    float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
                     vec3 atmo_tint = u_caster_atmos[j].xyz;
                     vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
                     float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
@@ -450,7 +420,7 @@ void main() {
                     vec3 vec_radial = hit - plane_center;
                     float d = length(vec_radial);
                     
-                    float r_star_proj = star_radius * t / dist_to_star;
+                    float r_star_proj = star_ang_radius * t;
                     vec3 L_plane = L - denom * plane_normal;
                     float L_plane_len = length(L_plane);
                     
@@ -476,8 +446,8 @@ void main() {
                         
                         if (overlap_min >= overlap_max) continue;
                         
-                        float v_min = clamp((overlap_min - d) / max(1e-6, R_eff), -1.0, 1.0);
-                        float v_max = clamp((overlap_max - d) / max(1e-6, R_eff), -1.0, 1.0);
+                        float v_min = clamp((overlap_min - d) / max(1e-9, R_eff), -1.0, 1.0);
+                        float v_max = clamp((overlap_max - d) / max(1e-9, R_eff), -1.0, 1.0);
                         
                         float f_max = (v_max * sqrt(max(0.0, 1.0 - v_max*v_max)) + asin(v_max)) / 3.14159265358979 + 0.5;
                         float f_min = (v_min * sqrt(max(0.0, 1.0 - v_min*v_min)) + asin(v_min)) / 3.14159265358979 + 0.5;
@@ -880,6 +850,7 @@ uniform int u_clip_mode;
 uniform uint u_caster_mask_lo;
 uniform uint u_caster_mask_hi;
 uniform bool u_planetshine_enabled;
+uniform sampler2D u_eclipse_lut;
 
 out vec4 out_color;
 
@@ -948,9 +919,17 @@ void main() {
         dusty_phase *= 0.15;
         
         float sun_side = dot(N, L);
-        float same_side = smoothstep(-0.02, 0.02, sun_side * cam_side);
         
-        float solar_elevation = mix(0.15, 1.0, abs(sun_side));
+        float star_ang_radius = star_radius / dist_to_star;
+        float sin_alpha_local = clamp(star_ang_radius, 1e-6, 1.0);
+        float alpha = asin(sin_alpha_local);
+        
+        float effective_sun_side = sqrt(sun_side * sun_side + 0.180126 * alpha * alpha);
+        float solar_elevation = max(0.02, effective_sun_side);
+        
+        float v_star = clamp(sun_side / sin_alpha_local, -1.0, 1.0);
+        float f_top = (v_star * sqrt(max(0.0, 1.0 - v_star*v_star)) + asin(v_star)) / 3.14159265358979 + 0.5;
+        float same_side = (cam_side > 0.0) ? f_top : (1.0 - f_top);
         
         float rock_reflect_s = rock_reflect * solar_elevation * rocky_phase;
         float rock_transmit_s = rock_transmit * solar_elevation * rocky_phase;
@@ -959,76 +938,57 @@ void main() {
         float transmitted_s = rock_transmit_s + dust_transmit * dusty_phase;
         
         float direct_illum_s = mix(transmitted_s, reflected_s, same_side);
-        
         vec3 shadow_s = vec3(1.0);
         for (int j = 0; j < u_num_casters; j++) {
+            if (dot(shadow_s, shadow_s) < 0.001) break;
+            
             if (j < 32) { if ((u_caster_mask_lo & (1u << j)) == 0u) continue; }
             else        { if ((u_caster_mask_hi & (1u << (j - 32))) == 0u) continue; }
             
             vec3 caster_pos = u_casters[j].xyz;
             float caster_r = u_casters[j].w;
             vec3 frag_to_caster = caster_pos - f_world_pos;
-            float t = dot(frag_to_caster, L);
-            if (t <= 0.0 || t >= dist_to_star) continue;
-            vec3 perp_vec = frag_to_caster - t * L;
-            float perp_sq = dot(perp_vec, perp_vec);
+            float dist_to_caster = length(frag_to_caster);
             
-            float r_star_proj = star_radius * t / dist_to_star;
+            if (dist_to_caster < caster_r * 1.02) continue;
+            
+            vec3 V_c = frag_to_caster / dist_to_caster;
+            float t_proj = dot(frag_to_caster, L);
             
             float oblateness = u_caster_poles_obl[j].w;
-            float perp;
             if (oblateness > 0.0) {
                 vec3 pole = u_caster_poles_obl[j].xyz;
-                perp = sqrt(perp_sq);
+                vec3 perp_vec = frag_to_caster - t_proj * L;
                 caster_r = get_oblate_radius(caster_r, oblateness, pole, L, perp_vec);
-            } else {
-                float r_penumbra = caster_r + r_star_proj;
-                if (perp_sq >= r_penumbra * r_penumbra) continue;
-                perp = sqrt(perp_sq);
             }
             
-            float r_penumbra = caster_r + r_star_proj;
-            float r_umbra = abs(caster_r - r_star_proj);
-            float occlusion = 0.0;
+            float sin_beta = clamp(caster_r / dist_to_caster, 0.0, 1.0);
+            float beta = asin(sin_beta);
             
-            if (perp >= r_penumbra) {
-                occlusion = 0.0;
-            } else if (perp <= r_umbra) {
-                float div_denom = max(1e-9, r_star_proj * r_star_proj);
-                occlusion = (caster_r >= r_star_proj) ? 1.0 : (caster_r * caster_r) / div_denom;
-            } else {
-                float rc2 = caster_r * caster_r;
-                float rs2 = r_star_proj * r_star_proj;
-                float h = perp - caster_r;
-                float denom_c = 2.0 * perp * caster_r;
-                float denom_s = 2.0 * perp * r_star_proj;
-                if (denom_c > 1e-7 && denom_s > 1e-7 && rs2 > 1e-9) {
-                    float eps_c = clamp((rs2 - h * h) / denom_c, 0.0, 2.0);
-                    float angle_c = 2.0 * asin(sqrt(clamp(eps_c * 0.5, 0.0, 1.0)));
-                    float sin_c = sqrt(clamp(eps_c * (2.0 - eps_c), 0.0, 1.0));
-                    float x_s = clamp((h * (perp + caster_r) + rs2) / denom_s, -1.0, 1.0);
-                    float angle_s = acos(x_s);
-                    float area = rc2 * angle_c + rs2 * angle_s - perp * caster_r * sin_c;
-                    occlusion = clamp(area / (3.14159265358979 * rs2), 0.0, 1.0);
-                } else {
-                    occlusion = clamp((r_penumbra - perp) / max(1e-7, r_penumbra - r_umbra), 0.0, 1.0);
-                    float max_occ = (caster_r >= r_star_proj) ? 1.0 : (rc2 / max(1e-9, rs2));
-                    occlusion = clamp(occlusion * max_occ, 0.0, 1.0);
-                }
-            }
+            float cos_gamma = dot(L, V_c);
+            float gamma = acos(clamp(cos_gamma, -1.0, 1.0));
+            float R_max = max(alpha, beta);
+            float R_min = min(alpha, beta);
+            float x_norm = gamma / max(1e-9, R_max);
+            float y_norm = R_min / max(1e-9, R_max);
+            float area_fraction = texture(u_eclipse_lut, vec2(x_norm * 0.5, y_norm)).r;
+            float occlusion = clamp(area_fraction * (R_max * R_max) / max(1e-9, alpha * alpha), 0.0, 1.0);
             
             vec3 caster_shadow = vec3(1.0 - occlusion);
+            
             float atmo_h = u_caster_atmos[j].w;
             if (atmo_h > 0.0 && occlusion > 0.0) {
-                float depth_into_umbra = clamp((r_umbra - perp) / max(1e-6, r_umbra), 0.0, 1.0);
+                float r_umbra = abs(alpha - beta);
+                float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
                 vec3 atmo_tint = u_caster_atmos[j].xyz;
                 vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
                 float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
                 float atmo_blend = smoothstep(0.5, 1.0, occlusion);
                 caster_shadow += deep_tint * refraction_intensity * atmo_blend;
             }
+            
             shadow_s *= caster_shadow;
-        }
+        }   
         
         if (u_host_planet_radius > 0.0) {
             vec3 frag_to_host = u_host_planet_pos - f_world_pos;
@@ -1038,7 +998,7 @@ void main() {
                 float perp_sq = dot(perp_vec, perp_vec);
                 float host_r = u_host_planet_radius;
                 float host_oblateness = u_host_planet_pole_obl.w;
-                float r_star_proj = star_radius * t / dist_to_star;
+                float r_star_proj = star_ang_radius * t;
                 float r_penumbra = host_r + r_star_proj;
                 
                 if (host_oblateness > 0.0 || perp_sq < r_penumbra * r_penumbra) {
@@ -1232,6 +1192,7 @@ uniform int u_num_active_casters;
 uniform vec4 u_active_casters[8];
 uniform vec4 u_active_caster_poles_obl[8];
 uniform vec4 u_active_caster_atmos[8];
+uniform sampler2D u_eclipse_lut;
 
 out vec4 out_color;
 
@@ -1247,52 +1208,65 @@ vec3 toSphericalSpace(vec3 p, vec4 pole_obl) {
     return p_perp + (h / (1.0 - f)) * pole;
 }
 
+float get_oblate_radius(float r_eq, float oblateness, vec3 pole, vec3 L, vec3 perp_vec) {
+    if (oblateness <= 0.0 || r_eq < 1e-6) return r_eq;
+    float perp_len = length(perp_vec);
+    if (perp_len < 1e-6) return r_eq;
+    float PdotL = dot(pole, L);
+    vec3 P_proj = pole - L * PdotL;
+    float P_proj_len = length(P_proj);
+    if (P_proj_len < 1e-6) return r_eq;
+    vec3 P_dir = P_proj / P_proj_len;
+    float y = dot(perp_vec, P_dir);
+    float x = length(perp_vec - y * P_dir);
+    float f_factor = 1.0 - oblateness;
+    float R_minor = r_eq * sqrt(PdotL * PdotL + f_factor * f_factor * P_proj_len * P_proj_len);
+    float angle = atan(y, x);
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+    return (r_eq * R_minor) / sqrt(R_minor * R_minor * cos_a * cos_a + r_eq * r_eq * sin_a * sin_a);
+}
+
 vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius) {
     vec3 shadow = vec3(1.0);
     for (int i = 0; i < u_num_active_casters; i++) {
         vec3 caster_pos = u_active_casters[i].xyz;
         float caster_r = u_active_casters[i].w;
         vec3 s_to_c = caster_pos - eval_render_pos;
+        float dist_to_caster = length(s_to_c);
+        
+        if (dist_to_caster < caster_r * 1.02) continue;
+        
+        vec3 V_c = s_to_c / dist_to_caster;
         float proj = dot(s_to_c, L_dir);
-        if (proj <= 0.0 || proj >= dist_to_star) continue;
-        vec3 perp_vec = s_to_c - proj * L_dir;
-        float perp_sq = dot(perp_vec, perp_vec);
-        float r_star_proj = star_radius * proj / dist_to_star;
-        float r_penumbra = caster_r + r_star_proj;
-        if (perp_sq >= r_penumbra * r_penumbra) continue;
         
-        float perp = sqrt(perp_sq);
-        float r_umbra = abs(caster_r - r_star_proj);
-        float occ = 0.0;
-        
-        if (perp <= r_umbra) {
-            float div_denom = max(1e-9, r_star_proj * r_star_proj);
-            occ = (caster_r >= r_star_proj) ? 1.0 : (caster_r * caster_r) / div_denom;
-        } else {
-            float rc2 = caster_r * caster_r;
-            float rs2 = r_star_proj * r_star_proj;
-            float h = perp - caster_r;
-            float denom_c = 2.0 * perp * caster_r;
-            float denom_s = 2.0 * perp * r_star_proj;
-            if (denom_c > 1e-7 && denom_s > 1e-7 && rs2 > 1e-9) {
-                float eps_c = clamp((rs2 - h * h) / denom_c, 0.0, 2.0);
-                float angle_c = 2.0 * asin(sqrt(clamp(eps_c * 0.5, 0.0, 1.0)));
-                float sin_c = sqrt(clamp(eps_c * (2.0 - eps_c), 0.0, 1.0));
-                float x_s = clamp((h * (perp + caster_r) + rs2) / denom_s, -1.0, 1.0);
-                float angle_s = acos(x_s);
-                float area = rc2 * angle_c + rs2 * angle_s - perp * caster_r * sin_c;
-                occ = clamp(area / (3.14159265358979 * rs2), 0.0, 1.0);
-            } else {
-                occ = clamp((r_penumbra - perp) / max(1e-7, r_penumbra - r_umbra), 0.0, 1.0);
-                float max_occ = (caster_r >= r_star_proj) ? 1.0 : (rc2 / max(1e-9, rs2));
-                occ = clamp(occ * max_occ, 0.0, 1.0);
-            }
+        float oblateness = u_active_caster_poles_obl[i].w;
+        if (oblateness > 0.0) {
+            vec3 pole = u_active_caster_poles_obl[i].xyz;
+            vec3 perp_vec = s_to_c - proj * L_dir;
+            caster_r = get_oblate_radius(caster_r, oblateness, pole, L_dir, perp_vec);
         }
+        
+        float sin_alpha_local = clamp(star_radius / dist_to_star, 0.0, 1.0);
+        float alpha = asin(sin_alpha_local);
+        
+        float sin_beta = clamp(caster_r / dist_to_caster, 0.0, 1.0);
+        float beta = asin(sin_beta);
+        
+        float cos_gamma = dot(L_dir, V_c);
+        float gamma = acos(clamp(cos_gamma, -1.0, 1.0));
+        float R_max = max(alpha, beta);
+        float R_min = min(alpha, beta);
+        float x_norm = gamma / max(1e-9, R_max);
+        float y_norm = R_min / max(1e-9, R_max);
+        float area_fraction = texture(u_eclipse_lut, vec2(x_norm * 0.5, y_norm)).r;
+        float occ = clamp(area_fraction * (R_max * R_max) / max(1e-9, alpha * alpha), 0.0, 1.0);
         
         vec3 caster_shadow = vec3(1.0 - occ);
         float atmo_h = u_active_caster_atmos[i].w;
         if (atmo_h > 0.0 && occ > 0.0) {
-            float depth_into_umbra = clamp((r_umbra - perp) / max(1e-6, r_umbra), 0.0, 1.0);
+            float r_umbra = abs(alpha - beta);
+            float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
             vec3 atmo_tint = u_active_caster_atmos[i].xyz;
             vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
             float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
@@ -1356,8 +1330,8 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             
             if (overlap_min >= overlap_max) continue;
             
-            float v_min = clamp((overlap_min - d) / max(1e-6, R_eff), -1.0, 1.0);
-            float v_max = clamp((overlap_max - d) / max(1e-6, R_eff), -1.0, 1.0);
+            float v_min = clamp((overlap_min - d) / max(1e-9, R_eff), -1.0, 1.0);
+            float v_max = clamp((overlap_max - d) / max(1e-9, R_eff), -1.0, 1.0);
             
             float f_max = (v_max * sqrt(max(0.0, 1.0 - v_max*v_max)) + asin(v_max)) / 3.14159265358979 + 0.5;
             float f_min = (v_min * sqrt(max(0.0, 1.0 - v_min*v_min)) + asin(v_min)) / 3.14159265358979 + 0.5;
@@ -1523,6 +1497,7 @@ void main() {
 
         // 3.5 Global Eclipse & Ring Shadow
         vec3 global_eclipse_shadow = vec3(1.0);
+        vec3 end_eclipse_shadow = vec3(1.0);
         bool skip_volumetric_shadow = false;
 
         if (u_atmo_quality > 0) { // Low or High Quality
@@ -1533,6 +1508,7 @@ void main() {
             float dist_mid_star = length(mid_to_star);
             vec3 L_mid = mid_to_star / dist_mid_star;
             global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius);
+            end_eclipse_shadow = global_eclipse_shadow;
 
             // --- High Quality Early-Out ---
             if (u_atmo_quality == 2) {
@@ -1546,9 +1522,12 @@ void main() {
                 vec3 end_to_star = star_pos - end_render;
                 vec3 shadow_end = compute_shadow(end_render, end_to_star / length(end_to_star), length(end_to_star), planet_center_render, star_radius);
                 
-                if (shadow_start.r > 0.999 && global_eclipse_shadow.r > 0.999 && shadow_end.r > 0.999) {
+                global_eclipse_shadow = shadow_start;
+                end_eclipse_shadow = shadow_end;
+
+                if (shadow_start.r > 0.999 && shadow_end.r > 0.999) {
                     skip_volumetric_shadow = true;
-                } else if (shadow_start.r < 0.001 && global_eclipse_shadow.r < 0.001 && shadow_end.r < 0.001) {
+                } else if (shadow_start.r < 0.001 && shadow_end.r < 0.001) {
                     skip_volumetric_shadow = true;
                 }
             }
@@ -1620,11 +1599,8 @@ void main() {
 
             vec3 sample_shadow = global_eclipse_shadow;
             if (u_atmo_quality == 2 && !skip_volumetric_shadow) { // High Quality (Volumetric)
-                vec3 sample_render = sample_pos / u_au_to_km + planet_center_render;
-                vec3 sample_to_star = star_pos - sample_render;
-                float dist_sample_star = length(sample_to_star);
-                vec3 L_sample = sample_to_star / dist_sample_star;
-                sample_shadow = compute_shadow(sample_render, L_sample, dist_sample_star, planet_center_render, star_radius);
+                float t_lerp = (float(i) + 0.5) / float(u_num_samples);
+                sample_shadow = mix(global_eclipse_shadow, end_eclipse_shadow, t_lerp);
             }
             // Approximate multiple scattering with a low-extinction term
             vec3 direct_attenuation = exp(-tau);
