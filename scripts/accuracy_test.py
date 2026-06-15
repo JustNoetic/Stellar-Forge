@@ -8,7 +8,7 @@ import math
 import numpy as np
 import rebound
 from spice_manager import SpiceManager
-from reboundx_physics import attach_reboundx_forces
+from physics_core import attach_custom_forces
 from constants import C_AU_YR
 from math_utils import pole_to_ecliptic
 from fetch_horizons import query_horizons, parse_state_vector, HORIZONS_IDS, PARENT_NAIF
@@ -110,8 +110,7 @@ def main():
     has_gr = phys_star_idx >= 0
 
     if has_j2 or has_gr:
-        attach_reboundx_forces(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)
-        sim.force_is_velocity_dependent = 1
+        attach_custom_forces(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)
 
     print(f"\n--- Integrating 1 Calendar Year Forward (365 days) ---")
     start_t = time.time()

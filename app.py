@@ -15,7 +15,6 @@ from imgui.integrations.glfw import GlfwRenderer
 import warnings
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from reboundx_physics import attach_reboundx_forces
 from numba import njit
 import datetime
 import os as _os

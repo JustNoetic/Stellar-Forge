@@ -8,7 +8,6 @@ from constants import *
 from math_utils import *
 from system_manager import SystemManager, SystemSnapshot, derive_star_properties
 import warnings
-from reboundx_physics import attach_reboundx_forces
 from render_utils import *
 
 _PARTICLE_STRIDE = None
@@ -36,6 +35,250 @@ def _extract_render_state(sim, num_bodies, out_pos, out_vel):
     out_vel[:, 0] = arr[:, 3]
     out_vel[:, 1] = arr[:, 5]
     out_vel[:, 2] = -arr[:, 4]
+
+@njit(cache=True)
+def compute_custom_forces(arr, num_bodies, G_val, c2, has_j2, has_gr, phys_star_idx, oblate_indices, oblate_j2, oblate_j4, oblate_req, oblate_poles):
+    if has_gr and num_bodies > 1:
+        # 1. Transform to Jacobi coordinates
+        M = np.zeros(num_bodies, dtype=np.float64)
+        M[0] = arr[0, 9]
+        for i in range(1, num_bodies):
+            M[i] = M[i-1] + arr[i, 9]
+            
+        jx = np.zeros(num_bodies, dtype=np.float64)
+        jy = np.zeros(num_bodies, dtype=np.float64)
+        jz = np.zeros(num_bodies, dtype=np.float64)
+        jvx = np.zeros(num_bodies, dtype=np.float64)
+        jvy = np.zeros(num_bodies, dtype=np.float64)
+        jvz = np.zeros(num_bodies, dtype=np.float64)
+        jax = np.zeros(num_bodies, dtype=np.float64)
+        jay = np.zeros(num_bodies, dtype=np.float64)
+        jaz = np.zeros(num_bodies, dtype=np.float64)
+        
+        rx_com = arr[0, 0]
+        ry_com = arr[0, 1]
+        rz_com = arr[0, 2]
+        vx_com = arr[0, 3]
+        vy_com = arr[0, 4]
+        vz_com = arr[0, 5]
+        ax_com = arr[0, 6]
+        ay_com = arr[0, 7]
+        az_com = arr[0, 8]
+        
+        for i in range(1, num_bodies):
+            jx[i] = arr[i, 0] - rx_com
+            jy[i] = arr[i, 1] - ry_com
+            jz[i] = arr[i, 2] - rz_com
+            jvx[i] = arr[i, 3] - vx_com
+            jvy[i] = arr[i, 4] - vy_com
+            jvz[i] = arr[i, 5] - vz_com
+            jax[i] = arr[i, 6] - ax_com
+            jay[i] = arr[i, 7] - ay_com
+            jaz[i] = arr[i, 8] - az_com
+            
+            mi = arr[i, 9]
+            if M[i] > 0.0:
+                frac = mi / M[i]
+                rx_com += frac * jx[i]
+                ry_com += frac * jy[i]
+                rz_com += frac * jz[i]
+                vx_com += frac * jvx[i]
+                vy_com += frac * jvy[i]
+                vz_com += frac * jvz[i]
+                ax_com += frac * jax[i]
+                ay_com += frac * jay[i]
+                az_com += frac * jaz[i]
+                
+        # 2. Compute GR forces in Jacobi coordinates
+        mu = G_val * arr[0, 9]
+        jgr_ax = np.zeros(num_bodies, dtype=np.float64)
+        jgr_ay = np.zeros(num_bodies, dtype=np.float64)
+        jgr_az = np.zeros(num_bodies, dtype=np.float64)
+        
+        for i in range(1, num_bodies):
+            x = jx[i]
+            y = jy[i]
+            z = jz[i]
+            vx = jvx[i]
+            vy = jvy[i]
+            vz = jvz[i]
+            ax = jax[i]
+            ay = jay[i]
+            az = jaz[i]
+            
+            r2 = x*x + y*y + z*z
+            if r2 == 0.0: continue
+            ri = math.sqrt(r2)
+            
+            vi_x = vx
+            vi_y = vy
+            vi_z = vz
+            vi2 = vi_x*vi_x + vi_y*vi_y + vi_z*vi_z
+            A = (0.5 * vi2 + 3.0 * mu / ri) / c2
+            
+            for q in range(10):
+                old_v_x = vi_x
+                old_v_y = vi_y
+                old_v_z = vi_z
+                
+                vi_x = vx / (1.0 - A)
+                vi_y = vy / (1.0 - A)
+                vi_z = vz / (1.0 - A)
+                vi2 = vi_x*vi_x + vi_y*vi_y + vi_z*vi_z
+                A = (0.5 * vi2 + 3.0 * mu / ri) / c2
+                
+                dvx = vi_x - old_v_x
+                dvy = vi_y - old_v_y
+                dvz = vi_z - old_v_z
+                if vi2 > 0.0 and (dvx*dvx + dvy*dvy + dvz*dvz)/vi2 < 4.93038e-32:
+                    break
+                    
+            B = (mu / ri - 1.5 * vi2) * mu / (r2 * ri) / c2
+            rdotrdot = x*vx + y*vy + z*vz
+            
+            vidot_x = ax + B*x
+            vidot_y = ay + B*y
+            vidot_z = az + B*z
+            
+            vdotvdot = vi_x*vidot_x + vi_y*vidot_y + vi_z*vidot_z
+            D = (vdotvdot - 3.0 * mu / (r2 * ri) * rdotrdot) / c2
+            
+            jgr_ax[i] = B * (1.0 - A) * x - A * ax - D * vi_x
+            jgr_ay[i] = B * (1.0 - A) * y - A * ay - D * vi_y
+            jgr_az[i] = B * (1.0 - A) * z - A * az - D * vi_z
+            
+        # 3. Transform Jacobi GR accelerations back to inertial
+        ax_running = 0.0
+        ay_running = 0.0
+        az_running = 0.0
+        
+        igr_ax = np.zeros(num_bodies, dtype=np.float64)
+        igr_ay = np.zeros(num_bodies, dtype=np.float64)
+        igr_az = np.zeros(num_bodies, dtype=np.float64)
+        
+        for i in range(num_bodies - 1, 0, -1):
+            mi = arr[i, 9]
+            if M[i] > 0.0:
+                frac = mi / M[i]
+                ax_running -= frac * jgr_ax[i]
+                ay_running -= frac * jgr_ay[i]
+                az_running -= frac * jgr_az[i]
+                
+            igr_ax[i] = jgr_ax[i] + ax_running
+            igr_ay[i] = jgr_ay[i] + ay_running
+            igr_az[i] = jgr_az[i] + az_running
+            
+        igr_ax[0] = ax_running
+        igr_ay[0] = ay_running
+        igr_az[0] = az_running
+        
+        for i in range(num_bodies):
+            arr[i, 6] += igr_ax[i]
+            arr[i, 7] += igr_ay[i]
+            arr[i, 8] += igr_az[i]
+
+    if has_j2 and oblate_indices is not None:
+        for obl_idx in range(len(oblate_indices)):
+            body_idx = oblate_indices[obl_idx]
+            if body_idx >= num_bodies: continue
+            
+            j2 = oblate_j2[obl_idx]
+            j4 = oblate_j4[obl_idx]
+            if j2 == 0.0 and j4 == 0.0: continue
+            
+            req = oblate_req[obl_idx]
+            M = arr[body_idx, 9]
+            if M == 0.0: continue
+            
+            px = oblate_poles[obl_idx, 0]
+            py = oblate_poles[obl_idx, 1]
+            pz = oblate_poles[obl_idx, 2]
+            
+            base_j2 = -(1.5) * j2 * G_val * M * (req**2)
+            base_j4 = (15.0/8.0) * j4 * G_val * M * (req**4)
+            
+            bx = arr[body_idx, 0]
+            by = arr[body_idx, 1]
+            bz = arr[body_idx, 2]
+            
+            for i in range(num_bodies):
+                if i == body_idx: continue
+                
+                dx = arr[i, 0] - bx
+                dy = arr[i, 1] - by
+                dz = arr[i, 2] - bz
+                
+                r2 = dx*dx + dy*dy + dz*dz
+                if r2 == 0.0: continue
+                r = math.sqrt(r2)
+                z_dot = dx*px + dy*py + dz*pz
+                z_r = z_dot / r
+                z_r_sq = z_r * z_r
+                
+                a_x = 0.0
+                a_y = 0.0
+                a_z = 0.0
+                
+                if j2 != 0.0:
+                    prefac_j2 = base_j2 / (r2*r2*r)
+                    term1 = 1.0 - 5.0 * z_r_sq
+                    term2 = 2.0 * z_dot
+                    a_x += prefac_j2 * (term1 * dx + term2 * px)
+                    a_y += prefac_j2 * (term1 * dy + term2 * py)
+                    a_z += prefac_j2 * (term1 * dz + term2 * pz)
+                    
+                if j4 != 0.0:
+                    prefac_j4 = base_j4 / (r2*r2*r2*r)
+                    z_r_4 = z_r_sq * z_r_sq
+                    term1 = 1.0 - 14.0 * z_r_sq + 21.0 * z_r_4
+                    term2 = 4.0 * z_r - 28.0 * z_r_sq * z_r
+                    a_x += prefac_j4 * (term1 * dx + term2 * r * px)
+                    a_y += prefac_j4 * (term1 * dy + term2 * r * py)
+                    a_z += prefac_j4 * (term1 * dz + term2 * r * pz)
+                
+                arr[i, 6] += a_x
+                arr[i, 7] += a_y
+                arr[i, 8] += a_z
+                
+                mi = arr[i, 9]
+                if mi > 0.0:
+                    ratio = mi / M
+                    arr[body_idx, 6] -= a_x * ratio
+                    arr[body_idx, 7] -= a_y * ratio
+                    arr[body_idx, 8] -= a_z * ratio
+
+def attach_custom_forces(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list):
+    if not has_j2 and not has_gr:
+        return
+        
+    stride = ctypes.sizeof(rebound.Particle) // 8
+    G_val = sim.G
+    c2 = C_AU_YR * C_AU_YR
+    
+    oblate_indices = None
+    oblate_j2 = None
+    oblate_j4 = None
+    oblate_req = None
+    oblate_poles = None
+    
+    if has_j2 and oblate_physics_list:
+        oblate_indices = np.array([x[0] for x in oblate_physics_list], dtype=np.int32)
+        oblate_j2 = np.array([x[1] for x in oblate_physics_list], dtype=np.float64)
+        oblate_j4 = np.array([x[2] for x in oblate_physics_list], dtype=np.float64)
+        oblate_req = np.array([x[3] for x in oblate_physics_list], dtype=np.float64)
+        oblate_poles = np.array([x[4] for x in oblate_physics_list], dtype=np.float64)
+        
+    initial_addr = ctypes.addressof(sim._particles.contents)
+    
+    def force_callback(sim_ref):
+        n = sim.N
+        raw = (ctypes.c_double * (n * stride)).from_address(initial_addr)
+        arr = np.frombuffer(raw, dtype=np.float64).reshape(n, stride)
+        compute_custom_forces(arr, n, G_val, c2, has_j2, has_gr, phys_star_idx, 
+                              oblate_indices, oblate_j2, oblate_j4, oblate_req, oblate_poles)
+
+    sim.additional_forces = force_callback
+    sim.force_is_velocity_dependent = 1
 
 @njit(cache=True)
 def compute_keplerian_elements(rx, ry, rz, vx, vy, vz, mu):
@@ -799,7 +1042,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         sim = restore_snap.sim_copy.copy()
-                    attach_reboundx_forces(sim, restore_snap.has_j2, restore_snap.has_gr, restore_snap.phys_star_idx, restore_snap.oblate_physics_list)
+                    attach_custom_forces(sim, restore_snap.has_j2, restore_snap.has_gr, restore_snap.phys_star_idx, restore_snap.oblate_physics_list)
                     if restore_snap.has_j2 and len(restore_snap.oblate_physics_list) > 0:
                         print(f"[System] Restored J2 precession for {len(restore_snap.oblate_physics_list)} oblate bodies")
                     if restore_snap.has_gr and restore_snap.phys_star_idx >= 0:
@@ -1135,7 +1378,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 warnings.simplefilter("ignore")
                 sim_timeline_base = sim.copy()
                 sim_start_copy = sim.copy()
-            attach_reboundx_forces(sim_start_copy, shared_state["has_j2"], shared_state["has_gr"], shared_state["phys_star_idx"], shared_state["oblate_physics_list"])
+            attach_custom_forces(sim_start_copy, shared_state["has_j2"], shared_state["has_gr"], shared_state["phys_star_idx"], shared_state["oblate_physics_list"])
                 
             render_start_time = time.time()
             valid_steps = 0
@@ -1422,11 +1665,11 @@ def load_system_from_data(bodies_data_raw):
 
     rebx_obj = None
     if has_j2 or has_gr:
-        attach_reboundx_forces(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)
+        attach_custom_forces(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)
         if has_j2:
-            print(f"[System] Attached J2 precession for {len(oblate_physics_list)} oblate bodies via reboundx")
+            print(f"[System] Attached J2 precession for {len(oblate_physics_list)} oblate bodies via custom Numba forces")
         if has_gr:
-            print(f"[System] Attached 1PN GR precession (star index {phys_star_idx}) via reboundx")
+            print(f"[System] Attached 1PN GR precession (star index {phys_star_idx}) via custom Numba forces")
         sim.force_is_velocity_dependent = 1
 
     num_bodies = len(sim.particles)
