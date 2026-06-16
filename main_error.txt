@@ -1,7 +1,6 @@
 Traceback (most recent call last):
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\main.py", line 10, in <module>
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\app.py", line 580, in run
-    _init_arr = _get_particle_array(sim, num_bodies)
-                ^^^^^^^^^^^^^^^^^^^
-NameError: name '_get_particle_array' is not defined
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 788, in run
+    from engine.post_shaders import bloom_downsample_shader_vs, bloom_downsample_shader_fs, bloom_upsample_shader_vs, bloom_upsample_shader_fs, composite_shader_vs, composite_shader_fs
+ModuleNotFoundError: No module named 'engine'

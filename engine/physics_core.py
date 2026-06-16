@@ -2239,6 +2239,11 @@ class Simulation:
                 break
                 
             dt_step = self.dt
+            
+            # Ensure dt_step has the same sign as t_diff
+            if (t_diff > 0 and dt_step < 0) or (t_diff < 0 and dt_step > 0):
+                dt_step = -dt_step
+                
             if t_diff > 0 and dt_step > t_diff:
                 dt_step = t_diff
             elif t_diff < 0 and dt_step < t_diff:
