@@ -785,32 +785,7 @@ class App:
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
     
-        from post_shaders import bloom_downsample_shader_vs, bloom_downsample_shader_fs, bloom_upsample_shader_vs, bloom_upsample_shader_fs, composite_shader_vs, composite_shader_fs
-        self.prog_bloom_downsample = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
-        self.prog_bloom_upsample = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
-        self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
-        
-        # Bloom UI State
-        self.bloom_settings = {
-            "enabled": True,
-            "intensity": 0.35,
-            "threshold": 0.5,
-            "radius": 1.0,
-        }
-        
-        self.hdr_fbo = None
-        self.hdr_color_tex = None
-        self.hdr_depth_rb = None
-        
-        self.bloom_fbos = []
-        self.bloom_texs = []
-        self.num_bloom_mips = 6
-        
-        self.quad_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
-        self.quad_vao_downsample = ctx.vertex_array(self.prog_bloom_downsample, [(self.quad_vbo, '2f', 'in_position')])
-        self.quad_vao_upsample = ctx.vertex_array(self.prog_bloom_upsample, [(self.quad_vbo, '2f', 'in_position')])
-        self.quad_vao_composite = ctx.vertex_array(self.prog_composite, [(self.quad_vbo, '2f', 'in_position')])
-    
+
         def build_eclipse_lut(ctx):
             LUT_SIZE = 256
             x_arr = np.linspace(0.0, 2.0, LUT_SIZE, dtype='f4')
@@ -1722,39 +1697,7 @@ class App:
                 continue
             
             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-            
-            # Rebuild HDR FBO if needed
-            if self.hdr_fbo is None or self.hdr_fbo.size != (self.fb_width, self.fb_height):
-                if self.hdr_fbo: self.hdr_fbo.release()
-                if self.hdr_color_tex: self.hdr_color_tex.release()
-                if self.hdr_depth_rb: self.hdr_depth_rb.release()
-                for fbo in self.bloom_fbos: fbo.release()
-                for tex in self.bloom_texs: tex.release()
-                
-                self.hdr_color_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f2')
-                self.hdr_color_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                self.hdr_color_tex.repeat_x = False
-                self.hdr_color_tex.repeat_y = False
-                
-                self.hdr_depth_rb = ctx.depth_renderbuffer((self.fb_width, self.fb_height))
-                self.hdr_fbo = ctx.framebuffer(color_attachments=[self.hdr_color_tex], depth_attachment=self.hdr_depth_rb)
-                
-                self.bloom_fbos = []
-                self.bloom_texs = []
-                mip_w, mip_h = self.fb_width // 2, self.fb_height // 2
-                for i in range(self.num_bloom_mips):
-                    mip_w, mip_h = max(1, mip_w), max(1, mip_h)
-                    tex = ctx.texture((mip_w, mip_h), 4, dtype='f2')
-                    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    tex.repeat_x = False
-                    tex.repeat_y = False
-                    fbo = ctx.framebuffer(color_attachments=[tex])
-                    self.bloom_texs.append(tex)
-                    self.bloom_fbos.append(fbo)
-                    mip_w //= 2
-                    mip_h //= 2
-            
-            self.hdr_fbo.use()
+            ctx.screen.use()
             ctx.clear(0.02, 0.02, 0.03, 1.0) 
     
             is_scrubbing = tl_active and tl_prog >= 1.0
@@ -2830,15 +2773,7 @@ class App:
                     _, self.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", self.camera.get("planetshine_enabled", True))
                     _, self.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", self.camera.get("ringshine_enabled", True))
                     
-                    imgui.separator()
-                    if imgui.collapsing_header("Bloom & Post-Process", imgui.TREE_NODE_DEFAULT_OPEN)[0]:
-                        _, self.bloom_settings["enabled"] = imgui.checkbox("Enable Bloom", self.bloom_settings["enabled"])
-                        if self.bloom_settings["enabled"]:
-                            _, self.bloom_settings["intensity"] = imgui.slider_float("Intensity", self.bloom_settings["intensity"], 0.0, 1.0)
-                            _, self.bloom_settings["threshold"] = imgui.slider_float("Threshold", self.bloom_settings["threshold"], 0.0, 2.0)
-                            _, self.bloom_settings["radius"] = imgui.slider_float("Radius", self.bloom_settings["radius"], 0.1, 2.0)
-                            
-                    imgui.separator()
+
                     if imgui.button("Close"):
                         self.camera["show_settings_modal"] = False
                 imgui.end()
@@ -3943,66 +3878,9 @@ class App:
                             print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
                 imgui.end()
     
-            # --- POST-PROCESSING & BLOOM ---
-            # Unbind HDR FBO and prepare for post-processing
+            # Re-enable standard settings for ImGui
             ctx.screen.use()
             ctx.disable(moderngl.DEPTH_TEST)
-            
-            if self.bloom_settings["enabled"] and self.hdr_color_tex and self.bloom_fbos:
-                # 1. Downsample (Extract bright parts)
-                self.prog_bloom_downsample['u_threshold'].value = self.bloom_settings["threshold"]
-                
-                src_tex = self.hdr_color_tex
-                for i, fbo in enumerate(self.bloom_fbos):
-                    fbo.use()
-                    src_tex.use(location=0)
-                    self.prog_bloom_downsample['u_texture'].value = 0
-                    self.prog_bloom_downsample['u_texel_size'].value = (1.0 / src_tex.width, 1.0 / src_tex.height)
-                    self.quad_vao_downsample.render(moderngl.TRIANGLE_STRIP)
-                    src_tex = self.bloom_texs[i]
-                    # Disable threshold after first downsample pass
-                    if i == 0:
-                        self.prog_bloom_downsample['u_threshold'].value = 0.0
-                        
-                # 2. Upsample (Blur)
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = moderngl.ONE, moderngl.ONE # Additive blending
-                self.prog_bloom_upsample['u_radius'].value = self.bloom_settings["radius"]
-                
-                for i in range(len(self.bloom_fbos) - 1, 0, -1):
-                    target_fbo = self.bloom_fbos[i - 1]
-                    src_tex = self.bloom_texs[i]
-                    
-                    target_fbo.use()
-                    src_tex.use(location=0)
-                    self.prog_bloom_upsample['u_texture'].value = 0
-                    self.prog_bloom_upsample['u_texel_size'].value = (1.0 / src_tex.width, 1.0 / src_tex.height)
-                    self.quad_vao_upsample.render(moderngl.TRIANGLE_STRIP)
-                    
-                ctx.disable(moderngl.BLEND)
-                bloom_result_tex = self.bloom_texs[0]
-            else:
-                bloom_result_tex = self.hdr_color_tex # Fallback (no bloom texture)
-                
-            # 3. Composite & Tone Mapping to Screen
-            ctx.screen.use()
-            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-            
-            self.hdr_color_tex.use(location=0)
-            self.prog_composite['u_main_texture'].value = 0
-            
-            if self.bloom_settings["enabled"]:
-                bloom_result_tex.use(location=1)
-                self.prog_composite['u_bloom_texture'].value = 1
-                self.prog_composite['u_bloom_intensity'].value = self.bloom_settings["intensity"]
-            else:
-                self.hdr_color_tex.use(location=1)
-                self.prog_composite['u_bloom_texture'].value = 1
-                self.prog_composite['u_bloom_intensity'].value = 0.0
-                
-            self.quad_vao_composite.render(moderngl.TRIANGLE_STRIP)
-            
-            # Re-enable standard settings for ImGui
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             
