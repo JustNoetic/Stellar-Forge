@@ -283,6 +283,8 @@ uniform int u_atmo_quality;
 uniform bool u_planetshine_enabled;
 uniform bool u_ringshine_enabled;
 uniform sampler2D u_eclipse_lut;
+uniform float u_exposure;
+uniform bool u_hdr_enabled;
 uniform vec3 u_camera_pos;
 
 out vec4 out_color;
@@ -322,8 +324,23 @@ void main() {
         vec3 edge_tint = vec3(1.0, 0.85, 0.65);
         vec3 color_shift = mix(edge_tint, vec3(1.0), pow(mu, 0.5));
         
-        // Multiply by 1.5 to push star brightness into HDR range, making bloom pop
-        out_color = vec4(f_color * color_shift * ld * 1.5, 1.0);
+        // Find which star this is to get its luminosity and radius
+        float star_lum = 1.0;
+        float star_r = 0.00465;
+        for (int s = 0; s < u_num_stars; s++) {
+            if (distance(f_world_pos, u_stars_pos_radius[s].xyz) < u_stars_pos_radius[s].w * 1.5) {
+                star_lum = u_stars_colors[s].a;
+                star_r = max(u_stars_pos_radius[s].w, 1e-6);
+                break;
+            }
+        }
+        
+        float surface_luminance = u_hdr_enabled ? (star_lum / (star_r * star_r)) : 1.0;
+        vec3 final_star_color = f_color * color_shift * ld * surface_luminance;
+        if (u_hdr_enabled) {
+            final_star_color *= u_exposure;
+        }
+        out_color = vec4(final_star_color, 1.0);
     } else {
         vec3 N = normalize(f_normal);
         vec3 total_diffuse_color = vec3(0.0);
@@ -338,14 +355,21 @@ void main() {
             if (dist_to_star < 1e-5) continue;
             vec3 L = frag_to_star / dist_to_star;
             
+            float star_lum = u_stars_colors[s].a;
+            
             // Angular radius of the star for soft penumbra at terminator
             float star_ang_radius = star_radius / dist_to_star;
             float sin_alpha = clamp(star_ang_radius, 0.0, 1.0);
             float alpha = asin(sin_alpha);
             
-            // Lambert cosine law: brightness decreases with angle
+            // Lambert cosine law with soft terminator
             float NdotL = dot(N, L);
             float diffuse = clamp((NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+            
+            // Inverse-square falloff
+            if (u_hdr_enabled) {
+                diffuse *= star_lum / (dist_to_star * dist_to_star);
+            }
             
             // === Analytical eclipse shadows ===
             vec3 shadow = vec3(1.0);
@@ -538,8 +562,12 @@ void main() {
                 }
                 shine_intensity *= shadow_occlusion;
                 
+                float star_lum = u_stars_colors[s].a;
+                float dist_to_star = distance(star_pos, f_world_pos);
+                float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star * dist_to_star, 1e-8)) : 1.0;
+                
                 vec3 ring_tint = u_ring_colors[k] * 1.2;
-                ring_shine += ring_tint * star_color * shine_intensity;
+                ring_shine += ring_tint * star_color * shine_intensity * irradiance;
             }
         }
         
@@ -549,6 +577,9 @@ void main() {
         }
         if (u_ringshine_enabled) {
             final_color += f_color * ring_shine;
+        }
+        if (u_hdr_enabled) {
+            final_color *= u_exposure;
         }
         out_color = vec4(final_color, 1.0);
     }
@@ -859,6 +890,7 @@ layout(std140, binding = 1) uniform SceneData {
 
 uniform vec3 u_host_planet_pos;
 uniform float u_host_planet_radius;
+uniform vec3 u_host_planet_color;
 uniform vec3 u_camera_pos;
 uniform vec4 u_host_planet_pole_obl;
 uniform int u_clip_mode;
@@ -866,6 +898,8 @@ uniform uint u_caster_mask_lo;
 uniform uint u_caster_mask_hi;
 uniform bool u_planetshine_enabled;
 uniform sampler2D u_eclipse_lut;
+uniform float u_exposure;
+uniform bool u_hdr_enabled;
 
 out vec4 out_color;
 
@@ -923,6 +957,8 @@ void main() {
         if (dist_to_star < 1e-5) continue;
         vec3 L = frag_to_star / dist_to_star;
         
+        float star_lum = u_stars_colors[s].a;
+        
         float cos_theta = -dot(L, V);
         
         float denom_rock = 1.0 + g_rock * g_rock - 2.0 * g_rock * cos_theta;
@@ -953,6 +989,11 @@ void main() {
         float transmitted_s = rock_transmit_s + dust_transmit * dusty_phase;
         
         float direct_illum_s = mix(transmitted_s, reflected_s, same_side);
+        
+        // Inverse-square falloff
+        if (u_hdr_enabled) {
+            direct_illum_s *= star_lum / (dist_to_star * dist_to_star);
+        }
         vec3 shadow_s = vec3(1.0);
         for (int j = 0; j < u_num_casters; j++) {
             if (dot(shadow_s, shadow_s) < 0.001) break;
@@ -1076,13 +1117,18 @@ void main() {
         for (int s = 0; s < u_num_stars; s++) {
             vec3 star_pos = u_stars_pos_radius[s].xyz;
             vec3 star_color = u_stars_colors[s].rgb;
-            vec3 host_to_star = normalize(star_pos - u_host_planet_pos);
+            float star_lum = u_stars_colors[s].a;
+            vec3 host_to_star = star_pos - u_host_planet_pos;
+            float dist_host_star = length(host_to_star);
+            float irradiance = u_hdr_enabled ? (star_lum / max(dist_host_star * dist_host_star, 1e-8)) : 1.0;
+            
+            host_to_star /= max(dist_host_star, 1e-6);
             float planet_phase = max(0.0, dot(host_to_star, -dir_to_host));
             float shine_intensity = planet_phase * solid_angle * planet_elevation;
             float p_reflect = rock_reflect + 0.3 * f_color.a; 
             float p_transmit = rock_transmit + 0.2 * f_color.a;
             float shine_response = mix(p_transmit, p_reflect, cam_planet_same_side);
-            total_planetshine += star_color * (shine_intensity * shine_response * 0.8);
+            total_planetshine += u_host_planet_color * star_color * irradiance * (shine_intensity * shine_response * 0.4);
         }
     }
     
@@ -1092,7 +1138,7 @@ void main() {
     }
     float final_alpha = clamp(f_color.a, 0.0, 1.0);
     vec3 raw_color = f_color.rgb * illumination;
-    vec3 final_color = 1.0 - exp(-raw_color);
+    vec3 final_color = u_hdr_enabled ? (raw_color * u_exposure) : raw_color;
     
     out_color = vec4(final_color, final_alpha);
 }
@@ -1208,6 +1254,8 @@ uniform vec4 u_active_casters[8];
 uniform vec4 u_active_caster_poles_obl[8];
 uniform vec4 u_active_caster_atmos[8];
 uniform sampler2D u_eclipse_lut;
+uniform float u_exposure;
+uniform bool u_hdr_enabled;
 
 out vec4 out_color;
 
@@ -1505,6 +1553,7 @@ void main() {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = u_stars_pos_radius[s].w;
         vec3 star_color = u_stars_colors[s].rgb;
+        float star_lum = u_stars_colors[s].a;
 
         vec3 sun_pos_local = (star_pos - planet_center_render) * u_au_to_km;
         vec3 sun_dir = normalize(sun_pos_local);
@@ -1636,8 +1685,12 @@ void main() {
         float phase_M = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_theta * cos_theta))
                       / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
 
+        // Inverse-square falloff for irradiance
+        float dist_to_star = length(star_pos - planet_center_render);
+        float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star * dist_to_star, 1e-8)) : 1.0;
+        
         // 9. Final scattered light
-        scattered += star_color * u_sun_intensity * (
+        scattered += star_color * u_sun_intensity * irradiance * (
             phase_R * beta_R * total_rayleigh +
             phase_M * beta_M * total_mie
         );
@@ -1651,11 +1704,9 @@ void main() {
                              + beta_M * mie_ext_factor * final_od_mie
                              + beta_A * final_od_rayleigh));
 
-    // Tone mapping to prevent blowout while preserving hue
-    float max_scatter = max(scattered.r, max(scattered.g, scattered.b));
-    if (max_scatter > 1e-6) {
-        float mapped_max = 1.0 - exp(-max_scatter);
-        scattered = scattered * (mapped_max / max_scatter);
+    // Apply Exposure
+    if (u_hdr_enabled) {
+        scattered *= u_exposure;
     }
 
     // 11. Premultiplied alpha output

@@ -214,7 +214,7 @@ class ModernGLGlfwRenderer(GlfwRenderer):
         self.modern_renderer.shutdown()
 
 @njit
-def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors):
+def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, hdr_enabled):
     N = len(pos)
     planetshine_dirs = np.zeros((N, 3), dtype=np.float32)
     planetshine_colors = np.zeros((N, 3), dtype=np.float32)
@@ -285,9 +285,14 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                 if phase < 0.0:
                     phase = 0.0
                     
-                total_caster_light_r += star_col[0] * phase
-                total_caster_light_g += star_col[1] * phase
-                total_caster_light_b += star_col[2] * phase
+                if hdr_enabled:
+                    irradiance = star_col[3] / max(c_dist * c_dist, 1e-8)
+                else:
+                    irradiance = 1.0
+                    
+                total_caster_light_r += star_col[0] * phase * irradiance
+                total_caster_light_g += star_col[1] * phase * irradiance
+                total_caster_light_b += star_col[2] * phase * irradiance
                 
             bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * 2.0
             bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * 2.0
@@ -320,6 +325,8 @@ class App:
             "target": np.array([0.0, 0.0, 0.0], dtype='f8'),
             "target_offset": np.array([0.0, 0.0, 0.0], dtype='f8'),
             "pan_offset": np.array([0.0, 0.0, 0.0], dtype='f8'),
+            "exposure": 1.0,
+            "hdr_enabled": True,
             "distance": 45.0,     
             "distance_actual": 45.0,
             "fov": 45.0,
@@ -458,6 +465,12 @@ class App:
                 self.time_ctrl["multiplier"] = max(self.time_ctrl["multiplier"] / 2.0, 1.0)
             elif key == glfw.KEY_R:
                 self.time_ctrl["multiplier"] = 1.0
+            elif key == glfw.KEY_MINUS:
+                multiplier = 10.0 if (mods & glfw.MOD_SHIFT) else 2.0
+                self.camera["exposure"] /= multiplier
+            elif key == glfw.KEY_EQUAL:
+                multiplier = 10.0 if (mods & glfw.MOD_SHIFT) else 2.0
+                self.camera["exposure"] *= multiplier
     
     def resize_callback(self, window, width, height):
         if self.impl: self.impl.resize_callback(window, width, height)
@@ -474,6 +487,9 @@ class App:
     
     def run(self):
         if _PERF_ENABLED:
+            import sys
+            import os
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             from scripts.perf_test import PerfTracker as _BootTracker
             _BootTracker().__class__
             if _PERF_TRACKER is None:
@@ -1060,6 +1076,7 @@ class App:
         u_ring_host_pos = prog_rings['u_host_planet_pos']
         u_ring_host_radius = prog_rings['u_host_planet_radius']
         u_ring_host_pole_obl = prog_rings['u_host_planet_pole_obl']
+        u_ring_host_color = prog_rings.get('u_host_planet_color', None)
         u_ring_camera_pos = prog_rings['u_camera_pos']
         u_ring_body_offset = prog_rings['u_body_offset']
         u_ring_clip_mode = prog_rings['u_clip_mode']
@@ -1970,14 +1987,15 @@ class App:
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
             star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
             star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
-            
+            hdr_enabled = self.camera.get("hdr_enabled", True)
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
                 all_instances[:total_render_bodies, 6],
                 all_instances[:total_render_bodies, 3:6],
                 all_instances[:total_render_bodies, 8],
                 star_positions,
-                star_colors
+                star_colors,
+                hdr_enabled
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
             all_instances[:total_render_bodies, 19:22] = planetshine_colors
@@ -2148,8 +2166,18 @@ class App:
                     pos = all_instances[i, 0:3]
                     radius = all_instances[i, 6]
                     color = all_instances[i, 3:6]
+                    
+                    lum = 1.0
+                    if i < num_bodies:
+                        b_data = bodies_data[i]
+                    else:
+                        b_data = self.bodies_data_cmp[i - num_bodies]
+                        
+                    if "star_props" in b_data and "lum" in b_data["star_props"]:
+                        lum = float(b_data["star_props"]["lum"])
+                        
                     stars_pos_radius.append([pos[0], pos[1], pos[2], radius])
-                    stars_colors.append([color[0], color[1], color[2], 1.0])
+                    stars_colors.append([color[0], color[1], color[2], lum])
                     
             num_stars = len(stars_pos_radius)
             num_stars = min(num_stars, 16)
@@ -2259,7 +2287,15 @@ class App:
     
             ring_gradient_tex.use(location=0)
             
-
+            # Pass Exposure and HDR setting to shaders
+            exposure = self.camera.get("exposure", 1.0)
+            hdr_enabled = self.camera.get("hdr_enabled", True)
+            
+            for prog in (prog_spheres, prog_rings, prog_atmo):
+                if 'u_exposure' in prog:
+                    prog['u_exposure'].value = exposure
+                if 'u_hdr_enabled' in prog:
+                    prog['u_hdr_enabled'].value = hdr_enabled
             
             ctx.enable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
@@ -2588,6 +2624,8 @@ class App:
                         u_ring_body_offset.write(body_pos_rel)
                         u_ring_host_pos.write(body_pos_rel)
                         u_ring_host_radius.value = float(body_radii[bi])
+                        if u_ring_host_color is not None:
+                            u_ring_host_color.value = tuple(float(c) for c in body_colors[bi])
                         u_ring_host_pole_obl.value = (
                             float(all_instances[bi, 9]),
                             float(all_instances[bi, 10]),
@@ -2607,6 +2645,8 @@ class App:
                         u_ring_body_offset.write(body_pos_rel)
                         u_ring_host_pos.write(body_pos_rel)
                         u_ring_host_radius.value = float(self.body_radii_cmp[bi])
+                        if u_ring_host_color is not None:
+                            u_ring_host_color.value = tuple(float(c) for c in self.body_colors_cmp[bi])
                         
                         body_idx_in_unified = num_bodies + bi
                         u_ring_host_pole_obl.value = (
@@ -2760,6 +2800,11 @@ class App:
                 if expanded:
                     # Atmosphere Quality
                     _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)"])
+                    
+                    # Exposure & HDR
+                    _, self.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", self.camera.get("hdr_enabled", True))
+                    if self.camera.get("hdr_enabled", True):
+                        _, self.camera["exposure"] = imgui.slider_float("Exposure", self.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
                     
                     # Orbit Lines
                     _, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
@@ -3492,46 +3537,104 @@ class App:
                         
                         imgui.same_line(imgui.get_window_width() - 70)
                         if imgui.button("Export"):
-                            exp = {}
-                            c = visual_arr[insp_idx, 0:3]
-                            exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+                            is_hidden_combo = glfw.get_key(self.window, glfw.KEY_LEFT_BRACKET) == glfw.PRESS and glfw.get_key(self.window, glfw.KEY_RIGHT_BRACKET) == glfw.PRESS
                             
-                            atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
-                            if atmo_item:
-                                exp["atmosphere"] = {
-                                    "height": float(atmo_item["atmo_radius_km"] - atmo_item["planet_radius_km"]),
-                                    "rayleighCoefficients": [float(x) for x in atmo_item["beta_rayleigh"]],
-                                    "rayleighScaleHeight": float(atmo_item["h_rayleigh"]),
-                                    "mieCoefficient": float(atmo_item["beta_mie"]),
-                                    "mieScaleHeight": float(atmo_item["h_mie"]),
-                                    "mieAsymmetry": float(atmo_item["mie_g"]),
-                                    "absorptionCoefficients": [float(x) for x in atmo_item["beta_absorption"]],
-                                    "intensity": float(atmo_item["intensity"])
-                                }
+                            def fmt(val, dec=5): return round(float(val), dec)
+                            
+                            if is_hidden_combo and active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                                system_file = "data/system.json"
+                                try:
+                                    with open(system_file, "r") as f:
+                                        sys_data = json.load(f)
+                                        
+                                    for s_body in sys_data:
+                                        name = s_body.get("name")
+                                        b_idx = None
+                                        for i, b in enumerate(bodies_data):
+                                            if b.get("name") == name:
+                                                b_idx = i
+                                                break
+                                                
+                                        if b_idx is not None:
+                                            c = visual_arr[b_idx, 0:3]
+                                            s_body["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+                                            
+                                            atmo_item = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
+                                            if atmo_item:
+                                                s_body["atmosphere"] = {
+                                                    "height": fmt(atmo_item["atmo_radius_km"] - atmo_item["planet_radius_km"], 2),
+                                                    "rayleighCoefficients": [fmt(x, 8) for x in atmo_item["beta_rayleigh"]],
+                                                    "rayleighScaleHeight": fmt(atmo_item["h_rayleigh"], 2),
+                                                    "mieCoefficient": fmt(atmo_item["beta_mie"], 8),
+                                                    "mieScaleHeight": fmt(atmo_item["h_mie"], 2),
+                                                    "mieAsymmetry": fmt(atmo_item["mie_g"], 4),
+                                                    "absorptionCoefficients": [fmt(x, 8) for x in atmo_item["beta_absorption"]],
+                                                    "intensity": fmt(atmo_item["intensity"], 3)
+                                                }
+                                                
+                                            ring_segs = [r for r in ring_precomputed if r['body_idx'] == b_idx]
+                                            if ring_segs:
+                                                s_body["rings"] = []
+                                                body_r_au = bodies_data[b_idx].get('radius', 1000.0) / 1.496e8
+                                                for r in ring_segs:
+                                                    rc = r.get('raw_color', [1.0, 1.0, 1.0])
+                                                    hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
+                                                    s_body["rings"].append({
+                                                        "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
+                                                        "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
+                                                        "color": hex_col,
+                                                        "opacity": fmt(r['opacity']),
+                                                        "scatter": fmt(r['scatter']),
+                                                        "asymmetry": fmt(r['asymmetry']),
+                                                        "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
+                                                    })
+                                                    
+                                    with open(system_file, "w") as f:
+                                        json.dump(sys_data, f, indent=2)
+                                    print(f"Secret Combo: Exported entire system cosmetics directly to {system_file}!")
+                                except Exception as e:
+                                    print(f"Error updating system.json: {e}")
+                            else:
+                                exp = {}
+                                c = visual_arr[insp_idx, 0:3]
+                                exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
                                 
-                            ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
-                            if ring_segs:
-                                exp["rings"] = []
-                                body_r_au = body_info.get('radius', 1000.0) / 1.496e8
-                                for r in ring_segs:
-                                    rc = r.get('raw_color', [1.0, 1.0, 1.0])
-                                    hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
-                                    exp["rings"].append({
-                                        "inner": float(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
-                                        "outer": float(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
-                                        "color": hex_col,
-                                        "opacity": float(r['opacity']),
-                                        "scatter": float(r['scatter']),
-                                        "asymmetry": float(r['asymmetry']),
-                                        "gradient": [{"p": float(g['p']), "a": float(g['a'])} for g in r.get('gradient', [])]
-                                    })
-                            
-                            import os
-                            os.makedirs("exports", exist_ok=True)
-                            filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
-                            with open(filename, 'w') as f:
-                                json.dump(exp, f, indent=4)
-                            print(f"Exported cosmetics to {filename}")
+                                atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                                if atmo_item:
+                                    exp["atmosphere"] = {
+                                        "height": fmt(atmo_item["atmo_radius_km"] - atmo_item["planet_radius_km"], 2),
+                                        "rayleighCoefficients": [fmt(x, 8) for x in atmo_item["beta_rayleigh"]],
+                                        "rayleighScaleHeight": fmt(atmo_item["h_rayleigh"], 2),
+                                        "mieCoefficient": fmt(atmo_item["beta_mie"], 8),
+                                        "mieScaleHeight": fmt(atmo_item["h_mie"], 2),
+                                        "mieAsymmetry": fmt(atmo_item["mie_g"], 4),
+                                        "absorptionCoefficients": [fmt(x, 8) for x in atmo_item["beta_absorption"]],
+                                        "intensity": fmt(atmo_item["intensity"], 3)
+                                    }
+                                    
+                                ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
+                                if ring_segs:
+                                    exp["rings"] = []
+                                    body_r_au = body_info.get('radius', 1000.0) / 1.496e8
+                                    for r in ring_segs:
+                                        rc = r.get('raw_color', [1.0, 1.0, 1.0])
+                                        hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
+                                        exp["rings"].append({
+                                            "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
+                                            "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
+                                            "color": hex_col,
+                                            "opacity": fmt(r['opacity']),
+                                            "scatter": fmt(r['scatter']),
+                                            "asymmetry": fmt(r['asymmetry']),
+                                            "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
+                                        })
+                                
+                                import os
+                                os.makedirs("exports", exist_ok=True)
+                                filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
+                                with open(filename, 'w') as f:
+                                    json.dump(exp, f, indent=4)
+                                print(f"Exported cosmetics to {filename}")
                             
                         changed_c, new_c = imgui.color_edit3("Base Color", *visual_arr[insp_idx, 0:3])
                         if changed_c:
