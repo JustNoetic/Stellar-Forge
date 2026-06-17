@@ -80,13 +80,17 @@ def main():
         
         j2 = body.get("J2", 0.0)
         if j2 > 0:
-            r_mean = body.get("r", 1.0)
-            f = body.get("oblateness", 0.0)
-            if f > 0:
-                req = r_mean / ((1.0 - f)**(1.0/3.0))
+            req_km = body.get("req_km")
+            if req_km:
+                req = req_km / 149597870.7
             else:
-                req = r_mean
-            req = req * 0.00465 # solar radii to AU
+                r_mean = body.get("r", 1.0)
+                f = body.get("oblateness", 0.0)
+                if f > 0:
+                    req = r_mean / ((1.0 - f)**(1.0/3.0))
+                else:
+                    req = r_mean
+                req = req * 0.00465 # solar radii to AU
             if "pole_ra" in body and "pole_dec" in body:
                 pole_ecl = pole_to_ecliptic(body["pole_ra"], body["pole_dec"])
                 pole = np.array(pole_ecl, dtype=np.float64)

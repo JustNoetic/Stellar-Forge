@@ -334,6 +334,8 @@ class App:
             "yaw_actual": -90.0,
             "pitch": 25.0,        
             "pitch_actual": 25.0,
+            "roll": 0.0,
+            "roll_actual": 0.0,
             "left_dragging": False,
             "right_dragging": False,
             "last_x": 0.0,
@@ -466,10 +468,10 @@ class App:
             elif key == glfw.KEY_R:
                 self.time_ctrl["multiplier"] = 1.0
             elif key == glfw.KEY_MINUS:
-                multiplier = 10.0 if (mods & glfw.MOD_SHIFT) else 2.0
+                multiplier = 2.0 if (mods & glfw.MOD_SHIFT) else 1.1
                 self.camera["exposure"] /= multiplier
             elif key == glfw.KEY_EQUAL:
-                multiplier = 10.0 if (mods & glfw.MOD_SHIFT) else 2.0
+                multiplier = 2.0 if (mods & glfw.MOD_SHIFT) else 1.1
                 self.camera["exposure"] *= multiplier
     
     def resize_callback(self, window, width, height):
@@ -871,57 +873,12 @@ class App:
                 r_scatter = ring_seg.get('scatter', 0.0)
                 r_asymmetry = ring_seg.get('asymmetry', 0.7)
                 
-                RADIAL_SUBDIVISIONS = 32
                 sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                
-                theta_arr = np.linspace(0, 2.0 * math.pi, RING_SEGMENTS + 1)
-                p_arr = np.linspace(0, 1.0, RADIAL_SUBDIVISIONS + 1)
-                theta_grid, p_grid = np.meshgrid(theta_arr, p_arr, indexing='ij')
-                
-                r_grid = inner_r + p_grid * (outer_r - inner_r)
-                flat_r = r_grid.ravel()
-                flat_ct = np.cos(theta_grid).ravel()
-                flat_st = np.sin(theta_grid).ravel()
-                n_verts = len(flat_r)
-                
-                eq_pos = np.zeros((n_verts, 3))
-                eq_pos[:, 0] = flat_r * flat_ct
-                eq_pos[:, 2] = flat_r * flat_st
-                verts = (R_ring @ eq_pos.T).T.astype('f4')
-                
-                flat_p = p_grid.ravel()
-                if sorted_gradient:
-                    grad_p = np.array([g['p'] for g in sorted_gradient])
-                    grad_a = np.array([g['a'] for g in sorted_gradient])
-                    alpha_mults = np.interp(flat_p, grad_p, grad_a).astype('f4')
-                    
-                    tex_p = np.linspace(0.0, 1.0, 256)
-                    shadow_grad = np.interp(tex_p, grad_p, grad_a).astype('f4')
-                else:
-                    alpha_mults = np.ones(n_verts, dtype='f4')
-                    shadow_grad = np.ones(256, dtype='f4')
-                
-                colors = np.zeros((n_verts, 4), dtype='f4')
-                colors[:, 0] = r_color[0]
-                colors[:, 1] = r_color[1]
-                colors[:, 2] = r_color[2]
-                colors[:, 3] = r_opacity * alpha_mults
-                
-                stride = RADIAL_SUBDIVISIONS + 1
-                ii, jj = np.meshgrid(np.arange(RING_SEGMENTS), np.arange(RADIAL_SUBDIVISIONS), indexing='ij')
-                ii, jj = ii.ravel(), jj.ravel()
-                p00 = ii * stride + jj
-                p01 = p00 + 1
-                p10 = (ii + 1) * stride + jj
-                p11 = p10 + 1
-                indices = np.column_stack([p00, p01, p10, p10, p01, p11]).ravel().astype('i4')
+                shadow_grad = generate_ring_shadow_grad(sorted_gradient)
                 
                 ring_precomputed.append({
                     'body_idx': body_idx,
-                    'verts': np.array(verts, dtype='f4'),
-                    'indices': np.array(indices, dtype='i4'),
-                    'normal': pole_n.astype('f4'),
-                    'colors': np.array(colors, dtype='f4'),
+                    'pole': pole_n.astype('f4'),
                     'inner_r': inner_r,
                     'outer_r': outer_r,
                     'opacity': r_opacity,
@@ -930,6 +887,7 @@ class App:
                     'shadow_grad': shadow_grad,
                     'raw_color': r_color,
                     'gradient': sorted_gradient,
+                    'row_idx': len(ring_precomputed),
                 })
     
         ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
@@ -952,35 +910,29 @@ class App:
             rings_by_body_init[bi].append(ring)
         
         for bi, rings in rings_by_body_init.items():
-            all_ring_verts = []
-            all_ring_indices = []
-            vert_offset = 0
-            for ring in rings:
-                n_v = len(ring['verts'])
-                ring_packed = np.zeros((n_v, 12), dtype='f4')
-                ring_packed[:, 0:3] = ring['verts']
-                ring_packed[:, 3:6] = ring['normal']
-                ring_packed[:, 6:10] = ring['colors']
-                ring_packed[:, 10] = ring['scatter']
-                ring_packed[:, 11] = ring['asymmetry']
-                all_ring_verts.append(ring_packed)
-                all_ring_indices.append(ring['indices'] + vert_offset)
-                vert_offset += n_v
+            min_r = min([r['inner_r'] for r in rings])
+            max_r = max([r['outer_r'] for r in rings])
+            pole_n = rings[0]['pole']
             
-            all_v = np.concatenate(all_ring_verts, axis=0)
-            all_i = np.concatenate(all_ring_indices, axis=0)
+            verts, normals, indices = generate_ring_geometry(pole_n, min_r, max_r)
+            n_v = len(verts)
+            ring_packed = np.zeros((n_v, 6), dtype='f4')
+            ring_packed[:, 0:3] = verts
+            ring_packed[:, 3:6] = normals
             
-            ring_vbo = ctx.buffer(all_v.tobytes())
-            ring_ibo = ctx.buffer(all_i.tobytes())
+            ring_vbo = ctx.buffer(ring_packed.tobytes())
+            ring_ibo = ctx.buffer(indices.tobytes())
             ring_vao = ctx.vertex_array(
                 prog_rings,
-                [(ring_vbo, '3f 3f 4f 1f 1f', 'in_position', 'in_normal', 'in_color', 'in_scatter', 'in_asymmetry')],
+                [(ring_vbo, '3f 3f', 'in_position', 'in_normal')],
                 index_buffer=ring_ibo
             )
             ring_render_groups.append({
                 'body_idx': bi,
                 'vao': ring_vao,
-                'num_indices': len(all_i),
+                'vbo': ring_vbo,
+                'ibo': ring_ibo,
+                'num_indices': len(indices),
             })
     
         INSTANCE_FLOATS = 24
@@ -1280,6 +1232,8 @@ class App:
                 # Release old ring GL objects and rebuild
                 for g in ring_render_groups:
                     g['vao'].release()
+                    if 'vbo' in g: g['vbo'].release()
+                    if 'ibo' in g: g['ibo'].release()
                 ring_render_groups = []
                 ring_precomputed = []
     
@@ -1302,15 +1256,13 @@ class App:
                         r_opacity = ring_seg.get('opacity', 1.0)
                         r_scatter = ring_seg.get('scatter', 0.0)
                         r_asymmetry = ring_seg.get('asymmetry', 0.7)
-                        RADIAL_SUBDIVISIONS = 32
                         sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                        verts_r, indices_r, norm_r, colors_r, shadow_grad_r = generate_ring_arrays(
-                            pole_render_r, inner_r, outer_r, r_color, r_opacity, r_scatter, r_asymmetry, sorted_gradient)
+                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient)
                         ring_precomputed.append({
-                            'body_idx': body_idx_r, 'verts': verts_r, 'indices': indices_r,
-                            'normal': norm_r, 'colors': colors_r, 'inner_r': inner_r, 'outer_r': outer_r,
+                            'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
                             'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry,
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
+                            'row_idx': len(ring_precomputed),
                         })
     
                 ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
@@ -1326,29 +1278,25 @@ class App:
                     bi_r = ring['body_idx']
                     rings_by_body_sw.setdefault(bi_r, []).append(ring)
                 for bi_r, rings_r in rings_by_body_sw.items():
-                    all_ring_verts_sw = []
-                    all_ring_indices_sw = []
-                    vert_offset_sw = 0
-                    for ring in rings_r:
-                        n_v = len(ring['verts'])
-                        ring_packed = np.zeros((n_v, 12), dtype='f4')
-                        ring_packed[:, 0:3] = ring['verts']
-                        ring_packed[:, 3:6] = ring['normal']
-                        ring_packed[:, 6:10] = ring['colors']
-                        ring_packed[:, 10] = ring['scatter']
-                        ring_packed[:, 11] = ring['asymmetry']
-                        all_ring_verts_sw.append(ring_packed)
-                        all_ring_indices_sw.append(ring['indices'] + vert_offset_sw)
-                        vert_offset_sw += n_v
-                    all_v_sw = np.concatenate(all_ring_verts_sw, axis=0)
-                    all_i_sw = np.concatenate(all_ring_indices_sw, axis=0)
+                    min_r = min([r['inner_r'] for r in rings_r])
+                    max_r = max([r['outer_r'] for r in rings_r])
+                    pole_n = rings_r[0]['pole']
+                    
+                    verts, normals, indices = generate_ring_geometry(pole_n, min_r, max_r)
+                    n_v = len(verts)
+                    ring_packed = np.zeros((n_v, 6), dtype='f4')
+                    ring_packed[:, 0:3] = verts
+                    ring_packed[:, 3:6] = normals
+                    
+                    all_v_sw = ring_packed
+                    all_i_sw = indices
                     ring_vbo_sw = ctx.buffer(all_v_sw.tobytes())
                     ring_ibo_sw = ctx.buffer(all_i_sw.tobytes())
                     ring_vao_sw = ctx.vertex_array(
                         prog_rings,
-                        [(ring_vbo_sw, '3f 3f 4f 1f 1f', 'in_position', 'in_normal', 'in_color', 'in_scatter', 'in_asymmetry')],
+                        [(ring_vbo_sw, '3f 3f', 'in_position', 'in_normal')],
                         index_buffer=ring_ibo_sw)
-                    ring_render_groups.append({'body_idx': bi_r, 'vao': ring_vao_sw, 'num_indices': len(all_i_sw)})
+                    ring_render_groups.append({'body_idx': bi_r, 'vao': ring_vao_sw, 'vbo': ring_vbo_sw, 'ibo': ring_ibo_sw, 'num_indices': len(all_i_sw)})
     
                 # Reset self.camera and UI state
                 self.camera["tracking_idx"] = 0
@@ -1412,6 +1360,8 @@ class App:
                 # Release old ring GL objects and rebuild for comparison
                 for g in self.ring_render_groups_cmp:
                     g['vao'].release()
+                    if 'vbo' in g: g['vbo'].release()
+                    if 'ibo' in g: g['ibo'].release()
                 self.ring_render_groups_cmp = []
                 self.ring_precomputed_cmp = []
                 
@@ -1432,13 +1382,12 @@ class App:
                         r_scatter = ring_seg.get('scatter', 0.0)
                         r_asymmetry = ring_seg.get('asymmetry', 0.7)
                         sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                        verts_r, indices_r, norm_r, colors_r, shadow_grad_r = generate_ring_arrays(
-                            pole_render_r, inner_r, outer_r, r_color, r_opacity, r_scatter, r_asymmetry, sorted_gradient)
+                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient)
                         self.ring_precomputed_cmp.append({
-                            'body_idx': body_idx_r, 'verts': verts_r, 'indices': indices_r,
-                            'normal': norm_r, 'colors': colors_r, 'inner_r': inner_r, 'outer_r': outer_r,
+                            'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
                             'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry,
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
+                            'row_idx': len(self.ring_precomputed_cmp),
                         })
                         
                 rings_by_body_cmp = {}
@@ -1447,28 +1396,25 @@ class App:
                     rings_by_body_cmp.setdefault(bi_r, []).append(ring)
                 for bi_r, rings_r in rings_by_body_cmp.items():
                     all_ring_verts_cmp = []
-                    all_ring_indices_cmp = []
-                    vert_offset_cmp = 0
-                    for ring in rings_r:
-                        n_v = len(ring['verts'])
-                        ring_packed = np.zeros((n_v, 12), dtype='f4')
-                        ring_packed[:, 0:3] = ring['verts']
-                        ring_packed[:, 3:6] = ring['normal']
-                        ring_packed[:, 6:10] = ring['colors']
-                        ring_packed[:, 10] = ring['scatter']
-                        ring_packed[:, 11] = ring['asymmetry']
-                        all_ring_verts_cmp.append(ring_packed)
-                        all_ring_indices_cmp.append(ring['indices'] + vert_offset_cmp)
-                        vert_offset_cmp += n_v
-                    all_v_cmp = np.concatenate(all_ring_verts_cmp, axis=0)
-                    all_i_cmp = np.concatenate(all_ring_indices_cmp, axis=0)
+                    min_r = min([r['inner_r'] for r in rings_r])
+                    max_r = max([r['outer_r'] for r in rings_r])
+                    pole_n = rings_r[0]['pole']
+                    
+                    verts, normals, indices = generate_ring_geometry(pole_n, min_r, max_r)
+                    n_v = len(verts)
+                    ring_packed = np.zeros((n_v, 6), dtype='f4')
+                    ring_packed[:, 0:3] = verts
+                    ring_packed[:, 3:6] = normals
+                    
+                    all_v_cmp = ring_packed
+                    all_i_cmp = indices
                     ring_vbo_cmp = ctx.buffer(all_v_cmp.tobytes())
                     ring_ibo_cmp = ctx.buffer(all_i_cmp.tobytes())
                     ring_vao_cmp = ctx.vertex_array(
                         prog_rings,
-                        [(ring_vbo_cmp, '3f 3f 4f 1f 1f', 'in_position', 'in_normal', 'in_color', 'in_scatter', 'in_asymmetry')],
+                        [(ring_vbo_cmp, '3f 3f', 'in_position', 'in_normal')],
                         index_buffer=ring_ibo_cmp)
-                    self.ring_render_groups_cmp.append({'body_idx': bi_r, 'vao': ring_vao_cmp, 'num_indices': len(all_i_cmp)})
+                    self.ring_render_groups_cmp.append({'body_idx': bi_r, 'vao': ring_vao_cmp, 'vbo': ring_vbo_cmp, 'ibo': ring_ibo_cmp, 'num_indices': len(all_i_cmp)})
                     
                 print(f"[System] Comparison switched to '{self.comparison_system_name}' ({self.num_bodies_cmp} bodies)")
     
@@ -1744,10 +1690,16 @@ class App:
                     
                 sys_mgr_spice.populate_states_fast(et, self._ephem_mapping, pos_snap_render, vel_snap_render, spice_valid_mask)
     
+            if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
+                self.camera["roll"] += 60.0 * dt_render
+            if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+                self.camera["roll"] -= 60.0 * dt_render
+
             lerp_factor = 1.0 - math.exp(-15.0 * dt_render)
             self.camera["distance_actual"] += (self.camera["distance"] - self.camera["distance_actual"]) * lerp_factor
             self.camera["yaw_actual"] += (self.camera["yaw"] - self.camera["yaw_actual"]) * lerp_factor
             self.camera["pitch_actual"] += (self.camera["pitch"] - self.camera["pitch_actual"]) * lerp_factor
+            self.camera["roll_actual"] += (self.camera["roll"] - self.camera["roll_actual"]) * lerp_factor
             self.camera["target_offset"] *= math.exp(-10.0 * dt_render)
     
             compute_barycenters(pos_snap_render, vel_snap_render, mass_snap, parent_snap,
@@ -1858,6 +1810,11 @@ class App:
                                    
             cam_pos = cam_pos_f8.astype('f4')
             view = matrix44.create_look_at(cam_pos, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], dtype='f4')
+            
+            roll_rad = math.radians(self.camera["roll_actual"])
+            if abs(roll_rad) > 1e-6:
+                view = matrix44.multiply(view, matrix44.create_from_z_rotation(roll_rad, dtype='f4'))
+                
             near = max(self.camera["distance_actual"] * 0.0001, 1e-9)
             
             # Incorporate both primary and comparison system body relative positions and radii
@@ -1890,7 +1847,7 @@ class App:
                     break
                 bi = ring['body_idx']
                 ring_centers_buf[n_ring_planes] = pos_rel_all[bi]
-                ring_normals_buf[n_ring_planes] = ring['normal']
+                ring_normals_buf[n_ring_planes] = ring['pole']
                 ring_params_buf[n_ring_planes, 0] = ring['inner_r']
                 ring_params_buf[n_ring_planes, 1] = ring['outer_r']
                 ring_params_buf[n_ring_planes, 2] = ring['opacity']
@@ -2636,6 +2593,18 @@ class App:
                         if k is not None:
                             u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
                             u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
+                        
+                        body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                        prog_rings['u_num_ring_planes'].value = len(body_rings)
+                        for idx, r in enumerate(body_rings):
+                            if idx >= 16: break
+                            prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
+                            prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
+                            prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
+                            prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
+                            prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 
                 if self.comparison_enabled and self.ring_render_groups_cmp:
@@ -2657,6 +2626,17 @@ class App:
                         )
                         u_ring_caster_mask_lo_uni.value = 0
                         u_ring_caster_mask_hi_uni.value = 0
+                        body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                        prog_rings['u_num_ring_planes'].value = len(body_rings)
+                        for idx, r in enumerate(body_rings):
+                            if idx >= 16: break
+                            prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
+                            prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
+                            prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
+                            prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
+                            prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 ctx.depth_mask = True
                 ctx.disable(moderngl.BLEND)
@@ -3269,18 +3249,44 @@ class App:
                         else:
                             m_lunar = body_mass / 3.694e-8
                             imgui.text(u"  Mass:    {m_lunar:.4e} M\u263E".format(m_lunar=m_lunar))
-                        if body_r_km > 100:
-                            imgui.text(f"  Radius:  {body_r_km:,.0f} km")
-                        elif body_r_km > 0.1:
-                            imgui.text(f"  Radius:  {body_r_km:.1f} km")
-                        if body_r_km > 0.0:
-                            g_m_s2 = (1.32712440018e14 * body_mass) / (body_r_km ** 2)
-                            g_earth = g_m_s2 / 9.80665
-                            if g_m_s2 >= 1e-4:
-                                imgui.text("  Surface G: {:.3f} m/s² ({:.3f} g)".format(g_m_s2, g_earth))
-                            else:
-                                imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
+                    if body_r_km > 100:
+                        imgui.text(f"  Radius:  {body_r_km:,.0f} km")
+                    elif body_r_km > 0.1:
+                        imgui.text(f"  Radius:  {body_r_km:.1f} km")
+                    if body_r_km > 0.0:
+                        g_m_s2 = (1.32712440018e14 * body_mass) / (body_r_km ** 2)
+                        g_earth = g_m_s2 / 9.80665
+                        if g_m_s2 >= 1e-4:
+                            imgui.text("  Surface G: {:.3f} m/s² ({:.3f} g)".format(g_m_s2, g_earth))
+                        else:
+                            imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
                     
+                    target_pos = cur_subsys_pos_buf[insp_idx] if inspect_bary else cur_pos_snap_render[insp_idx]
+                    dist_to_center_km = np.linalg.norm(target_pos - cam_world_pos_f8) * 149597870.7
+                    if inspect_bary:
+                        imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
+                    else:
+                        dist_to_surface_km = dist_to_center_km - body_r_km
+                        if dist_to_center_km > 1.49597e7:
+                            imgui.text(f"  Cam Dist: {dist_to_center_km / 149597870.7:.5f} AU")
+                        else:
+                            imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
+                        if dist_to_surface_km > 1.49597e7:
+                            imgui.text(f"  Altitude: {dist_to_surface_km / 149597870.7:.5f} AU")
+                        elif dist_to_surface_km > 0:
+                            imgui.text(f"  Altitude: {dist_to_surface_km:,.0f} km")
+                        else:
+                            imgui.text(f"  Altitude: 0 km (Surface)")
+                    
+                    if not inspect_bary and 'star_props' in body_info:
+                        lum = body_info['star_props'].get('lum', 1.0)
+                        abs_mag = 4.83 - 2.5 * math.log10(max(lum, 1e-10))
+                        dist_au = dist_to_center_km / 149597870.7
+                        dist_pc = dist_au / 206265.0
+                        app_mag = abs_mag + 5.0 * math.log10(max(dist_pc, 1e-10)) - 5.0
+                        imgui.text(f"  Abs Mag (M): {abs_mag:+.2f}")
+                        imgui.text(f"  App Mag (m): {app_mag:+.2f}")
+
                     if parent_idx >= 0:
                         imgui.separator()
                         imgui.text_colored("Orbital Elements", 1.0, 0.85, 0.4)
@@ -3295,10 +3301,23 @@ class App:
                             pv = cur_vel_snap_render[parent_idx]
                             rel_r = bp - pp
                             rel_v = bv - pv
-                            orb_mass = cur_subsys_mass_buf[insp_idx]
                         else:
                             rel_r = cur_pos_snap_render[insp_idx] - cur_pos_snap_render[parent_idx]
                             rel_v = cur_vel_snap_render[insp_idx] - cur_vel_snap_render[parent_idx]
+                            orb_h = np.cross(rel_r, rel_v)
+                            h_norm = np.linalg.norm(orb_h)
+                            if h_norm > 1e-12:
+                                orb_normal = orb_h / h_norm
+                                pole_ra = body_info.get('pole_ra')
+                                pole_dec = body_info.get('pole_dec')
+                                if pole_ra is not None and pole_dec is not None:
+                                    body_pole = pole_to_ecliptic(pole_ra, pole_dec)
+                                    tilt_rad = math.acos(np.clip(np.dot(body_pole, orb_normal), -1.0, 1.0))
+                                    tilt_deg = math.degrees(tilt_rad)
+                                    if tilt_deg > 90.0:
+                                        imgui.text(f"  Axial Tilt: {tilt_deg:.2f}\u00B0 (Retrograde)")
+                                    else:
+                                        imgui.text(f"  Axial Tilt: {tilt_deg:.2f}\u00B0")
                             orb_mass = body_mass
                         
                         ecl_rx, ecl_ry, ecl_rz = rel_r[0], -rel_r[2], rel_r[1]
@@ -3537,7 +3556,7 @@ class App:
                         
                         imgui.same_line(imgui.get_window_width() - 70)
                         if imgui.button("Export"):
-                            is_hidden_combo = glfw.get_key(self.window, glfw.KEY_LEFT_BRACKET) == glfw.PRESS and glfw.get_key(self.window, glfw.KEY_RIGHT_BRACKET) == glfw.PRESS
+                            is_hidden_combo = glfw.get_key(window, glfw.KEY_LEFT_BRACKET) == glfw.PRESS and glfw.get_key(window, glfw.KEY_RIGHT_BRACKET) == glfw.PRESS
                             
                             def fmt(val, dec=5): return round(float(val), dec)
                             
@@ -3575,7 +3594,7 @@ class App:
                                             ring_segs = [r for r in ring_precomputed if r['body_idx'] == b_idx]
                                             if ring_segs:
                                                 s_body["rings"] = []
-                                                body_r_au = bodies_data[b_idx].get('radius', 1000.0) / 1.496e8
+                                                body_r_au = (bodies_data[b_idx].get('r', 0.0) * 696340.0) / 1.495978707e8
                                                 for r in ring_segs:
                                                     rc = r.get('raw_color', [1.0, 1.0, 1.0])
                                                     hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
@@ -3615,7 +3634,7 @@ class App:
                                 ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
                                 if ring_segs:
                                     exp["rings"] = []
-                                    body_r_au = body_info.get('radius', 1000.0) / 1.496e8
+                                    body_r_au = (body_info.get('r', 0.0) * 696340.0) / 1.495978707e8
                                     for r in ring_segs:
                                         rc = r.get('raw_color', [1.0, 1.0, 1.0])
                                         hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
@@ -3718,20 +3737,25 @@ class App:
                                     changed_asym, new_asym = imgui.slider_float(f"Forward Scatter Asym##{i}", ring_item['asymmetry'], 0.0, 0.999)
                                     
                                     grad_changed = False
+                                    grad_sort_needed = False
                                     if imgui.tree_node(f"Alpha Gradient##{i}"):
                                         grad = ring_item['gradient']
                                         if imgui.button(f"Add Stop##{i}"):
                                             grad.append({'p': 1.0, 'a': 1.0})
+                                            grad_sort_needed = True
                                         
                                         stops_to_remove = []
                                         for j, stop in enumerate(grad):
                                             imgui.push_item_width(100)
-                                            changed_p, n_p = imgui.slider_float(f"Pos##{i}_{j}", stop['p'], 0.0, 1.0)
+                                            changed_p, n_p = imgui.slider_float(f"Pos##{i}_{id(stop)}", stop['p'], 0.0, 1.0)
+                                            if imgui.is_item_deactivated_after_edit():
+                                                grad_sort_needed = True
                                             imgui.same_line()
-                                            changed_a, n_a = imgui.slider_float(f"Alpha##{i}_{j}", stop['a'], 0.0, 1.0)
+                                            changed_a, n_a = imgui.slider_float(f"Alpha##{i}_{id(stop)}", stop['a'], 0.0, 1.0)
                                             imgui.same_line()
-                                            if imgui.button(f"X##{i}_{j}"):
+                                            if imgui.button(f"X##{i}_{id(stop)}"):
                                                 stops_to_remove.append(j)
+                                                grad_sort_needed = True
                                             imgui.pop_item_width()
                                             
                                             if changed_p or changed_a:
@@ -3743,8 +3767,9 @@ class App:
                                             grad.pop(j)
                                             grad_changed = True
                                             
-                                        if grad_changed:
+                                        if grad_sort_needed:
                                             grad.sort(key=lambda x: x['p'])
+                                            grad_changed = True
                                             
                                         imgui.tree_pop()
                                     
@@ -3756,14 +3781,7 @@ class App:
                                         if changed_scat: ring_item['scatter'] = new_scat
                                         if changed_asym: ring_item['asymmetry'] = new_asym
                                         
-                                        pole_render = visual_arr[insp_idx, 5:8]
-                                        verts, indices, norm, colors, shadow_grad = generate_ring_arrays(
-                                            pole_render, ring_item['inner_r'], ring_item['outer_r'],
-                                            ring_item['raw_color'], ring_item['opacity'], ring_item['scatter'], ring_item['asymmetry'], ring_item['gradient']
-                                        )
-                                        ring_item['verts'] = verts
-                                        ring_item['indices'] = indices
-                                        ring_item['colors'] = colors
+                                        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'])
                                         ring_item['shadow_grad'] = shadow_grad
                                         rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
                                     
@@ -3782,15 +3800,15 @@ class App:
                                     pole_render = visual_arr[insp_idx, 5:8]
                                     color = visual_arr[insp_idx, 0:3]
                                     grad = [{'p': 0.0, 'a': 0.0}, {'p': 0.5, 'a': 1.0}, {'p': 1.0, 'a': 0.0}]
-                                    verts, indices, norm, colors, shadow_grad = generate_ring_arrays(
-                                        pole_render, r_in, r_out, color, 1.0, 2.5, 0.8, grad
-                                    )
+                                    pole_n = pole_render / np.linalg.norm(pole_render)
+                                    shadow_grad = generate_ring_shadow_grad(grad)
                                     ring_precomputed.append({
                                         'body_idx': insp_idx,
-                                        'verts': verts, 'indices': indices, 'normal': norm, 'colors': colors,
+                                        'pole': pole_n.astype('f4'),
                                         'inner_r': r_in, 'outer_r': r_out, 'opacity': 1.0,
                                         'scatter': 2.5, 'asymmetry': 0.8, 'shadow_grad': shadow_grad,
-                                        'raw_color': color, 'gradient': grad
+                                        'raw_color': color, 'gradient': grad,
+                                        'row_idx': len(ring_precomputed)
                                     })
                                     rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
                     

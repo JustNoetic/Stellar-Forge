@@ -536,7 +536,8 @@ void main() {
             if (dist_to_ring_sq < 1e-12) continue;
             
             float frag_elevation = dot(N, ring_normal);
-            float form_factor = abs(frag_elevation) * (1.0 - abs(frag_elevation)) * 4.0; 
+            float abs_elev = abs(frag_elevation);
+            float form_factor = abs_elev * (1.0 - abs_elev) * (1.0 - abs_elev) * 6.75; 
             float ring_area = (outer_r * outer_r - inner_r * inner_r);
             float solid_angle = ring_area / max(dist_to_ring_sq, ring_area) * 0.1;
             
@@ -551,14 +552,16 @@ void main() {
                 float shadow_occlusion = 1.0;
                 if (dot(N, L) < 0.0) {
                     float anti_solar_alignment = max(0.0, dot(N, -L));
-                    shadow_occlusion = 1.0 - (anti_solar_alignment * 0.95);
+                    shadow_occlusion = 1.0 - (anti_solar_alignment * 0.85);
                 }
+                
+                float noon_fade = 1.0 - max(0.0, dot(N, L));
                 
                 float shine_intensity = 0.0;
                 if (same_hemisphere > 0.0) {
-                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 2.5;
+                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 3.5 * noon_fade;
                 } else {
-                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 1.2;
+                    shine_intensity = abs(sun_elevation) * form_factor * solid_angle * opacity * 1.25;
                 }
                 shine_intensity *= shadow_occlusion;
                 
@@ -815,9 +818,6 @@ ring_vertex_shader = """
 #version 460 core
 in vec3 in_position;
 in vec3 in_normal;
-in vec4 in_color;
-in float in_scatter;
-in float in_asymmetry;
 
 #define MAX_CASTERS 64
 #define MAX_STARS 16
@@ -841,18 +841,14 @@ uniform vec3 u_body_offset;
 
 out vec3 f_world_pos;
 out vec3 f_normal;
-out vec4 f_color;
+out vec3 f_local_pos;
 out float f_clip_z;
-out float f_scatter;
-out float f_asymmetry;
 
 void main() {
     vec3 world_pos = in_position + u_body_offset;
     f_world_pos = world_pos;
     f_normal = in_normal;
-    f_color = in_color;
-    f_scatter = in_scatter;
-    f_asymmetry = in_asymmetry;
+    f_local_pos = in_position;
     gl_Position = projection * view * vec4(world_pos, 1.0);
     gl_Position.z = (log2(max(1e-6, u_depth_C * gl_Position.w + 1.0)) / log2(u_depth_C * u_far + 1.0) * 2.0 - 1.0) * gl_Position.w;
     f_clip_z = gl_Position.w;
@@ -866,10 +862,8 @@ ring_fragment_shader = """
 
 in vec3 f_world_pos;
 in vec3 f_normal;
-in vec4 f_color;
+in vec3 f_local_pos;
 in float f_clip_z;
-in float f_scatter;
-in float f_asymmetry;
 
 layout(std140, binding = 1) uniform SceneData {
     mat4 projection;
@@ -901,6 +895,24 @@ uniform sampler2D u_eclipse_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 
+struct RingPlane {
+    vec3 color;
+    float inner_r;
+    float outer_r;
+    float opacity;
+    float scatter;
+    float asymmetry;
+    int row_idx;
+    float _pad1;
+    float _pad2;
+    float _pad3;
+};
+
+#define MAX_RING_PLANES 16
+uniform RingPlane u_ring_planes[MAX_RING_PLANES];
+uniform int u_num_ring_planes;
+uniform sampler2D u_ring_gradients;
+
 out vec4 out_color;
 
 float get_oblate_radius(float r_eq, float oblateness, vec3 pole, vec3 L, vec3 perp_vec) {
@@ -930,6 +942,41 @@ void main() {
         if (u_clip_mode == 1 && d > 0.0) discard;
         if (u_clip_mode == 2 && d <= 0.0) discard;
     }
+    
+    float r = length(f_local_pos);
+    
+    vec3 total_color = vec3(0.0);
+    float total_tau = 0.0;
+    float total_scatter = 0.0;
+    float total_asym = 0.0;
+    
+    for (int i=0; i<u_num_ring_planes; i++) {
+        if (r >= u_ring_planes[i].inner_r && r <= u_ring_planes[i].outer_r) {
+            float t = (r - u_ring_planes[i].inner_r) / max(1e-6, u_ring_planes[i].outer_r - u_ring_planes[i].inner_r);
+            float alpha = texture(u_ring_gradients, vec2(t, (float(u_ring_planes[i].row_idx) + 0.5)/16.0)).r;
+            float raw_a = alpha * u_ring_planes[i].opacity;
+            float tau = 0.0;
+            if (raw_a >= 0.999) {
+                tau = 6.907 + (raw_a - 0.999) * 10.0;
+            } else {
+                tau = -log(1.0 - raw_a);
+            }
+            
+            total_color += u_ring_planes[i].color * tau;
+            total_scatter += u_ring_planes[i].scatter * tau;
+            total_asym += u_ring_planes[i].asymmetry * tau;
+            total_tau += tau;
+        }
+    }
+    
+    if (total_tau <= 1e-6) discard;
+    
+    float physical_alpha = 1.0 - exp(-total_tau);
+    
+    vec4 f_color = vec4(total_color / max(1e-6, total_tau), physical_alpha);
+    float f_scatter = total_scatter / max(1e-6, total_tau);
+    float f_asymmetry = total_asym / max(1e-6, total_tau);
+
     
     vec3 V = normalize(u_camera_pos - f_world_pos);
     vec3 N = normalize(f_normal);
@@ -1128,7 +1175,7 @@ void main() {
             float p_reflect = rock_reflect + 0.3 * f_color.a; 
             float p_transmit = rock_transmit + 0.2 * f_color.a;
             float shine_response = mix(p_transmit, p_reflect, cam_planet_same_side);
-            total_planetshine += u_host_planet_color * star_color * irradiance * (shine_intensity * shine_response * 0.4);
+            total_planetshine += u_host_planet_color * star_color * irradiance * (shine_intensity * shine_response * 0.2);
         }
     }
     
@@ -1136,11 +1183,9 @@ void main() {
     if (u_planetshine_enabled) {
         illumination += total_planetshine;
     }
-    float final_alpha = clamp(f_color.a, 0.0, 1.0);
     vec3 raw_color = f_color.rgb * illumination;
     vec3 final_color = u_hdr_enabled ? (raw_color * u_exposure) : raw_color;
-    
-    out_color = vec4(final_color, final_alpha);
+    out_color = vec4(final_color, physical_alpha);
 }
 """
 

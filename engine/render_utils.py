@@ -197,7 +197,17 @@ def create_icosphere_mesh(subdivisions=4):
     i_arr = np.array(faces, dtype='i4').ravel()
     return v_arr.ravel(), i_arr
 
-def generate_ring_arrays(pole_render, inner_r, outer_r, r_color, r_opacity, r_scatter, r_asymmetry, sorted_gradient):
+def generate_ring_shadow_grad(sorted_gradient):
+    if sorted_gradient:
+        grad_p = np.array([g['p'] for g in sorted_gradient])
+        grad_a = np.array([g['a'] for g in sorted_gradient])
+        tex_p = np.linspace(0.0, 1.0, 256)
+        shadow_grad = np.interp(tex_p, grad_p, grad_a).astype('f4')
+    else:
+        shadow_grad = np.ones(256, dtype='f4')
+    return shadow_grad
+
+def generate_ring_geometry(pole_render, min_r, max_r):
     pole_n = pole_render / np.linalg.norm(pole_render)
     ref = np.array([0., 0., 1.])
     tangent = np.cross(pole_n, ref)
@@ -215,7 +225,7 @@ def generate_ring_arrays(pole_render, inner_r, outer_r, r_color, r_opacity, r_sc
     p_arr = np.linspace(0, 1.0, RADIAL_SUBDIVISIONS + 1)
     theta_grid, p_grid = np.meshgrid(theta_arr, p_arr, indexing='ij')
     
-    r_grid = inner_r + p_grid * (outer_r - inner_r)
+    r_grid = min_r + p_grid * (max_r - min_r)
     flat_r = r_grid.ravel()
     flat_ct = np.cos(theta_grid).ravel()
     flat_st = np.sin(theta_grid).ravel()
@@ -226,22 +236,7 @@ def generate_ring_arrays(pole_render, inner_r, outer_r, r_color, r_opacity, r_sc
     eq_pos[:, 2] = flat_r * flat_st
     verts = (R_ring @ eq_pos.T).T.astype('f4')
     
-    flat_p = p_grid.ravel()
-    if sorted_gradient:
-        grad_p = np.array([g['p'] for g in sorted_gradient])
-        grad_a = np.array([g['a'] for g in sorted_gradient])
-        alpha_mults = np.interp(flat_p, grad_p, grad_a).astype('f4')
-        tex_p = np.linspace(0.0, 1.0, 256)
-        shadow_grad = np.interp(tex_p, grad_p, grad_a).astype('f4')
-    else:
-        alpha_mults = np.ones(n_verts, dtype='f4')
-        shadow_grad = np.ones(256, dtype='f4')
-        
-    colors = np.zeros((n_verts, 4), dtype='f4')
-    colors[:, 0] = r_color[0]
-    colors[:, 1] = r_color[1]
-    colors[:, 2] = r_color[2]
-    colors[:, 3] = r_opacity * alpha_mults
+    normals = np.tile(pole_n, (n_verts, 1)).astype('f4')
     
     stride = RADIAL_SUBDIVISIONS + 1
     ii, jj = np.meshgrid(np.arange(RING_SEGMENTS), np.arange(RADIAL_SUBDIVISIONS), indexing='ij')
@@ -252,7 +247,7 @@ def generate_ring_arrays(pole_render, inner_r, outer_r, r_color, r_opacity, r_sc
     p11 = p10 + 1
     indices = np.column_stack([p00, p01, p10, p10, p01, p11]).ravel().astype('i4')
     
-    return verts, indices, pole_n.astype('f4'), colors, shadow_grad
+    return verts, normals, indices
 
 def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex):
     rings = [r for r in ring_precomputed if r['body_idx'] == bi]
@@ -260,38 +255,35 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
     existing_group = next((g for g in ring_render_groups if g['body_idx'] == bi), None)
     if existing_group:
         existing_group['vao'].release()
+        if 'vbo' in existing_group: existing_group['vbo'].release()
+        if 'ibo' in existing_group: existing_group['ibo'].release()
         ring_render_groups.remove(existing_group)
         
     if rings:
-        all_ring_verts = []
-        all_ring_indices = []
-        vert_offset = 0
-        for ring in rings:
-            n_v = len(ring['verts'])
-            ring_packed = np.zeros((n_v, 12), dtype='f4')
-            ring_packed[:, 0:3] = ring['verts']
-            ring_packed[:, 3:6] = ring['normal']
-            ring_packed[:, 6:10] = ring['colors']
-            ring_packed[:, 10] = ring['scatter']
-            ring_packed[:, 11] = ring['asymmetry']
-            all_ring_verts.append(ring_packed)
-            all_ring_indices.append(ring['indices'] + vert_offset)
-            vert_offset += n_v
+        min_r = min([r['inner_r'] for r in rings])
+        max_r = max([r['outer_r'] for r in rings])
+        pole_n = rings[0]['pole']
         
-        all_v = np.concatenate(all_ring_verts, axis=0)
-        all_i = np.concatenate(all_ring_indices, axis=0)
+        verts, normals, indices = generate_ring_geometry(pole_n, min_r, max_r)
         
-        ring_vbo = ctx.buffer(all_v.tobytes())
-        ring_ibo = ctx.buffer(all_i.tobytes())
+        n_v = len(verts)
+        ring_packed = np.zeros((n_v, 6), dtype='f4')
+        ring_packed[:, 0:3] = verts
+        ring_packed[:, 3:6] = normals
+        
+        ring_vbo = ctx.buffer(ring_packed.tobytes())
+        ring_ibo = ctx.buffer(indices.tobytes())
         ring_vao = ctx.vertex_array(
             prog_rings,
-            [(ring_vbo, '3f 3f 4f 1f 1f', 'in_position', 'in_normal', 'in_color', 'in_scatter', 'in_asymmetry')],
+            [(ring_vbo, '3f 3f', 'in_position', 'in_normal')],
             index_buffer=ring_ibo
         )
         ring_render_groups.append({
             'body_idx': bi,
             'vao': ring_vao,
-            'num_indices': len(all_i),
+            'vbo': ring_vbo,
+            'ibo': ring_ibo,
+            'num_indices': len(indices),
         })
         
     ring_gradient_data = np.zeros((16, 256), dtype='f4')

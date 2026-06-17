@@ -213,7 +213,7 @@ def compute_custom_forces(arr, num_bodies, G_val, c2, has_j2, has_gr, phys_star_
                     prefac_j4 = base_j4 / (r2*r2*r2*r)
                     z_r_4 = z_r_sq * z_r_sq
                     term1 = 1.0 - 14.0 * z_r_sq + 21.0 * z_r_4
-                    term2 = 4.0 * z_r - 28.0 * z_r_sq * z_r
+                    term2 = 4.0 * z_r - (28.0 / 3.0) * z_r_sq * z_r
                     a_x += prefac_j4 * (term1 * dx + term2 * r * px)
                     a_y += prefac_j4 * (term1 * dy + term2 * r * py)
                     a_z += prefac_j4 * (term1 * dz + term2 * r * pz)
@@ -1562,10 +1562,14 @@ def load_system_from_data(bodies_data_raw):
         j2 = body.get('J2', 0.0)
         if j2 > 0.0:
             j4 = body.get('j4', 0.0)
-            r_mean = body.get('r', 1.0)
-            f = body.get('oblateness', 0.0)
-            req_solar = r_mean / ((1.0 - f) ** (1.0 / 3.0)) if f > 0 else r_mean
-            req_au = req_solar * 0.00465
+            req_km = body.get('req_km')
+            if req_km:
+                req_au = req_km / 149597870.7
+            else:
+                r_mean = body.get('r', 1.0)
+                f = body.get('oblateness', 0.0)
+                req_solar = r_mean / ((1.0 - f) ** (1.0 / 3.0)) if f > 0 else r_mean
+                req_au = req_solar * 0.00465
             rot_period = body.get('rotation_period', 0.0)
             oblate_physics_list.append((idx, j2, j4, req_au, pole_ecl, mass, name, rot_period))
 
@@ -2252,7 +2256,7 @@ class Simulation:
             self.dt, dt_done, success = ias15_step_numba(
                 self.arr, self.N, self.G, c2, self.has_j2, self.has_gr, self.phys_star_idx,
                 self.oblate_indices, self.oblate_j2, self.oblate_j4, self.oblate_req, self.oblate_poles,
-                dt_step, 0.0, 1e-9, self.dt_last_done,
+                dt_step, 0.0, 1e-4, self.dt_last_done,
                 self._g, self._e, self._b, self._csb, self._er, self._br,
                 self._at, self._x0, self._v0, self._a0, self._csx, self._csv,
                 _IAS15_H, _IAS15_RR, _IAS15_C, _IAS15_D

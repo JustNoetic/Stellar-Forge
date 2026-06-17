@@ -1,6 +1,9 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 788, in run
-    from engine.post_shaders import bloom_downsample_shader_vs, bloom_downsample_shader_fs, bloom_upsample_shader_vs, bloom_upsample_shader_fs, composite_shader_vs, composite_shader_fs
-ModuleNotFoundError: No module named 'engine'
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3786, in run
+    rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\render_utils.py", line 286, in rebuild_ring_render_group
+    'num_indices': len(all_i),
+                       ^^^^^
+NameError: name 'all_i' is not defined
