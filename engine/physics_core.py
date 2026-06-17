@@ -1219,8 +1219,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                                     dp = sim.particles[i]
                                     dp.x += dx; dp.y += dy; dp.z += dz
                                     dp.vx += dvx; dp.vy += dvy; dp.vz += dvz
-                                    shared_state["pos"][i] = (dp.x, dp.y, dp.z)
-                                    shared_state["vel"][i] = (dp.vx, dp.vy, dp.vz)
+                                    shared_state["pos"][i] = [dp.x, dp.z, -dp.y]
+                                    shared_state["vel"][i] = [dp.vx, dp.vz, -dp.vy]
                         
                     with shared_state["lock"]:
                         if "mass" in op:
@@ -1232,6 +1232,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                             shared_state["vel"][idx] = [op["vel"][0], op["vel"][2], -op["vel"][1]]
                         if "radius" in op:
                             r_au = op["radius"] / 1.496e8
+                            if "radii" in shared_state:
+                                shared_state["radii"][idx] = r_au
                             if shared_state.get("oblate_indices") is not None:
                                 mask = shared_state["oblate_indices"] == idx
                                 if np.any(mask):
@@ -1261,6 +1263,9 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         shared_state["pos"] = np.vstack([shared_state["pos"], pos_ogl])
                         shared_state["vel"] = np.vstack([shared_state["vel"], vel_ogl])
                         shared_state["mass"] = np.append(shared_state["mass"], mass)
+                        if "radii" in shared_state:
+                            r_au = op.get("radius", 6000.0) / 1.496e8
+                            shared_state["radii"] = np.append(shared_state["radii"], r_au)
                         shared_state["parent_indices"] = np.append(shared_state["parent_indices"], np.int32(parent_idx))
                         is_star = op.get("type") == "Star"
                         if shared_state.get("is_star_mask") is not None:
@@ -1278,6 +1283,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         shared_state["pos"] = np.delete(shared_state["pos"], idx, axis=0)
                         shared_state["vel"] = np.delete(shared_state["vel"], idx, axis=0)
                         shared_state["mass"] = np.delete(shared_state["mass"], idx)
+                        if "radii" in shared_state:
+                            shared_state["radii"] = np.delete(shared_state["radii"], idx)
                         
                         pi = np.delete(shared_state["parent_indices"], idx)
                         pi[pi == idx] = 0
@@ -1444,6 +1451,62 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 sim.t += dt_sim
             else:
                 sim.integrate(sim.t + dt_sim)
+                
+                # COLLISION DETECTION
+                local_pos = np.empty((num_bodies, 3), dtype=np.float64)
+                local_vel = np.empty((num_bodies, 3), dtype=np.float64)
+                _extract_render_state(sim, num_bodies, local_pos, local_vel)
+                
+                with shared_state["lock"]:
+                    radii = shared_state.get("radii")
+                    
+                if radii is not None:
+                    collisions = []
+                    for i in range(num_bodies):
+                        for j in range(i + 1, num_bodies):
+                            dx = local_pos[i, 0] - local_pos[j, 0]
+                            dy = local_pos[i, 1] - local_pos[j, 1]
+                            dz = local_pos[i, 2] - local_pos[j, 2]
+                            dist_sq = dx*dx + dy*dy + dz*dz
+                            r_sum = radii[i] + radii[j]
+                            if dist_sq < r_sum * r_sum:
+                                collisions.append((i, j))
+                                
+                    if collisions:
+                        # Process only the first collision to avoid overlapping indices complexity this tick
+                        idxA, idxB = collisions[0]
+                        massA = sim.arr[idxA, 9]
+                        massB = sim.arr[idxB, 9]
+                        
+                        winner = idxA if massA >= massB else idxB
+                        loser = idxB if winner == idxA else idxA
+                        
+                        new_mass = massA + massB
+                        if new_mass > 0:
+                            new_vx = (massA * sim.arr[idxA, 3] + massB * sim.arr[idxB, 3]) / new_mass
+                            new_vy = (massA * sim.arr[idxA, 4] + massB * sim.arr[idxB, 4]) / new_mass
+                            new_vz = (massA * sim.arr[idxA, 5] + massB * sim.arr[idxB, 5]) / new_mass
+                        else:
+                            new_vx = new_vy = new_vz = 0.0
+                            
+                        # Volume addition for inelastic merge R_new = (R_A^3 + R_B^3)^(1/3)
+                        r1 = radii[winner]
+                        r2 = radii[loser]
+                        new_r_au = (r1**3 + r2**3)**(1/3.0)
+                        new_r_km = new_r_au * 1.496e8
+                        
+                        with shared_state["lock"]:
+                            shared_state["crud_queue"].append({
+                                "action": "UPDATE",
+                                "idx": winner,
+                                "mass": new_mass,
+                                "radius": new_r_km,
+                                "vel": [new_vx, new_vy, new_vz]
+                            })
+                            shared_state["crud_queue"].append({
+                                "action": "DELETE",
+                                "idx": loser
+                            })
             
             frame_count += 1
             if frame_count % 30 == 0:

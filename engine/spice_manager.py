@@ -335,7 +335,7 @@ class SpiceManager:
             b_name = body["name"]
             found_id = None
             for sp_id, info in self.SPICE_BODIES.items():
-                if info["name"] == b_name:
+                if info["name"].upper() == b_name.upper():
                     if sp_id in [5, 6, 7, 8, 9]:
                         com_id = sp_id * 100 + 99
                         try:
@@ -447,7 +447,7 @@ class SpiceManager:
                 matching_state = None
                 matching_id = None
                 for sp_id, data in states.items():
-                    if data["info"]["name"] == b_name:
+                    if data["info"]["name"].upper() == b_name.upper():
                         matching_state = data
                         matching_id = sp_id
                         break
@@ -494,9 +494,9 @@ class SpiceManager:
                     bodies_data.append(body_copy)
                     
             # Add any SPICE bodies that weren't in the template
-            template_names = {b["name"] for b in bodies_data}
+            template_names = {b["name"].upper() for b in bodies_data}
             
-            if "Sun" not in template_names and 10 in states:
+            if "SUN" not in template_names and 10 in states:
                 sun_data = states[10]
                 m_sun, r_sun = self._get_body_properties(10, sun_data["info"]["mass_kg"], sun_data["info"]["radius_km"])
                 bodies_data.append({
@@ -508,10 +508,10 @@ class SpiceManager:
                     "is_root": True,
                     "sv": {"x": 0.0, "y": 0.0, "z": 0.0, "vx": 0.0, "vy": 0.0, "vz": 0.0}
                 })
-                template_names.add("Sun")
+                template_names.add("SUN")
                 
             for body_id, data in states.items():
-                if body_id == 10 or data["info"]["name"] in template_names:
+                if body_id == 10 or data["info"]["name"].upper() in template_names:
                     continue
                     
                 parent_id = 10

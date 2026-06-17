@@ -1,9 +1,13 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3786, in run
-    rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\render_utils.py", line 286, in rebuild_ring_render_group
-    'num_indices': len(all_i),
-                       ^^^^^
-NameError: name 'all_i' is not defined
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3456, in run
+    c_pos, c_vel = get_cartesian_from_keplerian(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\numba\core\dispatcher.py", line 424, in _compile_for_args
+    error_rewrite(e, 'typing')
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\numba\core\dispatcher.py", line 365, in error_rewrite
+    raise e.with_traceback(None)
+numba.core.errors.TypingError: Failed in nopython mode pipeline (step: nopython frontend)
+[1m[1mNameError: name 'G' is not defined[0m
+[0m[1mDuring: Pass nopython_type_inference[0m
