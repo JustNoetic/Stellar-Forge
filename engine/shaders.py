@@ -391,6 +391,7 @@ void main() {
                 
                 vec3 V_c = frag_to_caster / dist_to_caster;
                 float t_proj = dot(frag_to_caster, L);
+                if (t_proj < 0.0) continue;
                 
                 // Account for oblateness
                 float oblateness = u_caster_poles_obl[j].w;
@@ -405,12 +406,11 @@ void main() {
                 
                 float cos_gamma = dot(L, V_c);
                 float gamma = acos(clamp(cos_gamma, -1.0, 1.0));
-                float R_max = max(alpha, beta);
-                float R_min = min(alpha, beta);
-                float x_norm = gamma / max(1e-9, R_max);
-                float y_norm = R_min / max(1e-9, R_max);
-                float area_fraction = texture(u_eclipse_lut, vec2(x_norm * 0.5, y_norm)).r;
-                float occlusion = clamp(area_fraction * (R_max * R_max) / max(1e-9, alpha * alpha), 0.0, 1.0);
+                float penumbra_outer = alpha + beta;
+                float penumbra_inner = max(0.0, beta - alpha);
+                
+                float max_occ = clamp((beta * beta) / max(1e-9, alpha * alpha), 0.0, 1.0);
+                float occlusion = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
                 
                 vec3 caster_shadow = vec3(1.0 - occlusion);
                 
@@ -420,7 +420,12 @@ void main() {
                     float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
                     vec3 atmo_tint = u_caster_atmos[j].xyz;
                     vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
-                    float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
+                    
+                    float penetration = max(0.0, r_umbra - gamma);
+                    float effective_beta = min(beta, 0.02); // Maximum refraction angle (~1.1 deg)
+                    float distance_falloff = effective_beta * effective_beta;
+                    
+                    float refraction_intensity = exp(-penetration * 150.0) * 1000.0 * distance_falloff;
                     float atmo_blend = smoothstep(0.5, 1.0, occlusion);
                     caster_shadow += deep_tint * refraction_intensity * atmo_blend;
                 }
@@ -885,6 +890,7 @@ layout(std140, binding = 1) uniform SceneData {
 uniform vec3 u_host_planet_pos;
 uniform float u_host_planet_radius;
 uniform vec3 u_host_planet_color;
+uniform vec4 u_host_planet_atmo;
 uniform vec3 u_camera_pos;
 uniform vec4 u_host_planet_pole_obl;
 uniform int u_clip_mode;
@@ -1057,6 +1063,7 @@ void main() {
             
             vec3 V_c = frag_to_caster / dist_to_caster;
             float t_proj = dot(frag_to_caster, L);
+            if (t_proj < 0.0) continue;
             
             float oblateness = u_caster_poles_obl[j].w;
             if (oblateness > 0.0) {
@@ -1070,12 +1077,12 @@ void main() {
             
             float cos_gamma = dot(L, V_c);
             float gamma = acos(clamp(cos_gamma, -1.0, 1.0));
-            float R_max = max(alpha, beta);
-            float R_min = min(alpha, beta);
-            float x_norm = gamma / max(1e-9, R_max);
-            float y_norm = R_min / max(1e-9, R_max);
-            float area_fraction = texture(u_eclipse_lut, vec2(x_norm * 0.5, y_norm)).r;
-            float occlusion = clamp(area_fraction * (R_max * R_max) / max(1e-9, alpha * alpha), 0.0, 1.0);
+            
+            float penumbra_outer = alpha + beta;
+            float penumbra_inner = max(0.0, beta - alpha);
+            
+            float max_occ = clamp((beta * beta) / max(1e-9, alpha * alpha), 0.0, 1.0);
+            float occlusion = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
             
             vec3 caster_shadow = vec3(1.0 - occlusion);
             
@@ -1085,7 +1092,12 @@ void main() {
                 float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
                 vec3 atmo_tint = u_caster_atmos[j].xyz;
                 vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
-                float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
+                
+                float penetration = max(0.0, r_umbra - gamma);
+                float effective_beta = min(beta, 0.02);
+                float distance_falloff = effective_beta * effective_beta;
+                
+                float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
                 float atmo_blend = smoothstep(0.5, 1.0, occlusion);
                 caster_shadow += deep_tint * refraction_intensity * atmo_blend;
             }
@@ -1141,7 +1153,30 @@ void main() {
                                 occlusion = clamp(occlusion * max_occ, 0.0, 1.0);
                             }
                         }
-                        shadow_s *= vec3(1.0 - occlusion);
+                        vec3 host_shadow = vec3(1.0 - occlusion);
+                        float host_atmo_h = u_host_planet_atmo.w;
+                        if (host_atmo_h > 0.0 && occlusion > 0.0) {
+                            float sin_beta = clamp(host_r / dist_to_star, 0.0, 1.0); // Wait, dist_to_star is distance to star.
+                            // Distance to host is dist_host, which we don't have here. 
+                            // Actually, frag_to_host is available!
+                            float dist_host = length(frag_to_host);
+                            float beta = asin(clamp(host_r / dist_host, 0.0, 1.0));
+                            float gamma = asin(clamp(perp / dist_host, 0.0, 1.0));
+                            float r_umbra = abs(star_ang_radius - beta);
+                            float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
+                            
+                            vec3 atmo_tint = u_host_planet_atmo.xyz;
+                            vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
+                            
+                            float penetration = max(0.0, r_umbra - gamma);
+                            float effective_beta = min(beta, 0.02);
+                            float distance_falloff = effective_beta * effective_beta;
+                            
+                            float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
+                            float atmo_blend = smoothstep(0.5, 1.0, occlusion);
+                            host_shadow += deep_tint * refraction_intensity * atmo_blend;
+                        }
+                        shadow_s *= host_shadow;
                     }
                 }
             }
@@ -1347,6 +1382,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         
         vec3 V_c = s_to_c / dist_to_caster;
         float proj = dot(s_to_c, L_dir);
+        if (proj < 0.0) continue;
         
         float oblateness = u_active_caster_poles_obl[i].w;
         if (oblateness > 0.0) {
@@ -1355,20 +1391,18 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             caster_r = get_oblate_radius(caster_r, oblateness, pole, L_dir, perp_vec);
         }
         
-        float sin_alpha_local = clamp(star_radius / dist_to_star, 0.0, 1.0);
-        float alpha = asin(sin_alpha_local);
+        // Lightweight small-angle smoothstep approximation for volumetric shadows
+        float alpha = star_radius / dist_to_star;
+        float beta = caster_r / dist_to_caster;
         
-        float sin_beta = clamp(caster_r / dist_to_caster, 0.0, 1.0);
-        float beta = asin(sin_beta);
+        vec3 perp = s_to_c - proj * L_dir;
+        float gamma = length(perp) / dist_to_caster;
         
-        float cos_gamma = dot(L_dir, V_c);
-        float gamma = acos(clamp(cos_gamma, -1.0, 1.0));
-        float R_max = max(alpha, beta);
-        float R_min = min(alpha, beta);
-        float x_norm = gamma / max(1e-9, R_max);
-        float y_norm = R_min / max(1e-9, R_max);
-        float area_fraction = texture(u_eclipse_lut, vec2(x_norm * 0.5, y_norm)).r;
-        float occ = clamp(area_fraction * (R_max * R_max) / max(1e-9, alpha * alpha), 0.0, 1.0);
+        float penumbra_outer = alpha + beta;
+        float penumbra_inner = max(0.0, beta - alpha);
+        
+        float max_occ = clamp((beta * beta) / max(1e-9, alpha * alpha), 0.0, 1.0);
+        float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
         
         vec3 caster_shadow = vec3(1.0 - occ);
         float atmo_h = u_active_caster_atmos[i].w;
@@ -1377,7 +1411,12 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
             vec3 atmo_tint = u_active_caster_atmos[i].xyz;
             vec3 deep_tint = pow(atmo_tint, vec3(1.0 + depth_into_umbra * 0.5));
-            float refraction_intensity = exp(-depth_into_umbra * 1.2) * 1.5;
+            
+            float penetration = max(0.0, r_umbra - gamma);
+            float effective_beta = min(beta, 0.02);
+            float distance_falloff = effective_beta * effective_beta;
+            
+            float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
             float atmo_blend = smoothstep(0.5, 1.0, occ);
             caster_shadow += deep_tint * refraction_intensity * atmo_blend;
         }

@@ -1031,6 +1031,7 @@ class App:
         u_ring_host_radius = prog_rings['u_host_planet_radius']
         u_ring_host_pole_obl = prog_rings['u_host_planet_pole_obl']
         u_ring_host_color = prog_rings.get('u_host_planet_color', None)
+        u_ring_host_atmo = prog_rings.get('u_host_planet_atmo', None)
         u_ring_camera_pos = prog_rings['u_camera_pos']
         u_ring_body_offset = prog_rings['u_body_offset']
         u_ring_clip_mode = prog_rings['u_clip_mode']
@@ -2591,6 +2592,21 @@ class App:
                             float(all_instances[bi, 11]),
                             float(all_instances[bi, 12])
                         )
+                        if u_ring_host_atmo is not None:
+                            atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
+                            if atmo is not None:
+                                beta_r_c = atmo['beta_rayleigh']
+                                beta_m_c = atmo['beta_mie']
+                                h_r_c = atmo['h_rayleigh']
+                                h_m_c = atmo['h_mie']
+                                R_km_c = atmo['planet_radius_km']
+                                od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
+                                od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
+                                trans = np.exp(-(od_r_c + od_m_c) * 0.5)
+                                thickness = atmo['atmo_radius_au'] - atmo['surface_radius_au']
+                                u_ring_host_atmo.value = (float(trans[0]), float(trans[1]), float(trans[2]), float(thickness))
+                            else:
+                                u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                         k = ring_idx_by_body.get(bi)
                         if k is not None:
                             u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
@@ -2626,6 +2642,21 @@ class App:
                             float(all_instances[body_idx_in_unified, 11]),
                             float(all_instances[body_idx_in_unified, 12])
                         )
+                        if u_ring_host_atmo is not None:
+                            atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
+                            if atmo is not None:
+                                beta_r_c = atmo['beta_rayleigh']
+                                beta_m_c = atmo['beta_mie']
+                                h_r_c = atmo['h_rayleigh']
+                                h_m_c = atmo['h_mie']
+                                R_km_c = atmo['planet_radius_km']
+                                od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
+                                od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
+                                trans = np.exp(-(od_r_c + od_m_c) * 0.5)
+                                thickness = atmo['atmo_radius_au'] - atmo['surface_radius_au']
+                                u_ring_host_atmo.value = (float(trans[0]), float(trans[1]), float(trans[2]), float(thickness))
+                            else:
+                                u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                         u_ring_caster_mask_lo_uni.value = 0
                         u_ring_caster_mask_hi_uni.value = 0
                         body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
