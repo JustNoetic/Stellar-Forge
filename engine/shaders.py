@@ -425,7 +425,7 @@ void main() {
                     float effective_beta = min(beta, 0.02); // Maximum refraction angle (~1.1 deg)
                     float distance_falloff = effective_beta * effective_beta;
                     
-                    float refraction_intensity = exp(-penetration * 150.0) * 1000.0 * distance_falloff;
+                    float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
                     float atmo_blend = smoothstep(0.5, 1.0, occlusion);
                     caster_shadow += deep_tint * refraction_intensity * atmo_blend;
                 }
@@ -1156,9 +1156,6 @@ void main() {
                         vec3 host_shadow = vec3(1.0 - occlusion);
                         float host_atmo_h = u_host_planet_atmo.w;
                         if (host_atmo_h > 0.0 && occlusion > 0.0) {
-                            float sin_beta = clamp(host_r / dist_to_star, 0.0, 1.0); // Wait, dist_to_star is distance to star.
-                            // Distance to host is dist_host, which we don't have here. 
-                            // Actually, frag_to_host is available!
                             float dist_host = length(frag_to_host);
                             float beta = asin(clamp(host_r / dist_host, 0.0, 1.0));
                             float gamma = asin(clamp(perp / dist_host, 0.0, 1.0));
@@ -1306,7 +1303,6 @@ uniform float u_atmo_radius_au;
 uniform float u_planet_radius_km;
 uniform float u_atmo_radius_km;
 uniform float u_au_to_km;
-uniform float u_star_angular_radius;
 uniform vec3  u_beta_rayleigh;
 uniform float u_h_rayleigh;
 uniform float u_beta_mie;
@@ -1316,7 +1312,6 @@ uniform vec3  u_beta_absorption;
 uniform float u_sun_intensity;
 uniform vec3  u_camera_pos;
 uniform int   u_num_samples;
-uniform int   u_num_light_samples;
 uniform vec4  u_pole_obl;
 uniform sampler2D u_optical_depth_lut;
 
@@ -1364,10 +1359,10 @@ float get_oblate_radius(float r_eq, float oblateness, vec3 pole, vec3 L, vec3 pe
     float x = length(perp_vec - y * P_dir);
     float f_factor = 1.0 - oblateness;
     float R_minor = r_eq * sqrt(PdotL * PdotL + f_factor * f_factor * P_proj_len * P_proj_len);
-    float angle = atan(y, x);
-    float cos_a = cos(angle);
-    float sin_a = sin(angle);
-    return (r_eq * R_minor) / sqrt(R_minor * R_minor * cos_a * cos_a + r_eq * r_eq * sin_a * sin_a);
+    if (R_minor < 1e-6) return r_eq;
+    float denom = sqrt((x / r_eq) * (x / r_eq) + (y / R_minor) * (y / R_minor));
+    if (denom < 1e-6) return r_eq;
+    return perp_len / denom;
 }
 
 vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius) {
@@ -1639,6 +1634,9 @@ void main() {
         vec3 star_color = u_stars_colors[s].rgb;
         float star_lum = u_stars_colors[s].a;
 
+        float dist_to_star_au = length(star_pos - planet_center_render);
+        float sin_star = star_radius / max(dist_to_star_au, 1e-6);
+
         vec3 sun_pos_local = (star_pos - planet_center_render) * u_au_to_km;
         vec3 sun_dir = normalize(sun_pos_local);
         vec3 sun_dir_sph = toSphericalSpace(sun_dir, u_pole_obl);
@@ -1699,46 +1697,35 @@ void main() {
             od_rayleigh += rho_R * step_size;
             od_mie += rho_M * step_size;
 
-            // 5. Light ray: optical depth from sample to sun using LUT
+            // 5. Light ray: optical depth from sample to sun
             float light_cos_theta = dot(sample_pos_sph / sample_len, sun_dir_sph);
             float h_norm = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-            float uv_x = light_cos_theta * 0.5 + 0.5;
-            vec2 lut_uv = vec2(uv_x, h_norm);
-            
-            vec4 od_light = texture(u_optical_depth_lut, lut_uv);
-            
-            // --- Soft terminator correction ---
+
+            // --- Physically-based self-shadow (sun disc visibility) ---
             float sin_planet_angle = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
+            float alpha_planet = asin(clamp(sin_planet_angle, 0.0, 0.9999));
             float cos_horizon = -sqrt(max(0.0, 1.0 - sin_planet_angle * sin_planet_angle));
 
+            // Compute visible fraction of sun disc via analytical disc-disc occultation.
+            // separation = angle from planet center (nadir) to sun center, as seen from sample
+            // When separation == alpha_planet, sun center is at the geometric horizon.
+            float alpha_sun_local = asin(clamp(sin_star, 0.0, 0.9999));
+            float separation = acos(clamp(-light_cos_theta, -1.0, 1.0));
+            float x_vis = clamp((separation - alpha_planet) / max(alpha_sun_local, 1e-7), -1.0, 1.0);
+            // Circle-chord area formula: fraction of sun disc above the planet limb
+            float vis_fraction = (acos(clamp(-x_vis, -1.0, 1.0)) + x_vis * sqrt(max(0.0, 1.0 - x_vis * x_vis))) / PI;
+
+            // OD lookup at the center of the visible portion of the star disc.
+            // For a normal star, top ≈ bottom ≈ center → unchanged.
+            // For a large star partially below the horizon, the visible center shifts
+            // well above the horizon → lower OD → properly soft terminator.
+            float disc_top_cos = min(light_cos_theta + sin_star, 1.0);
+            float disc_bot_cos = max(light_cos_theta - sin_star, cos_horizon);
+            float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
+            vec2 lut_uv = vec2(clamp(effective_cos * 0.5 + 0.5, 0.0, 1.0), h_norm);
+            vec4 od_light = texture(u_optical_depth_lut, lut_uv);
             float od_light_R = od_light.r;
             float od_light_M = od_light.g;
-            float penumbra_factor = 1.0;
-
-            float sin_star = u_star_angular_radius;
-            if (sin_star > 1e-5) {
-                float angular_dist = light_cos_theta - cos_horizon;
-                float penumbra_width = sin_star * 2.0;
-                penumbra_factor = clamp(angular_dist / max(1e-6, penumbra_width) + 0.5, 0.0, 1.0);
-                
-                if (penumbra_factor < 0.999) {
-                    vec2 horizon_uv = vec2((-cos_horizon) * 0.5 + 0.5, h_norm);
-                    vec4 od_horizon = texture(u_optical_depth_lut, horizon_uv);
-                    
-                    if (penumbra_factor < 0.5) {
-                        od_light_R = od_horizon.r;
-                        od_light_M = od_horizon.g;
-                    } else {
-                        float blend_t = (penumbra_factor - 0.5) / 0.5;
-                        od_light_R = mix(od_horizon.r, od_light.r, blend_t);
-                        od_light_M = mix(od_horizon.g, od_light.g, blend_t);
-                    }
-                }
-            } else {
-                if (light_cos_theta < cos_horizon) {
-                    penumbra_factor = 0.0;
-                }
-            }
 
             // 7. Accumulate in-scattered light
             vec3 tau = beta_R * (od_rayleigh + od_light_R)
@@ -1753,7 +1740,7 @@ void main() {
             // Approximate multiple scattering with a low-extinction term
             vec3 direct_attenuation = exp(-tau);
             vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.2) - direct_attenuation) * 0.4);
-            vec3 attenuation = (direct_attenuation + ms_attenuation) * sample_shadow * penumbra_factor;
+            vec3 attenuation = (direct_attenuation + ms_attenuation) * sample_shadow * vis_fraction;
 
             total_rayleigh += rho_R * attenuation * step_size;
             total_mie      += rho_M * attenuation * step_size;
@@ -1770,8 +1757,7 @@ void main() {
                       / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
 
         // Inverse-square falloff for irradiance
-        float dist_to_star = length(star_pos - planet_center_render);
-        float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star * dist_to_star, 1e-8)) : 1.0;
+        float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star_au * dist_to_star_au, 1e-8)) : 1.0;
         
         // 9. Final scattered light
         scattered += star_color * u_sun_intensity * irradiance * (

@@ -27,6 +27,7 @@ from physics_core import *
 from physics_core import _extract_render_state, _update_hierarchy_core
 from render_utils import *
 from shaders import *
+from post_shaders import *
 _PERF_ENABLED = _os.environ.get("STELLAR_FORGE_PERF") == "1"
 _PERF_TRACKER = None
 
@@ -214,7 +215,7 @@ class ModernGLGlfwRenderer(GlfwRenderer):
         self.modern_renderer.shutdown()
 
 @njit
-def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, hdr_enabled):
+def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, hdr_enabled):
     N = len(pos)
     planetshine_dirs = np.zeros((N, 3), dtype=np.float32)
     planetshine_colors = np.zeros((N, 3), dtype=np.float32)
@@ -229,10 +230,13 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             
         pos_i = pos[i]
         
-        best_j = -1
-        best_val = -1.0
-        best_dir = np.zeros(3, dtype=np.float32)
-        best_color = np.zeros(3, dtype=np.float32)
+        total_dir_x = 0.0
+        total_dir_y = 0.0
+        total_dir_z = 0.0
+        total_color_r = 0.0
+        total_color_g = 0.0
+        total_color_b = 0.0
+        total_weight = 0.0
         
         for j in range(N):
             if i == j or is_star[j] > 0.5:
@@ -267,6 +271,7 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             for s in range(num_stars):
                 star_pos = star_positions[s]
                 star_col = star_colors[s]
+                star_lum = star_lums[s]
                 
                 cx = star_pos[0] - pos_j[0]
                 cy = star_pos[1] - pos_j[1]
@@ -281,12 +286,13 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                     cy = 0.0
                     cz = 0.0
                     
-                phase = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
-                if phase < 0.0:
-                    phase = 0.0
-                    
+                cos_α = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
+                cos_α = max(-1.0, min(1.0, cos_α))
+                α = np.arccos(cos_α)
+                phase = (np.sin(α) + (np.pi - α) * cos_α) / np.pi
+
                 if hdr_enabled:
-                    irradiance = star_col[3] / max(c_dist * c_dist, 1e-8)
+                    irradiance = star_lum / max(c_dist * c_dist, 1e-8)
                 else:
                     irradiance = 1.0
                     
@@ -294,24 +300,27 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                 total_caster_light_g += star_col[1] * phase * irradiance
                 total_caster_light_b += star_col[2] * phase * irradiance
                 
-            bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * 2.0
-            bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * 2.0
-            bounce_b = colors[j, 2] * total_caster_light_b * solid_angle * 2.0
+            bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * (2.0 / 3.0)
+            bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * (2.0 / 3.0)
+            bounce_b = colors[j, 2] * total_caster_light_b * solid_angle * (2.0 / 3.0)
             
             val = bounce_r*bounce_r + bounce_g*bounce_g + bounce_b*bounce_b
-            if val > best_val:
-                best_val = val
-                best_j = j
-                best_dir[0] = dir_to_caster_x
-                best_dir[1] = dir_to_caster_y
-                best_dir[2] = dir_to_caster_z
-                best_color[0] = bounce_r
-                best_color[1] = bounce_g
-                best_color[2] = bounce_b
-                
-        if best_j != -1 and best_val > 1e-12:
-            planetshine_dirs[i] = best_dir
-            planetshine_colors[i] = best_color
+            total_dir_x += dir_to_caster_x * val
+            total_dir_y += dir_to_caster_y * val
+            total_dir_z += dir_to_caster_z * val
+            total_color_r += bounce_r * val
+            total_color_g += bounce_g * val
+            total_color_b += bounce_b * val
+            total_weight += val
+            
+        if total_weight > 1e-12:
+            inv_w = 1.0 / total_weight
+            planetshine_dirs[i, 0] = total_dir_x * inv_w
+            planetshine_dirs[i, 1] = total_dir_y * inv_w
+            planetshine_dirs[i, 2] = total_dir_z * inv_w
+            planetshine_colors[i, 0] = total_color_r * inv_w
+            planetshine_colors[i, 1] = total_color_g * inv_w
+            planetshine_colors[i, 2] = total_color_b * inv_w
             
     return planetshine_dirs, planetshine_colors
 
@@ -351,7 +360,27 @@ class App:
             "show_settings_modal": False,
             "planetshine_enabled": True,
             "ringshine_enabled": True,
+            "bloom_intensity": 0.05,
+            "bloom_threshold": 1.0,
+            "msaa_samples": 4, # 0 for off, 2, 4, 8
         }
+        
+        # Post-Processing FBOs
+        self.hdr_msaa_fbo = None
+        self.hdr_resolve_fbo = None
+        self.hdr_resolve_tex = None
+        self.bloom_fbos = []
+        self.bloom_texs = []
+        self.last_fb_size = (0, 0)
+        self.last_msaa_samples = -1
+        
+        self.quad_vao_down = None
+        self.quad_vao_up = None
+        self.quad_vao_comp = None
+        
+        self.prog_bloom_down = None
+        self.prog_bloom_up = None
+        self.prog_composite = None
         self.time_ctrl = {
             "paused": True,
             "multiplier": 1.0,
@@ -804,8 +833,21 @@ class App:
         prog_rings = ctx.program(vertex_shader=ring_vertex_shader, fragment_shader=ring_fragment_shader)
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
-    
-
+        
+        self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
+        self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
+        self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
+        
+        quad_vertices = np.array([
+            -1.0, -1.0,
+             1.0, -1.0,
+            -1.0,  1.0,
+             1.0,  1.0,
+        ], dtype='f4')
+        quad_vbo = ctx.buffer(quad_vertices.tobytes())
+        self.quad_vao_down = ctx.vertex_array(self.prog_bloom_down, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_up = ctx.vertex_array(self.prog_bloom_up, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_comp = ctx.vertex_array(self.prog_composite, [(quad_vbo, '2f', 'in_position')])
         def build_eclipse_lut(ctx):
             LUT_SIZE = 256
             x_arr = np.linspace(0.0, 2.0, LUT_SIZE, dtype='f4')
@@ -1048,7 +1090,6 @@ class App:
         u_atmo_atmo_radius = prog_atmo['u_atmo_radius_km']
         u_atmo_radius_au_uniform = prog_atmo['u_atmo_radius_au']
         u_atmo_au_to_km = prog_atmo['u_au_to_km']
-        u_atmo_star_angular_radius = prog_atmo['u_star_angular_radius']
         u_atmo_beta_rayleigh = prog_atmo['u_beta_rayleigh']
         u_atmo_h_rayleigh = prog_atmo['u_h_rayleigh']
         u_atmo_beta_mie = prog_atmo['u_beta_mie']
@@ -1059,7 +1100,6 @@ class App:
         u_atmo_sun_intensity = prog_atmo['u_sun_intensity']
         u_atmo_camera_pos = prog_atmo['u_camera_pos']
         u_atmo_num_samples = prog_atmo['u_num_samples']
-        u_atmo_num_light_samples = prog_atmo.get('u_num_light_samples', None)
         u_atmo_pole_obl = prog_atmo['u_pole_obl']
         u_atmo_body_idx_uni = prog_atmo['u_body_idx']
         u_atmo_num_ring_planes = prog_atmo['u_num_ring_planes']
@@ -1662,8 +1702,55 @@ class App:
                 imgui.end_frame()
                 continue
             
+            msaa_samples = self.camera.get("msaa_samples", 4)
+            if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples:
+                self.last_fb_size = (self.fb_width, self.fb_height)
+                self.last_msaa_samples = msaa_samples
+                
+                # Release old
+                if self.hdr_msaa_fbo: self.hdr_msaa_fbo.release()
+                if self.hdr_resolve_fbo: self.hdr_resolve_fbo.release()
+                if self.hdr_resolve_tex: self.hdr_resolve_tex.release()
+                for fbo in self.bloom_fbos: fbo.release()
+                for tex in self.bloom_texs: tex.release()
+                self.bloom_fbos = []
+                self.bloom_texs = []
+                
+                # Rebuild
+                self.hdr_resolve_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                self.hdr_resolve_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.hdr_resolve_tex.repeat_x = False
+                self.hdr_resolve_tex.repeat_y = False
+                
+                if msaa_samples > 0:
+                    msaa_color = ctx.renderbuffer((self.fb_width, self.fb_height), components=4, samples=msaa_samples, dtype='f4')
+                    msaa_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height), samples=msaa_samples)
+                    self.hdr_msaa_fbo = ctx.framebuffer(color_attachments=[msaa_color], depth_attachment=msaa_depth)
+                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex])
+                else:
+                    self.hdr_msaa_fbo = None
+                    resolve_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height))
+                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=resolve_depth)
+                
+                # Bloom chain (5 levels)
+                bw, bh = self.fb_width // 2, self.fb_height // 2
+                for i in range(5):
+                    bw = max(1, bw)
+                    bh = max(1, bh)
+                    btex = ctx.texture((bw, bh), 3, dtype='f4')
+                    btex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    btex.repeat_x = False
+                    btex.repeat_y = False
+                    self.bloom_texs.append(btex)
+                    self.bloom_fbos.append(ctx.framebuffer(color_attachments=[btex]))
+                    bw //= 2
+                    bh //= 2
+
             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-            ctx.screen.use()
+            if self.hdr_msaa_fbo:
+                self.hdr_msaa_fbo.use()
+            else:
+                self.hdr_resolve_fbo.use()
             ctx.clear(0.02, 0.02, 0.03, 1.0) 
     
             is_scrubbing = tl_active and tl_prog >= 1.0
@@ -1947,6 +2034,16 @@ class App:
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
             star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
             star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
+            star_indices_numba = np.where(is_star_mask[:total_render_bodies])[0]
+            star_lums = np.ones(len(star_indices_numba), dtype=np.float32)
+            for _k in range(len(star_indices_numba)):
+                _idx = star_indices_numba[_k]
+                if _idx < num_bodies:
+                    _bd = bodies_data[_idx]
+                else:
+                    _bd = self.bodies_data_cmp[_idx - num_bodies]
+                if "star_props" in _bd and "lum" in _bd["star_props"]:
+                    star_lums[_k] = float(_bd["star_props"]["lum"])
             hdr_enabled = self.camera.get("hdr_enabled", True)
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
@@ -1955,6 +2052,7 @@ class App:
                 all_instances[:total_render_bodies, 8],
                 star_positions,
                 star_colors,
+                star_lums,
                 hdr_enabled
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
@@ -2447,14 +2545,13 @@ class App:
     
                     if atmo_quality == 1:
                         n_samples = 16
-                        n_light = 4
                     else:
                         if apparent_px < 50:
-                            n_samples, n_light = 8, 4
+                            n_samples = 8
                         elif apparent_px < 200:
-                            n_samples, n_light = 16, 6
+                            n_samples = 16
                         else:
-                            n_samples, n_light = 32, 8
+                            n_samples = 32
                             
                     if 'lut_tex' not in atmo:
                         build_atmo_lut(atmo)
@@ -2473,19 +2570,8 @@ class App:
                     u_atmo_mie_g.value = atmo['mie_g']
                     u_atmo_beta_absorption.write(atmo['beta_absorption'])
                     u_atmo_sun_intensity.value = scaled_intensity
-                    
-                    if num_stars > 0:
-                        star_pos = pos_rel_all[star_idx] if not is_cmp else cmp_pos_rel[self.star_idx_cmp]
-                        body_to_star = star_pos - body_pos_rel
-                        dist_to_star = np.linalg.norm(body_to_star)
-                        star_r_au = body_radii[star_idx] if not is_cmp else self.body_radii_cmp[self.star_idx_cmp]
-                        sin_star_angular = star_r_au / max(dist_to_star, 1e-12)
-                    else:
-                        sin_star_angular = 0.0
-                    u_atmo_star_angular_radius.value = float(sin_star_angular)
 
                     u_atmo_num_samples.value = n_samples
-                    if u_atmo_num_light_samples: u_atmo_num_light_samples.value = n_light
                     u_atmo_pole_obl.value = (
                         float(all_instances[body_idx_in_unified, 9]),
                         float(all_instances[body_idx_in_unified, 10]),
@@ -2819,6 +2905,18 @@ class App:
                     if self.camera.get("hdr_enabled", True):
                         _, self.camera["exposure"] = imgui.slider_float("Exposure", self.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
                     
+                    # Bloom
+                    _, self.camera["bloom_intensity"] = imgui.slider_float("Bloom Intensity", self.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
+                    _, self.camera["bloom_threshold"] = imgui.slider_float("Bloom Threshold", self.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
+                    
+                    # MSAA
+                    msaa_options = [0, 2, 4, 8]
+                    msaa_labels = ["Off", "2x", "4x", "8x"]
+                    current_msaa = self.camera.get("msaa_samples", 4)
+                    current_idx = msaa_options.index(current_msaa) if current_msaa in msaa_options else 2
+                    _, new_msaa_idx = imgui.combo("MSAA", current_idx, msaa_labels)
+                    self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
+
                     # Orbit Lines
                     _, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
                     if show_orbits:
@@ -4032,6 +4130,57 @@ class App:
                             print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
                 imgui.end()
     
+            # --- Post Processing ---
+            if self.hdr_msaa_fbo:
+                ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
+            
+            # Bloom Downsample
+            ctx.disable(moderngl.DEPTH_TEST)
+            ctx.disable(moderngl.BLEND)
+            
+            # Pass 1: Extract and Downsample to bloom_fbos[0]
+            if len(self.bloom_fbos) == 5:
+                self.bloom_fbos[0].use()
+                ctx.viewport = (0, 0, self.bloom_texs[0].width, self.bloom_texs[0].height)
+                self.hdr_resolve_tex.use(location=0)
+                self.prog_bloom_down['u_texture'].value = 0
+                self.prog_bloom_down['u_texel_size'].value = (1.0 / self.hdr_resolve_tex.width, 1.0 / self.hdr_resolve_tex.height)
+                self.prog_bloom_down['u_threshold'].value = self.camera.get("bloom_threshold", 1.0)
+                self.quad_vao_down.render(moderngl.TRIANGLE_STRIP)
+                
+                # Pass 2..5: Downsample
+                self.prog_bloom_down['u_threshold'].value = 0.0 # only threshold on first pass
+                for i in range(1, 5):
+                    self.bloom_fbos[i].use()
+                    ctx.viewport = (0, 0, self.bloom_texs[i].width, self.bloom_texs[i].height)
+                    self.bloom_texs[i-1].use(location=0)
+                    self.prog_bloom_down['u_texel_size'].value = (1.0 / self.bloom_texs[i-1].width, 1.0 / self.bloom_texs[i-1].height)
+                    self.quad_vao_down.render(moderngl.TRIANGLE_STRIP)
+                    
+                # Pass 6..9: Upsample with Additive Blending
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = moderngl.ONE, moderngl.ONE
+                self.prog_bloom_up['u_texture'].value = 0
+                self.prog_bloom_up['u_radius'].value = 1.0
+                
+                for i in range(3, -1, -1):
+                    self.bloom_fbos[i].use()
+                    ctx.viewport = (0, 0, self.bloom_texs[i].width, self.bloom_texs[i].height)
+                    self.bloom_texs[i+1].use(location=0)
+                    self.prog_bloom_up['u_texel_size'].value = (1.0 / self.bloom_texs[i+1].width, 1.0 / self.bloom_texs[i+1].height)
+                    self.quad_vao_up.render(moderngl.TRIANGLE_STRIP)
+                    
+                # Final Composite
+                ctx.disable(moderngl.BLEND)
+                ctx.screen.use()
+                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                self.hdr_resolve_tex.use(location=0)
+                self.bloom_texs[0].use(location=1)
+                self.prog_composite['u_main_texture'].value = 0
+                self.prog_composite['u_bloom_texture'].value = 1
+                self.prog_composite['u_bloom_intensity'].value = self.camera.get("bloom_intensity", 0.05)
+                self.quad_vao_comp.render(moderngl.TRIANGLE_STRIP)
+
             # Re-enable standard settings for ImGui
             ctx.screen.use()
             ctx.disable(moderngl.DEPTH_TEST)

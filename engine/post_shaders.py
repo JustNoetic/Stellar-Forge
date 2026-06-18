@@ -50,6 +50,12 @@ void main() {
         } else {
             // Soft thresholding
             color *= smoothstep(u_threshold, u_threshold + 0.5, brightness);
+            
+            // Make 10x less sensitive
+            color *= 0.2;
+            
+            // Softly compress extreme brightness so it doesn't spread infinitely
+            color = color / (1.0 + color * 0.05);
         }
     }
     
@@ -118,8 +124,16 @@ void main() {
     
     vec3 final_color = hdr_color + bloom_color * u_bloom_intensity;
     
+    // Measure luminance before tone mapping to detect extreme glare
+    float pre_luma = dot(final_color, vec3(0.2126, 0.7152, 0.0722));
+    
     // Apply Tone Mapping
     final_color = ACESFilm(final_color);
+    
+    // Violet glare for extreme brightness (simulating hurt eyes)
+    float eye_hurt_blend = smoothstep(10.0, 150.0, pre_luma);
+    vec3 violet_tint = vec3(0.65, 0.45, 1.0); // Violet
+    final_color = mix(final_color, violet_tint, eye_hurt_blend * 0.03);
     
     out_color = vec4(final_color, 1.0);
 }

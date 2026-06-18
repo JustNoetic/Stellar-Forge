@@ -1,16 +1,9 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 796, in run
-    prog_spheres = ctx.program(vertex_shader=sphere_vertex_shader, fragment_shader=sphere_fragment_shader)
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 1978, in program
-    res.mglo, _members, res._subroutines, res._geom, res._glo = self.mglo.program(
-                                                                ^^^^^^^^^^^^^^^^^^
-_moderngl.Error: GLSL Compiler failed
-
-fragment_shader
-===============
-0(186) : error C1503: undefined variable "u_au_to_km"
-
-
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2692, in run
+    render_atmosphere_pass(1)
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2610, in render_atmosphere_pass
+    u_atmo_star_angular_radius.value = float(sin_star_angular)
+                                             ^^^^^^^^^^^^^^^^
+NameError: name 'sin_star_angular' is not defined
