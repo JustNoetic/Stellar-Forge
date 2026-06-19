@@ -251,10 +251,11 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             dist_sq = dx*dx + dy*dy + dz*dz
             
             min_dist = r_j * 1.05
-            max_dist = r_j * 300.0
+            max_dist = r_j * 300.0 # Fade out contribution beyond 300 radii
             if dist_sq < min_dist * min_dist or dist_sq > max_dist * max_dist:
                 continue
                 
+            # Inverse Square Law for Geometric Area
             solid_angle = (r_j * r_j) / dist_sq
             if solid_angle < 1e-8:
                 continue
@@ -282,10 +283,9 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                     cy /= c_dist
                     cz /= c_dist
                 else:
-                    cx = 0.0
-                    cy = 0.0
-                    cz = 0.0
+                    cx = 0.0; cy = 0.0; cz = 0.0
                     
+                # Lambertian Phase Function
                 cos_α = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
                 cos_α = max(-1.0, min(1.0, cos_α))
                 α = np.arccos(cos_α)
@@ -299,28 +299,37 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                 total_caster_light_r += star_col[0] * phase * irradiance
                 total_caster_light_g += star_col[1] * phase * irradiance
                 total_caster_light_b += star_col[2] * phase * irradiance
-                
-            bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * (2.0 / 3.0)
-            bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * (2.0 / 3.0)
-            bounce_b = colors[j, 2] * total_caster_light_b * solid_angle * (2.0 / 3.0)
             
-            val = bounce_r*bounce_r + bounce_g*bounce_g + bounce_b*bounce_b
-            total_dir_x += dir_to_caster_x * val
-            total_dir_y += dir_to_caster_y * val
-            total_dir_z += dir_to_caster_z * val
-            total_color_r += bounce_r * val
-            total_color_g += bounce_g * val
-            total_color_b += bounce_b * val
-            total_weight += val
+            # Boost multiplier to make it slightly more visible on SDR monitors
+            boost = 1.5 
+            
+            bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * (2.0 / 3.0) * boost
+            bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * (2.0 / 3.0) * boost
+            bounce_b = colors[j, 2] * total_caster_light_b * solid_angle * (2.0 / 3.0) * boost
+            
+            # Calculate luminance to properly weight the direction vector
+            lum = bounce_r * 0.2126 + bounce_g * 0.7152 + bounce_b * 0.0722
+            
+            total_dir_x += dir_to_caster_x * lum
+            total_dir_y += dir_to_caster_y * lum
+            total_dir_z += dir_to_caster_z * lum
+            
+            # Direct Summation: Light is additive!
+            total_color_r += bounce_r
+            total_color_g += bounce_g
+            total_color_b += bounce_b
+            total_weight += lum
             
         if total_weight > 1e-12:
             inv_w = 1.0 / total_weight
             planetshine_dirs[i, 0] = total_dir_x * inv_w
             planetshine_dirs[i, 1] = total_dir_y * inv_w
             planetshine_dirs[i, 2] = total_dir_z * inv_w
-            planetshine_colors[i, 0] = total_color_r * inv_w
-            planetshine_colors[i, 1] = total_color_g * inv_w
-            planetshine_colors[i, 2] = total_color_b * inv_w
+        
+        # Colors are no longer divided/averaged. They are purely additive.
+        planetshine_colors[i, 0] = total_color_r
+        planetshine_colors[i, 1] = total_color_g
+        planetshine_colors[i, 2] = total_color_b
             
     return planetshine_dirs, planetshine_colors
 
@@ -2056,7 +2065,7 @@ class App:
                 hdr_enabled
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
-            all_instances[:total_render_bodies, 19:22] = planetshine_colors
+            all_instances[:total_render_bodies, 20:23] = planetshine_colors
             
             all_instances_buffer.write(all_instances[:total_render_bodies].tobytes())
             
