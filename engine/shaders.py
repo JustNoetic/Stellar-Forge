@@ -423,20 +423,20 @@ void main() {
                 if (atmo_h > 0.0 && gamma < penumbra_outer) {
                     float r_umbra = abs(alpha - beta);
                     float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
-                    vec3 atmo_tint = u_caster_atmos[j].xyz;
+                    vec3 atmo_tint = u_caster_atmos[j].xyz; // NOTE: for the host planet block, this is u_host_planet_atmo.xyz
                     
                     // Hardware intrinsic exponentiation (fast)
-                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (depth_into_umbra * 0.5));
+                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (depth_into_umbra * 0.8));
                     
                     float penetration = max(0.0, r_umbra - gamma);
-                    float effective_beta = min(beta, 0.02);
+                    float effective_beta = min(beta, 0.05); // Increased from 0.02
                     float distance_falloff = effective_beta * effective_beta;
                     
-                    float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
+                    // Relaxed exponential decay (75.0 instead of 150.0) lets light bleed deeper into the umbra
+                    float refraction_intensity = exp(-penetration * 75.0) * 3500.0 * distance_falloff;
                     
-                    // Fix: Blend smoothly across the entire penumbra, eliminating the sharp knee line
                     float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-                    caster_shadow += deep_tint * refraction_intensity * atmo_blend;
+                    caster_shadow += deep_tint * refraction_intensity * atmo_blend; // NOTE: host_shadow for the host block
                 }
                 
                 shadow *= clamp(caster_shadow, 0.0, 1.0);
@@ -609,53 +609,65 @@ void main() {
                         closest_ring_pt = closest_plane_pt; 
                     }
                     
-                    // Light direction points from the ring up (or down) towards the moon
-                    vec3 L_ring = normalize(closest_ring_pt - f_world_pos);
-                    float NdotL_ring = max(0.0, dot(N, L_ring));
+                    // Calculate light direction from the closest ring point
+                    vec3 L_ring_unnorm = closest_ring_pt - f_world_pos;
+                    float d_ring = max(length(L_ring_unnorm), 1e-6);
+                    vec3 L_ring = L_ring_unnorm / d_ring;
+                    
+                    // --- UMBRA SHADOW SOFTENING ---
+                    // Calculate how deep the fragment is inside the host planet's shadow
+                    vec3 V = closest_ring_pt - ring_center;
+                    float t_proj = dot(V, -L); // -L is the anti-solar direction
+                    vec3 V_perp = V - t_proj * (-L);
+                    float d_axis = length(V_perp);
+                    
+                    // Find the host planet radius dynamically to determine shadow width
+                    float host_radius = inner_r * 0.7; // sensible fallback
+                    for (int j = 0; j < u_num_casters; j++) {
+                        if (distance(u_casters[j].xyz, ring_center) < 1e-4) {
+                            host_radius = u_casters[j].w;
+                            float oblateness = u_caster_poles_obl[j].w;
+                            if (oblateness > 0.0) {
+                                host_radius = get_oblate_radius(host_radius, oblateness, u_caster_poles_obl[j].xyz, -L, V_perp);
+                            }
+                            break;
+                        }
+                    }
+                    
+                    float ring_shadow_factor = 1.0;
+                    float shadow_wrap = 0.2; // Base wrap for rings (they are broad area lights)
+                    
+                    // Check if inside the cylindrical shadow (behind planet & within radius)
+                    if (t_proj > 0.0) {
+                        // User requested 0.9 for the inner bound. 
+                        // We stretch the outer bound to 1.15 for a very gradual, soft darkening.
+                        float shadow_gradient = smoothstep(host_radius * 0.9, host_radius * 1.15, d_axis);
+                        ring_shadow_factor = mix(0.05, 1.0, shadow_gradient);
+                        
+                        // As the moon goes deeper into the shadow, the lit ring becomes a 180-degree halo.
+                        // We significantly increase the lighting wrap to simulate this massive area light,
+                        // which completely eliminates the sharp terminator line and softly wraps the sphere.
+                        shadow_wrap = mix(0.8, 0.2, shadow_gradient); 
+                    }
+                    
+                    // Wrapped Lambertian: Light smoothly wraps around the sphere based on area light size
+                    float NdotL_raw = dot(N, L_ring);
+                    float NdotL_ring = max(0.0, (NdotL_raw + shadow_wrap) / (1.0 + shadow_wrap));
                     
                     if (NdotL_ring > 0.0) {
-                        // Solid angle drops to zero if the moon is exactly on the ring plane (edge-on)
-                        float sin_elev = clamp(abs(moon_h) / max(dist_to_center, 1e-6), 0.0, 1.0);
+                        // Prevent pure black ring-plane edge cases by adding a tiny effective thickness
+                        float sin_elev = clamp((abs(moon_h) + inner_r * 0.001) / d_ring, 0.0, 1.0);
                         float ring_area = (outer_r * outer_r - inner_r * inner_r);
-                        float solid_angle = (ring_area * sin_elev) / max(dist_to_center * dist_to_center, ring_area * 0.1) * 0.4;
+                        
+                        float d_eff = max(d_ring, inner_r * 0.05); 
+                        float solid_angle = (ring_area * sin_elev) / max(d_eff * d_eff, ring_area * 0.1) * 0.15;
                         
                         // Check if the moon is above or below the sunlit side of the rings
                         float same_hemisphere = sun_elevation * moon_h;
-                        float ring_brightness = (same_hemisphere > 0.0) ? (effective_sun_elev * opacity * 4.0) : (effective_sun_elev * opacity * 0.8);
                         
-                        // UMBRA CHECK: Is the closest ring point currently inside Saturn's shadow?
-                        float ring_shadow_factor = 1.0;
-                        for (int j = 0; j < u_num_casters; j++) {
-                            if (ring_shadow_factor < 0.01) break;
-                            vec3 caster_pos = u_casters[j].xyz;
-                            float caster_r = u_casters[j].w;
-                            
-                            // Don't let the moon cast a shadow on the ring point it is receiving light from
-                            if (distance(caster_pos, f_world_pos) < caster_r * 1.5) continue;
-                            
-                            vec3 ring_to_caster = caster_pos - closest_ring_pt;
-                            float t_proj = dot(ring_to_caster, L);
-                            
-                            if (t_proj > 0.0) { 
-                                float dist_sq = dot(ring_to_caster, ring_to_caster);
-                                float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
-                                float r_penumbra = caster_r + t_proj * star_ang_radius;
-                                
-                                if (perp_sq < r_penumbra * r_penumbra) {
-                                    float inv_t = 1.0 / max(t_proj, 1e-6);
-                                    float beta = caster_r * inv_t;
-                                    float gamma = sqrt(perp_sq) * inv_t;
-                                    
-                                    float penumbra_outer = star_ang_radius + beta;
-                                    float penumbra_inner = max(0.0, beta - star_ang_radius);
-                                    float max_occ = min(1.0, (beta * beta) / max(1e-9, star_ang_radius * star_ang_radius));
-                                    float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
-                                    ring_shadow_factor *= (1.0 - occ);
-                                }
-                            }
-                        }
+                        // Halved brightness per user request
+                        float ring_brightness = (same_hemisphere > 0.0) ? (effective_sun_elev * opacity * 1.25) : (effective_sun_elev * opacity * 0.3);
                         
-                        // Apply standard Lambertian lighting!
                         shine_intensity = NdotL_ring * ring_brightness * solid_angle * ring_shadow_factor;
                     }
                 }
@@ -997,10 +1009,10 @@ struct RingPlane {
     float opacity;
     float scatter;
     float asymmetry;
+    float backscatter;
     int row_idx;
     float _pad1;
     float _pad2;
-    float _pad3;
 };
 
 #define MAX_RING_PLANES 16
@@ -1044,6 +1056,7 @@ void main() {
     float total_tau = 0.0;
     float total_scatter = 0.0;
     float total_asym = 0.0;
+    float total_backscatter = 0.0;
     
     for (int i=0; i<u_num_ring_planes; i++) {
         if (r >= u_ring_planes[i].inner_r && r <= u_ring_planes[i].outer_r) {
@@ -1060,6 +1073,7 @@ void main() {
             total_color += u_ring_planes[i].color * tau;
             total_scatter += u_ring_planes[i].scatter * tau;
             total_asym += u_ring_planes[i].asymmetry * tau;
+            total_backscatter += u_ring_planes[i].backscatter * tau;
             total_tau += tau;
         }
     }
@@ -1071,13 +1085,14 @@ void main() {
     vec4 f_color = vec4(total_color / max(1e-6, total_tau), physical_alpha);
     float f_scatter = total_scatter / max(1e-6, total_tau);
     float f_asymmetry = total_asym / max(1e-6, total_tau);
+    float f_backscatter = total_backscatter / max(1e-6, total_tau);
 
     
     vec3 V = normalize(u_camera_pos - f_world_pos);
     vec3 N = normalize(f_normal);
     float cam_side = dot(N, V);
     
-    float g_rock = -0.3;
+    float g_rock = f_backscatter;
     float g_dust = f_asymmetry;
     
     float rock_albedo = 1.0 - f_scatter;
@@ -1107,6 +1122,10 @@ void main() {
         float rocky_phase = (1.0 - g_rock * g_rock) / (denom_rock * sqrt(denom_rock));
         rocky_phase = min(rocky_phase, 2.5);
         
+        float denom_rock_back = 1.0 + g_rock * g_rock + 2.0 * g_rock * cos_theta;
+        float rocky_phase_back = (1.0 - g_rock * g_rock) / (denom_rock_back * sqrt(denom_rock_back));
+        rocky_phase_back = min(rocky_phase_back, 2.5);
+        
         float denom_dust = 1.0 + g_dust * g_dust - 2.0 * g_dust * cos_theta;
         float dusty_phase = (1.0 - g_dust * g_dust) / (denom_dust * sqrt(denom_dust));
         dusty_phase *= 0.15;
@@ -1125,7 +1144,8 @@ void main() {
         float same_side = (cam_side > 0.0) ? f_top : (1.0 - f_top);
         
         float rock_reflect_s = rock_reflect * solar_elevation * rocky_phase;
-        float rock_transmit_s = rock_transmit * solar_elevation * rocky_phase;
+        float rock_transmit_phase = rocky_phase + rocky_phase_back * (1.0 - f_color.a);
+        float rock_transmit_s = rock_transmit * solar_elevation * rock_transmit_phase;
         
         float reflected_s = rock_reflect_s + dust_reflect * dusty_phase;
         float transmitted_s = rock_transmit_s + dust_transmit * dusty_phase;

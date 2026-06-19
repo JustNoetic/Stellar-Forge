@@ -215,27 +215,94 @@ class ModernGLGlfwRenderer(GlfwRenderer):
         self.modern_renderer.shutdown()
 
 @njit
-def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, hdr_enabled):
+def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled):
     N = len(pos)
+    num_stars = len(star_positions)
+    
     planetshine_dirs = np.zeros((N, 3), dtype=np.float32)
     planetshine_colors = np.zeros((N, 3), dtype=np.float32)
     
-    num_stars = len(star_positions)
     if num_stars == 0:
         return planetshine_dirs, planetshine_colors
         
+    # =========================================================================
+    # PASS 1: Precalculate Shadows & Irradiance for all potential casters
+    # j_lit[j, s] stores the shadowed irradiance received by body j from star s
+    # star_dirs[j, s] stores the normalized vector from body j to star s
+    # =========================================================================
+    j_lit = np.zeros((N, num_stars), dtype=np.float32)
+    star_dirs = np.zeros((N, num_stars, 3), dtype=np.float32)
+    
+    for j in range(N):
+        if is_star[j] > 0.5: 
+            continue
+            
+        for s in range(num_stars):
+            cx = star_positions[s, 0] - pos[j, 0]
+            cy = star_positions[s, 1] - pos[j, 1]
+            cz = star_positions[s, 2] - pos[j, 2]
+            c_dist = np.sqrt(cx*cx + cy*cy + cz*cz)
+            
+            if c_dist < 1e-6: 
+                continue
+                
+            cx /= c_dist
+            cy /= c_dist
+            cz /= c_dist
+            
+            star_dirs[j, s, 0] = cx
+            star_dirs[j, s, 1] = cy
+            star_dirs[j, s, 2] = cz
+            
+            # ECLIPSE CHECK: Does body 'j' sit inside the shadow of body 'k'?
+            shadow_factor = 1.0
+            for k in range(N):
+                if k == j or is_star[k] > 0.5: 
+                    continue
+                
+                vk_x = pos[k, 0] - pos[j, 0]
+                vk_y = pos[k, 1] - pos[j, 1]
+                vk_z = pos[k, 2] - pos[j, 2]
+                t = vk_x * cx + vk_y * cy + vk_z * cz
+                
+                if t > 0.0 and t < c_dist:
+                    dist_sq_k = vk_x*vk_x + vk_y*vk_y + vk_z*vk_z
+                    perp_sq = max(0.0, dist_sq_k - t*t)
+                    
+                    r_penumbra = radii[k] + t * (star_radii[s] / c_dist)
+                    if perp_sq < r_penumbra * r_penumbra:
+                        inv_t = 1.0 / t
+                        beta = radii[k] * inv_t
+                        gamma = np.sqrt(perp_sq) * inv_t
+                        alpha = star_radii[s] / c_dist
+                        
+                        p_out = alpha + beta
+                        p_in = max(0.0, beta - alpha)
+                        
+                        if gamma < p_in:
+                            occ = 1.0
+                        else:
+                            t_val = max(0.0, min(1.0, (gamma - p_out) / (p_in - p_out + 1e-12)))
+                            occ = t_val * t_val * (3.0 - 2.0 * t_val) # Smoothstep
+                            
+                        max_occ = min(1.0, (beta * beta) / max(1e-12, alpha * alpha))
+                        shadow_factor *= (1.0 - max_occ * occ)
+                        
+            if shadow_factor > 0.001:
+                irradiance = (star_lums[s] / max(c_dist * c_dist, 1e-8)) if hdr_enabled else 1.0
+                j_lit[j, s] = shadow_factor * irradiance
+
+    # =========================================================================
+    # PASS 2: Distribute light to receivers
+    # =========================================================================
     for i in range(N):
         if is_star[i] > 0.5:
             continue
             
         pos_i = pos[i]
         
-        total_dir_x = 0.0
-        total_dir_y = 0.0
-        total_dir_z = 0.0
-        total_color_r = 0.0
-        total_color_g = 0.0
-        total_color_b = 0.0
+        total_dir_x, total_dir_y, total_dir_z = 0.0, 0.0, 0.0
+        total_color_r, total_color_g, total_color_b = 0.0, 0.0, 0.0
         total_weight = 0.0
         
         for j in range(N):
@@ -250,75 +317,69 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             dz = pos_j[2] - pos_i[2]
             dist_sq = dx*dx + dy*dy + dz*dz
             
+            # Distance Falloff Culling (This makes Pass 2 basically O(N))
             min_dist = r_j * 1.05
-            max_dist = r_j * 300.0 # Fade out contribution beyond 300 radii
+            max_dist = r_j * 300.0 
             if dist_sq < min_dist * min_dist or dist_sq > max_dist * max_dist:
                 continue
                 
-            # Inverse Square Law for Geometric Area
             solid_angle = (r_j * r_j) / dist_sq
             if solid_angle < 1e-8:
                 continue
-                
-            dist = np.sqrt(dist_sq)
-            dir_to_caster_x = dx / dist
-            dir_to_caster_y = dy / dist
-            dir_to_caster_z = dz / dist
-            
-            total_caster_light_r = 0.0
-            total_caster_light_g = 0.0
-            total_caster_light_b = 0.0
             
             for s in range(num_stars):
-                star_pos = star_positions[s]
-                star_col = star_colors[s]
-                star_lum = star_lums[s]
+                # If body j is completely in the dark from this star, skip!
+                if j_lit[j, s] < 1e-6:
+                    continue
                 
-                cx = star_pos[0] - pos_j[0]
-                cy = star_pos[1] - pos_j[1]
-                cz = star_pos[2] - pos_j[2]
-                c_dist = np.sqrt(cx*cx + cy*cy + cz*cz)
-                if c_dist > 1e-6:
-                    cx /= c_dist
-                    cy /= c_dist
-                    cz /= c_dist
+                cx = star_dirs[j, s, 0]
+                cy = star_dirs[j, s, 1]
+                cz = star_dirs[j, s, 2]
+                
+                # CRESCENT SHIFT: Move the apparent light emission point towards the sun
+                shift_x = pos_j[0] + cx * r_j * 0.7
+                shift_y = pos_j[1] + cy * r_j * 0.7
+                shift_z = pos_j[2] + cz * r_j * 0.7
+                
+                dir_to_caster_x = shift_x - pos_i[0]
+                dir_to_caster_y = shift_y - pos_i[1]
+                dir_to_caster_z = shift_z - pos_i[2]
+                
+                d_c_sq = dir_to_caster_x**2 + dir_to_caster_y**2 + dir_to_caster_z**2
+                d_c = np.sqrt(d_c_sq)
+                if d_c > 1e-6:
+                    dir_to_caster_x /= d_c
+                    dir_to_caster_y /= d_c
+                    dir_to_caster_z /= d_c
                 else:
-                    cx = 0.0; cy = 0.0; cz = 0.0
-                    
-                # Lambertian Phase Function
-                cos_α = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
-                cos_α = max(-1.0, min(1.0, cos_α))
-                α = np.arccos(cos_α)
-                phase = (np.sin(α) + (np.pi - α) * cos_α) / np.pi
+                    continue
 
-                if hdr_enabled:
-                    irradiance = star_lum / max(c_dist * c_dist, 1e-8)
-                else:
-                    irradiance = 1.0
-                    
-                total_caster_light_r += star_col[0] * phase * irradiance
-                total_caster_light_g += star_col[1] * phase * irradiance
-                total_caster_light_b += star_col[2] * phase * irradiance
+                # Lambertian Phase Function
+                cos_a = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
+                cos_a = max(-1.0, min(1.0, cos_a))
+                a = np.arccos(cos_a)
+                phase = (np.sin(a) + (np.pi - a) * cos_a) / np.pi
+                
+                # Apply the precalculated shadowed irradiance
+                light_r = star_colors[s, 0] * phase * j_lit[j, s]
+                light_g = star_colors[s, 1] * phase * j_lit[j, s]
+                light_b = star_colors[s, 2] * phase * j_lit[j, s]
             
-            # Boost multiplier to make it slightly more visible on SDR monitors
-            boost = 1.5 
-            
-            bounce_r = colors[j, 0] * total_caster_light_r * solid_angle * (2.0 / 3.0) * boost
-            bounce_g = colors[j, 1] * total_caster_light_g * solid_angle * (2.0 / 3.0) * boost
-            bounce_b = colors[j, 2] * total_caster_light_b * solid_angle * (2.0 / 3.0) * boost
-            
-            # Calculate luminance to properly weight the direction vector
-            lum = bounce_r * 0.2126 + bounce_g * 0.7152 + bounce_b * 0.0722
-            
-            total_dir_x += dir_to_caster_x * lum
-            total_dir_y += dir_to_caster_y * lum
-            total_dir_z += dir_to_caster_z * lum
-            
-            # Direct Summation: Light is additive!
-            total_color_r += bounce_r
-            total_color_g += bounce_g
-            total_color_b += bounce_b
-            total_weight += lum
+                boost = 1.5 
+                bounce_r = colors[j, 0] * light_r * solid_angle * (2.0 / 3.0) * boost
+                bounce_g = colors[j, 1] * light_g * solid_angle * (2.0 / 3.0) * boost
+                bounce_b = colors[j, 2] * light_b * solid_angle * (2.0 / 3.0) * boost
+                
+                lum = bounce_r * 0.2126 + bounce_g * 0.7152 + bounce_b * 0.0722
+                
+                total_dir_x += dir_to_caster_x * lum
+                total_dir_y += dir_to_caster_y * lum
+                total_dir_z += dir_to_caster_z * lum
+                
+                total_color_r += bounce_r
+                total_color_g += bounce_g
+                total_color_b += bounce_b
+                total_weight += lum
             
         if total_weight > 1e-12:
             inv_w = 1.0 / total_weight
@@ -326,7 +387,6 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             planetshine_dirs[i, 1] = total_dir_y * inv_w
             planetshine_dirs[i, 2] = total_dir_z * inv_w
         
-        # Colors are no longer divided/averaged. They are purely additive.
         planetshine_colors[i, 0] = total_color_r
         planetshine_colors[i, 1] = total_color_g
         planetshine_colors[i, 2] = total_color_b
@@ -923,8 +983,9 @@ class App:
                 outer_r = ring_seg['outer'] * body_radius_au
                 r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
                 r_opacity = ring_seg.get('opacity', 1.0)
-                r_scatter = ring_seg.get('scatter', 0.0)
+                r_scatter = ring_seg.get('scatter', 2.5)
                 r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                r_backscatter = ring_seg.get('backscatter', -0.3)
                 
                 sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
                 shadow_grad = generate_ring_shadow_grad(sorted_gradient)
@@ -937,6 +998,7 @@ class App:
                     'opacity': r_opacity,
                     'scatter': r_scatter,
                     'asymmetry': r_asymmetry,
+                    'backscatter': r_backscatter,
                     'shadow_grad': shadow_grad,
                     'raw_color': r_color,
                     'gradient': sorted_gradient,
@@ -1306,13 +1368,14 @@ class App:
                         outer_r = ring_seg['outer'] * body_radius_au_r
                         r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
                         r_opacity = ring_seg.get('opacity', 1.0)
-                        r_scatter = ring_seg.get('scatter', 0.0)
+                        r_scatter = ring_seg.get('scatter', 2.5)
                         r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                        r_backscatter = ring_seg.get('backscatter', -0.3)
                         sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
                         shadow_grad_r = generate_ring_shadow_grad(sorted_gradient)
                         ring_precomputed.append({
                             'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
-                            'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry,
+                            'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
                             'row_idx': len(ring_precomputed),
                         })
@@ -1431,13 +1494,14 @@ class App:
                         outer_r = ring_seg['outer'] * body_radius_au_r
                         r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
                         r_opacity = ring_seg.get('opacity', 1.0)
-                        r_scatter = ring_seg.get('scatter', 0.0)
+                        r_scatter = ring_seg.get('scatter', 2.5)
                         r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                        r_backscatter = ring_seg.get('backscatter', -0.3)
                         sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
                         shadow_grad_r = generate_ring_shadow_grad(sorted_gradient)
                         self.ring_precomputed_cmp.append({
                             'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
-                            'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry,
+                            'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
                             'row_idx': len(self.ring_precomputed_cmp),
                         })
@@ -2043,8 +2107,10 @@ class App:
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
             star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
             star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
+            star_radii = all_instances[:total_render_bodies][is_star_mask, 6] # Added star radii
             star_indices_numba = np.where(is_star_mask[:total_render_bodies])[0]
             star_lums = np.ones(len(star_indices_numba), dtype=np.float32)
+            
             for _k in range(len(star_indices_numba)):
                 _idx = star_indices_numba[_k]
                 if _idx < num_bodies:
@@ -2053,7 +2119,9 @@ class App:
                     _bd = self.bodies_data_cmp[_idx - num_bodies]
                 if "star_props" in _bd and "lum" in _bd["star_props"]:
                     star_lums[_k] = float(_bd["star_props"]["lum"])
+                    
             hdr_enabled = self.camera.get("hdr_enabled", True)
+            
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
                 all_instances[:total_render_bodies, 6],
@@ -2062,6 +2130,7 @@ class App:
                 star_positions,
                 star_colors,
                 star_lums,
+                star_radii, # Pass radii to Numba
                 hdr_enabled
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
@@ -2284,7 +2353,7 @@ class App:
                     R_km = atmo['planet_radius_km']
                     od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
                     od_m = beta_m * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
-                    transmittance = np.exp(-(od_r + od_m) * 0.5)
+                    transmittance = np.exp(-(od_r + od_m) * 0.1)
                     caster_atmos_buf[i_c, 0:3] = transmittance
                     caster_atmos_buf[i_c, 3] = atmo['atmo_radius_au'] - atmo['surface_radius_au']
                 else:
@@ -2640,7 +2709,7 @@ class App:
                             R_km_c = atmo_info['planet_radius_km']
                             od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
                             od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
-                            transmittance = np.exp(-(od_r_c + od_m_c) * 0.5)
+                            transmittance = np.exp(-(od_r_c + od_m_c) * 0.1)
                             thickness = atmo_info['atmo_radius_au'] - atmo_info['surface_radius_au']
                             active_atmos_buf[i_ac, 0:3] = transmittance
                             active_atmos_buf[i_ac, 3] = thickness
@@ -2697,7 +2766,7 @@ class App:
                                 R_km_c = atmo['planet_radius_km']
                                 od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
                                 od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
-                                trans = np.exp(-(od_r_c + od_m_c) * 0.5)
+                                trans = np.exp(-(od_r_c + od_m_c) * 0.1)
                                 thickness = atmo['atmo_radius_au'] - atmo['surface_radius_au']
                                 u_ring_host_atmo.value = (float(trans[0]), float(trans[1]), float(trans[2]), float(thickness))
                             else:
@@ -2717,6 +2786,7 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
                             prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
                             prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
                             prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 
@@ -2747,7 +2817,7 @@ class App:
                                 R_km_c = atmo['planet_radius_km']
                                 od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
                                 od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
-                                trans = np.exp(-(od_r_c + od_m_c) * 0.5)
+                                trans = np.exp(-(od_r_c + od_m_c) * 0.1)
                                 thickness = atmo['atmo_radius_au'] - atmo['surface_radius_au']
                                 u_ring_host_atmo.value = (float(trans[0]), float(trans[1]), float(trans[2]), float(thickness))
                             else:
@@ -2764,6 +2834,7 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
                             prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
                             prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
                             prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 ctx.depth_mask = True
@@ -3745,6 +3816,8 @@ class App:
                                                         "opacity": fmt(r['opacity']),
                                                         "scatter": fmt(r['scatter']),
                                                         "asymmetry": fmt(r['asymmetry']),
+                                                        "backscatter": fmt(r['backscatter']),
+                                                        "shadow_grad": r['shadow_grad'],
                                                         "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
                                                     })
                                                     
@@ -3785,6 +3858,8 @@ class App:
                                             "opacity": fmt(r['opacity']),
                                             "scatter": fmt(r['scatter']),
                                             "asymmetry": fmt(r['asymmetry']),
+                                            "backscatter": fmt(r['backscatter']),
+                                            "shadow_grad": r['shadow_grad'],
                                             "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
                                         })
                                 
@@ -3873,8 +3948,9 @@ class App:
                                     changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 1.496e8, 10.0, ring_item['inner_r'] * 1.496e8 + 10, body_r_km * 50.0)
                                     changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
                                     changed_op, new_op = imgui.slider_float(f"Opacity##{i}", ring_item['opacity'], 0.0, 1.0)
-                                    changed_scat, new_scat = imgui.drag_float(f"Forward Scatter Mult##{i}", ring_item['scatter'], 0.05, 0.0, 100.0)
+                                    changed_scat, new_scat = imgui.slider_float(f"Forward Scatter Mult##{i}", ring_item['scatter'], 0.0, 10.0)
                                     changed_asym, new_asym = imgui.slider_float(f"Forward Scatter Asym##{i}", ring_item['asymmetry'], 0.0, 0.999)
+                                    changed_bks, new_bks = imgui.slider_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), -0.999, 0.0)
                                     
                                     grad_changed = False
                                     grad_sort_needed = False
@@ -3913,13 +3989,14 @@ class App:
                                             
                                         imgui.tree_pop()
                                     
-                                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or grad_changed:
+                                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or grad_changed:
                                         if changed_in: ring_item['inner_r'] = new_in / 1.496e8
                                         if changed_out: ring_item['outer_r'] = new_out / 1.496e8
                                         if changed_col: ring_item['raw_color'] = new_col
                                         if changed_op: ring_item['opacity'] = new_op
                                         if changed_scat: ring_item['scatter'] = new_scat
                                         if changed_asym: ring_item['asymmetry'] = new_asym
+                                        if changed_bks: ring_item['backscatter'] = new_bks
                                         
                                         shadow_grad = generate_ring_shadow_grad(ring_item['gradient'])
                                         ring_item['shadow_grad'] = shadow_grad
@@ -3945,8 +4022,8 @@ class App:
                                     ring_precomputed.append({
                                         'body_idx': insp_idx,
                                         'pole': pole_n.astype('f4'),
-                                        'inner_r': r_in, 'outer_r': r_out, 'opacity': 1.0,
-                                        'scatter': 2.5, 'asymmetry': 0.8, 'shadow_grad': shadow_grad,
+                                        'inner_r': r_in, 'outer_r': r_out, 'opacity': 0.8,
+                                        'scatter': 2.5, 'asymmetry': 0.8, 'backscatter': -0.3, 'shadow_grad': shadow_grad,
                                         'raw_color': color, 'gradient': grad,
                                         'row_idx': len(ring_precomputed)
                                     })
