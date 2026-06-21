@@ -1,10 +1,32 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2369, in run
-    props = compute_atmosphere_properties(
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\atmosphere_physics.py", line 59, in compute_atmosphere_properties
-    number_density = pressure_pa / (K_B * temperature_k)
-                     ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
-ZeroDivisionError: float division by zero
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 905, in run
+    prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 1978, in program
+    res.mglo, _members, res._subroutines, res._geom, res._glo = self.mglo.program(
+                                                                ^^^^^^^^^^^^^^^^^^
+_moderngl.Error: GLSL Compiler failed
+
+fragment_shader
+===============
+0(602) : error C1503: undefined variable "L_mid"
+0(610) : error C1503: undefined variable "dist_mid_star"
+0(620) : error C1503: undefined variable "u_host_planet_radius"
+0(621) : error C1503: undefined variable "u_host_planet_pos"
+0(622) : error C1503: undefined variable "L_mid"
+0(625) : error C1503: undefined variable "u_host_planet_radius"
+0(629) : error C1503: undefined variable "u_host_planet_atmo"
+0(629) : error C1503: undefined variable "u_host_planet_atmo"
+0(630) : error C1503: undefined variable "dist_mid_star"
+0(633) : error C1503: undefined variable "dist_mid_star"
+0(640) : error C1503: undefined variable "u_host_planet_atmo"
+0(648) : error C1503: undefined variable "u_host_planet_atmo"
+0(667) : error C1503: undefined variable "L_mid"
+0(675) : error C1503: undefined variable "L_mid"
+0(675) : error C1503: undefined variable "L_mid"
+0(678) : error C1503: undefined variable "dist_mid_star"
+0(681) : error C1503: undefined variable "dist_mid_star"
+
+

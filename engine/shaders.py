@@ -426,22 +426,22 @@ void main() {
                 vec3 caster_shadow = vec3(1.0 - occ);
                 
                 if (atmo_h > 0.0 && gamma < penumbra_outer) {
-                    float r_umbra = abs(alpha - beta);
-                    float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
-                    vec3 atmo_tint = u_caster_atmos[j].xyz; // NOTE: for the host planet block, this is u_host_planet_atmo.xyz
+                    float max_bend = clamp(atmo_h * 25000.0, 0.001, 0.05);
+                    float req_bend = beta - gamma;
                     
-                    // Hardware intrinsic exponentiation (fast)
-                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (depth_into_umbra * 0.8));
+                    float optical_depth = max(0.0, req_bend);
+                    float atmospheric_transmission = exp(-optical_depth * 150.0);
+                    float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
                     
-                    float penetration = max(0.0, r_umbra - gamma);
-                    float effective_beta = min(beta, 0.05); // Increased from 0.02
-                    float distance_falloff = effective_beta * effective_beta;
+                    float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
+                    vec3 atmo_tint = u_caster_atmos[j].xyz;
+                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
                     
-                    // Relaxed exponential decay (75.0 instead of 150.0) lets light bleed deeper into the umbra
-                    float refraction_intensity = exp(-penetration * 75.0) * 3500.0 * distance_falloff;
-                    
+                    float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+                    float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
                     float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-                    caster_shadow += deep_tint * refraction_intensity * atmo_blend; // NOTE: host_shadow for the host block
+                    
+                    caster_shadow += deep_tint * refraction_intensity * atmo_blend;
                 }
                 
                 shadow *= clamp(caster_shadow, 0.0, 1.0);
@@ -517,7 +517,7 @@ void main() {
                             // Penumbra is extremely narrow, 1 sample is sufficient
                             float r = 0.5 * (overlap_min + overlap_max);
                             float p = (r - inner_r) / max(1e-6, outer_r - inner_r);
-                            sum_alpha = texture(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0)).r;
+                            sum_alpha = textureLod(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0), 0.0).r;
                         } else {
                             // Penumbra is wide, use 5 samples for filtering
                             int tex_samples = 5;
@@ -525,14 +525,16 @@ void main() {
                                 float u = (float(s) + 0.5) / float(tex_samples);
                                 float r = mix(overlap_min, overlap_max, u);
                                 float p = (r - inner_r) / max(1e-6, outer_r - inner_r);
-                                sum_alpha += texture(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0)).r;
+                                sum_alpha += textureLod(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0), 0.0).r;
                             }
                             sum_alpha /= float(tex_samples);
                         }
                         float alpha_mult = sum_alpha;
                         float opacity = u_ring_params[j].z;
                         
-                        plane_occlusion += fraction * opacity * alpha_mult;
+                        float tau = -log(max(1e-6, 1.0 - opacity * alpha_mult));
+                        float light_mu = max(1e-4, abs(dot(normalize(u_ring_normal[j]), L)));
+                        plane_occlusion += fraction * (1.0 - exp(-tau / light_mu));
                     }
                     
                     shadow *= vec3(1.0 - min(plane_occlusion, 1.0));
@@ -1080,6 +1082,7 @@ void main() {
     float total_scatter = 0.0;
     float total_asym = 0.0;
     float total_backscatter = 0.0;
+    float final_edge_alpha = 1.0;
     
     for (int i=0; i<u_num_ring_planes; i++) {
         float inner_r = u_ring_planes[i].inner_r;
@@ -1091,15 +1094,21 @@ void main() {
             float alpha = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0)).r;
             
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
-            alpha *= edge_alpha;
+            final_edge_alpha = edge_alpha;
             
             float raw_a = alpha * u_ring_planes[i].opacity;
             float tau = 0.0;
             if (raw_a >= 0.999) {
-                tau = 6.907 + (raw_a - 0.999) * 10.0;
+                tau = 100.0;
             } else {
                 tau = -log(max(1e-6, 1.0 - raw_a));
             }
+            
+            vec3 V_dir = normalize(u_camera_pos - f_world_pos);
+            vec3 N_dir = normalize(f_normal);
+            float view_mu = max(1e-4, abs(dot(N_dir, V_dir)));
+            
+            tau /= view_mu;
             
             total_color = u_ring_planes[i].color * tau;
             total_scatter = u_ring_planes[i].scatter * tau;
@@ -1240,15 +1249,21 @@ void main() {
             vec3 caster_shadow = vec3(1.0 - occ);
             
             if (atmo_h > 0.0 && gamma < penumbra_outer) {
-                float r_umbra = abs(alpha - beta);
-                float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
+                float max_bend = clamp(atmo_h * 25000.0, 0.001, 0.05);
+                float req_bend = beta - gamma;
+                
+                float optical_depth = max(0.0, req_bend);
+                float atmospheric_transmission = exp(-optical_depth * 150.0);
+                float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+                
+                float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
                 vec3 atmo_tint = u_caster_atmos[j].xyz;
-                vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (depth_into_umbra * 0.5));
-                float penetration = max(0.0, r_umbra - gamma);
-                float effective_beta = min(beta, 0.02);
-                float distance_falloff = effective_beta * effective_beta;
-                float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
+                vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+                
+                float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+                float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
                 float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
+                
                 caster_shadow += deep_tint * refraction_intensity * atmo_blend;
             }
             shadow_s *= clamp(caster_shadow, 0.0, 1.0);
@@ -1296,15 +1311,21 @@ void main() {
                         vec3 host_shadow = vec3(1.0 - occ);
                         
                         if (host_atmo_h > 0.0 && gamma < penumbra_outer) {
-                            float r_umbra = abs(alpha - beta);
-                            float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
+                            float max_bend = clamp(host_atmo_h * 25000.0, 0.001, 0.05);
+                            float req_bend = beta - gamma;
+                            
+                            float optical_depth = max(0.0, req_bend);
+                            float atmospheric_transmission = exp(-optical_depth * 150.0);
+                            float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+                            
+                            float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
                             vec3 atmo_tint = u_host_planet_atmo.xyz;
-                            vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (depth_into_umbra * 0.5));
-                            float penetration = max(0.0, r_umbra - gamma);
-                            float effective_beta = min(beta, 0.02);
-                            float distance_falloff = effective_beta * effective_beta;
-                            float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
+                            vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+                            
+                            float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+                            float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
                             float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
+                            
                             host_shadow += deep_tint * refraction_intensity * atmo_blend;
                         }
                         shadow_s *= clamp(host_shadow, 0.0, 1.0);
@@ -1351,7 +1372,7 @@ void main() {
     }
     vec3 raw_color = f_color.rgb * illumination;
     vec3 final_color = u_hdr_enabled ? (raw_color * u_exposure) : raw_color;
-    out_color = vec4(final_color, physical_alpha);
+    out_color = vec4(final_color * final_edge_alpha, physical_alpha * final_edge_alpha);
 }
 """
 
@@ -1467,8 +1488,7 @@ uniform bool u_hdr_enabled;
 
 out vec4 out_color;
 
-int g_num_local_rings;
-int g_local_rings[16];
+// g_local_rings removed to prevent local memory array spilling
 
 vec3 toSphericalSpace(vec3 p, vec4 pole_obl) {
     float f = pole_obl.w;
@@ -1542,31 +1562,37 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         vec3 caster_shadow = vec3(1.0 - occ);
         
         if (atmo_h > 0.0 && gamma < penumbra_outer) {
-            float r_umbra = abs(alpha - beta);
-            float depth_into_umbra = clamp((r_umbra - gamma) / max(1e-6, r_umbra), 0.0, 1.0);
+            float max_bend = clamp(atmo_h * 25000.0, 0.001, 0.05);
+            float req_bend = beta - gamma;
+            
+            float optical_depth = max(0.0, req_bend);
+            float atmospheric_transmission = exp(-optical_depth * 150.0);
+            float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+            
+            float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
             vec3 atmo_tint = u_active_caster_atmos[i].xyz;
-            vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (depth_into_umbra * 0.5));
-            float penetration = max(0.0, r_umbra - gamma);
-            float effective_beta = min(beta, 0.02);
-            float distance_falloff = effective_beta * effective_beta;
-            float refraction_intensity = exp(-penetration * 150.0) * 2000.0 * distance_falloff;
+            vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+            
+            float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+            float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
             float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
+            
             caster_shadow += deep_tint * refraction_intensity * atmo_blend;
         }
         shadow *= clamp(caster_shadow, 0.0, 1.0);
     }
     
     uint processed_mask = 0u;
-    for (int i = 0; i < g_num_local_rings; i++) {
-        int k = g_local_rings[i];
+    for (int k = 0; k < u_num_ring_planes; k++) {
+        if ((u_ring_mask & (1u << k)) == 0u) continue;
         if ((processed_mask & (1u << k)) != 0u) continue;
         
         vec3 plane_center = u_ring_center[k];
         vec3 plane_normal = u_ring_normal[k];
         
         uint coplanar_mask = 0u;
-        for (int j = i; j < g_num_local_rings; j++) {
-            int ring_idx = g_local_rings[j];
+        for (int ring_idx = k; ring_idx < u_num_ring_planes; ring_idx++) {
+            if ((u_ring_mask & (1u << ring_idx)) == 0u) continue;
             if (distance(plane_center, u_ring_center[ring_idx]) < 1e-6 && 
                 dot(plane_normal, u_ring_normal[ring_idx]) > 0.999) {
                 coplanar_mask |= (1u << ring_idx);
@@ -1600,8 +1626,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         
         float plane_occlusion = 0.0;
         
-        for (int j = i; j < g_num_local_rings; j++) {
-            int ring_idx = g_local_rings[j];
+        for (int ring_idx = k; ring_idx < u_num_ring_planes; ring_idx++) {
             if ((coplanar_mask & (1u << ring_idx)) == 0u) continue;
             float inner_r = u_ring_params[ring_idx].x;
             float outer_r = u_ring_params[ring_idx].y;
@@ -1619,10 +1644,12 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             float fraction = max(0.0, f_max - f_min);
             
             float p_mid = ((overlap_min + overlap_max) * 0.5 - inner_r) / max(1e-6, outer_r - inner_r);
-            float alpha_mult = texture(u_ring_gradients, vec2(p_mid, (float(ring_idx) + 0.5) / 16.0)).r;
+            float alpha_mult = textureLod(u_ring_gradients, vec2(p_mid, (float(ring_idx) + 0.5) / 16.0), 0.0).r;
             float opacity = u_ring_params[ring_idx].z;
             
-            plane_occlusion += fraction * opacity * alpha_mult;
+            float tau = -log(max(1e-6, 1.0 - opacity * alpha_mult));
+            float light_mu = max(1e-4, abs(dot(normalize(u_ring_normal[ring_idx]), L_dir)));
+            plane_occlusion += fraction * (1.0 - exp(-tau / light_mu));
         }
         
         shadow *= vec3(1.0 - min(plane_occlusion, 1.0));
@@ -1668,13 +1695,7 @@ vec2 compute_optical_depth(vec3 origin, vec3 dir) {
 void main() {
     u_ring_mask = floatBitsToUint(instances[u_body_idx * 6 + 3].w);
     
-    g_num_local_rings = 0;
-    for (int k = 0; k < u_num_ring_planes; k++) {
-        if ((u_ring_mask & (1u << k)) == 0u) continue;
-        if (g_num_local_rings < 16) {
-            g_local_rings[g_num_local_rings++] = k;
-        }
-    }
+    // g_local_rings removed to prevent local memory array spilling
 
     vec3 planet_center_render = u_body_offset;
     vec3 cam_local_au = u_camera_pos - planet_center_render;
@@ -1786,6 +1807,18 @@ void main() {
         vec3 global_eclipse_shadow = vec3(1.0);
         vec3 end_eclipse_shadow = vec3(1.0);
         bool skip_volumetric_shadow = false;
+        
+        vec4 ring_s1_out = vec4(1e9);
+        vec4 ring_s2_out = vec4(-1e9);
+        vec4 ring_s1_in = vec4(1e9);
+        vec4 ring_s2_in = vec4(-1e9);
+        vec4 ring_inner = vec4(0.0);
+        vec4 ring_outer = vec4(1.0);
+        vec4 ring_opac = vec4(0.0);
+        vec4 ring_v_coord = vec4(0.0);
+        vec4 ring_R_eff = vec4(0.0);
+        vec3 ring_A_prime = vec3(0.0);
+        vec3 ring_B = vec3(0.0);
 
         if (u_atmo_quality > 0) { 
             float s_mid = (s_start + s_end) * 0.5;
@@ -1794,25 +1827,230 @@ void main() {
             vec3 mid_to_star = star_pos - mid_render;
             float dist_mid_star = length(mid_to_star);
             vec3 L_mid = mid_to_star / max(dist_mid_star, 1e-6);
-            global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius);
-            end_eclipse_shadow = global_eclipse_shadow;
+            if (u_atmo_quality == 1) {
+                global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius);
+                end_eclipse_shadow = global_eclipse_shadow;
+            }
 
+            // High mode interpolation and early-out removed because they miss thin ring shadows.
             if (u_atmo_quality == 2) {
-                vec3 start_pos = frag_local + s_start * ray_dir;
-                vec3 start_render = start_pos / u_au_to_km + planet_center_render;
-                vec3 start_to_star = star_pos - start_render;
-                vec3 shadow_start = compute_shadow(start_render, start_to_star / length(start_to_star), length(start_to_star), planet_center_render, star_radius);
+                vec3 O = frag_local / u_au_to_km + planet_center_render;
+                vec3 V = ray_dir / u_au_to_km;
                 
-                vec3 end_pos = frag_local + s_end * ray_dir;
-                vec3 end_render = end_pos / u_au_to_km + planet_center_render;
-                vec3 end_to_star = star_pos - end_render;
-                vec3 shadow_end = compute_shadow(end_render, end_to_star / length(end_to_star), length(end_to_star), planet_center_render, star_radius);
+                int ring_count = 0;
+                uint processed_mask = 0u;
+                for (int k = 0; k < u_num_ring_planes; k++) {
+                    if ((u_ring_mask & (1u << k)) == 0u) continue;
+                    if ((processed_mask & (1u << k)) != 0u) continue;
+                    
+                    vec3 N = u_ring_normal[k];
+                    vec3 C_km = u_ring_center[k] * u_au_to_km;
+                    vec3 O_km = frag_local + planet_center_render * u_au_to_km;
+                    
+                    float denom = dot(L_mid, N);
+                    if (abs(denom) < 1e-8) continue;
+                    
+                    float ra_km = dot(C_km - O_km, N) / denom;
+                    float rb_km = -dot(ray_dir, N) / denom;
+                    
+                    vec3 A_km = O_km + ra_km * L_mid;
+                    vec3 B_km = ray_dir + rb_km * L_mid;
+                    vec3 A_prime_km = A_km - C_km;
+                    
+                    float qa = dot(B_km, B_km);
+                    float qb = 2.0 * dot(A_prime_km, B_km);
+                    float qc = dot(A_prime_km, A_prime_km);
+                    
+                    float r_star_proj_km = abs((star_radius * u_au_to_km) * ra_km / max(dist_mid_star * u_au_to_km, 1e-6));
+                    float R_eff_km = r_star_proj_km;
+                    vec3 L_plane = L_mid - denom * N;
+                    float L_plane_len = length(L_plane);
+                    if (L_plane_len > 1e-5 && qa > 1e-8) {
+                        vec3 L_proj = L_plane / L_plane_len;
+                        vec3 T_vec = normalize(cross(N, L_mid));
+                        float s_mid_ring = (-qb) / (2.0 * qa);
+                        vec3 dir_radial = normalize(A_prime_km + s_mid_ring * B_km);
+                        float cos_theta = dot(dir_radial, L_proj);
+                        float sin_theta = dot(dir_radial, T_vec);
+                        R_eff_km = r_star_proj_km * sqrt( pow(cos_theta / max(1e-6, abs(denom)), 2.0) + pow(sin_theta, 2.0) );
+                    }
+                    
+                    for (int ring_idx = k; ring_idx < u_num_ring_planes; ring_idx++) {
+                        if ((u_ring_mask & (1u << ring_idx)) == 0u) continue;
+                        if (distance(u_ring_center[k], u_ring_center[ring_idx]) < 1e-5 && dot(N, u_ring_normal[ring_idx]) > 0.999) {
+                            processed_mask |= (1u << ring_idx);
+                            if (ring_count >= 4) continue;
+                            
+                            float inner_r_km = u_ring_params[ring_idx].x * u_au_to_km;
+                            float outer_r_km = u_ring_params[ring_idx].y * u_au_to_km;
+                            float opacity = u_ring_params[ring_idx].z;
+                            float base_tau = -log(max(1e-6, 1.0 - opacity));
+                            float scaled_tau = base_tau / max(1e-4, abs(denom));
+                            
+                            float eff_outer_km = outer_r_km + R_eff_km;
+                            float eff_inner_km = max(0.0, inner_r_km - R_eff_km);
+                            
+                            float c_out = qc - eff_outer_km * eff_outer_km;
+                            float disc_out = qb * qb - 4.0 * qa * c_out;
+                            
+                            if (disc_out > 0.0 && qa > 1e-8) {
+                                float sqrt_out = sqrt(disc_out);
+                                float s1_o = (-qb - sqrt_out) / (2.0 * qa);
+                                float s2_o = (-qb + sqrt_out) / (2.0 * qa);
+                                
+                                float c_in = qc - eff_inner_km * eff_inner_km;
+                                float disc_in = qb * qb - 4.0 * qa * c_in;
+                                float s1_i = 1e9;
+                                float s2_i = -1e9;
+                                if (disc_in > 0.0) {
+                                    float sqrt_in = sqrt(disc_in);
+                                    s1_i = (-qb - sqrt_in) / (2.0 * qa);
+                                    s2_i = (-qb + sqrt_in) / (2.0 * qa);
+                                }
+                                
+                                if (abs(rb_km) < 1e-8) {
+                                    if (ra_km <= 0.0) { s1_o = 1e9; s2_o = -1e9; }
+                                } else {
+                                    float s_cross = -ra_km / rb_km;
+                                    if (rb_km < 0.0) {
+                                        s2_o = min(s2_o, s_cross);
+                                        s2_i = min(s2_i, s_cross);
+                                    } else {
+                                        s1_o = max(s1_o, s_cross);
+                                        s1_i = max(s1_i, s_cross);
+                                    }
+                                }
+                                
+                                if (s1_o > s2_o) continue;
+                                
+                                if (ring_count == 0) { 
+                                    ring_s1_out.x = s1_o; ring_s2_out.x = s2_o; ring_s1_in.x = s1_i; ring_s2_in.x = s2_i;
+                                    ring_inner.x = inner_r_km; ring_outer.x = outer_r_km; ring_opac.x = scaled_tau; ring_v_coord.x = (float(ring_idx) + 0.5) / 16.0;
+                                    ring_A_prime = A_prime_km; ring_B = B_km; ring_R_eff.x = R_eff_km;
+                                }
+                                else if (ring_count == 1) { 
+                                    ring_s1_out.y = s1_o; ring_s2_out.y = s2_o; ring_s1_in.y = s1_i; ring_s2_in.y = s2_i; 
+                                    ring_inner.y = inner_r_km; ring_outer.y = outer_r_km; ring_opac.y = scaled_tau; ring_v_coord.y = (float(ring_idx) + 0.5) / 16.0;
+                                    ring_R_eff.y = R_eff_km;
+                                }
+                                else if (ring_count == 2) { 
+                                    ring_s1_out.z = s1_o; ring_s2_out.z = s2_o; ring_s1_in.z = s1_i; ring_s2_in.z = s2_i;
+                                    ring_inner.z = inner_r_km; ring_outer.z = outer_r_km; ring_opac.z = scaled_tau; ring_v_coord.z = (float(ring_idx) + 0.5) / 16.0;
+                                    ring_R_eff.z = R_eff_km;
+                                }
+                                else if (ring_count == 3) { 
+                                    ring_s1_out.w = s1_o; ring_s2_out.w = s2_o; ring_s1_in.w = s1_i; ring_s2_in.w = s2_i;
+                                    ring_inner.w = inner_r_km; ring_outer.w = outer_r_km; ring_opac.w = scaled_tau; ring_v_coord.w = (float(ring_idx) + 0.5) / 16.0;
+                                    ring_R_eff.w = R_eff_km;
+                                }
+                                
+                                ring_count++;
+                            }
+                        }
+                    }
+                }
                 
+                vec3 shadow_start = vec3(1.0);
+                vec3 shadow_end = vec3(1.0);
+                
+                vec3 start_render = O + s_start * V;
+                vec3 end_render = O + s_end * V;
+                vec3 L_start = L_mid;
+                float sr_start = star_radius / max(dist_mid_star, 1e-6);
+                vec3 L_end = L_mid;
+                float sr_end = sr_start;
+                
+                for (int c = 0; c < u_num_active_casters; c++) {
+                    vec3 pos = u_active_casters[c].xyz;
+                    float rad = u_active_casters[c].w;
+                    float atmo = u_active_caster_atmos[c].w;
+                    float obl = u_active_caster_poles_obl[c].w;
+                    vec3 pole = u_active_caster_poles_obl[c].xyz;
+                    vec3 atmo_tint = u_active_caster_atmos[c].xyz;
+                    
+                    vec3 s2c = pos - start_render;
+                    float t = dot(s2c, L_start);
+                    if (t > 0.0) {
+                        float dist_sq = dot(s2c, s2c);
+                        if (dist_sq > rad * rad * 1.0404) {
+                            float dist = sqrt(dist_sq);
+                            float p2 = max(0.0, dist_sq - t * t);
+                            float r = rad;
+                            if (obl > 0.0) r = get_oblate_radius(r, obl, pole, L_start, s2c - t * L_start);
+                            float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
+                            float rp = eff_r + dist * sr_start;
+                            if (p2 < rp * rp) {
+                                float inv_d = 1.0 / dist;
+                                float alpha = sr_start; float beta = r * inv_d; float gamma = sqrt(p2) * inv_d;
+                                float po = alpha + beta; float pi = max(0.0, beta - alpha);
+                                float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
+                                vec3 sh = vec3(1.0 - occ);
+                                if (atmo > 0.0 && gamma < po) {
+                                    float max_bend = clamp(atmo * 25000.0, 0.001, 0.05);
+                                    float req_bend = beta - gamma;
+                                    
+                                    float optical_depth = max(0.0, req_bend);
+                                    float atmospheric_transmission = exp(-optical_depth * 150.0);
+                                    float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+                                    
+                                    float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
+                                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+                                    
+                                    float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+                                    float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
+                                    float atmo_blend = smoothstep(po, pi, gamma);
+                                    
+                                    sh += deep_tint * refraction_intensity * atmo_blend;
+                                }
+                                shadow_start *= clamp(sh, 0.0, 1.0);
+                            }
+                        }
+                    }
+                    
+                    s2c = pos - end_render;
+                    t = dot(s2c, L_end);
+                    if (t > 0.0) {
+                        float dist_sq = dot(s2c, s2c);
+                        if (dist_sq > rad * rad * 1.0404) {
+                            float dist = sqrt(dist_sq);
+                            float p2 = max(0.0, dist_sq - t * t);
+                            float r = rad;
+                            if (obl > 0.0) r = get_oblate_radius(r, obl, pole, L_end, s2c - t * L_end);
+                            float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
+                            float rp = eff_r + dist * sr_end;
+                            if (p2 < rp * rp) {
+                                float inv_d = 1.0 / dist;
+                                float alpha = sr_end; float beta = r * inv_d; float gamma = sqrt(p2) * inv_d;
+                                float po = alpha + beta; float pi = max(0.0, beta - alpha);
+                                float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
+                                vec3 sh = vec3(1.0 - occ);
+                                if (atmo > 0.0 && gamma < po) {
+                                    float max_bend = clamp(atmo * 25000.0, 0.001, 0.05);
+                                    float req_bend = beta - gamma;
+                                    
+                                    float optical_depth = max(0.0, req_bend);
+                                    float atmospheric_transmission = exp(-optical_depth * 150.0);
+                                    float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+                                    
+                                    float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
+                                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+                                    
+                                    float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+                                    float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
+                                    float atmo_blend = smoothstep(po, pi, gamma);
+                                    
+                                    sh += deep_tint * refraction_intensity * atmo_blend;
+                                }
+                                shadow_end *= clamp(sh, 0.0, 1.0);
+                            }
+                        }
+                    }
+                }
                 global_eclipse_shadow = shadow_start;
                 end_eclipse_shadow = shadow_end;
-
-                if (shadow_start.r > 0.999 && shadow_end.r > 0.999) skip_volumetric_shadow = true;
-                else if (shadow_start.r < 0.001 && shadow_end.r < 0.001) skip_volumetric_shadow = true;
+                
+                if (shadow_start.r > 0.999 && shadow_end.r > 0.999 && ring_count == 0) skip_volumetric_shadow = true;
+                else if (shadow_start.r < 0.001 && shadow_end.r < 0.001 && ring_count == 0) skip_volumetric_shadow = true;
             }
         }
         
@@ -1828,6 +2066,10 @@ void main() {
         float od_mie = 0.0;
         vec3 total_rayleigh = vec3(0.0);
         vec3 total_mie = vec3(0.0);
+
+        float current_s = s_start + 0.5 * step_size;
+        float t_lerp = 0.5 / float(steps);
+        float t_step = 1.0 / float(steps);
 
         for (int i = 0; i < steps; i++) {
             float sample_len = length(current_pos_sph);
@@ -1864,7 +2106,7 @@ void main() {
             float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet); // Reused cos_planet
             float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
             vec2 lut_uv = vec2(clamp(effective_cos * 0.5 + 0.5, 0.0, 1.0), h_norm);
-            vec4 od_light = texture(u_optical_depth_lut, lut_uv);
+            vec4 od_light = textureLod(u_optical_depth_lut, lut_uv, 0.0);
 
             vec3 tau = beta_R * (od_rayleigh + od_light.r)
                      + beta_M * (od_mie + od_light.g)
@@ -1872,20 +2114,53 @@ void main() {
 
             vec3 sample_shadow = global_eclipse_shadow;
             if (u_atmo_quality == 2 && !skip_volumetric_shadow) { 
-                float t_lerp = (float(i) + 0.5) / float(steps);
                 sample_shadow = mix(global_eclipse_shadow, end_eclipse_shadow, t_lerp);
+                
+                float d = length(ring_A_prime + current_s * ring_B);
+                vec4 s_vec = vec4(current_s);
+                vec4 mask = step(ring_s1_out, s_vec) * step(s_vec, ring_s2_out) * (vec4(1.0) - step(ring_s1_in, s_vec) * step(s_vec, ring_s2_in));
+                
+                if (any(greaterThan(mask, vec4(0.0)))) {
+                    vec4 o_min = max(ring_inner, vec4(d) - ring_R_eff);
+                    vec4 o_max = min(ring_outer, vec4(d) + ring_R_eff);
+                    vec4 valid = step(o_min, o_max) * mask;
+                    
+                    if (any(greaterThan(valid, vec4(0.0)))) {
+                        vec4 r_eff_inv = 1.0 / max(vec4(1e-9), ring_R_eff);
+                        vec4 v_min = clamp((o_min - vec4(d)) * r_eff_inv, -1.0, 1.0);
+                        vec4 v_max = clamp((o_max - vec4(d)) * r_eff_inv, -1.0, 1.0);
+                        vec4 frac = max(vec4(0.0), smoothstep(-1.0, 1.0, v_max) - smoothstep(-1.0, 1.0, v_min));
+                        vec4 p_mid = clamp(((o_min + o_max) * 0.5 - ring_inner) / max(vec4(1e-6), ring_outer - ring_inner), 0.0, 1.0);
+                        
+                        vec4 sh_mult = vec4(1.0);
+                        if (valid.x > 0.0) sh_mult.x = 1.0 - frac.x * (1.0 - exp(-ring_opac.x * textureLod(u_ring_gradients, vec2(p_mid.x, ring_v_coord.x), 0.0).r));
+                        if (valid.y > 0.0) sh_mult.y = 1.0 - frac.y * (1.0 - exp(-ring_opac.y * textureLod(u_ring_gradients, vec2(p_mid.y, ring_v_coord.y), 0.0).r));
+                        if (valid.z > 0.0) sh_mult.z = 1.0 - frac.z * (1.0 - exp(-ring_opac.z * textureLod(u_ring_gradients, vec2(p_mid.z, ring_v_coord.z), 0.0).r));
+                        if (valid.w > 0.0) sh_mult.w = 1.0 - frac.w * (1.0 - exp(-ring_opac.w * textureLod(u_ring_gradients, vec2(p_mid.w, ring_v_coord.w), 0.0).r));
+                        
+                        sample_shadow *= sh_mult.x * sh_mult.y * sh_mult.z * sh_mult.w;
+                    }
+                }
+            } else if (u_atmo_quality == 3) {
+                vec3 sample_pos_local = frag_local + current_s * ray_dir;
+                vec3 sample_render = sample_pos_local / u_au_to_km + planet_center_render;
+                vec3 sample_to_star = star_pos - sample_render;
+                float dist_sample_star = length(sample_to_star);
+                sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius);
             }
 
             vec3 direct_attenuation = exp(-tau);
             vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.2) - direct_attenuation) * 0.4);
             
             vec3 atten_direct = direct_attenuation * sample_shadow * vis_fraction;
-            vec3 atten_ms = ms_attenuation * mix(sample_shadow, vec3(1.0), 0.5) * vis_fraction;
+            vec3 atten_ms = ms_attenuation * sample_shadow * vis_fraction;
 
             total_rayleigh += rho_R * (atten_direct + atten_ms) * step_size;
             total_mie      += rho_M * atten_direct * step_size;
 
             current_pos_sph += step_dir_sph;
+            current_s += step_size;
+            t_lerp += t_step;
         }
 
         float cos_theta = dot(ray_dir, sun_dir);

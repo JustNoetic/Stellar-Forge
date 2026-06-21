@@ -84,7 +84,7 @@
     {
         "name": "Earth",
         "type": "Terrestrial",
-        "color": "#002d54",
+        "color": "#1e4596",
         "parentId": "Sun",
         "m": 3.0034896154649684e-06,
         "r": 0.009158,
@@ -123,7 +123,7 @@
     {
         "name": "Moon",
         "type": "Moon",
-        "color": "#cccddb",
+        "color": "#3d3d3b",
         "parentId": "Earth",
         "m": 3.694303349765111e-08,
         "r": 0.002497,

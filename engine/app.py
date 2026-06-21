@@ -2915,9 +2915,12 @@ class App:
             force_layout = getattr(self, "_last_fb_width", 0) != self.fb_width or getattr(self, "_last_fb_height", 0) != self.fb_height
             cond_layout = imgui.ALWAYS if force_layout else imgui.ONCE
             
-            imgui.set_next_window_position(20, 20, cond_layout)
-            imgui.set_next_window_size(230, min(340, self.fb_height - 40), cond_layout)
-            imgui.begin("Simulation Controls")
+            imgui.set_next_window_position(10, 10, cond_layout)
+            imgui.set_next_window_size(320, self.fb_height - 20, cond_layout)
+            imgui.begin("Control Panel")
+            
+            imgui.text_colored("Simulation & Time Controls", 0.6, 0.9, 1.0)
+            imgui.separator()
             
             imgui.text("Current Date:")
             imgui.text(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d} UTC")
@@ -3041,14 +3044,14 @@ class App:
                 
             imgui.text(f"FOV: {self.camera['fov']:.1f} deg")
             if imgui.button("Reset FOV"): self.camera["fov"] = 45.0
-            imgui.end()
             
             if self.camera.get("show_settings_modal", False):
                 imgui.set_next_window_size(320, 240, imgui.FIRST_USE_EVER)
+                imgui.set_next_window_position(self.fb_width // 2 - 160, self.fb_height // 2 - 120, imgui.FIRST_USE_EVER)
                 expanded, self.camera["show_settings_modal"] = imgui.begin("Graphics & Quality Settings", True)
                 if expanded:
                     # Atmosphere Quality
-                    _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)"])
+                    _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Extreme (Brute Force)"])
                     
                     # Exposure & HDR
                     _, self.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", self.camera.get("hdr_enabled", True))
@@ -3084,9 +3087,10 @@ class App:
                         self.camera["show_settings_modal"] = False
                 imgui.end()
     
-            imgui.set_next_window_position(20, 370, cond_layout)
-            imgui.set_next_window_size(230, min(600, self.fb_height - 380), cond_layout)
-            imgui.begin("System Hierarchy")
+            imgui.spacing()
+            imgui.spacing()
+            imgui.text_colored("System Hierarchy", 0.6, 0.9, 1.0)
+            imgui.separator()
             
             # ── System Selector ──
             imgui.text_colored(active_system_name, 0.6, 0.9, 1.0)
@@ -3455,8 +3459,8 @@ class App:
                 else:
                     win_title = f"{body_name}###inspector"
                 
-                imgui.set_next_window_position(self.fb_width - 300, 20, cond_layout)
-                imgui.set_next_window_size(280, min(580, self.fb_height - 40), cond_layout)
+                imgui.set_next_window_position(self.fb_width - 350, 10, cond_layout)
+                imgui.set_next_window_size(340, self.fb_height - 20, cond_layout)
                 expanded, opened = imgui.begin(win_title, True)
                 if not opened:
                     self.camera["inspected_idx"] = None
@@ -4126,7 +4130,7 @@ class App:
     
             if self.camera.get("add_mode", False):
                 imgui.set_next_window_size(350, 400, imgui.FIRST_USE_EVER)
-                imgui.set_next_window_position(600, 50, imgui.FIRST_USE_EVER)
+                imgui.set_next_window_position(self.fb_width // 2 - 175, self.fb_height // 2 - 200, imgui.FIRST_USE_EVER)
                 expanded, self.camera["add_mode"] = imgui.begin("Add Orbiting Body", True)
                 if expanded:
                     ad = self.camera["add_data"]
