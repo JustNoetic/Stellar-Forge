@@ -1,7 +1,10 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2117, in run
-    planetshine_dirs, planetshine_colors = compute_planetshine_numba(
-                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: not enough arguments: expected 9, got 8
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2369, in run
+    props = compute_atmosphere_properties(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\atmosphere_physics.py", line 59, in compute_atmosphere_properties
+    number_density = pressure_pa / (K_B * temperature_k)
+                     ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+ZeroDivisionError: float division by zero

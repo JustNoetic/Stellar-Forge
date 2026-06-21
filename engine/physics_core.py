@@ -989,7 +989,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
     except (AttributeError, OSError):
         pass
 
-    last_time = time.time()
+    last_time = time.perf_counter()
     
     with shared_state["lock"]:
         current_parents = shared_state["parent_indices"].copy()
@@ -1009,7 +1009,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
         
     frame_count = 0
     while running[0]:
-        now = time.time()
+        now = time.perf_counter()
         dt_real = min(now - last_time, 0.1)
         last_time = now
         # ── System Switch Handling ──
@@ -1175,7 +1175,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     shared_state["ephemeris_exit"] = switch_req["ephemeris_exit"]
                 
             frame_count = 0
-            last_time = time.time()
+            last_time = time.perf_counter()
             continue
 
         crud_ops = []
@@ -1394,7 +1394,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 sim_start_copy = sim.copy()
             attach_custom_forces(sim_start_copy, shared_state["has_j2"], shared_state["has_gr"], shared_state["phys_star_idx"], shared_state["oblate_physics_list"])
                 
-            render_start_time = time.time()
+            render_start_time = time.perf_counter()
             valid_steps = 0
             for step in range(num_steps):
                 if not running[0] or time_ctrl.get("cancel_render", False):
@@ -1413,7 +1413,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 tl_raw_arr[step] = _tl_arr[:, 0:6]
                 
                 if step % 20 == 0:
-                    current_real_time = time.time()
+                    current_real_time = time.perf_counter()
                     elapsed = current_real_time - render_start_time
                     rate = (sim_start_copy.t - start_t) * SECONDS_PER_YEAR / max(elapsed, 0.001)
                     with shared_state["lock"]:
@@ -1547,9 +1547,16 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 if frame_count % 30 == 0:
                     shared_state["hierarchy_version"] += 1
                 
-        elapsed = time.time() - now
-        sleep_time = max(0.001, 0.016 - elapsed)
-        time.sleep(sleep_time)
+        elapsed = time.perf_counter() - now
+        target_time = 0.00832
+        sleep_time = target_time - elapsed
+        if sleep_time > 0:
+            # Sleep for most of the time to save CPU, but leave 1ms for busy wait
+            if sleep_time > 0.001:
+                time.sleep(sleep_time - 0.001)
+            # Busy wait the remainder for high precision
+            while (time.perf_counter() - now) < target_time:
+                pass
 
     if _timer_set:
         try:
@@ -1715,13 +1722,13 @@ def load_system_from_data(bodies_data_raw):
                 'atmo_radius_km': atmo_radius_km,
                 'atmo_radius_au': atmo_radius_au,
                 'surface_radius_au': radius_au,
-                'beta_rayleigh': np.array(atmo['rayleighCoefficients'], dtype='f4'),
-                'h_rayleigh': float(atmo['rayleighScaleHeight']),
-                'beta_mie': float(atmo['mieCoefficient']),
-                'h_mie': float(atmo['mieScaleHeight']),
-                'mie_g': float(atmo['mieAsymmetry']),
-                'beta_absorption': np.array(atmo.get('absorptionCoefficients', [0,0,0]), dtype='f4'),
-                'intensity': float(atmo['intensity']),
+                'surface_pressure': float(atmo.get('surface_pressure', 1.0)),
+                'temperature': float(atmo.get('temperature', 288.15)),
+                'composition': atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
+                'intensity': float(atmo.get('intensity', 1.0)),
+                'beta_mie': float(atmo.get('mieCoefficient', 21.0e-6)),
+                'h_mie': float(atmo.get('mieScaleHeight', 1.2)),
+                'mie_g': float(atmo.get('mieAsymmetry', 0.758))
             })
 
     # ── J2 / GR setup ──

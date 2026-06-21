@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
+    app.run()
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 604, in run
+    bodies_data_raw = sys_mgr.load_default_system()
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\system_manager.py", line 368, in load_default_system
+    with open(self.default_json, 'r') as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'data/system.json'

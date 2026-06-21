@@ -64,22 +64,13 @@
         "pole_ra": 272.76,
         "pole_dec": 67.16,
         "atmosphere": {
-            "height": 180,
-            "rayleighCoefficients": [
-                2.5e-05,
-                2.2e-05,
-                1.5e-05
-            ],
-            "rayleighScaleHeight": 15.9,
-            "mieCoefficient": 2e-05,
-            "mieScaleHeight": 10.0,
-            "mieAsymmetry": 0.8,
-            "absorptionCoefficients": [
-                1e-06,
-                5e-06,
-                1.5e-05
-            ],
-            "intensity": 25.0
+            "surface_pressure": 92.0,
+            "temperature": 737.0,
+            "composition": {
+                "CO2": 0.965,
+                "N2": 0.035
+            },
+            "height": 180.0
         },
         "sv": {
             "x": 0.09883766826832031,
@@ -108,22 +99,15 @@
         "J2": 0.00108,
         "oblateness": 0.00335,
         "atmosphere": {
-            "height": 100.0,
-            "rayleighCoefficients": [
-                8.1e-06,
-                2.516e-05,
-                5.76e-05
-            ],
-            "rayleighScaleHeight": 19.9,
-            "mieCoefficient": 0.0001705,
-            "mieScaleHeight": 1.2,
-            "mieAsymmetry": 0.934,
-            "absorptionCoefficients": [
-                0.0,
-                0.0,
-                0.0
-            ],
-            "intensity": 15.0
+            "surface_pressure": 1.0,
+            "temperature": 288.15,
+            "composition": {
+                "N2": 0.78,
+                "O2": 0.21,
+                "Ar": 0.01,
+                "O3": 0.0000003
+            },
+            "height": 100.0
         },
         "sv": {
             "x": -0.1828767788717711,
@@ -180,22 +164,14 @@
         "oblateness": 0.00589,
         "rotation_period": 24.6229,
         "atmosphere": {
-            "height": 80,
-            "rayleighCoefficients": [
-                4e-08,
-                9e-08,
-                2.2e-07
-            ],
-            "rayleighScaleHeight": 11.1,
-            "mieCoefficient": 5e-06,
-            "mieScaleHeight": 5.0,
-            "mieAsymmetry": 0.65,
-            "absorptionCoefficients": [
-                0,
-                0,
-                0
-            ],
-            "intensity": 15.0
+            "surface_pressure": 0.006,
+            "temperature": 210.0,
+            "composition": {
+                "CO2": 0.953,
+                "N2": 0.027,
+                "Ar": 0.016
+            },
+            "height": 80.0
         },
         "sv": {
             "x": 0.3476350316543381,
@@ -270,22 +246,13 @@
         "rotation_period": 9.925,
         "oblateness": 0.06487,
         "atmosphere": {
-            "height": 300.0,
-            "rayleighCoefficients": [
-                9.999999974752427e-07,
-                1.1000000768035534e-06,
-                1.2000000424450263e-06
-            ],
-            "rayleighScaleHeight": 30.399999618530273,
-            "mieCoefficient": 1.600000023841858e-06,
-            "mieScaleHeight": 1.7999999523162842,
-            "mieAsymmetry": 0.9750000238418579,
-            "absorptionCoefficients": [
-                6.999999868639861e-07,
-                8.999999749903509e-07,
-                1.1000000768035534e-06
-            ],
-            "intensity": 18.0
+            "surface_pressure": 1.0,
+            "temperature": 165.0,
+            "composition": {
+                "H2": 0.898,
+                "He": 0.102
+            },
+            "height": 300.0
         },
         "sv": {
             "x": -1.697618454436056,
@@ -313,6 +280,14 @@
         "omega": 49.1,
         "M": 330.9,
         "orbitRef": "equatorial",
+        "atmosphere": {
+            "surface_pressure": 1e-08,
+            "temperature": 130.0,
+            "composition": {
+                "CO2": 1.0
+            },
+            "height": 50.0
+        },
         "sv": {
             "x": 0.0008456156297465204,
             "y": 0.002698081098136725,
@@ -501,22 +476,13 @@
         "J2": 0.01629071,
         "rotation_period": 10.656,
         "atmosphere": {
-            "height": 400.0,
-            "rayleighCoefficients": [
-                8e-07,
-                1.2e-06,
-                2.1e-06
-            ],
-            "rayleighScaleHeight": 25.5,
-            "mieCoefficient": 2e-06,
-            "mieScaleHeight": 2.0,
-            "mieAsymmetry": 0.45,
-            "absorptionCoefficients": [
-                1e-06,
-                3e-06,
-                7e-06
-            ],
-            "intensity": 23.0
+            "surface_pressure": 1.0,
+            "temperature": 134.0,
+            "composition": {
+                "H2": 0.963,
+                "He": 0.032
+            },
+            "height": 400.0
         },
         "rings": [
             {
@@ -849,22 +815,14 @@
         "M": 11.7,
         "orbitRef": "equatorial",
         "atmosphere": {
-            "height": 600.0,
-            "rayleighCoefficients": [
-                4.999999987376214e-07,
-                8.999999749903509e-07,
-                1.3999999737279722e-06
-            ],
-            "rayleighScaleHeight": 57.900001525878906,
-            "mieCoefficient": 4.000000059604645e-07,
-            "mieScaleHeight": 31.600000381469727,
-            "mieAsymmetry": 0.9200000166893005,
-            "absorptionCoefficients": [
-                4.0000000467443897e-07,
-                3.000000106112566e-07,
-                2.0000000233721948e-07
-            ],
-            "intensity": 10.5
+            "surface_pressure": 1.45,
+            "temperature": 94.0,
+            "composition": {
+                "N2": 0.942,
+                "CH4": 0.0565,
+                "Ar": 0.0015
+            },
+            "height": 600.0
         },
         "sv": {
             "x": 0.007826718728372225,
@@ -1085,22 +1043,14 @@
             }
         ],
         "atmosphere": {
-            "height": 300,
-            "rayleighCoefficients": [
-                6e-07,
-                1.5e-06,
-                3.5e-06
-            ],
-            "rayleighScaleHeight": 21.3,
-            "mieCoefficient": 1.5e-06,
-            "mieScaleHeight": 2.5,
-            "mieAsymmetry": 0.82,
-            "absorptionCoefficients": [
-                8e-06,
-                2e-06,
-                5e-08
-            ],
-            "intensity": 25.0
+            "surface_pressure": 1.0,
+            "temperature": 76.0,
+            "composition": {
+                "H2": 0.825,
+                "He": 0.152,
+                "CH4": 0.023
+            },
+            "height": 300.0
         },
         "sv": {
             "x": 9.87859766650508,
@@ -1271,22 +1221,14 @@
         "j4": -3.3e-05,
         "rotation_period": 16.11,
         "atmosphere": {
-            "height": 300,
-            "rayleighCoefficients": [
-                5e-07,
-                1.8e-06,
-                5e-06
-            ],
-            "rayleighScaleHeight": 40.0,
-            "mieCoefficient": 2e-06,
-            "mieScaleHeight": 2.5,
-            "mieAsymmetry": 0.82,
-            "absorptionCoefficients": [
-                1.2e-05,
-                3e-06,
-                1e-07
-            ],
-            "intensity": 25.0
+            "surface_pressure": 1.0,
+            "temperature": 72.0,
+            "composition": {
+                "H2": 0.80,
+                "He": 0.19,
+                "CH4": 0.01
+            },
+            "height": 300.0
         },
         "sv": {
             "x": 29.87207937137551,

@@ -37,27 +37,30 @@ void main() {
     vec3 l = texture(u_texture, v_texcoord + vec2(-1.0, -1.0) * texel).rgb;
     vec3 m = texture(u_texture, v_texcoord + vec2( 1.0, -1.0) * texel).rgb;
     
-    vec3 color = e * 0.125;
-    color += (a+c+g+i)*0.03125;
-    color += (b+d+f+h)*0.0625;
-    color += (j+k+l+m)*0.125;
-    
     // Apply threshold (only on first pass, u_threshold > 0.0)
+    // We apply it per-tap rather than post-accumulation to prevent small bright sources
+    // from becoming pixelated/blocky after the 13-tap filter smears them.
+    vec3 color = vec3(0.0);
+    
+    vec3 taps[13] = vec3[](a, b, c, d, e, f, g, h, i, j, k, l, m);
+    
     if (u_threshold > 0.0) {
-        float brightness = max(color.r, max(color.g, color.b));
-        if (brightness < u_threshold) {
-            color = vec3(0.0);
-        } else {
-            // Soft thresholding
-            color *= smoothstep(u_threshold, u_threshold + 0.5, brightness);
-            
-            // Make 10x less sensitive
-            color *= 0.2;
-            
-            // Softly compress extreme brightness so it doesn't spread infinitely
-            color = color / (1.0 + color * 0.05);
+        for (int idx=0; idx<13; idx++) {
+            float brightness = max(taps[idx].r, max(taps[idx].g, taps[idx].b));
+            if (brightness >= u_threshold) {
+                taps[idx] *= smoothstep(u_threshold, u_threshold + 0.5, brightness);
+                taps[idx] *= 0.2;
+                taps[idx] = taps[idx] / (1.0 + taps[idx] * 0.05);
+            } else {
+                taps[idx] = vec3(0.0);
+            }
         }
     }
+    
+    color = taps[4] * 0.125;
+    color += (taps[0]+taps[2]+taps[6]+taps[8])*0.03125;
+    color += (taps[1]+taps[3]+taps[5]+taps[7])*0.0625;
+    color += (taps[9]+taps[10]+taps[11]+taps[12])*0.125;
     
     out_color = vec4(color, 1.0);
 }
