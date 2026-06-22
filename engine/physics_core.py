@@ -1612,7 +1612,7 @@ def load_system_from_data(bodies_data_raw):
         idx = name_to_idx[name]
         mass = body.get('m', 0.0)
         color = hex_to_rgb(body.get('color', '#ffffff'))
-        radius_au = body.get('r', 1.0) * 0.00465
+        radius_au = body.get('r', 1.0) * SOLAR_RADII_TO_AU
 
         obj_type = body.get('type', 'Unknown')
         if obj_type == "Star": min_px = 3.0
@@ -1639,7 +1639,7 @@ def load_system_from_data(bodies_data_raw):
                 r_mean = body.get('r', 1.0)
                 f = body.get('oblateness', 0.0)
                 req_solar = r_mean / ((1.0 - f) ** (1.0 / 3.0)) if f > 0 else r_mean
-                req_au = req_solar * 0.00465
+                req_au = req_solar * SOLAR_RADII_TO_AU
             rot_period = body.get('rotation_period', 0.0)
             oblate_physics_list.append((idx, j2, j4, req_au, pole_ecl, mass, name, rot_period))
 
@@ -1712,7 +1712,7 @@ def load_system_from_data(bodies_data_raw):
             atmo = body['atmosphere']
             r_solar = body.get('r', 1.0)
             planet_radius_km = r_solar * SOLAR_RADIUS_KM
-            radius_au = r_solar * 0.00465
+            radius_au = r_solar * SOLAR_RADII_TO_AU
             atmo_height_km = atmo['height']
             atmo_radius_km = planet_radius_km + atmo_height_km
             atmo_radius_au = atmo_radius_km / AU_TO_KM

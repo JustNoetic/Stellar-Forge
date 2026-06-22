@@ -1,4 +1,5 @@
 import OpenGL
+import OpenGL.GL as gl
 OpenGL.ERROR_CHECKING = False
 import glfw
 import moderngl
@@ -6,6 +7,13 @@ import numpy as np
 import ctypes
 
 import json
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 import math
 import threading
 import time
@@ -214,6 +222,41 @@ class ModernGLGlfwRenderer(GlfwRenderer):
         
     def shutdown(self):
         self.modern_renderer.shutdown()
+
+def get_cached_atmosphere_properties(atmo, mass_sm):
+    mass_kg = mass_sm * 1.98847e30
+    R_km = atmo.get('planet_radius_km', 0.0)
+    
+    if not atmo.get('_dirty', True) and \
+       atmo.get('_cached_mass') == mass_sm and \
+       atmo.get('_cached_radius') == R_km:
+        return atmo['_cached_props'], atmo['_cached_trans'], atmo['_cached_thick']
+
+    g_m_s2 = (6.67430e-11 * mass_kg) / ((R_km * 1000.0) ** 2) if R_km > 0 else 9.81
+    props = compute_atmosphere_properties(
+        atmo.get('surface_pressure', 1.0),
+        atmo.get('temperature', 288.15),
+        atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
+        g_m_s2
+    )
+    
+    beta_r = props['beta_rayleigh']
+    beta_m = atmo.get('beta_mie', 21.0e-6)
+    h_r = props['scale_height_km']
+    h_m = atmo.get('h_mie', 1.2)
+    od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
+    od_m = beta_m * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
+    trans = np.exp(-(od_r + od_m) * 0.1)
+    thick = atmo.get('atmo_radius_au', 0.0) - atmo.get('surface_radius_au', 0.0)
+    
+    atmo['_cached_mass'] = mass_sm
+    atmo['_cached_radius'] = R_km
+    atmo['_cached_props'] = props
+    atmo['_cached_trans'] = trans
+    atmo['_cached_thick'] = thick
+    atmo['_dirty'] = False
+    
+    return props, trans, thick
 
 @njit
 def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled):
@@ -518,10 +561,17 @@ class App:
         dx = xpos - self.camera["last_x"]
         dy = ypos - self.camera["last_y"]
         
+        roll_rad = math.radians(self.camera.get("roll_actual", 0.0))
+        cos_r = math.cos(roll_rad)
+        sin_r = math.sin(roll_rad)
+        
+        dx_eff = dx * cos_r + dy * sin_r
+        dy_eff = -dx * sin_r + dy * cos_r
+        
         if self.camera["left_dragging"]:
             sensitivity = 0.3
-            self.camera["yaw"] += dx * sensitivity
-            self.camera["pitch"] -= dy * sensitivity
+            self.camera["yaw"] += dx_eff * sensitivity
+            self.camera["pitch"] -= dy_eff * sensitivity
             self.camera["pitch"] = max(-89.9, min(89.9, self.camera["pitch"])) 
             
         elif self.camera["right_dragging"]:
@@ -542,7 +592,7 @@ class App:
             up = np.cross(right, front)
             up /= np.linalg.norm(up)
             
-            pan_vec = -right * dx * pan_speed + up * dy * pan_speed
+            pan_vec = -right * dx_eff * pan_speed + up * dy_eff * pan_speed
             if self.camera["tracking_idx"] is not None:
                 self.camera["pan_offset"] += pan_vec
             else:
@@ -1246,13 +1296,7 @@ class App:
             
             mass_kg = mass_sm * 1.98847e30
             radius_km = atmo['planet_radius_km']
-            g_m_s2 = (6.67430e-11 * mass_kg) / ((radius_km * 1000.0) ** 2) if radius_km > 0 else 9.81
-            props = compute_atmosphere_properties(
-                atmo.get('surface_pressure', 1.0),
-                atmo.get('temperature', 288.15),
-                atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                g_m_s2
-            )
+            props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
             
             self.prog_atmo_lut['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
             self.prog_atmo_lut['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
@@ -1325,7 +1369,7 @@ class App:
                 non_star_mask = is_star_arr == 0.0
                 non_star_indices = np.where(non_star_mask)[0][:64]
                 n_casters_fixed = len(non_star_indices)
-                star_radius_au = visual_data[star_idx][3] if star_idx < len(visual_data) else 0.00465
+                star_radius_au = visual_data[star_idx][3] if star_idx < len(visual_data) else SOLAR_RADII_TO_AU
     
                 pos_snap = np.zeros((num_bodies, 3), dtype='f8')
                 vel_snap = np.zeros((num_bodies, 3), dtype='f8')
@@ -1592,7 +1636,7 @@ class App:
                             pos_snap_render = np.vstack([pos_snap_render, pos])
                             vel_snap_render = np.vstack([vel_snap_render, vel])
                             
-                            r_au = radius / 1.496e8
+                            r_au = radius / 149597870.7
                             body_radii = np.append(body_radii, r_au)
                             
                             new_inst = np.zeros(INSTANCE_FLOATS, dtype='f4')
@@ -1695,7 +1739,7 @@ class App:
                                 bodies_data[idx]["m"] = float(op["mass"])
                             if "radius" in op:
                                 bodies_data[idx]["r"] = float(op["radius"] / 696340.0)
-                                r_au = op["radius"] / 1.496e8
+                                r_au = op["radius"] / 149597870.7
                                 body_radii[idx] = r_au
                                 visual_arr[idx][3] = r_au
                                 visual_data[idx][3] = r_au
@@ -1705,7 +1749,7 @@ class App:
                                         a['surface_radius_au'] = r_au
                                         if a['atmo_radius_km'] < a['planet_radius_km']:
                                             a['atmo_radius_km'] = a['planet_radius_km'] * 1.025
-                                            a['atmo_radius_au'] = a['atmo_radius_km'] / 1.496e8
+                                            a['atmo_radius_au'] = a['atmo_radius_km'] / 149597870.7
                                         if 'lut_tex' in a:
                                             a['lut_tex'].release()
                                             del a['lut_tex']
@@ -1995,7 +2039,7 @@ class App:
             if abs(roll_rad) > 1e-6:
                 view = matrix44.multiply(view, matrix44.create_from_z_rotation(roll_rad, dtype='f4'))
                 
-            near = max(self.camera["distance_actual"] * 0.0001, 1e-9)
+            near = max(self.camera["distance_actual"] * 0.00000001, 1e-12)
             
             # Incorporate both primary and comparison system body relative positions and radii
             max_dist_from_target = 0.0
@@ -2339,7 +2383,7 @@ class App:
             
             if num_stars == 0:
                 num_stars = 1
-                stars_pos_radius = [[0.0, 0.0, 0.0, 0.00465]]
+                stars_pos_radius = [[0.0, 0.0, 0.0, SOLAR_RADII_TO_AU]]
                 stars_colors = [[1.0, 1.0, 1.0, 1.0]]
             
             caster_data_buf[:n_casters_fixed, 0:3] = pos_rel_all[caster_indices[:n_casters_fixed]]
@@ -2363,25 +2407,9 @@ class App:
                 b_idx = caster_indices[i_c]
                 atmo = atmo_by_body.get(b_idx)
                 if atmo:
-                    mass_kg = mass_snap[b_idx] * 1.98847e30
-                    radius_km = atmo['planet_radius_km']
-                    g_m_s2 = (6.67430e-11 * mass_kg) / ((radius_km * 1000.0) ** 2) if radius_km > 0 else 9.81
-                    props = compute_atmosphere_properties(
-                        atmo.get('surface_pressure', 1.0),
-                        atmo.get('temperature', 288.15),
-                        atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                        g_m_s2
-                    )
-                    beta_r = props['beta_rayleigh']
-                    beta_m = atmo.get('beta_mie', 21.0e-6)
-                    h_r = props['scale_height_km']
-                    h_m = atmo.get('h_mie', 1.2)
-                    R_km = atmo['planet_radius_km']
-                    od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
-                    od_m = beta_m * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
-                    transmittance = np.exp(-(od_r + od_m) * 0.1)
-                    caster_atmos_buf[i_c, 0:3] = transmittance
-                    caster_atmos_buf[i_c, 3] = atmo['atmo_radius_au'] - atmo['surface_radius_au']
+                    props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
+                    caster_atmos_buf[i_c, 0:3] = trans
+                    caster_atmos_buf[i_c, 3] = thickness
                 else:
                     caster_atmos_buf[i_c] = 0.0
             if n_casters_fixed < 64:
@@ -2618,9 +2646,11 @@ class App:
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.blend_func = (moderngl.ONE, gl.GL_SRC1_COLOR)
                 ctx.depth_func = '<='
                 ctx.enable(moderngl.CULL_FACE)
+                ctx.cull_face = 'front'
+                ctx.disable(moderngl.DEPTH_TEST)
                 ctx.depth_mask = False
     
                 u_atmo_quality_uniform.value = atmo_quality
@@ -2665,20 +2695,12 @@ class App:
                         mass_sm = self.mass_snap_cmp[atmo['body_idx']]
                     else:
                         mass_sm = mass_snap[atmo['body_idx']]
-                    mass_kg = mass_sm * 1.98847e30
-                    radius_km = atmo['planet_radius_km']
-                    g_m_s2 = (6.67430e-11 * mass_kg) / ((radius_km * 1000.0) ** 2) if radius_km > 0 else 9.81
                     
                     if 'lut_tex' not in atmo:
                         build_atmo_lut(atmo, mass_sm)
                     atmo['lut_tex'].use(location=1)
                     
-                    props = compute_atmosphere_properties(
-                        atmo.get('surface_pressure', 1.0),
-                        atmo.get('temperature', 288.15),
-                        atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                        g_m_s2
-                    )
+                    props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
     
                     scaled_intensity = atmo['intensity']
     
@@ -2748,25 +2770,9 @@ class App:
                         atmo_info = lookup.get(c_local_idx)
                         if atmo_info:
                             mass_sm_c = self.mass_snap_cmp[c_local_idx] if is_c_cmp else mass_snap[c_local_idx]
-                            mass_kg_c = mass_sm_c * 1.98847e30
-                            R_km_c = atmo_info['planet_radius_km']
-                            g_m_s2_c = (6.67430e-11 * mass_kg_c) / ((R_km_c * 1000.0) ** 2) if R_km_c > 0 else 9.81
-                            props_c = compute_atmosphere_properties(
-                                atmo_info.get('surface_pressure', 1.0),
-                                atmo_info.get('temperature', 288.15),
-                                atmo_info.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                                g_m_s2_c
-                            )
-                            beta_r_c = props_c['beta_rayleigh']
-                            beta_m_c = atmo_info.get('beta_mie', 21.0e-6)
-                            h_r_c = props_c['scale_height_km']
-                            h_m_c = atmo_info.get('h_mie', 1.2)
-                            od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
-                            od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
-                            transmittance = np.exp(-(od_r_c + od_m_c) * 0.1)
-                            thickness = atmo_info['atmo_radius_au'] - atmo_info['surface_radius_au']
-                            active_atmos_buf[i_ac, 0:3] = transmittance
-                            active_atmos_buf[i_ac, 3] = thickness
+                            _, trans_c, thick_c = get_cached_atmosphere_properties(atmo_info, mass_sm_c)
+                            active_atmos_buf[i_ac, 0:3] = trans_c
+                            active_atmos_buf[i_ac, 3] = thick_c
                             
                     u_atmo_num_active_casters.value = n_active
                     u_atmo_active_casters.write(active_casters_buf.tobytes())
@@ -2778,7 +2784,9 @@ class App:
                     vao_atmo.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
-                ctx.disable(moderngl.CULL_FACE)
+                ctx.enable(moderngl.DEPTH_TEST)
+                ctx.enable(moderngl.CULL_FACE)
+                ctx.cull_face = 'back'
                 ctx.depth_func = '<'
                 ctx.disable(moderngl.BLEND)
 
@@ -2787,6 +2795,7 @@ class App:
     
             # --- Render Rings ---
             if ring_render_groups or (self.comparison_enabled and self.ring_render_groups_cmp):
+                ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                 u_ring_camera_pos.write(cam_pos)
@@ -2813,24 +2822,8 @@ class App:
                         if u_ring_host_atmo is not None:
                             atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
                             if atmo is not None:
-                                mass_kg_c = mass_snap[bi] * 1.98847e30
-                                R_km_c = atmo['planet_radius_km']
-                                g_m_s2_c = (6.67430e-11 * mass_kg_c) / ((R_km_c * 1000.0) ** 2) if R_km_c > 0 else 9.81
-                                props_c = compute_atmosphere_properties(
-                                    atmo.get('surface_pressure', 1.0),
-                                    atmo.get('temperature', 288.15),
-                                    atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                                    g_m_s2_c
-                                )
-                                beta_r_c = props_c['beta_rayleigh']
-                                beta_m_c = atmo.get('beta_mie', 21.0e-6)
-                                h_r_c = props_c['scale_height_km']
-                                h_m_c = atmo.get('h_mie', 1.2)
-                                od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
-                                od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
-                                trans = np.exp(-(od_r_c + od_m_c) * 0.1)
-                                thickness = atmo['atmo_radius_au'] - atmo['surface_radius_au']
-                                u_ring_host_atmo.value = (float(trans[0]), float(trans[1]), float(trans[2]), float(thickness))
+                                _, trans_c, thick_c = get_cached_atmosphere_properties(atmo, mass_snap[bi])
+                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), float(thick_c))
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                         k = ring_idx_by_body.get(bi)
@@ -2872,24 +2865,8 @@ class App:
                         if u_ring_host_atmo is not None:
                             atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
                             if atmo is not None:
-                                mass_kg_c = self.mass_snap_cmp[bi] * 1.98847e30
-                                R_km_c = atmo['planet_radius_km']
-                                g_m_s2_c = (6.67430e-11 * mass_kg_c) / ((R_km_c * 1000.0) ** 2) if R_km_c > 0 else 9.81
-                                props_c = compute_atmosphere_properties(
-                                    atmo.get('surface_pressure', 1.0),
-                                    atmo.get('temperature', 288.15),
-                                    atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                                    g_m_s2_c
-                                )
-                                beta_r_c = props_c['beta_rayleigh']
-                                beta_m_c = atmo.get('beta_mie', 21.0e-6)
-                                h_r_c = props_c['scale_height_km']
-                                h_m_c = atmo.get('h_mie', 1.2)
-                                od_r_c = beta_r_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_r_c)
-                                od_m_c = beta_m_c * 1000.0 * math.sqrt(2.0 * math.pi * R_km_c * h_m_c)
-                                trans = np.exp(-(od_r_c + od_m_c) * 0.1)
-                                thickness = atmo['atmo_radius_au'] - atmo['surface_radius_au']
-                                u_ring_host_atmo.value = (float(trans[0]), float(trans[1]), float(trans[2]), float(thickness))
+                                _, trans_c, thick_c = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
+                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), float(thick_c))
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                         u_ring_caster_mask_lo_uni.value = 0
@@ -3653,7 +3630,7 @@ class App:
                             _, self.camera["edit_data"]["M"] = imgui.input_double("Mean Anomaly (deg)", self.camera["edit_data"]["M"], format="%.3f")
                         else:
                             use_km = oe_a < 0.01
-                            AU_TO_KM = 1.496e8
+                            AU_TO_KM = 149597870.7
                             
                             if use_km:
                                 imgui.text(f"  Semi-major:  {oe_a * AU_TO_KM:,.0f} km")
@@ -3706,7 +3683,7 @@ class App:
                             j2_nodal = 0.0
                             parent_j2 = cur_bodies_data[parent_idx].get('J2', 0.0)
                             if parent_j2 > 0 and oe_P > 0:
-                                parent_r_au = cur_bodies_data[parent_idx].get('r', 0.0) * 0.00465
+                                parent_r_au = cur_bodies_data[parent_idx].get('r', 0.0) * SOLAR_RADII_TO_AU
                                 n_mean = 2.0 * math.pi / (oe_P / 365.25)
                                 if p_param > 0:
                                     ratio2 = (parent_r_au / p_param) ** 2
@@ -3761,7 +3738,7 @@ class App:
                                 self.shared_state["crud_queue"].append(payload)
                                 
                             body_info['r'] = ed["radius"] / 696340.0
-                            visual_arr[insp_idx, 3] = body_info['r'] * 0.00465
+                            visual_arr[insp_idx, 3] = body_info['r'] * SOLAR_RADII_TO_AU
                             
                             self.camera["edit_mode"] = False
                             
@@ -3841,7 +3818,7 @@ class App:
                         
                         imgui.same_line(imgui.get_window_width() - 70)
                         if imgui.button("Export"):
-                            is_hidden_combo = glfw.get_key(window, glfw.KEY_LEFT_BRACKET) == glfw.PRESS and glfw.get_key(window, glfw.KEY_RIGHT_BRACKET) == glfw.PRESS
+                            is_hidden_combo = glfw.get_key(window, glfw.KEY_BACKSLASH) == glfw.PRESS
                             
                             def fmt(val, dec=5): return round(float(val), dec)
                             
@@ -3892,7 +3869,7 @@ class App:
                                                     })
                                                     
                                     with open(system_file, "w") as f:
-                                        json.dump(sys_data, f, indent=2)
+                                        json.dump(sys_data, f, indent=2, cls=NumpyEncoder)
                                     print(f"Secret Combo: Exported entire system cosmetics directly to {system_file}!")
                                 except Exception as e:
                                     print(f"Error updating system.json: {e}")
@@ -3933,7 +3910,7 @@ class App:
                                 os.makedirs("exports", exist_ok=True)
                                 filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
                                 with open(filename, 'w') as f:
-                                    json.dump(exp, f, indent=4)
+                                    json.dump(exp, f, indent=4, cls=NumpyEncoder)
                                 print(f"Exported cosmetics to {filename}")
                             
                         changed_c, new_c = imgui.color_edit3("Base Color", *visual_arr[insp_idx, 0:3])
@@ -3947,7 +3924,8 @@ class App:
                                 changed_r, new_height = imgui.drag_float("Atmosphere Height (km)", current_height, 1.0, 1.0, body_r_km * 10.0)
                                 if changed_r:
                                     atmo_item['atmo_radius_km'] = atmo_item['planet_radius_km'] + new_height
-                                    atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 1.496e8
+                                    atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 149597870.7
+                                    atmo_item['_dirty'] = True
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
@@ -3955,6 +3933,7 @@ class App:
                                 changed_p, new_p = imgui.drag_float("Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
                                 if changed_p: 
                                     atmo_item['surface_pressure'] = new_p
+                                    atmo_item['_dirty'] = True
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
@@ -3962,6 +3941,7 @@ class App:
                                 changed_t, new_t = imgui.drag_float("Temperature (K)", atmo_item.get('temperature', 288.15), 1.0, 0.0, 10000.0)
                                 if changed_t: 
                                     atmo_item['temperature'] = new_t
+                                    atmo_item['_dirty'] = True
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
@@ -3998,6 +3978,7 @@ class App:
                                             
                                     if gas_changed:
                                         atmo_item['composition'] = comp
+                                        atmo_item['_dirty'] = True
                                         if 'lut_tex' in atmo_item:
                                             atmo_item['lut_tex'].release()
                                             del atmo_item['lut_tex']
@@ -4006,9 +3987,11 @@ class App:
                                 changed_m, b_mie = imgui.drag_float("Aerosol Beta (x10^-6)", atmo_item.get('beta_mie', 21.0e-6)*1e6, 0.1)
                                 if changed_m:
                                     atmo_item['beta_mie'] = b_mie * 1e-6
+                                    atmo_item['_dirty'] = True
                                 changed_hm, new_hm = imgui.drag_float("Aerosol Scale (km)", atmo_item.get('h_mie', 1.2), 0.1, 0.1, 1000.0)
                                 if changed_hm:
                                     atmo_item['h_mie'] = new_hm
+                                    atmo_item['_dirty'] = True
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
@@ -4023,9 +4006,9 @@ class App:
                                     atmo_bodies.append({
                                         'body_idx': insp_idx,
                                         'planet_radius_km': body_r_km,
-                                        'surface_radius_au': body_r_km / 1.496e8,
+                                        'surface_radius_au': body_r_km / 149597870.7,
                                         'atmo_radius_km': body_r_km * 1.025,
-                                        'atmo_radius_au': (body_r_km * 1.025) / 1.496e8,
+                                        'atmo_radius_au': (body_r_km * 1.025) / 149597870.7,
                                         'surface_pressure': 1.0,
                                         'temperature': 288.15,
                                         'composition': {"N2": 0.78, "O2": 0.21},
@@ -4041,8 +4024,8 @@ class App:
                             
                             for i, ring_item in enumerate(rings):
                                 if imgui.tree_node(f"Ring Layer {i}"):
-                                    changed_in, new_in = imgui.drag_float(f"Inner Radius (km)##{i}", ring_item['inner_r'] * 1.496e8, 10.0, body_r_km, ring_item['outer_r'] * 1.496e8 - 10)
-                                    changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 1.496e8, 10.0, ring_item['inner_r'] * 1.496e8 + 10, body_r_km * 50.0)
+                                    changed_in, new_in = imgui.drag_float(f"Inner Radius (km)##{i}", ring_item['inner_r'] * 149597870.7, 10.0, body_r_km, ring_item['outer_r'] * 149597870.7 - 10)
+                                    changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
                                     changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
                                     changed_op, new_op = imgui.slider_float(f"Opacity##{i}", ring_item['opacity'], 0.0, 1.0)
                                     changed_scat, new_scat = imgui.slider_float(f"Forward Scatter Mult##{i}", ring_item['scatter'], 0.0, 10.0)
@@ -4087,8 +4070,8 @@ class App:
                                         imgui.tree_pop()
                                     
                                     if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or grad_changed:
-                                        if changed_in: ring_item['inner_r'] = new_in / 1.496e8
-                                        if changed_out: ring_item['outer_r'] = new_out / 1.496e8
+                                        if changed_in: ring_item['inner_r'] = new_in / 149597870.7
+                                        if changed_out: ring_item['outer_r'] = new_out / 149597870.7
                                         if changed_col: ring_item['raw_color'] = new_col
                                         if changed_op: ring_item['opacity'] = new_op
                                         if changed_scat: ring_item['scatter'] = new_scat
@@ -4107,10 +4090,10 @@ class App:
                                     
                             if imgui.button("Add Ring Layer"):
                                 if len(rings) < 16:
-                                    r_in = body_r_km * 1.2 / 1.496e8
+                                    r_in = body_r_km * 1.2 / 149597870.7
                                     if rings:
-                                        r_in = rings[-1]['outer_r'] + (100 / 1.496e8)
-                                    r_out = r_in + (body_r_km * 0.5 / 1.496e8)
+                                        r_in = rings[-1]['outer_r'] + (100 / 149597870.7)
+                                    r_out = r_in + (body_r_km * 0.5 / 149597870.7)
                                     pole_render = visual_arr[insp_idx, 5:8]
                                     color = visual_arr[insp_idx, 0:3]
                                     grad = [{'p': 0.0, 'a': 0.0}, {'p': 0.5, 'a': 1.0}, {'p': 1.0, 'a': 0.0}]
@@ -4190,7 +4173,7 @@ class App:
                         
                         is_moon = ad.get("is_moon", False)
                         real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
-                        real_a = ad["a"] / 1.496e8 if is_moon else ad["a"]
+                        real_a = ad["a"] / 149597870.7 if is_moon else ad["a"]
                         
                         c_pos, c_vel = get_cartesian_from_keplerian(
                             parent_m, real_mass, real_a, ad["e"], 

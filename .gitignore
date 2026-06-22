@@ -91,3 +91,4 @@ perf_test_output.txt
 exports/
 kernels/
 systems/
+main_error.txt

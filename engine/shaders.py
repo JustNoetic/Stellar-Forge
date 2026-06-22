@@ -326,7 +326,7 @@ void main() {
         
         // Find which star this is to get its luminosity and radius
         float star_lum = 1.0;
-        float star_r = 0.00465;
+        float star_r = 0.0046547454; // 1 solar radius in AU (exact: SOLAR_RADIUS_KM / AU_TO_KM)
         for (int s = 0; s < u_num_stars; s++) {
             if (distance(f_world_pos, u_stars_pos_radius[s].xyz) < u_stars_pos_radius[s].w * 1.5) {
                 star_lum = u_stars_colors[s].a;
@@ -393,7 +393,8 @@ void main() {
                 float dist_to_caster = sqrt(dist_sq);
                 if (dist_to_caster < caster_r * 1.02) continue; // Skip self
                 
-                float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
+                vec3 cross_vec = cross(frag_to_caster, L);
+                float perp_sq = dot(cross_vec, cross_vec);
                 
                 // Bounding cone early out using maximum equatorial radius
                 float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
@@ -1217,7 +1218,8 @@ void main() {
             float dist_to_caster = sqrt(dist_sq);
             if (dist_to_caster < caster_r * 1.02) continue;
             
-            float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
+            vec3 cross_vec = cross(frag_to_caster, L);
+            float perp_sq = dot(cross_vec, cross_vec);
             
             // Bounding cone early out using maximum equatorial radius
             float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
@@ -1276,7 +1278,8 @@ void main() {
             if (t_proj > 0.0 && t_proj < dist_to_star) {
                 float dist_sq = dot(frag_to_host, frag_to_host);
                 float dist_to_host = sqrt(dist_sq);
-                float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
+                vec3 cross_vec = cross(frag_to_host, L);
+                float perp_sq = dot(cross_vec, cross_vec);
                 
                 float host_r = u_host_planet_radius;
                 float host_atmo_h = u_host_planet_atmo.w;
@@ -1407,11 +1410,10 @@ out vec3 f_local_pos;
 out float f_clip_z;
 
 void main() {
-    vec3 world_pos = in_position * u_atmo_radius_au + u_body_offset;
+    vec3 world_pos = in_position * (u_atmo_radius_au * 1.03) + u_body_offset;
     f_world_pos = world_pos;
-    f_local_pos = in_position;
+    f_local_pos = in_position * 1.03;
     gl_Position = projection * view * vec4(world_pos, 1.0);
-    gl_Position.z = (log2(max(1e-6, u_depth_C * gl_Position.w + 1.0)) / log2(u_depth_C * u_far + 1.0) * 2.0 - 1.0) * gl_Position.w;
     f_clip_z = gl_Position.w;
 }
 """
@@ -1486,7 +1488,8 @@ uniform sampler2D u_optical_depth_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 
-out vec4 out_color;
+layout(location = 0, index = 0) out vec4 out_color;
+layout(location = 0, index = 1) out vec4 out_transmittance;
 
 // g_local_rings removed to prevent local memory array spilling
 
@@ -1535,7 +1538,8 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         float dist_to_caster = sqrt(dist_sq);
         if (dist_to_caster < caster_r * 1.02) continue;
         
-        float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
+        vec3 cross_vec = cross(s_to_c, L_dir);
+        float perp_sq = dot(cross_vec, cross_vec);
         
         float oblateness = u_active_caster_poles_obl[i].w;
         if (oblateness > 0.0) {
@@ -1798,7 +1802,7 @@ void main() {
         float star_lum = u_stars_colors[s].a;
 
         float dist_to_star_au = length(star_pos - planet_center_render);
-        float sin_star = star_radius / max(dist_to_star_au * u_au_to_km, star_radius + 0.01);
+        float sin_star = star_radius / max(dist_to_star_au, star_radius + 1e-6);
 
         vec3 sun_pos_local = (star_pos - planet_center_render) * u_au_to_km;
         vec3 sun_dir = normalize(sun_pos_local);
@@ -1820,13 +1824,17 @@ void main() {
         vec3 ring_A_prime = vec3(0.0);
         vec3 ring_B = vec3(0.0);
 
+        float s_mid = (s_start + s_end) * 0.5;
+        vec3 mid_pos = frag_local + s_mid * ray_dir;
+        vec3 mid_render = mid_pos / u_au_to_km + planet_center_render;
+        vec3 mid_to_star = star_pos - mid_render;
+        float dist_mid_star = length(mid_to_star);
+        vec3 L_mid = mid_to_star / max(dist_mid_star, 1e-6);
+        float sr_start = star_radius / max(dist_mid_star, 1e-6);
+        vec3 O = frag_local / u_au_to_km + planet_center_render;
+        vec3 V = ray_dir / u_au_to_km;
+
         if (u_atmo_quality > 0) { 
-            float s_mid = (s_start + s_end) * 0.5;
-            vec3 mid_pos = frag_local + s_mid * ray_dir;
-            vec3 mid_render = mid_pos / u_au_to_km + planet_center_render;
-            vec3 mid_to_star = star_pos - mid_render;
-            float dist_mid_star = length(mid_to_star);
-            vec3 L_mid = mid_to_star / max(dist_mid_star, 1e-6);
             if (u_atmo_quality == 1) {
                 global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius);
                 end_eclipse_shadow = global_eclipse_shadow;
@@ -1834,9 +1842,6 @@ void main() {
 
             // High mode interpolation and early-out removed because they miss thin ring shadows.
             if (u_atmo_quality == 2) {
-                vec3 O = frag_local / u_au_to_km + planet_center_render;
-                vec3 V = ray_dir / u_au_to_km;
-                
                 int ring_count = 0;
                 uint processed_mask = 0u;
                 for (int k = 0; k < u_num_ring_planes; k++) {
@@ -1886,66 +1891,44 @@ void main() {
                             float opacity = u_ring_params[ring_idx].z;
                             float base_tau = -log(max(1e-6, 1.0 - opacity));
                             float scaled_tau = base_tau / max(1e-4, abs(denom));
-                            
-                            float eff_outer_km = outer_r_km + R_eff_km;
-                            float eff_inner_km = max(0.0, inner_r_km - R_eff_km);
-                            
-                            float c_out = qc - eff_outer_km * eff_outer_km;
-                            float disc_out = qb * qb - 4.0 * qa * c_out;
-                            
-                            if (disc_out > 0.0 && qa > 1e-8) {
-                                float sqrt_out = sqrt(disc_out);
-                                float s1_o = (-qb - sqrt_out) / (2.0 * qa);
-                                float s2_o = (-qb + sqrt_out) / (2.0 * qa);
                                 
-                                float c_in = qc - eff_inner_km * eff_inner_km;
-                                float disc_in = qb * qb - 4.0 * qa * c_in;
-                                float s1_i = 1e9;
-                                float s2_i = -1e9;
-                                if (disc_in > 0.0) {
-                                    float sqrt_in = sqrt(disc_in);
-                                    s1_i = (-qb - sqrt_in) / (2.0 * qa);
-                                    s2_i = (-qb + sqrt_in) / (2.0 * qa);
-                                }
-                                
-                                if (abs(rb_km) < 1e-8) {
-                                    if (ra_km <= 0.0) { s1_o = 1e9; s2_o = -1e9; }
+                            float ring_s_valid_min = -1e9;
+                            float ring_s_valid_max = 1e9;
+                            if (abs(rb_km) < 1e-8) {
+                                if (ra_km <= 0.0) { ring_s_valid_min = 1e9; ring_s_valid_max = -1e9; }
+                            } else {
+                                float s_cross = -ra_km / rb_km;
+                                if (rb_km < 0.0) {
+                                    ring_s_valid_max = s_cross;
                                 } else {
-                                    float s_cross = -ra_km / rb_km;
-                                    if (rb_km < 0.0) {
-                                        s2_o = min(s2_o, s_cross);
-                                        s2_i = min(s2_i, s_cross);
-                                    } else {
-                                        s1_o = max(s1_o, s_cross);
-                                        s1_i = max(s1_i, s_cross);
-                                    }
+                                    ring_s_valid_min = s_cross;
                                 }
-                                
-                                if (s1_o > s2_o) continue;
-                                
+                            }
+                            if (ring_s_valid_min > ring_s_valid_max) continue;
+                            
                                 if (ring_count == 0) { 
-                                    ring_s1_out.x = s1_o; ring_s2_out.x = s2_o; ring_s1_in.x = s1_i; ring_s2_in.x = s2_i;
+                                    ring_s1_out.x = ring_s_valid_min; ring_s2_out.x = ring_s_valid_max;
                                     ring_inner.x = inner_r_km; ring_outer.x = outer_r_km; ring_opac.x = scaled_tau; ring_v_coord.x = (float(ring_idx) + 0.5) / 16.0;
                                     ring_A_prime = A_prime_km; ring_B = B_km; ring_R_eff.x = R_eff_km;
                                 }
                                 else if (ring_count == 1) { 
-                                    ring_s1_out.y = s1_o; ring_s2_out.y = s2_o; ring_s1_in.y = s1_i; ring_s2_in.y = s2_i; 
+                                    ring_s1_out.y = ring_s_valid_min; ring_s2_out.y = ring_s_valid_max;
                                     ring_inner.y = inner_r_km; ring_outer.y = outer_r_km; ring_opac.y = scaled_tau; ring_v_coord.y = (float(ring_idx) + 0.5) / 16.0;
                                     ring_R_eff.y = R_eff_km;
                                 }
                                 else if (ring_count == 2) { 
-                                    ring_s1_out.z = s1_o; ring_s2_out.z = s2_o; ring_s1_in.z = s1_i; ring_s2_in.z = s2_i;
+                                    ring_s1_out.z = ring_s_valid_min; ring_s2_out.z = ring_s_valid_max;
                                     ring_inner.z = inner_r_km; ring_outer.z = outer_r_km; ring_opac.z = scaled_tau; ring_v_coord.z = (float(ring_idx) + 0.5) / 16.0;
                                     ring_R_eff.z = R_eff_km;
                                 }
                                 else if (ring_count == 3) { 
-                                    ring_s1_out.w = s1_o; ring_s2_out.w = s2_o; ring_s1_in.w = s1_i; ring_s2_in.w = s2_i;
+                                    ring_s1_out.w = ring_s_valid_min; ring_s2_out.w = ring_s_valid_max;
                                     ring_inner.w = inner_r_km; ring_outer.w = outer_r_km; ring_opac.w = scaled_tau; ring_v_coord.w = (float(ring_idx) + 0.5) / 16.0;
                                     ring_R_eff.w = R_eff_km;
                                 }
                                 
                                 ring_count++;
-                            }
+                            
                         }
                     }
                 }
@@ -1974,7 +1957,8 @@ void main() {
                         float dist_sq = dot(s2c, s2c);
                         if (dist_sq > rad * rad * 1.0404) {
                             float dist = sqrt(dist_sq);
-                            float p2 = max(0.0, dist_sq - t * t);
+                            vec3 cross_vec = cross(s2c, L_start);
+                            float p2 = dot(cross_vec, cross_vec);
                             float r = rad;
                             if (obl > 0.0) r = get_oblate_radius(r, obl, pole, L_start, s2c - t * L_start);
                             float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
@@ -2013,7 +1997,8 @@ void main() {
                         float dist_sq = dot(s2c, s2c);
                         if (dist_sq > rad * rad * 1.0404) {
                             float dist = sqrt(dist_sq);
-                            float p2 = max(0.0, dist_sq - t * t);
+                            vec3 cross_vec = cross(s2c, L_end);
+                            float p2 = dot(cross_vec, cross_vec);
                             float r = rad;
                             if (obl > 0.0) r = get_oblate_radius(r, obl, pole, L_end, s2c - t * L_end);
                             float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
@@ -2118,7 +2103,7 @@ void main() {
                 
                 float d = length(ring_A_prime + current_s * ring_B);
                 vec4 s_vec = vec4(current_s);
-                vec4 mask = step(ring_s1_out, s_vec) * step(s_vec, ring_s2_out) * (vec4(1.0) - step(ring_s1_in, s_vec) * step(s_vec, ring_s2_in));
+                vec4 mask = step(ring_s1_out, s_vec) * step(s_vec, ring_s2_out);
                 
                 if (any(greaterThan(mask, vec4(0.0)))) {
                     vec4 o_min = max(ring_inner, vec4(d) - ring_R_eff);
@@ -2150,7 +2135,7 @@ void main() {
             }
 
             vec3 direct_attenuation = exp(-tau);
-            vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.2) - direct_attenuation) * 0.4);
+            vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.4) - direct_attenuation) * 1.5);
             
             vec3 atten_direct = direct_attenuation * sample_shadow * vis_fraction;
             vec3 atten_ms = ms_attenuation * sample_shadow * vis_fraction;
@@ -2190,8 +2175,8 @@ void main() {
         scattered *= u_exposure;
     }
 
-    float avg_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;
-    out_color = vec4(scattered, (1.0 - avg_transmittance));
+    out_color = vec4(scattered, 1.0);
+    out_transmittance = vec4(transmittance, 1.0);
 }
 """
 

@@ -27,6 +27,8 @@ GAS_PROPERTIES = {
     "O3":  (1.000271, 1.096, 0.04800, np.array([0.5e-25, 3.0e-25, 0.2e-25])), # Ozone strongly absorbs green/red (Chappuis band)
 }
 
+_atmo_cache = {}
+
 def compute_atmosphere_properties(pressure_atm, temperature_k, composition, gravity_m_s2):
     """
     Computes scattering and absorption coefficients based on physical properties.
@@ -42,6 +44,13 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     """
     if not composition:
         composition = {"N2": 1.0}
+        
+    comp_tuple = tuple(sorted(composition.items()))
+    cache_key = (pressure_atm, temperature_k, comp_tuple, gravity_m_s2)
+    
+    if cache_key in _atmo_cache:
+        return _atmo_cache[cache_key]
+
         
     total_fraction = sum(composition.values())
     if total_fraction <= 0:
@@ -93,9 +102,12 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
         
     scale_height_km = scale_height_m / 1000.0
     
-    return {
+    res = {
         "beta_rayleigh": beta_rayleigh.astype(np.float32),
         "beta_absorption": beta_absorption.astype(np.float32),
         "scale_height_km": float(scale_height_km),
         "molar_mass": float(avg_molar_mass)
     }
+    
+    _atmo_cache[cache_key] = res
+    return res
