@@ -1488,8 +1488,7 @@ uniform sampler2D u_optical_depth_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 
-layout(location = 0, index = 0) out vec4 out_color;
-layout(location = 0, index = 1) out vec4 out_transmittance;
+out vec4 out_color;
 
 // g_local_rings removed to prevent local memory array spilling
 
@@ -2135,7 +2134,7 @@ void main() {
             }
 
             vec3 direct_attenuation = exp(-tau);
-            vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.4) - direct_attenuation) * 1.5);
+            vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.2) - direct_attenuation) * 0.4);
             
             vec3 atten_direct = direct_attenuation * sample_shadow * vis_fraction;
             vec3 atten_ms = ms_attenuation * sample_shadow * vis_fraction;
@@ -2175,8 +2174,8 @@ void main() {
         scattered *= u_exposure;
     }
 
-    out_color = vec4(scattered, 1.0);
-    out_transmittance = vec4(transmittance, 1.0);
+    float avg_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;
+    out_color = vec4(scattered, (1.0 - avg_transmittance));
 }
 """
 

@@ -11,6 +11,8 @@ import os
 import math
 import datetime
 
+from star_calc import StarCalculator
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Stellar Evolution — derive star properties from mass, metallicity, age
@@ -226,45 +228,6 @@ def rgb_to_hex(r, g, b):
 #  System Data Helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def create_star_body(star_name, mass, metallicity, age):
-    """Create a bodies_data entry for a new star.
-
-    Derives all physical properties from mass, metallicity, and age,
-    then formats them into the system.json body schema.
-
-    Args:
-        star_name: display name for the star (e.g., "Alpha")
-        mass: mass in solar masses
-        metallicity: [Fe/H] in dex
-        age: age in Gyr
-
-    Returns:
-        dict in the same format as entries in system.json
-    """
-    props = derive_star_properties(mass, metallicity, age)
-    r, g, b = temperature_to_rgb(props["temperature"])
-    color_hex = rgb_to_hex(r, g, b)
-
-    return {
-        "name": star_name,
-        "type": "Star",
-        "m": mass,
-        "r": props["radius"],
-        "color": color_hex,
-        "is_root": True,
-        "pole_ra": 270.0,
-        "pole_dec": 66.5607089,
-        "star_props": {
-            "lum": props["luminosity"],
-            "temp": props["temperature"],
-            "age": age,
-            "metallicity": metallicity,
-            "prog": props["progress"],
-            "class": props["spectral_class"],
-            "stage": props["stage"],
-        },
-        "sv": {"x": 0, "y": 0, "z": 0, "vx": 0, "vy": 0, "vz": 0},
-    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -425,28 +388,86 @@ class SystemManager:
 
     # ── Creation ─────────────────────────────────────────────────────
 
-    def create_new_system(self, system_name, star_name, mass, metallicity, age):
-        """Create a brand-new star system with a single star.
-
-        Generates the star body from mass/metallicity/age, writes files to
-        disk, and returns the bodies_data list.
-
+    def create_new_system_from_props(self, system_name, star_name, star_props):
+        """Create a brand-new star system with a single star using detailed props.
+        
         Args:
             system_name: display name for the system
             star_name: name of the central star
-            mass: stellar mass in solar masses
-            metallicity: [Fe/H] in dex
-            age: stellar age in Gyr
-
+            star_props: dictionary of stellar physics parameters
+            
         Returns:
             list containing one star body dict
         """
-        star = create_star_body(star_name, mass, metallicity, age)
+        mode = star_props.get("mode", "evolution")
+        
+        if mode == "evolution":
+            mass = star_props.get("mass", 1.0)
+            metallicity = star_props.get("metallicity", 0.0)
+            age = star_props.get("age", 4.6)
+            lum_mult = max(0.5, min(2.0, 1.0 - 0.2 * metallicity))
+            base_l_for_life = StarCalculator.ms_lum_from_mass(mass) * lum_mult
+            lifespan_gyr = 10 * (mass / max(1e-10, base_l_for_life))
+            age_pct = age / lifespan_gyr if lifespan_gyr > 0 else 0.46
+            
+            res = StarCalculator.forge(
+                mode="evolution",
+                evo_path=star_props.get("evo_path", "standard"),
+                mass=mass,
+                metallicity=metallicity,
+                rot_frac=star_props.get("rot_frac", 0.0),
+                inclination=star_props.get("inclination", 0.0),
+                age_pct=age_pct
+            )
+        else:
+            res = StarCalculator.forge(
+                mode="surface",
+                mass=1.0,
+                metallicity=0.0,
+                rot_frac=star_props.get("rot_frac", 0.0),
+                inclination=star_props.get("inclination", 0.0),
+                radius=star_props.get("radius") if star_props.get("locked_rad") else None,
+                temp=star_props.get("temp") if star_props.get("locked_temp") else None,
+                lum=star_props.get("lum") if star_props.get("locked_lum") else None
+            )
+            
+        color_hex = res["visual"]["colorHex"]
+        
+        star = {
+            "name": star_name,
+            "type": "Star",
+            "m": res["physical"]["mass_msun"],
+            "r": res["physical"]["radius_rsun"],
+            "color": color_hex,
+            "is_root": True,
+            "pole_ra": 270.0,
+            "pole_dec": 66.5607089,
+            "star_props": {
+                "mode": mode,
+                "evo_path": star_props.get("evo_path", "standard"),
+                "mass": star_props.get("mass", 1.0) if mode == "evolution" else res["physical"]["mass_msun"],
+                "metallicity": star_props.get("metallicity", 0.0),
+                "rot_frac": star_props.get("rot_frac", 0.0),
+                "inclination": star_props.get("inclination", 0.0),
+                "age_pct": age_pct if mode == "evolution" else res["evolution"]["age_pct"] / 100.0,
+                "age": star_props.get("age", 4.6),
+                
+                "radius": res["physical"]["radius_rsun"],
+                "temp": res["physical"]["temp_k"],
+                "lum": res["physical"]["lum_lsun"],
+                "locked_rad": star_props.get("locked_rad", True),
+                "locked_temp": star_props.get("locked_temp", True),
+                "locked_lum": star_props.get("locked_lum", False),
+                
+                "class": res["classification"]["fullDesignation"],
+                "stage": res["evolution"]["phase"]
+            },
+            "sv": {"x": 0, "y": 0, "z": 0, "vx": 0, "vy": 0, "vz": 0},
+        }
+        
         bodies_data = [star]
-
         self.save_system_data(system_name, bodies_data)
         self.save_meta(system_name, bodies_data)
-
         return bodies_data
 
     # ── Deletion ─────────────────────────────────────────────────────

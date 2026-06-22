@@ -1,5 +1,4 @@
 import OpenGL
-import OpenGL.GL as gl
 OpenGL.ERROR_CHECKING = False
 import glfw
 import moderngl
@@ -1760,6 +1759,8 @@ class App:
                                 visual_colors_f8[idx] = np.array(c, dtype='f8')
                                 body_colors[idx] = np.array(c, dtype='f4')
                                 visual_data[idx][0:3] = c
+                            if "star_props" in op:
+                                bodies_data[idx]["star_props"] = op["star_props"]
                             if "pos" in op:
                                 pidx = parent_snap[idx]
                                 if pidx >= 0 and pidx != idx:
@@ -2039,7 +2040,7 @@ class App:
             if abs(roll_rad) > 1e-6:
                 view = matrix44.multiply(view, matrix44.create_from_z_rotation(roll_rad, dtype='f4'))
                 
-            near = max(self.camera["distance_actual"] * 0.00000001, 1e-12)
+            near = max(self.camera["distance_actual"] * 0.0000001, 1e-10)
             
             # Incorporate both primary and comparison system body relative positions and radii
             max_dist_from_target = 0.0
@@ -2646,7 +2647,7 @@ class App:
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, gl.GL_SRC1_COLOR)
+                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                 ctx.depth_func = '<='
                 ctx.enable(moderngl.CULL_FACE)
                 ctx.cull_face = 'front'
@@ -3453,12 +3454,22 @@ class App:
                             changed, self.camera["edit_mode"] = imgui.checkbox("Edit Mode", self.camera["edit_mode"])
                             if changed and self.camera["edit_mode"]:
                                 self.time_ctrl["multiplier"] = 0.0
+                                sp = body_info.get("star_props", {})
                                 self.camera["edit_data"] = {
                                     "mass": float(mass_snap[insp_idx]),
                                     "radius": float(body_info.get('r', 0.0) * 696340.0),
                                     "type": body_info.get("type", "Moon"),
                                     "a": 0.0, "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
-                                    "init_orbit": True
+                                    "init_orbit": True,
+                                    "star_mode": sp.get("mode", "evolution"),
+                                    "metallicity": sp.get("metallicity", 0.0),
+                                    "age": sp.get("age", 4.6),
+                                    "s_rad": sp.get("radius", float(body_info.get('r', 1.0))),
+                                    "s_temp": sp.get("temp", 5778.0),
+                                    "s_lum": sp.get("lum", 1.0),
+                                    "locked_rad": sp.get("locked_rad", True),
+                                    "locked_temp": sp.get("locked_temp", True),
+                                    "locked_lum": sp.get("locked_lum", False)
                                 }
                     
                     imgui.separator()
@@ -3468,10 +3479,81 @@ class App:
                     body_r_km = body_info.get('r', 0.0) * 696340.0
                     
                     if not insp_is_cmp and self.camera["edit_mode"] and not inspect_bary:
-                        _, self.camera["edit_data"]["mass"] = imgui.input_double(u"Mass (M\u2609)", self.camera["edit_data"]["mass"], format="%e")
-                        _, self.camera["edit_data"]["radius"] = imgui.input_double("Radius (km)", self.camera["edit_data"]["radius"], format="%.1f")
-                        edit_mass = self.camera["edit_data"]["mass"]
-                        edit_r_km = self.camera["edit_data"]["radius"]
+                        ed = self.camera["edit_data"]
+                        types_list = ["Star", "Terrestrial", "Gas Giant", "Ice Giant", "Dwarf Planet", "Moon"]
+                        if "type" not in ed: ed["type"] = body_info.get("type", "Moon")
+                        type_idx = types_list.index(ed["type"]) if ed["type"] in types_list else 1
+                        changed_t, type_idx = imgui.combo("Type", type_idx, types_list)
+                        if changed_t: ed["type"] = types_list[type_idx]
+                        
+                        if ed["type"] == "Star":
+                            changed_m, mode_idx = imgui.combo("Star Mode", 0 if ed.get("star_mode", "evolution")=="evolution" else 1, ["Evolution Track", "Surface Physics"])
+                            if changed_m: ed["star_mode"] = ["evolution", "surface"][mode_idx]
+                            
+                            if ed["star_mode"] == "evolution":
+                                _, ed["mass"] = imgui.slider_float(u"Mass (M\u2609)", ed["mass"], 0.01, 150.0, format="%.4f", power=3.0)
+                                _, ed["metallicity"] = imgui.slider_float("[Fe/H] (dex)", ed.get("metallicity", 0.0), -4.0, 1.0, format="%.3f")
+                                _, ed["age"] = imgui.slider_float("Age (Gyr)", ed.get("age", 4.6), 0.0, 15.0, format="%.3f")
+                                
+                                try:
+                                    from star_calc import StarCalculator
+                                    lum_mult = max(0.5, min(2.0, 1.0 - 0.2 * ed["metallicity"]))
+                                    base_l_for_life = StarCalculator.ms_lum_from_mass(ed["mass"]) * lum_mult
+                                    lifespan_gyr = 10 * (ed["mass"] / max(1e-10, base_l_for_life))
+                                    age_pct = ed["age"] / lifespan_gyr if lifespan_gyr > 0 else 0.46
+                                    preview = StarCalculator.forge(mode="evolution", mass=ed["mass"], metallicity=ed["metallicity"], age_pct=age_pct)
+                                    ed["radius"] = preview["physical"]["radius_rsun"] * 696340.0
+                                    ed["_preview"] = preview
+                                except Exception as e:
+                                    import traceback
+                                    traceback.print_exc()
+                                    ed["_preview"] = None
+                            else:
+                                if "locked_rad" not in ed: ed["locked_rad"] = True
+                                if "locked_temp" not in ed: ed["locked_temp"] = True
+                                if "locked_lum" not in ed: ed["locked_lum"] = False
+                                num_locked = ed["locked_rad"] + ed["locked_temp"] + ed["locked_lum"]
+                                
+                                c1, ed["locked_rad"] = imgui.checkbox("##lr", ed["locked_rad"]); imgui.same_line(); _, ed["s_rad"] = imgui.slider_float(u"Radius (R\u2609)", ed.get("s_rad", 1.0), 0.01, 2000.0, format="%.4f", power=3.0)
+                                c2, ed["locked_temp"] = imgui.checkbox("##lt", ed["locked_temp"]); imgui.same_line(); _, ed["s_temp"] = imgui.slider_float("Temp (K)", ed.get("s_temp", 5778.0), 1000.0, 50000.0, format="%.0f", power=2.0)
+                                c3, ed["locked_lum"] = imgui.checkbox("##ll", ed["locked_lum"]); imgui.same_line(); _, ed["s_lum"] = imgui.slider_float(u"Luminosity (L\u2609)", ed.get("s_lum", 1.0), 0.0001, 1000000.0, format="%.4f", power=5.0)
+                                
+                                if c1 and ed["locked_rad"] and num_locked == 2:
+                                    if ed["locked_temp"] and not c2: ed["locked_temp"] = False
+                                    elif ed["locked_lum"] and not c3: ed["locked_lum"] = False
+                                elif c2 and ed["locked_temp"] and num_locked == 2:
+                                    if ed["locked_rad"] and not c1: ed["locked_rad"] = False
+                                    elif ed["locked_lum"] and not c3: ed["locked_lum"] = False
+                                elif c3 and ed["locked_lum"] and num_locked == 2:
+                                    if ed["locked_rad"] and not c1: ed["locked_rad"] = False
+                                    elif ed["locked_temp"] and not c2: ed["locked_temp"] = False
+                                    
+                                if ed["locked_rad"] + ed["locked_temp"] + ed["locked_lum"] != 2:
+                                    imgui.text_colored("Must lock exactly 2 properties!", 1.0, 0.3, 0.3)
+                                    ed["_preview"] = None
+                                else:
+                                    try:
+                                        from star_calc import StarCalculator
+                                        preview = StarCalculator.forge(mode="surface", mass=1.0, metallicity=0.0,
+                                            radius=ed["s_rad"] if ed["locked_rad"] else None,
+                                            temp=ed["s_temp"] if ed["locked_temp"] else None,
+                                            lum=ed["s_lum"] if ed["locked_lum"] else None)
+                                        ed["radius"] = preview["physical"]["radius_rsun"] * 696340.0
+                                        ed["mass"] = preview["physical"]["mass_msun"]
+                                        ed["_preview"] = preview
+                                    except Exception as e:
+                                        import traceback
+                                        traceback.print_exc()
+                                        ed["_preview"] = None
+                            
+                            edit_mass = ed["mass"]
+                            edit_r_km = ed["radius"]
+                        else:
+                            _, ed["mass"] = imgui.input_double(u"Mass (M\u2609)", ed["mass"], format="%e")
+                            _, ed["radius"] = imgui.input_double("Radius (km)", ed["radius"], format="%.1f")
+                            edit_mass = ed["mass"]
+                            edit_r_km = ed["radius"]
+                            
                         if edit_r_km > 0.0:
                             g_m_s2 = (1.32712440018e14 * edit_mass) / (edit_r_km ** 2)
                             g_earth = g_m_s2 / 9.80665
@@ -3479,14 +3561,6 @@ class App:
                                 imgui.text("  Surface G: {:.3f} m/s² ({:.3f} g)".format(g_m_s2, g_earth))
                             else:
                                 imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
-                        
-                        types_list = ["Star", "Terrestrial", "Gas Giant", "Ice Giant", "Dwarf Planet", "Moon"]
-                        if "type" not in self.camera["edit_data"]:
-                            self.camera["edit_data"]["type"] = body_info.get("type", "Moon")
-                        type_idx = types_list.index(self.camera["edit_data"]["type"]) if self.camera["edit_data"]["type"] in types_list else 1
-                        changed_t, type_idx = imgui.combo("Type", type_idx, types_list)
-                        if changed_t:
-                            self.camera["edit_data"]["type"] = types_list[type_idx]
                     elif inspect_bary:
                         bary_mass = cur_subsys_mass_buf[insp_idx]
                         if bary_mass > 1e-4:
@@ -3541,7 +3615,15 @@ class App:
                             imgui.text(f"  Altitude: 0 km (Surface)")
                     
                     if not inspect_bary and 'star_props' in body_info:
-                        lum = body_info['star_props'].get('lum', 1.0)
+                        sp = body_info['star_props']
+                        imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
+                        imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
+                        imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
+                        if sp.get('mode') == 'evolution':
+                            imgui.text(f"  Metallicity: {sp.get('metallicity', 0.0):.3f}")
+                            imgui.text(f"  Age:         {sp.get('age', 0.0):.3f} Gyr")
+                            
+                        lum = sp.get('lum', 1.0)
                         abs_mag = 4.83 - 2.5 * math.log10(max(lum, 1e-10))
                         dist_au = dist_to_center_km / 149597870.7
                         dist_pc = dist_au / 206265.0
@@ -3706,6 +3788,24 @@ class App:
                                 "radius": ed["radius"],
                                 "type": ed["type"]
                             }
+                            if ed["type"] == "Star" and ed.get("_preview"):
+                                pr = ed["_preview"]
+                                hx = pr["visual"]["colorHex"].lstrip('#')
+                                payload["color"] = [int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0]
+                                payload["star_props"] = {
+                                    "mode": ed.get("star_mode", "evolution"),
+                                    "mass": ed["mass"] if ed.get("star_mode") == "evolution" else pr["physical"]["mass_msun"],
+                                    "metallicity": ed.get("metallicity", 0.0),
+                                    "age": ed.get("age", 4.6),
+                                    "radius": pr["physical"]["radius_rsun"],
+                                    "temp": pr["physical"]["temp_k"],
+                                    "lum": pr["physical"]["lum_lsun"],
+                                    "locked_rad": ed.get("locked_rad", True),
+                                    "locked_temp": ed.get("locked_temp", True),
+                                    "locked_lum": ed.get("locked_lum", False),
+                                    "class": pr["classification"]["fullDesignation"],
+                                    "stage": pr["evolution"]["phase"]
+                                }
                             if parent_idx >= 0:
                                 p_pos = pos_snap_render[parent_idx]
                                 p_vel = vel_snap_render[parent_idx]
@@ -4223,59 +4323,134 @@ class App:
                     imgui.text_colored("Star Properties", 1.0, 0.85, 0.4)
                     _, cd["star_name"] = imgui.input_text("Star Name", cd["star_name"], 256)
                     
-                    imgui.spacing()
-                    imgui.text_colored("The Big Three", 0.4, 1.0, 0.7)
-                    _, cd["mass"] = imgui.input_double(u"Mass (M\u2609)", cd["mass"], format="%.4f")
-                    _, cd["metallicity"] = imgui.input_double("[Fe/H] (dex)", cd["metallicity"], format="%.3f")
-                    _, cd["age"] = imgui.input_double("Age (Gyr)", cd["age"], format="%.3f")
+                    if "star_mode" not in cd: cd["star_mode"] = "Evolution Track"
                     
+                    imgui.spacing()
+                    changed_m, mode_idx = imgui.combo("Creation Mode", 0 if cd["star_mode"]=="Evolution Track" else 1, ["Evolution Track", "Surface Physics"])
+                    if changed_m: cd["star_mode"] = ["Evolution Track", "Surface Physics"][mode_idx]
+                    
+                    if cd["star_mode"] == "Evolution Track":
+                        imgui.spacing()
+                        imgui.text_colored("Evolution Parameters", 0.4, 1.0, 0.7)
+                        _, cd["mass"] = imgui.slider_float(u"Mass (M\u2609)", cd["mass"], 0.01, 150.0, format="%.4f", power=3.0)
+                        _, cd["metallicity"] = imgui.slider_float("[Fe/H] (dex)", cd["metallicity"], -4.0, 1.0, format="%.3f")
+                        _, cd["age"] = imgui.slider_float("Age (Gyr)", cd["age"], 0.0, 15.0, format="%.3f")
+                        
+                        try:
+                            from star_calc import StarCalculator
+                            lum_mult = max(0.5, min(2.0, 1.0 - 0.2 * cd["metallicity"]))
+                            base_l_for_life = StarCalculator.ms_lum_from_mass(cd["mass"]) * lum_mult
+                            lifespan_gyr = 10 * (cd["mass"] / max(1e-10, base_l_for_life))
+                            age_pct = cd["age"] / lifespan_gyr if lifespan_gyr > 0 else 0.46
+                            
+                            preview = StarCalculator.forge(mode="evolution", mass=cd["mass"], metallicity=cd["metallicity"], age_pct=age_pct)
+                            hx = preview["visual"]["colorHex"].lstrip('#')
+                            pr, pg, pb = int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                            preview = None
+                            pr, pg, pb = 1,1,1
+                    else:
+                        imgui.spacing()
+                        imgui.text_colored("Surface Constraints (Lock 2)", 0.4, 1.0, 0.7)
+                        if "locked_rad" not in cd: cd["locked_rad"] = True
+                        if "locked_temp" not in cd: cd["locked_temp"] = True
+                        if "locked_lum" not in cd: cd["locked_lum"] = False
+                        if "radius" not in cd: cd["radius"] = 1.0
+                        if "temp" not in cd: cd["temp"] = 5778.0
+                        if "lum" not in cd: cd["lum"] = 1.0
+                        
+                        num_locked = cd["locked_rad"] + cd["locked_temp"] + cd["locked_lum"]
+                        
+                        c1, cd["locked_rad"] = imgui.checkbox("##lr", cd["locked_rad"]); imgui.same_line(); _, cd["radius"] = imgui.slider_float(u"Radius (R\u2609)", cd["radius"], 0.01, 2000.0, format="%.4f", power=3.0)
+                        c2, cd["locked_temp"] = imgui.checkbox("##lt", cd["locked_temp"]); imgui.same_line(); _, cd["temp"] = imgui.slider_float("Temp (K)", cd["temp"], 1000.0, 50000.0, format="%.0f", power=2.0)
+                        c3, cd["locked_lum"] = imgui.checkbox("##ll", cd["locked_lum"]); imgui.same_line(); _, cd["lum"] = imgui.slider_float(u"Luminosity (L\u2609)", cd["lum"], 0.0001, 1000000.0, format="%.4f", power=5.0)
+                        
+                        if c1 and cd["locked_rad"] and num_locked == 2:
+                            if cd["locked_temp"] and not c2: cd["locked_temp"] = False
+                            elif cd["locked_lum"] and not c3: cd["locked_lum"] = False
+                        elif c2 and cd["locked_temp"] and num_locked == 2:
+                            if cd["locked_rad"] and not c1: cd["locked_rad"] = False
+                            elif cd["locked_lum"] and not c3: cd["locked_lum"] = False
+                        elif c3 and cd["locked_lum"] and num_locked == 2:
+                            if cd["locked_rad"] and not c1: cd["locked_rad"] = False
+                            elif cd["locked_temp"] and not c2: cd["locked_temp"] = False
+                        
+                        if cd["locked_rad"] + cd["locked_temp"] + cd["locked_lum"] != 2:
+                            imgui.text_colored("Must lock exactly 2 properties!", 1.0, 0.3, 0.3)
+                            preview = None
+                            pr, pg, pb = 1, 1, 1
+                        else:
+                            try:
+                                from star_calc import StarCalculator
+                                preview = StarCalculator.forge(mode="surface", mass=1.0, metallicity=0.0,
+                                    radius=cd["radius"] if cd["locked_rad"] else None,
+                                    temp=cd["temp"] if cd["locked_temp"] else None,
+                                    lum=cd["lum"] if cd["locked_lum"] else None)
+                                hx = preview["visual"]["colorHex"].lstrip('#')
+                                pr, pg, pb = int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0
+                            except Exception as e:
+                                import traceback
+                                traceback.print_exc()
+                                preview = None
+                                pr, pg, pb = 1,1,1
+
                     # Live preview of derived properties
                     imgui.separator()
                     imgui.text_colored("Derived Properties (Preview)", 0.7, 0.7, 0.7)
-                    preview = derive_star_properties(cd["mass"], cd["metallicity"], cd["age"])
-                    pr, pg, pb = temperature_to_rgb(preview["temperature"])
-                    
-                    imgui.text(f"  Temperature:    {preview['temperature']:,.0f} K")
-                    imgui.text(f"  Luminosity:     {preview['luminosity']:.4f} L\u2609")
-                    imgui.text(f"  Radius:         {preview['radius']:.4f} R\u2609")
-                    imgui.text(f"  Spectral Class: {preview['spectral_class']}")
-                    imgui.text(f"  Stage:          {preview['stage']}")
-                    imgui.text(f"  MS Lifetime:    {preview['ms_lifetime']:.2f} Gyr")
-                    imgui.text(f"  MS Progress:    {preview['progress']:.1f}%")
-                    
-                    # Color preview
-                    imgui.spacing()
-                    imgui.text("Star Color:")
-                    imgui.same_line()
-                    imgui.color_button("##star_color_preview", pr, pg, pb, 1.0, 0, 20, 20)
+                    if preview:
+                        imgui.text(f"  Temperature:    {preview['physical']['temp_k']:,.0f} K")
+                        imgui.text(f"  Luminosity:     {preview['physical']['lum_lsun']:.4f} L\u2609")
+                        imgui.text(f"  Radius:         {preview['physical']['radius_rsun']:.4f} R\u2609")
+                        imgui.text(f"  Mass:           {preview['physical']['mass_msun']:.4f} M\u2609")
+                        imgui.text(f"  Spectral Class: {preview['classification']['fullDesignation']}")
+                        imgui.text(f"  Stage:          {preview['evolution']['phase']}")
+                        
+                        # Color preview
+                        imgui.spacing()
+                        imgui.text("Star Color:")
+                        imgui.same_line()
+                        imgui.color_button("##star_color_preview", pr, pg, pb, 1.0, 0, 20, 20)
+                    else:
+                        imgui.text_colored("Invalid parameters.", 1.0, 0.3, 0.3)
                     
                     imgui.separator()
                     
                     # Validation
                     name_ok = len(cd["system_name"].strip()) > 0
                     name_exists = sys_mgr.system_exists(cd["system_name"].strip())
-                    mass_ok = cd["mass"] > 0.01
-                    age_ok = cd["age"] >= 0
+                    
+                    if cd["star_mode"] == "Evolution Track":
+                        param_ok = cd["mass"] > 0.01 and cd["age"] >= 0
+                    else:
+                        param_ok = (cd["locked_rad"] + cd["locked_temp"] + cd["locked_lum"] == 2) and preview is not None
                     
                     if not name_ok:
                         imgui.text_colored("System name required", 1.0, 0.3, 0.3)
                     elif name_exists:
                         imgui.text_colored("System already exists!", 1.0, 0.3, 0.3)
-                    elif not mass_ok:
-                        imgui.text_colored(u"Mass must be > 0.01 M\u2609", 1.0, 0.3, 0.3)
-                    elif not age_ok:
-                        imgui.text_colored("Age must be >= 0", 1.0, 0.3, 0.3)
+                    elif not param_ok:
+                        imgui.text_colored("Check parameters", 1.0, 0.3, 0.3)
                     
-                    can_create = name_ok and not name_exists and mass_ok and age_ok
+                    can_create = name_ok and not name_exists and param_ok
                     
                     if can_create:
                         if imgui.button("Create System", width=-1):
                             sys_name = cd["system_name"].strip()
                             star_name_c = cd["star_name"].strip() or "Star"
                             
+                            # Build star_props dict
+                            sprops = {
+                                "mode": "evolution" if cd["star_mode"] == "Evolution Track" else "surface",
+                                "mass": cd["mass"], "metallicity": cd["metallicity"], "age": cd["age"],
+                                "radius": cd.get("radius", 1.0), "temp": cd.get("temp", 5778.0), "lum": cd.get("lum", 1.0),
+                                "locked_rad": cd.get("locked_rad", True), "locked_temp": cd.get("locked_temp", True), "locked_lum": cd.get("locked_lum", False)
+                            }
+                            
                             # Create system on disk
-                            new_bodies = sys_mgr.create_new_system(
-                                sys_name, star_name_c, cd["mass"], cd["metallicity"], cd["age"]
+                            new_bodies = sys_mgr.create_new_system_from_props(
+                                sys_name, star_name_c, sprops
                             )
                             
                             # Build REBOUND sim and trigger switch

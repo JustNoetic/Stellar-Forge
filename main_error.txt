@@ -1,60 +1,13 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 947, in run
-    prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 1978, in program
-    res.mglo, _members, res._subroutines, res._geom, res._glo = self.mglo.program(
-                                                                ^^^^^^^^^^^^^^^^^^
-_moderngl.Error: GLSL Compiler failed
-
-fragment_shader
-===============
-0(615) : error C1503: undefined variable "ring_count"
-0(616) : error C1503: undefined variable "ring_count"
-0(621) : error C1503: undefined variable "sin_star"
-0(623) : error C1503: undefined variable "sin_star"
-0(647) : error C1503: undefined variable "sun_dir_sph"
-0(668) : error C1503: undefined variable "sin_star"
-0(669) : error C1503: undefined variable "sin_star"
-0(678) : error C1503: undefined variable "global_eclipse_shadow"
-0(679) : error C1503: undefined variable "skip_volumetric_shadow"
-0(680) : error C1503: undefined variable "global_eclipse_shadow"
-0(680) : error C1503: undefined variable "end_eclipse_shadow"
-0(682) : error C1503: undefined variable "ring_A_prime"
-0(682) : error C1503: undefined variable "ring_B"
-0(684) : error C1503: undefined variable "ring_s1_out"
-0(684) : error C1503: undefined variable "ring_s2_out"
-0(687) : error C1503: undefined variable "ring_inner"
-0(687) : error C1503: undefined variable "ring_R_eff"
-0(688) : error C1503: undefined variable "ring_outer"
-0(688) : error C1503: undefined variable "ring_R_eff"
-0(692) : error C1503: undefined variable "ring_R_eff"
-0(696) : error C1503: undefined variable "ring_inner"
-0(696) : error C1503: undefined variable "ring_outer"
-0(696) : error C1503: undefined variable "ring_inner"
-0(699) : error C1503: undefined variable "ring_opac"
-0(699) : error C1503: undefined variable "ring_v_coord"
-0(700) : error C1503: undefined variable "ring_opac"
-0(700) : error C1503: undefined variable "ring_v_coord"
-0(701) : error C1503: undefined variable "ring_opac"
-0(701) : error C1503: undefined variable "ring_v_coord"
-0(702) : error C1503: undefined variable "ring_opac"
-0(702) : error C1503: undefined variable "ring_v_coord"
-0(710) : error C1503: undefined variable "star_pos"
-0(712) : error C1503: undefined variable "star_radius"
-0(729) : error C1503: undefined variable "sun_dir"
-0(737) : error C1503: undefined variable "star_lum"
-0(737) : error C1503: undefined variable "dist_to_star_au"
-0(737) : error C1503: undefined variable "dist_to_star_au"
-0(739) : error C1503: undefined variable "star_color"
-0(748) : error C1503: undefined variable "beta_R"
-0(749) : error C1503: undefined variable "final_od_rayleigh"
-0(749) : error C1503: undefined variable "beta_M"
-0(750) : error C1503: undefined variable "final_od_mie"
-0(750) : error C1503: undefined variable "beta_A"
-0(750) : error C1503: undefined variable "final_od_rayleigh"
-0(752) : error C0000: syntax error, unexpected reserved word "if" at token "if"
-
-
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2409, in run
+    props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 235, in get_cached_atmosphere_properties
+    props = compute_atmosphere_properties(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\atmosphere_physics.py", line 68, in compute_atmosphere_properties
+    number_density = pressure_pa / (K_B * temperature_k)
+                     ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
+ZeroDivisionError: float division by zero
