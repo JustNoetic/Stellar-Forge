@@ -1,13 +1,7 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2409, in run
-    props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
-                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 235, in get_cached_atmosphere_properties
-    props = compute_atmosphere_properties(
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\atmosphere_physics.py", line 68, in compute_atmosphere_properties
-    number_density = pressure_pa / (K_B * temperature_k)
-                     ~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~
-ZeroDivisionError: float division by zero
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 4035, in run
+    changed_c, new_c = imgui.color_edit3("Base Color", *visual_arr[insp_idx, 0:3])
+                                                        ~~~~~~~~~~^^^^^^^^^^^^^^^
+IndexError: index 3 is out of bounds for axis 0 with size 1

@@ -75,7 +75,7 @@ class StarCalculator:
             progress = (age_val - 1.0) * 10.0 # 0.0 to 1.0
             
             # --- MASSIVE STAR STRIPPING PATHWAY (LBV -> WR) ---
-            if initial_mass >= 25.0 and evo_path == "stripping":
+            if (initial_mass >= 25.0 and evo_path == "stripping") or initial_mass >= 45.0:
                 if progress < 0.5:
                     # 1.0 to 1.05: Luminous Blue Variable (LBV)
                     sub_prog = progress * 2.0

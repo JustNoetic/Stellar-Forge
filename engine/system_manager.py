@@ -404,11 +404,7 @@ class SystemManager:
         if mode == "evolution":
             mass = star_props.get("mass", 1.0)
             metallicity = star_props.get("metallicity", 0.0)
-            age = star_props.get("age", 4.6)
-            lum_mult = max(0.5, min(2.0, 1.0 - 0.2 * metallicity))
-            base_l_for_life = StarCalculator.ms_lum_from_mass(mass) * lum_mult
-            lifespan_gyr = 10 * (mass / max(1e-10, base_l_for_life))
-            age_pct = age / lifespan_gyr if lifespan_gyr > 0 else 0.46
+            age_pct = star_props.get("age_pct", 0.46)
             
             res = StarCalculator.forge(
                 mode="evolution",

@@ -684,6 +684,13 @@ class App:
         self.vel_snap_cmp = np.zeros((num_bodies_cmp, 3), dtype='f8')
         self.mass_snap_cmp = np.zeros(num_bodies_cmp, dtype='f8')
         self.parent_snap_cmp = np.zeros(num_bodies_cmp, dtype=np.int32)
+        
+        # Max orbits is usually 1024, but let's hardcode 1024 or fetch it if defined. Actually wait, let me just initialize subsys ones first.
+        self.subsys_pos_buf_cmp = np.zeros((num_bodies_cmp, 3), dtype='f8')
+        self.subsys_vel_buf_cmp = np.zeros((num_bodies_cmp, 3), dtype='f8')
+        self.subsys_mass_buf_cmp = np.zeros(num_bodies_cmp, dtype='f8')
+        self.visual_colors_f8_cmp = np.ascontiguousarray(self.visual_arr_cmp[:, 0:3], dtype='f8')
+        self.orbit_data_buf_cmp = np.zeros((2000, 20), dtype='f8')
     
         sim = bundle["sim"]
         num_bodies = bundle["num_bodies"]
@@ -1275,6 +1282,7 @@ class App:
     
         last_orbit_pos_snap = None
         last_orbit_pos_snap_cmp = None
+        last_comparison_offset_au = None
         last_cam_origin = None
         
         n_orbits = 0
@@ -1517,6 +1525,8 @@ class App:
                     if b.get('type') == 'Star':
                         self.is_star_arr_cmp[i] = 1.0
                 
+                last_orbit_pos_snap_cmp = None
+                last_comparison_offset_au = None
                 self.pos_snap_cmp = np.zeros((self.num_bodies_cmp, 3), dtype='f8')
                 self.vel_snap_cmp = np.zeros((self.num_bodies_cmp, 3), dtype='f8')
                 self.mass_snap_cmp = np.zeros(self.num_bodies_cmp, dtype='f8')
@@ -2311,7 +2321,8 @@ class App:
                     recompute_orbits_cmp = True
                     if last_orbit_pos_snap_cmp is not None and self.time_ctrl_cmp.get("paused"):
                         if np.array_equal(self.pos_snap_cmp, last_orbit_pos_snap_cmp):
-                            recompute_orbits_cmp = False
+                            if last_comparison_offset_au is not None and self.comparison_offset_au == last_comparison_offset_au:
+                                recompute_orbits_cmp = False
                                 
                     if recompute_orbits_cmp:
                         lod_levels_cmp = np.full(self.num_bodies_cmp, 2.0, dtype=np.float64)
@@ -2331,13 +2342,14 @@ class App:
                                     lod_levels_cmp[i] = 1.0
                         
                         cam_origin_cmp = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                        offset_vec = np.array([-self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                        offset_vec = np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                         self.n_orbits_cmp = compute_all_orbits_batch(
                             self.pos_snap_cmp, self.vel_snap_cmp, self.mass_snap_cmp, self.parent_snap_cmp,
                             self.subsys_pos_buf_cmp, self.subsys_vel_buf_cmp, self.subsys_mass_buf_cmp,
                             self.visual_colors_f8_cmp, cam_origin_cmp, G, max_orbits, self.orbit_data_buf_cmp, lod_levels_cmp,
                             offset_vec)
                         last_orbit_pos_snap_cmp = self.pos_snap_cmp.copy()
+                        last_comparison_offset_au = self.comparison_offset_au
                         
                         if self.n_orbits_cmp > 0:
                             valid_orbits_cmp = self.orbit_data_buf_cmp[:self.n_orbits_cmp]
@@ -3119,7 +3131,7 @@ class App:
                         "star_name": "Star",
                         "mass": 1.0,
                         "metallicity": 0.0,
-                        "age": 4.6,
+                        "age_pct": 46.0,
                     }
                 imgui.end_popup()
     
@@ -3463,7 +3475,7 @@ class App:
                                     "init_orbit": True,
                                     "star_mode": sp.get("mode", "evolution"),
                                     "metallicity": sp.get("metallicity", 0.0),
-                                    "age": sp.get("age", 4.6),
+                                    "age_pct": sp.get("age_pct", 0.46) * 100.0,
                                     "s_rad": sp.get("radius", float(body_info.get('r', 1.0))),
                                     "s_temp": sp.get("temp", 5778.0),
                                     "s_lum": sp.get("lum", 1.0),
@@ -3491,17 +3503,24 @@ class App:
                             if changed_m: ed["star_mode"] = ["evolution", "surface"][mode_idx]
                             
                             if ed["star_mode"] == "evolution":
-                                _, ed["mass"] = imgui.slider_float(u"Mass (M\u2609)", ed["mass"], 0.01, 150.0, format="%.4f", power=3.0)
-                                _, ed["metallicity"] = imgui.slider_float("[Fe/H] (dex)", ed.get("metallicity", 0.0), -4.0, 1.0, format="%.3f")
-                                _, ed["age"] = imgui.slider_float("Age (Gyr)", ed.get("age", 4.6), 0.0, 15.0, format="%.3f")
+                                _, ed["mass"] = imgui.drag_float(u"Mass (M\u2609)", ed["mass"], 0.01, 0.01, 300.0, format="%.4f")
+                                _, ed["metallicity"] = imgui.drag_float("[Fe/H] (dex)", ed.get("metallicity", 0.0), 0.01, -4.0, 1.0, format="%.3f")
+                                _, ed["age_pct"] = imgui.drag_float("Life Cycle (%)", ed.get("age_pct", 46.0), 0.1, -5.0, 120.0, format="%.1f%%")
+                                
+                                if ed["mass"] >= 45.0:
+                                    imgui.text_colored("Humphreys-Davidson Limit Reached", 1.0, 0.5, 0.2)
+                                    ed["evo_path"] = "stripping"
+                                elif ed["mass"] >= 25.0:
+                                    if "evo_path" not in ed: ed["evo_path"] = "standard"
+                                    changed_p, p_idx = imgui.combo("Evolution Branch", 0 if ed["evo_path"]=="standard" else 1, ["Red Supergiant", "LBV -> Wolf-Rayet"])
+                                    if changed_p: ed["evo_path"] = ["standard", "stripping"][p_idx]
+                                else:
+                                    ed["evo_path"] = "standard"
                                 
                                 try:
                                     from star_calc import StarCalculator
-                                    lum_mult = max(0.5, min(2.0, 1.0 - 0.2 * ed["metallicity"]))
-                                    base_l_for_life = StarCalculator.ms_lum_from_mass(ed["mass"]) * lum_mult
-                                    lifespan_gyr = 10 * (ed["mass"] / max(1e-10, base_l_for_life))
-                                    age_pct = ed["age"] / lifespan_gyr if lifespan_gyr > 0 else 0.46
-                                    preview = StarCalculator.forge(mode="evolution", mass=ed["mass"], metallicity=ed["metallicity"], age_pct=age_pct)
+                                    age_pct = ed["age_pct"] / 100.0
+                                    preview = StarCalculator.forge(mode="evolution", evo_path=ed.get("evo_path", "standard"), mass=ed["mass"], metallicity=ed["metallicity"], age_pct=age_pct)
                                     ed["radius"] = preview["physical"]["radius_rsun"] * 696340.0
                                     ed["_preview"] = preview
                                 except Exception as e:
@@ -3514,9 +3533,9 @@ class App:
                                 if "locked_lum" not in ed: ed["locked_lum"] = False
                                 num_locked = ed["locked_rad"] + ed["locked_temp"] + ed["locked_lum"]
                                 
-                                c1, ed["locked_rad"] = imgui.checkbox("##lr", ed["locked_rad"]); imgui.same_line(); _, ed["s_rad"] = imgui.slider_float(u"Radius (R\u2609)", ed.get("s_rad", 1.0), 0.01, 2000.0, format="%.4f", power=3.0)
-                                c2, ed["locked_temp"] = imgui.checkbox("##lt", ed["locked_temp"]); imgui.same_line(); _, ed["s_temp"] = imgui.slider_float("Temp (K)", ed.get("s_temp", 5778.0), 1000.0, 50000.0, format="%.0f", power=2.0)
-                                c3, ed["locked_lum"] = imgui.checkbox("##ll", ed["locked_lum"]); imgui.same_line(); _, ed["s_lum"] = imgui.slider_float(u"Luminosity (L\u2609)", ed.get("s_lum", 1.0), 0.0001, 1000000.0, format="%.4f", power=5.0)
+                                c1, ed["locked_rad"] = imgui.checkbox("##lr", ed["locked_rad"]); imgui.same_line(); _, ed["s_rad"] = imgui.drag_float(u"Radius (R\u2609)", ed.get("s_rad", 1.0), 0.05, 0.01, 2500.0, format="%.4f")
+                                c2, ed["locked_temp"] = imgui.checkbox("##lt", ed["locked_temp"]); imgui.same_line(); _, ed["s_temp"] = imgui.drag_float("Temp (K)", ed.get("s_temp", 5778.0), 10.0, 1000.0, 100000.0, format="%.0f")
+                                c3, ed["locked_lum"] = imgui.checkbox("##ll", ed["locked_lum"]); imgui.same_line(); _, ed["s_lum"] = imgui.drag_float(u"Luminosity (L\u2609)", ed.get("s_lum", 1.0), 0.01, 0.0001, 2000000.0, format="%.4f")
                                 
                                 if c1 and ed["locked_rad"] and num_locked == 2:
                                     if ed["locked_temp"] and not c2: ed["locked_temp"] = False
@@ -3597,7 +3616,9 @@ class App:
                         else:
                             imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
                     
-                    target_pos = cur_subsys_pos_buf[insp_idx] if inspect_bary else cur_pos_snap_render[insp_idx]
+                    target_pos = cur_subsys_pos_buf[insp_idx].copy() if inspect_bary else cur_pos_snap_render[insp_idx].copy()
+                    if insp_is_cmp:
+                        target_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                     dist_to_center_km = np.linalg.norm(target_pos - cam_world_pos_f8) * 149597870.7
                     if inspect_bary:
                         imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
@@ -3796,7 +3817,8 @@ class App:
                                     "mode": ed.get("star_mode", "evolution"),
                                     "mass": ed["mass"] if ed.get("star_mode") == "evolution" else pr["physical"]["mass_msun"],
                                     "metallicity": ed.get("metallicity", 0.0),
-                                    "age": ed.get("age", 4.6),
+                                    "age_pct": ed.get("age_pct", 46.0) / 100.0,
+                                    "evo_path": ed.get("evo_path", "standard"),
                                     "radius": pr["physical"]["radius_rsun"],
                                     "temp": pr["physical"]["temp_k"],
                                     "lum": pr["physical"]["lum_lsun"],
@@ -4332,18 +4354,25 @@ class App:
                     if cd["star_mode"] == "Evolution Track":
                         imgui.spacing()
                         imgui.text_colored("Evolution Parameters", 0.4, 1.0, 0.7)
-                        _, cd["mass"] = imgui.slider_float(u"Mass (M\u2609)", cd["mass"], 0.01, 150.0, format="%.4f", power=3.0)
-                        _, cd["metallicity"] = imgui.slider_float("[Fe/H] (dex)", cd["metallicity"], -4.0, 1.0, format="%.3f")
-                        _, cd["age"] = imgui.slider_float("Age (Gyr)", cd["age"], 0.0, 15.0, format="%.3f")
+                        _, cd["mass"] = imgui.drag_float(u"Mass (M\u2609)", cd["mass"], 0.01, 0.01, 300.0, format="%.4f")
+                        _, cd["metallicity"] = imgui.drag_float("[Fe/H] (dex)", cd["metallicity"], 0.01, -4.0, 1.0, format="%.3f")
+                        _, cd["age_pct"] = imgui.drag_float("Life Cycle (%)", cd["age_pct"], 0.1, -5.0, 120.0, format="%.1f%%")
+                        
+                        if cd["mass"] >= 45.0:
+                            imgui.text_colored("Humphreys-Davidson Limit Reached", 1.0, 0.5, 0.2)
+                            cd["evo_path"] = "stripping"
+                        elif cd["mass"] >= 25.0:
+                            if "evo_path" not in cd: cd["evo_path"] = "standard"
+                            changed_p, p_idx = imgui.combo("Evolution Branch", 0 if cd["evo_path"]=="standard" else 1, ["Red Supergiant", "LBV -> Wolf-Rayet"])
+                            if changed_p: cd["evo_path"] = ["standard", "stripping"][p_idx]
+                        else:
+                            cd["evo_path"] = "standard"
                         
                         try:
                             from star_calc import StarCalculator
-                            lum_mult = max(0.5, min(2.0, 1.0 - 0.2 * cd["metallicity"]))
-                            base_l_for_life = StarCalculator.ms_lum_from_mass(cd["mass"]) * lum_mult
-                            lifespan_gyr = 10 * (cd["mass"] / max(1e-10, base_l_for_life))
-                            age_pct = cd["age"] / lifespan_gyr if lifespan_gyr > 0 else 0.46
+                            age_pct = cd["age_pct"] / 100.0
                             
-                            preview = StarCalculator.forge(mode="evolution", mass=cd["mass"], metallicity=cd["metallicity"], age_pct=age_pct)
+                            preview = StarCalculator.forge(mode="evolution", evo_path=cd.get("evo_path", "standard"), mass=cd["mass"], metallicity=cd["metallicity"], age_pct=age_pct)
                             hx = preview["visual"]["colorHex"].lstrip('#')
                             pr, pg, pb = int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0
                         except Exception as e:
@@ -4363,9 +4392,9 @@ class App:
                         
                         num_locked = cd["locked_rad"] + cd["locked_temp"] + cd["locked_lum"]
                         
-                        c1, cd["locked_rad"] = imgui.checkbox("##lr", cd["locked_rad"]); imgui.same_line(); _, cd["radius"] = imgui.slider_float(u"Radius (R\u2609)", cd["radius"], 0.01, 2000.0, format="%.4f", power=3.0)
-                        c2, cd["locked_temp"] = imgui.checkbox("##lt", cd["locked_temp"]); imgui.same_line(); _, cd["temp"] = imgui.slider_float("Temp (K)", cd["temp"], 1000.0, 50000.0, format="%.0f", power=2.0)
-                        c3, cd["locked_lum"] = imgui.checkbox("##ll", cd["locked_lum"]); imgui.same_line(); _, cd["lum"] = imgui.slider_float(u"Luminosity (L\u2609)", cd["lum"], 0.0001, 1000000.0, format="%.4f", power=5.0)
+                        c1, cd["locked_rad"] = imgui.checkbox("##lr", cd["locked_rad"]); imgui.same_line(); _, cd["radius"] = imgui.drag_float(u"Radius (R\u2609)", cd["radius"], 0.05, 0.01, 2500.0, format="%.4f")
+                        c2, cd["locked_temp"] = imgui.checkbox("##lt", cd["locked_temp"]); imgui.same_line(); _, cd["temp"] = imgui.drag_float("Temp (K)", cd["temp"], 10.0, 1000.0, 100000.0, format="%.0f")
+                        c3, cd["locked_lum"] = imgui.checkbox("##ll", cd["locked_lum"]); imgui.same_line(); _, cd["lum"] = imgui.drag_float(u"Luminosity (L\u2609)", cd["lum"], 0.01, 0.0001, 2000000.0, format="%.4f")
                         
                         if c1 and cd["locked_rad"] and num_locked == 2:
                             if cd["locked_temp"] and not c2: cd["locked_temp"] = False
@@ -4422,7 +4451,7 @@ class App:
                     name_exists = sys_mgr.system_exists(cd["system_name"].strip())
                     
                     if cd["star_mode"] == "Evolution Track":
-                        param_ok = cd["mass"] > 0.01 and cd["age"] >= 0
+                        param_ok = cd["mass"] > 0.01
                     else:
                         param_ok = (cd["locked_rad"] + cd["locked_temp"] + cd["locked_lum"] == 2) and preview is not None
                     
@@ -4443,7 +4472,8 @@ class App:
                             # Build star_props dict
                             sprops = {
                                 "mode": "evolution" if cd["star_mode"] == "Evolution Track" else "surface",
-                                "mass": cd["mass"], "metallicity": cd["metallicity"], "age": cd["age"],
+                                "mass": cd["mass"], "metallicity": cd["metallicity"], "age_pct": cd["age_pct"] / 100.0,
+                                "evo_path": cd.get("evo_path", "standard"),
                                 "radius": cd.get("radius", 1.0), "temp": cd.get("temp", 5778.0), "lum": cd.get("lum", 1.0),
                                 "locked_rad": cd.get("locked_rad", True), "locked_temp": cd.get("locked_temp", True), "locked_lum": cd.get("locked_lum", False)
                             }
