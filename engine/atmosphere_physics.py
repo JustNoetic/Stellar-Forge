@@ -24,7 +24,8 @@ GAS_PROPERTIES = {
     "CH4": (1.000444, 1.000, 0.01604, np.array([0.0, 0.0, 0.0])),
     "H2":  (1.000132, 1.000, 0.002016, np.array([0.0, 0.0, 0.0])),
     "He":  (1.000036, 1.000, 0.004002, np.array([0.0, 0.0, 0.0])),
-    "O3":  (1.000271, 1.096, 0.04800, np.array([0.5e-25, 3.0e-25, 0.2e-25])), # Ozone strongly absorbs green/red (Chappuis band)
+    "O3":  (1.000271, 1.096, 0.04800, np.array([0.5e-25, 3.0e-25, 0.2e-25])),
+    "SO2": (1.000686, 1.000, 0.06406, np.array([0.001e-25, 0.005e-25, 0.03e-25])),
 }
 
 _atmo_cache = {}
@@ -63,7 +64,8 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     avg_n_minus_1 = 0.0
     king_numerator = 0.0
     king_denominator = 0.0
-    beta_absorption = np.zeros(3)
+    beta_abs_mixed = np.zeros(3)
+    beta_abs_layered = np.zeros(3)
     
     pressure_pa = pressure_atm * P_STD
     number_density = pressure_pa / (K_B * temperature_k)
@@ -84,7 +86,10 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
         
         # Absorption coefficient: cross section * number density of this specific gas
         gas_number_density = number_density * fraction
-        beta_absorption += abs_cross * gas_number_density
+        if gas == "O3":
+            beta_abs_layered += abs_cross * gas_number_density
+        else:
+            beta_abs_mixed += abs_cross * gas_number_density
         
     avg_n = 1.0 + avg_n_minus_1
     avg_king_factor = king_numerator / king_denominator if king_denominator > 0 else 1.0
@@ -110,9 +115,11 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     
     res = {
         "beta_rayleigh": beta_rayleigh.astype(np.float32),
-        "beta_absorption": beta_absorption.astype(np.float32),
+        "beta_abs_mixed": beta_abs_mixed.astype(np.float32),
+        "beta_abs_layered": beta_abs_layered.astype(np.float32),
         "scale_height_km": float(scale_height_km),
-        "molar_mass": float(avg_molar_mass)
+        "molar_mass": float(avg_molar_mass),
+        "atmo_height_km": float(scale_height_km * max(1.0, math.log(max(1.0, pressure_atm * 1e6))))
     }
     
     _atmo_cache[cache_key] = res

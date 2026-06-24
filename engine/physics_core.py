@@ -8,6 +8,7 @@ from math_utils import *
 from system_manager import SystemManager, SystemSnapshot, derive_star_properties
 import warnings
 from render_utils import *
+from atmosphere_physics import compute_atmosphere_properties
 
 def _extract_render_state(sim, num_bodies, out_pos, out_vel):
     """Extract particle positions/velocities with render coordinate swap (x, z, -y)."""
@@ -1717,7 +1718,14 @@ def load_system_from_data(bodies_data_raw):
             r_solar = body.get('r', 1.0)
             planet_radius_km = r_solar * SOLAR_RADIUS_KM
             radius_au = r_solar * SOLAR_RADII_TO_AU
-            atmo_height_km = atmo['height']
+            mass = body.get('m', 1.0)
+            mass_kg = mass * 1.98847e30
+            surface_pressure = float(atmo.get('surface_pressure', 1.0))
+            temperature = float(atmo.get('temperature', 288.15))
+            composition = atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01})
+            g_m_s2 = (6.67430e-11 * mass_kg) / ((planet_radius_km * 1000.0) ** 2) if planet_radius_km > 0 else 9.81
+            props = compute_atmosphere_properties(surface_pressure, temperature, composition, g_m_s2)
+            atmo_height_km = props['atmo_height_km']
             atmo_radius_km = planet_radius_km + atmo_height_km
             atmo_radius_au = atmo_radius_km / AU_TO_KM
             atmo_bodies.append({

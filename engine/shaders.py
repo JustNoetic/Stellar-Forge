@@ -1570,7 +1570,8 @@ uniform float u_h_rayleigh;
 uniform vec3 u_beta_mie;
 uniform float u_h_mie;
 uniform float u_mie_g;
-uniform vec3  u_beta_absorption;
+uniform vec3  u_beta_abs_mixed;
+uniform vec3  u_beta_abs_layered;
 uniform float u_sun_intensity;
 uniform vec3  u_camera_pos;
 uniform int   u_num_samples;
@@ -1775,11 +1776,18 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float a = dot(dir, dir);
     float b = dot(origin, dir);
-    float c = dot(origin, origin) - radius * radius;
-    float discriminant = b * b - a * c;
-    if (discriminant < 0.0) return vec2(1e10, -1e10);
-    float d = sqrt(discriminant);
-    return vec2((-b - d) / a, (-b + d) / a);
+    
+    // Improved precision for large distances
+    vec3 p = origin - (b / a) * dir;
+    float p2 = dot(p, p);
+    float r2 = radius * radius;
+    
+    if (p2 > r2) return vec2(1e10, -1e10);
+    
+    float d = sqrt((r2 - p2) / a);
+    float t_closest = -b / a;
+    
+    return vec2(t_closest - d, t_closest + d);
 }
 
 vec3 get_transmittance(float r, float cos_theta) {
@@ -1861,7 +1869,7 @@ void main() {
 
     for (int i = 0; i < u_num_active_casters; i++) {
         vec3 caster_pos = u_active_casters[i].xyz;
-        float caster_r = u_active_casters[i].w;
+        float caster_r = u_active_casters[i].w * u_au_to_km;
         vec3 caster_local = (caster_pos - planet_center_render) * u_au_to_km;
         
         if (length(caster_local) < 1.0) continue;
@@ -1880,7 +1888,8 @@ void main() {
 
     vec3 beta_R = u_beta_rayleigh * 1000.0;
     vec3 beta_M = u_beta_mie * 1000.0;
-    vec3 beta_A = u_beta_absorption * 1000.0;
+    vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
+    vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
     int steps = u_num_samples;
     float step_size = (s_end - s_start) / float(steps);
@@ -2041,8 +2050,8 @@ void main() {
                 vec3 shadow_start = vec3(1.0);
                 vec3 shadow_end = vec3(1.0);
                 
-                vec3 start_render = O + s_start * V;
-                vec3 end_render = O + s_end * V;
+                vec3 start_render = planet_center_render + (O + s_start * V) / u_au_to_km;
+                vec3 end_render = planet_center_render + (O + s_end * V) / u_au_to_km;
                 vec3 L_start = L_mid;
                 float sr_start = star_radius / max(dist_mid_star, 1e-6);
                 vec3 L_end = L_mid;
@@ -2202,7 +2211,7 @@ void main() {
             float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet); // Reused cos_planet
             float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
 
-            vec3 tau_to_cam = beta_R * od_rayleigh + beta_M * od_mie + beta_A * od_ozone;
+            vec3 tau_to_cam = beta_R * od_rayleigh + beta_M * od_mie + beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone;
             vec3 transmittance_to_sun = get_transmittance(sample_len, effective_cos);
 
             vec3 sample_shadow = global_eclipse_shadow;
@@ -2253,7 +2262,8 @@ void main() {
             vec2 ms_uv = vec2(sun_cos_zenith * 0.5 + 0.5, h_norm_ms);
             vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
             
-            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * sample_shadow * vis_fraction * step_size;
+            vec3 ms_attenuation = exp(-tau_to_cam);
+            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * ms_attenuation * sample_shadow * vis_fraction * step_size;
 
             current_pos_sph += step_dir_sph;
             current_s += step_size;
@@ -2284,7 +2294,8 @@ void main() {
 
     vec3 transmittance = exp(-(beta_R * final_od_rayleigh
                              + beta_M * final_od_mie
-                             + beta_A * final_od_ozone));
+                             + beta_A_mixed * final_od_rayleigh
+                             + beta_A_layered * final_od_ozone));
 
     if (u_hdr_enabled) {
         scattered *= u_exposure;
@@ -2326,16 +2337,24 @@ uniform float u_h_rayleigh;
 uniform float u_h_mie;
 uniform vec3 u_beta_rayleigh;
 uniform vec3 u_beta_mie;
-uniform vec3 u_beta_absorption;
+uniform vec3 u_beta_abs_mixed;
+uniform vec3 u_beta_abs_layered;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float a = dot(dir, dir);
     float b = dot(origin, dir);
-    float c = dot(origin, origin) - radius * radius;
-    float discriminant = b * b - a * c;
-    if (discriminant < 0.0) return vec2(1e10, -1e10);
-    float d = sqrt(discriminant);
-    return vec2((-b - d) / a, (-b + d) / a);
+    
+    // Improved precision for large distances
+    vec3 p = origin - (b / a) * dir;
+    float p2 = dot(p, p);
+    float r2 = radius * radius;
+    
+    if (p2 > r2) return vec2(1e10, -1e10);
+    
+    float d = sqrt((r2 - p2) / a);
+    float t_closest = -b / a;
+    
+    return vec2(t_closest - d, t_closest + d);
 }
 
 void main() {
@@ -2375,9 +2394,10 @@ void main() {
     
     vec3 beta_R = u_beta_rayleigh * 1000.0;
     vec3 beta_M = u_beta_mie * 1000.0;
-    vec3 beta_A = u_beta_absorption * 1000.0;
+    vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
+    vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
     
-    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M * od_mie + beta_A * od_ozone));
+    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M * od_mie + beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone));
     out_color = vec4(transmittance, 1.0);
 }
 """
@@ -2393,7 +2413,8 @@ uniform float u_h_rayleigh;
 uniform float u_h_mie;
 uniform vec3 u_beta_rayleigh;
 uniform vec3 u_beta_mie;
-uniform vec3 u_beta_absorption;
+uniform vec3 u_beta_abs_mixed;
+uniform vec3 u_beta_abs_layered;
 uniform float u_mie_g;
 
 uniform sampler2D u_transmittance_lut;
@@ -2401,11 +2422,18 @@ uniform sampler2D u_transmittance_lut;
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float a = dot(dir, dir);
     float b = dot(origin, dir);
-    float c = dot(origin, origin) - radius * radius;
-    float discriminant = b * b - a * c;
-    if (discriminant < 0.0) return vec2(1e10, -1e10);
-    float d = sqrt(discriminant);
-    return vec2((-b - d) / a, (-b + d) / a);
+    
+    // Improved precision for large distances
+    vec3 p = origin - (b / a) * dir;
+    float p2 = dot(p, p);
+    float r2 = radius * radius;
+    
+    if (p2 > r2) return vec2(1e10, -1e10);
+    
+    float d = sqrt((r2 - p2) / a);
+    float t_closest = -b / a;
+    
+    return vec2(t_closest - d, t_closest + d);
 }
 
 vec3 get_transmittance(float r, float cos_theta) {
@@ -2425,7 +2453,8 @@ void main() {
     
     vec3 beta_R = u_beta_rayleigh * 1000.0;
     vec3 beta_M = u_beta_mie * 1000.0;
-    vec3 beta_A = u_beta_absorption * 1000.0;
+    vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
+    vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
     
     const int sqrt_samples = 8;
     vec3 lum_total = vec3(0.0);
@@ -2468,7 +2497,7 @@ void main() {
                 float rho_O = exp(-pow((h_sample - 25.0) / 8.0, 2.0));
                 
                 vec3 scattering = beta_R * rho_R + beta_M * rho_M;
-                vec3 extinction = scattering + beta_A * rho_O;
+                vec3 extinction = scattering + beta_A_mixed * rho_R + beta_A_layered * rho_O;
                 
                 vec3 sample_transmittance = exp(-extinction * step_size);
                 

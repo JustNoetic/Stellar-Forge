@@ -1231,7 +1231,8 @@ class App:
         u_atmo_beta_mie = prog_atmo.get('u_beta_mie', None)
         u_atmo_h_mie = prog_atmo.get('u_h_mie', None)
         u_atmo_mie_g = prog_atmo.get('u_mie_g', None)
-        u_atmo_beta_absorption = prog_atmo.get('u_beta_absorption', None)
+        u_atmo_beta_abs_mixed = prog_atmo.get('u_beta_abs_mixed', None)
+        u_atmo_beta_abs_layered = prog_atmo.get('u_beta_abs_layered', None)
         u_atmo_quality_uniform = prog_atmo.get('u_atmo_quality', None)
         u_atmo_sun_intensity = prog_atmo.get('u_sun_intensity', None)
         u_atmo_camera_pos = prog_atmo.get('u_camera_pos', None)
@@ -1333,9 +1334,13 @@ class App:
             radius_km = atmo['planet_radius_km']
             props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
             
+            atmo['atmo_radius_km'] = atmo['planet_radius_km'] + props['atmo_height_km']
+            atmo['atmo_radius_au'] = atmo['atmo_radius_km'] / 149597870.7
+            
             beta_rayleigh = props['beta_rayleigh']
             beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 21.0e-6))
-            beta_absorption = props['beta_absorption']
+            beta_abs_mixed = props['beta_abs_mixed']
+            beta_abs_layered = props['beta_abs_layered']
             
             self.prog_atmo_lut['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
             self.prog_atmo_lut['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
@@ -1343,7 +1348,8 @@ class App:
             self.prog_atmo_lut['u_h_mie'].value = float(atmo.get('h_mie', 1.2))
             self.prog_atmo_lut['u_beta_rayleigh'].value = tuple(beta_rayleigh)
             self.prog_atmo_lut['u_beta_mie'].value = tuple(beta_mie)
-            self.prog_atmo_lut['u_beta_absorption'].value = tuple(beta_absorption)
+            self.prog_atmo_lut['u_beta_abs_mixed'].value = tuple(beta_abs_mixed)
+            self.prog_atmo_lut['u_beta_abs_layered'].value = tuple(beta_abs_layered)
             
             fbo.use()
             self.lut_vao.render(moderngl.TRIANGLE_STRIP)
@@ -1360,7 +1366,8 @@ class App:
             self.prog_multi_scatter_lut['u_h_mie'].value = float(atmo.get('h_mie', 1.2))
             self.prog_multi_scatter_lut['u_beta_rayleigh'].value = tuple(beta_rayleigh)
             self.prog_multi_scatter_lut['u_beta_mie'].value = tuple(beta_mie)
-            self.prog_multi_scatter_lut['u_beta_absorption'].value = tuple(beta_absorption)
+            self.prog_multi_scatter_lut['u_beta_abs_mixed'].value = tuple(beta_abs_mixed)
+            self.prog_multi_scatter_lut['u_beta_abs_layered'].value = tuple(beta_abs_layered)
             if 'u_mie_g' in self.prog_multi_scatter_lut:
                 self.prog_multi_scatter_lut['u_mie_g'].value = float(atmo.get('mie_g', 0.8))
             self.prog_multi_scatter_lut['u_transmittance_lut'].value = 1
@@ -1813,11 +1820,12 @@ class App:
                                 visual_data[idx][3] = r_au
                                 for a in atmo_bodies:
                                     if a['body_idx'] == idx:
+                                        old_radius = a['planet_radius_km']
+                                        height = max(1.0, a['atmo_radius_km'] - old_radius)
                                         a['planet_radius_km'] = float(op["radius"])
                                         a['surface_radius_au'] = r_au
-                                        if a['atmo_radius_km'] < a['planet_radius_km']:
-                                            a['atmo_radius_km'] = a['planet_radius_km'] * 1.025
-                                            a['atmo_radius_au'] = a['atmo_radius_km'] / 149597870.7
+                                        a['atmo_radius_km'] = a['planet_radius_km'] + height
+                                        a['atmo_radius_au'] = a['atmo_radius_km'] / 149597870.7
                                         if 'lut_tex' in a:
                                             a['lut_tex'].release()
                                             del a['lut_tex']
@@ -2620,16 +2628,34 @@ class App:
                 sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
                 
             if sorted_atmos:
+                # Ensure all visible atmospheres have their LUTs built with a clean OpenGL state
+                # This prevents issues where 'build_atmo_lut' inherits incorrect culling or blending states.
+                ctx.disable(moderngl.BLEND)
+                ctx.disable(moderngl.CULL_FACE)
+                ctx.disable(moderngl.DEPTH_TEST)
+                ctx.depth_mask = False
+                
+                for sq_dist, atmo, is_cmp in sorted_atmos:
+                    dist_to_body = math.sqrt(sq_dist)
+                    apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
+                    if apparent_px >= 2.0:
+                        bi_curr = atmo['body_idx']
+                        mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
+                        if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
+                            build_atmo_lut(atmo, mass_sm_curr)
+                            
                 _, closest_atmo, is_cmp = sorted_atmos[-1]
                 bi = closest_atmo['body_idx']
                 body_pos_rel = cmp_pos_rel[bi].astype('f4') if is_cmp else pos_rel_all[bi]
                 mass_sm = self.mass_snap_cmp[bi] if is_cmp else mass_snap[bi]
                 
+                # Make sure the closest atmo has its LUT built even if it's < 2px (AP shader expects it)
                 if 'lut_tex' not in closest_atmo or closest_atmo.get('lut_mass') != mass_sm:
                     build_atmo_lut(closest_atmo, mass_sm)
                 
                 closest_atmo['lut_tex'].use(location=1)
-                closest_atmo['lut_multi_scatter'].use(location=3)
+                if 'lut_multi_scatter' in closest_atmo:
+                    closest_atmo['lut_multi_scatter'].use(location=3)
                 
                 props, _, _ = get_cached_atmosphere_properties(closest_atmo, mass_sm)
                 beta_mie_val = closest_atmo.get('beta_mie', 21.0e-6)
@@ -2646,7 +2672,8 @@ class App:
                 if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
                 if 'u_h_mie' in prog: prog['u_h_mie'].value = closest_atmo.get('h_mie', 1.2)
                 if 'u_mie_g' in prog: prog['u_mie_g'].value = closest_atmo.get('mie_g', 0.758)
-                if 'u_beta_absorption' in prog: prog['u_beta_absorption'].write(props['beta_absorption'])
+                if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
+                if 'u_beta_abs_layered' in prog: prog['u_beta_abs_layered'].write(props['beta_abs_layered'])
                 
                 bi = closest_atmo['body_idx']
                 if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = closest_atmo['intensity']
@@ -2667,6 +2694,8 @@ class App:
                 
             self.ap_volume_tex.use(location=4)
             
+            ctx.enable(moderngl.DEPTH_TEST)
+            ctx.depth_mask = True
             ctx.enable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -2856,9 +2885,9 @@ class App:
                     else:
                         mass_sm = mass_snap[atmo['body_idx']]
                     
-                    if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm:
-                        build_atmo_lut(atmo, mass_sm)
-                    atmo['lut_tex'].use(location=1)
+                    # LUT should already be built cleanly before the pass
+                    if 'lut_tex' in atmo:
+                        atmo['lut_tex'].use(location=1)
                     if 'lut_multi_scatter' in atmo:
                         atmo['lut_multi_scatter'].use(location=3)
                     
@@ -2876,7 +2905,8 @@ class App:
                     if u_atmo_beta_mie is not None: u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
                     if u_atmo_h_mie is not None: u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
                     if u_atmo_mie_g is not None: u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
-                    if u_atmo_beta_absorption is not None: u_atmo_beta_absorption.write(props['beta_absorption'])
+                    if u_atmo_beta_abs_mixed is not None: u_atmo_beta_abs_mixed.write(props['beta_abs_mixed'])
+                    if u_atmo_beta_abs_layered is not None: u_atmo_beta_abs_layered.write(props['beta_abs_layered'])
                     if u_atmo_sun_intensity is not None: u_atmo_sun_intensity.value = scaled_intensity
 
                     if u_atmo_num_samples is not None: u_atmo_num_samples.value = n_samples
@@ -2957,7 +2987,8 @@ class App:
                     if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
                     if 'u_h_mie' in prog: prog['u_h_mie'].value = atmo.get('h_mie', 1.2)
                     if 'u_mie_g' in prog: prog['u_mie_g'].value = atmo.get('mie_g', 0.758)
-                    if 'u_beta_absorption' in prog: prog['u_beta_absorption'].write(props['beta_absorption'])
+                    if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
+                    if 'u_beta_abs_layered' in prog: prog['u_beta_abs_layered'].write(props['beta_abs_layered'])
                     if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = scaled_intensity
                     if 'u_num_samples' in prog: prog['u_num_samples'].value = n_samples
                     
@@ -4268,15 +4299,9 @@ class App:
                             atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
                             if atmo_item:
                                 current_height = atmo_item['atmo_radius_km'] - atmo_item['planet_radius_km']
-                                changed_r, new_height = imgui.drag_float("Atmosphere Height (km)", current_height, 1.0, 1.0, body_r_km * 10.0)
-                                if changed_r:
-                                    atmo_item['atmo_radius_km'] = atmo_item['planet_radius_km'] + new_height
-                                    atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 149597870.7
-                                    atmo_item['_dirty'] = True
-                                    if 'lut_tex' in atmo_item:
-                                        atmo_item['lut_tex'].release()
-                                        del atmo_item['lut_tex']
+                                imgui.text(f"Atmosphere Height: {current_height:,.1f} km")
                                 
+
                                 changed_p, new_p = imgui.drag_float("Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
                                 if changed_p: 
                                     atmo_item['surface_pressure'] = new_p

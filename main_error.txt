@@ -1,16 +1,11 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 965, in run
-    prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 1978, in program
-    res.mglo, _members, res._subroutines, res._geom, res._glo = self.mglo.program(
-                                                                ^^^^^^^^^^^^^^^^^^
-_moderngl.Error: GLSL Compiler failed
-
-fragment_shader
-===============
-0(298) : error C1038: declaration of "frag_local" conflicts with previous declaration at 0(277)
-
-
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3026, in run
+    render_atmosphere_pass(1)
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2971, in render_atmosphere_pass
+    if u_atmo_active_casters is not None: u_atmo_active_casters.write(active_casters_buf.tobytes())
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\_moderngl.py", line 95, in write
+    self.ctx._write_uniform(
+_moderngl.Error: invalid uniform size
