@@ -1,11 +1,7 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3026, in run
-    render_atmosphere_pass(1)
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 2971, in render_atmosphere_pass
-    if u_atmo_active_casters is not None: u_atmo_active_casters.write(active_casters_buf.tobytes())
-                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\_moderngl.py", line 95, in write
-    self.ctx._write_uniform(
-_moderngl.Error: invalid uniform size
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3360, in run
+    self.sky_view_lut_tex_color = self.ctx.texture((w, h), 4, dtype='f2')
+                                  ^^^^^^^^
+AttributeError: 'App' object has no attribute 'ctx'

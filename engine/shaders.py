@@ -1595,7 +1595,8 @@ uniform sampler2D u_multi_scatter_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 
-out vec4 out_color;
+layout(location = 0, index = 0) out vec4 out_color;
+layout(location = 0, index = 1) out vec4 out_transmittance;
 
 // g_local_rings removed to prevent local memory array spilling
 
@@ -1894,9 +1895,7 @@ void main() {
     int steps = u_num_samples;
     float step_size = (s_end - s_start) / float(steps);
     vec3 scattered = vec3(0.0);
-    float final_od_rayleigh = 0.0;
-    float final_od_mie = 0.0;
-    float final_od_ozone = 0.0;
+    vec3 final_transmittance = vec3(1.0);
 
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
@@ -2161,12 +2160,10 @@ void main() {
         vec3 step_dir_sph = ray_dir_sph * step_size;
         vec3 current_pos_sph = cam_local_sph + (s_start + 0.5 * step_size) * ray_dir_sph;
 
-        float od_rayleigh = 0.0;
-        float od_mie = 0.0;
-        float od_ozone = 0.0;
         vec3 total_rayleigh = vec3(0.0);
         vec3 total_mie = vec3(0.0);
         vec3 total_ms = vec3(0.0);
+        vec3 current_transmittance = vec3(1.0);
 
         float current_s = s_start + 0.5 * step_size;
         float t_lerp = 0.5 / float(steps);
@@ -2180,12 +2177,13 @@ void main() {
             float rho_M = exp(-altitude / u_h_mie);
             float rho_O = exp(-pow((altitude - 25.0) / 8.0, 2.0));
 
-            od_rayleigh += rho_R * step_size;
-            od_mie += rho_M * step_size;
-            od_ozone += rho_O * step_size;
+            vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
+            vec3 step_transmittance = exp(-step_extinction * step_size);
+            vec3 int_factor = (vec3(1.0) - step_transmittance) / max(step_extinction, 1e-6);
 
-            vec3 sun_dir = normalize(sun_pos_local - current_pos_sph);
-            vec3 sun_dir_sph = toSphericalSpace(sun_dir, u_pole_obl);
+            vec3 current_pos_local = cam_local + current_s * ray_dir;
+            vec3 sun_dir_local = normalize(sun_pos_local - current_pos_local);
+            vec3 sun_dir_sph = normalize(toSphericalSpace(sun_dir_local, u_pole_obl));
             float light_cos_theta = dot(current_pos_sph / sample_len, sun_dir_sph);
             float h_norm = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
 
@@ -2208,10 +2206,9 @@ void main() {
             }
 
             float disc_top_cos = min(light_cos_theta + sin_star, 1.0);
-            float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet); // Reused cos_planet
+            float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet);
             float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
 
-            vec3 tau_to_cam = beta_R * od_rayleigh + beta_M * od_mie + beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone;
             vec3 transmittance_to_sun = get_transmittance(sample_len, effective_cos);
 
             vec3 sample_shadow = global_eclipse_shadow;
@@ -2251,27 +2248,26 @@ void main() {
                 sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
             }
 
-            vec3 direct_attenuation = exp(-tau_to_cam) * transmittance_to_sun;
-            vec3 atten_direct = direct_attenuation * sample_shadow * vis_fraction;
+            vec3 sample_attenuation = current_transmittance * transmittance_to_sun * sample_shadow * vis_fraction;
 
-            total_rayleigh += rho_R * atten_direct * step_size;
-            total_mie      += rho_M * atten_direct * step_size;
+            total_rayleigh += rho_R * sample_attenuation * int_factor;
+            total_mie      += rho_M * sample_attenuation * int_factor;
             
-            float sun_cos_zenith = dot(normalize(current_pos_sph), normalize(sun_pos_local));
+            float sun_cos_zenith = dot(current_pos_sph / sample_len, sun_dir_sph);
             float h_norm_ms = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
             vec2 ms_uv = vec2(sun_cos_zenith * 0.5 + 0.5, h_norm_ms);
             vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
             
-            vec3 ms_attenuation = exp(-tau_to_cam);
-            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * ms_attenuation * sample_shadow * vis_fraction * step_size;
+            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * sample_shadow * vis_fraction * int_factor;
+
+            current_transmittance *= step_transmittance;
 
             current_pos_sph += step_dir_sph;
             current_s += step_size;
             t_lerp += t_step;
         }
 
-        vec3 sun_dir = normalize(sun_pos_local - current_pos_sph);
-        float cos_theta = dot(ray_dir, sun_dir);
+        float cos_theta = dot(ray_dir, L_mid);
         float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
 
         float g = u_mie_g;
@@ -2287,31 +2283,40 @@ void main() {
             total_ms
         );
 
-        final_od_rayleigh = od_rayleigh;
-        final_od_mie = od_mie;
-        final_od_ozone = od_ozone;
+        final_transmittance = current_transmittance;
     }
 
-    vec3 transmittance = exp(-(beta_R * final_od_rayleigh
-                             + beta_M * final_od_mie
-                             + beta_A_mixed * final_od_rayleigh
-                             + beta_A_layered * final_od_ozone));
+    vec3 transmittance = final_transmittance;
 
     if (u_hdr_enabled) {
         scattered *= u_exposure;
     }
 
-    float avg_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;
-    out_color = vec4(scattered, (1.0 - avg_transmittance));
+    out_color = vec4(scattered, 1.0);
+    out_transmittance = vec4(transmittance, 1.0);
 }
 """
 
+sky_view_lut_pass_fragment_shader = sky_view_lut_fragment_shader.replace(
+    "layout(location = 0, index = 0) out vec4 out_color;",
+    "layout(location = 0) out vec4 out_color;"
+).replace(
+    "layout(location = 0, index = 1) out vec4 out_transmittance;",
+    "layout(location = 1) out vec4 out_transmittance;"
+).replace(
+    "    if (u_hdr_enabled) {\n        scattered *= u_exposure;\n    }",
+    ""
+)
+
 atmo_fragment_shader = sky_view_lut_fragment_shader.replace(
     "in vec2 f_uv;",
-    "in vec3 f_local_pos;\nin float f_clip_z;"
+    "in vec3 f_local_pos;\nin float f_clip_z;\nuniform bool u_use_sky_view_lut;\nuniform sampler2D u_sky_view_lut_color;\nuniform sampler2D u_sky_view_lut_transmittance;"
 ).replace(
     "    float azimuth = f_uv.x * 2.0 * PI;\n    float elevation = f_uv.y * PI - PI/2.0;\n    vec3 ray_dir = vec3(cos(elevation)*sin(azimuth), sin(elevation), cos(elevation)*cos(azimuth));",
     "    if (f_clip_z < 0.0) discard;\n    vec3 f_pos_local_au = f_local_pos * u_atmo_radius_au;\n    vec3 f_pos_local = f_pos_local_au * u_au_to_km;\n    vec3 ray_dir = normalize(f_pos_local - cam_local);"
+).replace(
+    "    if (s_start >= s_end) discard;",
+    "    if (s_start >= s_end) discard;\n    if (u_use_sky_view_lut) {\n        float elevation = asin(clamp(ray_dir.y, -1.0, 1.0));\n        float az = atan(ray_dir.x, ray_dir.z);\n        float u = az / (2.0 * 3.14159265358979);\n        if (u < 0.0) u += 1.0;\n        float v = (elevation + 3.14159265358979/2.0) / 3.14159265358979;\n        vec3 scattered = textureLod(u_sky_view_lut_color, vec2(u, v), 0.0).rgb;\n        vec3 transmittance = textureLod(u_sky_view_lut_transmittance, vec2(u, v), 0.0).rgb;\n        if (u_hdr_enabled) scattered *= u_exposure;\n        out_color = vec4(scattered, 1.0);\n        out_transmittance = vec4(transmittance, 1.0);\n        return;\n    }"
 )
 
 
@@ -2549,11 +2554,11 @@ aerial_perspective_compute_shader = sky_view_lut_fragment_shader.replace(
     "// AP_VOLUME_HOOK",
     "s_end = min(s_end, slice_dist);"
 ).replace(
-    "out vec4 out_color;",
+    "layout(location = 0, index = 0) out vec4 out_color;\nlayout(location = 0, index = 1) out vec4 out_transmittance;",
     "vec4 out_color;"
 ).replace(
-    "out_color = vec4(scattered, (1.0 - avg_transmittance));",
-    "imageStore(destTex, gid, vec4(scattered, (1.0 - avg_transmittance)));"
+    "    out_color = vec4(scattered, 1.0);\n    out_transmittance = vec4(transmittance, 1.0);",
+    "    float avg_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;\n    imageStore(destTex, gid, vec4(scattered, (1.0 - avg_transmittance)));"
 ).replace(
     "discard;",
     "imageStore(destTex, gid, vec4(0.0)); return;"

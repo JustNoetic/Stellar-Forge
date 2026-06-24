@@ -240,7 +240,7 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     )
     
     beta_r = props['beta_rayleigh']
-    beta_m = atmo.get('beta_mie', 21.0e-6)
+    beta_m = atmo.get('beta_mie', 2.0e-6)
     h_r = props['scale_height_km']
     h_m = atmo.get('h_mie', 1.2)
     od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
@@ -478,7 +478,11 @@ class App:
             "ringshine_enabled": True,
             "bloom_intensity": 0.05,
             "bloom_threshold": 1.0,
-            "msaa_samples": 4, # 0 for off, 2, 4, 8
+            "msaa_samples": 4,
+            "sky_view_mode": 0,
+            "sky_view_hybrid_dist": 1.1,
+            "sky_view_quality": 2,
+            "sky_view_custom_res": (1024, 512),
         }
         
         # Post-Processing FBOs
@@ -1008,10 +1012,18 @@ class App:
         
         self.prog_atmo_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=atmo_lut_fragment_shader)
         self.prog_multi_scatter_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=multi_scatter_lut_fragment_shader)
+        self.prog_sky_view_lut_pass = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=sky_view_lut_pass_fragment_shader)
         self.prog_aerial_perspective = ctx.compute_shader(aerial_perspective_compute_shader)
         lut_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
         self.lut_vao = ctx.vertex_array(self.prog_atmo_lut, [(lut_vbo, '2f', 'in_position')])
         self.multi_scatter_vao = ctx.vertex_array(self.prog_multi_scatter_lut, [(lut_vbo, '2f', 'in_position')])
+        self.sky_view_vao = ctx.vertex_array(self.prog_sky_view_lut_pass, [(lut_vbo, '2f', 'in_position')])
+        
+        self.sky_view_lut_tex_color = ctx.texture((1024, 512), 4, dtype='f2')
+        self.sky_view_lut_tex_trans = ctx.texture((1024, 512), 4, dtype='f2')
+        self.sky_view_lut_tex_color.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.sky_view_lut_tex_trans.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.sky_view_lut_fbo = ctx.framebuffer(color_attachments=[self.sky_view_lut_tex_color, self.sky_view_lut_tex_trans])
         
         if 'u_transmittance_lut' in prog_atmo: prog_atmo['u_transmittance_lut'].value = 1
         if 'u_multi_scatter_lut' in prog_atmo: prog_atmo['u_multi_scatter_lut'].value = 3
@@ -1338,7 +1350,7 @@ class App:
             atmo['atmo_radius_au'] = atmo['atmo_radius_km'] / 149597870.7
             
             beta_rayleigh = props['beta_rayleigh']
-            beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 21.0e-6))
+            beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 2.0e-6))
             beta_abs_mixed = props['beta_abs_mixed']
             beta_abs_layered = props['beta_abs_layered']
             
@@ -2600,7 +2612,7 @@ class App:
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, self.prog_aerial_perspective):
+            for prog in (prog_spheres, prog_rings, prog_atmo, self.prog_aerial_perspective, self.prog_sky_view_lut_pass):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -2658,7 +2670,7 @@ class App:
                     closest_atmo['lut_multi_scatter'].use(location=3)
                 
                 props, _, _ = get_cached_atmosphere_properties(closest_atmo, mass_sm)
-                beta_mie_val = closest_atmo.get('beta_mie', 21.0e-6)
+                beta_mie_val = closest_atmo.get('beta_mie', 2.0e-6)
                 
                 prog = self.prog_aerial_perspective
                 if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
@@ -2835,7 +2847,7 @@ class App:
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.blend_func = (moderngl.ONE, 0x88F9) # GL_SRC1_COLOR for Dual-Source Blending
                 ctx.depth_func = '<='
                 ctx.enable(moderngl.CULL_FACE)
                 ctx.cull_face = 'front'
@@ -2901,7 +2913,7 @@ class App:
                     if u_atmo_atmo_radius is not None: u_atmo_atmo_radius.value = float(atmo['atmo_radius_km'])
                     if u_atmo_beta_rayleigh is not None: u_atmo_beta_rayleigh.write(props['beta_rayleigh'])
                     if u_atmo_h_rayleigh is not None: u_atmo_h_rayleigh.value = props['scale_height_km']
-                    beta_mie_val = atmo.get('beta_mie', 21.0e-6)
+                    beta_mie_val = atmo.get('beta_mie', 2.0e-6)
                     if u_atmo_beta_mie is not None: u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
                     if u_atmo_h_mie is not None: u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
                     if u_atmo_mie_g is not None: u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
@@ -2975,44 +2987,90 @@ class App:
                     if u_atmo_body_idx_uni is not None: u_atmo_body_idx_uni.value = body_idx_in_unified
                     
                     # Generate Sky View LUT for this specific planet
-                    prog = prog_atmo
-                    if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
-                    if 'u_body_offset' in prog: prog['u_body_offset'].write(body_pos_rel.astype('f4'))
-                    if 'u_planet_radius_km' in prog: prog['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
-                    if 'u_atmo_radius_km' in prog: prog['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
-                    if 'u_atmo_radius_au' in prog: prog['u_atmo_radius_au'].value = float(atmo['atmo_radius_au'])
-                    if 'u_au_to_km' in prog: prog['u_au_to_km'].value = AU_TO_KM
-                    if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
-                    if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
-                    if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
-                    if 'u_h_mie' in prog: prog['u_h_mie'].value = atmo.get('h_mie', 1.2)
-                    if 'u_mie_g' in prog: prog['u_mie_g'].value = atmo.get('mie_g', 0.758)
-                    if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
-                    if 'u_beta_abs_layered' in prog: prog['u_beta_abs_layered'].write(props['beta_abs_layered'])
-                    if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = scaled_intensity
-                    if 'u_num_samples' in prog: prog['u_num_samples'].value = n_samples
-                    
-                    if 'u_body_idx' in prog: prog['u_body_idx'].value = body_idx_in_unified
-                    if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
-                        float(all_instances[body_idx_in_unified, 9]),
-                        float(all_instances[body_idx_in_unified, 10]),
-                        float(all_instances[body_idx_in_unified, 11]),
-                        float(all_instances[body_idx_in_unified, 12])
-                    )
-                    if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = clip_mode
-                    if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
-                    
-                    if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = n_active
-                    if 'u_active_casters' in prog: prog['u_active_casters'].write(active_casters_buf.tobytes())
-                    if 'u_active_caster_poles_obl' in prog: prog['u_active_caster_poles_obl'].write(active_poles_obl_buf.tobytes())
-                    if 'u_active_caster_atmos' in prog: prog['u_active_caster_atmos'].write(active_atmos_buf.tobytes())
-                    
-                    if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
-                    if n_ring_planes > 0:
-                        if 'u_ring_center' in prog: prog['u_ring_center'].write(ring_centers_buf)
-                        if 'u_ring_normal' in prog: prog['u_ring_normal'].write(ring_normals_buf)
-                        if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
-                    
+                    sv_mode = self.camera.get("sky_view_mode", 0)
+                    if sv_mode == 0:
+                        dist_mult = self.camera.get("sky_view_hybrid_dist", 1.1)
+                        use_sky_view = (dist_to_body < atmo['atmo_radius_au'] * dist_mult)
+                    elif sv_mode == 1:
+                        use_sky_view = False
+                    else:
+                        use_sky_view = True
+                    if 'u_use_sky_view_lut' in prog_atmo:
+                        prog_atmo['u_use_sky_view_lut'].value = use_sky_view
+                        
+                    progs_to_update = [self.prog_sky_view_lut_pass, prog_atmo] if use_sky_view else [prog_atmo]
+                    for prog in progs_to_update:
+                        if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
+                        if 'u_body_offset' in prog: prog['u_body_offset'].write(body_pos_rel.astype('f4'))
+                        if 'u_planet_radius_km' in prog: prog['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
+                        if 'u_atmo_radius_km' in prog: prog['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
+                        if 'u_atmo_radius_au' in prog: prog['u_atmo_radius_au'].value = float(atmo['atmo_radius_au'])
+                        if 'u_au_to_km' in prog: prog['u_au_to_km'].value = AU_TO_KM
+                        if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
+                        if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
+                        if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                        if 'u_h_mie' in prog: prog['u_h_mie'].value = atmo.get('h_mie', 1.2)
+                        if 'u_mie_g' in prog: prog['u_mie_g'].value = atmo.get('mie_g', 0.758)
+                        if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
+                        if 'u_beta_abs_layered' in prog: prog['u_beta_abs_layered'].write(props['beta_abs_layered'])
+                        if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = scaled_intensity
+                        if 'u_num_samples' in prog: prog['u_num_samples'].value = n_samples
+                        
+                        if 'u_body_idx' in prog: prog['u_body_idx'].value = body_idx_in_unified
+                        if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
+                            float(all_instances[body_idx_in_unified, 9]),
+                            float(all_instances[body_idx_in_unified, 10]),
+                            float(all_instances[body_idx_in_unified, 11]),
+                            float(all_instances[body_idx_in_unified, 12])
+                        )
+                        if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = clip_mode
+                        if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
+                        
+                        if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = n_active
+                        if 'u_active_casters' in prog: prog['u_active_casters'].write(active_casters_buf.tobytes())
+                        if 'u_active_caster_poles_obl' in prog: prog['u_active_caster_poles_obl'].write(active_poles_obl_buf.tobytes())
+                        if 'u_active_caster_atmos' in prog: prog['u_active_caster_atmos'].write(active_atmos_buf.tobytes())
+                        
+                        if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
+                        if n_ring_planes > 0:
+                            if 'u_ring_center' in prog: prog['u_ring_center'].write(ring_centers_buf)
+                            if 'u_ring_normal' in prog: prog['u_ring_normal'].write(ring_normals_buf)
+                            if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
+                            
+                    if use_sky_view:
+                        ctx.disable(moderngl.BLEND)
+                        ctx.disable(moderngl.CULL_FACE)
+                        self.sky_view_lut_fbo.use()
+                        self.sky_view_lut_fbo.clear(0.0, 0.0, 0.0, 0.0)
+                        ctx.viewport = (0, 0, self.sky_view_lut_tex_color.width, self.sky_view_lut_tex_color.height)
+                        
+                        prog = self.prog_sky_view_lut_pass
+                        if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
+                        if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
+                        if 'lut_tex' in atmo: atmo['lut_tex'].use(location=1)
+                        if 'lut_multi_scatter' in atmo: atmo['lut_multi_scatter'].use(location=3)
+                        eclipse_lut_tex.use(location=2)
+                        
+                        prog = self.prog_sky_view_lut_pass
+                        if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
+                        if 'u_transmittance_lut' in prog: prog['u_transmittance_lut'].value = 1
+                        if 'u_multi_scatter_lut' in prog: prog['u_multi_scatter_lut'].value = 3
+                        
+                        self.sky_view_vao.render(moderngl.TRIANGLE_STRIP)
+                        
+                        if self.hdr_resolve_fbo:
+                            self.hdr_resolve_fbo.use()
+                            
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.enable(moderngl.BLEND)
+                        ctx.enable(moderngl.CULL_FACE)
+                        ctx.blend_func = (moderngl.ONE, 0x88F9)
+                        
+                        self.sky_view_lut_tex_color.use(location=6)
+                        self.sky_view_lut_tex_trans.use(location=7)
+                        if 'u_sky_view_lut_color' in prog_atmo: prog_atmo['u_sky_view_lut_color'].value = 6
+                        if 'u_sky_view_lut_transmittance' in prog_atmo: prog_atmo['u_sky_view_lut_transmittance'].value = 7
+
                     vao_atmo.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
@@ -3261,6 +3319,51 @@ class App:
                 if expanded:
                     # Atmosphere Quality
                     _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Extreme (Brute Force)"])
+                    
+                    imgui.separator()
+                    imgui.text("Sky View Rendering")
+                    
+                    # Sky View Mode
+                    sv_modes = ["Auto/Hybrid", "Pure Ray Marching", "Pure Sky View LUT"]
+                    changed_mode, self.camera["sky_view_mode"] = imgui.combo("Rendering Mode", self.camera.get("sky_view_mode", 0), sv_modes)
+                    
+                    # Hybrid Distance
+                    if self.camera["sky_view_mode"] == 0:
+                        _, self.camera["sky_view_hybrid_dist"] = imgui.slider_float("Hybrid Switch Distance", self.camera.get("sky_view_hybrid_dist", 1.1), 0.1, 10.0, "%.1f x Atmo Radius")
+                        
+                    # Sky View Quality
+                    sv_qualities = ["Low (256x128)", "Medium (512x256)", "High (1024x512)", "Ultra (2048x1024)", "Extreme (4096x2048)", "Custom"]
+                    changed_q, new_q = imgui.combo("LUT Quality", self.camera.get("sky_view_quality", 2), sv_qualities)
+                    if changed_q:
+                        self.camera["sky_view_quality"] = new_q
+                        
+                    if self.camera.get("sky_view_quality", 2) == 5:
+                        cw, ch = self.camera.get("sky_view_custom_res", (1024, 512))
+                        _, cw = imgui.input_int("Custom Width", cw)
+                        _, ch = imgui.input_int("Custom Height", ch)
+                        self.camera["sky_view_custom_res"] = (max(16, cw), max(16, ch))
+                        if imgui.button("Apply Custom Resolution"):
+                            self.camera["sky_view_quality_changed"] = True
+                            
+                    if changed_q or self.camera.pop("sky_view_quality_changed", False):
+                        q_idx = self.camera.get("sky_view_quality", 2)
+                        q_dims = [(256, 128), (512, 256), (1024, 512), (2048, 1024), (4096, 2048)]
+                        w, h = self.camera.get("sky_view_custom_res", (1024, 512)) if q_idx == 5 else q_dims[q_idx]
+                        
+                        # Release old resources
+                        if hasattr(self, 'sky_view_lut_fbo') and self.sky_view_lut_fbo:
+                            self.sky_view_lut_fbo.release()
+                            self.sky_view_lut_tex_color.release()
+                            self.sky_view_lut_tex_trans.release()
+                            
+                        # Recreate
+                        self.sky_view_lut_tex_color = ctx.texture((w, h), 4, dtype='f2')
+                        self.sky_view_lut_tex_trans = ctx.texture((w, h), 4, dtype='f2')
+                        self.sky_view_lut_tex_color.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                        self.sky_view_lut_tex_trans.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                        self.sky_view_lut_fbo = ctx.framebuffer(color_attachments=[self.sky_view_lut_tex_color, self.sky_view_lut_tex_trans])
+                    
+                    imgui.separator()
                     
                     # Exposure & HDR
                     _, self.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", self.camera.get("hdr_enabled", True))
@@ -3874,39 +3977,52 @@ class App:
                         else:
                             imgui.text(f"  Altitude: 0 km (Surface)")
                     
-                    if not inspect_bary and 'star_props' in body_info:
-                        sp = body_info['star_props']
-                        imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
-                        imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
-                        imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
-                        imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
-                        
-                        rot_frac = sp.get('rot_frac', 0.0)
-                        if rot_frac > 0:
-                            imgui.text(f"  Rot Period:  {sp.get('rotation_period', 0.0):.2f} hours")
-                            imgui.text(f"  Eq Velocity: {sp.get('v_eq', 0.0):.2f} km/s")
-                            imgui.text(f"  Eq Radius:   {sp.get('r_eq', sp.get('radius', 0.0)):.4f} R\u2609")
-                            imgui.text(f"  Pole Radius: {sp.get('r_pole', sp.get('radius', 0.0)):.4f} R\u2609")
-                            imgui.text(f"  Eq Temp:     {sp.get('t_eq', sp.get('temp', 0.0)):,.0f} K")
-                            imgui.text(f"  Pole Temp:   {sp.get('t_pole', sp.get('temp', 0.0)):,.0f} K")
-                            imgui.text(f"  Eq Lum:      {sp.get('lum_eq', sp.get('lum', 0.0)):.4f} L\u2609")
-                            imgui.text(f"  Pole Lum:    {sp.get('lum_pole', sp.get('lum', 0.0)):.4f} L\u2609")
-                        
-                        if sp.get('mode') == 'evolution':
-                            imgui.text(f"  Metallicity: {sp.get('metallicity', 0.0):.3f}")
-                            age_gyr = sp.get('age', 0.0)
-                            if age_gyr < 0.1:
-                                imgui.text(f"  Age:         {age_gyr * 1000.0:,.1f} Myr")
-                            else:
-                                imgui.text(f"  Age:         {age_gyr:,.3f} Gyr")
+                    if not inspect_bary:
+                        if 'star_props' in body_info:
+                            sp = body_info['star_props']
+                            imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
+                            imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
+                            imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
+                            imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
                             
-                        lum = sp.get('lum', 1.0)
-                        abs_mag = 4.83 - 2.5 * math.log10(max(lum, 1e-10))
-                        dist_au = dist_to_center_km / 149597870.7
-                        dist_pc = dist_au / 206265.0
-                        app_mag = abs_mag + 5.0 * math.log10(max(dist_pc, 1e-10)) - 5.0
-                        imgui.text(f"  Abs Mag (M): {abs_mag:+.2f}")
-                        imgui.text(f"  App Mag (m): {app_mag:+.2f}")
+                            rot_frac = sp.get('rot_frac', 0.0)
+                            if rot_frac > 0:
+                                imgui.text(f"  Rot Period:  {sp.get('rotation_period', 0.0):.2f} hours")
+                                imgui.text(f"  Eq Velocity: {sp.get('v_eq', 0.0):.2f} km/s")
+                                imgui.text(f"  Eq Radius:   {sp.get('r_eq', sp.get('radius', 0.0)):.4f} R\u2609")
+                                imgui.text(f"  Pole Radius: {sp.get('r_pole', sp.get('radius', 0.0)):.4f} R\u2609")
+                                imgui.text(f"  Eq Temp:     {sp.get('t_eq', sp.get('temp', 0.0)):,.0f} K")
+                                imgui.text(f"  Pole Temp:   {sp.get('t_pole', sp.get('temp', 0.0)):,.0f} K")
+                                imgui.text(f"  Eq Lum:      {sp.get('lum_eq', sp.get('lum', 0.0)):.4f} L\u2609")
+                                imgui.text(f"  Pole Lum:    {sp.get('lum_pole', sp.get('lum', 0.0)):.4f} L\u2609")
+                            
+                            if sp.get('mode') == 'evolution':
+                                imgui.text(f"  Metallicity: {sp.get('metallicity', 0.0):.3f}")
+                                age_gyr = sp.get('age', 0.0)
+                                if age_gyr < 0.1:
+                                    imgui.text(f"  Age:         {age_gyr * 1000.0:,.1f} Myr")
+                                else:
+                                    imgui.text(f"  Age:         {age_gyr:,.3f} Gyr")
+                                    
+                            lum = sp.get('lum', 1.0)
+                            abs_mag = 4.83 - 2.5 * math.log10(max(lum, 1e-10))
+                            dist_au = dist_to_center_km / 149597870.7
+                            dist_pc = dist_au / 206265.0
+                            app_mag = abs_mag + 5.0 * math.log10(max(dist_pc, 1e-10)) - 5.0
+                            imgui.text(f"  Abs Mag (M): {abs_mag:+.2f}")
+                            imgui.text(f"  App Mag (m): {app_mag:+.2f}")
+                        else:
+                            c = visual_arr[insp_idx, 0:3]
+                            p_v = float(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+                            atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                            if atmo_item:
+                                p_surf = atmo_item.get('surface_pressure', 1.0)
+                                atmo_albedo = min(1.0, p_surf * 0.1) * 0.5
+                                p_v = min(1.0, p_v * (1.0 - min(1.0, p_surf * 0.1)) + atmo_albedo)
+                            if p_v > 0.0 and body_r_km > 0.0:
+                                diam_km = body_r_km * 2.0
+                                abs_mag_h = 5.0 * math.log10(1329.0 / (diam_km * math.sqrt(p_v)))
+                                imgui.text(f"  Abs Mag (H): {abs_mag_h:+.2f}")
 
                     if parent_idx >= 0:
                         imgui.separator()
@@ -4291,9 +4407,12 @@ class App:
                                     json.dump(exp, f, indent=4, cls=NumpyEncoder)
                                 print(f"Exported cosmetics to {filename}")
                             
-                        changed_c, new_c = imgui.color_edit3("Base Color", *visual_arr[insp_idx, 0:3])
+                        # Convert linear albedo to sRGB for the color picker
+                        srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in visual_arr[insp_idx, 0:3]]
+                        changed_c, new_c = imgui.color_edit3("Base Color (sRGB)", *srgb_c)
                         if changed_c:
-                            visual_arr[insp_idx, 0:3] = new_c
+                            # Convert back to linear before storing
+                            visual_arr[insp_idx, 0:3] = [pow(c, 2.2) if c > 0 else 0.0 for c in new_c]
                         
                         if imgui.collapsing_header("Atmosphere")[0]:
                             atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
@@ -4356,7 +4475,7 @@ class App:
                                             del atmo_item['lut_tex']
                                     imgui.tree_pop()
                                 
-                                changed_m, b_mie = imgui.drag_float("Aerosol Beta (x10^-6)", atmo_item.get('beta_mie', 21.0e-6)*1e6, 0.1)
+                                changed_m, b_mie = imgui.drag_float("Aerosol Beta (x10^-6)", atmo_item.get('beta_mie', 2.0e-6)*1e6, 0.1)
                                 if changed_m:
                                     atmo_item['beta_mie'] = b_mie * 1e-6
                                     atmo_item['_dirty'] = True
@@ -4384,7 +4503,7 @@ class App:
                                         'surface_pressure': 1.0,
                                         'temperature': 288.15,
                                         'composition': {"N2": 0.78, "O2": 0.21},
-                                        'beta_mie': 21.0e-6,
+                                        'beta_mie': 2.0e-6,
                                         'h_mie': 1.2,
                                         'mie_g': 0.758,
                                         'intensity': 1.0

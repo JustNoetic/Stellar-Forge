@@ -125,7 +125,7 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     _atmo_cache[cache_key] = res
     return res
 
-def compute_mie_coefficients(base_beta=21.0e-6, angstrom_exponent=1.2):
+def compute_mie_coefficients(base_beta=2.0e-6, angstrom_exponent=1.2):
     """
     Computes Mie scattering coefficients using the Angstrom exponent approximation.
     base_beta is the scattering coefficient at 550nm.
