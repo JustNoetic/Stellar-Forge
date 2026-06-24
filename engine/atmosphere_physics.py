@@ -61,7 +61,8 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     # Calculate aggregate physical properties
     avg_molar_mass = 0.0
     avg_n_minus_1 = 0.0
-    avg_king_factor = 0.0
+    king_numerator = 0.0
+    king_denominator = 0.0
     beta_absorption = np.zeros(3)
     
     pressure_pa = pressure_atm * P_STD
@@ -75,13 +76,18 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
         
         avg_molar_mass += m * fraction
         avg_n_minus_1 += (n - 1.0) * fraction
-        avg_king_factor += king * fraction
+        
+        # Bodhaine King factor weighting
+        f_i = fraction * ((n**2 - 1.0) / (n**2 + 2.0))**2
+        king_numerator += f_i * king
+        king_denominator += f_i
         
         # Absorption coefficient: cross section * number density of this specific gas
         gas_number_density = number_density * fraction
         beta_absorption += abs_cross * gas_number_density
         
     avg_n = 1.0 + avg_n_minus_1
+    avg_king_factor = king_numerator / king_denominator if king_denominator > 0 else 1.0
     
     # Rayleigh scattering cross section for the mixture
     # sigma = (24 * pi^3 / (lambda^4 * N_s^2)) * ((n^2 - 1)/(n^2 + 2))^2 * KingFactor
@@ -111,3 +117,13 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     
     _atmo_cache[cache_key] = res
     return res
+
+def compute_mie_coefficients(base_beta=21.0e-6, angstrom_exponent=1.2):
+    """
+    Computes Mie scattering coefficients using the Angstrom exponent approximation.
+    base_beta is the scattering coefficient at 550nm.
+    """
+    lambda_0 = 550e-9
+    # beta_mie = base_beta * (lambda / lambda_0)^(-alpha)
+    beta_mie = base_beta * (WAVELENGTHS / lambda_0) ** (-angstrom_exponent)
+    return beta_mie.astype(np.float32)

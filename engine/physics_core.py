@@ -1626,8 +1626,12 @@ def load_system_from_data(bodies_data_raw):
             pole_render = np.array([pole_ecl[0], pole_ecl[2], -pole_ecl[1]], dtype='f8')
             pole_dirs[idx] = pole_render
         obl = body.get('oblateness', 0.0)
+        pole_color = hex_to_rgb(body.get('color_pole', body.get('color', '#ffffff')))
+        lum_eq = body.get('lum_eq', 0.0)
+        lum_pole = body.get('lum_pole', 0.0)
         visual_data.append([color[0], color[1], color[2], radius_au, min_px,
-                            pole_render[0], pole_render[1], pole_render[2], obl])
+                            pole_render[0], pole_render[1], pole_render[2], obl,
+                            pole_color[0], pole_color[1], pole_color[2], lum_eq, lum_pole])
 
         j2 = body.get('J2', 0.0)
         if j2 > 0.0:

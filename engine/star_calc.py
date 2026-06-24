@@ -268,14 +268,28 @@ class StarCalculator:
             phase = f"{color_name} {size_name}"
 
         # Color Math
-        if is_bh:
-            color_hex = "#000000"
-        else:
-            t = apparent_temp / 100
+        def temp_to_hex(temp_k):
+            t = temp_k / 100
             r_c = 255 if t <= 66 else max(0, min(255, 329.69 * ((t - 60) ** -0.133)))
             g_c = max(0, min(255, 99.47 * math.log(max(1, t)) - 161.1)) if t <= 66 else max(0, min(255, 288.1 * ((t - 60) ** -0.075)))
             b_c = 255 if t >= 66 else (0 if t <= 19 else max(0, min(255, 138.5 * math.log(max(1, t - 10)) - 305)))
-            color_hex = f"#{int(r_c):02x}{int(g_c):02x}{int(b_c):02x}"
+            return f"#{int(r_c):02x}{int(g_c):02x}{int(b_c):02x}"
+
+        if is_bh:
+            color_hex = "#000000"
+            color_hex_pole = "#000000"
+            color_hex_eq = "#000000"
+        else:
+            color_hex = temp_to_hex(apparent_temp)
+            color_hex_pole = temp_to_hex(t_pole)
+            color_hex_eq = temp_to_hex(t_eq)
+
+        if apparent_temp > 0:
+            lum_eq = lum * ((r_eq * r_pole) / (radius ** 2)) * ((t_eq / temp) ** 4)
+            lum_pole = lum * ((r_eq * r_eq) / (radius ** 2)) * ((t_pole / temp) ** 4)
+        else:
+            lum_eq = 0
+            lum_pole = 0
 
         base_mass_for_life = mass if mode == "evolution" else current_mass
         base_l_for_life = cls.ms_lum_from_mass(base_mass_for_life) * lum_mult
@@ -348,5 +362,5 @@ class StarCalculator:
                 "oblateness": round(1.0 - (r_pole / r_eq), 3) if r_eq > 0 else 0,
                 "is_rotating": rot_frac > 0.05
             },
-            "visual": { "colorHex": color_hex, "is_bh": is_bh, "is_wr": phase_override == "Wolf-Rayet (WR)", "visual_oblateness": round(1.0 - (r_proj_y / r_eq), 3) if r_eq > 0 else 0 }
+            "visual": { "colorHex": color_hex, "colorHexEq": color_hex_eq, "colorHexPole": color_hex_pole, "lum_eq": round(lum_eq, 6), "lum_pole": round(lum_pole, 6), "is_bh": is_bh, "is_wr": phase_override == "Wolf-Rayet (WR)", "visual_oblateness": round(1.0 - (r_proj_y / r_eq), 3) if r_eq > 0 else 0 }
         }

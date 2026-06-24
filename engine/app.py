@@ -35,7 +35,7 @@ from physics_core import _extract_render_state, _update_hierarchy_core
 from render_utils import *
 from shaders import *
 from post_shaders import *
-from atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES
+from atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients
 _PERF_ENABLED = _os.environ.get("STELLAR_FORGE_PERF") == "1"
 _PERF_TRACKER = None
 
@@ -244,8 +244,12 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     h_r = props['scale_height_km']
     h_m = atmo.get('h_mie', 1.2)
     od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
-    od_m = beta_m * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
-    trans = np.exp(-(od_r + od_m) * 0.1)
+    od_m = compute_mie_coefficients(beta_m) * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
+    tau = od_r + od_m
+    direct_trans = np.exp(-tau)
+    forward_scatter = tau * np.exp(-tau * 0.8) * 0.3
+    multi_scatter = 0.02 * np.exp(-tau * 0.2)
+    trans = np.clip(direct_trans + forward_scatter + multi_scatter, 0.0, 1.0)
     thick = atmo.get('atmo_radius_au', 0.0) - atmo.get('surface_radius_au', 0.0)
     
     atmo['_cached_mass'] = mass_sm
@@ -1145,11 +1149,11 @@ class App:
         orbit_ssbo_out.bind_to_storage_buffer(binding=1)
         vao_gpu_orbits = ctx.vertex_array(prog_gpu_orbits, [])
     
-        UBO_SIZE = 4768
+        UBO_SIZE = 5280
         scene_ubo = ctx.buffer(reserve=UBO_SIZE)
         scene_ubo.bind_to_uniform_block(1)
         ubo_staging = np.zeros(UBO_SIZE // 4, dtype=np.float32)
-        ubo_casters_int_view = ubo_staging[166:167].view(np.int32)
+        ubo_casters_int_view = ubo_staging[294:295].view(np.int32)
         ubo_num_stars_int_view = ubo_staging[32:33].view(np.int32)
     
         uniform_screen_height = prog_spheres['screen_height']
@@ -1298,7 +1302,7 @@ class App:
     
         def build_atmo_lut(atmo, mass_sm):
             prev_fbo = ctx.fbo
-            lut_tex = ctx.texture((256, 256), 2, dtype='f4')
+            lut_tex = ctx.texture((256, 256), 4, dtype='f4')
             fbo = ctx.framebuffer(color_attachments=[lut_tex])
             
             mass_kg = mass_sm * 1.98847e30
@@ -1321,6 +1325,7 @@ class App:
             lut_tex.repeat_x = False
             lut_tex.repeat_y = False
             atmo['lut_tex'] = lut_tex
+            atmo['lut_mass'] = mass_sm
             
         print("[Render Loop] Entering main render loop")
         frame_counter = 0
@@ -1660,13 +1665,13 @@ class App:
                             subsys_mass_buf = np.append(subsys_mass_buf, mass)
                             
                             min_px = 3.0 if btype == "Star" else (1.0 if btype == "Moon" else 2.0)
-                            new_vis = np.array([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0], dtype='f4')
+                            new_vis = np.array([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0, color[0], color[1], color[2], 0.0, 0.0], dtype='f4')
                             visual_arr = np.vstack([visual_arr, new_vis])
                             visual_colors_f8 = np.vstack([visual_colors_f8, np.array(color, dtype='f8')])
                             body_colors = np.vstack([body_colors, np.array(color, dtype='f4')])
                             is_star_val = 1.0 if btype == "Star" else 0.0
                             is_star_arr = np.append(is_star_arr, is_star_val)
-                            visual_data.append([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0])
+                            visual_data.append([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0, color[0], color[1], color[2], 0.0, 0.0])
                             
                             inst_data_lo = np.vstack([inst_data_lo, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                             inst_data_hi = np.vstack([inst_data_hi, np.zeros(INSTANCE_FLOATS, dtype='f4')])
@@ -1925,10 +1930,11 @@ class App:
                     
                 sys_mgr_spice.populate_states_fast(et, self._ephem_mapping, pos_snap_render, vel_snap_render, spice_valid_mask)
     
-            if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
-                self.camera["roll"] += 60.0 * dt_render
-            if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
-                self.camera["roll"] -= 60.0 * dt_render
+            if not imgui.get_io().want_capture_keyboard:
+                if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
+                    self.camera["roll"] += 60.0 * dt_render
+                if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+                    self.camera["roll"] -= 60.0 * dt_render
 
             lerp_factor = 1.0 - math.exp(-15.0 * dt_render)
             self.camera["distance_actual"] += (self.camera["distance"] - self.camera["distance_actual"]) * lerp_factor
@@ -2166,6 +2172,10 @@ class App:
             all_instances[:num_bodies, 8] = is_star_arr
             all_instances[:num_bodies, 9:12] = visual_arr[:, 5:8]
             all_instances[:num_bodies, 12] = visual_arr[:, 8]
+            if visual_arr.shape[1] > 9:
+                all_instances[:num_bodies, 13:16] = visual_arr[:, 9:12]
+                all_instances[:num_bodies, 19] = visual_arr[:, 12]
+                all_instances[:num_bodies, 23] = visual_arr[:, 13]
             
             if self.comparison_enabled:
                 cmp_pos_rel = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -2174,6 +2184,10 @@ class App:
                 all_instances[num_bodies:, 8] = self.is_star_arr_cmp
                 all_instances[num_bodies:, 9:12] = self.visual_arr_cmp[:, 5:8]
                 all_instances[num_bodies:, 12] = self.visual_arr_cmp[:, 8]
+                if self.visual_arr_cmp.shape[1] > 9:
+                    all_instances[num_bodies:, 13:16] = self.visual_arr_cmp[:, 9:12]
+                    all_instances[num_bodies:, 19] = self.visual_arr_cmp[:, 12]
+                    all_instances[num_bodies:, 23] = self.visual_arr_cmp[:, 13]
             
             # Precalculate planetshine bounce light direction & color on CPU using Numba
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
@@ -2370,6 +2384,8 @@ class App:
             # Gather all active stars in the unified scene (both primary and comparison)
             stars_pos_radius = []
             stars_colors = []
+            stars_poles_obl = []
+            stars_pole_colors = []
             
             for i in range(total_render_bodies):
                 if all_instances[i, 8] > 0.5:
@@ -2386,18 +2402,39 @@ class App:
                     if "star_props" in b_data and "lum" in b_data["star_props"]:
                         lum = float(b_data["star_props"]["lum"])
                         
+                    lum_eq = all_instances[i, 19]
+                    lum_pole = all_instances[i, 23]
+                    
+                    if lum_eq == 0.0:
+                        lum_eq = lum
+                    if lum_pole == 0.0:
+                        lum_pole = lum
+                        
                     stars_pos_radius.append([pos[0], pos[1], pos[2], radius])
-                    stars_colors.append([color[0], color[1], color[2], lum])
+                    stars_colors.append([color[0], color[1], color[2], lum_eq])
+                    
+                    pole = all_instances[i, 9:12]
+                    obl = all_instances[i, 12]
+                    pole_color = all_instances[i, 13:16]
+                    if pole_color[0] == 0.0 and pole_color[1] == 0.0 and pole_color[2] == 0.0:
+                        pole_color = color # fallback
+                        
+                    stars_poles_obl.append([pole[0], pole[1], pole[2], obl])
+                    stars_pole_colors.append([pole_color[0], pole_color[1], pole_color[2], lum_pole])
                     
             num_stars = len(stars_pos_radius)
             num_stars = min(num_stars, 16)
             stars_pos_radius = stars_pos_radius[:num_stars]
             stars_colors = stars_colors[:num_stars]
+            stars_poles_obl = stars_poles_obl[:num_stars]
+            stars_pole_colors = stars_pole_colors[:num_stars]
             
             if num_stars == 0:
                 num_stars = 1
                 stars_pos_radius = [[0.0, 0.0, 0.0, SOLAR_RADII_TO_AU]]
                 stars_colors = [[1.0, 1.0, 1.0, 1.0]]
+                stars_poles_obl = [[0.0, 1.0, 0.0, 0.0]]
+                stars_pole_colors = [[1.0, 1.0, 1.0, 1.0]]
             
             caster_data_buf[:n_casters_fixed, 0:3] = pos_rel_all[caster_indices[:n_casters_fixed]]
             caster_data_buf[:n_casters_fixed, 3] = body_radii[caster_indices[:n_casters_fixed]]
@@ -2438,23 +2475,30 @@ class App:
             # Write stars arrays
             stars_pos_radius_flat = np.zeros(64, dtype=np.float32)
             stars_colors_flat = np.zeros(64, dtype=np.float32)
+            stars_poles_obl_flat = np.zeros(64, dtype=np.float32)
+            stars_pole_colors_flat = np.zeros(64, dtype=np.float32)
             for s_idx in range(num_stars):
                 stars_pos_radius_flat[s_idx*4 : (s_idx+1)*4] = stars_pos_radius[s_idx]
                 stars_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_colors[s_idx]
+                stars_poles_obl_flat[s_idx*4 : (s_idx+1)*4] = stars_poles_obl[s_idx]
+                stars_pole_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_pole_colors[s_idx]
                 
             ubo_staging[36:100] = stars_pos_radius_flat
             ubo_staging[100:164] = stars_colors_flat
+            ubo_staging[164:228] = stars_poles_obl_flat
+            ubo_staging[228:292] = stars_pole_colors_flat
             
-            ubo_staging[164] = far
-            ubo_staging[165] = depth_C
+            ubo_staging[292] = far
+            ubo_staging[293] = depth_C
+            ubo_casters_int_view = ubo_staging[294:295].view(np.int32)
             ubo_casters_int_view[0] = n_casters_fixed
-            # Note: ubo_casters_int_view maps to ubo_staging[166:167]
-            ubo_staging[167] = 0.0 # padding
+            # Note: ubo_casters_int_view maps to ubo_staging[294:295]
+            ubo_staging[295] = 0.0 # padding
             
-            ubo_staging[168:424] = caster_data_buf.ravel()
-            ubo_staging[424:680] = caster_poles_obl_buf.ravel()
-            ubo_staging[680:936] = caster_colors_buf.ravel()
-            ubo_staging[936:1192] = caster_atmos_buf.ravel()
+            ubo_staging[296:552] = caster_data_buf.ravel()
+            ubo_staging[552:808] = caster_poles_obl_buf.ravel()
+            ubo_staging[808:1064] = caster_colors_buf.ravel()
+            ubo_staging[1064:1320] = caster_atmos_buf.ravel()
             
             scene_ubo.write(ubo_staging.tobytes())
             
@@ -2709,7 +2753,7 @@ class App:
                     else:
                         mass_sm = mass_snap[atmo['body_idx']]
                     
-                    if 'lut_tex' not in atmo:
+                    if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm:
                         build_atmo_lut(atmo, mass_sm)
                     atmo['lut_tex'].use(location=1)
                     
@@ -2723,7 +2767,8 @@ class App:
                     u_atmo_atmo_radius.value = float(atmo['atmo_radius_km'])
                     u_atmo_beta_rayleigh.write(props['beta_rayleigh'])
                     u_atmo_h_rayleigh.value = props['scale_height_km']
-                    u_atmo_beta_mie.value = atmo.get('beta_mie', 21.0e-6)
+                    beta_mie_val = atmo.get('beta_mie', 21.0e-6)
+                    u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
                     u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
                     u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
                     u_atmo_beta_absorption.write(props['beta_absorption'])
@@ -3133,6 +3178,26 @@ class App:
                         "metallicity": 0.0,
                         "age_pct": 46.0,
                     }
+                
+                if active_system_name != sys_mgr.SOLAR_SYSTEM_NAME:
+                    imgui.push_style_color(imgui.COLOR_TEXT, 1.0, 0.4, 0.4)
+                    if imgui.selectable("- Delete Current System")[0]:
+                        sys_mgr.delete_system(active_system_name)
+                        target_name = sys_mgr.SOLAR_SYSTEM_NAME
+                        raw_data = sys_mgr.load_system_data(target_name)
+                        new_bndl = load_system_from_data(raw_data)
+                        req = {
+                            "old_bodies_data": bodies_data,
+                            "old_visual_data": visual_data,
+                            "old_atmo_bodies": atmo_bodies,
+                            "old_ring_bodies": ring_bodies,
+                            "old_star_idx": star_idx,
+                            "new_bundle": new_bndl,
+                        }
+                        with self.shared_state["lock"]:
+                            self.shared_state["system_switch_request"] = req
+                    imgui.pop_style_color()
+                    
                 imgui.end_popup()
     
             imgui.separator()
@@ -3640,9 +3705,26 @@ class App:
                         imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
                         imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
                         imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
+                        imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
+                        
+                        rot_frac = sp.get('rot_frac', 0.0)
+                        if rot_frac > 0:
+                            imgui.text(f"  Rot Period:  {sp.get('rotation_period', 0.0):.2f} hours")
+                            imgui.text(f"  Eq Velocity: {sp.get('v_eq', 0.0):.2f} km/s")
+                            imgui.text(f"  Eq Radius:   {sp.get('r_eq', sp.get('radius', 0.0)):.4f} R\u2609")
+                            imgui.text(f"  Pole Radius: {sp.get('r_pole', sp.get('radius', 0.0)):.4f} R\u2609")
+                            imgui.text(f"  Eq Temp:     {sp.get('t_eq', sp.get('temp', 0.0)):,.0f} K")
+                            imgui.text(f"  Pole Temp:   {sp.get('t_pole', sp.get('temp', 0.0)):,.0f} K")
+                            imgui.text(f"  Eq Lum:      {sp.get('lum_eq', sp.get('lum', 0.0)):.4f} L\u2609")
+                            imgui.text(f"  Pole Lum:    {sp.get('lum_pole', sp.get('lum', 0.0)):.4f} L\u2609")
+                        
                         if sp.get('mode') == 'evolution':
                             imgui.text(f"  Metallicity: {sp.get('metallicity', 0.0):.3f}")
-                            imgui.text(f"  Age:         {sp.get('age', 0.0):.3f} Gyr")
+                            age_gyr = sp.get('age', 0.0)
+                            if age_gyr < 0.1:
+                                imgui.text(f"  Age:         {age_gyr * 1000.0:,.1f} Myr")
+                            else:
+                                imgui.text(f"  Age:         {age_gyr:,.3f} Gyr")
                             
                         lum = sp.get('lum', 1.0)
                         abs_mag = 4.83 - 2.5 * math.log10(max(lum, 1e-10))
@@ -4348,6 +4430,12 @@ class App:
                     if "star_mode" not in cd: cd["star_mode"] = "Evolution Track"
                     
                     imgui.spacing()
+                    imgui.text_colored("Rotation", 0.4, 1.0, 0.7)
+                    if "rot_frac_pct" not in cd: cd["rot_frac_pct"] = 0.0
+                    _, cd["rot_frac_pct"] = imgui.drag_float("Critical Rotation (%)", cd["rot_frac_pct"], 1.0, 0.0, 99.0, format="%.1f%%")
+                    cd["rot_frac"] = cd["rot_frac_pct"] / 100.0
+                    
+                    imgui.spacing()
                     changed_m, mode_idx = imgui.combo("Creation Mode", 0 if cd["star_mode"]=="Evolution Track" else 1, ["Evolution Track", "Surface Physics"])
                     if changed_m: cd["star_mode"] = ["Evolution Track", "Surface Physics"][mode_idx]
                     
@@ -4372,7 +4460,7 @@ class App:
                             from star_calc import StarCalculator
                             age_pct = cd["age_pct"] / 100.0
                             
-                            preview = StarCalculator.forge(mode="evolution", evo_path=cd.get("evo_path", "standard"), mass=cd["mass"], metallicity=cd["metallicity"], age_pct=age_pct)
+                            preview = StarCalculator.forge(mode="evolution", evo_path=cd.get("evo_path", "standard"), mass=cd["mass"], metallicity=cd["metallicity"], age_pct=age_pct, rot_frac=cd.get("rot_frac", 0.0))
                             hx = preview["visual"]["colorHex"].lstrip('#')
                             pr, pg, pb = int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0
                         except Exception as e:
@@ -4416,7 +4504,8 @@ class App:
                                 preview = StarCalculator.forge(mode="surface", mass=1.0, metallicity=0.0,
                                     radius=cd["radius"] if cd["locked_rad"] else None,
                                     temp=cd["temp"] if cd["locked_temp"] else None,
-                                    lum=cd["lum"] if cd["locked_lum"] else None)
+                                    lum=cd["lum"] if cd["locked_lum"] else None,
+                                    rot_frac=cd.get("rot_frac", 0.0))
                                 hx = preview["visual"]["colorHex"].lstrip('#')
                                 pr, pg, pb = int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0
                             except Exception as e:
@@ -4433,8 +4522,36 @@ class App:
                         imgui.text(f"  Luminosity:     {preview['physical']['lum_lsun']:.4f} L\u2609")
                         imgui.text(f"  Radius:         {preview['physical']['radius_rsun']:.4f} R\u2609")
                         imgui.text(f"  Mass:           {preview['physical']['mass_msun']:.4f} M\u2609")
+                        
+                        rot_frac = cd.get("rot_frac", 0.0)
+                        if rot_frac > 0:
+                            v_crit_m_s = math.sqrt((6.6743e-11 * preview['physical']['mass_msun'] * 1.9884e30) / (preview['physical']['radius_rsun'] * 6.957e8))
+                            v_eq_m_s = v_crit_m_s * rot_frac
+                            circumference_m = 2.0 * math.pi * (preview['physical']['radius_rsun'] * 6.957e8)
+                            rot_period_s = circumference_m / max(v_eq_m_s, 1e-5)
+                            cd["rotation_period"] = rot_period_s / 3600.0
+                        else:
+                            cd["rotation_period"] = 0.0
+                            v_eq_m_s = 0.0
+                            
+                        imgui.text(f"  Rotation Period:{cd['rotation_period']:,.2f} hours")
+                        imgui.text(f"  Equatorial Vel: {v_eq_m_s/1000.0:,.2f} km/s")
+                        if rot_frac > 0:
+                            imgui.text(f"  Eq Radius:      {preview['rotation']['r_eq']:.4f} R\u2609")
+                            imgui.text(f"  Pole Radius:    {preview['rotation']['r_pole']:.4f} R\u2609")
+                            imgui.text(f"  Eq Temp:        {preview['rotation']['t_eq']:,.0f} K")
+                            imgui.text(f"  Pole Temp:      {preview['rotation']['t_pole']:,.0f} K")
+                            imgui.text(f"  Eq Lum:         {preview['visual']['lum_eq']:.4f} L\u2609")
+                            imgui.text(f"  Pole Lum:       {preview['visual']['lum_pole']:.4f} L\u2609")
+                        
                         imgui.text(f"  Spectral Class: {preview['classification']['fullDesignation']}")
                         imgui.text(f"  Stage:          {preview['evolution']['phase']}")
+                        
+                        age_gyr = preview['evolution']['age_gyr']
+                        if age_gyr < 0.1:
+                            imgui.text(f"  Age:            {age_gyr * 1000.0:,.1f} Myr")
+                        else:
+                            imgui.text(f"  Age:            {age_gyr:,.3f} Gyr")
                         
                         # Color preview
                         imgui.spacing()
@@ -4443,7 +4560,7 @@ class App:
                         imgui.color_button("##star_color_preview", pr, pg, pb, 1.0, 0, 20, 20)
                     else:
                         imgui.text_colored("Invalid parameters.", 1.0, 0.3, 0.3)
-                    
+                        
                     imgui.separator()
                     
                     # Validation
@@ -4475,7 +4592,10 @@ class App:
                                 "mass": cd["mass"], "metallicity": cd["metallicity"], "age_pct": cd["age_pct"] / 100.0,
                                 "evo_path": cd.get("evo_path", "standard"),
                                 "radius": cd.get("radius", 1.0), "temp": cd.get("temp", 5778.0), "lum": cd.get("lum", 1.0),
-                                "locked_rad": cd.get("locked_rad", True), "locked_temp": cd.get("locked_temp", True), "locked_lum": cd.get("locked_lum", False)
+                                "locked_rad": cd.get("locked_rad", True), "locked_temp": cd.get("locked_temp", True), "locked_lum": cd.get("locked_lum", False),
+                                "rotation_period": cd.get("rotation_period", 0.0),
+                                "rot_frac": cd.get("rot_frac", 0.0),
+                                "inclination": cd.get("inclination", 0.0)
                             }
                             
                             # Create system on disk

@@ -1,7 +1,16 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 4035, in run
-    changed_c, new_c = imgui.color_edit3("Base Color", *visual_arr[insp_idx, 0:3])
-                                                        ~~~~~~~~~~^^^^^^^^^^^^^^^
-IndexError: index 3 is out of bounds for axis 0 with size 1
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 965, in run
+    prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Noetic\AppData\Local\Programs\Python\Python311\Lib\site-packages\moderngl\__init__.py", line 1978, in program
+    res.mglo, _members, res._subroutines, res._geom, res._glo = self.mglo.program(
+                                                                ^^^^^^^^^^^^^^^^^^
+_moderngl.Error: GLSL Compiler failed
+
+fragment_shader
+===============
+0(408) : error C1503: undefined variable "sun_dir"
+
+

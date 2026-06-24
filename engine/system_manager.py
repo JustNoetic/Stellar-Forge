@@ -427,17 +427,25 @@ class SystemManager:
                 lum=star_props.get("lum") if star_props.get("locked_lum") else None
             )
             
-        color_hex = res["visual"]["colorHex"]
+        color_hex_eq = res["visual"]["colorHexEq"]
+        color_hex_pole = res["visual"]["colorHexPole"]
+        lum_eq = res["visual"]["lum_eq"]
+        lum_pole = res["visual"]["lum_pole"]
         
         star = {
             "name": star_name,
             "type": "Star",
             "m": res["physical"]["mass_msun"],
-            "r": res["physical"]["radius_rsun"],
-            "color": color_hex,
+            "r": res["rotation"]["r_eq"],
+            "color": color_hex_eq,
+            "color_pole": color_hex_pole,
+            "lum_eq": lum_eq,
+            "lum_pole": lum_pole,
+            "oblateness": res["rotation"]["oblateness"],
             "is_root": True,
             "pole_ra": 270.0,
             "pole_dec": 66.5607089,
+            "rotation_period": star_props.get("rotation_period", 0.0),
             "star_props": {
                 "mode": mode,
                 "evo_path": star_props.get("evo_path", "standard"),
@@ -454,9 +462,17 @@ class SystemManager:
                 "locked_rad": star_props.get("locked_rad", True),
                 "locked_temp": star_props.get("locked_temp", True),
                 "locked_lum": star_props.get("locked_lum", False),
+                "rotation_period": star_props.get("rotation_period", 0.0),
                 
                 "class": res["classification"]["fullDesignation"],
-                "stage": res["evolution"]["phase"]
+                "stage": res["evolution"]["phase"],
+                "r_eq": res["rotation"]["r_eq"],
+                "r_pole": res["rotation"]["r_pole"],
+                "t_eq": res["rotation"]["t_eq"],
+                "t_pole": res["rotation"]["t_pole"],
+                "lum_eq": res["visual"]["lum_eq"],
+                "lum_pole": res["visual"]["lum_pole"],
+                "v_eq": res["rotation"]["v_eq"]
             },
             "sv": {"x": 0, "y": 0, "z": 0, "vx": 0, "vy": 0, "vz": 0},
         }

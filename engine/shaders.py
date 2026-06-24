@@ -166,6 +166,8 @@ layout(std140, binding = 1) uniform SceneData {
     float _pad0, _pad1, _pad2;
     vec4 u_stars_pos_radius[MAX_STARS]; // xyz = pos, w = radius
     vec4 u_stars_colors[MAX_STARS];     // rgb = color, w = intensity
+    vec4 u_stars_poles_obl[MAX_STARS];  // xyz = pole, w = oblateness
+    vec4 u_stars_pole_colors[MAX_STARS]; // rgb = pole color, w = pole intensity
     float u_far;
     float u_depth_C;
     int u_num_casters;
@@ -262,6 +264,8 @@ layout(std140, binding = 1) uniform SceneData {
     float _pad0, _pad1, _pad2;
     vec4 u_stars_pos_radius[MAX_STARS]; // xyz = pos, w = radius
     vec4 u_stars_colors[MAX_STARS];     // rgb = color, w = intensity
+    vec4 u_stars_poles_obl[MAX_STARS];  // xyz = pole, w = oblateness
+    vec4 u_stars_pole_colors[MAX_STARS]; // rgb = pole color, w = pole intensity
     float u_far;
     float u_depth_C;
     int u_num_casters;
@@ -326,17 +330,28 @@ void main() {
         
         // Find which star this is to get its luminosity and radius
         float star_lum = 1.0;
-        float star_r = 0.0046547454; // 1 solar radius in AU (exact: SOLAR_RADIUS_KM / AU_TO_KM)
+        float star_r = 0.0046547454; // 1 solar radius in AU
+        vec3 star_base_color = f_color; // fallback
         for (int s = 0; s < u_num_stars; s++) {
             if (distance(f_world_pos, u_stars_pos_radius[s].xyz) < u_stars_pos_radius[s].w * 1.5) {
-                star_lum = u_stars_colors[s].a;
                 star_r = max(u_stars_pos_radius[s].w, 1e-6);
+                
+                vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+                float sin_lat = abs(dot(N, pole_dir));
+                
+                vec3 eq_color = u_stars_colors[s].rgb;
+                float eq_lum = u_stars_colors[s].a;
+                vec3 pole_color = u_stars_pole_colors[s].rgb;
+                float pole_lum = u_stars_pole_colors[s].a;
+                
+                star_base_color = mix(eq_color, pole_color, sin_lat);
+                star_lum = mix(eq_lum, pole_lum, sin_lat);
                 break;
             }
         }
         
         float surface_luminance = u_hdr_enabled ? (star_lum / (star_r * star_r)) : 1.0;
-        vec3 final_star_color = f_color * color_shift * ld * surface_luminance;
+        vec3 final_star_color = star_base_color * color_shift * ld * surface_luminance;
         if (u_hdr_enabled) {
             final_star_color *= u_exposure;
         }
@@ -348,14 +363,21 @@ void main() {
         for (int s = 0; s < u_num_stars; s++) {
             vec3 star_pos = u_stars_pos_radius[s].xyz;
             float star_radius = u_stars_pos_radius[s].w;
-            vec3 star_color = u_stars_colors[s].rgb;
-            
             vec3 frag_to_star = star_pos - f_world_pos;
             float dist_to_star = length(frag_to_star);
             if (dist_to_star < 1e-5) continue;
             vec3 L = frag_to_star / dist_to_star;
             
-            float star_lum = u_stars_colors[s].a;
+            vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+            float sin_lat = abs(dot(L, pole_dir));
+            
+            vec3 eq_color = u_stars_colors[s].rgb;
+            float eq_lum = u_stars_colors[s].a;
+            vec3 pole_color = u_stars_pole_colors[s].rgb;
+            float pole_lum = u_stars_pole_colors[s].a;
+            
+            vec3 star_color = mix(eq_color, pole_color, sin_lat);
+            float star_lum = mix(eq_lum, pole_lum, sin_lat);
             
             // Angular radius of the star for soft penumbra at terminator
             float star_ang_radius = star_radius / dist_to_star;
@@ -402,19 +424,27 @@ void main() {
                 if (perp_sq > max_r_penumbra * max_r_penumbra) continue;
                 
                 float oblateness = u_caster_poles_obl[j].w;
+                vec3 perp_vec = frag_to_caster - t_proj * L;
                 if (oblateness > 0.0) {
                     vec3 pole = u_caster_poles_obl[j].xyz;
-                    vec3 perp_vec = frag_to_caster - t_proj * L;
                     caster_r = get_oblate_radius(caster_r, oblateness, pole, L, perp_vec);
                 }
                 
+                float directional_star_r = star_radius;
+                float star_obl = u_stars_poles_obl[s].w;
+                if (star_obl > 0.0) {
+                    vec3 star_pole = u_stars_poles_obl[s].xyz;
+                    directional_star_r = get_oblate_radius(star_radius, star_obl, star_pole, L, perp_vec);
+                }
+                float local_star_radius_over_dist = directional_star_r / dist_to_star;
+                
                 // Perfect Bounding Cone Early Out (Zero Artifacts)
                 float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
-                float r_penumbra = effective_r + dist_to_caster * star_radius_over_dist;
+                float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
                 if (perp_sq > r_penumbra * r_penumbra) continue;
                 
                 float inv_dist = 1.0 / dist_to_caster;
-                float alpha = star_radius_over_dist;
+                float alpha = local_star_radius_over_dist;
                 float beta = caster_r * inv_dist;
                 float gamma = sqrt(perp_sq) * inv_dist;
                 
@@ -427,7 +457,7 @@ void main() {
                 vec3 caster_shadow = vec3(1.0 - occ);
                 
                 if (atmo_h > 0.0 && gamma < penumbra_outer) {
-                    float max_bend = clamp(atmo_h * 25000.0, 0.001, 0.05);
+                    float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * caster_r / max(1.0, atmo_h * caster_r * 2.0)), 0.001, 0.05);
                     float req_bend = beta - gamma;
                     
                     float optical_depth = max(0.0, req_bend);
@@ -586,10 +616,22 @@ void main() {
             
             for (int s = 0; s < u_num_stars; s++) {
                 vec3 star_pos = u_stars_pos_radius[s].xyz;
-                vec3 star_color = u_stars_colors[s].rgb;
                 float star_radius = u_stars_pos_radius[s].w;
-                vec3 L = normalize(star_pos - f_world_pos);
-                float dist_to_star = distance(star_pos, f_world_pos);
+                vec3 frag_to_star = star_pos - f_world_pos;
+                float dist_to_star = length(frag_to_star);
+                if (dist_to_star < 1e-5) continue;
+                vec3 L = frag_to_star / dist_to_star;
+                
+                vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+                float sin_lat = abs(dot(L, pole_dir));
+                
+                vec3 eq_color = u_stars_colors[s].rgb;
+                float eq_lum = u_stars_colors[s].a;
+                vec3 pole_color = u_stars_pole_colors[s].rgb;
+                float pole_lum = u_stars_pole_colors[s].a;
+                
+                vec3 star_color = mix(eq_color, pole_color, sin_lat);
+                float star_lum = mix(eq_lum, pole_lum, sin_lat);
                 
                 float sun_elevation = dot(L, ring_normal);
                 float star_ang_radius = star_radius / max(dist_to_star, 1e-6);
@@ -698,7 +740,6 @@ void main() {
                     }
                 }
                 
-                float star_lum = u_stars_colors[s].a;
                 float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star * dist_to_star, 1e-8)) : 1.0;
                 
                 vec3 ring_tint = u_ring_colors[k] * 1.2;
@@ -960,6 +1001,8 @@ layout(std140, binding = 1) uniform SceneData {
     float _pad0, _pad1, _pad2;
     vec4 u_stars_pos_radius[MAX_STARS]; // xyz = pos, w = radius
     vec4 u_stars_colors[MAX_STARS];     // rgb = color, w = intensity
+    vec4 u_stars_poles_obl[MAX_STARS];  // xyz = pole, w = oblateness
+    vec4 u_stars_pole_colors[MAX_STARS]; // rgb = pole color, w = pole intensity
     float u_far;
     float u_depth_C;
     int u_num_casters;
@@ -1004,6 +1047,8 @@ layout(std140, binding = 1) uniform SceneData {
     float _pad0, _pad1, _pad2;
     vec4 u_stars_pos_radius[MAX_STARS];
     vec4 u_stars_colors[MAX_STARS];
+    vec4 u_stars_poles_obl[MAX_STARS];
+    vec4 u_stars_pole_colors[MAX_STARS];
     float u_far;
     float u_depth_C;
     int u_num_casters;
@@ -1147,14 +1192,21 @@ void main() {
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = u_stars_pos_radius[s].w;
-        vec3 star_color = u_stars_colors[s].rgb;
-        
         vec3 frag_to_star = star_pos - f_world_pos;
         float dist_to_star = length(frag_to_star);
         if (dist_to_star < 1e-5) continue;
         vec3 L = frag_to_star / dist_to_star;
         
-        float star_lum = u_stars_colors[s].a;
+        vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+        float sin_lat = abs(dot(L, pole_dir));
+        
+        vec3 eq_color = u_stars_colors[s].rgb;
+        float eq_lum = u_stars_colors[s].a;
+        vec3 pole_color = u_stars_pole_colors[s].rgb;
+        float pole_lum = u_stars_pole_colors[s].a;
+        
+        vec3 star_color = mix(eq_color, pole_color, sin_lat);
+        float star_lum = mix(eq_lum, pole_lum, sin_lat);
         
         float cos_theta = -dot(L, V);
         
@@ -1227,18 +1279,26 @@ void main() {
             if (perp_sq > max_r_penumbra * max_r_penumbra) continue;
             
             float oblateness = u_caster_poles_obl[j].w;
+            vec3 perp_vec = frag_to_caster - t_proj * L;
             if (oblateness > 0.0) {
                 vec3 pole = u_caster_poles_obl[j].xyz;
-                vec3 perp_vec = frag_to_caster - t_proj * L;
                 caster_r = get_oblate_radius(caster_r, oblateness, pole, L, perp_vec);
             }
             
+            float directional_star_r = star_radius;
+            float star_obl = u_stars_poles_obl[s].w;
+            if (star_obl > 0.0) {
+                vec3 star_pole = u_stars_poles_obl[s].xyz;
+                directional_star_r = get_oblate_radius(star_radius, star_obl, star_pole, L, perp_vec);
+            }
+            float local_star_radius_over_dist = directional_star_r / dist_to_star;
+            
             float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
-            float r_penumbra = effective_r + dist_to_caster * star_radius_over_dist;
+            float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
             if (perp_sq > r_penumbra * r_penumbra) continue;
             
             float inv_dist = 1.0 / dist_to_caster;
-            float alpha = star_radius_over_dist;
+            float alpha = local_star_radius_over_dist;
             float beta = caster_r * inv_dist;
             float gamma = sqrt(perp_sq) * inv_dist;
             
@@ -1251,7 +1311,7 @@ void main() {
             vec3 caster_shadow = vec3(1.0 - occ);
             
             if (atmo_h > 0.0 && gamma < penumbra_outer) {
-                float max_bend = clamp(atmo_h * 25000.0, 0.001, 0.05);
+                float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * caster_r / max(1.0, atmo_h * caster_r * 2.0)), 0.001, 0.05);
                 float req_bend = beta - gamma;
                 
                 float optical_depth = max(0.0, req_bend);
@@ -1290,18 +1350,26 @@ void main() {
                 float max_r_penumbra = max_effective_r + dist_to_host * star_radius_over_dist;
                 
                 if (perp_sq <= max_r_penumbra * max_r_penumbra) {
+                    vec3 perp_vec = frag_to_host - t_proj * L;
                     if (host_oblateness > 0.0) {
                         vec3 host_pole = u_host_planet_pole_obl.xyz;
-                        vec3 perp_vec = frag_to_host - t_proj * L;
                         host_r = get_oblate_radius(host_r, host_oblateness, host_pole, L, perp_vec);
                     }
                     
+                    float directional_star_r = star_radius;
+                    float star_obl = u_stars_poles_obl[s].w;
+                    if (star_obl > 0.0) {
+                        vec3 star_pole = u_stars_poles_obl[s].xyz;
+                        directional_star_r = get_oblate_radius(star_radius, star_obl, star_pole, L, perp_vec);
+                    }
+                    float local_star_radius_over_dist = directional_star_r / dist_to_star;
+                    
                     float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
-                    float r_penumbra = effective_r + dist_to_host * star_radius_over_dist;
+                    float r_penumbra = effective_r + dist_to_host * local_star_radius_over_dist;
                     
                     if (perp_sq <= r_penumbra * r_penumbra) {
                         float inv_dist = 1.0 / dist_to_host;
-                        float alpha = star_radius_over_dist;
+                        float alpha = local_star_radius_over_dist;
                         float beta = host_r * inv_dist;
                         float gamma = sqrt(perp_sq) * inv_dist;
                         
@@ -1314,7 +1382,7 @@ void main() {
                         vec3 host_shadow = vec3(1.0 - occ);
                         
                         if (host_atmo_h > 0.0 && gamma < penumbra_outer) {
-                            float max_bend = clamp(host_atmo_h * 25000.0, 0.001, 0.05);
+                            float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * host_r / max(1.0, host_atmo_h * host_r * 2.0)), 0.001, 0.05);
                             float req_bend = beta - gamma;
                             
                             float optical_depth = max(0.0, req_bend);
@@ -1353,14 +1421,24 @@ void main() {
         float cam_planet_same_side = smoothstep(-0.02, 0.02, planet_side * cam_side);
         for (int s = 0; s < u_num_stars; s++) {
             vec3 star_pos = u_stars_pos_radius[s].xyz;
-            vec3 star_color = u_stars_colors[s].rgb;
-            float star_lum = u_stars_colors[s].a;
             vec3 host_to_star = star_pos - u_host_planet_pos;
             float dist_host_star = length(host_to_star);
+            vec3 L_host = host_to_star / max(dist_host_star, 1e-6);
+            
+            vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+            float sin_lat = abs(dot(L_host, pole_dir));
+            
+            vec3 eq_color = u_stars_colors[s].rgb;
+            float eq_lum = u_stars_colors[s].a;
+            vec3 pole_color = u_stars_pole_colors[s].rgb;
+            float pole_lum = u_stars_pole_colors[s].a;
+            
+            vec3 star_color = mix(eq_color, pole_color, sin_lat);
+            float star_lum = mix(eq_lum, pole_lum, sin_lat);
+            
             float irradiance = u_hdr_enabled ? (star_lum / max(dist_host_star * dist_host_star, 1e-8)) : 1.0;
             
-            host_to_star /= max(dist_host_star, 1e-6);
-            float planet_phase = max(0.0, dot(host_to_star, -dir_to_host));
+            float planet_phase = max(0.0, dot(L_host, -dir_to_host));
             float shine_intensity = planet_phase * solid_angle * planet_elevation;
             float p_reflect = rock_reflect + 0.3 * f_color.a; 
             float p_transmit = rock_transmit + 0.2 * f_color.a;
@@ -1392,6 +1470,8 @@ layout(std140, binding = 1) uniform SceneData {
     float _pad0, _pad1, _pad2;
     vec4 u_stars_pos_radius[MAX_STARS]; // xyz = pos, w = radius
     vec4 u_stars_colors[MAX_STARS];     // rgb = color, w = intensity
+    vec4 u_stars_poles_obl[MAX_STARS];  // xyz = pole, w = oblateness
+    vec4 u_stars_pole_colors[MAX_STARS]; // rgb = pole color, w = pole intensity
     float u_far;
     float u_depth_C;
     int u_num_casters;
@@ -1436,6 +1516,8 @@ layout(std140, binding = 1) uniform SceneData {
     float _pad0, _pad1, _pad2;
     vec4 u_stars_pos_radius[MAX_STARS]; // xyz = pos, w = radius
     vec4 u_stars_colors[MAX_STARS];     // rgb = color, w = intensity
+    vec4 u_stars_poles_obl[MAX_STARS];  // xyz = pole, w = oblateness
+    vec4 u_stars_pole_colors[MAX_STARS]; // rgb = pole color, w = pole intensity
     float u_far;
     float u_depth_C;
     int u_num_casters;
@@ -1462,7 +1544,7 @@ uniform float u_atmo_radius_km;
 uniform float u_au_to_km;
 uniform vec3  u_beta_rayleigh;
 uniform float u_h_rayleigh;
-uniform float u_beta_mie;
+uniform vec3 u_beta_mie;
 uniform float u_h_mie;
 uniform float u_mie_g;
 uniform vec3  u_beta_absorption;
@@ -1520,9 +1602,9 @@ float get_oblate_radius(float r_eq, float oblateness, vec3 pole, vec3 L, vec3 pe
     return perp_len / denom;
 }
 
-vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius) {
+vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius, float star_obl, vec3 star_pole) {
     vec3 shadow = vec3(1.0);
-    float star_radius_over_dist = star_radius / max(dist_to_star, 1e-6);
+    float base_star_radius_over_dist = star_radius / max(dist_to_star, 1e-6);
     
     for (int i = 0; i < u_num_active_casters; i++) {
         vec3 caster_pos = u_active_casters[i].xyz;
@@ -1540,19 +1622,25 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         vec3 cross_vec = cross(s_to_c, L_dir);
         float perp_sq = dot(cross_vec, cross_vec);
         
+        vec3 perp_vec = s_to_c - t_proj * L_dir;
         float oblateness = u_active_caster_poles_obl[i].w;
         if (oblateness > 0.0) {
             vec3 pole = u_active_caster_poles_obl[i].xyz;
-            vec3 perp_vec = s_to_c - t_proj * L_dir;
             caster_r = get_oblate_radius(caster_r, oblateness, pole, L_dir, perp_vec);
         }
         
+        float directional_star_r = star_radius;
+        if (star_obl > 0.0) {
+            directional_star_r = get_oblate_radius(star_radius, star_obl, star_pole, L_dir, perp_vec);
+        }
+        float local_star_radius_over_dist = directional_star_r / max(dist_to_star, 1e-6);
+        
         float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
-        float r_penumbra = effective_r + dist_to_caster * star_radius_over_dist;
+        float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
         if (perp_sq > r_penumbra * r_penumbra) continue;
         
         float inv_dist = 1.0 / dist_to_caster;
-        float alpha = star_radius_over_dist;
+        float alpha = local_star_radius_over_dist;
         float beta = caster_r * inv_dist;
         float gamma = sqrt(perp_sq) * inv_dist;
         
@@ -1565,7 +1653,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         vec3 caster_shadow = vec3(1.0 - occ);
         
         if (atmo_h > 0.0 && gamma < penumbra_outer) {
-            float max_bend = clamp(atmo_h * 25000.0, 0.001, 0.05);
+            float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * caster_r / max(1.0, atmo_h * caster_r * 2.0)), 0.001, 0.05);
             float req_bend = beta - gamma;
             
             float optical_depth = max(0.0, req_bend);
@@ -1684,6 +1772,7 @@ vec2 compute_optical_depth(vec3 origin, vec3 dir) {
     
     float od_rayleigh = 0.0;
     float od_mie = 0.0;
+    float od_ozone = 0.0;
     
     for (int i = 0; i < steps; i++) {
         vec3 p = origin + dir * ((float(i) + 0.5) * step_size);
@@ -1785,7 +1874,7 @@ void main() {
     if (s_start >= s_end) discard;
 
     vec3 beta_R = u_beta_rayleigh * 1000.0;
-    vec3 beta_M = vec3(u_beta_mie) * 1000.0;
+    vec3 beta_M = u_beta_mie * 1000.0;
     vec3 beta_A = u_beta_absorption * 1000.0;
 
     int steps = u_num_samples;
@@ -1793,19 +1882,30 @@ void main() {
     vec3 scattered = vec3(0.0);
     float final_od_rayleigh = 0.0;
     float final_od_mie = 0.0;
+    float final_od_ozone = 0.0;
 
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = u_stars_pos_radius[s].w;
-        vec3 star_color = u_stars_colors[s].rgb;
-        float star_lum = u_stars_colors[s].a;
-
-        float dist_to_star_au = length(star_pos - planet_center_render);
+        
+        vec3 frag_to_star = star_pos - planet_center_render;
+        float dist_to_star_au = length(frag_to_star);
+        vec3 L = frag_to_star / max(dist_to_star_au, 1e-6);
+        
+        vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+        float sin_lat = abs(dot(L, pole_dir));
+        
+        vec3 eq_color = u_stars_colors[s].rgb;
+        float eq_lum = u_stars_colors[s].a;
+        vec3 pole_color = u_stars_pole_colors[s].rgb;
+        float pole_lum = u_stars_pole_colors[s].a;
+        
+        vec3 star_color = mix(eq_color, pole_color, sin_lat);
+        float star_lum = mix(eq_lum, pole_lum, sin_lat);
         float sin_star = star_radius / max(dist_to_star_au, star_radius + 1e-6);
 
         vec3 sun_pos_local = (star_pos - planet_center_render) * u_au_to_km;
-        vec3 sun_dir = normalize(sun_pos_local);
-        vec3 sun_dir_sph = toSphericalSpace(sun_dir, u_pole_obl);
+        // sun_dir computed per-sample now
 
         vec3 global_eclipse_shadow = vec3(1.0);
         vec3 end_eclipse_shadow = vec3(1.0);
@@ -1835,7 +1935,7 @@ void main() {
 
         if (u_atmo_quality > 0) { 
             if (u_atmo_quality == 1) {
-                global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius);
+                global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
                 end_eclipse_shadow = global_eclipse_shadow;
             }
 
@@ -1969,7 +2069,7 @@ void main() {
                                 float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
                                 vec3 sh = vec3(1.0 - occ);
                                 if (atmo > 0.0 && gamma < po) {
-                                    float max_bend = clamp(atmo * 25000.0, 0.001, 0.05);
+                                    float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * r / max(1.0, atmo * r * 2.0)), 0.001, 0.05);
                                     float req_bend = beta - gamma;
                                     
                                     float optical_depth = max(0.0, req_bend);
@@ -2009,7 +2109,7 @@ void main() {
                                 float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
                                 vec3 sh = vec3(1.0 - occ);
                                 if (atmo > 0.0 && gamma < po) {
-                                    float max_bend = clamp(atmo * 25000.0, 0.001, 0.05);
+                                    float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * r / max(1.0, atmo * r * 2.0)), 0.001, 0.05);
                                     float req_bend = beta - gamma;
                                     
                                     float optical_depth = max(0.0, req_bend);
@@ -2048,6 +2148,7 @@ void main() {
 
         float od_rayleigh = 0.0;
         float od_mie = 0.0;
+        float od_ozone = 0.0;
         vec3 total_rayleigh = vec3(0.0);
         vec3 total_mie = vec3(0.0);
 
@@ -2061,10 +2162,14 @@ void main() {
 
             float rho_R = exp(-altitude / u_h_rayleigh);
             float rho_M = exp(-altitude / u_h_mie);
+            float rho_O = exp(-pow((altitude - 25.0) / 8.0, 2.0));
 
             od_rayleigh += rho_R * step_size;
             od_mie += rho_M * step_size;
+            od_ozone += rho_O * step_size;
 
+            vec3 sun_dir = normalize(sun_pos_local - current_pos_sph);
+            vec3 sun_dir_sph = toSphericalSpace(sun_dir, u_pole_obl);
             float light_cos_theta = dot(current_pos_sph / sample_len, sun_dir_sph);
             float h_norm = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
 
@@ -2094,7 +2199,7 @@ void main() {
 
             vec3 tau = beta_R * (od_rayleigh + od_light.r)
                      + beta_M * (od_mie + od_light.g)
-                     + beta_A * (od_rayleigh + od_light.r);
+                     + beta_A * (od_ozone + od_light.b);
 
             vec3 sample_shadow = global_eclipse_shadow;
             if (u_atmo_quality == 2 && !skip_volumetric_shadow) { 
@@ -2130,7 +2235,7 @@ void main() {
                 vec3 sample_render = sample_pos_local / u_au_to_km + planet_center_render;
                 vec3 sample_to_star = star_pos - sample_render;
                 float dist_sample_star = length(sample_to_star);
-                sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius);
+                sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
             }
 
             vec3 direct_attenuation = exp(-tau);
@@ -2140,13 +2245,14 @@ void main() {
             vec3 atten_ms = ms_attenuation * sample_shadow * vis_fraction;
 
             total_rayleigh += rho_R * (atten_direct + atten_ms) * step_size;
-            total_mie      += rho_M * atten_direct * step_size;
+            total_mie      += rho_M * (atten_direct + atten_ms) * step_size;
 
             current_pos_sph += step_dir_sph;
             current_s += step_size;
             t_lerp += t_step;
         }
 
+        vec3 sun_dir = normalize(sun_pos_local - current_pos_sph);
         float cos_theta = dot(ray_dir, sun_dir);
         float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
 
@@ -2164,11 +2270,12 @@ void main() {
 
         final_od_rayleigh = od_rayleigh;
         final_od_mie = od_mie;
+        final_od_ozone = od_ozone;
     }
 
     vec3 transmittance = exp(-(beta_R * final_od_rayleigh
                              + beta_M * final_od_mie
-                             + beta_A * final_od_rayleigh));
+                             + beta_A * final_od_ozone));
 
     if (u_hdr_enabled) {
         scattered *= u_exposure;
@@ -2233,6 +2340,7 @@ void main() {
     
     float od_rayleigh = 0.0;
     float od_mie = 0.0;
+    float od_ozone = 0.0;
     
     for (int i = 0; i < num_samples; i++) {
         float t = (float(i) + 0.5) * step_size;
@@ -2241,8 +2349,9 @@ void main() {
         
         od_rayleigh += exp(-h_sample / u_h_rayleigh) * step_size;
         od_mie += exp(-h_sample / u_h_mie) * step_size;
+        od_ozone += exp(-pow((h_sample - 25.0) / 8.0, 2.0)) * step_size;
     }
     
-    out_color = vec4(od_rayleigh, od_mie, 0.0, 1.0);
+    out_color = vec4(od_rayleigh, od_mie, od_ozone, 1.0);
 }
 """
