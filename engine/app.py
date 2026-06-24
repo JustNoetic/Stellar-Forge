@@ -1007,12 +1007,33 @@ class App:
         if 'u_eclipse_lut' in prog_atmo: prog_atmo['u_eclipse_lut'].value = 2
         
         self.prog_atmo_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=atmo_lut_fragment_shader)
+        self.prog_multi_scatter_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=multi_scatter_lut_fragment_shader)
+        self.prog_aerial_perspective = ctx.compute_shader(aerial_perspective_compute_shader)
         lut_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
         self.lut_vao = ctx.vertex_array(self.prog_atmo_lut, [(lut_vbo, '2f', 'in_position')])
-        if 'u_optical_depth_lut' in prog_atmo: prog_atmo['u_optical_depth_lut'].value = 1
+        self.multi_scatter_vao = ctx.vertex_array(self.prog_multi_scatter_lut, [(lut_vbo, '2f', 'in_position')])
+        
+        if 'u_transmittance_lut' in prog_atmo: prog_atmo['u_transmittance_lut'].value = 1
+        if 'u_multi_scatter_lut' in prog_atmo: prog_atmo['u_multi_scatter_lut'].value = 3
+        if 'u_aerial_perspective_volume' in prog_spheres: prog_spheres['u_aerial_perspective_volume'].value = 4
+        if 'u_aerial_perspective_volume' in prog_rings: prog_rings['u_aerial_perspective_volume'].value = 4
+
+        
+        
+        if 'u_transmittance_lut' in self.prog_aerial_perspective: self.prog_aerial_perspective['u_transmittance_lut'].value = 1
+        if 'u_multi_scatter_lut' in self.prog_aerial_perspective: self.prog_aerial_perspective['u_multi_scatter_lut'].value = 3
 
         ring_precomputed = []
         RING_SEGMENTS = 128
+
+        
+        self.ap_volume_tex = ctx.texture3d((32, 32, 32), 4, dtype='f2')
+        self.ap_volume_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.ap_volume_tex.repeat_x = False
+        self.ap_volume_tex.repeat_y = False
+        self.ap_volume_tex.repeat_z = False
+        
+
         for body_idx, rings_data, pole_render, body_radius_au in ring_bodies:
             pole_n = pole_render / np.linalg.norm(pole_render)
             ref = np.array([0., 0., 1.])
@@ -1198,33 +1219,33 @@ class App:
         u_ring_caster_mask_hi_uni = prog_rings['u_caster_mask_hi']
         u_ring_planetshine_enabled = prog_rings.get('u_planetshine_enabled', None)
 
-        u_atmo_body_offset = prog_atmo['u_body_offset']
+        u_atmo_body_offset = prog_atmo.get('u_body_offset', None)
         if 'u_ring_gradients' in prog_atmo:
             prog_atmo['u_ring_gradients'].value = 0
-        u_atmo_planet_radius = prog_atmo['u_planet_radius_km']
-        u_atmo_atmo_radius = prog_atmo['u_atmo_radius_km']
-        u_atmo_radius_au_uniform = prog_atmo['u_atmo_radius_au']
-        u_atmo_au_to_km = prog_atmo['u_au_to_km']
-        u_atmo_beta_rayleigh = prog_atmo['u_beta_rayleigh']
-        u_atmo_h_rayleigh = prog_atmo['u_h_rayleigh']
-        u_atmo_beta_mie = prog_atmo['u_beta_mie']
-        u_atmo_h_mie = prog_atmo['u_h_mie']
-        u_atmo_mie_g = prog_atmo['u_mie_g']
-        u_atmo_beta_absorption = prog_atmo['u_beta_absorption']
-        u_atmo_quality_uniform = prog_atmo['u_atmo_quality']
-        u_atmo_sun_intensity = prog_atmo['u_sun_intensity']
-        u_atmo_camera_pos = prog_atmo['u_camera_pos']
-        u_atmo_num_samples = prog_atmo['u_num_samples']
-        u_atmo_pole_obl = prog_atmo['u_pole_obl']
-        u_atmo_body_idx_uni = prog_atmo['u_body_idx']
-        u_atmo_num_ring_planes = prog_atmo['u_num_ring_planes']
-        u_atmo_ring_centers = prog_atmo['u_ring_center']
-        u_atmo_ring_normals = prog_atmo['u_ring_normal']
-        u_atmo_ring_params = prog_atmo['u_ring_params']
-        u_atmo_num_active_casters = prog_atmo['u_num_active_casters']
-        u_atmo_active_casters = prog_atmo['u_active_casters']
-        u_atmo_active_caster_poles_obl = prog_atmo['u_active_caster_poles_obl']
-        u_atmo_active_caster_atmos = prog_atmo['u_active_caster_atmos']
+        u_atmo_planet_radius = prog_atmo.get('u_planet_radius_km', None)
+        u_atmo_atmo_radius = prog_atmo.get('u_atmo_radius_km', None)
+        u_atmo_radius_au_uniform = prog_atmo.get('u_atmo_radius_au', None)
+        u_atmo_au_to_km = prog_atmo.get('u_au_to_km', None)
+        u_atmo_beta_rayleigh = prog_atmo.get('u_beta_rayleigh', None)
+        u_atmo_h_rayleigh = prog_atmo.get('u_h_rayleigh', None)
+        u_atmo_beta_mie = prog_atmo.get('u_beta_mie', None)
+        u_atmo_h_mie = prog_atmo.get('u_h_mie', None)
+        u_atmo_mie_g = prog_atmo.get('u_mie_g', None)
+        u_atmo_beta_absorption = prog_atmo.get('u_beta_absorption', None)
+        u_atmo_quality_uniform = prog_atmo.get('u_atmo_quality', None)
+        u_atmo_sun_intensity = prog_atmo.get('u_sun_intensity', None)
+        u_atmo_camera_pos = prog_atmo.get('u_camera_pos', None)
+        u_atmo_num_samples = prog_atmo.get('u_num_samples', None)
+        u_atmo_pole_obl = prog_atmo.get('u_pole_obl', None)
+        u_atmo_body_idx_uni = prog_atmo.get('u_body_idx', None)
+        u_atmo_num_ring_planes = prog_atmo.get('u_num_ring_planes', None)
+        u_atmo_ring_centers = prog_atmo.get('u_ring_center', None)
+        u_atmo_ring_normals = prog_atmo.get('u_ring_normal', None)
+        u_atmo_ring_params = prog_atmo.get('u_ring_params', None)
+        u_atmo_num_active_casters = prog_atmo.get('u_num_active_casters', None)
+        u_atmo_active_casters = prog_atmo.get('u_active_casters', None)
+        u_atmo_active_caster_poles_obl = prog_atmo.get('u_active_caster_poles_obl', None)
+        u_atmo_active_caster_atmos = prog_atmo.get('u_active_caster_atmos', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
 
 
@@ -1305,26 +1326,59 @@ class App:
             lut_tex = ctx.texture((256, 256), 4, dtype='f4')
             fbo = ctx.framebuffer(color_attachments=[lut_tex])
             
+            multi_scatter_tex = ctx.texture((32, 32), 4, dtype='f4')
+            ms_fbo = ctx.framebuffer(color_attachments=[multi_scatter_tex])
+            
             mass_kg = mass_sm * 1.98847e30
             radius_km = atmo['planet_radius_km']
             props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
+            
+            beta_rayleigh = props['beta_rayleigh']
+            beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 21.0e-6))
+            beta_absorption = props['beta_absorption']
             
             self.prog_atmo_lut['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
             self.prog_atmo_lut['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
             self.prog_atmo_lut['u_h_rayleigh'].value = float(props['scale_height_km'])
             self.prog_atmo_lut['u_h_mie'].value = float(atmo.get('h_mie', 1.2))
+            self.prog_atmo_lut['u_beta_rayleigh'].value = tuple(beta_rayleigh)
+            self.prog_atmo_lut['u_beta_mie'].value = tuple(beta_mie)
+            self.prog_atmo_lut['u_beta_absorption'].value = tuple(beta_absorption)
             
             fbo.use()
             self.lut_vao.render(moderngl.TRIANGLE_STRIP)
+            
+            lut_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            lut_tex.repeat_x = False
+            lut_tex.repeat_y = False
+            
+            lut_tex.use(location=1)
+            
+            self.prog_multi_scatter_lut['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
+            self.prog_multi_scatter_lut['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
+            self.prog_multi_scatter_lut['u_h_rayleigh'].value = float(props['scale_height_km'])
+            self.prog_multi_scatter_lut['u_h_mie'].value = float(atmo.get('h_mie', 1.2))
+            self.prog_multi_scatter_lut['u_beta_rayleigh'].value = tuple(beta_rayleigh)
+            self.prog_multi_scatter_lut['u_beta_mie'].value = tuple(beta_mie)
+            self.prog_multi_scatter_lut['u_beta_absorption'].value = tuple(beta_absorption)
+            if 'u_mie_g' in self.prog_multi_scatter_lut:
+                self.prog_multi_scatter_lut['u_mie_g'].value = float(atmo.get('mie_g', 0.8))
+            self.prog_multi_scatter_lut['u_transmittance_lut'].value = 1
+            
+            ms_fbo.use()
+            self.multi_scatter_vao.render(moderngl.TRIANGLE_STRIP)
+            
             if prev_fbo:
                 prev_fbo.use()
             else:
                 ctx.screen.use()
             
-            lut_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            lut_tex.repeat_x = False
-            lut_tex.repeat_y = False
+            multi_scatter_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            multi_scatter_tex.repeat_x = False
+            multi_scatter_tex.repeat_y = False
+            
             atmo['lut_tex'] = lut_tex
+            atmo['lut_multi_scatter'] = multi_scatter_tex
             atmo['lut_mass'] = mass_sm
             
         print("[Render Loop] Entering main render loop")
@@ -2538,11 +2592,80 @@ class App:
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo):
+            for prog in (prog_spheres, prog_rings, prog_atmo, self.prog_aerial_perspective):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
                     prog['u_hdr_enabled'].value = hdr_enabled
+                    
+            # --- Prepare and sort atmosphere bodies ---
+            sorted_atmos = []
+            if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
+                atmo_dists = []
+                if atmo_bodies:
+                    for atmo in atmo_bodies:
+                        dx = pos_rel_all[atmo['body_idx'], 0] - cam_pos[0]
+                        dy = pos_rel_all[atmo['body_idx'], 1] - cam_pos[1]
+                        dz = pos_rel_all[atmo['body_idx'], 2] - cam_pos[2]
+                        atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, False))
+                        
+                if self.comparison_enabled and self.atmo_bodies_cmp:
+                    for atmo in self.atmo_bodies_cmp:
+                        bi_cmp = atmo['body_idx']
+                        dx = cmp_pos_rel[bi_cmp, 0] - cam_pos[0]
+                        dy = cmp_pos_rel[bi_cmp, 1] - cam_pos[1]
+                        dz = cmp_pos_rel[bi_cmp, 2] - cam_pos[2]
+                        atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, True))
+                    
+                sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
+                
+            if sorted_atmos:
+                _, closest_atmo, is_cmp = sorted_atmos[-1]
+                bi = closest_atmo['body_idx']
+                body_pos_rel = cmp_pos_rel[bi].astype('f4') if is_cmp else pos_rel_all[bi]
+                mass_sm = self.mass_snap_cmp[bi] if is_cmp else mass_snap[bi]
+                
+                if 'lut_tex' not in closest_atmo or closest_atmo.get('lut_mass') != mass_sm:
+                    build_atmo_lut(closest_atmo, mass_sm)
+                
+                closest_atmo['lut_tex'].use(location=1)
+                closest_atmo['lut_multi_scatter'].use(location=3)
+                
+                props, _, _ = get_cached_atmosphere_properties(closest_atmo, mass_sm)
+                beta_mie_val = closest_atmo.get('beta_mie', 21.0e-6)
+                
+                prog = self.prog_aerial_perspective
+                if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
+                if 'u_body_offset' in prog: prog['u_body_offset'].write(body_pos_rel.astype('f4'))
+                if 'u_planet_radius_km' in prog: prog['u_planet_radius_km'].value = float(closest_atmo['planet_radius_km'])
+                if 'u_atmo_radius_km' in prog: prog['u_atmo_radius_km'].value = float(closest_atmo['atmo_radius_km'])
+                if 'u_atmo_radius_au' in prog: prog['u_atmo_radius_au'].value = float(closest_atmo['atmo_radius_au'])
+                if 'u_au_to_km' in prog: prog['u_au_to_km'].value = 149597870.7
+                if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
+                if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
+                if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                if 'u_h_mie' in prog: prog['u_h_mie'].value = closest_atmo.get('h_mie', 1.2)
+                if 'u_mie_g' in prog: prog['u_mie_g'].value = closest_atmo.get('mie_g', 0.758)
+                if 'u_beta_absorption' in prog: prog['u_beta_absorption'].write(props['beta_absorption'])
+                
+                bi = closest_atmo['body_idx']
+                if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = closest_atmo['intensity']
+                if 'u_body_idx' in prog: prog['u_body_idx'].value = bi
+                if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
+                    float(all_instances[bi, 9]),
+                    float(all_instances[bi, 10]),
+                    float(all_instances[bi, 11]),
+                    float(all_instances[bi, 12])
+                )
+                if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
+                if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
+                if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = 0 # AP shadow caching omitted for brevity
+                
+                
+                self.ap_volume_tex.bind_to_image(0, read=False, write=True)
+                self.prog_aerial_perspective.run(32 // 4, 32 // 4, 32 // 4)
+                
+            self.ap_volume_tex.use(location=4)
             
             ctx.enable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
@@ -2678,26 +2801,6 @@ class App:
                         prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
-            # --- Prepare and sort atmosphere bodies ---
-            sorted_atmos = []
-            if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
-                atmo_dists = []
-                if atmo_bodies:
-                    for atmo in atmo_bodies:
-                        dx = pos_rel_all[atmo['body_idx'], 0] - cam_pos[0]
-                        dy = pos_rel_all[atmo['body_idx'], 1] - cam_pos[1]
-                        dz = pos_rel_all[atmo['body_idx'], 2] - cam_pos[2]
-                        atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, False))
-                        
-                if self.comparison_enabled and self.atmo_bodies_cmp:
-                    for atmo in self.atmo_bodies_cmp:
-                        bi_cmp = atmo['body_idx']
-                        dx = cmp_pos_rel[bi_cmp, 0] - cam_pos[0]
-                        dy = cmp_pos_rel[bi_cmp, 1] - cam_pos[1]
-                        dz = cmp_pos_rel[bi_cmp, 2] - cam_pos[2]
-                        atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, True))
-                    
-                sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
 
             def render_atmosphere_pass(clip_mode):
                 if not sorted_atmos:
@@ -2710,16 +2813,16 @@ class App:
                 ctx.disable(moderngl.DEPTH_TEST)
                 ctx.depth_mask = False
     
-                u_atmo_quality_uniform.value = atmo_quality
-                u_atmo_camera_pos.write(cam_pos)
+                if u_atmo_quality_uniform is not None: u_atmo_quality_uniform.value = atmo_quality
+                if u_atmo_camera_pos is not None: u_atmo_camera_pos.write(cam_pos)
                 AU_TO_KM = 149597870.7
-                u_atmo_au_to_km.value = AU_TO_KM
+                if u_atmo_au_to_km is not None: u_atmo_au_to_km.value = AU_TO_KM
             
-                u_atmo_num_ring_planes.value = n_ring_planes
+                if u_atmo_num_ring_planes is not None: u_atmo_num_ring_planes.value = n_ring_planes
                 if n_ring_planes > 0:
-                    u_atmo_ring_centers.write(ring_centers_buf)
-                    u_atmo_ring_normals.write(ring_normals_buf)
-                    u_atmo_ring_params.write(ring_params_buf)
+                    if u_atmo_ring_centers is not None: u_atmo_ring_centers.write(ring_centers_buf)
+                    if u_atmo_ring_normals is not None: u_atmo_ring_normals.write(ring_normals_buf)
+                    if u_atmo_ring_params is not None: u_atmo_ring_params.write(ring_params_buf)
                 
                 if u_atmo_clip_mode is not None:
                     u_atmo_clip_mode.value = clip_mode
@@ -2756,26 +2859,28 @@ class App:
                     if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm:
                         build_atmo_lut(atmo, mass_sm)
                     atmo['lut_tex'].use(location=1)
+                    if 'lut_multi_scatter' in atmo:
+                        atmo['lut_multi_scatter'].use(location=3)
                     
                     props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
     
                     scaled_intensity = atmo['intensity']
     
-                    u_atmo_body_offset.write(body_pos_rel.astype('f4'))
-                    u_atmo_radius_au_uniform.value = float(atmo['atmo_radius_au'])
-                    u_atmo_planet_radius.value = float(atmo['planet_radius_km'])
-                    u_atmo_atmo_radius.value = float(atmo['atmo_radius_km'])
-                    u_atmo_beta_rayleigh.write(props['beta_rayleigh'])
-                    u_atmo_h_rayleigh.value = props['scale_height_km']
+                    if u_atmo_body_offset is not None: u_atmo_body_offset.write(body_pos_rel.astype('f4'))
+                    if u_atmo_radius_au_uniform is not None: u_atmo_radius_au_uniform.value = float(atmo['atmo_radius_au'])
+                    if u_atmo_planet_radius is not None: u_atmo_planet_radius.value = float(atmo['planet_radius_km'])
+                    if u_atmo_atmo_radius is not None: u_atmo_atmo_radius.value = float(atmo['atmo_radius_km'])
+                    if u_atmo_beta_rayleigh is not None: u_atmo_beta_rayleigh.write(props['beta_rayleigh'])
+                    if u_atmo_h_rayleigh is not None: u_atmo_h_rayleigh.value = props['scale_height_km']
                     beta_mie_val = atmo.get('beta_mie', 21.0e-6)
-                    u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
-                    u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
-                    u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
-                    u_atmo_beta_absorption.write(props['beta_absorption'])
-                    u_atmo_sun_intensity.value = scaled_intensity
+                    if u_atmo_beta_mie is not None: u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                    if u_atmo_h_mie is not None: u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
+                    if u_atmo_mie_g is not None: u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
+                    if u_atmo_beta_absorption is not None: u_atmo_beta_absorption.write(props['beta_absorption'])
+                    if u_atmo_sun_intensity is not None: u_atmo_sun_intensity.value = scaled_intensity
 
-                    u_atmo_num_samples.value = n_samples
-                    u_atmo_pole_obl.value = (
+                    if u_atmo_num_samples is not None: u_atmo_num_samples.value = n_samples
+                    if u_atmo_pole_obl is not None: u_atmo_pole_obl.value = (
                         float(all_instances[body_idx_in_unified, 9]),
                         float(all_instances[body_idx_in_unified, 10]),
                         float(all_instances[body_idx_in_unified, 11]),
@@ -2832,12 +2937,50 @@ class App:
                             active_atmos_buf[i_ac, 0:3] = trans_c
                             active_atmos_buf[i_ac, 3] = thick_c
                             
-                    u_atmo_num_active_casters.value = n_active
-                    u_atmo_active_casters.write(active_casters_buf.tobytes())
-                    u_atmo_active_caster_poles_obl.write(active_poles_obl_buf.tobytes())
-                    u_atmo_active_caster_atmos.write(active_atmos_buf.tobytes())
+                    if u_atmo_num_active_casters is not None: u_atmo_num_active_casters.value = n_active
+                    if u_atmo_active_casters is not None: u_atmo_active_casters.write(active_casters_buf.tobytes())
+                    if u_atmo_active_caster_poles_obl is not None: u_atmo_active_caster_poles_obl.write(active_poles_obl_buf.tobytes())
+                    if u_atmo_active_caster_atmos is not None: u_atmo_active_caster_atmos.write(active_atmos_buf.tobytes())
                     
-                    u_atmo_body_idx_uni.value = body_idx_in_unified
+                    if u_atmo_body_idx_uni is not None: u_atmo_body_idx_uni.value = body_idx_in_unified
+                    
+                    # Generate Sky View LUT for this specific planet
+                    prog = prog_atmo
+                    if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
+                    if 'u_body_offset' in prog: prog['u_body_offset'].write(body_pos_rel.astype('f4'))
+                    if 'u_planet_radius_km' in prog: prog['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
+                    if 'u_atmo_radius_km' in prog: prog['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
+                    if 'u_atmo_radius_au' in prog: prog['u_atmo_radius_au'].value = float(atmo['atmo_radius_au'])
+                    if 'u_au_to_km' in prog: prog['u_au_to_km'].value = AU_TO_KM
+                    if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
+                    if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
+                    if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                    if 'u_h_mie' in prog: prog['u_h_mie'].value = atmo.get('h_mie', 1.2)
+                    if 'u_mie_g' in prog: prog['u_mie_g'].value = atmo.get('mie_g', 0.758)
+                    if 'u_beta_absorption' in prog: prog['u_beta_absorption'].write(props['beta_absorption'])
+                    if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = scaled_intensity
+                    if 'u_num_samples' in prog: prog['u_num_samples'].value = n_samples
+                    
+                    if 'u_body_idx' in prog: prog['u_body_idx'].value = body_idx_in_unified
+                    if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
+                        float(all_instances[body_idx_in_unified, 9]),
+                        float(all_instances[body_idx_in_unified, 10]),
+                        float(all_instances[body_idx_in_unified, 11]),
+                        float(all_instances[body_idx_in_unified, 12])
+                    )
+                    if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = clip_mode
+                    if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
+                    
+                    if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = n_active
+                    if 'u_active_casters' in prog: prog['u_active_casters'].write(active_casters_buf.tobytes())
+                    if 'u_active_caster_poles_obl' in prog: prog['u_active_caster_poles_obl'].write(active_poles_obl_buf.tobytes())
+                    if 'u_active_caster_atmos' in prog: prog['u_active_caster_atmos'].write(active_atmos_buf.tobytes())
+                    
+                    if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
+                    if n_ring_planes > 0:
+                        if 'u_ring_center' in prog: prog['u_ring_center'].write(ring_centers_buf)
+                        if 'u_ring_normal' in prog: prog['u_ring_normal'].write(ring_normals_buf)
+                        if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
                     
                     vao_atmo.render(moderngl.TRIANGLES)
     

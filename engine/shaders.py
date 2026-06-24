@@ -290,6 +290,8 @@ uniform sampler2D u_eclipse_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform vec3 u_camera_pos;
+uniform sampler3D u_aerial_perspective_volume;
+uniform float u_au_to_km;
 
 out vec4 out_color;
 
@@ -757,7 +759,17 @@ void main() {
         if (u_hdr_enabled) {
             final_color *= u_exposure;
         }
-        out_color = vec4(final_color, 1.0);
+        
+        float cam_dist = length(f_world_pos - u_camera_pos) * u_au_to_km;
+        float slice = sqrt(clamp(cam_dist / 100000.0, 0.0, 1.0));
+        vec4 clip_pos = projection * view * vec4(f_world_pos, 1.0);
+        vec2 ndc = clip_pos.xy / clip_pos.w;
+        vec2 uv = ndc * 0.5 + 0.5;
+        vec3 uvw = vec3(uv, slice);
+        vec4 ap = textureLod(u_aerial_perspective_volume, uvw, 0.0);
+        float trans = 1.0 - ap.a;
+        
+        out_color = vec4(final_color * trans + ap.rgb, 1.0);
     }
 }
 """
@@ -1072,6 +1084,8 @@ uniform bool u_planetshine_enabled;
 uniform sampler2D u_eclipse_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
+uniform sampler3D u_aerial_perspective_volume;
+uniform float u_au_to_km;
 
 struct RingPlane {
     vec3 color;
@@ -1453,7 +1467,17 @@ void main() {
     }
     vec3 raw_color = f_color.rgb * illumination;
     vec3 final_color = u_hdr_enabled ? (raw_color * u_exposure) : raw_color;
-    out_color = vec4(final_color * final_edge_alpha, physical_alpha * final_edge_alpha);
+    
+    float cam_dist = length(f_world_pos - u_camera_pos) * u_au_to_km;
+    float slice = sqrt(clamp(cam_dist / 100000.0, 0.0, 1.0));
+    vec4 clip_pos = projection * view * vec4(f_world_pos, 1.0);
+    vec2 ndc = clip_pos.xy / clip_pos.w;
+    vec2 uv = ndc * 0.5 + 0.5;
+    vec3 uvw = vec3(uv, slice);
+    vec4 ap = textureLod(u_aerial_perspective_volume, uvw, 0.0);
+    float trans = 1.0 - ap.a;
+    
+    out_color = vec4(final_color * trans + ap.rgb * final_edge_alpha, physical_alpha * final_edge_alpha);
 }
 """
 
@@ -1498,16 +1522,14 @@ void main() {
 }
 """
 
-atmo_fragment_shader = """
+sky_view_lut_fragment_shader = """
 #version 460 core
 #define MAX_CASTERS 64
 #define MAX_STARS 16
 #define MAX_RING_PLANES 16
 #define PI 3.14159265358979
 
-in vec3 f_world_pos;
-in vec3 f_local_pos;
-in float f_clip_z;
+in vec2 f_uv;
 
 layout(std140, binding = 1) uniform SceneData {
     mat4 projection;
@@ -1566,7 +1588,8 @@ uniform vec4 u_active_casters[8];
 uniform vec4 u_active_caster_poles_obl[8];
 uniform vec4 u_active_caster_atmos[8];
 uniform sampler2D u_eclipse_lut; // Kept to avoid uniform bound errors
-uniform sampler2D u_optical_depth_lut;
+uniform sampler2D u_transmittance_lut;
+uniform sampler2D u_multi_scatter_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 
@@ -1758,30 +1781,10 @@ vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     return vec2((-b - d) / a, (-b + d) / a);
 }
 
-vec2 compute_optical_depth(vec3 origin, vec3 dir) {
-    vec2 t_atmo = raySphereIntersect(origin, dir, u_atmo_radius_km);
-    vec2 t_planet = raySphereIntersect(origin, dir, u_planet_radius_km);
-    
-    float ray_len = t_atmo.y;
-    if (t_planet.x > 0.0 && t_planet.x < t_atmo.y) {
-        return vec2(1e6, 1e6); // Ray hits planet -> infinite optical depth
-    }
-    
-    int steps = 4; // Fast secondary raymarch
-    float step_size = ray_len / float(steps);
-    
-    float od_rayleigh = 0.0;
-    float od_mie = 0.0;
-    float od_ozone = 0.0;
-    
-    for (int i = 0; i < steps; i++) {
-        vec3 p = origin + dir * ((float(i) + 0.5) * step_size);
-        float h = length(p) - u_planet_radius_km;
-        if (h < 0.0) return vec2(1e6, 1e6);
-        od_rayleigh += exp(-h / u_h_rayleigh) * step_size;
-        od_mie += exp(-h / u_h_mie) * step_size;
-    }
-    return vec2(od_rayleigh, od_mie);
+vec3 get_transmittance(float r, float cos_theta) {
+    float h_norm = clamp((r - u_planet_radius_km) / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+    float u = cos_theta * 0.5 + 0.5;
+    return textureLod(u_transmittance_lut, vec2(u, h_norm), 0.0).rgb;
 }
 
 void main() {
@@ -1791,30 +1794,31 @@ void main() {
 
     vec3 planet_center_render = u_body_offset;
     vec3 cam_local_au = u_camera_pos - planet_center_render;
-    vec3 frag_local_au = f_local_pos * u_atmo_radius_au;
-
     vec3 cam_local = cam_local_au * u_au_to_km;
-    vec3 frag_local = frag_local_au * u_au_to_km;
 
-    vec3 ray_dir = normalize(frag_local - cam_local);
+    float azimuth = f_uv.x * 2.0 * PI;
+    float elevation = f_uv.y * PI - PI/2.0;
+    vec3 ray_dir = vec3(cos(elevation)*sin(azimuth), sin(elevation), cos(elevation)*cos(azimuth));
 
     vec3 ray_dir_sph = toSphericalSpace(ray_dir, u_pole_obl);
-    vec3 frag_local_sph = toSphericalSpace(frag_local, u_pole_obl);
+    vec3 cam_local_sph = toSphericalSpace(cam_local, u_pole_obl);
 
-    vec2 s_atmo = raySphereIntersect(frag_local_sph, ray_dir_sph, u_atmo_radius_km);
+    vec2 s_atmo = raySphereIntersect(cam_local_sph, ray_dir_sph, u_atmo_radius_km);
     if (s_atmo.x > s_atmo.y) discard;
 
-    vec2 s_planet = raySphereIntersect(frag_local_sph, ray_dir_sph, u_planet_radius_km);
+    vec2 s_planet = raySphereIntersect(cam_local_sph, ray_dir_sph, u_planet_radius_km);
 
-    float dist_to_frag = length(frag_local - cam_local);
-    float s_cam = -dist_to_frag; 
-
-    float s_start = max(s_atmo.x, s_cam);
+    float s_start = max(0.0, s_atmo.x);
     float s_end = s_atmo.y;
+    // AP_VOLUME_HOOK
     
-    if (s_planet.x > s_cam && s_planet.x < s_end) {
+    if (s_planet.x > 0.0 && s_planet.x < s_end) {
         s_end = s_planet.x;
     }
+    
+    // We also need frag_local for shadow calculations later
+    // Dummy intersection point far away to retain ring logic cleanly
+    vec3 frag_local = cam_local;
 
     float closest_s_ring = 1e10;
     for (int k = 0; k < u_num_ring_planes; k++) {
@@ -1856,7 +1860,7 @@ void main() {
 
     for (int i = 0; i < u_num_active_casters; i++) {
         vec3 caster_pos = u_active_casters[i].xyz;
-        float caster_r = u_active_casters[i].w * u_au_to_km;
+        float caster_r = u_active_casters[i].w;
         vec3 caster_local = (caster_pos - planet_center_render) * u_au_to_km;
         
         if (length(caster_local) < 1.0) continue;
@@ -1866,7 +1870,7 @@ void main() {
         vec3 dir_c = toSphericalSpace(ray_dir, pole_obl);
         
         vec2 s_c = raySphereIntersect(origin_c, dir_c, caster_r);
-        if (s_c.x > s_cam && s_c.x < s_end) {
+        if (s_c.x > 0.0 && s_c.x < s_end) {
             s_end = s_c.x;
         }
     }
@@ -1902,7 +1906,8 @@ void main() {
         
         vec3 star_color = mix(eq_color, pole_color, sin_lat);
         float star_lum = mix(eq_lum, pole_lum, sin_lat);
-        float sin_star = star_radius / max(dist_to_star_au, star_radius + 1e-6);
+        float star_radius_au = star_radius / u_au_to_km;
+        float sin_star = star_radius_au / max(dist_to_star_au, star_radius_au + 1e-6);
 
         vec3 sun_pos_local = (star_pos - planet_center_render) * u_au_to_km;
         // sun_dir computed per-sample now
@@ -2144,13 +2149,14 @@ void main() {
         float sin_sun = sin_star;
         
         vec3 step_dir_sph = ray_dir_sph * step_size;
-        vec3 current_pos_sph = frag_local_sph + (s_start + 0.5 * step_size) * ray_dir_sph;
+        vec3 current_pos_sph = cam_local_sph + (s_start + 0.5 * step_size) * ray_dir_sph;
 
         float od_rayleigh = 0.0;
         float od_mie = 0.0;
         float od_ozone = 0.0;
         vec3 total_rayleigh = vec3(0.0);
         vec3 total_mie = vec3(0.0);
+        vec3 total_ms = vec3(0.0);
 
         float current_s = s_start + 0.5 * step_size;
         float t_lerp = 0.5 / float(steps);
@@ -2194,12 +2200,9 @@ void main() {
             float disc_top_cos = min(light_cos_theta + sin_star, 1.0);
             float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet); // Reused cos_planet
             float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
-            vec2 lut_uv = vec2(clamp(effective_cos * 0.5 + 0.5, 0.0, 1.0), h_norm);
-            vec4 od_light = textureLod(u_optical_depth_lut, lut_uv, 0.0);
 
-            vec3 tau = beta_R * (od_rayleigh + od_light.r)
-                     + beta_M * (od_mie + od_light.g)
-                     + beta_A * (od_ozone + od_light.b);
+            vec3 tau_to_cam = beta_R * od_rayleigh + beta_M * od_mie + beta_A * od_ozone;
+            vec3 transmittance_to_sun = get_transmittance(sample_len, effective_cos);
 
             vec3 sample_shadow = global_eclipse_shadow;
             if (u_atmo_quality == 2 && !skip_volumetric_shadow) { 
@@ -2238,14 +2241,18 @@ void main() {
                 sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
             }
 
-            vec3 direct_attenuation = exp(-tau);
-            vec3 ms_attenuation = max(vec3(0.0), (exp(-tau * 0.2) - direct_attenuation) * 0.4);
-            
+            vec3 direct_attenuation = exp(-tau_to_cam) * transmittance_to_sun;
             vec3 atten_direct = direct_attenuation * sample_shadow * vis_fraction;
-            vec3 atten_ms = ms_attenuation * sample_shadow * vis_fraction;
 
-            total_rayleigh += rho_R * (atten_direct + atten_ms) * step_size;
-            total_mie      += rho_M * (atten_direct + atten_ms) * step_size;
+            total_rayleigh += rho_R * atten_direct * step_size;
+            total_mie      += rho_M * atten_direct * step_size;
+            
+            float sun_cos_zenith = dot(normalize(current_pos_sph), normalize(sun_pos_local));
+            float h_norm_ms = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+            vec2 ms_uv = vec2(sun_cos_zenith * 0.5 + 0.5, h_norm_ms);
+            vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
+            
+            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * sample_shadow * vis_fraction * step_size;
 
             current_pos_sph += step_dir_sph;
             current_s += step_size;
@@ -2265,7 +2272,8 @@ void main() {
         
         scattered += star_color * u_sun_intensity * irradiance * (
             phase_R * beta_R * total_rayleigh +
-            phase_M * beta_M * total_mie
+            phase_M * beta_M * total_mie +
+            total_ms
         );
 
         final_od_rayleigh = od_rayleigh;
@@ -2285,6 +2293,15 @@ void main() {
     out_color = vec4(scattered, (1.0 - avg_transmittance));
 }
 """
+
+atmo_fragment_shader = sky_view_lut_fragment_shader.replace(
+    "in vec2 f_uv;",
+    "in vec3 f_local_pos;\nin float f_clip_z;"
+).replace(
+    "    float azimuth = f_uv.x * 2.0 * PI;\n    float elevation = f_uv.y * PI - PI/2.0;\n    vec3 ray_dir = vec3(cos(elevation)*sin(azimuth), sin(elevation), cos(elevation)*cos(azimuth));",
+    "    if (f_clip_z < 0.0) discard;\n    vec3 f_pos_local_au = f_local_pos * u_atmo_radius_au;\n    vec3 f_pos_local = f_pos_local_au * u_au_to_km;\n    vec3 ray_dir = normalize(f_pos_local - cam_local);"
+)
+
 
 
 atmo_lut_vertex_shader = """
@@ -2306,6 +2323,9 @@ uniform float u_planet_radius_km;
 uniform float u_atmo_radius_km;
 uniform float u_h_rayleigh;
 uniform float u_h_mie;
+uniform vec3 u_beta_rayleigh;
+uniform vec3 u_beta_mie;
+uniform vec3 u_beta_absorption;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float a = dot(dir, dir);
@@ -2331,8 +2351,8 @@ void main() {
     
     float ray_len = t_atmo.y;
     if (t_planet.x > 0.0 && t_planet.x < t_atmo.y) {
-        // Ray hits the planet - integrate to the surface
-        ray_len = t_planet.x;
+        out_color = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
     }
     
     int num_samples = 256;
@@ -2352,6 +2372,159 @@ void main() {
         od_ozone += exp(-pow((h_sample - 25.0) / 8.0, 2.0)) * step_size;
     }
     
-    out_color = vec4(od_rayleigh, od_mie, od_ozone, 1.0);
+    vec3 beta_R = u_beta_rayleigh * 1000.0;
+    vec3 beta_M = u_beta_mie * 1000.0;
+    vec3 beta_A = u_beta_absorption * 1000.0;
+    
+    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M * od_mie + beta_A * od_ozone));
+    out_color = vec4(transmittance, 1.0);
 }
 """
+
+multi_scatter_lut_fragment_shader = """
+#version 460 core
+in vec2 f_uv;
+out vec4 out_color;
+
+uniform float u_planet_radius_km;
+uniform float u_atmo_radius_km;
+uniform float u_h_rayleigh;
+uniform float u_h_mie;
+uniform vec3 u_beta_rayleigh;
+uniform vec3 u_beta_mie;
+uniform vec3 u_beta_absorption;
+uniform float u_mie_g;
+
+uniform sampler2D u_transmittance_lut;
+
+vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
+    float a = dot(dir, dir);
+    float b = dot(origin, dir);
+    float c = dot(origin, origin) - radius * radius;
+    float discriminant = b * b - a * c;
+    if (discriminant < 0.0) return vec2(1e10, -1e10);
+    float d = sqrt(discriminant);
+    return vec2((-b - d) / a, (-b + d) / a);
+}
+
+vec3 get_transmittance(float r, float cos_theta) {
+    float h_norm = clamp((r - u_planet_radius_km) / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+    float u = cos_theta * 0.5 + 0.5;
+    return textureLod(u_transmittance_lut, vec2(u, h_norm), 0.0).rgb;
+}
+
+void main() {
+    float cos_sun_zenith = f_uv.x * 2.0 - 1.0;
+    float sin_sun_zenith = sqrt(max(0.0, 1.0 - cos_sun_zenith * cos_sun_zenith));
+    float h = f_uv.y * max(1e-4, u_atmo_radius_km - u_planet_radius_km);
+    float r = u_planet_radius_km + h;
+    
+    vec3 origin = vec3(0.0, r, 0.0);
+    vec3 sun_dir = vec3(sin_sun_zenith, cos_sun_zenith, 0.0);
+    
+    vec3 beta_R = u_beta_rayleigh * 1000.0;
+    vec3 beta_M = u_beta_mie * 1000.0;
+    vec3 beta_A = u_beta_absorption * 1000.0;
+    
+    const int sqrt_samples = 8;
+    vec3 lum_total = vec3(0.0);
+    vec3 fms_total = vec3(0.0);
+    
+    for (int i = 0; i < sqrt_samples; i++) {
+        for (int j = 0; j < sqrt_samples; j++) {
+            float u = (float(i) + 0.5) / float(sqrt_samples);
+            float v = (float(j) + 0.5) / float(sqrt_samples);
+            
+            float theta = acos(1.0 - 2.0 * u);
+            float phi = 2.0 * 3.14159265358979 * v;
+            
+            vec3 ray_dir = vec3(sin(theta)*cos(phi), cos(theta), sin(theta)*sin(phi));
+            
+            vec2 t_atmo = raySphereIntersect(origin, ray_dir, u_atmo_radius_km);
+            vec2 t_planet = raySphereIntersect(origin, ray_dir, u_planet_radius_km);
+            
+            float ray_len = t_atmo.y;
+            if (t_planet.x > 0.0 && t_planet.x < t_atmo.y) {
+                ray_len = t_planet.x;
+            }
+            
+            int ray_samples = 20;
+            float step_size = ray_len / float(ray_samples);
+            
+            vec3 lum = vec3(0.0);
+            vec3 fms = vec3(0.0);
+            
+            float current_s = 0.5 * step_size;
+            vec3 transmittance_accum = vec3(1.0);
+            
+            for (int s = 0; s < ray_samples; s++) {
+                vec3 p = origin + ray_dir * current_s;
+                float p_len = length(p);
+                float h_sample = max(0.0, p_len - u_planet_radius_km);
+                
+                float rho_R = exp(-h_sample / u_h_rayleigh);
+                float rho_M = exp(-h_sample / u_h_mie);
+                float rho_O = exp(-pow((h_sample - 25.0) / 8.0, 2.0));
+                
+                vec3 scattering = beta_R * rho_R + beta_M * rho_M;
+                vec3 extinction = scattering + beta_A * rho_O;
+                
+                vec3 sample_transmittance = exp(-extinction * step_size);
+                
+                float p_cos_sun = dot(p, sun_dir) / p_len;
+                vec3 trans_to_sun = get_transmittance(p_len, p_cos_sun);
+                
+                float phase = 1.0 / (4.0 * 3.14159265358979);
+                
+                vec3 S = scattering * trans_to_sun * phase;
+                
+                vec3 Sint = (S - S * sample_transmittance) / max(extinction, 1e-6);
+                lum += transmittance_accum * Sint;
+                
+                vec3 FMS_Sint = (scattering - scattering * sample_transmittance) / max(extinction, 1e-6);
+                fms += transmittance_accum * FMS_Sint;
+                
+                transmittance_accum *= sample_transmittance;
+                current_s += step_size;
+            }
+            
+            lum_total += lum;
+            fms_total += fms;
+        }
+    }
+    
+    float n_samples = float(sqrt_samples * sqrt_samples);
+    vec3 L2nd = lum_total / n_samples;
+    vec3 fms_avg = fms_total / n_samples;
+    
+    vec3 psi = L2nd / max(vec3(1.0) - fms_avg, 1e-6);
+    out_color = vec4(psi, 1.0);
+}
+"""
+
+aerial_perspective_compute_shader = sky_view_lut_fragment_shader.replace(
+    "in vec2 f_uv;",
+    "layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;\nlayout(rgba16f, binding = 0) writeonly uniform image3D destTex;"
+).replace(
+    "void main() {",
+    """void main() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(gid, ivec3(32, 32, 32)))) return;
+    
+    vec2 f_uv = vec2(float(gid.x) + 0.5, float(gid.y) + 0.5) / 32.0;
+    float depth_slice = float(gid.z) / 31.0;
+    float slice_dist = depth_slice * depth_slice * 100000.0;
+"""
+).replace(
+    "// AP_VOLUME_HOOK",
+    "s_end = min(s_end, slice_dist);"
+).replace(
+    "out vec4 out_color;",
+    "vec4 out_color;"
+).replace(
+    "out_color = vec4(scattered, (1.0 - avg_transmittance));",
+    "imageStore(destTex, gid, vec4(scattered, (1.0 - avg_transmittance)));"
+).replace(
+    "discard;",
+    "imageStore(destTex, gid, vec4(0.0)); return;"
+)

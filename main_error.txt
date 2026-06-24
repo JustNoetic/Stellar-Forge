@@ -11,6 +11,6 @@ _moderngl.Error: GLSL Compiler failed
 
 fragment_shader
 ===============
-0(408) : error C1503: undefined variable "sun_dir"
+0(298) : error C1038: declaration of "frag_local" conflicts with previous declaration at 0(277)
 
 
