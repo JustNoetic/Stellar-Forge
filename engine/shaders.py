@@ -1793,8 +1793,9 @@ vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
 
 vec3 get_transmittance(float r, float cos_theta) {
     float h_norm = clamp((r - u_planet_radius_km) / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-    float u = cos_theta * 0.5 + 0.5;
-    return textureLod(u_transmittance_lut, vec2(u, h_norm), 0.0).rgb;
+    float v = sqrt(h_norm);
+    float u = 0.5 + 0.5 * sign(cos_theta) * sqrt(abs(cos_theta));
+    return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
 void main() {
@@ -1807,7 +1808,8 @@ void main() {
     vec3 cam_local = cam_local_au * u_au_to_km;
 
     float azimuth = f_uv.x * 2.0 * PI;
-    float elevation = f_uv.y * PI - PI/2.0;
+    float y = f_uv.y * 2.0 - 1.0;
+    float elevation = sign(y) * y * y * (PI / 2.0);
     vec3 ray_dir = vec3(cos(elevation)*sin(azimuth), sin(elevation), cos(elevation)*cos(azimuth));
 
     vec3 ray_dir_sph = toSphericalSpace(ray_dir, u_pole_obl);
@@ -2255,10 +2257,12 @@ void main() {
             
             float sun_cos_zenith = dot(current_pos_sph / sample_len, sun_dir_sph);
             float h_norm_ms = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-            vec2 ms_uv = vec2(sun_cos_zenith * 0.5 + 0.5, h_norm_ms);
+            float ms_u = 0.5 + 0.5 * sign(sun_cos_zenith) * sqrt(abs(sun_cos_zenith));
+            float ms_v = sqrt(h_norm_ms);
+            vec2 ms_uv = vec2(ms_u, ms_v);
             vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
             
-            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * sample_shadow * vis_fraction * int_factor;
+            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * int_factor;
 
             current_transmittance *= step_transmittance;
 
@@ -2312,11 +2316,11 @@ atmo_fragment_shader = sky_view_lut_fragment_shader.replace(
     "in vec2 f_uv;",
     "in vec3 f_local_pos;\nin float f_clip_z;\nuniform bool u_use_sky_view_lut;\nuniform sampler2D u_sky_view_lut_color;\nuniform sampler2D u_sky_view_lut_transmittance;"
 ).replace(
-    "    float azimuth = f_uv.x * 2.0 * PI;\n    float elevation = f_uv.y * PI - PI/2.0;\n    vec3 ray_dir = vec3(cos(elevation)*sin(azimuth), sin(elevation), cos(elevation)*cos(azimuth));",
+    "    float azimuth = f_uv.x * 2.0 * PI;\n    float y = f_uv.y * 2.0 - 1.0;\n    float elevation = sign(y) * y * y * (PI / 2.0);\n    vec3 ray_dir = vec3(cos(elevation)*sin(azimuth), sin(elevation), cos(elevation)*cos(azimuth));",
     "    if (f_clip_z < 0.0) discard;\n    vec3 f_pos_local_au = f_local_pos * u_atmo_radius_au;\n    vec3 f_pos_local = f_pos_local_au * u_au_to_km;\n    vec3 ray_dir = normalize(f_pos_local - cam_local);"
 ).replace(
     "    if (s_start >= s_end) discard;",
-    "    if (s_start >= s_end) discard;\n    if (u_use_sky_view_lut) {\n        float elevation = asin(clamp(ray_dir.y, -1.0, 1.0));\n        float az = atan(ray_dir.x, ray_dir.z);\n        float u = az / (2.0 * 3.14159265358979);\n        if (u < 0.0) u += 1.0;\n        float v = (elevation + 3.14159265358979/2.0) / 3.14159265358979;\n        vec3 scattered = textureLod(u_sky_view_lut_color, vec2(u, v), 0.0).rgb;\n        vec3 transmittance = textureLod(u_sky_view_lut_transmittance, vec2(u, v), 0.0).rgb;\n        if (u_hdr_enabled) scattered *= u_exposure;\n        out_color = vec4(scattered, 1.0);\n        out_transmittance = vec4(transmittance, 1.0);\n        return;\n    }"
+    "    if (s_start >= s_end) discard;\n    if (u_use_sky_view_lut) {\n        float elevation = asin(clamp(ray_dir.y, -1.0, 1.0));\n        float az = atan(ray_dir.x, ray_dir.z);\n        float u = az / (2.0 * 3.14159265358979);\n        if (u < 0.0) u += 1.0;\n        float v = 0.5 + 0.5 * sign(elevation) * sqrt(abs(elevation) / (3.14159265358979 / 2.0));\n        vec3 scattered = textureLod(u_sky_view_lut_color, vec2(u, v), 0.0).rgb;\n        vec3 transmittance = textureLod(u_sky_view_lut_transmittance, vec2(u, v), 0.0).rgb;\n        if (u_hdr_enabled) scattered *= u_exposure;\n        out_color = vec4(scattered, 1.0);\n        out_transmittance = vec4(transmittance, 1.0);\n        return;\n    }"
 )
 
 
@@ -2363,9 +2367,10 @@ vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
 }
 
 void main() {
-    float cos_theta = f_uv.x * 2.0 - 1.0;
+    float x = f_uv.x * 2.0 - 1.0;
+    float cos_theta = sign(x) * x * x;
     float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
-    float h = f_uv.y * max(1e-4, u_atmo_radius_km - u_planet_radius_km);
+    float h = f_uv.y * f_uv.y * max(1e-4, u_atmo_radius_km - u_planet_radius_km);
     float r = u_planet_radius_km + h;
     
     vec3 origin = vec3(0.0, r, 0.0);
@@ -2443,14 +2448,16 @@ vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
 
 vec3 get_transmittance(float r, float cos_theta) {
     float h_norm = clamp((r - u_planet_radius_km) / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-    float u = cos_theta * 0.5 + 0.5;
-    return textureLod(u_transmittance_lut, vec2(u, h_norm), 0.0).rgb;
+    float v = sqrt(h_norm);
+    float u = 0.5 + 0.5 * sign(cos_theta) * sqrt(abs(cos_theta));
+    return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
 void main() {
-    float cos_sun_zenith = f_uv.x * 2.0 - 1.0;
+    float x = f_uv.x * 2.0 - 1.0;
+    float cos_sun_zenith = sign(x) * x * x;
     float sin_sun_zenith = sqrt(max(0.0, 1.0 - cos_sun_zenith * cos_sun_zenith));
-    float h = f_uv.y * max(1e-4, u_atmo_radius_km - u_planet_radius_km);
+    float h = f_uv.y * f_uv.y * max(1e-4, u_atmo_radius_km - u_planet_radius_km);
     float r = u_planet_radius_km + h;
     
     vec3 origin = vec3(0.0, r, 0.0);
@@ -2521,6 +2528,19 @@ void main() {
                 
                 transmittance_accum *= sample_transmittance;
                 current_s += step_size;
+            }
+            
+            if (t_planet.x > 0.0 && t_planet.x < t_atmo.y) {
+                vec3 p = origin + ray_dir * t_planet.x;
+                float p_len = length(p);
+                float p_cos_sun = dot(p, sun_dir) / max(p_len, 1e-6);
+                vec3 trans_to_sun = get_transmittance(p_len, p_cos_sun);
+                
+                float NdotL = max(0.0, p_cos_sun);
+                vec3 ground_albedo = vec3(0.3);
+                vec3 ground_lum = (ground_albedo / 3.14159265358979) * NdotL * trans_to_sun;
+                
+                lum += transmittance_accum * ground_lum;
             }
             
             lum_total += lum;
