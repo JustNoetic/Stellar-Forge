@@ -1142,7 +1142,6 @@ void main() {
     float total_scatter = 0.0;
     float total_asym = 0.0;
     float total_backscatter = 0.0;
-    float final_edge_alpha = 1.0;
     
     for (int i=0; i<u_num_ring_planes; i++) {
         float inner_r = u_ring_planes[i].inner_r;
@@ -1154,30 +1153,32 @@ void main() {
             float alpha = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0)).r;
             
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
-            final_edge_alpha = edge_alpha;
             
-            float raw_a = alpha * u_ring_planes[i].opacity;
+            float raw_a = alpha * u_ring_planes[i].opacity * edge_alpha;
             float tau = 0.0;
             if (raw_a >= 0.999) {
                 tau = 100.0;
-            } else {
-                tau = -log(max(1e-6, 1.0 - raw_a));
+            } else if (raw_a > 1e-6) {
+                tau = -log(1.0 - raw_a);
             }
             
-            vec3 V_dir = normalize(u_camera_pos - f_world_pos);
-            vec3 N_dir = normalize(f_normal);
-            float view_mu = max(1e-4, abs(dot(N_dir, V_dir)));
-            
-            tau /= view_mu;
-            
-            total_color = u_ring_planes[i].color * tau;
-            total_scatter = u_ring_planes[i].scatter * tau;
-            total_asym = u_ring_planes[i].asymmetry * tau;
-            total_backscatter = u_ring_planes[i].backscatter * tau;
-            total_tau = tau;
-            break;
+            if (tau > 0.0) {
+                vec3 V_dir = normalize(u_camera_pos - f_world_pos);
+                vec3 N_dir = normalize(f_normal);
+                float view_mu = max(1e-4, abs(dot(N_dir, V_dir)));
+                
+                tau /= view_mu;
+                
+                total_color += u_ring_planes[i].color * tau;
+                total_scatter += u_ring_planes[i].scatter * tau;
+                total_asym += u_ring_planes[i].asymmetry * tau;
+                total_backscatter += u_ring_planes[i].backscatter * tau;
+                total_tau += tau;
+            }
         }
     }
+    
+    if (total_tau <= 1e-6) discard;
     
     float physical_alpha = 1.0 - exp(-total_tau);
     
@@ -1477,7 +1478,7 @@ void main() {
     vec4 ap = textureLod(u_aerial_perspective_volume, uvw, 0.0);
     float trans = 1.0 - ap.a;
     
-    out_color = vec4(final_color * trans + ap.rgb * final_edge_alpha, physical_alpha * final_edge_alpha);
+    out_color = vec4(final_color * trans + ap.rgb * physical_alpha, physical_alpha);
 }
 """
 
