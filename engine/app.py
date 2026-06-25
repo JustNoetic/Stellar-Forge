@@ -222,6 +222,28 @@ class ModernGLGlfwRenderer(GlfwRenderer):
     def shutdown(self):
         self.modern_renderer.shutdown()
 
+def compute_max_bend(caster_r_au, atmo_h_km):
+    if atmo_h_km <= 0.0 or caster_r_au <= 0.0:
+        return 0.0
+    caster_r_km = caster_r_au * 149597870.7
+    val = (3.141592653589793 * caster_r_km) / max(1e-6, atmo_h_km * 2.0)
+    max_bend = 2.0 * 0.00029 * math.sqrt(val)
+    return max(0.001, min(0.05, max_bend))
+
+def compute_ring_coplanar_masks(n_ring_planes, centers, normals):
+    masks = np.zeros(16, dtype=np.uint32)
+    for k in range(n_ring_planes):
+        mask = 0
+        c_k = centers[k]
+        n_k = normals[k]
+        for j in range(n_ring_planes):
+            dist = math.sqrt(sum((c_k[i] - centers[j][i])**2 for i in range(3)))
+            dot_prod = sum(n_k[i] * normals[j][i] for i in range(3))
+            if dist < 1e-5 and dot_prod > 0.999:
+                mask |= (1 << j)
+        masks[k] = mask
+    return masks
+
 def get_cached_atmosphere_properties(atmo, mass_sm):
     mass_kg = mass_sm * 1.98847e30
     R_km = atmo.get('planet_radius_km', 0.0)
@@ -244,8 +266,10 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     h_r = props['scale_height_km']
     h_m = atmo.get('h_mie', 1.2)
     od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
-    od_m = compute_mie_coefficients(beta_m) * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
-    tau = od_r + od_m
+    od_m = compute_mie_coefficients(beta_m, atmo.get('mie_angstrom', None)) * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
+    od_o3 = props['beta_abs_layered'] * 1000.0 * 1200.0  # Slant path through stratospheric ozone
+    od_mixed = props['beta_abs_mixed'] * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
+    tau = od_r + od_m + od_o3 + od_mixed
     direct_trans = np.exp(-tau)
     forward_scatter = tau * np.exp(-tau * 0.8) * 0.3
     multi_scatter = 0.02 * np.exp(-tau * 0.2)
@@ -536,10 +560,31 @@ class App:
             elif yoffset < 0: self.camera["fov"] += fov_speed
             self.camera["fov"] = max(1.0, min(120.0, self.camera["fov"]))
         else:
-            zoom_speed = self.camera["distance"] * 0.2 
-            if yoffset > 0: self.camera["distance"] -= zoom_speed
-            elif yoffset < 0: self.camera["distance"] += zoom_speed
-            self.camera["distance"] = max(1e-7, self.camera["distance"])
+            r_target = 0.0
+            if self.camera["tracking_idx"] is not None:
+                track_idx = self.camera["tracking_idx"]
+                is_cmp = self.camera.get("tracking_is_cmp", False)
+                if is_cmp and hasattr(self, "body_radii_cmp") and self.body_radii_cmp is not None:
+                    if track_idx < len(self.body_radii_cmp):
+                        r_target = float(self.body_radii_cmp[track_idx])
+                elif hasattr(self, "body_radii") and self.body_radii is not None:
+                    if track_idx < len(self.body_radii):
+                        r_target = float(self.body_radii[track_idx])
+            
+            # Calculate height above target surface
+            h = max(1e-11, self.camera["distance"] - r_target)
+            
+            # Zoom speed is proportional to height (easier ground move)
+            zoom_speed = max(1e-10, h * 0.2)
+            
+            if yoffset > 0:
+                self.camera["distance"] -= zoom_speed
+            elif yoffset < 0:
+                self.camera["distance"] += zoom_speed
+                
+            # Prevent clipping into the ground (safety buffer ~30 meters)
+            min_dist = r_target + 2e-7
+            self.camera["distance"] = max(min_dist, self.camera["distance"])
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)
@@ -1205,6 +1250,8 @@ class App:
         uniform_ring_normals = prog_spheres['u_ring_normal']
         uniform_ring_params = prog_spheres['u_ring_params']
         uniform_ring_colors = prog_spheres.get('u_ring_colors', None)
+        uniform_ring_coplanar_mask = prog_spheres.get('u_ring_coplanar_mask', None)
+        uniform_caster_max_bend = prog_spheres.get('u_caster_max_bend', None)
         uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
         if 'u_ring_gradients' in prog_spheres:
             prog_spheres['u_ring_gradients'].value = 0
@@ -1230,6 +1277,7 @@ class App:
         u_ring_caster_mask_lo_uni = prog_rings['u_caster_mask_lo']
         u_ring_caster_mask_hi_uni = prog_rings['u_caster_mask_hi']
         u_ring_planetshine_enabled = prog_rings.get('u_planetshine_enabled', None)
+        u_ring_caster_max_bend = prog_rings.get('u_caster_max_bend', None)
 
         u_atmo_body_offset = prog_atmo.get('u_body_offset', None)
         if 'u_ring_gradients' in prog_atmo:
@@ -1255,10 +1303,12 @@ class App:
         u_atmo_ring_centers = prog_atmo.get('u_ring_center', None)
         u_atmo_ring_normals = prog_atmo.get('u_ring_normal', None)
         u_atmo_ring_params = prog_atmo.get('u_ring_params', None)
+        u_atmo_ring_coplanar_mask = prog_atmo.get('u_ring_coplanar_mask', None)
         u_atmo_num_active_casters = prog_atmo.get('u_num_active_casters', None)
         u_atmo_active_casters = prog_atmo.get('u_active_casters', None)
         u_atmo_active_caster_poles_obl = prog_atmo.get('u_active_caster_poles_obl', None)
         u_atmo_active_caster_atmos = prog_atmo.get('u_active_caster_atmos', None)
+        u_atmo_active_max_bend = prog_atmo.get('u_active_max_bend', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
 
 
@@ -1285,10 +1335,12 @@ class App:
         caster_poles_obl_buf = np.zeros((64, 4), dtype='f4')
         caster_colors_buf = np.zeros((64, 4), dtype='f4')
         caster_atmos_buf = np.zeros((64, 4), dtype='f4')
+        caster_max_bend_buf = np.zeros(64, dtype='f4')
         ring_centers_buf = np.zeros((16, 3), dtype='f4')
         ring_normals_buf = np.zeros((16, 3), dtype='f4')
         ring_params_buf = np.zeros((16, 3), dtype='f4')
         ring_colors_buf = np.zeros((16, 3), dtype='f4')
+        ring_coplanar_mask_buf = np.zeros(16, dtype='u4')
         all_instances = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
         cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
         cull_mask_hi = np.zeros(num_bodies, dtype=np.uint32)
@@ -1334,7 +1386,12 @@ class App:
         orbits_med_cmp = np.zeros((0, 20), dtype='f8')
         orbits_low_cmp = np.zeros((0, 20), dtype='f8')
     
-        def build_atmo_lut(atmo, mass_sm):
+        def build_atmo_lut(atmo, mass_sm, is_cmp=False):
+            if 'lut_tex' in atmo and atmo['lut_tex']:
+                atmo['lut_tex'].release()
+            if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
+                atmo['lut_multi_scatter'].release()
+
             prev_fbo = ctx.fbo
             lut_tex = ctx.texture((256, 256), 4, dtype='f4')
             fbo = ctx.framebuffer(color_attachments=[lut_tex])
@@ -1350,9 +1407,15 @@ class App:
             atmo['atmo_radius_au'] = atmo['atmo_radius_km'] / 149597870.7
             
             beta_rayleigh = props['beta_rayleigh']
-            beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 2.0e-6))
+            beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 2.0e-6), atmo.get('mie_angstrom', None))
             beta_abs_mixed = props['beta_abs_mixed']
             beta_abs_layered = props['beta_abs_layered']
+            
+            bi = atmo['body_idx']
+            if is_cmp and hasattr(self, 'visual_arr_cmp') and self.visual_arr_cmp is not None and len(self.visual_arr_cmp) > bi:
+                albedo = self.visual_arr_cmp[bi, 0:3]
+            else:
+                albedo = visual_arr[bi, 0:3]
             
             self.prog_atmo_lut['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
             self.prog_atmo_lut['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
@@ -1382,6 +1445,8 @@ class App:
             self.prog_multi_scatter_lut['u_beta_abs_layered'].value = tuple(beta_abs_layered)
             if 'u_mie_g' in self.prog_multi_scatter_lut:
                 self.prog_multi_scatter_lut['u_mie_g'].value = float(atmo.get('mie_g', 0.8))
+            if 'u_ground_albedo' in self.prog_multi_scatter_lut:
+                self.prog_multi_scatter_lut['u_ground_albedo'].value = tuple(albedo)
             self.prog_multi_scatter_lut['u_transmittance_lut'].value = 1
             
             ms_fbo.use()
@@ -1391,6 +1456,9 @@ class App:
                 prev_fbo.use()
             else:
                 ctx.screen.use()
+            
+            fbo.release()
+            ms_fbo.release()
             
             multi_scatter_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
             multi_scatter_tex.repeat_x = False
@@ -1402,6 +1470,7 @@ class App:
             
         print("[Render Loop] Entering main render loop")
         frame_counter = 0
+        last_sky_view_body_key = None
         while not glfw.window_should_close(window):
             frame_counter += 1
             # ── System Switch — render-side rebuild ──
@@ -1478,10 +1547,12 @@ class App:
                 caster_poles_obl_buf = np.zeros((64, 4), dtype='f4')
                 caster_colors_buf = np.zeros((64, 4), dtype='f4')
                 caster_atmos_buf = np.zeros((64, 4), dtype='f4')
+                caster_max_bend_buf = np.zeros(64, dtype='f4')
                 ring_centers_buf = np.zeros((16, 3), dtype='f4')
                 ring_normals_buf = np.zeros((16, 3), dtype='f4')
                 ring_params_buf = np.zeros((16, 3), dtype='f4')
                 ring_colors_buf = np.zeros((16, 3), dtype='f4')
+                ring_coplanar_mask_buf = np.zeros(16, dtype='u4')
                 cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
                 cull_mask_hi = np.zeros(num_bodies, dtype=np.uint32)
                 cull_ring_mask = np.zeros(num_bodies, dtype=np.uint32)
@@ -2010,6 +2081,24 @@ class App:
                 if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
                     self.camera["roll"] -= 60.0 * dt_render
 
+            self.body_radii = body_radii
+            
+            # Enforce minimum distance to prevent clipping into the ground
+            r_target = 0.0
+            if self.camera["tracking_idx"] is not None:
+                track_idx = self.camera["tracking_idx"]
+                is_cmp = self.camera.get("tracking_is_cmp", False)
+                if is_cmp and hasattr(self, "body_radii_cmp") and self.body_radii_cmp is not None:
+                    if track_idx < len(self.body_radii_cmp):
+                        r_target = float(self.body_radii_cmp[track_idx])
+                elif hasattr(self, "body_radii") and self.body_radii is not None:
+                    if track_idx < len(self.body_radii):
+                        r_target = float(self.body_radii[track_idx])
+            
+            min_dist = r_target + 2e-7  # Target radius + ~30 meters safety buffer
+            self.camera["distance"] = max(min_dist, self.camera["distance"])
+            self.camera["distance_actual"] = max(min_dist, self.camera["distance_actual"])
+
             lerp_factor = 1.0 - math.exp(-15.0 * dt_render)
             self.camera["distance_actual"] += (self.camera["distance"] - self.camera["distance_actual"]) * lerp_factor
             self.camera["yaw_actual"] += (self.camera["yaw"] - self.camera["yaw_actual"]) * lerp_factor
@@ -2130,7 +2219,7 @@ class App:
             if abs(roll_rad) > 1e-6:
                 view = matrix44.multiply(view, matrix44.create_from_z_rotation(roll_rad, dtype='f4'))
                 
-            near = max(self.camera["distance_actual"] * 0.0000001, 1e-10)
+            near = max(self.camera["distance_actual"] * 0.0000001, 1e-13)
             
             # Incorporate both primary and comparison system body relative positions and radii
             max_dist_from_target = 0.0
@@ -2147,7 +2236,7 @@ class App:
                 
             # Set the far plane dynamically to ensure no clipping, with a minimum of 100.0 AU
             far = max(self.camera["distance_actual"] + max_dist_from_target * 2.0 + 10.0, 100.0)
-            depth_C = 1.0 / max(near, 1e-12)
+            depth_C = 1.0 / max(near, 1e-13)
             aspect_ratio = self.fb_width / max(self.fb_height, 1)
             projection = matrix44.create_perspective_projection_matrix(self.camera["fov"], aspect_ratio, near, far, dtype='f4')
     
@@ -2168,6 +2257,8 @@ class App:
                 ring_params_buf[n_ring_planes, 2] = ring['opacity']
                 ring_colors_buf[n_ring_planes, 0:3] = ring['raw_color']
                 n_ring_planes += 1
+            
+            ring_coplanar_mask_buf[:] = compute_ring_coplanar_masks(n_ring_planes, ring_centers_buf, ring_normals_buf)
     
             caster_indices = non_star_indices
             n_casters_fixed = min(len(caster_indices), 64)
@@ -2532,12 +2623,17 @@ class App:
                 atmo = atmo_by_body.get(b_idx)
                 if atmo:
                     props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
+                    thick_km = float(atmo.get('atmo_radius_km', 0.0) - atmo.get('planet_radius_km', 0.0))
+                    scale_height_km = float(props.get('scale_height_km', 8.5))
                     caster_atmos_buf[i_c, 0:3] = trans
-                    caster_atmos_buf[i_c, 3] = thickness
+                    caster_atmos_buf[i_c, 3] = thick_km
+                    caster_max_bend_buf[i_c] = compute_max_bend(body_radii[b_idx], scale_height_km)
                 else:
                     caster_atmos_buf[i_c] = 0.0
+                    caster_max_bend_buf[i_c] = 0.0
             if n_casters_fixed < 64:
                 caster_atmos_buf[n_casters_fixed:] = 0
+                caster_max_bend_buf[n_casters_fixed:] = 0
     
             ubo_staging[0:16] = projection.ravel()
             ubo_staging[16:32] = view.ravel()
@@ -2586,12 +2682,18 @@ class App:
                 prog_spheres['u_camera_pos'].value = tuple(cam_pos)
             if 'u_ringshine_enabled' in prog_spheres:
                 prog_spheres['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
+            if uniform_caster_max_bend is not None:
+                uniform_caster_max_bend.write(caster_max_bend_buf)
+            if u_ring_caster_max_bend is not None:
+                u_ring_caster_max_bend.write(caster_max_bend_buf)
             if n_ring_planes > 0:
                 uniform_ring_centers.write(ring_centers_buf)
                 uniform_ring_normals.write(ring_normals_buf)
                 uniform_ring_params.write(ring_params_buf)
                 if uniform_ring_colors:
                     uniform_ring_colors.write(ring_colors_buf)
+                if uniform_ring_coplanar_mask is not None:
+                    uniform_ring_coplanar_mask.write(ring_coplanar_mask_buf)
             
             view_rot = view.copy()
             view_rot[3, 0:3] = 0.0
@@ -2619,6 +2721,7 @@ class App:
                     prog['u_hdr_enabled'].value = hdr_enabled
                     
             # --- Prepare and sort atmosphere bodies ---
+            last_sky_view_body_key = None
             sorted_atmos = []
             if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
                 atmo_dists = []
@@ -2654,7 +2757,7 @@ class App:
                         bi_curr = atmo['body_idx']
                         mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
                         if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
-                            build_atmo_lut(atmo, mass_sm_curr)
+                            build_atmo_lut(atmo, mass_sm_curr, is_cmp)
                             
                 _, closest_atmo, is_cmp = sorted_atmos[-1]
                 bi = closest_atmo['body_idx']
@@ -2663,7 +2766,7 @@ class App:
                 
                 # Make sure the closest atmo has its LUT built even if it's < 2px (AP shader expects it)
                 if 'lut_tex' not in closest_atmo or closest_atmo.get('lut_mass') != mass_sm:
-                    build_atmo_lut(closest_atmo, mass_sm)
+                    build_atmo_lut(closest_atmo, mass_sm, is_cmp)
                 
                 closest_atmo['lut_tex'].use(location=1)
                 if 'lut_multi_scatter' in closest_atmo:
@@ -2681,7 +2784,7 @@ class App:
                 if 'u_au_to_km' in prog: prog['u_au_to_km'].value = 149597870.7
                 if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
                 if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
-                if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val, closest_atmo.get('mie_angstrom', None)).astype('f4'))
                 if 'u_h_mie' in prog: prog['u_h_mie'].value = closest_atmo.get('h_mie', 1.2)
                 if 'u_mie_g' in prog: prog['u_mie_g'].value = closest_atmo.get('mie_g', 0.758)
                 if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
@@ -2721,14 +2824,15 @@ class App:
             vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
             ctx.disable(moderngl.BLEND)
             ctx.disable(moderngl.CULL_FACE)
+
+            if self.hdr_msaa_fbo:
+                ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
+                self.hdr_resolve_fbo.use()
     
     
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
             
-            if self.hdr_msaa_fbo:
-                ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
-                self.hdr_resolve_fbo.use()
 
             if show_orbits:
                 if n_orbits > 0:
@@ -2844,6 +2948,7 @@ class App:
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
 
             def render_atmosphere_pass(clip_mode):
+                nonlocal last_sky_view_body_key
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
@@ -2864,6 +2969,7 @@ class App:
                     if u_atmo_ring_centers is not None: u_atmo_ring_centers.write(ring_centers_buf)
                     if u_atmo_ring_normals is not None: u_atmo_ring_normals.write(ring_normals_buf)
                     if u_atmo_ring_params is not None: u_atmo_ring_params.write(ring_params_buf)
+                    if u_atmo_ring_coplanar_mask is not None: u_atmo_ring_coplanar_mask.write(ring_coplanar_mask_buf.tobytes())
                 
                 if u_atmo_clip_mode is not None:
                     u_atmo_clip_mode.value = clip_mode
@@ -2914,7 +3020,7 @@ class App:
                     if u_atmo_beta_rayleigh is not None: u_atmo_beta_rayleigh.write(props['beta_rayleigh'])
                     if u_atmo_h_rayleigh is not None: u_atmo_h_rayleigh.value = props['scale_height_km']
                     beta_mie_val = atmo.get('beta_mie', 2.0e-6)
-                    if u_atmo_beta_mie is not None: u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                    if u_atmo_beta_mie is not None: u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4'))
                     if u_atmo_h_mie is not None: u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
                     if u_atmo_mie_g is not None: u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
                     if u_atmo_beta_abs_mixed is not None: u_atmo_beta_abs_mixed.write(props['beta_abs_mixed'])
@@ -2954,6 +3060,7 @@ class App:
                     active_casters_buf = np.zeros((8, 4), dtype='f4')
                     active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
                     active_atmos_buf = np.zeros((8, 4), dtype='f4')
+                    active_max_bend_buf = np.zeros(8, dtype='f4')
                     
                     atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
                     atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
@@ -2975,14 +3082,18 @@ class App:
                         atmo_info = lookup.get(c_local_idx)
                         if atmo_info:
                             mass_sm_c = self.mass_snap_cmp[c_local_idx] if is_c_cmp else mass_snap[c_local_idx]
-                            _, trans_c, thick_c = get_cached_atmosphere_properties(atmo_info, mass_sm_c)
+                            props_c, trans_c, thick_c = get_cached_atmosphere_properties(atmo_info, mass_sm_c)
+                            thick_km = float(atmo_info.get('atmo_radius_km', 0.0) - atmo_info.get('planet_radius_km', 0.0))
+                            scale_height_km = float(props_c.get('scale_height_km', 8.5))
                             active_atmos_buf[i_ac, 0:3] = trans_c
-                            active_atmos_buf[i_ac, 3] = thick_c
+                            active_atmos_buf[i_ac, 3] = thick_km
+                            active_max_bend_buf[i_ac] = compute_max_bend(rad_c, scale_height_km)
                             
                     if u_atmo_num_active_casters is not None: u_atmo_num_active_casters.value = n_active
                     if u_atmo_active_casters is not None: u_atmo_active_casters.write(active_casters_buf.tobytes())
                     if u_atmo_active_caster_poles_obl is not None: u_atmo_active_caster_poles_obl.write(active_poles_obl_buf.tobytes())
                     if u_atmo_active_caster_atmos is not None: u_atmo_active_caster_atmos.write(active_atmos_buf.tobytes())
+                    if u_atmo_active_max_bend is not None: u_atmo_active_max_bend.write(active_max_bend_buf.tobytes())
                     
                     if u_atmo_body_idx_uni is not None: u_atmo_body_idx_uni.value = body_idx_in_unified
                     
@@ -3008,7 +3119,7 @@ class App:
                         if 'u_au_to_km' in prog: prog['u_au_to_km'].value = AU_TO_KM
                         if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
                         if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
-                        if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val).astype('f4'))
+                        if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4'))
                         if 'u_h_mie' in prog: prog['u_h_mie'].value = atmo.get('h_mie', 1.2)
                         if 'u_mie_g' in prog: prog['u_mie_g'].value = atmo.get('mie_g', 0.758)
                         if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
@@ -3038,26 +3149,29 @@ class App:
                             if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
                             
                     if use_sky_view:
-                        ctx.disable(moderngl.BLEND)
-                        ctx.disable(moderngl.CULL_FACE)
-                        self.sky_view_lut_fbo.use()
-                        self.sky_view_lut_fbo.clear(0.0, 0.0, 0.0, 0.0)
-                        ctx.viewport = (0, 0, self.sky_view_lut_tex_color.width, self.sky_view_lut_tex_color.height)
-                        
-                        prog = self.prog_sky_view_lut_pass
-                        if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
-                        if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
-                        if 'lut_tex' in atmo: atmo['lut_tex'].use(location=1)
-                        if 'lut_multi_scatter' in atmo: atmo['lut_multi_scatter'].use(location=3)
-                        eclipse_lut_tex.use(location=2)
-                        
-                        prog = self.prog_sky_view_lut_pass
-                        if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
-                        if 'u_transmittance_lut' in prog: prog['u_transmittance_lut'].value = 1
-                        if 'u_multi_scatter_lut' in prog: prog['u_multi_scatter_lut'].value = 3
-                        
-                        self.sky_view_vao.render(moderngl.TRIANGLE_STRIP)
-                        
+                        body_key = (bi, is_cmp)
+                        if last_sky_view_body_key != body_key:
+                            ctx.disable(moderngl.BLEND)
+                            ctx.disable(moderngl.CULL_FACE)
+                            self.sky_view_lut_fbo.use()
+                            self.sky_view_lut_fbo.clear(0.0, 0.0, 0.0, 0.0)
+                            ctx.viewport = (0, 0, self.sky_view_lut_tex_color.width, self.sky_view_lut_tex_color.height)
+                            
+                            prog = self.prog_sky_view_lut_pass
+                            if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
+                            if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
+                            if 'lut_tex' in atmo: atmo['lut_tex'].use(location=1)
+                            if 'lut_multi_scatter' in atmo: atmo['lut_multi_scatter'].use(location=3)
+                            eclipse_lut_tex.use(location=2)
+                            
+                            prog = self.prog_sky_view_lut_pass
+                            if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
+                            if 'u_transmittance_lut' in prog: prog['u_transmittance_lut'].value = 1
+                            if 'u_multi_scatter_lut' in prog: prog['u_multi_scatter_lut'].value = 3
+                            
+                            self.sky_view_vao.render(moderngl.TRIANGLE_STRIP)
+                            last_sky_view_body_key = body_key
+                            
                         if self.hdr_resolve_fbo:
                             self.hdr_resolve_fbo.use()
                             
@@ -3112,8 +3226,9 @@ class App:
                         if u_ring_host_atmo is not None:
                             atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
                             if atmo is not None:
-                                _, trans_c, thick_c = get_cached_atmosphere_properties(atmo, mass_snap[bi])
-                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), float(thick_c))
+                                props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
+                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                         k = ring_idx_by_body.get(bi)
@@ -3155,8 +3270,9 @@ class App:
                         if u_ring_host_atmo is not None:
                             atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
                             if atmo is not None:
-                                _, trans_c, thick_c = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
-                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), float(thick_c))
+                                props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
+                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                         u_ring_caster_mask_lo_uni.value = 0
@@ -3179,6 +3295,8 @@ class App:
     
             # --- Pass 2: Atmosphere in front of rings ---
             render_atmosphere_pass(2)
+            
+
             force_layout = getattr(self, "_last_fb_width", 0) != self.fb_width or getattr(self, "_last_fb_height", 0) != self.fb_height
             cond_layout = imgui.ALWAYS if force_layout else imgui.ONCE
             
@@ -4012,16 +4130,44 @@ class App:
                             imgui.text(f"  Abs Mag (M): {abs_mag:+.2f}")
                             imgui.text(f"  App Mag (m): {app_mag:+.2f}")
                         else:
-                            c = visual_arr[insp_idx, 0:3]
-                            p_v = float(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
-                            atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                            c = self.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
+                            atmo_item = next((a for a in (self.atmo_bodies_cmp if insp_is_cmp else atmo_bodies) if a['body_idx'] == insp_idx), None)
                             if atmo_item:
-                                p_surf = atmo_item.get('surface_pressure', 1.0)
-                                atmo_albedo = min(1.0, p_surf * 0.1) * 0.5
-                                p_v = min(1.0, p_v * (1.0 - min(1.0, p_surf * 0.1)) + atmo_albedo)
+                                # Physically calculated geometric albedo
+                                mass_val = cur_mass_snap[insp_idx] if len(cur_mass_snap) > insp_idx else 3.0e-6
+                                props, _, _ = get_cached_atmosphere_properties(atmo_item, mass_val)
+                                
+                                H_r_m = props['scale_height_km'] * 1000.0
+                                H_m_m = atmo_item.get('h_mie', 1.2) * 1000.0
+                                
+                                beta_R = props['beta_rayleigh']
+                                beta_M = compute_mie_coefficients(atmo_item.get('beta_mie', 2.0e-6), atmo_item.get('mie_angstrom', None))
+                                beta_O3 = props['beta_abs_layered']
+                                beta_mixed = props['beta_abs_mixed']
+                                
+                                tau_R = beta_R * H_r_m
+                                tau_M = beta_M * H_m_m
+                                tau_O3 = beta_O3 * 14179.6
+                                tau_mixed = beta_mixed * H_r_m
+                                
+                                tau_total = tau_R + tau_M + tau_O3 + tau_mixed
+                                
+                                T_surf = np.exp(-tau_total)
+                                p_surf = c * (T_surf ** 2)
+                                
+                                p_Rayleigh = 0.69 * (1.0 - np.exp(-tau_R)) * np.exp(-2.0 * tau_O3)
+                                p_Mie = 0.75 * 0.9 * (1.0 - np.exp(-tau_M)) * np.exp(-2.0 * tau_O3)
+                                
+                                p_rgb = p_surf + (1.0 - p_surf) * (p_Rayleigh + p_Mie)
+                                p_rgb = np.clip(p_rgb, 0.0, 1.0)
+                                p_v = float(0.2126 * p_rgb[0] + 0.7152 * p_rgb[1] + 0.0722 * p_rgb[2])
+                            else:
+                                p_v = float(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+                                
                             if p_v > 0.0 and body_r_km > 0.0:
                                 diam_km = body_r_km * 2.0
                                 abs_mag_h = 5.0 * math.log10(1329.0 / (diam_km * math.sqrt(p_v)))
+                                imgui.text(f"  Geom Albedo: {p_v:.3f}")
                                 imgui.text(f"  Abs Mag (H): {abs_mag_h:+.2f}")
 
                     if parent_idx >= 0:
@@ -4408,11 +4554,27 @@ class App:
                                 print(f"Exported cosmetics to {filename}")
                             
                         # Convert linear albedo to sRGB for the color picker
-                        srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in visual_arr[insp_idx, 0:3]]
+                        if insp_is_cmp:
+                            srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in self.visual_arr_cmp[insp_idx, 0:3]]
+                        else:
+                            srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in visual_arr[insp_idx, 0:3]]
                         changed_c, new_c = imgui.color_edit3("Base Color (sRGB)", *srgb_c)
                         if changed_c:
                             # Convert back to linear before storing
-                            visual_arr[insp_idx, 0:3] = [pow(c, 2.2) if c > 0 else 0.0 for c in new_c]
+                            linear_c = [pow(c, 2.2) if c > 0 else 0.0 for c in new_c]
+                            if insp_is_cmp:
+                                self.visual_arr_cmp[insp_idx, 0:3] = linear_c
+                                self.visual_data_cmp[insp_idx][0:3] = linear_c
+                                atmo_item = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == insp_idx), None)
+                            else:
+                                visual_arr[insp_idx, 0:3] = linear_c
+                                atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                            
+                            if atmo_item:
+                                atmo_item['_dirty'] = True
+                                if 'lut_tex' in atmo_item:
+                                    atmo_item['lut_tex'].release()
+                                    del atmo_item['lut_tex']
                         
                         if imgui.collapsing_header("Atmosphere")[0]:
                             atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
@@ -4487,6 +4649,31 @@ class App:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
                                 _, atmo_item['mie_g'] = imgui.slider_float("Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
+                                
+                                # Aerosol Angstrom Exponent (Auto vs Manual)
+                                is_manual = ('mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None)
+                                changed_mode, use_manual = imgui.checkbox("Manual Angstrom Exponent", is_manual)
+                                if changed_mode:
+                                    if use_manual:
+                                        atmo_item['mie_angstrom'] = 1.2
+                                    else:
+                                        atmo_item['mie_angstrom'] = None
+                                    atmo_item['_dirty'] = True
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
+                                
+                                if 'mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None:
+                                    changed_ang, new_ang = imgui.slider_float("Aerosol Angstrom", atmo_item['mie_angstrom'], 0.0, 5.0)
+                                    if changed_ang:
+                                        atmo_item['mie_angstrom'] = new_ang
+                                        atmo_item['_dirty'] = True
+                                        if 'lut_tex' in atmo_item:
+                                            atmo_item['lut_tex'].release()
+                                            del atmo_item['lut_tex']
+                                else:
+                                    auto_val = 1.2 * math.exp(-atmo_item.get('beta_mie', 2.0e-6) / 5.0e-6)
+                                    imgui.text(f"  Auto Angstrom Exponent: {auto_val:.3f} (based on Beta)")
                                 
                                 _, atmo_item['intensity'] = imgui.drag_float("Intensity", atmo_item['intensity'], 0.5, 0.0, 1000.0)
                                 

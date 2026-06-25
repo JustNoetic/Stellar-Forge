@@ -1,7 +1,7 @@
 Traceback (most recent call last):
   File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\main.py", line 10, in <module>
     app.run()
-  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3360, in run
-    self.sky_view_lut_tex_color = self.ctx.texture((w, h), 4, dtype='f2')
-                                  ^^^^^^^^
-AttributeError: 'App' object has no attribute 'ctx'
+  File "D:\Files\Coding\OpenGL\Stellar-Forge\engine\app.py", line 3709, in run
+    label = f"{bodies_data[idx]['name']}"
+               ~~~~~~~~~~~^^^^^
+IndexError: list index out of range

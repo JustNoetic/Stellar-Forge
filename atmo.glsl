@@ -68,6 +68,8 @@ uniform int u_num_active_casters;
 uniform vec4 u_active_casters[8];
 uniform vec4 u_active_caster_poles_obl[8];
 uniform vec4 u_active_caster_atmos[8];
+uniform float u_active_max_bend[8];
+uniform uint u_ring_coplanar_mask[16];
 uniform sampler2D u_eclipse_lut; // Kept to avoid uniform bound errors
 uniform sampler2D u_transmittance_lut;
 uniform sampler2D u_multi_scatter_lut;
@@ -121,11 +123,10 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         if (t_proj < 0.0) continue;
         
         float dist_sq = dot(s_to_c, s_to_c);
-        float dist_to_caster = sqrt(dist_sq);
-        if (dist_to_caster < caster_r * 1.02) continue;
+        if (dist_sq < caster_r * caster_r * 1.0404) continue;
         
-        vec3 cross_vec = cross(s_to_c, L_dir);
-        float perp_sq = dot(cross_vec, cross_vec);
+        float dist_to_caster = sqrt(dist_sq);
+        float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
         
         vec3 perp_vec = s_to_c - t_proj * L_dir;
         float oblateness = u_active_caster_poles_obl[i].w;
@@ -157,8 +158,8 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         
         vec3 caster_shadow = vec3(1.0 - occ);
         
-        if (atmo_h > 0.0 && gamma < penumbra_outer) {
-            float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * caster_r / max(1.0, atmo_h * caster_r * 2.0)), 0.001, 0.05);
+        float max_bend = u_active_max_bend[i];
+        if (max_bend > 0.0 && gamma < penumbra_outer) {
             float req_bend = beta - gamma;
             
             float optical_depth = max(0.0, req_bend);
@@ -186,15 +187,8 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         vec3 plane_center = u_ring_center[k];
         vec3 plane_normal = u_ring_normal[k];
         
-        uint coplanar_mask = 0u;
-        for (int ring_idx = k; ring_idx < u_num_ring_planes; ring_idx++) {
-            if ((u_ring_mask & (1u << ring_idx)) == 0u) continue;
-            if (distance(plane_center, u_ring_center[ring_idx]) < 1e-6 && 
-                dot(plane_normal, u_ring_normal[ring_idx]) > 0.999) {
-                coplanar_mask |= (1u << ring_idx);
-                processed_mask |= (1u << ring_idx);
-            }
-        }
+        uint coplanar_mask = u_ring_coplanar_mask[k];
+        processed_mask |= coplanar_mask;
         
         float denom = dot(L_dir, plane_normal);
         if (abs(denom) < 1e-8) continue;
@@ -272,8 +266,9 @@ vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
 
 vec3 get_transmittance(float r, float cos_theta) {
     float h_norm = clamp((r - u_planet_radius_km) / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-    float u = cos_theta * 0.5 + 0.5;
-    return textureLod(u_transmittance_lut, vec2(u, h_norm), 0.0).rgb;
+    float v = sqrt(h_norm);
+    float u = 0.5 + 0.5 * sign(cos_theta) * sqrt(abs(cos_theta));
+    return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
 void main() {
@@ -371,7 +366,7 @@ void main() {
         float az = atan(ray_dir.x, ray_dir.z);
         float u = az / (2.0 * 3.14159265358979);
         if (u < 0.0) u += 1.0;
-        float v = (elevation + 3.14159265358979/2.0) / 3.14159265358979;
+        float v = 0.5 + 0.5 * sign(elevation) * sqrt(abs(elevation) / (3.14159265358979 / 2.0));
         vec3 scattered = textureLod(u_sky_view_lut_color, vec2(u, v), 0.0).rgb;
         vec3 transmittance = textureLod(u_sky_view_lut_transmittance, vec2(u, v), 0.0).rgb;
         if (u_hdr_enabled) scattered *= u_exposure;
@@ -534,10 +529,8 @@ void main() {
                                 }
                                 
                                 ring_count++;
-                            
                         }
                     }
-                }
                 
                 vec3 shadow_start = vec3(1.0);
                 vec3 shadow_end = vec3(1.0);
@@ -575,8 +568,8 @@ void main() {
                                 float po = alpha + beta; float pi = max(0.0, beta - alpha);
                                 float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
                                 vec3 sh = vec3(1.0 - occ);
-                                if (atmo > 0.0 && gamma < po) {
-                                    float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * r / max(1.0, atmo * r * 2.0)), 0.001, 0.05);
+                                float max_bend = u_active_max_bend[c];
+                                if (max_bend > 0.0 && gamma < po) {
                                     float req_bend = beta - gamma;
                                     
                                     float optical_depth = max(0.0, req_bend);
@@ -615,8 +608,8 @@ void main() {
                                 float po = alpha + beta; float pi = max(0.0, beta - alpha);
                                 float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
                                 vec3 sh = vec3(1.0 - occ);
-                                if (atmo > 0.0 && gamma < po) {
-                                    float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * r / max(1.0, atmo * r * 2.0)), 0.001, 0.05);
+                                float max_bend = u_active_max_bend[c];
+                                if (max_bend > 0.0 && gamma < po) {
                                     float req_bend = beta - gamma;
                                     
                                     float optical_depth = max(0.0, req_bend);
@@ -734,11 +727,15 @@ void main() {
                     }
                 }
             } else if (u_atmo_quality == 3) {
-                vec3 sample_pos_local = frag_local + current_s * ray_dir;
-                vec3 sample_render = sample_pos_local / u_au_to_km + planet_center_render;
-                vec3 sample_to_star = star_pos - sample_render;
-                float dist_sample_star = length(sample_to_star);
-                sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
+                if (u_num_active_casters > 0 || u_ring_mask != 0u) {
+                    vec3 sample_pos_local = frag_local + current_s * ray_dir;
+                    vec3 sample_render = sample_pos_local / u_au_to_km + planet_center_render;
+                    vec3 sample_to_star = star_pos - sample_render;
+                    float dist_sample_star = length(sample_to_star);
+                    sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
+                } else {
+                    sample_shadow = global_eclipse_shadow;
+                }
             }
 
             vec3 sample_attenuation = current_transmittance * transmittance_to_sun * sample_shadow * vis_fraction;
@@ -751,7 +748,8 @@ void main() {
             vec2 ms_uv = vec2(sun_cos_zenith * 0.5 + 0.5, h_norm_ms);
             vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
             
-            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * sample_shadow * vis_fraction * int_factor;
+            vec3 ms_shadow = mix(vec3(0.2), vec3(1.0), sample_shadow);
+            total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * ms_shadow * int_factor;
 
             current_transmittance *= step_transmittance;
 

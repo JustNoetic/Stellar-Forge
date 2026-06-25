@@ -51,7 +51,7 @@
   {
     "name": "Mercury",
     "type": "Terrestrial",
-    "color": "#a3a3a3",
+    "color": "#232323",
     "parentId": "Sun",
     "m": 1.6601208254589484e-07,
     "r": 0.0035,
@@ -1938,7 +1938,7 @@
         "opacity": 0.012,
         "scatter": 0.07,
         "asymmetry": 0.945,
-        "backscatter": -0.3,
+        "backscatter": -0.999,
         "shadow_grad": [
           0.27900001406669617,
           0.27915745973587036,
@@ -2227,7 +2227,7 @@
         "opacity": 0.012,
         "scatter": 0.09,
         "asymmetry": 0.934,
-        "backscatter": -0.3,
+        "backscatter": -0.999,
         "shadow_grad": [
           0.0,
           0.009902951307594776,

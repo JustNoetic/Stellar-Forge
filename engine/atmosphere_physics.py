@@ -24,7 +24,7 @@ GAS_PROPERTIES = {
     "CH4": (1.000444, 1.000, 0.01604, np.array([0.0, 0.0, 0.0])),
     "H2":  (1.000132, 1.000, 0.002016, np.array([0.0, 0.0, 0.0])),
     "He":  (1.000036, 1.000, 0.004002, np.array([0.0, 0.0, 0.0])),
-    "O3":  (1.000271, 1.096, 0.04800, np.array([0.5e-25, 3.0e-25, 0.2e-25])),
+    "O3":  (1.000271, 1.096, 0.04800, np.array([1.036e-25, 3.0e-25, 0.1356e-25])),
     "SO2": (1.000686, 1.000, 0.06406, np.array([0.001e-25, 0.005e-25, 0.03e-25])),
 }
 
@@ -87,7 +87,9 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
         # Absorption coefficient: cross section * number density of this specific gas
         gas_number_density = number_density * fraction
         if gas == "O3":
-            beta_abs_layered += abs_cross * gas_number_density
+            # Ozone is concentrated in the stratosphere, where its peak density
+            # is about 246.2 times its average sea-level mixing ratio.
+            beta_abs_layered += abs_cross * (gas_number_density * 246.2)
         else:
             beta_abs_mixed += abs_cross * gas_number_density
         
@@ -125,11 +127,18 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     _atmo_cache[cache_key] = res
     return res
 
-def compute_mie_coefficients(base_beta=2.0e-6, angstrom_exponent=1.2):
+def compute_mie_coefficients(base_beta=2.0e-6, angstrom_exponent=None):
     """
     Computes Mie scattering coefficients using the Angstrom exponent approximation.
     base_beta is the scattering coefficient at 550nm.
+    If angstrom_exponent is None, it is calculated automatically from the aerosol concentration:
+    thick aerosol decks (clouds) are assumed to have large particles (angstrom -> 0),
+    while thin background hazes are assumed to have small particles (angstrom -> 1.2).
     """
+    if angstrom_exponent is None:
+        # Clear skies (base_beta -> 0) yields 1.2, thick cloud decks (base_beta >= 2.0e-5) yields ~ 0.0
+        angstrom_exponent = 1.2 * math.exp(-base_beta / 5.0e-6)
+        
     lambda_0 = 550e-9
     # beta_mie = base_beta * (lambda / lambda_0)^(-alpha)
     beta_mie = base_beta * (WAVELENGTHS / lambda_0) ** (-angstrom_exponent)
