@@ -1269,6 +1269,7 @@ class App:
         u_ring_host_pos = prog_rings['u_host_planet_pos']
         u_ring_host_radius = prog_rings['u_host_planet_radius']
         u_ring_host_pole_obl = prog_rings['u_host_planet_pole_obl']
+        u_ring_host_R_minor = prog_rings.get('u_host_planet_R_minor', None)
         u_ring_host_color = prog_rings.get('u_host_planet_color', None)
         u_ring_host_atmo = prog_rings.get('u_host_planet_atmo', None)
         u_ring_camera_pos = prog_rings['u_camera_pos']
@@ -1298,6 +1299,7 @@ class App:
         u_atmo_camera_pos = prog_atmo.get('u_camera_pos', None)
         u_atmo_num_samples = prog_atmo.get('u_num_samples', None)
         u_atmo_pole_obl = prog_atmo.get('u_pole_obl', None)
+        u_atmo_active_caster_R_minor = prog_atmo.get('u_active_caster_R_minor', None)
         u_atmo_body_idx_uni = prog_atmo.get('u_body_idx', None)
         u_atmo_num_ring_planes = prog_atmo.get('u_num_ring_planes', None)
         u_atmo_ring_centers = prog_atmo.get('u_ring_center', None)
@@ -1912,6 +1914,15 @@ class App:
                                         if 'lut_tex' in a:
                                             a['lut_tex'].release()
                                             del a['lut_tex']
+                            if "oblateness" in op:
+                                f = op["oblateness"]
+                                bodies_data[idx]["oblateness"] = f
+                                bodies_data[idx]["J2"] = op["J2"]
+                                bodies_data[idx]["j4"] = op["j4"]
+                                bodies_data[idx]["rotation_period"] = op["rotation_period"]
+                                
+                                visual_arr[idx][8] = f
+                                visual_data[idx][8] = f
                             if "color" in op:
                                 c = op["color"]
                                 bodies_data[idx]["color"] = f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}"
@@ -2584,7 +2595,26 @@ class App:
                     if pole_color[0] == 0.0 and pole_color[1] == 0.0 and pole_color[2] == 0.0:
                         pole_color = color # fallback
                         
-                    stars_poles_obl.append([pole[0], pole[1], pole[2], obl])
+                    # Calculate star R_minor relative to target_pos
+                    track_idx = self.camera.get("tracking_idx")
+                    if track_idx is not None and track_idx < total_render_bodies:
+                        target_pos = all_instances[track_idx, 0:3]
+                    else:
+                        target_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                    
+                    to_target = pos - target_pos
+                    dist = np.linalg.norm(to_target)
+                    if dist > 1e-6:
+                        L = to_target / dist
+                    else:
+                        L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    
+                    p_dot_L = np.dot(pole, L)
+                    p_proj_sq = 1.0 - p_dot_L**2
+                    f_factor = 1.0 - obl
+                    r_minor = radius * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                    
+                    stars_poles_obl.append([pole[0], pole[1], pole[2], r_minor])
                     stars_pole_colors.append([pole_color[0], pole_color[1], pole_color[2], lum_pole])
                     
             num_stars = len(stars_pos_radius)
@@ -2606,10 +2636,28 @@ class App:
             if n_casters_fixed < 64:
                 caster_data_buf[n_casters_fixed:] = 0
                 
-            caster_poles_obl_buf[:n_casters_fixed, 0:3] = all_instances[caster_indices[:n_casters_fixed], 9:12]
-            caster_poles_obl_buf[:n_casters_fixed, 3] = all_instances[caster_indices[:n_casters_fixed], 12]
-            if n_casters_fixed < 64:
-                caster_poles_obl_buf[n_casters_fixed:] = 0
+            for i_c in range(n_casters_fixed):
+                b_idx = caster_indices[i_c]
+                pos_c = pos_rel_all[b_idx]
+                r_eq = body_radii[b_idx]
+                pole = all_instances[b_idx, 9:12]
+                f = all_instances[b_idx, 12]
+                
+                pos_star = pos_rel_all[star_idx]
+                to_star = pos_star - pos_c
+                dist_s = np.linalg.norm(to_star)
+                if dist_s > 1e-6:
+                    L = to_star / dist_s
+                else:
+                    L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                
+                p_dot_L = np.dot(pole, L)
+                p_proj_sq = 1.0 - p_dot_L**2
+                f_factor = 1.0 - f
+                r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                
+                caster_poles_obl_buf[i_c, 0:3] = pole
+                caster_poles_obl_buf[i_c, 3] = r_minor
                 
             caster_colors_buf[:n_casters_fixed, 0:3] = body_colors[caster_indices[:n_casters_fixed]]
             caster_colors_buf[:n_casters_fixed, 3] = 1.0
@@ -2793,11 +2841,13 @@ class App:
                 bi = closest_atmo['body_idx']
                 if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = closest_atmo['intensity']
                 if 'u_body_idx' in prog: prog['u_body_idx'].value = bi
+                f = float(all_instances[bi, 12])
+                f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
                 if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
                     float(all_instances[bi, 9]),
                     float(all_instances[bi, 10]),
                     float(all_instances[bi, 11]),
-                    float(all_instances[bi, 12])
+                    float(f_scale)
                 )
                 if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
                 if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
@@ -3059,6 +3109,7 @@ class App:
                     
                     active_casters_buf = np.zeros((8, 4), dtype='f4')
                     active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
+                    active_caster_r_minor_buf = np.zeros(8, dtype='f4')
                     active_atmos_buf = np.zeros((8, 4), dtype='f4')
                     active_max_bend_buf = np.zeros(8, dtype='f4')
                     
@@ -3075,8 +3126,24 @@ class App:
                         active_casters_buf[i_ac, 0:3] = pos_c
                         active_casters_buf[i_ac, 3] = rad_c
                         
+                        f = all_instances[idx_u, 12]
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
                         active_poles_obl_buf[i_ac, 0:3] = all_instances[idx_u, 9:12]
-                        active_poles_obl_buf[i_ac, 3] = all_instances[idx_u, 12]
+                        active_poles_obl_buf[i_ac, 3] = f_scale
+                        
+                        pos_star = cmp_pos_rel[self.star_idx_cmp] if is_c_cmp else pos_rel_all[star_idx]
+                        to_star = pos_star - pos_c
+                        dist_s = np.linalg.norm(to_star)
+                        if dist_s > 1e-6:
+                            L = to_star / dist_s
+                        else:
+                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        
+                        p_dot_L = np.dot(all_instances[idx_u, 9:12], L)
+                        p_proj_sq = 1.0 - p_dot_L**2
+                        f_factor = 1.0 - f
+                        r_minor = rad_c * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                        active_caster_r_minor_buf[i_ac] = r_minor
                         
                         lookup = atmo_lookup_cmp if is_c_cmp else atmo_lookup
                         atmo_info = lookup.get(c_local_idx)
@@ -3092,6 +3159,7 @@ class App:
                     if u_atmo_num_active_casters is not None: u_atmo_num_active_casters.value = n_active
                     if u_atmo_active_casters is not None: u_atmo_active_casters.write(active_casters_buf.tobytes())
                     if u_atmo_active_caster_poles_obl is not None: u_atmo_active_caster_poles_obl.write(active_poles_obl_buf.tobytes())
+                    if u_atmo_active_caster_R_minor is not None: u_atmo_active_caster_R_minor.write(active_caster_r_minor_buf.tobytes())
                     if u_atmo_active_caster_atmos is not None: u_atmo_active_caster_atmos.write(active_atmos_buf.tobytes())
                     if u_atmo_active_max_bend is not None: u_atmo_active_max_bend.write(active_max_bend_buf.tobytes())
                     
@@ -3128,11 +3196,13 @@ class App:
                         if 'u_num_samples' in prog: prog['u_num_samples'].value = n_samples
                         
                         if 'u_body_idx' in prog: prog['u_body_idx'].value = body_idx_in_unified
+                        f = float(all_instances[body_idx_in_unified, 12])
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
                         if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
                             float(all_instances[body_idx_in_unified, 9]),
                             float(all_instances[body_idx_in_unified, 10]),
                             float(all_instances[body_idx_in_unified, 11]),
-                            float(all_instances[body_idx_in_unified, 12])
+                            float(f_scale)
                         )
                         if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = clip_mode
                         if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
@@ -3140,6 +3210,7 @@ class App:
                         if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = n_active
                         if 'u_active_casters' in prog: prog['u_active_casters'].write(active_casters_buf.tobytes())
                         if 'u_active_caster_poles_obl' in prog: prog['u_active_caster_poles_obl'].write(active_poles_obl_buf.tobytes())
+                        if 'u_active_caster_R_minor' in prog: prog['u_active_caster_R_minor'].write(active_caster_r_minor_buf.tobytes())
                         if 'u_active_caster_atmos' in prog: prog['u_active_caster_atmos'].write(active_atmos_buf.tobytes())
                         
                         if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
@@ -3217,12 +3288,31 @@ class App:
                         u_ring_host_radius.value = float(body_radii[bi])
                         if u_ring_host_color is not None:
                             u_ring_host_color.value = tuple(float(c) for c in body_colors[bi])
+                        f = float(all_instances[bi, 12])
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
                         u_ring_host_pole_obl.value = (
                             float(all_instances[bi, 9]),
                             float(all_instances[bi, 10]),
                             float(all_instances[bi, 11]),
-                            float(all_instances[bi, 12])
+                            float(f_scale)
                         )
+                        
+                        pos_host = pos_rel_all[bi]
+                        r_eq = float(body_radii[bi])
+                        pole = all_instances[bi, 9:12]
+                        pos_star = pos_rel_all[star_idx]
+                        to_star = pos_star - pos_host
+                        dist_s = np.linalg.norm(to_star)
+                        if dist_s > 1e-6:
+                            L = to_star / dist_s
+                        else:
+                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        p_dot_L = np.dot(pole, L)
+                        p_proj_sq = 1.0 - p_dot_L**2
+                        f_factor = 1.0 - f
+                        host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                        if u_ring_host_R_minor is not None:
+                            u_ring_host_R_minor.value = float(host_r_minor)
                         if u_ring_host_atmo is not None:
                             atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
                             if atmo is not None:
@@ -3261,12 +3351,31 @@ class App:
                             u_ring_host_color.value = tuple(float(c) for c in self.body_colors_cmp[bi])
                         
                         body_idx_in_unified = num_bodies + bi
+                        f = float(all_instances[body_idx_in_unified, 12])
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
                         u_ring_host_pole_obl.value = (
                             float(all_instances[body_idx_in_unified, 9]),
                             float(all_instances[body_idx_in_unified, 10]),
                             float(all_instances[body_idx_in_unified, 11]),
-                            float(all_instances[body_idx_in_unified, 12])
+                            float(f_scale)
                         )
+                        
+                        pos_host = cmp_pos_rel[bi]
+                        r_eq = float(self.body_radii_cmp[bi])
+                        pole = all_instances[body_idx_in_unified, 9:12]
+                        pos_star = cmp_pos_rel[self.star_idx_cmp]
+                        to_star = pos_star - pos_host
+                        dist_s = np.linalg.norm(to_star)
+                        if dist_s > 1e-6:
+                            L = to_star / dist_s
+                        else:
+                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        p_dot_L = np.dot(pole, L)
+                        p_proj_sq = 1.0 - p_dot_L**2
+                        f_factor = 1.0 - f
+                        host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                        if u_ring_host_R_minor is not None:
+                            u_ring_host_R_minor.value = float(host_r_minor)
                         if u_ring_host_atmo is not None:
                             atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
                             if atmo is not None:
@@ -3930,6 +4039,7 @@ class App:
                                 self.camera["edit_data"] = {
                                     "mass": float(mass_snap[insp_idx]),
                                     "radius": float(body_info.get('r', 0.0) * 696340.0),
+                                    "rotation_period": float(body_info.get("rotation_period", 0.0)),
                                     "type": body_info.get("type", "Moon"),
                                     "a": 0.0, "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
                                     "init_orbit": True,
@@ -4030,6 +4140,7 @@ class App:
                         else:
                             _, ed["mass"] = imgui.input_double(u"Mass (M\u2609)", ed["mass"], format="%e")
                             _, ed["radius"] = imgui.input_double("Radius (km)", ed["radius"], format="%.1f")
+                            _, ed["rotation_period"] = imgui.input_double("Rot Period (hours)", ed["rotation_period"], format="%.4f")
                             edit_mass = ed["mass"]
                             edit_r_km = ed["radius"]
                             
@@ -4320,12 +4431,45 @@ class App:
                         imgui.separator()
                         if imgui.button("Apply Changes", width=-1):
                             ed = self.camera["edit_data"]
+                            
+                            rot_hours = ed["rotation_period"]
+                            m_val = ed["mass"]
+                            r_km = ed["radius"]
+                            f = 0.0
+                            j2 = 0.0
+                            j4 = 0.0
+                            if rot_hours > 0.0 and m_val > 0.0 and r_km > 0.0:
+                                omega = 2.0 * math.pi / (rot_hours * 3600.0)
+                                r_eq_m = r_km * 1000.0
+                                mass_kg = m_val * 1.98847e30
+                                G_SI = 6.6743e-11
+                                m_param = (omega**2 * r_eq_m**3) / (G_SI * mass_kg)
+                                b_type = ed["type"]
+                                if b_type == "Moon" or b_type == "Dwarf Planet":
+                                    chi = 1.25
+                                elif b_type == "Terrestrial":
+                                    chi = 0.95
+                                else:
+                                    chi = 0.65
+                                f = chi * m_param
+                                j2 = m_param * (chi - 0.5)
+                                j4 = -0.15 * (f**2)
+                            
+                            pole_render = visual_arr[insp_idx, 5:8]
+                            pole_ecl = [float(pole_render[0]), float(-pole_render[2]), float(pole_render[1])]
+                            
                             payload = {
                                 "action": "UPDATE",
                                 "idx": insp_idx,
+                                "name": body_name,
                                 "mass": ed["mass"],
                                 "radius": ed["radius"],
-                                "type": ed["type"]
+                                "type": ed["type"],
+                                "rotation_period": rot_hours,
+                                "oblateness": f,
+                                "J2": j2,
+                                "j4": j4,
+                                "pole_ecl": pole_ecl
                             }
                             if ed["type"] == "Star" and ed.get("_preview"):
                                 pr = ed["_preview"]

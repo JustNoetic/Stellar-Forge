@@ -67,6 +67,7 @@ uniform int u_atmo_clip_mode;
 uniform int u_num_active_casters;
 uniform vec4 u_active_casters[8];
 uniform vec4 u_active_caster_poles_obl[8];
+uniform float u_active_caster_R_minor[8];
 uniform vec4 u_active_caster_atmos[8];
 uniform float u_active_max_bend[8];
 uniform uint u_ring_coplanar_mask[16];
@@ -81,17 +82,16 @@ layout(location = 0, index = 1) out vec4 out_transmittance;
 
 // g_local_rings removed to prevent local memory array spilling
 
-vec3 toSphericalSpace(vec3 p, vec4 pole_obl) {
-    float f = pole_obl.w;
-    if (f == 0.0) return p;
-    vec3 pole = pole_obl.xyz;
+vec3 toSphericalSpace(vec3 p, vec4 pole_scale) {
+    float f_scale = pole_scale.w;
+    if (f_scale <= 1.00001) return p;
+    vec3 pole = pole_scale.xyz;
     float h = dot(p, pole);
-    vec3 p_perp = p - h * pole;
-    return p_perp + (h / (1.0 - f)) * pole;
+    return p + (h * (f_scale - 1.0)) * pole;
 }
 
-float get_oblate_radius(float r_eq, float oblateness, vec3 pole, vec3 L, vec3 perp_vec) {
-    if (oblateness <= 0.0 || r_eq < 1e-6) return r_eq;
+float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_vec) {
+    if (r_minor < 1e-6 || r_eq < 1e-6) return r_eq;
     float perp_len = length(perp_vec);
     if (perp_len < 1e-6) return r_eq;
     float PdotL = dot(pole, L);
@@ -101,10 +101,7 @@ float get_oblate_radius(float r_eq, float oblateness, vec3 pole, vec3 L, vec3 pe
     vec3 P_dir = P_proj / P_proj_len;
     float y = dot(perp_vec, P_dir);
     float x = length(perp_vec - y * P_dir);
-    float f_factor = 1.0 - oblateness;
-    float R_minor = r_eq * sqrt(PdotL * PdotL + f_factor * f_factor * P_proj_len * P_proj_len);
-    if (R_minor < 1e-6) return r_eq;
-    float denom = sqrt((x / r_eq) * (x / r_eq) + (y / R_minor) * (y / R_minor));
+    float denom = sqrt((x / r_eq) * (x / r_eq) + (y / r_minor) * (y / r_minor));
     if (denom < 1e-6) return r_eq;
     return perp_len / denom;
 }
@@ -129,14 +126,14 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
         
         vec3 perp_vec = s_to_c - t_proj * L_dir;
-        float oblateness = u_active_caster_poles_obl[i].w;
-        if (oblateness > 0.0) {
+        float caster_r_minor = u_active_caster_R_minor[i];
+        if (caster_r_minor < caster_r - 1e-5) {
             vec3 pole = u_active_caster_poles_obl[i].xyz;
-            caster_r = get_oblate_radius(caster_r, oblateness, pole, L_dir, perp_vec);
+            caster_r = get_oblate_radius(caster_r, caster_r_minor, pole, L_dir, perp_vec);
         }
         
         float directional_star_r = star_radius;
-        if (star_obl > 0.0) {
+        if (star_obl < star_radius - 1e-5) {
             directional_star_r = get_oblate_radius(star_radius, star_obl, star_pole, L_dir, perp_vec);
         }
         float local_star_radius_over_dist = directional_star_r / max(dist_to_star, 1e-6);
@@ -546,7 +543,7 @@ void main() {
                     vec3 pos = u_active_casters[c].xyz;
                     float rad = u_active_casters[c].w;
                     float atmo = u_active_caster_atmos[c].w;
-                    float obl = u_active_caster_poles_obl[c].w;
+                    float caster_r_minor = u_active_caster_R_minor[c];
                     vec3 pole = u_active_caster_poles_obl[c].xyz;
                     vec3 atmo_tint = u_active_caster_atmos[c].xyz;
                     
@@ -559,7 +556,7 @@ void main() {
                             vec3 cross_vec = cross(s2c, L_start);
                             float p2 = dot(cross_vec, cross_vec);
                             float r = rad;
-                            if (obl > 0.0) r = get_oblate_radius(r, obl, pole, L_start, s2c - t * L_start);
+                            if (caster_r_minor < rad - 1e-5) r = get_oblate_radius(r, caster_r_minor, pole, L_start, s2c - t * L_start);
                             float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
                             float rp = eff_r + dist * sr_start;
                             if (p2 < rp * rp) {
@@ -599,7 +596,7 @@ void main() {
                             vec3 cross_vec = cross(s2c, L_end);
                             float p2 = dot(cross_vec, cross_vec);
                             float r = rad;
-                            if (obl > 0.0) r = get_oblate_radius(r, obl, pole, L_end, s2c - t * L_end);
+                            if (caster_r_minor < rad - 1e-5) r = get_oblate_radius(r, caster_r_minor, pole, L_end, s2c - t * L_end);
                             float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
                             float rp = eff_r + dist * sr_end;
                             if (p2 < rp * rp) {

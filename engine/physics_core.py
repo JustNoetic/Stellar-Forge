@@ -1242,6 +1242,43 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                                 for i, obl in enumerate(shared_state["oblate_physics_list"]):
                                     if obl[0] == idx:
                                         shared_state["oblate_physics_list"][i] = (obl[0], obl[1], obl[2], r_au, obl[4], obl[5], obl[6], obl[7])
+                        if "oblateness" in op:
+                            f = op["oblateness"]
+                            j2 = op.get("J2", 0.0)
+                            j4 = op.get("j4", 0.0)
+                            rot_period = op.get("rotation_period", 0.0)
+                            pole_ecl = np.array(op.get("pole_ecl", [0.0, 0.0, 1.0]), dtype=np.float64)
+                            r_au = op["radius"] / 1.496e8 if "radius" in op else p.r
+                            
+                            found = False
+                            opl = list(shared_state.get("oblate_physics_list", []))
+                            for i, obl in enumerate(opl):
+                                if obl[0] == idx:
+                                    opl[i] = (obl[0], j2, j4, r_au, pole_ecl, p.m, obl[6], rot_period)
+                                    found = True
+                                    break
+                            if not found and j2 > 0.0:
+                                name = op.get("name", "Edited")
+                                opl.append((idx, j2, j4, r_au, pole_ecl, p.m, name, rot_period))
+                                
+                            shared_state["oblate_physics_list"] = opl
+                            has_j2 = len(opl) > 0
+                            shared_state["has_j2"] = has_j2
+                            
+                            if has_j2:
+                                shared_state["oblate_indices"] = np.array([x[0] for x in opl], dtype=np.int32)
+                                shared_state["oblate_j2"] = np.array([x[1] for x in opl], dtype=np.float64)
+                                shared_state["oblate_req"] = np.array([x[3] for x in opl], dtype=np.float64)
+                                shared_state["oblate_poles"] = np.array([x[4] for x in opl], dtype=np.float64)
+                                shared_state["oblate_masses"] = np.array([x[5] for x in opl], dtype=np.float64)
+                            else:
+                                shared_state["oblate_indices"] = None
+                                shared_state["oblate_j2"] = None
+                                shared_state["oblate_req"] = None
+                                shared_state["oblate_poles"] = None
+                                shared_state["oblate_masses"] = None
+                                
+                            attach_custom_forces(sim, has_j2, sim.has_gr, sim.phys_star_idx, opl)
                         if "type" in op:
                             is_star = op["type"] == "Star"
                             if shared_state.get("is_star_mask") is not None:
