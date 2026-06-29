@@ -6,7 +6,7 @@
 [![NASA SPICE](https://img.shields.io/badge/Ephemeris-NASA%20JPL%20SPICE-red.svg)](https://naif.jpl.nasa.gov/naif/)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-**Stellar-Forge** is a state-of-the-art, interactive N-body gravitational simulation engine and astronomical sandbox built with Python, ModernGL, Numba JIT acceleration, and PyImGui. It provides real-time physics integration, physically based atmospheric raymarching, general relativity orbital precession, higher-order zonal harmonic oblate gravity ($J_2, J_4$), eclipse shadow lookup tables (supporting oblate star geometry), comprehensive body inspection, and seamless integration with NASA JPL SPICE kernels and Horizons ephemeris data.
+**Stellar-Forge** is a state-of-the-art, interactive N-body gravitational simulation engine and astronomical sandbox built with Python, ModernGL, Numba JIT acceleration, and PyImGui. It provides real-time physics integration, physically based atmospheric raymarching, general relativity orbital precession, higher-order zonal harmonic oblate gravity ($J_2, J_4$), analytical Keplerian propagation, eclipse shadow lookup tables (supporting oblate star geometry), comprehensive body inspection, and seamless integration with NASA JPL SPICE kernels and Horizons ephemeris data.
 
 ---
 
@@ -49,6 +49,7 @@ pip install numpy moderngl glfw pyrr imgui numba spiceypy requests
 - [Key Features](#-key-features)
 - [Physics Engine & Accuracy Testing](#-physics-engine--accuracy-testing)
   - [IAS15 N-Body Integrator](#ias15-n-body-integrator)
+  - [Analytical Keplerian Propagation](#analytical-keplerian-propagation)
   - [Relativistic & Oblate Gravity](#relativistic--oblate-gravity)
   - [JPL Horizons Benchmark Results](#jpl-horizons-benchmark-results)
 - [Graphics & Rendering Pipeline](#-graphics--rendering-pipeline)
@@ -67,7 +68,8 @@ pip install numpy moderngl glfw pyrr imgui numba spiceypy requests
 ## ✨ Key Features
 
 - **🚀 High-Performance N-Body Integrator**: Implements the **IAS15** (15th-order adaptive step-size integrator by Rein & Spiegel), compiled to machine code via Numba (`@njit(nogil=True)`), enabling ultra-fast simulations outside Python's Global Interpreter Lock (GIL).
-- **🌌 General Relativity & Zonal Harmonics**: Accurately simulates 1PN (post-Newtonian) Schwarzschild relativistic precession around compact objects and $J_2/J_4$ oblate gravitational harmonics for fast-rotating giant stars and planets.
+- **🪐 Analytical Keplerian Propagation**: $\mathcal{O}(N)$ hierarchical propagation mode utilizing Jacobi coordinates and top-down subsystem barycentric placement to completely eliminate circular dependencies and barycentric wobble. Includes $J_2$, GR, and third-body vector precession.
+- **🌌 General Relativity & Zonal Harmonics**: Accurately simulates 1PN (post-Newtonian) Schwarzschild relativistic precession around compact objects and $J_2 / J_4$ oblate gravitational harmonics for fast-rotating giant stars and planets.
 - **🌑 Eclipse Shadows & Oblate Star Geometry**: Precomputed eclipse Look-Up Tables (LUTs) casting realistic umbra and penumbra shadows across planet surfaces, atmospheres, and rings, including geometric projection support for oblate stars.
 - **🔬 JPL Horizons Accuracy Suite**: Includes automated verification benchmarks (`accuracy_test.py`) that compare 1-year numerical integrations directly against NASA JPL Horizons ground-truth state vectors.
 - **🛠️ Comprehensive Body Inspector**: In-depth GUI panel displaying real-time physical properties, osculating Keplerian orbital elements, atmospheric composition, effective thermal equilibrium, spectral type classifications, and dynamic property sliders.
@@ -81,30 +83,57 @@ pip install numpy moderngl glfw pyrr imgui numba spiceypy requests
 
 ### IAS15 N-Body Integrator
 
-The core physics integration uses **IAS15**, a 15th-order Gauss-Radau predictor-corrector integrator capable of adaptive step size control down to machine precision.
+The core physics N-body integration uses **IAS15**, a 15th-order Gauss-Radau predictor-corrector integrator capable of adaptive step size control down to machine precision.
 
-\[
+$$
 x(t) = x_0 + v_0 t + \int_0^t \int_0^{\tau} a(t') \, dt' \, d\tau
-\]
+$$
 
 It evaluates accelerations at specific Gauss-Radau nodes, adapting step sizes based on local truncation error estimates:
-\[
+$$
 \Delta t_{\text{new}} = \Delta t \cdot \left( \frac{\epsilon}{\text{error}} \right)^{1/7}
-\]
+$$
+
+### Analytical Keplerian Propagation
+
+Stellar-Forge includes an alternate **Analytical Keplerian Mode** for $\mathcal{O}(N)$ complexity simulation. Rather than numerically integrating gravitational equations of motion, it computes exact Keplerian orbits within a hierarchical tree.
+
+#### 1. Jacobi Coordinate Decomposition
+Standard hierarchical models suffer from "barycentric wobble" when minor bodies orbit massive bodies that themselves orbit a central barycenter. To solve this, Stellar-Forge uses **Jacobi coordinates**:
+- The state of each body is calculated relative to the *barycenter of all inner subsystems* orbiting the same parent.
+- This decomposes the N-body system into a sequence of decoupled two-body problems with mass-weighted coordinates.
+
+#### 2. Vector Nodal & Apsidal Precession
+To prevent orbit lines from remaining static, the analytical engine includes vector-based perturbations that update elements analytically at each time step:
+- **Nodal Precession Vector ($\mathbf{\Omega}_{\text{prec}}$)**: Represents orbital plane regression around the parent's spin axis or third-body normal vector. Calculated from $J_2$ oblateness and third-body (grandparent) gravitational influence.
+- **Apsidal Precession ($d\omega/dt$)**: Analytical advance of the periapsis inside the orbital plane, caused by $J_2$ zonal harmonics, general relativity (1PN precession), and third-body resonance.
+
+For each body, the orbit normal vector $\mathbf{n}$ and eccentricity vector $\mathbf{e}$ are precessed via axis-angle rotation:
+$$
+\mathbf{v}_{\text{new}} = \mathbf{v} \cos\theta + (\mathbf{k} \times \mathbf{v}) \sin\theta + \mathbf{k} (\mathbf{k} \cdot \mathbf{v})(1 - \cos\theta)
+$$
+Where $\mathbf{k}$ is the unit precession axis, and $\theta = \|\mathbf{\Omega}_{\text{prec}}\| \Delta t$.
+
+#### 3. Top-Down Jacobi Placement
+During propagation:
+1. Mean anomaly is updated: $M(t) = (M_0 + n \cdot \Delta t) \bmod 2\pi$.
+2. The eccentric anomaly $E$ is solved via Kepler's Equation: $M = E - e \sin E$.
+3. Precessed $\mathbf{n}$ and $\mathbf{e}$ vectors are used to generate the 3D relative position and velocity.
+4. Position and velocity are mapped back from Jacobi coordinates to Cartesian coordinates in a top-down pass through the hierarchy tree.
 
 ### Relativistic & Oblate Gravity
 
 1. **General Relativity (1PN Post-Newtonian Correction)**:
    Accounts for perihelion precession near massive objects:
-   \[
+   $$
    \mathbf{a}_{\text{GR}} = \frac{G M}{c^2 r^3} \left( \left[ 4 \frac{G M}{r} - v^2 \right] \mathbf{r} + 4 (\mathbf{r} \cdot \mathbf{v}) \mathbf{v} \right)
-   \]
+   $$
 
-2. **Oblate Harmonics ($J_2$ and $J_4$)**:
+2. **Oblate Harmonics ($J_2, J_4$)**:
    Modifications to gravitational potential due to rotational oblateness:
-   \[
-   V(r, \theta) = -\frac{GM}{r} \left[ 1 - \sum_{n=2}^4 J_n \left( \frac{R_{eq}}{r} \right)^n P_n(\cos\theta) \right]
-   \]
+    $$
+    V(r, \theta) = -\frac{GM}{r} \left[ 1 - \sum_{n=2}^4 J_n \left( \frac{R_{eq}}{r} \right)^n P_n(\cos\theta) \right]
+    $$
 
 ### JPL Horizons Benchmark Results
 
@@ -112,38 +141,32 @@ Stellar-Forge includes automated accuracy testing scripts (`accuracy_test.py`) t
 
 Errors are decomposed into standard astronomical **RTN (Radial, Transverse/Along-Track, Normal/Cross-Track)** coordinate frames in kilometers. Below are the actual benchmark results:
 
-```
---- 1-YEAR ACCURACY TEST RESULTS (2025 -> 2026) ---
-===============================================================================================
-Body Name       |   Total Drift (km) |  Ahead/Behind (km) |    Radial (km) | Cross-Track (km)
-----------------+--------------------+--------------------+----------------+----------------
-Mercury         |            0.19 km |           -0.19 km |       -0.02 km |        -0.00 km
-Venus           |            0.13 km |           -0.13 km |        0.01 km |        -0.00 km
-Earth           |            0.05 km |           -0.05 km |       -0.00 km |         0.00 km
-Moon            |            0.90 km |            0.90 km |       -0.01 km |         0.03 km
-Mars            |            0.08 km |            0.07 km |       -0.03 km |         0.00 km
-Jupiter         |            0.69 km |            0.14 km |        0.67 km |         0.01 km
-Saturn          |            0.17 km |            0.15 km |        0.05 km |        -0.06 km
-Neptune         |           11.15 km |          -10.38 km |       -2.35 km |        -3.33 km
-Pluto           |           19.88 km |           14.14 km |       -8.14 km |        11.35 km
-Ceres           |            0.15 km |            0.09 km |       -0.12 km |        -0.00 km
-Vesta           |            0.20 km |            0.16 km |       -0.12 km |         0.00 km
-Pallas          |            0.05 km |            0.03 km |       -0.03 km |         0.02 km
-Haumea          |            0.05 km |           -0.04 km |       -0.03 km |         0.01 km
-Makemake        |            0.03 km |           -0.02 km |       -0.03 km |         0.00 km
-Eris            |            0.04 km |            0.02 km |        0.03 km |        -0.02 km
-----------------+--------------------+--------------------+----------------+----------------
-Major Galilean / Saturnian / Jovian Moons & Satellites:
-Europa          |           15.14 km |            2.41 km |        0.98 km |       -14.91 km
-Ganymede        |           24.72 km |           24.41 km |        0.30 km |        -3.88 km
-Callisto        |           18.00 km |           17.98 km |        0.13 km |         0.65 km
-Titan           |           54.93 km |          -54.93 km |       -0.02 km |        -0.13 km
-Hyperion        |           58.07 km |          -57.92 km |        4.04 km |         0.20 km
-Charon          |           17.58 km |          -17.58 km |       -0.00 km |         0.00 km
-Triton          |          230.37 km |         -229.30 km |       -0.02 km |        22.25 km
-```
+| Body Name | Total Drift (km) | Ahead/Behind (km) | Radial (km) | Cross-Track (km) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Mercury** | 0.19 km | -0.19 km | -0.02 km | -0.00 km |
+| **Venus** | 0.13 km | -0.13 km | 0.01 km | -0.00 km |
+| **Earth** | 0.05 km | -0.05 km | -0.00 km | 0.00 km |
+| **Moon** | 0.90 km | 0.90 km | -0.01 km | 0.03 km |
+| **Mars** | 0.08 km | 0.07 km | -0.03 km | 0.00 km |
+| **Jupiter** | 0.69 km | 0.14 km | 0.67 km | 0.01 km |
+| **Saturn** | 0.17 km | 0.15 km | 0.05 km | -0.06 km |
+| **Neptune** | 11.15 km | -10.38 km | -2.35 km | -3.33 km |
+| **Pluto** | 19.88 km | 14.14 km | -8.14 km | 11.35 km |
+| **Ceres** | 0.15 km | 0.09 km | -0.12 km | -0.00 km |
+| **Vesta** | 0.20 km | 0.16 km | -0.12 km | 0.00 km |
+| **Pallas** | 0.05 km | 0.03 km | -0.03 km | 0.02 km |
+| **Haumea** | 0.05 km | -0.04 km | -0.03 km | 0.01 km |
+| **Makemake** | 0.03 km | -0.02 km | -0.03 km | 0.00 km |
+| **Eris** | 0.04 km | 0.02 km | 0.03 km | -0.02 km |
+| **Europa** *(Jovian Moon)* | 15.14 km | 2.41 km | 0.98 km | -14.91 km |
+| **Ganymede** *(Jovian Moon)* | 24.72 km | 24.41 km | 0.30 km | -3.88 km |
+| **Callisto** *(Jovian Moon)* | 18.00 km | 17.98 km | 0.13 km | 0.65 km |
+| **Titan** *(Saturnian Moon)* | 54.93 km | -54.93 km | -0.02 km | -0.13 km |
+| **Hyperion** *(Saturnian Moon)* | 58.07 km | -57.92 km | 4.04 km | 0.20 km |
+| **Charon** *(Plutonian Moon)* | 17.58 km | -17.58 km | -0.00 km | 0.00 km |
+| **Triton** *(Neptunian Moon)* | 230.37 km | -229.30 km | -0.02 km | 22.25 km |
 
-*Note: Major planets and dwarf planets achieve sub-kilometer to near-zero positional drift over a full orbital year ($<0.05 \text{ km}$ for Earth and Eris!). Small close-in moons reflect expected high-frequency tidal and multi-body resonance drift when unmodelled by point-mass dynamics.*
+*\*Note: Major planets and dwarf planets achieve sub-kilometer to near-zero positional drift over a full orbital year ($< 0.05 \text{ km}$ for Earth and Eris!). Small close-in moons reflect expected high-frequency tidal and multi-body resonance drift when unmodelled by point-mass dynamics.*
 
 To run the benchmark yourself:
 ```bash
@@ -199,8 +222,10 @@ graph TD
     
     subgraph Physics Thread
         D --> E[IAS15 Integrator ias15_step_numba]
+        D --> E2[Keplerian Engine propagate_keplerian_system_numba]
         E --> F[Custom Forces GR 1PN & J2/J4]
-        F --> G[Keplerian Elements & Barycenters]
+        E2 --> G[Keplerian Elements & Barycenters]
+        F --> G
         G --> H[Shared State Mutex Buffer Snapshot]
     end
     
@@ -225,6 +250,7 @@ Stellar-Forge/
 │   ├── app.py                   # Main window, rendering loops, ImGui UI & event handling
 │   ├── main.py                  # Entry point script with fault handling and crash loggers
 │   ├── physics_core.py          # Numba-compiled IAS15 integrator, custom forces & physics loop
+│   ├── kepler_analytical.py     # Analytical Keplerian Jacobi coordinate propagation engine
 │   ├── system_manager.py        # System I/O, state snapshots, stellar property derivation
 │   ├── spice_manager.py         # NAIF SPICE kernel manager, automated kernel downloader
 │   ├── star_calc.py             # Stellar classification, HR diagram statistics & HZ bounds
