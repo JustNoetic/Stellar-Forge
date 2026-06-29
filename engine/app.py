@@ -504,8 +504,13 @@ class App:
             "edit_mode": False,
             "edit_data": {},
             "show_settings_modal": False,
+            "atmo_quality": 1,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
+            "show_orbits": True,
+            "orbit_fade_dir_idx": 0,
+            "orbit_min_alpha": 0.3,
+            "show_habitable_zone": False,
             "planetshine_enabled": True,
             "ringshine_enabled": True,
             "bloom_intensity": 0.05,
@@ -515,6 +520,7 @@ class App:
             "sky_view_hybrid_dist": 1.1,
             "sky_view_quality": 2,
             "sky_view_custom_res": (1024, 512),
+            "inspector_frame": 0,
         }
         self.sky_view_cache = {}
         
@@ -556,6 +562,56 @@ class App:
         self.n_orbits_low_cmp = 0
         self.ring_render_groups_cmp = []
         self.ring_precomputed_cmp = []
+        self.load_settings()
+
+    def load_settings(self):
+        try:
+            import json
+            import os
+            settings_path = os.path.join("data", "graphics_settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path, 'r') as f:
+                    saved = json.load(f)
+                for k, v in saved.items():
+                    if k == "sky_view_custom_res" and isinstance(v, list):
+                        self.camera[k] = tuple(v)
+                    else:
+                        self.camera[k] = v
+        except Exception as e:
+            print(f"Failed to load settings: {e}")
+
+    def save_settings(self):
+        try:
+            import json
+            import os
+            os.makedirs("data", exist_ok=True)
+            settings_path = os.path.join("data", "graphics_settings.json")
+            saved = {
+                "atmo_quality": self.camera.get("atmo_quality", 1),
+                "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
+                "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
+                "sky_view_mode": self.camera.get("sky_view_mode", 0),
+                "sky_view_hybrid_dist": self.camera.get("sky_view_hybrid_dist", 1.1),
+                "sky_view_quality": self.camera.get("sky_view_quality", 2),
+                "sky_view_custom_res": list(self.camera.get("sky_view_custom_res", (1024, 512))),
+                "hdr_enabled": self.camera.get("hdr_enabled", True),
+                "exposure": self.camera.get("exposure", 1.0),
+                "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
+                "bloom_threshold": self.camera.get("bloom_threshold", 1.0),
+                "msaa_samples": self.camera.get("msaa_samples", 4),
+                "show_orbits": self.camera.get("show_orbits", True),
+                "orbit_fade_dir_idx": self.camera.get("orbit_fade_dir_idx", 0),
+                "orbit_min_alpha": self.camera.get("orbit_min_alpha", 0.3),
+                "show_habitable_zone": self.camera.get("show_habitable_zone", False),
+                "planetshine_enabled": self.camera.get("planetshine_enabled", True),
+                "ringshine_enabled": self.camera.get("ringshine_enabled", True),
+                "inspector_frame": self.camera.get("inspector_frame", 0),
+                "fov": self.camera.get("fov", 45.0),
+            }
+            with open(settings_path, 'w') as f:
+                json.dump(saved, f, indent=4)
+        except Exception as e:
+            print(f"Failed to save settings: {e}")
 
     def scroll_callback(self, window, xoffset, yoffset):
         if self.impl: self.impl.scroll_callback(window, xoffset, yoffset)
@@ -1093,37 +1149,25 @@ class App:
         self.prog_atmo_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=atmo_lut_fragment_shader)
         self.prog_multi_scatter_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=multi_scatter_lut_fragment_shader)
         self.prog_sky_view_lut_pass = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=sky_view_lut_pass_fragment_shader)
-        self.prog_aerial_perspective = ctx.compute_shader(aerial_perspective_compute_shader)
         lut_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
         self.lut_vao = ctx.vertex_array(self.prog_atmo_lut, [(lut_vbo, '2f', 'in_position')])
         self.multi_scatter_vao = ctx.vertex_array(self.prog_multi_scatter_lut, [(lut_vbo, '2f', 'in_position')])
         self.sky_view_vao = ctx.vertex_array(self.prog_sky_view_lut_pass, [(lut_vbo, '2f', 'in_position')])
         
-        self.sky_view_lut_tex_color = ctx.texture((1024, 512), 4, dtype='f2')
-        self.sky_view_lut_tex_trans = ctx.texture((1024, 512), 4, dtype='f2')
+        q_idx_init = self.camera.get("sky_view_quality", 2)
+        q_dims_init = [(256, 128), (512, 256), (1024, 512), (2048, 1024), (4096, 2048)]
+        init_w, init_h = self.camera.get("sky_view_custom_res", (1024, 512)) if q_idx_init == 5 else q_dims_init[min(4, max(0, q_idx_init))]
+        self.sky_view_lut_tex_color = ctx.texture((init_w, init_h), 4, dtype='f2')
+        self.sky_view_lut_tex_trans = ctx.texture((init_w, init_h), 4, dtype='f2')
         self.sky_view_lut_tex_color.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.sky_view_lut_tex_trans.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.sky_view_lut_fbo = ctx.framebuffer(color_attachments=[self.sky_view_lut_tex_color, self.sky_view_lut_tex_trans])
         
         if 'u_transmittance_lut' in prog_atmo: prog_atmo['u_transmittance_lut'].value = 1
         if 'u_multi_scatter_lut' in prog_atmo: prog_atmo['u_multi_scatter_lut'].value = 3
-        if 'u_aerial_perspective_volume' in prog_spheres: prog_spheres['u_aerial_perspective_volume'].value = 4
-        if 'u_aerial_perspective_volume' in prog_rings: prog_rings['u_aerial_perspective_volume'].value = 4
-
-        
-        
-        if 'u_transmittance_lut' in self.prog_aerial_perspective: self.prog_aerial_perspective['u_transmittance_lut'].value = 1
-        if 'u_multi_scatter_lut' in self.prog_aerial_perspective: self.prog_aerial_perspective['u_multi_scatter_lut'].value = 3
 
         ring_precomputed = []
         RING_SEGMENTS = 128
-
-        
-        self.ap_volume_tex = ctx.texture3d((32, 32, 32), 4, dtype='f2')
-        self.ap_volume_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.ap_volume_tex.repeat_x = False
-        self.ap_volume_tex.repeat_y = False
-        self.ap_volume_tex.repeat_z = False
         
 
         for body_idx, rings_data, pole_render, body_radius_au in ring_bodies:
@@ -1381,12 +1425,12 @@ class App:
         switch_req_name = active_system_name
     
         last_render_time = time.perf_counter()
-        show_orbits = True
-        show_habitable_zone = False
-        orbit_fade_dir = 1.0
-        orbit_fade_dir_idx = 0
-        orbit_min_alpha = 0.3
-        atmo_quality = 1
+        show_orbits = self.camera.get("show_orbits", True)
+        show_habitable_zone = self.camera.get("show_habitable_zone", False)
+        orbit_fade_dir_idx = self.camera.get("orbit_fade_dir_idx", 0)
+        orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
+        orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
+        atmo_quality = self.camera.get("atmo_quality", 1)
         now_dt = datetime.datetime.now()
         jump_date = [now_dt.year, now_dt.month, now_dt.day, now_dt.hour, now_dt.minute]
         scrub_index = [0]
@@ -2785,7 +2829,7 @@ class App:
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, self.prog_aerial_perspective, self.prog_sky_view_lut_pass):
+            for prog in (prog_spheres, prog_rings, prog_atmo, self.prog_sky_view_lut_pass):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -2828,58 +2872,7 @@ class App:
                         mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
                         if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
                             build_atmo_lut(atmo, mass_sm_curr, is_cmp)
-                            
-                _, closest_atmo, is_cmp = sorted_atmos[-1]
-                bi = closest_atmo['body_idx']
-                body_pos_rel = cmp_pos_rel[bi].astype('f4') if is_cmp else pos_rel_all[bi]
-                mass_sm = self.mass_snap_cmp[bi] if is_cmp else mass_snap[bi]
-                
-                # Make sure the closest atmo has its LUT built even if it's < 2px (AP shader expects it)
-                if 'lut_tex' not in closest_atmo or closest_atmo.get('lut_mass') != mass_sm:
-                    build_atmo_lut(closest_atmo, mass_sm, is_cmp)
-                
-                closest_atmo['lut_tex'].use(location=1)
-                if 'lut_multi_scatter' in closest_atmo:
-                    closest_atmo['lut_multi_scatter'].use(location=3)
-                
-                props, _, _ = get_cached_atmosphere_properties(closest_atmo, mass_sm)
-                beta_mie_val = closest_atmo.get('beta_mie', 2.0e-6)
-                
-                prog = self.prog_aerial_perspective
-                if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
-                if 'u_body_offset' in prog: prog['u_body_offset'].write(body_pos_rel.astype('f4'))
-                if 'u_planet_radius_km' in prog: prog['u_planet_radius_km'].value = float(closest_atmo['planet_radius_km'])
-                if 'u_atmo_radius_km' in prog: prog['u_atmo_radius_km'].value = float(closest_atmo['atmo_radius_km'])
-                if 'u_atmo_radius_au' in prog: prog['u_atmo_radius_au'].value = float(closest_atmo['atmo_radius_au'])
-                if 'u_au_to_km' in prog: prog['u_au_to_km'].value = 149597870.7
-                if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
-                if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
-                if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val, closest_atmo.get('mie_angstrom', None)).astype('f4'))
-                if 'u_h_mie' in prog: prog['u_h_mie'].value = closest_atmo.get('h_mie', 1.2)
-                if 'u_mie_g' in prog: prog['u_mie_g'].value = closest_atmo.get('mie_g', 0.758)
-                if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
-                if 'u_beta_abs_layered' in prog: prog['u_beta_abs_layered'].write(props['beta_abs_layered'])
-                
-                bi = closest_atmo['body_idx']
-                if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = closest_atmo['intensity']
-                if 'u_body_idx' in prog: prog['u_body_idx'].value = bi
-                f = float(all_instances[bi, 12])
-                f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
-                if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
-                    float(all_instances[bi, 9]),
-                    float(all_instances[bi, 10]),
-                    float(all_instances[bi, 11]),
-                    float(f_scale)
-                )
-                if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
-                if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
-                if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = 0 # AP shadow caching omitted for brevity
-                
-                
-                self.ap_volume_tex.bind_to_image(0, read=False, write=True)
-                self.prog_aerial_perspective.run(32 // 4, 32 // 4, 32 // 4)
-                
-            self.ap_volume_tex.use(location=4)
+
             
             ctx.enable(moderngl.DEPTH_TEST)
             ctx.depth_mask = True
@@ -3607,26 +3600,34 @@ class App:
                 self.camera["show_settings_modal"] = True
                 
             imgui.text(f"FOV: {self.camera['fov']:.1f} deg")
-            if imgui.button("Reset FOV"): self.camera["fov"] = 45.0
+            if imgui.button("Reset FOV"):
+                self.camera["fov"] = 45.0
+                self.save_settings()
             
             if self.camera.get("show_settings_modal", False):
                 imgui.set_next_window_size(320, 320, imgui.FIRST_USE_EVER)
                 imgui.set_next_window_position(self.fb_width // 2 - 160, self.fb_height // 2 - 160, imgui.FIRST_USE_EVER)
                 expanded, self.camera["show_settings_modal"] = imgui.begin("Graphics & Quality Settings", True)
                 if expanded:
+                    settings_changed = False
                     # Atmosphere Quality
-                    _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Extreme (Brute Force)"])
+                    changed_aq, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Extreme (Brute Force)"])
+                    if changed_aq:
+                        self.camera["atmo_quality"] = atmo_quality
+                        settings_changed = True
                     
                     if atmo_quality > 0:
                         max_steps = self.camera.get("atmo_steps_max", 32)
                         changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
                         if changed_steps:
                             self.camera["atmo_steps_max"] = max_steps
+                            settings_changed = True
                             
                         adaptive_steps = self.camera.get("atmo_adaptive_steps", True)
                         changed_adapt, adaptive_steps = imgui.checkbox("Adaptive Step Count", adaptive_steps)
                         if changed_adapt:
                             self.camera["atmo_adaptive_steps"] = adaptive_steps
+                            settings_changed = True
                     
                     imgui.separator()
                     imgui.text("Sky View Rendering")
@@ -3634,16 +3635,21 @@ class App:
                     # Sky View Mode
                     sv_modes = ["Auto/Hybrid", "Pure Ray Marching", "Pure Sky View LUT"]
                     changed_mode, self.camera["sky_view_mode"] = imgui.combo("Rendering Mode", self.camera.get("sky_view_mode", 0), sv_modes)
+                    if changed_mode:
+                        settings_changed = True
                     
                     # Hybrid Distance
                     if self.camera["sky_view_mode"] == 0:
-                        _, self.camera["sky_view_hybrid_dist"] = imgui.slider_float("Hybrid Switch Distance", self.camera.get("sky_view_hybrid_dist", 1.1), 0.1, 10.0, "%.1f x Atmo Radius")
+                        changed_hd, self.camera["sky_view_hybrid_dist"] = imgui.slider_float("Hybrid Switch Distance", self.camera.get("sky_view_hybrid_dist", 1.1), 0.1, 10.0, "%.1f x Atmo Radius")
+                        if changed_hd:
+                            settings_changed = True
                         
                     # Sky View Quality
                     sv_qualities = ["Low (256x128)", "Medium (512x256)", "High (1024x512)", "Ultra (2048x1024)", "Extreme (4096x2048)", "Custom"]
                     changed_q, new_q = imgui.combo("LUT Quality", self.camera.get("sky_view_quality", 2), sv_qualities)
                     if changed_q:
                         self.camera["sky_view_quality"] = new_q
+                        settings_changed = True
                         
                     if self.camera.get("sky_view_quality", 2) == 5:
                         cw, ch = self.camera.get("sky_view_custom_res", (1024, 512))
@@ -3652,6 +3658,7 @@ class App:
                         self.camera["sky_view_custom_res"] = (max(16, cw), max(16, ch))
                         if imgui.button("Apply Custom Resolution"):
                             self.camera["sky_view_quality_changed"] = True
+                            settings_changed = True
                             
                     if changed_q or self.camera.pop("sky_view_quality_changed", False):
                         q_idx = self.camera.get("sky_view_quality", 2)
@@ -3674,37 +3681,65 @@ class App:
                     imgui.separator()
                     
                     # Exposure & HDR
-                    _, self.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", self.camera.get("hdr_enabled", True))
+                    changed_hdr, self.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", self.camera.get("hdr_enabled", True))
+                    if changed_hdr:
+                        settings_changed = True
                     if self.camera.get("hdr_enabled", True):
-                        _, self.camera["exposure"] = imgui.slider_float("Exposure", self.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
+                        changed_exp, self.camera["exposure"] = imgui.slider_float("Exposure", self.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
+                        if changed_exp:
+                            settings_changed = True
                     
                     # Bloom
-                    _, self.camera["bloom_intensity"] = imgui.slider_float("Bloom Intensity", self.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
-                    _, self.camera["bloom_threshold"] = imgui.slider_float("Bloom Threshold", self.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
+                    changed_bi, self.camera["bloom_intensity"] = imgui.slider_float("Bloom Intensity", self.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
+                    if changed_bi:
+                        settings_changed = True
+                    changed_bt, self.camera["bloom_threshold"] = imgui.slider_float("Bloom Threshold", self.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
+                    if changed_bt:
+                        settings_changed = True
                     
                     # MSAA
                     msaa_options = [0, 2, 4, 8]
                     msaa_labels = ["Off", "2x", "4x", "8x"]
                     current_msaa = self.camera.get("msaa_samples", 4)
                     current_idx = msaa_options.index(current_msaa) if current_msaa in msaa_options else 2
-                    _, new_msaa_idx = imgui.combo("MSAA", current_idx, msaa_labels)
-                    self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
+                    changed_msaa, new_msaa_idx = imgui.combo("MSAA", current_idx, msaa_labels)
+                    if changed_msaa:
+                        self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
+                        settings_changed = True
 
                     # Orbit Lines
-                    _, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
+                    changed_so, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
+                    if changed_so:
+                        self.camera["show_orbits"] = show_orbits
+                        settings_changed = True
                     if show_orbits:
-                        _, orbit_fade_dir_idx = imgui.combo("Orbit Fade", orbit_fade_dir_idx, ["Bright Behind", "Bright Ahead"])
-                        orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
-                        _, orbit_min_alpha = imgui.slider_float("Min Alpha", orbit_min_alpha, 0.0, 1.0, "%.2f")
+                        changed_ofd, orbit_fade_dir_idx = imgui.combo("Orbit Fade", orbit_fade_dir_idx, ["Bright Behind", "Bright Ahead"])
+                        if changed_ofd:
+                            orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
+                            self.camera["orbit_fade_dir_idx"] = orbit_fade_dir_idx
+                            settings_changed = True
+                        changed_oma, orbit_min_alpha = imgui.slider_float("Min Alpha", orbit_min_alpha, 0.0, 1.0, "%.2f")
+                        if changed_oma:
+                            self.camera["orbit_min_alpha"] = orbit_min_alpha
+                            settings_changed = True
                         
                     # Habitable Zones
-                    _, show_habitable_zone = imgui.checkbox("Show Habitable Zones", show_habitable_zone)
+                    changed_hz, show_habitable_zone = imgui.checkbox("Show Habitable Zones", show_habitable_zone)
+                    if changed_hz:
+                        self.camera["show_habitable_zone"] = show_habitable_zone
+                        settings_changed = True
                         
                     imgui.separator()
                     # Bounce lighting toggles
-                    _, self.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", self.camera.get("planetshine_enabled", True))
-                    _, self.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", self.camera.get("ringshine_enabled", True))
+                    changed_ps, self.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", self.camera.get("planetshine_enabled", True))
+                    if changed_ps:
+                        settings_changed = True
+                    changed_rs, self.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", self.camera.get("ringshine_enabled", True))
+                    if changed_rs:
+                        settings_changed = True
                     
+                    if settings_changed:
+                        self.save_settings()
 
                     if imgui.button("Close"):
                         self.camera["show_settings_modal"] = False
@@ -4635,8 +4670,10 @@ class App:
                         
                         self.camera.setdefault("inspector_frame", 0)
                         changed_frame, self.camera["inspector_frame"] = imgui.combo("Reference Frame", self.camera["inspector_frame"], ["Ecliptic", "Equatorial"])
-                        if changed_frame and not insp_is_cmp and self.camera["edit_mode"]:
-                            self.camera["edit_data"]["init_orbit"] = True
+                        if changed_frame:
+                            self.save_settings()
+                            if not insp_is_cmp and self.camera["edit_mode"]:
+                                self.camera["edit_data"]["init_orbit"] = True
                             
                         if self.camera["inspector_frame"] == 1:
                             pole_render = cur_visual_arr[parent_idx, 5:8]
@@ -5786,6 +5823,7 @@ class App:
         running_cmp[0] = False
         physics_thread.join(timeout=1.0)
         physics_thread_cmp.join(timeout=1.0)
+        self.save_settings()
         self.impl.shutdown()
         glfw.terminate()
     

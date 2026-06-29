@@ -1,0 +1,13 @@
+=== Stellar-Forge Performance Report ===
+
+Frames measured : 3965
+Avg frame time  :    2.52 ms  (396.5 FPS)
+Min frame time  :    1.76 ms  (569.8 FPS)
+Max frame time  :    7.88 ms  (126.9 FPS)
+50%ile          :    2.23 ms  (449.2 FPS)
+ 1% low (99%ile):    6.01 ms  (166.3 FPS)
+ 1% high ( 1%ile):    1.84 ms  (543.2 FPS)
+
+--- Per-section CPU cost (sorted by total time) ---
+  section                             total ms    count     avg ms     min ms     max ms      %
+  compute_barycenters                    32.72     3965      0.008      0.004      0.834  100.0

@@ -1,0 +1,25 @@
+{
+    "atmo_quality": 1,
+    "atmo_steps_max": 32,
+    "atmo_adaptive_steps": true,
+    "sky_view_mode": 0,
+    "sky_view_hybrid_dist": 1.1,
+    "sky_view_quality": 2,
+    "sky_view_custom_res": [
+        1024,
+        512
+    ],
+    "hdr_enabled": true,
+    "exposure": 1.0,
+    "bloom_intensity": 0.05,
+    "bloom_threshold": 1.0,
+    "msaa_samples": 4,
+    "show_orbits": true,
+    "orbit_fade_dir_idx": 0,
+    "orbit_min_alpha": 0.3,
+    "show_habitable_zone": false,
+    "planetshine_enabled": true,
+    "ringshine_enabled": true,
+    "inspector_frame": 0,
+    "fov": 45.0
+}

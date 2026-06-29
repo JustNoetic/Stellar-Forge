@@ -298,7 +298,6 @@ uniform sampler2D u_eclipse_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform vec3 u_camera_pos;
-uniform sampler3D u_aerial_perspective_volume;
 uniform float u_au_to_km;
 
 out vec4 out_color;
@@ -1076,7 +1075,6 @@ uniform bool u_planetshine_enabled;
 uniform sampler2D u_eclipse_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
-uniform sampler3D u_aerial_perspective_volume;
 uniform float u_au_to_km;
 uniform float u_caster_max_bend[64];
 
@@ -1545,8 +1543,32 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_atmos[MAX_CASTERS];
 };
 
-uniform vec3 u_body_offset;
-uniform float u_atmo_radius_au;
+layout(std430, binding = 8) buffer AtmoData {
+    vec3  u_body_offset;
+    float u_atmo_radius_au;
+    vec3  u_beta_rayleigh;
+    float u_h_rayleigh;
+    vec3  u_beta_mie;
+    float u_h_mie;
+    vec3  u_beta_abs_mixed;
+    float u_mie_g;
+    vec3  u_beta_abs_layered;
+    float u_sun_intensity;
+    float u_planet_radius_km;
+    float u_atmo_radius_km;
+    float u_au_to_km;
+    int   u_num_samples;
+    vec4  u_pole_obl;
+    int   u_num_active_casters;
+    bool  u_atmo_adaptive_steps;
+    int   u_body_idx;
+    float _pad_meta;
+    vec4  u_active_casters[8];
+    vec4  u_active_caster_poles_obl[8];
+    float u_active_caster_R_minor[8];
+    vec4  u_active_caster_atmos[8];
+    float u_active_max_bend[8];
+};
 
 out vec3 f_world_pos;
 out vec3 f_local_pos;
@@ -2648,32 +2670,3 @@ void main() {
 }
 """
 
-aerial_perspective_compute_shader = sky_view_lut_fragment_shader.replace(
-    "in vec2 f_uv;",
-    "layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;\nlayout(rgba16f, binding = 0) writeonly uniform image3D destTex;"
-).replace(
-    "void main() {",
-    """void main() {
-    ivec3 gid = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(gid, ivec3(32, 32, 32)))) return;
-    
-    vec2 f_uv = vec2(float(gid.x) + 0.5, float(gid.y) + 0.5) / 32.0;
-    float depth_slice = float(gid.z) / 31.0;
-    float slice_dist = depth_slice * depth_slice * 100000.0;
-"""
-).replace(
-    "// AP_VOLUME_HOOK",
-    "s_end = min(s_end, slice_dist);"
-).replace(
-    "layout(location = 0, index = 0) out vec4 out_color;\nlayout(location = 0, index = 1) out vec4 out_transmittance;",
-    "vec4 out_color;\nvec4 out_transmittance;"
-).replace(
-    "    out_color = vec4(scattered, 1.0);\n    out_transmittance = vec4(transmittance, 1.0);",
-    "    float avg_transmittance = (transmittance.r + transmittance.g + transmittance.b) / 3.0;\n    imageStore(destTex, gid, vec4(scattered, (1.0 - avg_transmittance)));"
-).replace(
-    "    if (s_atmo.x > s_atmo.y) {\n        out_color = vec4(0.0, 0.0, 0.0, 1.0);\n        out_transmittance = vec4(1.0, 1.0, 1.0, 1.0);\n        return;\n    }",
-    "    if (s_atmo.x > s_atmo.y) {\n        imageStore(destTex, gid, vec4(0.0));\n        return;\n    }"
-).replace(
-    "    if (s_start >= s_end) {\n        out_color = vec4(0.0, 0.0, 0.0, 1.0);\n        out_transmittance = vec4(1.0, 1.0, 1.0, 1.0);\n        return;\n    }",
-    "    if (s_start >= s_end) {\n        imageStore(destTex, gid, vec4(0.0));\n        return;\n    }"
-)

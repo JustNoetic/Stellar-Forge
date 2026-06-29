@@ -9,7 +9,7 @@ import numpy as np
 from physics_core import Simulation
 from spice_manager import SpiceManager
 from physics_core import attach_custom_forces
-from constants import C_AU_YR
+from constants import C_AU_YR, SOLAR_RADII_TO_AU, AU_TO_KM
 from math_utils import pole_to_ecliptic
 from fetch_horizons import query_horizons, parse_state_vector, HORIZONS_IDS, PARENT_NAIF
 
@@ -82,7 +82,7 @@ def main():
         if j2 > 0:
             req_km = body.get("req_km")
             if req_km:
-                req = req_km / 149597870.7
+                req = req_km / AU_TO_KM
             else:
                 r_mean = body.get("r", 1.0)
                 f = body.get("oblateness", 0.0)
@@ -90,7 +90,7 @@ def main():
                     req = r_mean / ((1.0 - f)**(1.0/3.0))
                 else:
                     req = r_mean
-                req = req * 0.00465 # solar radii to AU
+                req = req * SOLAR_RADII_TO_AU
             if "pole_ra" in body and "pole_dec" in body:
                 pole_ecl = pole_to_ecliptic(body["pole_ra"], body["pole_dec"])
                 pole = np.array(pole_ecl, dtype=np.float64)
@@ -142,8 +142,6 @@ def main():
     print(f"{'='*95}")
     print(f"{'Body Name':<15} | {'Total Drift (km)':>18} | {'Ahead/Behind (km)':>18} | {'Radial (km)':>14} | {'Cross-Track (km)':>15}")
     print(f"{'-'*15}-+-{'-'*18}-+-{'-'*18}-+-{'-'*14}-+-{'-'*15}")
-    
-    AU_TO_KM = 149597870.7
     
     for i, body in enumerate(bodies):
         name = body["name"]
