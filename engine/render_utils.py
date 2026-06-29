@@ -45,8 +45,9 @@ def format_time_speed(multiplier):
         return f"{sign_str}{multiplier / 31557600:.1f} years/s"
 
 def format_sim_time(t_years):
+    # Try spiceypy first if ephemeris mode is active
     try:
-        _mgr = globals().get('sys_mgr_spice')
+        from app import _mgr
         if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
             import spiceypy as spice
             epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
@@ -64,16 +65,57 @@ def format_sim_time(t_years):
         dt_utc = epoch + datetime.timedelta(seconds=delta_seconds)
         return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute
     except (OverflowError, OSError, ValueError):
-        return 9999, 12, 31, 23, 59
+        # Fallback to simple math for extreme years beyond 9999
+        total_days = t_years * 365.25
+        y = 2026 + int(total_days // 365.25)
+        rem_days = total_days % 365.25
+        
+        rem_days += 0.5 # Add the 12-hour offset from Jan 1 12:00
+        if rem_days >= 365.25:
+            y += 1
+            rem_days -= 365.25
+            
+        m = 1
+        days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        is_leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
+        if is_leap: days_in_month[2] = 29
+        
+        d = int(rem_days) + 1
+        rem_hours = (rem_days - int(rem_days)) * 24
+        
+        for i in range(1, 13):
+            if d > days_in_month[i]:
+                d -= days_in_month[i]
+                m += 1
+            else:
+                break
+                
+        if m > 12: m, d = 12, 31
+        h = int(rem_hours)
+        mn = int((rem_hours - h) * 60)
+        return y, m, d, h, mn
 
 def sim_time_from_date(y, m, d, h=0, mn=0):
-    epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-    try:
-        dt_utc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), 0, tzinfo=datetime.timezone.utc)
-        delta = dt_utc - epoch
-        return delta.total_seconds() / (365.25 * 86400)
-    except ValueError:
-        return 0.0
+    if 1 <= y <= 9999:
+        try:
+            epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+            dt_utc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), 0, tzinfo=datetime.timezone.utc)
+            delta = dt_utc - epoch
+            return delta.total_seconds() / (365.25 * 86400)
+        except ValueError:
+            pass
+            
+    # For extreme years, use a simplified Julian year progression
+    dy = y - 2026
+    days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    days_ytd = d - 1
+    for i in range(1, int(m)):
+        days_ytd += days_in_month[i]
+        if i == 2 and y % 4 == 0 and (y % 100 != 0 or y % 400 == 0):
+            days_ytd += 1
+            
+    total_days = dy * 365.25 + days_ytd + (h - 12) / 24.0 + mn / 1440.0
+    return total_days / 365.25
 
 @njit(cache=True)
 def compute_ring_culling(

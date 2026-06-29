@@ -137,3 +137,61 @@ def get_cartesian_from_keplerian(parent_m, body_m, a, e, inc_deg, Omega_deg, ome
     omega = math.radians(omega_deg)
     M = math.radians(M_deg)
     return orbital_to_cartesian(a, e, inc, Omega, omega, M, mu)
+
+@njit(cache=True)
+def axis_angle_rotation(v, axis, theta):
+    """Rotate vector v around unit vector axis by angle theta."""
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    cross_prod = np.array([
+        axis[1]*v[2] - axis[2]*v[1],
+        axis[2]*v[0] - axis[0]*v[2],
+        axis[0]*v[1] - axis[1]*v[0]
+    ], dtype=np.float64)
+    dot_prod = v[0]*axis[0] + v[1]*axis[1] + v[2]*axis[2]
+    
+    return np.array([
+        v[0] * cos_t + cross_prod[0] * sin_t + axis[0] * dot_prod * (1.0 - cos_t),
+        v[1] * cos_t + cross_prod[1] * sin_t + axis[1] * dot_prod * (1.0 - cos_t),
+        v[2] * cos_t + cross_prod[2] * sin_t + axis[2] * dot_prod * (1.0 - cos_t)
+    ], dtype=np.float64)
+
+@njit(cache=True)
+def vector_orbital_to_cartesian(a, e, n_vec, e_vec, M, mu):
+    """Convert orbital elements to Cartesian pos/vel using normal and eccentricity unit vectors.
+       n_vec is orbit normal (Z), e_vec is periapsis direction (X)."""
+    E = kepler_solve(M, e)
+    cos_E, sin_E = math.cos(E), math.sin(E)
+    r = a * (1.0 - e * cos_E)
+    
+    cos_f = (cos_E - e) / (1.0 - e * cos_E)
+    sin_f = math.sqrt(max(0.0, 1.0 - e*e)) * sin_E / (1.0 - e * cos_E)
+    
+    x_orb = r * cos_f
+    y_orb = r * sin_f
+    
+    fac = math.sqrt(mu / max(a**3, 1e-30))
+    denom = 1.0 - e * cos_E
+    vx_orb = -fac * a * sin_E / denom
+    vy_orb = fac * a * math.sqrt(max(0.0, 1.0 - e*e)) * cos_E / denom
+    
+    # Q vector is Y axis (n_vec x e_vec)
+    q_vec = np.array([
+        n_vec[1]*e_vec[2] - n_vec[2]*e_vec[1],
+        n_vec[2]*e_vec[0] - n_vec[0]*e_vec[2],
+        n_vec[0]*e_vec[1] - n_vec[1]*e_vec[0]
+    ], dtype=np.float64)
+    
+    pos = np.array([
+        x_orb * e_vec[0] + y_orb * q_vec[0],
+        x_orb * e_vec[1] + y_orb * q_vec[1],
+        x_orb * e_vec[2] + y_orb * q_vec[2]
+    ], dtype=np.float64)
+    
+    vel = np.array([
+        vx_orb * e_vec[0] + vy_orb * q_vec[0],
+        vx_orb * e_vec[1] + vy_orb * q_vec[1],
+        vx_orb * e_vec[2] + vy_orb * q_vec[2]
+    ], dtype=np.float64)
+    
+    return pos, vel

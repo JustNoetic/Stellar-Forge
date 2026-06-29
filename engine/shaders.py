@@ -935,7 +935,15 @@ void main() {
     
     dvec3 eye_pos = v.xyz - u_cam_pos_double.xyz;
     
-    f_color = vec4(color * 0.4, float(v.w));
+    vec3 final_rgb = color * 0.4;
+    float max_c = max(final_rgb.r, max(final_rgb.g, final_rgb.b));
+    if (max_c < 0.25 && max_c > 0.0001) {
+        final_rgb = final_rgb * (0.25 / max_c);
+    } else if (max_c <= 0.0001) {
+        final_rgb = vec3(0.25);
+    }
+
+    f_color = vec4(final_rgb, float(v.w));
     gl_Position = projection * view_rot * vec4(float(eye_pos.x), float(eye_pos.y), float(eye_pos.z), 1.0);
     f_clip_z = gl_Position.w;
 }
@@ -970,7 +978,16 @@ out float f_clip_z;
 void main() {
     vec3 pos = in_pos + u_bary_pos;
     vec3 eye_pos = pos - u_cam_pos_double.xyz;
-    f_color = vec4(u_color * 0.4, 1.0);
+    
+    vec3 final_rgb = u_color * 0.4;
+    float max_c = max(final_rgb.r, max(final_rgb.g, final_rgb.b));
+    if (max_c < 0.25 && max_c > 0.0001) {
+        final_rgb = final_rgb * (0.25 / max_c);
+    } else if (max_c <= 0.0001) {
+        final_rgb = vec3(0.25);
+    }
+
+    f_color = vec4(final_rgb, 1.0);
     gl_Position = projection * view_rot * vec4(eye_pos, 1.0);
     f_clip_z = gl_Position.w;
 }

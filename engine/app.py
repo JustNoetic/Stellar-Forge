@@ -728,7 +728,7 @@ class App:
             if key == glfw.KEY_SPACE and action == glfw.PRESS:
                 self.time_ctrl["paused"] = not self.time_ctrl["paused"]
             elif key in (glfw.KEY_UP, glfw.KEY_RIGHT):
-                self.time_ctrl["multiplier"] = min(self.time_ctrl["multiplier"] * 2.0, 1e9)
+                self.time_ctrl["multiplier"] = min(self.time_ctrl["multiplier"] * 2.0, 1e12)
             elif key in (glfw.KEY_DOWN, glfw.KEY_LEFT):
                 self.time_ctrl["multiplier"] = max(self.time_ctrl["multiplier"] / 2.0, 1.0)
             elif key == glfw.KEY_R:
@@ -3503,9 +3503,8 @@ class App:
                     self.time_ctrl["time_direction"] = 1
             imgui.same_line()
             
-            # Forward-only logarithmic slider (0 = realtime, 9 = max speed)
             val_log = math.log10(max(1.0, abs(self.time_ctrl["multiplier"])))
-            changed, new_log = imgui.slider_float("##speed", val_log, 0.0, 9.0, "")
+            changed, new_log = imgui.slider_float("##speed", val_log, 0.0, 12.0, "")
             if changed:
                 self.time_ctrl["multiplier"] = 10 ** new_log
                     

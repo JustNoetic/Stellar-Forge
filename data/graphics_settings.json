@@ -10,7 +10,7 @@
         512
     ],
     "hdr_enabled": true,
-    "exposure": 1.0,
+    "exposure": 4.0,
     "bloom_intensity": 0.05,
     "bloom_threshold": 1.0,
     "msaa_samples": 4,

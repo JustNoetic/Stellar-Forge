@@ -1410,7 +1410,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         if kepler_cached_elements is None or shared_state.get("keplerian_reextract", False) or len(kepler_cached_elements) != num_bodies:
                             with shared_state["lock"]:
                                 shared_state["keplerian_reextract"] = False
-                            kepler_cached_elements = extract_all_kepler_elements(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass, sim.t, G)
+                            kepler_cached_elements = extract_all_kepler_elements(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass, sim.t, G,
+                                                                                 sim.oblate_indices, sim.oblate_j2, sim.oblate_req, sim.oblate_poles, sim.has_gr, C_AU_YR)
                             kepler_init_pos = sim_pos.copy()
                             kepler_init_vel = sim_vel.copy()
                             kepler_subsys_init_pos = sub_pos.copy()
@@ -1531,7 +1532,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 if kepler_cached_elements is None or shared_state.get("keplerian_reextract", False) or len(kepler_cached_elements) != num_bodies:
                     with shared_state["lock"]:
                         shared_state["keplerian_reextract"] = False
-                    kepler_cached_elements = extract_all_kepler_elements(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass, sim.t, G)
+                    kepler_cached_elements = extract_all_kepler_elements(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass, sim.t, G,
+                                                                         sim.oblate_indices, sim.oblate_j2, sim.oblate_req, sim.oblate_poles, sim.has_gr, C_AU_YR)
                     kepler_init_pos = sim_pos.copy()
                     kepler_init_vel = sim_vel.copy()
                     kepler_subsys_init_pos = sub_pos.copy()
