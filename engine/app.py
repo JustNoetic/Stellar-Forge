@@ -767,6 +767,7 @@ class App:
         sys_mgr = SystemManager()
         sys_mgr_spice = SpiceManager()
         ephemeris_mode_active = False
+        keplerian_mode_active = False
         active_system_name = SystemManager.SOLAR_SYSTEM_NAME
         bodies_data_raw = sys_mgr.load_default_system()
         bundle = load_system_from_data(bodies_data_raw)
@@ -862,6 +863,9 @@ class App:
             "oblate_poles": oblate_poles if has_j2 else None,
             "oblate_masses": oblate_masses if has_j2 else None,
             "phys_star_idx": phys_star_idx,
+            "ephemeris_mode": False,
+            "keplerian_mode": False,
+            "keplerian_reextract": False,
             # ── System switching infrastructure ──
             "system_switch_request": None,       # set to dict with system bundle to trigger switch
             "system_switch_complete": False,      # physics thread sets True when switch is done
@@ -3585,7 +3589,7 @@ class App:
                 jump_date[3] = max(0, min(23, jump_date[3]))
                 jump_date[4] = max(0, min(59, jump_date[4]))
                 
-                if ephemeris_mode_active:
+                if ephemeris_mode_active or keplerian_mode_active:
                     if imgui.button("Jump to Date"):
                         target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4])
                         self.time_ctrl["sync_t"] = target_t
@@ -3912,6 +3916,50 @@ class App:
                 
                 self._show_ephem_download_modal = True
                 sys_mgr_spice.download_kernels_async(on_complete=_on_spice_ready)
+
+            # ── Simulation Physics Mode ──
+            imgui.text_colored("Simulation Physics Mode", 0.6, 0.9, 1.0)
+            cur_mode = 0
+            if keplerian_mode_active:
+                cur_mode = 1
+            elif ephemeris_mode_active:
+                cur_mode = 2
+
+            c0 = imgui.radio_button("N-Body", cur_mode == 0)
+            imgui.same_line()
+            c1 = imgui.radio_button("Keplerian", cur_mode == 1)
+            if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                imgui.same_line()
+                c2 = imgui.radio_button("Ephemeris", cur_mode == 2)
+            else:
+                c2 = False
+
+            if c0 and cur_mode != 0:
+                ephemeris_mode_active = False
+                keplerian_mode_active = False
+                self.shared_state["ephemeris_mode"] = False
+                self.shared_state["keplerian_mode"] = False
+            elif c1 and cur_mode != 1:
+                ephemeris_mode_active = False
+                keplerian_mode_active = True
+                self.shared_state["ephemeris_mode"] = False
+                self.shared_state["keplerian_mode"] = True
+                with self.shared_state["lock"]:
+                    self.shared_state["keplerian_reextract"] = True
+            elif c2 and cur_mode != 2:
+                if not sys_mgr_spice.settings_initialized:
+                    imgui.open_popup("Ephemeris Setup")
+                else:
+                    _trigger_ephem_switch()
+
+            if keplerian_mode_active:
+                imgui.text_colored("ANALYTICAL KEPLERIAN MODE ACTIVE", 0.3, 1.0, 0.3)
+                if imgui.button("Export & Switch to N-Body Mode", width=-1):
+                    ephemeris_mode_active = False
+                    keplerian_mode_active = False
+                    self.shared_state["ephemeris_mode"] = False
+                    self.shared_state["keplerian_mode"] = False
+                imgui.separator()
 
             if active_system_name == SystemManager.SOLAR_SYSTEM_NAME and not ephemeris_mode_active:
                 if imgui.button("Switch to Ephemeris Mode", width=-1):

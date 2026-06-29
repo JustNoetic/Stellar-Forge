@@ -9,6 +9,7 @@ from system_manager import SystemManager, SystemSnapshot, derive_star_properties
 import warnings
 from render_utils import *
 from atmosphere_physics import compute_atmosphere_properties
+from kepler_analytical import extract_all_kepler_elements, propagate_keplerian_system_numba
 
 def _extract_render_state(sim, num_bodies, out_pos, out_vel):
     """Extract particle positions/velocities with render coordinate swap (x, z, -y)."""
@@ -991,6 +992,11 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
         pass
 
     last_time = time.perf_counter()
+    kepler_cached_elements = None
+    kepler_init_pos = None
+    kepler_init_vel = None
+    kepler_subsys_init_pos = None
+    kepler_subsys_init_vel = None
     
     with shared_state["lock"]:
         current_parents = shared_state["parent_indices"].copy()
@@ -1175,6 +1181,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 if "ephemeris_exit" in switch_req:
                     shared_state["ephemeris_exit"] = switch_req["ephemeris_exit"]
                 
+            kepler_cached_elements = None
             frame_count = 0
             last_time = time.perf_counter()
             continue
@@ -1185,8 +1192,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 crud_ops = shared_state["crud_queue"][:]
                 shared_state["crud_queue"].clear()
 
-        
         if crud_ops:
+            kepler_cached_elements = None
             for op in crud_ops:
                 if op["action"] == "UPDATE":
                     idx = op["idx"]
@@ -1390,8 +1397,32 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     sim.particles[i].vz = raw_arr[i, 5]
                 sim.reset_integrator_state()
             else:
-                if shared_state.get("ephemeris_mode", False):
+                if shared_state.get("ephemeris_mode", False) or shared_state.get("keplerian_mode", False):
                     sim.t = sync_time
+                    if shared_state.get("keplerian_mode", False):
+                        sub_pos = np.empty((num_bodies, 3), dtype=np.float64)
+                        sub_vel = np.empty((num_bodies, 3), dtype=np.float64)
+                        sub_mass = np.empty(num_bodies, dtype=np.float64)
+                        sim_pos = sim.arr[:num_bodies, 0:3]
+                        sim_vel = sim.arr[:num_bodies, 3:6]
+                        sim_mass = sim.arr[:num_bodies, 9]
+                        compute_barycenters(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass)
+                        if kepler_cached_elements is None or shared_state.get("keplerian_reextract", False) or len(kepler_cached_elements) != num_bodies:
+                            with shared_state["lock"]:
+                                shared_state["keplerian_reextract"] = False
+                            kepler_cached_elements = extract_all_kepler_elements(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass, sim.t, G)
+                            kepler_init_pos = sim_pos.copy()
+                            kepler_init_vel = sim_vel.copy()
+                            kepler_subsys_init_pos = sub_pos.copy()
+                            kepler_subsys_init_vel = sub_vel.copy()
+                        propagate_keplerian_system_numba(kepler_cached_elements, current_parents, tree_indices, sim.t, kepler_subsys_init_pos, kepler_subsys_init_vel, sim_pos, sim_vel, sim_mass, sub_mass)
+                        for i in range(num_bodies):
+                            sim.particles[i].x = sim_pos[i, 0]
+                            sim.particles[i].y = sim_pos[i, 1]
+                            sim.particles[i].z = sim_pos[i, 2]
+                            sim.particles[i].vx = sim_vel[i, 0]
+                            sim.particles[i].vy = sim_vel[i, 1]
+                            sim.particles[i].vz = sim_vel[i, 2]
                 else:
                     sim.integrate(sync_time)
                 
@@ -1488,6 +1519,31 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             
             if shared_state.get("ephemeris_mode", False):
                 sim.t += dt_sim
+            elif shared_state.get("keplerian_mode", False):
+                sim.t += dt_sim
+                sub_pos = np.empty((num_bodies, 3), dtype=np.float64)
+                sub_vel = np.empty((num_bodies, 3), dtype=np.float64)
+                sub_mass = np.empty(num_bodies, dtype=np.float64)
+                sim_pos = sim.arr[:num_bodies, 0:3]
+                sim_vel = sim.arr[:num_bodies, 3:6]
+                sim_mass = sim.arr[:num_bodies, 9]
+                compute_barycenters(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass)
+                if kepler_cached_elements is None or shared_state.get("keplerian_reextract", False) or len(kepler_cached_elements) != num_bodies:
+                    with shared_state["lock"]:
+                        shared_state["keplerian_reextract"] = False
+                    kepler_cached_elements = extract_all_kepler_elements(sim_pos, sim_vel, sim_mass, current_parents, sub_pos, sub_vel, sub_mass, sim.t, G)
+                    kepler_init_pos = sim_pos.copy()
+                    kepler_init_vel = sim_vel.copy()
+                    kepler_subsys_init_pos = sub_pos.copy()
+                    kepler_subsys_init_vel = sub_vel.copy()
+                propagate_keplerian_system_numba(kepler_cached_elements, current_parents, tree_indices, sim.t, kepler_subsys_init_pos, kepler_subsys_init_vel, sim_pos, sim_vel, sim_mass, sub_mass)
+                for i in range(num_bodies):
+                    sim.particles[i].x = sim_pos[i, 0]
+                    sim.particles[i].y = sim_pos[i, 1]
+                    sim.particles[i].z = sim_pos[i, 2]
+                    sim.particles[i].vx = sim_vel[i, 0]
+                    sim.particles[i].vy = sim_vel[i, 1]
+                    sim.particles[i].vz = sim_vel[i, 2]
             else:
                 sim.integrate(sim.t + dt_sim)
                 
