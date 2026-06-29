@@ -54,6 +54,7 @@ uniform vec3  u_beta_abs_layered;
 uniform float u_sun_intensity;
 uniform vec3  u_camera_pos;
 uniform int   u_num_samples;
+uniform bool  u_atmo_adaptive_steps;
 uniform vec4  u_pole_obl;
 
 uniform sampler2D u_ring_gradients;
@@ -268,6 +269,11 @@ vec3 get_transmittance(float r, float cos_theta) {
     return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
+vec3 get_transmittance_precomputed(float v, float cos_theta) {
+    float u = 0.5 + 0.5 * sign(cos_theta) * sqrt(abs(cos_theta));
+    return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
+}
+
 void main() {
     u_ring_mask = floatBitsToUint(instances[u_body_idx * 6 + 3].w);
     
@@ -359,8 +365,20 @@ void main() {
 
     if (s_start >= s_end) discard;
     if (u_use_sky_view_lut) {
-        float elevation = asin(clamp(ray_dir.y, -1.0, 1.0));
-        float az = atan(ray_dir.x, ray_dir.z);
+        vec3 up = length(cam_local) > 1e-5 ? normalize(cam_local) : vec3(0.0, 1.0, 0.0);
+        vec3 east = cross(vec3(0.0, 1.0, 0.0), up);
+        if (length(east) < 1e-4) {
+            east = cross(up, vec3(0.0, 0.0, 1.0));
+        }
+        east = normalize(east);
+        vec3 north = cross(up, east);
+
+        float dir_up = dot(ray_dir, up);
+        float dir_east = dot(ray_dir, east);
+        float dir_north = dot(ray_dir, north);
+
+        float elevation = asin(clamp(dir_up, -1.0, 1.0));
+        float az = atan(dir_east, dir_north);
         float u = az / (2.0 * 3.14159265358979);
         if (u < 0.0) u += 1.0;
         float v = 0.5 + 0.5 * sign(elevation) * sqrt(abs(elevation) / (3.14159265358979 / 2.0));
@@ -378,6 +396,12 @@ void main() {
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
     int steps = u_num_samples;
+    if (u_atmo_adaptive_steps) {
+        float s_closest = clamp(-dot(cam_local_sph, ray_dir_sph), s_start, s_end);
+        float min_altitude = length(cam_local_sph + s_closest * ray_dir_sph) - u_planet_radius_km;
+        float step_factor = mix(0.25, 1.0, clamp(exp(-max(0.0, min_altitude) / max(1e-3, u_h_rayleigh * 2.0)), 0.0, 1.0));
+        steps = int(clamp(float(u_num_samples) * step_factor, min(4.0, float(u_num_samples)), float(u_num_samples)));
+    }
     float step_size = (s_end - s_start) / float(steps);
     vec3 scattered = vec3(0.0);
     vec3 final_transmittance = vec3(1.0);
@@ -635,6 +659,10 @@ void main() {
             }
         }
         
+        // Precompute star direction invariants
+        vec3 sun_dir_local = normalize(sun_pos_local - mid_pos);
+        vec3 sun_dir_sph_const = normalize(toSphericalSpace(sun_dir_local, u_pole_obl));
+
         // OPTIMIZATION 1: Fast limb math invariants pre-calculated
         float alpha_sun_local = asin(clamp(sin_star, 0.0, 0.9999));
         float cos_sun = cos(alpha_sun_local);
@@ -652,6 +680,8 @@ void main() {
         float t_lerp = 0.5 / float(steps);
         float t_step = 1.0 / float(steps);
 
+        float inv_atmo_thickness = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);
+
         for (int i = 0; i < steps; i++) {
             float sample_len = length(current_pos_sph);
             float altitude = sample_len - u_planet_radius_km;
@@ -664,11 +694,16 @@ void main() {
             vec3 step_transmittance = exp(-step_extinction * step_size);
             vec3 int_factor = (vec3(1.0) - step_transmittance) / max(step_extinction, 1e-6);
 
-            vec3 current_pos_local = cam_local + current_s * ray_dir;
-            vec3 sun_dir_local = normalize(sun_pos_local - current_pos_local);
-            vec3 sun_dir_sph = normalize(toSphericalSpace(sun_dir_local, u_pole_obl));
-            float light_cos_theta = dot(current_pos_sph / sample_len, sun_dir_sph);
-            float h_norm = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+            vec3 sun_dir_sph = sun_dir_sph_const;
+            if (u_atmo_quality == 3) {
+                // In ultra mode, compute the exact star direction per-sample for maximum precision in close ranges
+                vec3 current_pos_local = cam_local + current_s * ray_dir;
+                vec3 s_dir_loc = normalize(sun_pos_local - current_pos_local);
+                sun_dir_sph = normalize(toSphericalSpace(s_dir_loc, u_pole_obl));
+            }
+
+            float light_cos_theta = dot(current_pos_sph, sun_dir_sph) / sample_len;
+            float h_norm = clamp(altitude * inv_atmo_thickness, 0.0, 1.0);
 
             float sin_planet = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
             float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
@@ -682,17 +717,25 @@ void main() {
             if (neg_light_cos > cos_inner) { 
                 vis_fraction = 0.0;
             } else if (neg_light_cos > cos_outer) { 
-                float alpha_planet = asin(clamp(sin_planet, 0.0, 0.9999));
-                float separation = acos(clamp(neg_light_cos, -1.0, 1.0));
-                float x_vis = (separation - alpha_planet) / max(alpha_sun_local, 1e-7);
-                vis_fraction = (acos(clamp(-x_vis, -1.0, 1.0)) + x_vis * sqrt(max(0.0, 1.0 - x_vis * x_vis))) / PI;
+                if (u_atmo_quality == 3) {
+                    // Exact mathematical formulation for Ultra quality
+                    float alpha_planet = asin(clamp(sin_planet, 0.0, 0.9999));
+                    float separation = acos(clamp(neg_light_cos, -1.0, 1.0));
+                    float x_vis = (separation - alpha_planet) / max(alpha_sun_local, 1e-7);
+                    vis_fraction = (acos(clamp(-x_vis, -1.0, 1.0)) + x_vis * sqrt(max(0.0, 1.0 - x_vis * x_vis))) / PI;
+                } else {
+                    // Optimized linear cosine-space approximation with smoothstep for High and below
+                    float x_vis = (cos_planet * cos_sun - neg_light_cos) / max(1e-7, sin_planet * sin_sun);
+                    vis_fraction = smoothstep(-1.0, 1.0, x_vis);
+                }
             }
 
             float disc_top_cos = min(light_cos_theta + sin_star, 1.0);
             float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet);
             float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
 
-            vec3 transmittance_to_sun = get_transmittance(sample_len, effective_cos);
+            float v_norm = sqrt(h_norm);
+            vec3 transmittance_to_sun = get_transmittance_precomputed(v_norm, effective_cos);
 
             vec3 sample_shadow = global_eclipse_shadow;
             if (u_atmo_quality == 2 && !skip_volumetric_shadow) { 
@@ -740,12 +783,13 @@ void main() {
             total_rayleigh += rho_R * sample_attenuation * int_factor;
             total_mie      += rho_M * sample_attenuation * int_factor;
             
-            float sun_cos_zenith = dot(current_pos_sph / sample_len, sun_dir_sph);
-            float h_norm_ms = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-            vec2 ms_uv = vec2(sun_cos_zenith * 0.5 + 0.5, h_norm_ms);
+            float sun_cos_zenith = light_cos_theta;
+            float ms_u = 0.5 + 0.5 * sign(sun_cos_zenith) * sqrt(abs(sun_cos_zenith));
+            float ms_v = v_norm;
+            vec2 ms_uv = vec2(ms_u, ms_v);
             vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
             
-            vec3 ms_shadow = mix(vec3(0.2), vec3(1.0), sample_shadow);
+            vec3 ms_shadow = sample_shadow;
             total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * ms_shadow * int_factor;
 
             current_transmittance *= step_transmittance;

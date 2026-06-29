@@ -1388,6 +1388,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     sim.particles[i].vx = raw_arr[i, 3]
                     sim.particles[i].vy = raw_arr[i, 4]
                     sim.particles[i].vz = raw_arr[i, 5]
+                sim.reset_integrator_state()
             else:
                 if shared_state.get("ephemeris_mode", False):
                     sim.t = sync_time
@@ -2252,6 +2253,21 @@ class Simulation:
         self._csx = np.zeros(0, dtype=np.float64)
         self._csv = np.zeros(0, dtype=np.float64)
 
+    def reset_integrator_state(self):
+        self._g.fill(0.0)
+        self._e.fill(0.0)
+        self._b.fill(0.0)
+        self._csb.fill(0.0)
+        self._er.fill(0.0)
+        self._br.fill(0.0)
+        self._at.fill(0.0)
+        self._x0.fill(0.0)
+        self._v0.fill(0.0)
+        self._a0.fill(0.0)
+        self._csx.fill(0.0)
+        self._csv.fill(0.0)
+        self.dt_last_done = 0.0
+
     def _resize_buffers(self, n):
         n3 = n * 3
         if n3 > len(self._at):
@@ -2284,6 +2300,7 @@ class Simulation:
         self.hashes.append(hash)
         self.N += 1
         self._resize_buffers(self.N)
+        self.reset_integrator_state()
 
     def remove(self, index=None, hash=None):
         if hash is not None:
@@ -2298,9 +2315,8 @@ class Simulation:
             
             # Note: We must reset integrator state if a particle is removed or added
             # because the history buffers `b`, `e` will be invalidated.
-            self._resize_buffers(0) # clear it
             self._resize_buffers(self.N)
-            self.dt_last_done = 0.0
+            self.reset_integrator_state()
             
     def move_to_com(self):
         if self.N == 0: return

@@ -91,7 +91,7 @@ def main():
                 pole_ecl = pole_to_ecliptic(body["pole_ra"], body["pole_dec"])
                 pole = np.array(pole_ecl, dtype=np.float64)
             else:
-                pole = np.array([0, 1, 0], dtype=np.float64)
+                pole = np.array([0, 0, 1], dtype=np.float64)
                 
             m = body.get("m", 0.0)
             j4 = body.get("j4", 0.0)

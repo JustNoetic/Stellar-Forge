@@ -230,6 +230,7 @@ def compute_max_bend(caster_r_au, atmo_h_km):
     max_bend = 2.0 * 0.00029 * math.sqrt(val)
     return max(0.001, min(0.05, max_bend))
 
+@njit(cache=True)
 def compute_ring_coplanar_masks(n_ring_planes, centers, normals):
     masks = np.zeros(16, dtype=np.uint32)
     for k in range(n_ring_planes):
@@ -237,8 +238,13 @@ def compute_ring_coplanar_masks(n_ring_planes, centers, normals):
         c_k = centers[k]
         n_k = normals[k]
         for j in range(n_ring_planes):
-            dist = math.sqrt(sum((c_k[i] - centers[j][i])**2 for i in range(3)))
-            dot_prod = sum(n_k[i] * normals[j][i] for i in range(3))
+            c_j = centers[j]
+            n_j = normals[j]
+            dx = c_k[0] - c_j[0]
+            dy = c_k[1] - c_j[1]
+            dz = c_k[2] - c_j[2]
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            dot_prod = n_k[0] * n_j[0] + n_k[1] * n_j[1] + n_k[2] * n_j[2]
             if dist < 1e-5 and dot_prod > 0.999:
                 mask |= (1 << j)
         masks[k] = mask
@@ -498,6 +504,8 @@ class App:
             "edit_mode": False,
             "edit_data": {},
             "show_settings_modal": False,
+            "atmo_steps_max": 32,
+            "atmo_adaptive_steps": True,
             "planetshine_enabled": True,
             "ringshine_enabled": True,
             "bloom_intensity": 0.05,
@@ -508,6 +516,7 @@ class App:
             "sky_view_quality": 2,
             "sky_view_custom_res": (1024, 512),
         }
+        self.sky_view_cache = {}
         
         # Post-Processing FBOs
         self.hdr_msaa_fbo = None
@@ -934,6 +943,12 @@ class App:
             compute_keplerian_elements(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0)
             compute_barycenters(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2))
             compute_all_orbits_batch(np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), np.zeros((2, 3)), np.zeros((2, 3)), np.zeros(2), np.zeros((2, 3), dtype=np.float64), np.zeros(3), 1.0, 10, np.zeros((10, 20), dtype=np.float64), np.zeros(2, dtype=np.float64), np.zeros(3, dtype=np.float64))
+            
+            # Warm up the main integrator and custom force calculations
+            dummy_sim = Simulation()
+            dummy_sim.add(m=1.0, x=0.0, y=0.0, z=0.0, vx=0.0, vy=0.0, vz=0.0)
+            dummy_sim.add(m=1e-6, x=1.0, y=0.0, z=0.0, vx=0.0, vy=1.0, vz=0.0)
+            dummy_sim.integrate(1e-6)
         except Exception as e:
             print(f"[Init] Warmup warning: {e}")
             
@@ -1027,6 +1042,26 @@ class App:
         self.quad_vao_down = ctx.vertex_array(self.prog_bloom_down, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_up = ctx.vertex_array(self.prog_bloom_up, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_comp = ctx.vertex_array(self.prog_composite, [(quad_vbo, '2f', 'in_position')])
+        
+        # Compile Habitable Zone Shader
+        self.prog_hz = ctx.program(vertex_shader=hz_vertex_shader, fragment_shader=hz_fragment_shader)
+        
+        # Generate HZ unit ring geometry: x=cos, z=sin, y=lerp factor (0 for inner, 1 for outer)
+        segments = 64
+        theta = np.linspace(0, 2.0 * math.pi, segments + 1)
+        vertices = []
+        for t in theta:
+            cos_t = math.cos(t)
+            sin_t = math.sin(t)
+            # Inner vertex: y=0.0
+            vertices.extend([cos_t, 0.0, sin_t])
+            # Outer vertex: y=1.0
+            vertices.extend([cos_t, 1.0, sin_t])
+        hz_vertices = np.array(vertices, dtype='f4')
+        self.hz_vbo = ctx.buffer(hz_vertices.tobytes())
+        self.hz_vao = ctx.vertex_array(self.prog_hz, [(self.hz_vbo, '3f', 'in_position')])
+        self.hz_num_vertices = len(vertices) // 3
+
         def build_eclipse_lut(ctx):
             LUT_SIZE = 256
             x_arr = np.linspace(0.0, 2.0, LUT_SIZE, dtype='f4')
@@ -1280,38 +1315,21 @@ class App:
         u_ring_planetshine_enabled = prog_rings.get('u_planetshine_enabled', None)
         u_ring_caster_max_bend = prog_rings.get('u_caster_max_bend', None)
 
-        u_atmo_body_offset = prog_atmo.get('u_body_offset', None)
         if 'u_ring_gradients' in prog_atmo:
             prog_atmo['u_ring_gradients'].value = 0
-        u_atmo_planet_radius = prog_atmo.get('u_planet_radius_km', None)
-        u_atmo_atmo_radius = prog_atmo.get('u_atmo_radius_km', None)
-        u_atmo_radius_au_uniform = prog_atmo.get('u_atmo_radius_au', None)
-        u_atmo_au_to_km = prog_atmo.get('u_au_to_km', None)
-        u_atmo_beta_rayleigh = prog_atmo.get('u_beta_rayleigh', None)
-        u_atmo_h_rayleigh = prog_atmo.get('u_h_rayleigh', None)
-        u_atmo_beta_mie = prog_atmo.get('u_beta_mie', None)
-        u_atmo_h_mie = prog_atmo.get('u_h_mie', None)
-        u_atmo_mie_g = prog_atmo.get('u_mie_g', None)
-        u_atmo_beta_abs_mixed = prog_atmo.get('u_beta_abs_mixed', None)
-        u_atmo_beta_abs_layered = prog_atmo.get('u_beta_abs_layered', None)
         u_atmo_quality_uniform = prog_atmo.get('u_atmo_quality', None)
-        u_atmo_sun_intensity = prog_atmo.get('u_sun_intensity', None)
         u_atmo_camera_pos = prog_atmo.get('u_camera_pos', None)
-        u_atmo_num_samples = prog_atmo.get('u_num_samples', None)
-        u_atmo_pole_obl = prog_atmo.get('u_pole_obl', None)
-        u_atmo_active_caster_R_minor = prog_atmo.get('u_active_caster_R_minor', None)
-        u_atmo_body_idx_uni = prog_atmo.get('u_body_idx', None)
         u_atmo_num_ring_planes = prog_atmo.get('u_num_ring_planes', None)
         u_atmo_ring_centers = prog_atmo.get('u_ring_center', None)
         u_atmo_ring_normals = prog_atmo.get('u_ring_normal', None)
         u_atmo_ring_params = prog_atmo.get('u_ring_params', None)
         u_atmo_ring_coplanar_mask = prog_atmo.get('u_ring_coplanar_mask', None)
-        u_atmo_num_active_casters = prog_atmo.get('u_num_active_casters', None)
-        u_atmo_active_casters = prog_atmo.get('u_active_casters', None)
-        u_atmo_active_caster_poles_obl = prog_atmo.get('u_active_caster_poles_obl', None)
-        u_atmo_active_caster_atmos = prog_atmo.get('u_active_caster_atmos', None)
-        u_atmo_active_max_bend = prog_atmo.get('u_active_max_bend', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
+
+        self.atmo_ssbo = ctx.buffer(reserve=576)
+        self.atmo_ssbo.bind_to_storage_buffer(binding=8)
+        self.atmo_staging = np.zeros(144, dtype=np.float32)
+        self.atmo_staging_int_view = self.atmo_staging.view(np.int32)
 
 
     
@@ -1364,6 +1382,7 @@ class App:
     
         last_render_time = time.perf_counter()
         show_orbits = True
+        show_habitable_zone = False
         orbit_fade_dir = 1.0
         orbit_fade_dir_idx = 0
         orbit_min_alpha = 0.3
@@ -2342,7 +2361,11 @@ class App:
                     self.camera["tracking_is_cmp"] = best_is_cmp
 
     
-            all_instances = np.zeros((total_render_bodies, INSTANCE_FLOATS), dtype='f4')
+            if not hasattr(self, '_all_instances_cache') or self._all_instances_cache.shape[0] != total_render_bodies:
+                self._all_instances_cache = np.zeros((total_render_bodies, INSTANCE_FLOATS), dtype='f4')
+            else:
+                self._all_instances_cache[:] = 0.0
+            all_instances = self._all_instances_cache
             all_instances[:num_bodies, 0:3] = pos_rel_all
             all_instances[:num_bodies, 3:8] = visual_arr[:, 0:5]
             all_instances[:num_bodies, 8] = is_star_arr
@@ -2645,7 +2668,7 @@ class App:
                 
                 pos_star = pos_rel_all[star_idx]
                 to_star = pos_star - pos_c
-                dist_s = np.linalg.norm(to_star)
+                dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
                 if dist_s > 1e-6:
                     L = to_star / dist_s
                 else:
@@ -2769,7 +2792,6 @@ class App:
                     prog['u_hdr_enabled'].value = hdr_enabled
                     
             # --- Prepare and sort atmosphere bodies ---
-            last_sky_view_body_key = None
             sorted_atmos = []
             if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
                 atmo_dists = []
@@ -3012,7 +3034,6 @@ class App:
                 if u_atmo_quality_uniform is not None: u_atmo_quality_uniform.value = atmo_quality
                 if u_atmo_camera_pos is not None: u_atmo_camera_pos.write(cam_pos)
                 AU_TO_KM = 149597870.7
-                if u_atmo_au_to_km is not None: u_atmo_au_to_km.value = AU_TO_KM
             
                 if u_atmo_num_ring_planes is not None: u_atmo_num_ring_planes.value = n_ring_planes
                 if n_ring_planes > 0:
@@ -3024,6 +3045,17 @@ class App:
                 if u_atmo_clip_mode is not None:
                     u_atmo_clip_mode.value = clip_mode
     
+                # Pre-build lookup tables outside the loop
+                atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
+                atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
+
+                # Pre-allocate scratch arrays outside the loop
+                active_casters_buf = np.zeros((8, 4), dtype='f4')
+                active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
+                active_caster_r_minor_buf = np.zeros(8, dtype='f4')
+                active_atmos_buf = np.zeros((8, 4), dtype='f4')
+                active_max_bend_buf = np.zeros(8, dtype='f4')
+
                 for sq_dist, atmo, is_cmp in sorted_atmos:
                     bi = atmo['body_idx']
                     if is_cmp:
@@ -3039,14 +3071,15 @@ class App:
                         continue
     
                     if atmo_quality == 1:
-                        n_samples = 16
+                        n_samples = max(4, self.camera.get("atmo_steps_max", 32) // 2)
                     else:
+                        max_steps = self.camera.get("atmo_steps_max", 32)
                         if apparent_px < 50:
-                            n_samples = 8
+                            n_samples = max(4, max_steps // 4)
                         elif apparent_px < 200:
-                            n_samples = 16
+                            n_samples = max(4, max_steps // 2)
                         else:
-                            n_samples = 32
+                            n_samples = max_steps
                             
                     if is_cmp:
                         mass_sm = self.mass_snap_cmp[atmo['body_idx']]
@@ -3054,37 +3087,19 @@ class App:
                         mass_sm = mass_snap[atmo['body_idx']]
                     
                     # LUT should already be built cleanly before the pass
-                    if 'lut_tex' in atmo:
+                    if 'lut_tex' in atmo and atmo['lut_tex']:
                         atmo['lut_tex'].use(location=1)
                     if 'lut_multi_scatter' in atmo:
                         atmo['lut_multi_scatter'].use(location=3)
                     
                     props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
-    
                     scaled_intensity = atmo['intensity']
-    
-                    if u_atmo_body_offset is not None: u_atmo_body_offset.write(body_pos_rel.astype('f4'))
-                    if u_atmo_radius_au_uniform is not None: u_atmo_radius_au_uniform.value = float(atmo['atmo_radius_au'])
-                    if u_atmo_planet_radius is not None: u_atmo_planet_radius.value = float(atmo['planet_radius_km'])
-                    if u_atmo_atmo_radius is not None: u_atmo_atmo_radius.value = float(atmo['atmo_radius_km'])
-                    if u_atmo_beta_rayleigh is not None: u_atmo_beta_rayleigh.write(props['beta_rayleigh'])
-                    if u_atmo_h_rayleigh is not None: u_atmo_h_rayleigh.value = props['scale_height_km']
                     beta_mie_val = atmo.get('beta_mie', 2.0e-6)
-                    if u_atmo_beta_mie is not None: u_atmo_beta_mie.value = tuple(compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4'))
-                    if u_atmo_h_mie is not None: u_atmo_h_mie.value = atmo.get('h_mie', 1.2)
-                    if u_atmo_mie_g is not None: u_atmo_mie_g.value = atmo.get('mie_g', 0.758)
-                    if u_atmo_beta_abs_mixed is not None: u_atmo_beta_abs_mixed.write(props['beta_abs_mixed'])
-                    if u_atmo_beta_abs_layered is not None: u_atmo_beta_abs_layered.write(props['beta_abs_layered'])
-                    if u_atmo_sun_intensity is not None: u_atmo_sun_intensity.value = scaled_intensity
-
-                    if u_atmo_num_samples is not None: u_atmo_num_samples.value = n_samples
-                    if u_atmo_pole_obl is not None: u_atmo_pole_obl.value = (
-                        float(all_instances[body_idx_in_unified, 9]),
-                        float(all_instances[body_idx_in_unified, 10]),
-                        float(all_instances[body_idx_in_unified, 11]),
-                        float(all_instances[body_idx_in_unified, 12])
-                    )
+                    beta_mie_coeffs = compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4')
                     
+                    f = float(all_instances[body_idx_in_unified, 12])
+                    f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+
                     # CPU-side active neighbor culling (parent and children)
                     active_indices = []
                     if is_cmp:
@@ -3107,14 +3122,12 @@ class App:
                     n_active = min(len(active_indices), 8)
                     active_indices = active_indices[:n_active]
                     
-                    active_casters_buf = np.zeros((8, 4), dtype='f4')
-                    active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
-                    active_caster_r_minor_buf = np.zeros(8, dtype='f4')
-                    active_atmos_buf = np.zeros((8, 4), dtype='f4')
-                    active_max_bend_buf = np.zeros(8, dtype='f4')
-                    
-                    atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
-                    atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
+                    # Clear scratch buffers in-place
+                    active_casters_buf[:] = 0.0
+                    active_poles_obl_buf[:] = 0.0
+                    active_caster_r_minor_buf[:] = 0.0
+                    active_atmos_buf[:] = 0.0
+                    active_max_bend_buf[:] = 0.0
                     
                     for i_ac, idx_u in enumerate(active_indices):
                         is_c_cmp = (idx_u >= num_bodies)
@@ -3126,14 +3139,14 @@ class App:
                         active_casters_buf[i_ac, 0:3] = pos_c
                         active_casters_buf[i_ac, 3] = rad_c
                         
-                        f = all_instances[idx_u, 12]
-                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+                        fc = all_instances[idx_u, 12]
+                        fc_scale = 1.0 / (1.0 - fc) if fc < 1.0 else 1.0
                         active_poles_obl_buf[i_ac, 0:3] = all_instances[idx_u, 9:12]
-                        active_poles_obl_buf[i_ac, 3] = f_scale
+                        active_poles_obl_buf[i_ac, 3] = fc_scale
                         
                         pos_star = cmp_pos_rel[self.star_idx_cmp] if is_c_cmp else pos_rel_all[star_idx]
                         to_star = pos_star - pos_c
-                        dist_s = np.linalg.norm(to_star)
+                        dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
                         if dist_s > 1e-6:
                             L = to_star / dist_s
                         else:
@@ -3141,8 +3154,8 @@ class App:
                         
                         p_dot_L = np.dot(all_instances[idx_u, 9:12], L)
                         p_proj_sq = 1.0 - p_dot_L**2
-                        f_factor = 1.0 - f
-                        r_minor = rad_c * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                        fc_factor = 1.0 - fc
+                        r_minor = rad_c * np.sqrt(max(0.0, p_dot_L**2 + (fc_factor**2) * p_proj_sq))
                         active_caster_r_minor_buf[i_ac] = r_minor
                         
                         lookup = atmo_lookup_cmp if is_c_cmp else atmo_lookup
@@ -3156,14 +3169,35 @@ class App:
                             active_atmos_buf[i_ac, 3] = thick_km
                             active_max_bend_buf[i_ac] = compute_max_bend(rad_c, scale_height_km)
                             
-                    if u_atmo_num_active_casters is not None: u_atmo_num_active_casters.value = n_active
-                    if u_atmo_active_casters is not None: u_atmo_active_casters.write(active_casters_buf.tobytes())
-                    if u_atmo_active_caster_poles_obl is not None: u_atmo_active_caster_poles_obl.write(active_poles_obl_buf.tobytes())
-                    if u_atmo_active_caster_R_minor is not None: u_atmo_active_caster_R_minor.write(active_caster_r_minor_buf.tobytes())
-                    if u_atmo_active_caster_atmos is not None: u_atmo_active_caster_atmos.write(active_atmos_buf.tobytes())
-                    if u_atmo_active_max_bend is not None: u_atmo_active_max_bend.write(active_max_bend_buf.tobytes())
-                    
-                    if u_atmo_body_idx_uni is not None: u_atmo_body_idx_uni.value = body_idx_in_unified
+                    # Write all per-body atmosphere parameters into self.atmo_staging (std430 alignment)
+                    self.atmo_staging[0:3] = body_pos_rel
+                    self.atmo_staging[3] = float(atmo['atmo_radius_au'])
+                    self.atmo_staging[4:7] = props['beta_rayleigh']
+                    self.atmo_staging[7] = props['scale_height_km']
+                    self.atmo_staging[8:11] = beta_mie_coeffs
+                    self.atmo_staging[11] = atmo.get('h_mie', 1.2)
+                    self.atmo_staging[12:15] = props['beta_abs_mixed']
+                    self.atmo_staging[15] = atmo.get('mie_g', 0.758)
+                    self.atmo_staging[16:19] = props['beta_abs_layered']
+                    self.atmo_staging[19] = scaled_intensity
+                    self.atmo_staging[20] = float(atmo['planet_radius_km'])
+                    self.atmo_staging[21] = float(atmo['atmo_radius_km'])
+                    self.atmo_staging[22] = AU_TO_KM
+                    self.atmo_staging_int_view[23] = n_samples
+                    self.atmo_staging[24:27] = all_instances[body_idx_in_unified, 9:12]
+                    self.atmo_staging[27] = f_scale
+                    self.atmo_staging_int_view[28] = n_active
+                    self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
+                    self.atmo_staging_int_view[30] = body_idx_in_unified
+                    self.atmo_staging[31] = 0.0
+                    self.atmo_staging[32:64] = active_casters_buf.ravel()
+                    self.atmo_staging[64:96] = active_poles_obl_buf.ravel()
+                    self.atmo_staging[96:104] = active_caster_r_minor_buf
+                    self.atmo_staging[104:136] = active_atmos_buf.ravel()
+                    self.atmo_staging[136:144] = active_max_bend_buf
+
+                    # Single buffer upload per atmosphere body
+                    self.atmo_ssbo.write(self.atmo_staging.tobytes())
                     
                     # Generate Sky View LUT for this specific planet
                     sv_mode = self.camera.get("sky_view_mode", 0)
@@ -3177,51 +3211,33 @@ class App:
                     if 'u_use_sky_view_lut' in prog_atmo:
                         prog_atmo['u_use_sky_view_lut'].value = use_sky_view
                         
-                    progs_to_update = [self.prog_sky_view_lut_pass, prog_atmo] if use_sky_view else [prog_atmo]
-                    for prog in progs_to_update:
-                        if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
-                        if 'u_body_offset' in prog: prog['u_body_offset'].write(body_pos_rel.astype('f4'))
-                        if 'u_planet_radius_km' in prog: prog['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
-                        if 'u_atmo_radius_km' in prog: prog['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
-                        if 'u_atmo_radius_au' in prog: prog['u_atmo_radius_au'].value = float(atmo['atmo_radius_au'])
-                        if 'u_au_to_km' in prog: prog['u_au_to_km'].value = AU_TO_KM
-                        if 'u_beta_rayleigh' in prog: prog['u_beta_rayleigh'].write(props['beta_rayleigh'])
-                        if 'u_h_rayleigh' in prog: prog['u_h_rayleigh'].value = props['scale_height_km']
-                        if 'u_beta_mie' in prog: prog['u_beta_mie'].value = tuple(compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4'))
-                        if 'u_h_mie' in prog: prog['u_h_mie'].value = atmo.get('h_mie', 1.2)
-                        if 'u_mie_g' in prog: prog['u_mie_g'].value = atmo.get('mie_g', 0.758)
-                        if 'u_beta_abs_mixed' in prog: prog['u_beta_abs_mixed'].write(props['beta_abs_mixed'])
-                        if 'u_beta_abs_layered' in prog: prog['u_beta_abs_layered'].write(props['beta_abs_layered'])
-                        if 'u_sun_intensity' in prog: prog['u_sun_intensity'].value = scaled_intensity
-                        if 'u_num_samples' in prog: prog['u_num_samples'].value = n_samples
-                        
-                        if 'u_body_idx' in prog: prog['u_body_idx'].value = body_idx_in_unified
-                        f = float(all_instances[body_idx_in_unified, 12])
-                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
-                        if 'u_pole_obl' in prog: prog['u_pole_obl'].value = (
-                            float(all_instances[body_idx_in_unified, 9]),
-                            float(all_instances[body_idx_in_unified, 10]),
-                            float(all_instances[body_idx_in_unified, 11]),
-                            float(f_scale)
-                        )
-                        if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = clip_mode
-                        if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
-                        
-                        if 'u_num_active_casters' in prog: prog['u_num_active_casters'].value = n_active
-                        if 'u_active_casters' in prog: prog['u_active_casters'].write(active_casters_buf.tobytes())
-                        if 'u_active_caster_poles_obl' in prog: prog['u_active_caster_poles_obl'].write(active_poles_obl_buf.tobytes())
-                        if 'u_active_caster_R_minor' in prog: prog['u_active_caster_R_minor'].write(active_caster_r_minor_buf.tobytes())
-                        if 'u_active_caster_atmos' in prog: prog['u_active_caster_atmos'].write(active_atmos_buf.tobytes())
-                        
-                        if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
-                        if n_ring_planes > 0:
-                            if 'u_ring_center' in prog: prog['u_ring_center'].write(ring_centers_buf)
-                            if 'u_ring_normal' in prog: prog['u_ring_normal'].write(ring_normals_buf)
-                            if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
-                            
                     if use_sky_view:
                         body_key = (bi, is_cmp)
-                        if last_sky_view_body_key != body_key:
+                        
+                        # Calculate relative camera position and relative sun position in AU
+                        pos_star = cmp_pos_rel[self.star_idx_cmp] if is_cmp else pos_rel_all[star_idx]
+                        rel_cam_pos = cam_pos - body_pos_rel
+                        rel_sun_pos = pos_star - body_pos_rel
+                        
+                        cam_alt = np.linalg.norm(rel_cam_pos)
+                        sun_dist = np.linalg.norm(rel_sun_pos)
+                        
+                        if cam_alt > 1e-9 and sun_dist > 1e-9:
+                            dot_prod = np.dot(rel_cam_pos, rel_sun_pos) / (cam_alt * sun_dist)
+                            sun_angle = np.arccos(np.clip(dot_prod, -1.0, 1.0))
+                        else:
+                            sun_angle = 0.0
+                            
+                        # Check threshold to skip rendering if camera altitude and solar zenith angle are stable
+                        need_update = True
+                        if last_sky_view_body_key == body_key and body_key in self.sky_view_cache:
+                            cached_alt, cached_angle = self.sky_view_cache[body_key]
+                            alt_diff = abs(cam_alt - cached_alt) / max(1e-9, cached_alt)
+                            angle_diff = abs(sun_angle - cached_angle)
+                            if alt_diff <= 0.0005 and angle_diff <= 0.00087: # 0.05% altitude diff or 0.05 degrees (0.00087 rad)
+                                need_update = False
+                                
+                        if need_update:
                             ctx.disable(moderngl.BLEND)
                             ctx.disable(moderngl.CULL_FACE)
                             self.sky_view_lut_fbo.use()
@@ -3229,19 +3245,26 @@ class App:
                             ctx.viewport = (0, 0, self.sky_view_lut_tex_color.width, self.sky_view_lut_tex_color.height)
                             
                             prog = self.prog_sky_view_lut_pass
+                            if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
+                            if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
+                            if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
+                            if n_ring_planes > 0:
+                                if 'u_ring_center' in prog: prog['u_ring_center'].write(ring_centers_buf)
+                                if 'u_ring_normal' in prog: prog['u_ring_normal'].write(ring_normals_buf)
+                                if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
+                                
                             if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
-                            if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
-                            if 'lut_tex' in atmo: atmo['lut_tex'].use(location=1)
-                            if 'lut_multi_scatter' in atmo: atmo['lut_multi_scatter'].use(location=3)
-                            eclipse_lut_tex.use(location=2)
-                            
-                            prog = self.prog_sky_view_lut_pass
                             if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
                             if 'u_transmittance_lut' in prog: prog['u_transmittance_lut'].value = 1
                             if 'u_multi_scatter_lut' in prog: prog['u_multi_scatter_lut'].value = 3
                             
+                            if 'lut_tex' in atmo: atmo['lut_tex'].use(location=1)
+                            if 'lut_multi_scatter' in atmo: atmo['lut_multi_scatter'].use(location=3)
+                            eclipse_lut_tex.use(location=2)
+                            
                             self.sky_view_vao.render(moderngl.TRIANGLE_STRIP)
                             last_sky_view_body_key = body_key
+                            self.sky_view_cache[body_key] = (cam_alt, sun_angle)
                             
                         if self.hdr_resolve_fbo:
                             self.hdr_resolve_fbo.use()
@@ -3302,7 +3325,7 @@ class App:
                         pole = all_instances[bi, 9:12]
                         pos_star = pos_rel_all[star_idx]
                         to_star = pos_star - pos_host
-                        dist_s = np.linalg.norm(to_star)
+                        dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
                         if dist_s > 1e-6:
                             L = to_star / dist_s
                         else:
@@ -3365,7 +3388,7 @@ class App:
                         pole = all_instances[body_idx_in_unified, 9:12]
                         pos_star = cmp_pos_rel[self.star_idx_cmp]
                         to_star = pos_star - pos_host
-                        dist_s = np.linalg.norm(to_star)
+                        dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
                         if dist_s > 1e-6:
                             L = to_star / dist_s
                         else:
@@ -3399,6 +3422,53 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
                             prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+                ctx.depth_mask = True
+                ctx.disable(moderngl.BLEND)
+            
+            # --- Render Habitable Zones ---
+            if show_habitable_zone:
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.disable(moderngl.CULL_FACE)
+                ctx.depth_mask = False
+                
+                self.prog_hz['projection'].write(projection)
+                self.prog_hz['view'].write(view)
+                self.prog_hz['u_depth_C'].value = depth_C
+                self.prog_hz['u_far'].value = far
+                self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
+                
+                # Primary system stars
+                for i, body in enumerate(bodies_data):
+                    if body.get('type') == 'Star':
+                        sp = body.get('star_props', {})
+                        lum = sp.get('lum', 1.0)
+                        
+                        hz_inner = math.sqrt(lum / 1.1)
+                        hz_outer = math.sqrt(lum / 0.53)
+                        
+                        self.prog_hz['u_inner_r'].value = hz_inner
+                        self.prog_hz['u_outer_r'].value = hz_outer
+                        self.prog_hz['u_body_offset'].write(pos_rel_all[i])
+                        
+                        self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
+                        
+                # Comparison system stars
+                if self.comparison_enabled:
+                    for i, body in enumerate(self.bodies_data_cmp):
+                        if body.get('type') == 'Star':
+                            sp = body.get('star_props', {})
+                            lum = sp.get('lum', 1.0)
+                            
+                            hz_inner = math.sqrt(lum / 1.1)
+                            hz_outer = math.sqrt(lum / 0.53)
+                            
+                            self.prog_hz['u_inner_r'].value = hz_inner
+                            self.prog_hz['u_outer_r'].value = hz_outer
+                            self.prog_hz['u_body_offset'].write(cmp_pos_rel[i].astype('f4'))
+                            
+                            self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
+                
                 ctx.depth_mask = True
                 ctx.disable(moderngl.BLEND)
     
@@ -3540,12 +3610,23 @@ class App:
             if imgui.button("Reset FOV"): self.camera["fov"] = 45.0
             
             if self.camera.get("show_settings_modal", False):
-                imgui.set_next_window_size(320, 240, imgui.FIRST_USE_EVER)
-                imgui.set_next_window_position(self.fb_width // 2 - 160, self.fb_height // 2 - 120, imgui.FIRST_USE_EVER)
+                imgui.set_next_window_size(320, 320, imgui.FIRST_USE_EVER)
+                imgui.set_next_window_position(self.fb_width // 2 - 160, self.fb_height // 2 - 160, imgui.FIRST_USE_EVER)
                 expanded, self.camera["show_settings_modal"] = imgui.begin("Graphics & Quality Settings", True)
                 if expanded:
                     # Atmosphere Quality
                     _, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Extreme (Brute Force)"])
+                    
+                    if atmo_quality > 0:
+                        max_steps = self.camera.get("atmo_steps_max", 32)
+                        changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
+                        if changed_steps:
+                            self.camera["atmo_steps_max"] = max_steps
+                            
+                        adaptive_steps = self.camera.get("atmo_adaptive_steps", True)
+                        changed_adapt, adaptive_steps = imgui.checkbox("Adaptive Step Count", adaptive_steps)
+                        if changed_adapt:
+                            self.camera["atmo_adaptive_steps"] = adaptive_steps
                     
                     imgui.separator()
                     imgui.text("Sky View Rendering")
@@ -3615,6 +3696,9 @@ class App:
                         _, orbit_fade_dir_idx = imgui.combo("Orbit Fade", orbit_fade_dir_idx, ["Bright Behind", "Bright Ahead"])
                         orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
                         _, orbit_min_alpha = imgui.slider_float("Min Alpha", orbit_min_alpha, 0.0, 1.0, "%.2f")
+                        
+                    # Habitable Zones
+                    _, show_habitable_zone = imgui.checkbox("Show Habitable Zones", show_habitable_zone)
                         
                     imgui.separator()
                     # Bounce lighting toggles
@@ -4140,7 +4224,26 @@ class App:
                         else:
                             _, ed["mass"] = imgui.input_double(u"Mass (M\u2609)", ed["mass"], format="%e")
                             _, ed["radius"] = imgui.input_double("Radius (km)", ed["radius"], format="%.1f")
-                            _, ed["rotation_period"] = imgui.input_double("Rot Period (hours)", ed["rotation_period"], format="%.4f")
+                            
+                            # Check if tidally locked based on edit_data and parent
+                            is_locked = False
+                            if parent_idx >= 0:
+                                parent_m = cur_mass_snap[parent_idx]
+                                body_m = ed["mass"]
+                                r_km = ed["radius"]
+                                if body_m > 0 and r_km > 0:
+                                    r_tid = 0.00084 * ((parent_m**2 / body_m)**(1.0/6.0)) * math.sqrt(r_km)
+                                    a_val = ed.get("a", body_info.get("a", 1.0))
+                                    if a_val < r_tid:
+                                        is_locked = True
+                                        total_m = parent_m + body_m
+                                        p_years = math.sqrt(a_val**3 / total_m) if total_m > 0 else 0.0
+                                        ed["rotation_period"] = p_years * 365.25 * 24.0
+                            
+                            if is_locked:
+                                imgui.text("  Rot Period: {:.4f} hours [Tidally Locked]".format(ed["rotation_period"]))
+                            else:
+                                _, ed["rotation_period"] = imgui.input_double("Rot Period (hours)", ed["rotation_period"], format="%.4f")
                             edit_mass = ed["mass"]
                             edit_r_km = ed["radius"]
                             
@@ -4209,6 +4312,9 @@ class App:
                     if not inspect_bary:
                         if 'star_props' in body_info:
                             sp = body_info['star_props']
+                            
+                            imgui.separator()
+                            imgui.text_colored("Stellar Properties", 1.0, 0.85, 0.4)
                             imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
                             imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
                             imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
@@ -4216,6 +4322,8 @@ class App:
                             
                             rot_frac = sp.get('rot_frac', 0.0)
                             if rot_frac > 0:
+                                imgui.separator()
+                                imgui.text_colored("Stellar Rotation", 1.0, 0.85, 0.4)
                                 imgui.text(f"  Rot Period:  {sp.get('rotation_period', 0.0):.2f} hours")
                                 imgui.text(f"  Eq Velocity: {sp.get('v_eq', 0.0):.2f} km/s")
                                 imgui.text(f"  Eq Radius:   {sp.get('r_eq', sp.get('radius', 0.0)):.4f} R\u2609")
@@ -4226,6 +4334,8 @@ class App:
                                 imgui.text(f"  Pole Lum:    {sp.get('lum_pole', sp.get('lum', 0.0)):.4f} L\u2609")
                             
                             if sp.get('mode') == 'evolution':
+                                imgui.separator()
+                                imgui.text_colored("Stellar Evolution", 1.0, 0.85, 0.4)
                                 imgui.text(f"  Metallicity: {sp.get('metallicity', 0.0):.3f}")
                                 age_gyr = sp.get('age', 0.0)
                                 if age_gyr < 0.1:
@@ -4233,8 +4343,43 @@ class App:
                                 else:
                                     imgui.text(f"  Age:         {age_gyr:,.3f} Gyr")
                                     
+                            imgui.separator()
+                            imgui.text_colored("Observational Dynamics", 1.0, 0.85, 0.4)
                             lum = sp.get('lum', 1.0)
-                            abs_mag = 4.83 - 2.5 * math.log10(max(lum, 1e-10))
+                            rot_frac = sp.get('rot_frac', 0.0)
+                            
+                            # Camera inclination relative to star pole
+                            pole_vec = self.visual_arr_cmp[insp_idx, 5:8] if insp_is_cmp else visual_arr[insp_idx, 5:8]
+                            to_cam = cam_world_pos_f8 - target_pos
+                            dist_au = np.linalg.norm(to_cam)
+                            if dist_au > 1e-12:
+                                cam_dir = to_cam / dist_au
+                            else:
+                                cam_dir = np.array([0.0, 1.0, 0.0])
+                                
+                            cos_i_val = min(1.0, max(0.0, abs(np.dot(cam_dir, pole_vec))))
+                            sin_i_val = math.sqrt(1.0 - cos_i_val**2)
+                            viewing_inc_deg = math.degrees(math.acos(cos_i_val))
+                            
+                            if rot_frac > 0.0:
+                                r_pole = sp.get('r_pole', sp.get('radius', 1.0))
+                                r_eq = sp.get('r_eq', sp.get('radius', 1.0))
+                                radius = sp.get('radius', 1.0)
+                                t_pole = sp.get('t_pole', sp.get('temp', 5778.0))
+                                t_eq = sp.get('t_eq', sp.get('temp', 5778.0))
+                                temp = sp.get('temp', 5778.0)
+                                
+                                r_proj_y = math.sqrt((r_pole * sin_i_val)**2 + (r_eq * cos_i_val)**2)
+                                apparent_area_ratio = (r_eq * r_proj_y) / (radius ** 2) if radius > 0 else 1.0
+                                apparent_temp = t_pole * (1.0 - sin_i_val) + t_eq * sin_i_val
+                                apparent_lum = lum * apparent_area_ratio * ((apparent_temp / temp) ** 4) if temp > 0 else 0
+                                
+                                imgui.text(f"  View Inclination: {viewing_inc_deg:.1f}°")
+                                star_mag_lum = apparent_lum
+                            else:
+                                star_mag_lum = lum
+                                
+                            abs_mag = 4.83 - 2.5 * math.log10(max(star_mag_lum, 1e-10))
                             dist_au = dist_to_center_km / 149597870.7
                             dist_pc = dist_au / 206265.0
                             app_mag = abs_mag + 5.0 * math.log10(max(dist_pc, 1e-10)) - 5.0
@@ -4280,6 +4425,175 @@ class App:
                                 abs_mag_h = 5.0 * math.log10(1329.0 / (diam_km * math.sqrt(p_v)))
                                 imgui.text(f"  Geom Albedo: {p_v:.3f}")
                                 imgui.text(f"  Abs Mag (H): {abs_mag_h:+.2f}")
+                                
+                                # Calculate system-specific absolute magnitude and apparent magnitude
+                                star_idx_local = -1
+                                for k, b in enumerate(cur_bodies_data):
+                                    if b.get('type') == 'Star':
+                                        star_idx_local = k
+                                        break
+                                        
+                                if star_idx_local != -1:
+                                    star_body = cur_bodies_data[star_idx_local]
+                                    star_lum = star_body.get('star_props', {}).get('lum', 1.0)
+                                    
+                                    # Direction from star to planet
+                                    star_pos = cur_pos_snap_render[star_idx_local]
+                                    planet_pos = cur_pos_snap_render[insp_idx]
+                                    to_planet = planet_pos - star_pos
+                                    d_sp = np.linalg.norm(to_planet)
+                                    if d_sp > 1e-12:
+                                        L_dir = to_planet / d_sp
+                                    else:
+                                        L_dir = np.array([0.0, 1.0, 0.0])
+                                        
+                                    star_pole = self.visual_arr_cmp[star_idx_local, 5:8] if insp_is_cmp else visual_arr[star_idx_local, 5:8]
+                                    sin_lat = abs(np.dot(L_dir, star_pole))
+                                    
+                                    star_sp = star_body.get('star_props', {})
+                                    if star_sp.get('rot_frac', 0.0) > 0.0:
+                                        lum_eq = star_sp.get('lum_eq', star_lum)
+                                        lum_pole = star_sp.get('lum_pole', star_lum)
+                                        star_lum_dir = lum_eq * (1.0 - sin_lat) + lum_pole * sin_lat
+                                    else:
+                                        star_lum_dir = star_lum
+                                        
+                                    # System absolute magnitude accounts for local star illumination
+                                    abs_mag_sys = abs_mag_h - 2.5 * math.log10(max(star_lum_dir, 1e-10))
+                                    
+                                    # Apparent magnitude accounts for distance to star, distance to camera, and phase angle
+                                    to_cam = cam_world_pos_f8 - planet_pos
+                                    d_pc = np.linalg.norm(to_cam)
+                                    
+                                    if d_sp > 1e-12 and d_pc > 1e-12:
+                                        cos_alpha = np.dot(to_planet, -to_cam) / (d_sp * d_pc)
+                                        alpha = math.acos(min(1.0, max(-1.0, cos_alpha)))
+                                    else:
+                                        alpha = 0.0
+                                        
+                                    # Lambertian phase function
+                                    phi = max(1e-10, (1.0 - alpha / math.pi) * math.cos(alpha) + (1.0 / math.pi) * math.sin(alpha))
+                                    app_mag = abs_mag_sys + 5.0 * math.log10(max(d_sp * d_pc, 1e-10)) - 2.5 * math.log10(phi)
+                                    
+                                    imgui.text(f"  Sys Abs Mag: {abs_mag_sys:+.2f}")
+                                    imgui.text(f"  App Mag (m): {app_mag:+.2f}")
+                                
+                            rot_period_hours = body_info.get('rotation_period', 0.0)
+                            if self.camera["edit_mode"] and not insp_is_cmp:
+                                rot_period_hours = self.camera["edit_data"].get("rotation_period", rot_period_hours)
+                                current_r_km = self.camera["edit_data"].get("radius", body_r_km)
+                            else:
+                                current_r_km = body_r_km
+                            
+                            if rot_period_hours > 0:
+                                f = body_info.get('oblateness', 0.0)
+                                r_eq_km = current_r_km / ((1.0 - f) ** (1.0 / 3.0)) if f > 0 else current_r_km
+                                r_pole_km = r_eq_km * (1.0 - f)
+                                v_eq = (2.0 * math.pi * r_eq_km) / (rot_period_hours * 3600.0)
+                                
+                                imgui.text(f"  Rot Period:  {rot_period_hours:,.2f} hours")
+                                imgui.text(f"  Eq Velocity: {v_eq:.4f} km/s")
+                                if r_eq_km > 100:
+                                    imgui.text(f"  Eq Radius:   {r_eq_km:,.1f} km")
+                                    imgui.text(f"  Pole Radius: {r_pole_km:,.1f} km")
+                                elif r_eq_km > 0.0:
+                                    imgui.text(f"  Eq Radius:   {r_eq_km:.2f} km")
+                                    imgui.text(f"  Pole Radius: {r_pole_km:.2f} km")
+                                
+                            # --- Polish calculations ---
+                            star_idx_local = -1
+                            for k, b in enumerate(cur_bodies_data):
+                                if b.get('type') == 'Star':
+                                    star_idx_local = k
+                                    break
+                                    
+                            if star_idx_local != -1:
+                                star_body = cur_bodies_data[star_idx_local]
+                                star_lum = star_body.get('star_props', {}).get('lum', 1.0)
+                                
+                                # Direction from star to planet
+                                star_pos = cur_pos_snap_render[star_idx_local]
+                                planet_pos = cur_pos_snap_render[insp_idx]
+                                to_planet = planet_pos - star_pos
+                                dist_to_star_au = np.linalg.norm(to_planet)
+                                if dist_to_star_au > 1e-12:
+                                    L_dir = to_planet / dist_to_star_au
+                                else:
+                                    L_dir = np.array([0.0, 1.0, 0.0])
+                                    
+                                star_pole = self.visual_arr_cmp[star_idx_local, 5:8] if insp_is_cmp else visual_arr[star_idx_local, 5:8]
+                                sin_lat = abs(np.dot(L_dir, star_pole))
+                                
+                                star_sp = star_body.get('star_props', {})
+                                if star_sp.get('rot_frac', 0.0) > 0.0:
+                                    lum_eq = star_sp.get('lum_eq', star_lum)
+                                    lum_pole = star_sp.get('lum_pole', star_lum)
+                                    star_lum_dir = lum_eq * (1.0 - sin_lat) + lum_pole * sin_lat
+                                else:
+                                    star_lum_dir = star_lum
+                            else:
+                                star_lum_dir = 1.0
+                            
+                            eff_a = 1.0
+                            curr = insp_idx
+                            while curr >= 0:
+                                p_id = cur_parent_snap[curr]
+                                if p_id == -1:
+                                    break
+                                p_body = cur_bodies_data[p_id]
+                                if p_body.get('type') == 'Star':
+                                    eff_a = cur_bodies_data[curr].get('a', 1.0)
+                                    break
+                                curr = p_id
+                            
+                            b_type = body_info.get('type', 'Terrestrial')
+                            if b_type == 'Gas Giant':
+                                albedo = 0.34
+                            elif b_type == 'Dwarf Planet' or b_type == 'Moon':
+                                albedo = 0.12
+                            else:
+                                albedo = 0.3
+                                
+                            T_eq = 278.5 * ((star_lum_dir / (eff_a**2))**0.25) * ((1.0 - albedo)**0.25)
+                            T_surf = T_eq
+                            has_atmo = False
+                            atmo_press = 0.0
+                            atmo_data = body_info.get('atmosphere', None)
+                            if atmo_data:
+                                has_atmo = True
+                                atmo_press = atmo_data.get('surface_pressure', 0.0)
+                                comp = atmo_data.get('composition', {})
+                                
+                                potencies = {'CO2': 1.0, 'H2O': 1.5, 'CH4': 25.0, 'SO2': 5.0, 'Tholin': -15.0}
+                                f_gh = sum(comp.get(gas, 0.0) * factor for gas, factor in potencies.items())
+                                f_gh = max(0.0, f_gh)
+                                
+                                tau = (atmo_press ** 0.63) * (0.84 + 2.51 * f_gh)
+                                T_surf = T_eq * ((1.0 + 0.75 * tau) ** 0.25)
+                            
+                            imgui.text("  Equilibrium T: {:.1f} K ({:+.1f} \u00B0C)".format(T_eq, T_eq - 273.15))
+                            if has_atmo:
+                                imgui.text("  Surface T:     {:.1f} K ({:+.1f} \u00B0C)".format(T_surf, T_surf - 273.15))
+                                
+                            if parent_idx >= 0:
+                                parent_m = cur_mass_snap[parent_idx]
+                                body_m = cur_mass_snap[insp_idx]
+                                if body_m > 0 and body_r_km > 0:
+                                    r_tid = 0.00084 * ((parent_m**2 / body_m)**(1.0/6.0)) * math.sqrt(body_r_km)
+                                    d_roche_km = 2.44 * body_r_km * ((parent_m / body_m)**(1.0/3.0))
+                                    d_roche_au = d_roche_km / 149597870.7
+                                    
+                                    parent_type = cur_bodies_data[parent_idx].get('type', '')
+                                    if parent_type == 'Star':
+                                        imgui.text("  Tidal Lock Rad: {:.4f} AU".format(r_tid))
+                                        imgui.text("  Roche Limit:    {:.5f} AU ({:,.0f} km)".format(d_roche_au, d_roche_km))
+                                    else:
+                                        imgui.text("  Tidal Lock Rad: {:,.0f} km ({:.5f} AU)".format(r_tid * 149597870.7, r_tid))
+                                        imgui.text("  Roche Limit:    {:,.0f} km ({:.5f} AU)".format(d_roche_km, d_roche_au))
+                                        
+                                    a_val = body_info.get('a', 1.0)
+                                    if a_val < r_tid:
+                                        imgui.text_colored("  [Tidally Locked]", 0.3, 0.8, 1.0)
 
                     if parent_idx >= 0:
                         imgui.separator()
@@ -4306,12 +4620,14 @@ class App:
                                 pole_dec = body_info.get('pole_dec')
                                 if pole_ra is not None and pole_dec is not None:
                                     body_pole = pole_to_ecliptic(pole_ra, pole_dec)
-                                    tilt_rad = math.acos(np.clip(np.dot(body_pole, orb_normal), -1.0, 1.0))
+                                    # Convert body_pole to engine coordinates to match orb_normal (X_eng = X_ecl, Y_eng = Z_ecl, Z_eng = -Y_ecl)
+                                    body_pole_engine = np.array([body_pole[0], body_pole[2], -body_pole[1]])
+                                    tilt_rad = math.acos(np.clip(np.dot(body_pole_engine, orb_normal), -1.0, 1.0))
                                     tilt_deg = math.degrees(tilt_rad)
                                     if tilt_deg > 90.0:
-                                        imgui.text(f"  Axial Tilt: {tilt_deg:.2f}\u00B0 (Retrograde)")
+                                        imgui.text(f"  Axial Tilt: {tilt_deg:.2f}° (Retrograde)")
                                     else:
-                                        imgui.text(f"  Axial Tilt: {tilt_deg:.2f}\u00B0")
+                                        imgui.text(f"  Axial Tilt: {tilt_deg:.2f}°")
                             orb_mass = body_mass
                         
                         ecl_rx, ecl_ry, ecl_rz = rel_r[0], -rel_r[2], rel_r[1]
@@ -4429,8 +4745,31 @@ class App:
                     
                     if self.camera["edit_mode"] and not inspect_bary:
                         imgui.separator()
-                        if imgui.button("Apply Changes", width=-1):
+                        
+                        # Validate Roche Limit dynamically
+                        roche_violates = False
+                        if parent_idx >= 0:
+                            parent_m = cur_mass_snap[parent_idx]
                             ed = self.camera["edit_data"]
+                            body_m = ed["mass"]
+                            r_km = ed["radius"]
+                            a_val = ed.get("a", body_info.get("a", 1.0))
+                            e_val = ed.get("e", body_info.get("e", 0.0))
+                            if body_m > 0 and r_km > 0:
+                                d_roche_km = 2.44 * r_km * ((parent_m / body_m)**(1.0/3.0))
+                                d_roche_au = d_roche_km / 149597870.7
+                                periapsis_au = a_val * (1.0 - e_val)
+                                if periapsis_au < d_roche_au:
+                                    roche_violates = True
+                                    
+                        if roche_violates:
+                            imgui.text_colored("Warning: Orbit is within parent's Roche limit!", 1.0, 0.3, 0.3)
+                            imgui.text_colored("  Roche Limit: {:.5f} AU ({:,.0f} km)".format(d_roche_au, d_roche_km), 0.7, 0.7, 0.7)
+                            imgui.text_colored("  Periapsis: {:.5f} AU".format(periapsis_au), 0.7, 0.7, 0.7)
+                            imgui.text_colored("[Apply Changes Disabled]", 0.5, 0.5, 0.5)
+                        else:
+                            if imgui.button("Apply Changes", width=-1):
+                                ed = self.camera["edit_data"]
                             
                             rot_hours = ed["rotation_period"]
                             m_val = ed["mass"]
@@ -4723,10 +5062,96 @@ class App:
                         if imgui.collapsing_header("Atmosphere")[0]:
                             atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
                             if atmo_item:
-                                current_height = atmo_item['atmo_radius_km'] - atmo_item['planet_radius_km']
+                                mass_val = cur_mass_snap[insp_idx] if len(cur_mass_snap) > insp_idx else 3.0e-6
+                                R_km = atmo_item.get('planet_radius_km', body_r_km)
+                                
+                                # Compute T_eq for the planet
+                                star_idx_local = -1
+                                for k, b in enumerate(cur_bodies_data):
+                                    if b.get('type') == 'Star':
+                                        star_idx_local = k
+                                        break
+                                if star_idx_local != -1:
+                                    star_body = cur_bodies_data[star_idx_local]
+                                    star_lum = star_body.get('star_props', {}).get('lum', 1.0)
+                                    
+                                    # Direction from star to planet
+                                    star_pos = cur_pos_snap_render[star_idx_local]
+                                    planet_pos = cur_pos_snap_render[insp_idx]
+                                    to_planet = planet_pos - star_pos
+                                    dist_to_star_au = np.linalg.norm(to_planet)
+                                    if dist_to_star_au > 1e-12:
+                                        L_dir = to_planet / dist_to_star_au
+                                    else:
+                                        L_dir = np.array([0.0, 1.0, 0.0])
+                                        
+                                    star_pole = self.visual_arr_cmp[star_idx_local, 5:8] if insp_is_cmp else visual_arr[star_idx_local, 5:8]
+                                    sin_lat = abs(np.dot(L_dir, star_pole))
+                                    
+                                    star_sp = star_body.get('star_props', {})
+                                    if star_sp.get('rot_frac', 0.0) > 0.0:
+                                        lum_eq = star_sp.get('lum_eq', star_lum)
+                                        lum_pole = star_sp.get('lum_pole', star_lum)
+                                        star_lum_dir = lum_eq * (1.0 - sin_lat) + lum_pole * sin_lat
+                                    else:
+                                        star_lum_dir = star_lum
+                                else:
+                                    star_lum_dir = 1.0
+                                
+                                eff_a = 1.0
+                                curr = insp_idx
+                                while curr >= 0:
+                                    p_id = cur_parent_snap[curr]
+                                    if p_id == -1:
+                                        break
+                                    p_body = cur_bodies_data[p_id]
+                                    if p_body.get('type') == 'Star':
+                                        eff_a = cur_bodies_data[curr].get('a', 1.0)
+                                        break
+                                    curr = p_id
+                                
+                                b_type = body_info.get('type', 'Terrestrial')
+                                if b_type == 'Gas Giant':
+                                    albedo = 0.34
+                                elif b_type == 'Dwarf Planet' or b_type == 'Moon':
+                                    albedo = 0.12
+                                else:
+                                    albedo = 0.3
+                                    
+                                t_eq_atmo = 278.5 * ((star_lum_dir / (eff_a**2))**0.25) * ((1.0 - albedo)**0.25)
+                                
+                                # Calculate temperature dynamically from greenhouse effect
+                                comp = atmo_item.get('composition', {})
+                                potencies = {'CO2': 1.0, 'H2O': 1.5, 'CH4': 25.0, 'SO2': 5.0, 'Tholin': -15.0}
+                                f_gh = sum(comp.get(gas, 0.0) * factor for gas, factor in potencies.items())
+                                f_gh = max(0.0, f_gh)
+                                
+                                press = atmo_item.get('surface_pressure', 1.0)
+                                tau = (press ** 0.63) * (0.84 + 2.51 * f_gh)
+                                t_calc = t_eq_atmo * ((1.0 + 0.75 * tau) ** 0.25)
+                                if abs(atmo_item.get('temperature', 0.0) - t_calc) > 1e-4:
+                                    atmo_item['temperature'] = t_calc
+                                    atmo_item['_dirty'] = True
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
+                                
+                                # Synchronize back to body_info for inspector/physics consistency
+                                if 'atmosphere' not in body_info:
+                                    body_info['atmosphere'] = {}
+                                body_info['atmosphere']['temperature'] = atmo_item['temperature']
+                                body_info['atmosphere']['surface_pressure'] = atmo_item['surface_pressure']
+                                body_info['atmosphere']['composition'] = atmo_item['composition']
+                                
+                                # Re-evaluate atmosphere properties to get the actual scale height / height
+                                props, _, _ = get_cached_atmosphere_properties(atmo_item, mass_val)
+                                atmo_item['atmo_radius_km'] = R_km + props['atmo_height_km']
+                                atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 149597870.7
+                                body_info['atmosphere']['height'] = props['atmo_height_km']
+                                
+                                current_height = atmo_item['atmo_radius_km'] - R_km
                                 imgui.text(f"Atmosphere Height: {current_height:,.1f} km")
                                 
-
                                 changed_p, new_p = imgui.drag_float("Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
                                 if changed_p: 
                                     atmo_item['surface_pressure'] = new_p
@@ -4734,14 +5159,8 @@ class App:
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
-                                
-                                changed_t, new_t = imgui.drag_float("Temperature (K)", atmo_item.get('temperature', 288.15), 1.0, 0.0, 10000.0)
-                                if changed_t: 
-                                    atmo_item['temperature'] = new_t
-                                    atmo_item['_dirty'] = True
-                                    if 'lut_tex' in atmo_item:
-                                        atmo_item['lut_tex'].release()
-                                        del atmo_item['lut_tex']
+                                        
+                                imgui.text("Temperature: {:.1f} K ({:+.1f} °C) [Calculated]".format(atmo_item['temperature'], atmo_item['temperature'] - 273.15))
 
                                 comp = atmo_item.get('composition', {"N2": 0.78, "O2": 0.21})
                                 if imgui.tree_node("Composition"):
@@ -4823,9 +5242,11 @@ class App:
                                 
                                 if imgui.button("Remove Atmosphere"):
                                     atmo_bodies.remove(atmo_item)
+                                    if 'atmosphere' in body_info:
+                                        del body_info['atmosphere']
                             else:
                                 if imgui.button("Add Atmosphere"):
-                                    atmo_bodies.append({
+                                    new_atmo = {
                                         'body_idx': insp_idx,
                                         'planet_radius_km': body_r_km,
                                         'surface_radius_au': body_r_km / 149597870.7,
@@ -4838,7 +5259,13 @@ class App:
                                         'h_mie': 1.2,
                                         'mie_g': 0.758,
                                         'intensity': 1.0
-                                    })
+                                    }
+                                    atmo_bodies.append(new_atmo)
+                                    body_info['atmosphere'] = {
+                                        'surface_pressure': 1.0,
+                                        'temperature': 288.15,
+                                        'composition': {"N2": 0.78, "O2": 0.21}
+                                    }
                                     
                         if imgui.collapsing_header("Rings")[0]:
                             ring_group = next((g for g in ring_render_groups if g['body_idx'] == insp_idx), None)
@@ -4972,10 +5399,41 @@ class App:
                     imgui.text_colored("Orbital Elements", 1.0, 0.85, 0.4)
                     _, ad["frame"] = imgui.combo("Reference Frame", ad["frame"], ["Ecliptic", "Equatorial"])
                     
-                    if is_moon:
-                        _, ad["a"] = imgui.input_double("Semi-Major Axis (km)", ad["a"], format="%.1f")
+                    # Target Temperature Mode Option
+                    parent_idx_c = ad.get("parent_idx", 0)
+                    parent_is_star = bodies_data[parent_idx_c].get("type") == "Star" if parent_idx_c < len(bodies_data) else False
+                    if parent_is_star:
+                        if "mode_temp" not in ad:
+                            ad["mode_temp"] = False
+                        _, ad["mode_temp"] = imgui.checkbox("Set Orbit by Target Temperature", ad["mode_temp"])
+                        
+                    if parent_is_star and ad["mode_temp"]:
+                        if "target_temp_k" not in ad:
+                            ad["target_temp_k"] = 288.0
+                        _, ad["target_temp_k"] = imgui.input_double("Target Temp (K)", ad["target_temp_k"], format="%.1f")
+                        
+                        star_lum = bodies_data[parent_idx_c].get("star_props", {}).get("lum", 1.0)
+                        b_type = ad["type"]
+                        if b_type == 'Gas Giant':
+                            albedo = 0.34
+                        elif b_type == 'Dwarf Planet' or b_type == 'Moon':
+                            albedo = 0.12
+                        else:
+                            albedo = 0.3
+                            
+                        # Greenhouse effect for spawning is 0.0 because atmosphere is not configured yet
+                        T_eq_target = ad["target_temp_k"]
+                        if T_eq_target > 0:
+                            ad["a"] = ((278.5 / T_eq_target)**2) * math.sqrt(star_lum) * math.sqrt(1.0 - albedo)
+                        else:
+                            ad["a"] = 1.0
+                        imgui.text("  Calculated Semi-Major: {:.6f} AU".format(ad["a"]))
                     else:
-                        _, ad["a"] = imgui.input_double("Semi-Major Axis (AU)", ad["a"], format="%.6f")
+                        if is_moon:
+                            _, ad["a"] = imgui.input_double("Semi-Major Axis (km)", ad["a"], format="%.1f")
+                        else:
+                            _, ad["a"] = imgui.input_double("Semi-Major Axis (AU)", ad["a"], format="%.6f")
+                            
                     _, ad["e"] = imgui.input_double("Eccentricity", ad["e"], format="%.6f")
                     _, ad["inc"] = imgui.input_double("Inclination (deg)", ad["inc"], format="%.3f")
                     _, ad["Omega"] = imgui.input_double("Long Asc Node (deg)", ad["Omega"], format="%.3f")
@@ -4983,52 +5441,75 @@ class App:
                     _, ad["M"] = imgui.input_double("Mean Anomaly (deg)", ad["M"], format="%.3f")
                     
                     imgui.separator()
-                    if imgui.button("Spawn Body", width=-1):
-                        insp_idx = ad.get("parent_idx", 0)
-                        if insp_idx >= num_bodies:
-                            insp_idx = 0
-                        parent_m = mass_snap[insp_idx]
-                        p_pos = pos_snap_render[insp_idx]
-                        p_vel = vel_snap_render[insp_idx]
-                        ppx, ppy, ppz = p_pos[0], -p_pos[2], p_pos[1]
-                        pvx, pvy, pvz = p_vel[0], -p_vel[2], p_vel[1]
-                        
-                        is_moon = ad.get("is_moon", False)
-                        real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
-                        real_a = ad["a"] / 149597870.7 if is_moon else ad["a"]
-                        
-                        c_pos, c_vel = get_cartesian_from_keplerian(
-                            parent_m, real_mass, real_a, ad["e"], 
-                            ad["inc"], ad["Omega"], ad["omega"], ad["M"]
-                        )
-                        
-                        if ad["frame"] == 1:
-                            pole_render = visual_arr[insp_idx, 5:8]
-                            pole_ecl = np.array([pole_render[0], -pole_render[2], pole_render[1]])
-                            c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl)
-                        
-                        new_ecl_x = ppx + c_pos[0]
-                        new_ecl_y = ppy + c_pos[1]
-                        new_ecl_z = ppz + c_pos[2]
-                        
-                        new_ecl_vx = pvx + c_vel[0]
-                        new_ecl_vy = pvy + c_vel[1]
-                        new_ecl_vz = pvz + c_vel[2]
-                        
-                        payload = {
-                            "action": "CREATE",
-                            "name": ad["name"],
-                            "radius": ad["radius"],
-                            "mass": real_mass,
-                            "color": list(ad["color"]),
-                            "type": ad["type"],
-                            "parent_idx": insp_idx,
-                            "pos": [new_ecl_x, new_ecl_y, new_ecl_z],
-                            "vel": [new_ecl_vx, new_ecl_vy, new_ecl_vz]
-                        }
-                        with self.shared_state["lock"]:
-                            self.shared_state["crud_queue"].append(payload)
-                        self.camera["add_mode"] = False
+                    
+                    # Validate Roche Limit
+                    roche_violates = False
+                    parent_idx = ad.get("parent_idx", 0)
+                    parent_m = mass_snap[parent_idx] if parent_idx < len(mass_snap) else 0.0
+                    real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
+                    a_au = ad["a"] / 149597870.7 if is_moon else ad["a"]
+                    e_val = ad.get("e", 0.0)
+                    r_km = ad["radius"]
+                    
+                    if real_mass > 0 and r_km > 0 and parent_m > 0:
+                        d_roche_km = 2.44 * r_km * ((parent_m / real_mass)**(1.0/3.0))
+                        d_roche_au = d_roche_km / 149597870.7
+                        periapsis_au = a_au * (1.0 - e_val)
+                        if periapsis_au < d_roche_au:
+                            roche_violates = True
+                            
+                    if roche_violates:
+                        imgui.text_colored("Warning: Within parent's Roche limit!", 1.0, 0.3, 0.3)
+                        imgui.text_colored("  Roche: {:.5f} AU ({:,.0f} km)".format(d_roche_au, d_roche_km), 0.7, 0.7, 0.7)
+                        imgui.text_colored("  Periapsis: {:.5f} AU".format(periapsis_au), 0.7, 0.7, 0.7)
+                        imgui.text_colored("[Spawn Disabled]", 0.5, 0.5, 0.5)
+                    else:
+                        if imgui.button("Spawn Body", width=-1):
+                            insp_idx = ad.get("parent_idx", 0)
+                            if insp_idx >= num_bodies:
+                                insp_idx = 0
+                            parent_m = mass_snap[insp_idx]
+                            p_pos = pos_snap_render[insp_idx]
+                            p_vel = vel_snap_render[insp_idx]
+                            ppx, ppy, ppz = p_pos[0], -p_pos[2], p_pos[1]
+                            pvx, pvy, pvz = p_vel[0], -p_vel[2], p_vel[1]
+                            
+                            is_moon = ad.get("is_moon", False)
+                            real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
+                            real_a = ad["a"] / 149597870.7 if is_moon else ad["a"]
+                            
+                            c_pos, c_vel = get_cartesian_from_keplerian(
+                                parent_m, real_mass, real_a, ad["e"], 
+                                ad["inc"], ad["Omega"], ad["omega"], ad["M"]
+                            )
+                            
+                            if ad["frame"] == 1:
+                                pole_render = visual_arr[insp_idx, 5:8]
+                                pole_ecl = np.array([pole_render[0], -pole_render[2], pole_render[1]])
+                                c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl)
+                            
+                            new_ecl_x = ppx + c_pos[0]
+                            new_ecl_y = ppy + c_pos[1]
+                            new_ecl_z = ppz + c_pos[2]
+                            
+                            new_ecl_vx = pvx + c_vel[0]
+                            new_ecl_vy = pvy + c_vel[1]
+                            new_ecl_vz = pvz + c_vel[2]
+                            
+                            payload = {
+                                "action": "CREATE",
+                                "name": ad["name"],
+                                "radius": ad["radius"],
+                                "mass": real_mass,
+                                "color": list(ad["color"]),
+                                "type": ad["type"],
+                                "parent_idx": insp_idx,
+                                "pos": [new_ecl_x, new_ecl_y, new_ecl_z],
+                                "vel": [new_ecl_vx, new_ecl_vy, new_ecl_vz]
+                            }
+                            with self.shared_state["lock"]:
+                                self.shared_state["crud_queue"].append(payload)
+                            self.camera["add_mode"] = False
                 imgui.end()
             # ── Create New Star System Dialog ──
             if self.camera.get("show_create_system", False):

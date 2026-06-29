@@ -89,13 +89,13 @@
     "pole_dec": 67.16,
     "atmosphere": {
       "surface_pressure": 92.0,
-      "temperature": 737.0,
+      "temperature": 769.29,
       "composition": {
         "CO2": 0.965,
         "N2": 0.035,
         "SO2": 0.00015
       },
-      "height": 285.46
+      "height": 297.97
     },
     "sv": {
       "x": 0.09883766826832031,
@@ -125,14 +125,14 @@
     "oblateness": 0.00335,
     "atmosphere": {
       "surface_pressure": 1.0,
-      "temperature": 288.15,
+      "temperature": 287.86,
       "composition": {
         "N2": 0.78,
         "O2": 0.21,
         "Ar": 0.01,
         "O3": 1e-09
       },
-      "height": 116.58
+      "height": 116.47
     },
     "sv": {
       "x": -0.1828767788717711,
@@ -172,7 +172,7 @@
   {
     "name": "Mars",
     "type": "Terrestrial",
-    "color": "#cfaf86",
+    "color": "#2c211a",
     "parentId": "Sun",
     "m": 3.2271560829322774e-07,
     "r": 0.00487207,
@@ -190,13 +190,13 @@
     "rotation_period": 24.6229,
     "atmosphere": {
       "surface_pressure": 0.006,
-      "temperature": 210.0,
+      "temperature": 235.19,
       "composition": {
         "CO2": 0.953,
         "N2": 0.027,
         "Ar": 0.016
       },
-      "height": 93.82
+      "height": 105.07
     },
     "sv": {
       "x": 0.3476350316543381,
@@ -513,11 +513,11 @@
       {
         "inner": 1.10774,
         "outer": 1.3712,
-        "color": "#c4b99f",
-        "opacity": 0.101,
-        "scatter": 0.002,
-        "asymmetry": 0.963,
-        "backscatter": -0.3,
+        "color": "#292620",
+        "opacity": 0.82,
+        "scatter": 0.0,
+        "asymmetry": 0.965,
+        "backscatter": -0.664,
         "shadow_grad": [
           0.0,
           0.0052287583239376545,
@@ -798,11 +798,11 @@
       {
         "inner": 1.3752,
         "outer": 1.47399,
-        "color": "#c9bda1",
-        "opacity": 0.101,
-        "scatter": 0.002,
+        "color": "#2a271f",
+        "opacity": 0.796,
+        "scatter": 0.0,
         "asymmetry": 0.963,
-        "backscatter": -0.3,
+        "backscatter": -0.674,
         "shadow_grad": [
           1.0,
           1.0,
@@ -1075,11 +1075,11 @@
       {
         "inner": 1.47399,
         "outer": 1.94702,
-        "color": "#dbcda9",
-        "opacity": 0.94,
+        "color": "#433e30",
+        "opacity": 0.84,
         "scatter": 0.0002,
         "asymmetry": 0.91,
-        "backscatter": -0.3,
+        "backscatter": -0.664,
         "shadow_grad": [
           0.0,
           0.3921568691730499,
@@ -1360,11 +1360,11 @@
       {
         "inner": 2.02287,
         "outer": 2.26438,
-        "color": "#c2b493",
-        "opacity": 0.8,
+        "color": "#403b2c",
+        "opacity": 0.762,
         "scatter": 0.0014,
         "asymmetry": 0.91,
-        "backscatter": -0.3,
+        "backscatter": -0.635,
         "shadow_grad": [
           1.0,
           1.0,
@@ -1645,8 +1645,8 @@
       {
         "inner": 2.32222,
         "outer": 2.33661,
-        "color": "#abbfda",
-        "opacity": 0.137,
+        "color": "#262f3b",
+        "opacity": 0.112,
         "scatter": 0.05,
         "asymmetry": 0.963,
         "backscatter": -0.3,
@@ -1934,8 +1934,8 @@
       {
         "inner": 2.33523,
         "outer": 3.2772,
-        "color": "#8690d8",
-        "opacity": 0.012,
+        "color": "#2b2f49",
+        "opacity": 0.005,
         "scatter": 0.07,
         "asymmetry": 0.945,
         "backscatter": -0.999,
@@ -2223,8 +2223,8 @@
       {
         "inner": 2.97901,
         "outer": 6.49158,
-        "color": "#7b98e8",
-        "opacity": 0.012,
+        "color": "#252f4c",
+        "opacity": 0.005,
         "scatter": 0.09,
         "asymmetry": 0.934,
         "backscatter": -0.999,
