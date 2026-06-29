@@ -3826,43 +3826,94 @@ class App:
             imgui.separator()
             
             # ── Ephemeris Mode UI ──
-            if active_system_name == SystemManager.SOLAR_SYSTEM_NAME and not ephemeris_mode_active:
+            def _render_ephem_setup_modal():
+                if imgui.begin_popup_modal("Ephemeris Setup", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+                    imgui.text("Select which SPICE kernels to download and load:")
+                    imgui.text_colored("Warning: High resolution satellite kernels can be large and take time to download.", 1.0, 0.5, 0.2)
+                    imgui.separator()
+                    
+                    import os
+                    groups = {
+                        "Required Core": ["naif0012.tls", "pck00010.tpc", "de440s.bsp"],
+                        "Mars Moons": ["mar099s.bsp"],
+                        "Jupiter Moons": ["jup365.bsp", "jup347.bsp", "jup348.bsp", "jup349.bsp"],
+                        "Saturn Moons": ["sat441.bsp", "sat455.bsp", "sat456.bsp", "sat457.bsp", "sat459.bsp"],
+                        "Uranus Moons": ["ura111.bsp"],
+                        "Neptune Moons": ["nep095.bsp", "nep105.bsp", "nep104.bsp"],
+                        "Pluto System": ["plu060.bsp"]
+                    }
+                    
+                    for group_name, k_list in groups.items():
+                        imgui.text_colored(f"--- {group_name} ---", 0.7, 0.9, 1.0)
+                        for k_name in k_list:
+                            if k_name not in sys_mgr_spice.DEFAULT_KERNELS:
+                                continue
+                            desc = sys_mgr_spice.KERNEL_DESCRIPTIONS.get(k_name, k_name)
+                            if os.path.exists(os.path.join(sys_mgr_spice.KERNEL_DIR, k_name)):
+                                desc += " [Downloaded]"
+                            is_enabled = sys_mgr_spice.enabled_kernels.get(k_name, False)
+                            changed, new_val = imgui.checkbox(desc, is_enabled)
+                            if changed:
+                                sys_mgr_spice.enabled_kernels[k_name] = new_val
+                                
+                    imgui.separator()
+                    if ephemeris_mode_active:
+                        if imgui.button("Save & Apply Kernel Changes"):
+                            sys_mgr_spice.save_settings()
+                            self._ephem_mapping_ver = None
+                            imgui.close_current_popup()
+                            self._show_ephem_download_modal = True
+                            sys_mgr_spice.download_kernels_async(on_complete=lambda: sys_mgr_spice.load_kernels(force=True))
+                    else:
+                        if imgui.button("Save & Switch to Ephemeris Mode"):
+                            sys_mgr_spice.save_settings()
+                            self._ephem_mapping_ver = None
+                            imgui.close_current_popup()
+                            _trigger_ephem_switch()
+                    imgui.same_line()
+                    if imgui.button("Cancel"):
+                        imgui.close_current_popup()
+                    imgui.end_popup()
+
+            def _trigger_ephem_switch():
+                capture_t = display_t
+                capture_paused = self.time_ctrl["paused"]
+                capture_speed = self.time_ctrl["multiplier"]
+                import copy
+                capture_bodies = copy.deepcopy(bodies_data)
+                capture_visual = copy.deepcopy(visual_data)
+                capture_atmo = list(atmo_bodies)
+                capture_ring = list(ring_bodies)
+                capture_star_idx = star_idx
                 
-                def _trigger_ephem_switch():
-                    capture_t = display_t
-                    capture_paused = self.time_ctrl["paused"]
-                    capture_speed = self.time_ctrl["multiplier"]
-                    import copy
-                    capture_bodies = copy.deepcopy(bodies_data)
-                    capture_visual = copy.deepcopy(visual_data)
-                    capture_atmo = list(atmo_bodies)
-                    capture_ring = list(ring_bodies)
-                    capture_star_idx = star_idx
-                    
-                    def _on_spice_ready():
-                        epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-                        et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
-                        et = et_epoch + capture_t * 365.25 * 86400.0
-                        ephem_bundle = sys_mgr_spice.build_ephemeris_system(et, template_bodies=capture_bodies)
-                        new_bndl = load_system_from_data(ephem_bundle)
-                        req = {
-                            "old_bodies_data": capture_bodies,
-                            "old_visual_data": capture_visual,
-                            "old_atmo_bodies": capture_atmo,
-                            "old_ring_bodies": capture_ring,
-                            "old_star_idx": capture_star_idx,
-                            "new_bundle": new_bndl,
-                            "ephemeris_enter": True,
-                            "preserve_state": True,
-                            "preserve_t": capture_t,
-                            "preserve_paused": capture_paused,
-                            "preserve_speed": capture_speed
-                        }
-                        with self.shared_state["lock"]:
-                            self.shared_state["system_switch_request"] = req
-                    
-                    sys_mgr_spice.download_kernels_async(on_complete=_on_spice_ready)
-    
+                def _on_spice_ready():
+                    sys_mgr_spice.load_kernels(force=True)
+                    self._ephem_mapping_ver = None
+                    epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                    et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                    et = et_epoch + capture_t * 365.25 * 86400.0
+                    ephem_bundle = sys_mgr_spice.build_ephemeris_system(et, template_bodies=capture_bodies)
+                    new_bndl = load_system_from_data(ephem_bundle)
+                    req = {
+                        "old_bodies_data": capture_bodies,
+                        "old_visual_data": capture_visual,
+                        "old_atmo_bodies": capture_atmo,
+                        "old_ring_bodies": capture_ring,
+                        "old_star_idx": capture_star_idx,
+                        "new_bundle": new_bndl,
+                        "ephemeris_enter": True,
+                        "preserve_state": True,
+                        "preserve_t": capture_t,
+                        "preserve_paused": capture_paused,
+                        "preserve_speed": capture_speed
+                    }
+                    with self.shared_state["lock"]:
+                        self.shared_state["system_switch_request"] = req
+                
+                self._show_ephem_download_modal = True
+                sys_mgr_spice.download_kernels_async(on_complete=_on_spice_ready)
+
+            if active_system_name == SystemManager.SOLAR_SYSTEM_NAME and not ephemeris_mode_active:
                 if imgui.button("Switch to Ephemeris Mode", width=-1):
                     if not sys_mgr_spice.settings_initialized:
                         imgui.open_popup("Ephemeris Setup")
@@ -3872,38 +3923,86 @@ class App:
                 if imgui.button("Ephemeris Kernel Settings", width=-1):
                     imgui.open_popup("Ephemeris Setup")
                     
-                if imgui.begin_popup_modal("Ephemeris Setup", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
-                    imgui.text("Select which SPICE kernels to download and load:")
-                    imgui.text_colored("Warning: High resolution satellite kernels are large and take time to download.", 1.0, 0.5, 0.2)
-                    imgui.separator()
-                    
-                    import os
-                    for k_name in sys_mgr_spice.DEFAULT_KERNELS.keys():
-                        desc = sys_mgr_spice.KERNEL_DESCRIPTIONS.get(k_name, k_name)
-                        if os.path.exists(os.path.join(sys_mgr_spice.KERNEL_DIR, k_name)):
-                            desc += " [Downloaded]"
-                        is_enabled = sys_mgr_spice.enabled_kernels.get(k_name, False)
-                        changed, new_val = imgui.checkbox(desc, is_enabled)
-                        if changed:
-                            sys_mgr_spice.enabled_kernels[k_name] = new_val
+                _render_ephem_setup_modal()
+                
+                if getattr(self, "_show_ephem_download_modal", False) or sys_mgr_spice.is_downloading or sys_mgr_spice.download_error:
+                    imgui.open_popup("Downloading SPICE Ephemeris Data")
+
+                if imgui.begin_popup_modal("Downloading SPICE Ephemeris Data", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+                    if sys_mgr_spice.is_downloading:
+                        imgui.text_colored("Downloading NASA JPL SPICE Kernels...", 0.4, 0.8, 1.0)
+                        imgui.text(sys_mgr_spice.download_status)
+                        
+                        if sys_mgr_spice.download_bytes_total > 0:
+                            mb_cur = sys_mgr_spice.download_bytes_current / (1024 * 1024)
+                            mb_tot = sys_mgr_spice.download_bytes_total / (1024 * 1024)
+                            spd = sys_mgr_spice.download_speed_str
+                            imgui.text(f"File Progress: {mb_cur:.1f} MB / {mb_tot:.1f} MB  ({spd})")
+                        elif sys_mgr_spice.download_speed_str:
+                            imgui.text(f"Speed: {sys_mgr_spice.download_speed_str}")
                             
-                    imgui.separator()
-                    if imgui.button("Save & Switch to Ephemeris Mode"):
-                        sys_mgr_spice.save_settings()
-                        imgui.close_current_popup()
-                        _trigger_ephem_switch()
-                    imgui.same_line()
-                    if imgui.button("Cancel"):
+                        imgui.progress_bar(sys_mgr_spice.download_progress, size=(340, 0))
+                        imgui.separator()
+                        if imgui.button("Cancel Download", width=-1):
+                            sys_mgr_spice.cancel_download()
+                            self._show_ephem_download_modal = False
+                            imgui.close_current_popup()
+                    elif sys_mgr_spice.download_error:
+                        imgui.text_colored("Download Failed!", 1.0, 0.3, 0.3)
+                        imgui.text_wrapped(sys_mgr_spice.download_error)
+                        imgui.separator()
+                        if imgui.button("Close", width=-1):
+                            sys_mgr_spice.download_error = None
+                            self._show_ephem_download_modal = False
+                            imgui.close_current_popup()
+                    else:
+                        self._show_ephem_download_modal = False
                         imgui.close_current_popup()
                     imgui.end_popup()
-                
-                if sys_mgr_spice.is_downloading:
-                    imgui.text_colored(sys_mgr_spice.download_status, 1.0, 0.8, 0.2)
-                    imgui.progress_bar(sys_mgr_spice.download_progress, size=(-1, 0))
                 imgui.separator()
                 
             elif ephemeris_mode_active:
                 imgui.text_colored("EPHEMERIS MODE ACTIVE", 0.3, 1.0, 0.3)
+                if imgui.button("Ephemeris Kernel Settings", width=-1):
+                    imgui.open_popup("Ephemeris Setup")
+                    
+                _render_ephem_setup_modal()
+                
+                if getattr(self, "_show_ephem_download_modal", False) or sys_mgr_spice.is_downloading or sys_mgr_spice.download_error:
+                    imgui.open_popup("Downloading SPICE Ephemeris Data")
+
+                if imgui.begin_popup_modal("Downloading SPICE Ephemeris Data", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+                    if sys_mgr_spice.is_downloading:
+                        imgui.text_colored("Downloading NASA JPL SPICE Kernels...", 0.4, 0.8, 1.0)
+                        imgui.text(sys_mgr_spice.download_status)
+                        
+                        if sys_mgr_spice.download_bytes_total > 0:
+                            mb_cur = sys_mgr_spice.download_bytes_current / (1024 * 1024)
+                            mb_tot = sys_mgr_spice.download_bytes_total / (1024 * 1024)
+                            spd = sys_mgr_spice.download_speed_str
+                            imgui.text(f"File Progress: {mb_cur:.1f} MB / {mb_tot:.1f} MB  ({spd})")
+                        elif sys_mgr_spice.download_speed_str:
+                            imgui.text(f"Speed: {sys_mgr_spice.download_speed_str}")
+                            
+                        imgui.progress_bar(sys_mgr_spice.download_progress, size=(340, 0))
+                        imgui.separator()
+                        if imgui.button("Cancel Download", width=-1):
+                            sys_mgr_spice.cancel_download()
+                            self._show_ephem_download_modal = False
+                            imgui.close_current_popup()
+                    elif sys_mgr_spice.download_error:
+                        imgui.text_colored("Download Failed!", 1.0, 0.3, 0.3)
+                        imgui.text_wrapped(sys_mgr_spice.download_error)
+                        imgui.separator()
+                        if imgui.button("Close", width=-1):
+                            sys_mgr_spice.download_error = None
+                            self._show_ephem_download_modal = False
+                            imgui.close_current_popup()
+                    else:
+                        self._show_ephem_download_modal = False
+                        imgui.close_current_popup()
+                    imgui.end_popup()
+
                 if imgui.button("Export to N-Body System", width=-1):
                     capture_t = display_t
                     capture_paused = self.time_ctrl["paused"]

@@ -11,9 +11,11 @@
     "sat457.bsp": false,
     "sat459.bsp": false,
     "sat441.bsp": true,
-    "ura116xl.bsp": true,
+    "ura111.bsp": true,
+    "ura116xl.bsp": false,
+    "nep095.bsp": true,
     "nep104.bsp": false,
-    "nep105.bsp": true,
+    "nep105.bsp": false,
     "plu060.bsp": true,
     "mar099s.bsp": true
 }

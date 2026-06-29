@@ -10,7 +10,7 @@ class SpiceManager:
     Handles downloading basic kernels from NAIF and converting state vectors.
     """
     
-    KERNEL_DIR = "data/kernels"
+    KERNEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "kernels"))
     
     # Essential NAIF kernels for a basic Solar System ephemeris
     DEFAULT_KERNELS = {
@@ -26,7 +26,8 @@ class SpiceManager:
         "sat457.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat457.bsp",
         "sat459.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat459.bsp",
         "sat441.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat441.bsp",
-        "ura116xl.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/ura116xl.bsp",
+        "ura111.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/a_old_versions/ura111.bsp",
+        "nep095.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep095.bsp",
         "nep104.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep104.bsp",
         "nep105.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep105.bsp",
         "plu060.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/plu060.bsp",
@@ -46,14 +47,15 @@ class SpiceManager:
         "sat457.bsp": "Irregular Saturn Moons (190MB)",
         "sat459.bsp": "Irregular Saturn Moons (80MB)",
         "sat441.bsp": "Major Saturn Moons (631MB)",
-        "ura116xl.bsp": "Uranus Moons (659MB)",
+        "ura111.bsp": "Major Uranus Moons (Miranda, Ariel, etc.)",
+        "nep095.bsp": "Major & Inner Neptune Moons (Triton, Proteus, etc.)",
         "nep104.bsp": "Irregular Neptune Moons (318MB)",
-        "nep105.bsp": "Major Neptune Moons (201MB)",
+        "nep105.bsp": "Nereid Ephemeris (201MB)",
         "plu060.bsp": "Pluto Moons",
         "mar099s.bsp": "Mars Moons"
     }
 
-    ESSENTIAL_KERNELS = {"naif0012.tls", "pck00010.tpc", "de440s.bsp", "jup365.bsp", "sat441.bsp", "mar099s.bsp", "plu060.bsp"}
+    ESSENTIAL_KERNELS = {"naif0012.tls", "pck00010.tpc", "de440s.bsp", "jup365.bsp", "sat441.bsp", "ura111.bsp", "nep095.bsp", "mar099s.bsp", "plu060.bsp"}
 
     # Standard body mapping from SPICE IDs to recognizable names for rendering
     # SPICE IDs: 10=Sun, 1=Mercury Barycenter, 2=Venus Barycenter, 3=Earth Barycenter, etc.
@@ -72,6 +74,10 @@ class SpiceManager:
         502: {"name": "Europa", "type": "Moon", "color": "#9b7f59", "radius_km": 1560.8, "mass_kg": 4.7998e22},
         503: {"name": "Ganymede", "type": "Moon", "color": "#8b8173", "radius_km": 2631.2, "mass_kg": 1.4819e23},
         504: {"name": "Callisto", "type": "Moon", "color": "#5e5850", "radius_km": 2410.3, "mass_kg": 1.0759e23},
+        505: {"name": "Amalthea", "type": "Moon", "color": "#e65f5c", "radius_km": 83.56, "mass_kg": 2.068e18},
+        514: {"name": "Thebe", "type": "Moon", "color": "#5c544e", "radius_km": 48.74, "mass_kg": 4.195e17},
+        515: {"name": "Adrastea", "type": "Moon", "color": "#78716c", "radius_km": 8.36, "mass_kg": 1.948e15},
+        516: {"name": "Metis", "type": "Moon", "color": "#57534e", "radius_km": 21.59, "mass_kg": 3.596e16},
         6: {"name": "Saturn", "type": "Planet", "color": "#e3d599", "radius_km": 58232.0, "mass_kg": 5.6834e26},
         601: {"name": "Mimas", "type": "Moon", "color": "#a0a0a0", "radius_km": 198.2, "mass_kg": 3.7493e19},
         602: {"name": "Enceladus", "type": "Moon", "color": "#ffffff", "radius_km": 252.1, "mass_kg": 1.0802e20},
@@ -79,15 +85,30 @@ class SpiceManager:
         604: {"name": "Dione", "type": "Moon", "color": "#a0a0a0", "radius_km": 561.4, "mass_kg": 1.0954e21},
         605: {"name": "Rhea", "type": "Moon", "color": "#a0a0a0", "radius_km": 763.8, "mass_kg": 2.3065e21},
         606: {"name": "Titan", "type": "Moon", "color": "#e0a040", "radius_km": 2574.7, "mass_kg": 1.3452e23},
+        607: {"name": "Hyperion", "type": "Moon", "color": "#a8a29e", "radius_km": 135.1, "mass_kg": 5.584e18},
         608: {"name": "Iapetus", "type": "Moon", "color": "#505050", "radius_km": 734.5, "mass_kg": 1.8056e21},
+        609: {"name": "Phoebe", "type": "Moon", "color": "#374151", "radius_km": 106.5, "mass_kg": 8.289e18},
+        612: {"name": "Helene", "type": "Moon", "color": "#e2e8f0", "radius_km": 17.4, "mass_kg": 2.547e16},
+        613: {"name": "Telesto", "type": "Moon", "color": "#f1f5f9", "radius_km": 11.8, "mass_kg": 7.192e15},
+        614: {"name": "Calypso", "type": "Moon", "color": "#f8fafc", "radius_km": 10.4, "mass_kg": 3.596e15},
+        632: {"name": "Methone", "type": "Moon", "color": "#cbd5e1", "radius_km": 1.39, "mass_kg": 1.498e13},
+        634: {"name": "Polydeuces", "type": "Moon", "color": "#94a3b8", "radius_km": 0.70, "mass_kg": 4.495e12},
         7: {"name": "Uranus", "type": "Planet", "color": "#4b70dd", "radius_km": 25362.0, "mass_kg": 8.6810e25},
         701: {"name": "Ariel", "type": "Moon", "color": "#a0a0a0", "radius_km": 578.9, "mass_kg": 1.353e21},
         702: {"name": "Umbriel", "type": "Moon", "color": "#808080", "radius_km": 584.7, "mass_kg": 1.275e21},
         703: {"name": "Titania", "type": "Moon", "color": "#a0a0a0", "radius_km": 788.4, "mass_kg": 3.400e21},
         704: {"name": "Oberon", "type": "Moon", "color": "#808080", "radius_km": 761.4, "mass_kg": 3.076e21},
         705: {"name": "Miranda", "type": "Moon", "color": "#a0a0a0", "radius_km": 235.8, "mass_kg": 6.59e19},
+        715: {"name": "Puck", "type": "Moon", "color": "#3a3a3a", "radius_km": 80.8, "mass_kg": 2.892e18},
         8: {"name": "Neptune", "type": "Planet", "color": "#274687", "radius_km": 24622.0, "mass_kg": 1.0241e26},
         801: {"name": "Triton", "type": "Moon", "color": "#a0a0a0", "radius_km": 1353.4, "mass_kg": 2.14e22},
+        803: {"name": "Naiad", "type": "Moon", "color": "#888888", "radius_km": 29.9, "mass_kg": 1.888e17},
+        804: {"name": "Thalassa", "type": "Moon", "color": "#808080", "radius_km": 39.7, "mass_kg": 3.506e17},
+        805: {"name": "Despina", "type": "Moon", "color": "#7d7d7d", "radius_km": 73.8, "mass_kg": 2.128e18},
+        806: {"name": "Galatea", "type": "Moon", "color": "#7a7a7a", "radius_km": 79.4, "mass_kg": 2.113e18},
+        807: {"name": "Larissa", "type": "Moon", "color": "#6e6e6e", "radius_km": 96.8, "mass_kg": 4.900e18},
+        808: {"name": "Proteus", "type": "Moon", "color": "#505050", "radius_km": 200.5, "mass_kg": 4.390e19},
+        814: {"name": "Hippocamp", "type": "Moon", "color": "#555555", "radius_km": 17.4, "mass_kg": 4.944e16},
         9: {"name": "Pluto", "type": "Dwarf Planet", "color": "#ddc8b8", "radius_km": 1188.3, "mass_kg": 1.303e22},
         901: {"name": "Charon", "type": "Moon", "color": "#a0a0a0", "radius_km": 606.0, "mass_kg": 1.586e21}
     }
@@ -102,10 +123,38 @@ class SpiceManager:
         self.download_progress = 0.0
         self.download_status = ""
         self.is_downloading = False
+        self.cancel_requested = False
+        self.current_download_file = None
+        self.download_bytes_current = 0
+        self.download_bytes_total = 0
+        self.download_speed_str = ""
+        self.download_speed_bytes_per_sec = 0.0
+        self.download_error = None
         self.settings_path = os.path.join("data", "ephemeris_settings.json")
         self.enabled_kernels = {k: (k in self.ESSENTIAL_KERNELS) for k in self.DEFAULT_KERNELS.keys()}
         self.settings_initialized = False
         self._load_settings()
+
+    def cancel_download(self):
+        """Cancel any active downloading process and clean up temporary partial files."""
+        self.cancel_requested = True
+        self.is_downloading = False
+        self.download_status = "Download cancelled by user."
+        self.download_speed_str = ""
+        self._cleanup_partial_downloads()
+
+    def _cleanup_partial_downloads(self):
+        """Removes all .part files in kernel directory."""
+        if os.path.exists(self.KERNEL_DIR):
+            try:
+                for f in os.listdir(self.KERNEL_DIR):
+                    if f.endswith('.part'):
+                        try:
+                            os.remove(os.path.join(self.KERNEL_DIR, f))
+                        except Exception as e:
+                            print(f"[SPICE] Failed to delete temporary file {f}: {e}")
+            except Exception:
+                pass
 
     def _load_settings(self):
         if os.path.exists(self.settings_path):
@@ -126,6 +175,7 @@ class SpiceManager:
             with open(self.settings_path, 'w') as f:
                 json.dump(self.enabled_kernels, f, indent=4)
             self.settings_initialized = True
+            self.kernels_loaded = False
         except:
             pass
 
@@ -158,41 +208,106 @@ class SpiceManager:
             return
 
         self.is_downloading = True
+        self.cancel_requested = False
+        self.download_error = None
         self.download_progress = 0.0
+        self.download_bytes_current = 0
+        self.download_bytes_total = 0
+        self.download_speed_str = "Calculating speed..."
+        self.download_speed_bytes_per_sec = 0.0
         
         def _download_thread():
+            import time
             total_files = len(missing)
+            self._cleanup_partial_downloads()
+            
             for i, filename in enumerate(missing):
+                if self.cancel_requested:
+                    break
+                    
                 url = self.DEFAULT_KERNELS[filename]
                 path = os.path.join(self.KERNEL_DIR, filename)
+                part_path = path + ".part"
+                self.current_download_file = filename
                 self.download_status = f"Downloading {filename} ({i+1}/{total_files})..."
+                
+                start_time = time.time()
+                last_sample_time = [start_time]
+                last_sample_bytes = [0]
                 
                 try:
                     def _hook(count, block_size, total_size):
+                        if self.cancel_requested:
+                            raise InterruptedError("Download cancelled by user.")
+                        cur_bytes = count * block_size
+                        self.download_bytes_current = cur_bytes
+                        self.download_bytes_total = total_size
+                        
+                        now = time.time()
+                        dt = now - last_sample_time[0]
+                        if dt >= 0.4:
+                            speed_bps = (cur_bytes - last_sample_bytes[0]) / dt
+                            self.download_speed_bytes_per_sec = speed_bps
+                            if speed_bps >= 1024 * 1024:
+                                self.download_speed_str = f"{speed_bps / (1024 * 1024):.2f} MB/s"
+                            else:
+                                self.download_speed_str = f"{max(0.0, speed_bps / 1024):.1f} KB/s"
+                            last_sample_time[0] = now
+                            last_sample_bytes[0] = cur_bytes
+
                         if total_size > 0:
-                            file_prog = count * block_size / total_size
+                            file_prog = min(1.0, cur_bytes / total_size)
                             self.download_progress = (i + file_prog) / total_files
                             
-                    urllib.request.urlretrieve(url, path, reporthook=_hook)
+                    urllib.request.urlretrieve(url, part_path, reporthook=_hook)
+                    
+                    if self.cancel_requested:
+                        if os.path.exists(part_path):
+                            try: os.remove(part_path)
+                            except Exception: pass
+                        break
+                        
+                    if os.path.exists(path):
+                        try: os.remove(path)
+                        except Exception: pass
+                    os.rename(part_path, path)
+                    
                 except Exception as e:
-                    print(f"[SPICE] Failed to download {filename}: {e}")
-                    self.download_status = f"Error downloading {filename}"
+                    if os.path.exists(part_path):
+                        try: os.remove(part_path)
+                        except Exception: pass
+                    self._cleanup_partial_downloads()
                     self.is_downloading = False
+                    self.download_speed_str = ""
+                    if self.cancel_requested:
+                        self.download_status = "Download cancelled."
+                    else:
+                        print(f"[SPICE] Failed to download {filename}: {e}")
+                        self.download_status = f"Error downloading {filename}"
+                        self.download_error = str(e)
                     return
+
+            self._cleanup_partial_downloads()
+            self.is_downloading = False
+            self.current_download_file = None
+            self.download_speed_str = ""
+            
+            if self.cancel_requested:
+                self.download_status = "Download cancelled."
+                return
 
             self.download_progress = 1.0
             self.download_status = "Downloads complete. Loading kernels..."
             self.load_kernels()
-            self.is_downloading = False
             self.download_status = "Ready"
             if on_complete:
                 on_complete()
 
         threading.Thread(target=_download_thread, daemon=True).start()
 
-    def load_kernels(self):
+    def load_kernels(self, force=False):
         """Furnsh all available kernels in the KERNEL_DIR."""
-        if self.kernels_loaded:
+        if self.kernels_loaded and not force:
             return
             
         try:
@@ -347,6 +462,11 @@ class SpiceManager:
                             pass
                     found_id = sp_id
                     break
+            if found_id is None and self.kernels_loaded:
+                try:
+                    found_id = spice.bodn2c(b_name)
+                except Exception:
+                    pass
             mapping.append(found_id)
         return mapping
 
