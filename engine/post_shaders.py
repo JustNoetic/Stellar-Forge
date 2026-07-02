@@ -138,6 +138,9 @@ void main() {
     vec3 violet_tint = vec3(0.65, 0.45, 1.0); // Violet
     final_color = mix(final_color, violet_tint, eye_hurt_blend * 0.03);
     
+    // Gamma correction for sRGB monitors
+    final_color = pow(final_color, vec3(1.0 / 2.2));
+    
     out_color = vec4(final_color, 1.0);
 }
 """

@@ -827,6 +827,69 @@ class App:
         has_gr = bundle["has_gr"]
         phys_star_idx = bundle["phys_star_idx"]
     
+        import os
+        from PIL import Image
+        import glob
+
+        self.planet_textures = []
+        self.planet_normal_textures = []
+        self.planet_specular_textures = []
+        self.texture_slices = {} # name -> slice_idx
+        textures_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'textures')
+        if os.path.exists(textures_dir):
+            files = glob.glob(os.path.join(textures_dir, '*.png')) + glob.glob(os.path.join(textures_dir, '*.jpg'))
+            
+            base_names = set()
+            for f in files:
+                name = os.path.splitext(os.path.basename(f))[0]
+                if name.endswith("_ring") or name.endswith("_rings") or name.endswith("_normal") or name.endswith("_specular"): continue
+                base_names.add(name)
+                
+            for name in sorted(list(base_names)):
+                try:
+                    # Diffuse
+                    d_path = os.path.join(textures_dir, name + ".png")
+                    if not os.path.exists(d_path): d_path = os.path.join(textures_dir, name + ".jpg")
+                    img = Image.open(d_path).convert('RGBA')
+                    img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
+                    self.planet_textures.append(img.tobytes())
+                    
+                    # Normal
+                    n_path = os.path.join(textures_dir, name + "_normal.png")
+                    if not os.path.exists(n_path): n_path = os.path.join(textures_dir, name + "_normal.jpg")
+                    if os.path.exists(n_path):
+                        img_n = Image.open(n_path).convert('RGBA')
+                        img_n = img_n.resize((2048, 1024), Image.Resampling.LANCZOS)
+                        self.planet_normal_textures.append(img_n.tobytes())
+                    else:
+                        self.planet_normal_textures.append(Image.new('RGBA', (2048, 1024), (128, 128, 255, 255)).tobytes())
+                        
+                    # Specular
+                    s_path = os.path.join(textures_dir, name + "_specular.png")
+                    if not os.path.exists(s_path): s_path = os.path.join(textures_dir, name + "_specular.jpg")
+                    if os.path.exists(s_path):
+                        img_s = Image.open(s_path).convert('L')
+                        img_s = img_s.resize((2048, 1024), Image.Resampling.LANCZOS)
+                        self.planet_specular_textures.append(img_s.tobytes())
+                    else:
+                        self.planet_specular_textures.append(Image.new('L', (2048, 1024), 0).tobytes())
+                        
+                    self.texture_slices[name] = len(self.planet_textures)
+                except Exception as e:
+                    print(f"Failed to load planet textures for {name}: {e}")
+        
+        self.ring_textures = {}
+        if os.path.exists(textures_dir):
+            files = glob.glob(os.path.join(textures_dir, '*_ring.png')) + glob.glob(os.path.join(textures_dir, '*_rings.png'))
+            for f in files:
+                name = os.path.splitext(os.path.basename(f))[0].replace("_rings", "").replace("_ring", "")
+                try:
+                    img = Image.open(f).convert('RGBA')
+                    img = img.resize((1024, 1), Image.Resampling.LANCZOS)
+                    self.ring_textures[name] = img
+                except Exception as e:
+                    print(f"Failed to load ring texture {f}: {e}")
+        
         if has_j2:
             oblate_indices = np.array([x[0] for x in oblate_physics_list], dtype=np.int32)
             oblate_j2 = np.array([x[1] for x in oblate_physics_list], dtype=np.float64)
@@ -1199,7 +1262,13 @@ class App:
                 r_backscatter = ring_seg.get('backscatter', -0.3)
                 
                 sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                shadow_grad = generate_ring_shadow_grad(sorted_gradient)
+                b_name = bodies_data[body_idx]['name']
+                tex_sampled = None
+                if b_name in self.ring_textures:
+                    img_data = np.frombuffer(self.ring_textures[b_name].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                    img_data = img_data.reshape(1024, 4)
+                    tex_sampled = img_data[::4, :] # take 256 samples
+                shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled)
                 
                 ring_precomputed.append({
                     'body_idx': body_idx,
@@ -1217,12 +1286,12 @@ class App:
                 })
     
         ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
-        ring_gradient_data = np.zeros((16, 256), dtype='f4')
+        ring_gradient_data = np.zeros((16, 256, 4), dtype='f4')
         for j, ring in enumerate(ring_precomputed):
             if j >= 16: break
-            ring_gradient_data[j, :] = ring['shadow_grad']
+            ring_gradient_data[j, :, :] = ring['shadow_grad']
         
-        ring_gradient_tex = ctx.texture((256, 16), 1, ring_gradient_data.tobytes(), dtype='f4')
+        ring_gradient_tex = ctx.texture((256, 16), 4, ring_gradient_data.tobytes(), dtype='f4')
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.NEAREST)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
@@ -1261,7 +1330,7 @@ class App:
                 'num_indices': len(indices),
             })
     
-        INSTANCE_FLOATS = 24
+        INSTANCE_FLOATS = 28
         MAX_BODIES = 1000
     
         mesh_lo_verts, mesh_lo_idx = create_icosphere_mesh(subdivisions=1)
@@ -1276,7 +1345,7 @@ class App:
         ibo_ultra = ctx.buffer(mesh_ultra_idx.tobytes())
     
         # Instead of vbo_instances, use SSBOs for GPU culling
-        all_instances_buffer = ctx.buffer(reserve=MAX_BODIES * 96) # 24 floats * 4 bytes
+        all_instances_buffer = ctx.buffer(reserve=MAX_BODIES * 112) # 28 floats * 4 bytes
         vis_lo_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_hi_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_ultra_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
@@ -1389,9 +1458,19 @@ class App:
     
         visual_arr = np.array(visual_data, dtype='f4')
         is_star_arr = np.zeros(num_bodies, dtype='f4')
+        tex_idx_arr = np.zeros(num_bodies, dtype='f4')
+        rot_period_arr = np.zeros(num_bodies, dtype='f4')
         for i, b in enumerate(bodies_data):
             if b.get('type') == 'Star':
                 is_star_arr[i] = 1.0
+            if b['name'] in self.texture_slices:
+                tex_idx_arr[i] = float(self.texture_slices[b['name']])
+            
+            # Default to 24 hours if undefined, convert to seconds
+            r_hours = b.get('rotation_period', 24.0)
+            if r_hours == 0.0: r_hours = 24.0 # Prevent div zero
+            rot_period_arr[i] = r_hours * 3600.0
+            
         non_star_mask = is_star_arr == 0.0
         non_star_indices = np.where(non_star_mask)[0][:64]
         n_casters_fixed = len(non_star_indices)
@@ -1448,6 +1527,41 @@ class App:
         last_comparison_offset_au = None
         last_cam_origin = None
         
+        self.u_planet_textures_obj = None
+        self.u_planet_normal_textures_obj = None
+        self.u_planet_specular_textures_obj = None
+        
+        if self.planet_textures:
+            tex_data = b''.join(self.planet_textures)
+            self.u_planet_textures_obj = ctx.texture_array(
+                (2048, 1024, len(self.planet_textures)), 4, tex_data, dtype='f1'
+            )
+            self.u_planet_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            self.u_planet_textures_obj.build_mipmaps()
+            self.u_planet_textures_obj.use(location=3) # Use texture unit 3
+            if 'u_planet_textures' in prog_spheres:
+                prog_spheres['u_planet_textures'].value = 3
+                
+            normal_tex_data = b''.join(self.planet_normal_textures)
+            self.u_planet_normal_textures_obj = ctx.texture_array(
+                (2048, 1024, len(self.planet_normal_textures)), 4, normal_tex_data, dtype='f1'
+            )
+            self.u_planet_normal_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            self.u_planet_normal_textures_obj.build_mipmaps()
+            self.u_planet_normal_textures_obj.use(location=4) # Use texture unit 4
+            if 'u_planet_normal_textures' in prog_spheres:
+                prog_spheres['u_planet_normal_textures'].value = 4
+                
+            spec_tex_data = b''.join(self.planet_specular_textures)
+            self.u_planet_specular_textures_obj = ctx.texture_array(
+                (2048, 1024, len(self.planet_specular_textures)), 1, spec_tex_data, dtype='f1'
+            )
+            self.u_planet_specular_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            self.u_planet_specular_textures_obj.build_mipmaps()
+            self.u_planet_specular_textures_obj.use(location=5) # Use texture unit 5
+            if 'u_planet_specular_textures' in prog_spheres:
+                prog_spheres['u_planet_specular_textures'].value = 5
+
         n_orbits = 0
         n_orbits_hi = 0
         n_orbits_med = 0
@@ -2137,7 +2251,7 @@ class App:
                 self.hdr_msaa_fbo.use()
             else:
                 self.hdr_resolve_fbo.use()
-            ctx.clear(0.02, 0.02, 0.03, 1.0) 
+            ctx.clear(0.0, 0.0, 0.0, 1.0) 
     
             is_scrubbing = tl_active and tl_prog >= 1.0
     
@@ -2438,6 +2552,8 @@ class App:
                 all_instances[:num_bodies, 13:16] = visual_arr[:, 9:12]
                 all_instances[:num_bodies, 19] = visual_arr[:, 12]
                 all_instances[:num_bodies, 23] = visual_arr[:, 13]
+                all_instances[:num_bodies, 24] = tex_idx_arr
+                all_instances[:num_bodies, 25] = ((self.shared_state["t"] * 31557600.0) / rot_period_arr) * (2.0 * math.pi)
             
             if self.comparison_enabled:
                 cmp_pos_rel = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')

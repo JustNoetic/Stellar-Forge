@@ -43,9 +43,9 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= uint(u_num_bodies)) return;
     
-    vec4 f0 = instances[idx * 6 + 0];
-    vec4 f1 = instances[idx * 6 + 1];
-    vec4 f2 = instances[idx * 6 + 2];
+    vec4 f0 = instances[idx * 7 + 0];
+    vec4 f1 = instances[idx * 7 + 1];
+    vec4 f2 = instances[idx * 7 + 2];
     
     vec3 pos = f0.xyz;
     float r = f1.z;
@@ -65,8 +65,8 @@ void main() {
     uint mask_hi = 0;
     uint r_mask = 0;
     
-    vec3 star_pos = instances[u_star_idx * 6 + 0].xyz;
-    float star_r = instances[u_star_idx * 6 + 1].z;
+    vec3 star_pos = instances[u_star_idx * 7 + 0].xyz;
+    float star_r = instances[u_star_idx * 7 + 1].z;
     
     if (idx != uint(u_star_idx)) {
         vec3 L = star_pos - pos;
@@ -78,8 +78,8 @@ void main() {
                 int j = u_caster_indices[c];
                 if (j == int(idx) || j == u_star_idx) continue;
                 
-                vec3 p_j = instances[j * 6 + 0].xyz;
-                float r_j = instances[j * 6 + 1].z;
+                vec3 p_j = instances[j * 7 + 0].xyz;
+                float r_j = instances[j * 7 + 1].z;
                 
                 vec3 vec = p_j - pos;
                 float t = dot(vec, L_dir);
@@ -121,9 +121,9 @@ void main() {
         }
     }
     
-    instances[idx * 6 + 3].y = uintBitsToFloat(mask_lo);
-    instances[idx * 6 + 3].z = uintBitsToFloat(mask_hi);
-    instances[idx * 6 + 3].w = uintBitsToFloat(r_mask);
+    instances[idx * 7 + 3].y = uintBitsToFloat(mask_lo);
+    instances[idx * 7 + 3].z = uintBitsToFloat(mask_hi);
+    instances[idx * 7 + 3].w = uintBitsToFloat(r_mask);
     
     // 3. Lodge into visible buffers
     if (visible) {
@@ -190,14 +190,19 @@ flat out uvec2 f_caster_mask;
 flat out uint f_ring_mask;
 flat out vec3 f_planetshine_dir;
 flat out vec3 f_planetshine_color;
+flat out float f_tex_idx;
+flat out float f_rotation_angle;
+out vec3 f_local_pos;
+flat out vec3 f_pole;
 void main() {
     uint inst_idx = vis_indices[gl_InstanceID];
-    vec4 f0 = instances[inst_idx * 6 + 0];
-    vec4 f1 = instances[inst_idx * 6 + 1];
-    vec4 f2 = instances[inst_idx * 6 + 2];
-    vec4 f3 = instances[inst_idx * 6 + 3];
-    vec4 f4 = instances[inst_idx * 6 + 4];
-    vec4 f5 = instances[inst_idx * 6 + 5];
+    vec4 f0 = instances[inst_idx * 7 + 0];
+    vec4 f1 = instances[inst_idx * 7 + 1];
+    vec4 f2 = instances[inst_idx * 7 + 2];
+    vec4 f3 = instances[inst_idx * 7 + 3];
+    vec4 f4 = instances[inst_idx * 7 + 4];
+    vec4 f5 = instances[inst_idx * 7 + 5];
+    vec4 f6 = instances[inst_idx * 7 + 6];
     
     vec3 in_offset = f0.xyz;
     vec3 in_color = vec3(f0.w, f1.x, f1.y);
@@ -211,6 +216,9 @@ void main() {
     
     f_planetshine_dir = f4.xyz;
     f_planetshine_color = f5.xyz;
+    f_tex_idx = f6.x;
+    f_rotation_angle = f6.y;
+    f_pole = in_pole;
     
     f_color = in_color;
     f_caster_mask = in_caster_mask;
@@ -228,6 +236,7 @@ void main() {
     }
     f_brightness_scale = brightness_scale;
     
+    f_local_pos = in_position;
     vec3 scaled_pos = in_position;
     vec3 adj_normal = in_normal;
     if (in_oblateness > 0.0) {
@@ -262,6 +271,14 @@ flat in uvec2 f_caster_mask;
 flat in uint f_ring_mask;
 flat in vec3 f_planetshine_dir;
 flat in vec3 f_planetshine_color;
+flat in float f_tex_idx;
+flat in float f_rotation_angle;
+flat in vec3 f_pole;
+in vec3 f_local_pos;
+
+uniform sampler2DArray u_planet_textures;
+uniform sampler2DArray u_planet_normal_textures;
+uniform sampler2DArray u_planet_specular_textures;
 
 layout(std140, binding = 1) uniform SceneData {
     mat4 projection;
@@ -364,7 +381,59 @@ void main() {
         out_color = vec4(final_star_color * f_brightness_scale, 1.0);
     } else {
         vec3 N = normalize(f_normal);
+        float spec_intensity = 0.0;
+        vec3 local_f_color = f_color;
+        
+        if (f_tex_idx > 0.0) {
+            vec3 p = normalize(f_local_pos);
+            vec3 ref = vec3(0.0, 1.0, 0.0);
+            if (abs(dot(f_pole, ref)) > 0.999) {
+                ref = vec3(1.0, 0.0, 0.0);
+            }
+            vec3 tangent = normalize(cross(f_pole, ref));
+            vec3 bitangent = normalize(cross(f_pole, tangent));
+            
+            vec3 p_local = vec3(dot(p, tangent), dot(p, f_pole), dot(p, bitangent));
+            
+            float s = sin(-f_rotation_angle);
+            float c = cos(-f_rotation_angle);
+            vec3 p_rot = vec3(
+                p_local.x * c - p_local.z * s,
+                p_local.y,
+                p_local.x * s + p_local.z * c
+            );
+            
+            float u = 0.5 + atan(p_rot.z, p_rot.x) / (2.0 * 3.14159265);
+            float v = 0.5 - asin(clamp(p_rot.y, -1.0, 1.0)) / 3.14159265;
+            
+            vec4 tex_color = texture(u_planet_textures, vec3(u, v, f_tex_idx - 1.0));
+            // Decode sRGB to Linear
+            local_f_color = pow(tex_color.rgb, vec3(2.2));
+            
+            // Analytical TBN Mapping
+            vec3 map_normal = texture(u_planet_normal_textures, vec3(u, v, f_tex_idx - 1.0)).rgb;
+            map_normal = map_normal * 2.0 - 1.0;
+            
+            vec3 T_rot = normalize(vec3(-p_rot.z, 0.0, p_rot.x));
+            vec3 B_rot = normalize(cross(p_rot, T_rot));
+            
+            float s_inv = sin(f_rotation_angle);
+            float c_inv = cos(f_rotation_angle);
+            vec3 T_local = vec3(T_rot.x * c_inv - T_rot.z * s_inv, T_rot.y, T_rot.x * s_inv + T_rot.z * c_inv);
+            vec3 B_local = vec3(B_rot.x * c_inv - B_rot.z * s_inv, B_rot.y, B_rot.x * s_inv + B_rot.z * c_inv);
+            
+            vec3 T_world = T_local.x * tangent + T_local.y * f_pole + T_local.z * bitangent;
+            vec3 B_world = B_local.x * tangent + B_local.y * f_pole + B_local.z * bitangent;
+            
+            mat3 TBN = mat3(T_world, B_world, N);
+            N = normalize(TBN * map_normal);
+            
+            spec_intensity = texture(u_planet_specular_textures, vec3(u, v, f_tex_idx - 1.0)).r;
+        }
+        
         vec3 total_diffuse_color = vec3(0.0);
+        vec3 total_specular_color = vec3(0.0);
+        vec3 V = normalize(u_camera_pos - f_world_pos);
         
         for (int s = 0; s < u_num_stars; s++) {
             vec3 star_pos = u_stars_pos_radius[s].xyz;
@@ -388,15 +457,21 @@ void main() {
             // Angular radius of the star for soft penumbra at terminator
             float star_ang_radius = star_radius / dist_to_star;
             float sin_alpha = clamp(star_ang_radius, 0.0, 1.0);
-            float alpha = asin(sin_alpha);
             
             // Lambert cosine law with soft terminator
             float NdotL = dot(N, L);
             float diffuse = clamp((NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
             
+            // Blinn-Phong specular highlight
+            vec3 H = normalize(L + V);
+            float NdotH = max(dot(N, H), 0.0);
+            float specular = pow(NdotH, 64.0) * spec_intensity * diffuse;
+            
             // Inverse-square falloff
             if (u_hdr_enabled) {
-                diffuse *= star_lum / (dist_to_star * dist_to_star);
+                float falloff = star_lum / (dist_to_star * dist_to_star);
+                diffuse *= falloff;
+                specular *= falloff;
             }
             
             // === Analytical eclipse shadows ===
@@ -546,7 +621,7 @@ void main() {
                             // Penumbra is extremely narrow, 1 sample is sufficient
                             float r = 0.5 * (overlap_min + overlap_max);
                             float p = (r - inner_r) / max(1e-6, outer_r - inner_r);
-                            sum_alpha = textureLod(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0), 0.0).r;
+                            sum_alpha = textureLod(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0), 0.0).a;
                         } else {
                             // Penumbra is wide, use 5 samples for filtering
                             int tex_samples = 5;
@@ -554,7 +629,7 @@ void main() {
                                 float u = (float(s) + 0.5) / float(tex_samples);
                                 float r = mix(overlap_min, overlap_max, u);
                                 float p = (r - inner_r) / max(1e-6, outer_r - inner_r);
-                                sum_alpha += textureLod(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0), 0.0).r;
+                                sum_alpha += textureLod(u_ring_gradients, vec2(p, (float(j) + 0.5) / 16.0), 0.0).a;
                             }
                             sum_alpha /= float(tex_samples);
                         }
@@ -571,6 +646,7 @@ void main() {
             }
             
             total_diffuse_color += star_color * diffuse * shadow;
+            total_specular_color += star_color * specular * shadow;
         }
         
         // === Moonshine / Planetshine ===
@@ -745,12 +821,12 @@ void main() {
             }
         }
         
-        vec3 final_color = f_color * total_diffuse_color;
+        vec3 final_color = local_f_color * total_diffuse_color + total_specular_color;
         if (u_planetshine_enabled) {
-            final_color += f_color * bounce_light;
+            final_color += local_f_color * bounce_light;
         }
         if (u_ringshine_enabled) {
-            final_color += f_color * ring_shine;
+            final_color += local_f_color * ring_shine;
         }
         if (u_hdr_enabled) {
             final_color *= u_exposure;
@@ -959,7 +1035,9 @@ out vec4 out_color;
 void main() {
     if (f_color.a < 0.01) discard; // discard dashes
     gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
-    out_color = f_color;
+    // Decode sRGB to Linear and boost intensity to survive ACES tonemapping
+    vec3 linear_color = pow(f_color.rgb, vec3(2.2)) * 4.0;
+    out_color = vec4(linear_color, f_color.a);
 }
 """
 
@@ -1002,7 +1080,9 @@ uniform float u_depth_C;
 out vec4 out_color;
 void main() {
     gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
-    out_color = f_color;
+    // Decode sRGB to Linear and boost intensity to survive ACES tonemapping
+    vec3 linear_color = pow(f_color.rgb, vec3(2.2)) * 4.0;
+    out_color = vec4(linear_color, f_color.a);
 }
 """
 
@@ -1156,7 +1236,10 @@ void main() {
         
         if (r >= inner_r - dr && r <= outer_r + dr) {
             float t = (r - inner_r) / max(1e-6, outer_r - inner_r);
-            float alpha = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0)).r;
+            vec4 tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0));
+            tex_val.rgb = pow(tex_val.rgb, vec3(2.2));
+            float alpha = tex_val.a;
+            vec3 r_color = tex_val.rgb;
             
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
             
@@ -1185,7 +1268,7 @@ void main() {
                 tau /= view_mu;
                 tau_faded /= view_mu;
                 
-                total_color += u_ring_planes[i].color * tau;
+                total_color += u_ring_planes[i].color * r_color * tau;
                 total_scatter += u_ring_planes[i].scatter * tau;
                 total_asym += u_ring_planes[i].asymmetry * tau;
                 total_backscatter += u_ring_planes[i].backscatter * tau;
@@ -1531,7 +1614,8 @@ out vec4 out_color;
 void main() {
     gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
     float alpha = sin(f_radius_pct * 3.14159265);
-    out_color = vec4(u_color.rgb, u_color.a * alpha);
+    vec3 linear_color = pow(u_color.rgb, vec3(2.2)) * 4.0;
+    out_color = vec4(linear_color, u_color.a * alpha);
 }
 """
 
@@ -1836,7 +1920,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             float fraction = max(0.0, f_max - f_min);
             
             float p_mid = ((overlap_min + overlap_max) * 0.5 - inner_r) / max(1e-6, outer_r - inner_r);
-            float alpha_mult = textureLod(u_ring_gradients, vec2(p_mid, (float(ring_idx) + 0.5) / 16.0), 0.0).r;
+            float alpha_mult = textureLod(u_ring_gradients, vec2(p_mid, (float(ring_idx) + 0.5) / 16.0), 0.0).a;
             float opacity = u_ring_params[ring_idx].z;
             
             float tau = -log(max(1e-6, 1.0 - opacity * alpha_mult));
@@ -1879,9 +1963,9 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
 }
 
 void main() {
-    u_ring_mask = floatBitsToUint(instances[u_body_idx * 6 + 3].w);
-    vec3 body_planetshine_dir = instances[u_body_idx * 6 + 4].xyz;
-    vec3 body_planetshine_color = instances[u_body_idx * 6 + 5].xyz;
+    u_ring_mask = floatBitsToUint(instances[u_body_idx * 7 + 3].w);
+    vec3 body_planetshine_dir = instances[u_body_idx * 7 + 4].xyz;
+    vec3 body_planetshine_color = instances[u_body_idx * 7 + 5].xyz;
     
     // g_local_rings removed to prevent local memory array spilling
 
@@ -2367,10 +2451,10 @@ void main() {
                         vec4 p_mid = clamp(((o_min + o_max) * 0.5 - ring_inner) / max(vec4(1e-6), ring_outer - ring_inner), 0.0, 1.0);
                         
                         vec4 sh_mult = vec4(1.0);
-                        if (valid.x > 0.0) sh_mult.x = 1.0 - frac.x * (1.0 - exp(-ring_opac.x * textureLod(u_ring_gradients, vec2(p_mid.x, ring_v_coord.x), 0.0).r));
-                        if (valid.y > 0.0) sh_mult.y = 1.0 - frac.y * (1.0 - exp(-ring_opac.y * textureLod(u_ring_gradients, vec2(p_mid.y, ring_v_coord.y), 0.0).r));
-                        if (valid.z > 0.0) sh_mult.z = 1.0 - frac.z * (1.0 - exp(-ring_opac.z * textureLod(u_ring_gradients, vec2(p_mid.z, ring_v_coord.z), 0.0).r));
-                        if (valid.w > 0.0) sh_mult.w = 1.0 - frac.w * (1.0 - exp(-ring_opac.w * textureLod(u_ring_gradients, vec2(p_mid.w, ring_v_coord.w), 0.0).r));
+                        if (valid.x > 0.0) sh_mult.x = 1.0 - frac.x * (1.0 - exp(-ring_opac.x * textureLod(u_ring_gradients, vec2(p_mid.x, ring_v_coord.x), 0.0).a));
+                        if (valid.y > 0.0) sh_mult.y = 1.0 - frac.y * (1.0 - exp(-ring_opac.y * textureLod(u_ring_gradients, vec2(p_mid.y, ring_v_coord.y), 0.0).a));
+                        if (valid.z > 0.0) sh_mult.z = 1.0 - frac.z * (1.0 - exp(-ring_opac.z * textureLod(u_ring_gradients, vec2(p_mid.z, ring_v_coord.z), 0.0).a));
+                        if (valid.w > 0.0) sh_mult.w = 1.0 - frac.w * (1.0 - exp(-ring_opac.w * textureLod(u_ring_gradients, vec2(p_mid.w, ring_v_coord.w), 0.0).a));
                         
                         sample_shadow *= sh_mult.x * sh_mult.y * sh_mult.z * sh_mult.w;
                     }

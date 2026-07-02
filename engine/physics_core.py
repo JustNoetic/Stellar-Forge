@@ -1169,6 +1169,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             with shared_state["lock"]:
                 np.copyto(shared_state["pos"], local_pos)
                 np.copyto(shared_state["vel"], local_vel)
+                shared_state["t"] = sim.t
                 shared_state["mass"][:] = _init_arr_sw[:, 9]
                 shared_state["parent_indices"][:] = current_parents
                 shared_state["tree_indices"][:] = tree_indices
