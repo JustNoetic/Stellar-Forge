@@ -998,6 +998,12 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
     kepler_subsys_init_pos = None
     kepler_subsys_init_vel = None
     
+    was_keplerian = False
+    kepler_entry_sim_copy = None
+    kepler_entry_parents = None
+    kepler_entry_tree_indices = None
+    kepler_entry_tree_depths = None
+    
     with shared_state["lock"]:
         current_parents = shared_state["parent_indices"].copy()
         is_star_mask = shared_state.get("is_star_mask")
@@ -1181,10 +1187,49 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 if "ephemeris_exit" in switch_req:
                     shared_state["ephemeris_exit"] = switch_req["ephemeris_exit"]
                 
+            was_keplerian = False
+            kepler_entry_sim_copy = None
+            kepler_entry_parents = None
+            kepler_entry_tree_indices = None
+            kepler_entry_tree_depths = None
             kepler_cached_elements = None
             frame_count = 0
             last_time = time.perf_counter()
             continue
+        # ── Keplerian Mode Transitions ──
+        keplerian_active = shared_state.get("keplerian_mode", False)
+        if keplerian_active and not was_keplerian:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                kepler_entry_sim_copy = sim.copy()
+            kepler_entry_parents = current_parents.copy()
+            kepler_entry_tree_indices = tree_indices.copy()
+            kepler_entry_tree_depths = tree_depths.copy()
+            was_keplerian = True
+        elif not keplerian_active and was_keplerian:
+            export_requested = False
+            with shared_state["lock"]:
+                if shared_state.get("keplerian_export", False):
+                    export_requested = True
+                    shared_state["keplerian_export"] = False
+            
+            if not export_requested and kepler_entry_sim_copy is not None:
+                sim = kepler_entry_sim_copy
+                current_parents = kepler_entry_parents
+                tree_indices = kepler_entry_tree_indices
+                tree_depths = kepler_entry_tree_depths
+                with shared_state["lock"]:
+                    shared_state["parent_indices"][:] = current_parents
+                    shared_state["tree_indices"][:] = tree_indices
+                    shared_state["tree_depths"][:] = tree_depths
+                    shared_state["hierarchy_version"] += 1
+                    shared_state["rebuild_flag"] = True
+            
+            was_keplerian = False
+            kepler_entry_sim_copy = None
+            kepler_entry_parents = None
+            kepler_entry_tree_indices = None
+            kepler_entry_tree_depths = None
 
         crud_ops = []
         with shared_state["lock"]:

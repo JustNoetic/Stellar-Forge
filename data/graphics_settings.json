@@ -1,17 +1,17 @@
 {
-    "atmo_quality": 1,
-    "atmo_steps_max": 32,
+    "atmo_quality": 2,
+    "atmo_steps_max": 16,
     "atmo_adaptive_steps": true,
-    "sky_view_mode": 0,
-    "sky_view_hybrid_dist": 1.1,
+    "sky_view_mode": 1,
+    "sky_view_hybrid_dist": 1.100000023841858,
     "sky_view_quality": 2,
     "sky_view_custom_res": [
         1024,
         512
     ],
     "hdr_enabled": true,
-    "exposure": 4.0,
-    "bloom_intensity": 0.05,
+    "exposure": 249.435791015625,
+    "bloom_intensity": 0.05000000074505806,
     "bloom_threshold": 1.0,
     "msaa_samples": 4,
     "show_orbits": true,

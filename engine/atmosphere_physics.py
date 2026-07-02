@@ -22,10 +22,10 @@ GAS_PROPERTIES = {
     "Ar":  (1.000281, 1.000, 0.03995, np.array([0.0, 0.0, 0.0])),
     "CO2": (1.000450, 1.150, 0.04401, np.array([0.0, 0.0, 0.0])),
     "CH4": (1.000444, 1.000, 0.01604, np.array([0.0, 0.0, 0.0])),
-    "H2":  (1.000132, 1.000, 0.002016, np.array([0.0, 0.0, 0.0])),
+    "H2":  (1.000132, 1.020, 0.002016, np.array([0.0, 0.0, 0.0])),
     "He":  (1.000036, 1.000, 0.004002, np.array([0.0, 0.0, 0.0])),
-    "O3":  (1.000271, 1.096, 0.04800, np.array([1.036e-25, 3.0e-25, 0.1356e-25])),
-    "SO2": (1.000686, 1.000, 0.06406, np.array([0.001e-25, 0.005e-25, 0.03e-25])),
+    "O3":  (1.000520, 1.030, 0.04800, np.array([1.036e-25, 3.0e-25, 0.1356e-25])),
+    "SO2": (1.000686, 1.075, 0.06406, np.array([0.001e-25, 0.005e-25, 0.03e-25])),
 }
 
 _atmo_cache = {}
@@ -61,14 +61,14 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     
     # Calculate aggregate physical properties
     avg_molar_mass = 0.0
-    avg_n_minus_1 = 0.0
-    king_numerator = 0.0
-    king_denominator = 0.0
     beta_abs_mixed = np.zeros(3)
     beta_abs_layered = np.zeros(3)
+    sigma_rayleigh_mix = np.zeros(3)
     
     pressure_pa = pressure_atm * P_STD
     number_density = pressure_pa / (K_B * temperature_k)
+    
+    term1 = 24.0 * (math.pi ** 3) / (WAVELENGTHS ** 4 * N_S ** 2)
     
     for gas, fraction in normalized_composition.items():
         if gas not in GAS_PROPERTIES:
@@ -77,12 +77,13 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
         n, king, m, abs_cross = GAS_PROPERTIES[gas]
         
         avg_molar_mass += m * fraction
-        avg_n_minus_1 += (n - 1.0) * fraction
         
-        # Bodhaine King factor weighting
-        f_i = fraction * ((n**2 - 1.0) / (n**2 + 2.0))**2
-        king_numerator += f_i * king
-        king_denominator += f_i
+        # Rayleigh scattering cross section for this specific gas
+        term2_i = ((n**2 - 1.0) / (n**2 + 2.0))**2
+        sigma_i = term1 * term2_i * king
+        
+        # Add to mixture cross section (Bodhaine et al. 1999)
+        sigma_rayleigh_mix += fraction * sigma_i
         
         # Absorption coefficient: cross section * number density of this specific gas
         gas_number_density = number_density * fraction
@@ -92,20 +93,9 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
             beta_abs_layered += abs_cross * (gas_number_density * 246.2)
         else:
             beta_abs_mixed += abs_cross * gas_number_density
-        
-    avg_n = 1.0 + avg_n_minus_1
-    avg_king_factor = king_numerator / king_denominator if king_denominator > 0 else 1.0
-    
-    # Rayleigh scattering cross section for the mixture
-    # sigma = (24 * pi^3 / (lambda^4 * N_s^2)) * ((n^2 - 1)/(n^2 + 2))^2 * KingFactor
-    
-    term1 = 24.0 * (math.pi ** 3) / (WAVELENGTHS ** 4 * N_S ** 2)
-    term2 = ((avg_n ** 2 - 1.0) / (avg_n ** 2 + 2.0)) ** 2
-    
-    sigma_rayleigh = term1 * term2 * avg_king_factor
-    
-    # Beta Rayleigh = cross section * actual number density
-    beta_rayleigh = sigma_rayleigh * number_density
+            
+    # Beta Rayleigh = mixture cross section * actual number density
+    beta_rayleigh = sigma_rayleigh_mix * number_density
     
     # Scale height H = R * T / (M * g)
     if gravity_m_s2 > 0 and avg_molar_mass > 0:

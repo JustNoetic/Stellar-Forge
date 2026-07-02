@@ -41,11 +41,31 @@ pip install numpy moderngl glfw pyrr imgui numba spiceypy requests
   python engine/main.py
   ```
 
+### 3. Keyboard & Mouse Controls
+
+#### 🖱️ Mouse Navigation
+* **Left Mouse Button (Drag)**: Orbit / rotate the camera (yaw and pitch).
+* **Left Mouse Button (Click)**: Select / pick a celestial body in the viewport.
+* **Right Mouse Button (Drag)**: Pan the camera target (shifts the look-at target).
+* **Scroll Wheel**: Zoom in/out (zoom speed dynamically scales with altitude above the surface to prevent ground-clipping).
+* **Shift + Scroll Wheel**: Adjust Field of View (FOV) ($1.0^\circ - 120.0^\circ$).
+
+#### ⌨️ Keyboard Commands
+* **Space**: Pause / resume simulation time.
+* **Up / Right Arrow**: Double the simulation speed (time multiplier, capped at $10^{12}\times$).
+* **Down / Left Arrow**: Halve the simulation speed (minimum $1.0\times$).
+* **R**: Reset simulation time multiplier to $1.0\times$.
+* **Q / E**: Roll / tilt the camera counter-clockwise / clockwise.
+* **Minus (`-`) / Equal (`=`)**: Decrease / increase camera exposure.
+* **Shift + Minus (`-`) / Equal (`=`)**: Double-speed decrease / increase of camera exposure.
+* **Backslash (`\`) + Click "Export"**: Developer shortcut (only valid when active system is `Solar System`) that updates and dumps all bodies' cosmetics directly into the master `data/system.json`. (Standard **Click "Export"** without `\` saves a single body's cosmetic properties to a JSON file under `exports/`, while custom systems save changes directly).
+
 ---
 
 ## 📋 Table of Contents
 
 - [Quick Start / How to Run](#-quick-start--how-to-run)
+  - [Keyboard & Mouse Controls](#3-keyboard--mouse-controls)
 - [Key Features](#-key-features)
 - [Physics Engine & Accuracy Testing](#-physics-engine--accuracy-testing)
   - [IAS15 N-Body Integrator](#ias15-n-body-integrator)
@@ -187,9 +207,12 @@ Utilizes a multi-step precomputation technique inspired by Bruneton e.a.:
 2. **Multi-Scattering LUT**: Approximates higher-order light bounces inside the atmosphere.
 3. **Real-Time Raymarching Shader**: Combines Rayleigh scattering (sky color), Mie scattering (sun halos), and gas absorption in real time.
 
-### Planetary Rings & Planetshine
-- **Planetary Rings**: Rendered with dynamic optical depth, phase functions, and self-shadowing cast by the parent planet and companion bodies.
-- **Planetshine**: Secondary diffuse light bounced from illuminated planetary disks onto nearby moons, accelerated via Numba.
+### Planetary Rings, Planetshine & Ringshine
+- **Planetary Rings**: Rendered with dynamic optical depth, Phase functions (supporting forward/backward scattering asymmetry), and self-shadowing cast by the parent planet and companion bodies.
+- **Planetshine**: Secondary diffuse light bounced from illuminated planetary disks onto nearby satellites and moons. To keep rendering fast, the aggregate bounce light direction and color are precalculated on the CPU using Numba (`compute_planetshine_numba` in [app.py](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py)) and passed as instance attributes to the GPU.
+- **Ringshine**: Scattered sunlight from planetary ring planes onto the host planet's surface and its orbiting moons. Calculated in real time on the GPU (in the fragment shader of [shaders.py](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/shaders.py)):
+  - *For the Host Planet*: Evaluated using a macro-approximation based on the ring plane's area, elevation, solid angle, and a noon-fade term.
+  - *For Orbiting Moons*: Dynamically projects the closest ring element to the moon, evaluates a wrapped Lambertian light model to mimic the ring plane's broad area-light profile, and calculates soft penumbral shadow softening as the moon enters/leaves the host planet's cylindrical shadow cylinder.
 
 ### HDR Post-Processing Pyramid
 1. **Bright Pass Filtering**: Isolates high-intensity pixels above threshold.
@@ -258,17 +281,22 @@ Stellar-Forge/
 │   ├── post_shaders.py          # GLSL post-processing shaders (Bloom, HDR Tone Mapping)
 │   ├── render_utils.py          # ModernGL buffer handlers & UV sphere mesh generators
 │   ├── math_utils.py            # Fast vector operations & Kepler equation solvers
+│   ├── atmosphere_physics.py    # Physical atmosphere parameters (Rayleigh, Mie, absorption coefficients, scale height)
 │   └── constants.py             # Physical, astronomical constants & conversion ratios
 ├── data/                        # Simulation data & system presets
 │   ├── systems/                 # System JSON profiles (Solar System, Achernar, etc.)
 │   ├── kernels/                 # Storage directory for downloaded NAIF SPICE kernels
 │   ├── system.json              # Active default planetary system data
-│   └── ephemeris_settings.json  # Configuration for SPICE playback dates & active kernels
+│   ├── ephemeris_settings.json  # Configuration for SPICE playback dates & active kernels
+│   ├── graphics_settings.json   # Persistent configuration for rendering and graphics qualities
+│   └── horizons_cache.json      # Cache file for fetched JPL Horizons API queries
 ├── scripts/                     # Utility and benchmark scripts
 │   ├── fetch_horizons.py        # Fetch J2000 state vectors directly from JPL Horizons REST API
 │   ├── perf_test.py             # Benchmark engine startup and frame performance
 │   └── accuracy_test.py         # Physics solver validation against JPL Horizons ground truth
+├── exports/                     # Exported visual and cosmetic settings for planets
 ├── run.bat                      # Quick launch batch script for Windows
+├── test_spice.py                # Validation script for checking SPICE kernel playback loader
 ├── imgui.ini                    # Saved ImGui window positions and layout configurations
 └── README.md                    # Project documentation
 ```

@@ -1678,6 +1678,9 @@ uniform sampler2D u_transmittance_lut;
 uniform sampler2D u_multi_scatter_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
+uniform bool u_planetshine_enabled;
+uniform bool u_ringshine_enabled;
+uniform vec3 u_ring_colors[MAX_RING_PLANES];
 
 layout(location = 0, index = 0) out vec4 out_color;
 layout(location = 0, index = 1) out vec4 out_transmittance;
@@ -1877,6 +1880,8 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
 
 void main() {
     u_ring_mask = floatBitsToUint(instances[u_body_idx * 6 + 3].w);
+    vec3 body_planetshine_dir = instances[u_body_idx * 6 + 4].xyz;
+    vec3 body_planetshine_color = instances[u_body_idx * 6 + 5].xyz;
     
     // g_local_rings removed to prevent local memory array spilling
 
@@ -2270,6 +2275,15 @@ void main() {
         vec3 total_mie = vec3(0.0);
         vec3 total_ms = vec3(0.0);
         vec3 current_transmittance = vec3(1.0);
+        
+        vec3 total_rayleigh_ps = vec3(0.0);
+        vec3 total_mie_ps = vec3(0.0);
+        vec3 total_rayleigh_rs[MAX_RING_PLANES];
+        vec3 total_mie_rs[MAX_RING_PLANES];
+        for (int k = 0; k < MAX_RING_PLANES; k++) {
+            total_rayleigh_rs[k] = vec3(0.0);
+            total_mie_rs[k] = vec3(0.0);
+        }
 
         float current_s = s_start + 0.5 * step_size;
         float t_lerp = 0.5 / float(steps);
@@ -2387,6 +2401,110 @@ void main() {
             vec3 ms_shadow = sample_shadow;
             total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * ms_shadow * int_factor;
 
+            if (u_planetshine_enabled) {
+                float light_cos_theta_ps = dot(current_pos_sph, body_planetshine_dir) / sample_len;
+                float vis_fraction_ps = smoothstep(-cos_planet - 0.05, -cos_planet + 0.05, light_cos_theta_ps);
+                vec3 transmittance_to_ps = get_transmittance_precomputed(v_norm, light_cos_theta_ps);
+                vec3 ps_attenuation = current_transmittance * transmittance_to_ps * vis_fraction_ps;
+                total_rayleigh_ps += rho_R * ps_attenuation * int_factor;
+                total_mie_ps      += rho_M * ps_attenuation * int_factor;
+            }
+
+            if (u_ringshine_enabled) {
+                vec3 current_pos_local = cam_local + current_s * ray_dir;
+                for (int k = 0; k < u_num_ring_planes; k++) {
+                    vec3 ring_center_rel = u_ring_center[k];
+                    vec3 ring_center_loc = (ring_center_rel - u_body_offset) * u_au_to_km;
+                    vec3 ring_normal = u_ring_normal[k];
+                    float inner_r = u_ring_params[k].x * u_au_to_km;
+                    float outer_r = u_ring_params[k].y * u_au_to_km;
+                    float opacity = u_ring_params[k].z;
+                    
+                    vec3 frag_to_center = ring_center_loc - current_pos_local;
+                    float dist_to_center = length(frag_to_center);
+                    if (dist_to_center > outer_r * 20.0 || dist_to_center < 1e-6) continue;
+                    
+                    float moon_h = dot(current_pos_local - ring_center_loc, ring_normal);
+                    vec3 closest_plane_pt = current_pos_local - moon_h * ring_normal;
+                    vec3 center_to_plane_pt = closest_plane_pt - ring_center_loc;
+                    float rho = length(center_to_plane_pt);
+                    
+                    vec3 closest_ring_pt;
+                    if (rho < 1e-5) {
+                        closest_ring_pt = ring_center_loc + inner_r * vec3(1.0, 0.0, 0.0); 
+                    } else if (rho < inner_r) {
+                        closest_ring_pt = ring_center_loc + (center_to_plane_pt / rho) * inner_r;
+                    } else if (rho > outer_r) {
+                        closest_ring_pt = ring_center_loc + (center_to_plane_pt / rho) * outer_r;
+                    } else {
+                        closest_ring_pt = closest_plane_pt; 
+                    }
+                    
+                    vec3 L_ring_unnorm = closest_ring_pt - current_pos_local;
+                    float d_ring = max(length(L_ring_unnorm), 1e-6);
+                    
+                    vec3 V_pt = closest_ring_pt - ring_center_loc;
+                    float t_proj = dot(V_pt, -L_mid);
+                    vec3 V_perp = V_pt - t_proj * (-L_mid);
+                    float d_axis = length(V_perp);
+                    
+                    float host_radius = u_planet_radius_km;
+                    float host_r_minor = host_radius / max(1e-6, u_pole_obl.w);
+                    if (host_r_minor < host_radius - 1e-5) {
+                        host_radius = get_oblate_radius(host_radius, host_r_minor, u_pole_obl.xyz, -L_mid, V_perp);
+                    }
+                    
+                    float ring_shadow_factor = 1.0;
+                    if (t_proj > 0.0) {
+                        float shadow_gradient = smoothstep(host_radius * 0.9, host_radius * 1.15, d_axis);
+                        ring_shadow_factor = mix(0.05, 1.0, shadow_gradient);
+                    }
+                    
+                    float sun_elevation = dot(L_mid, ring_normal);
+                    float star_ang_radius = star_radius / max(dist_mid_star * u_au_to_km, 1e-6);
+                    float effective_sun_elev = sqrt(sun_elevation * sun_elevation + 0.180126 * star_ang_radius * star_ang_radius);
+                    
+                    bool is_host_atmo = (dist_to_center < inner_r);
+                    float shine_intensity = 0.0;
+                    
+                    if (is_host_atmo) {
+                        // Host planet form-factor model (consistent with surface shader)
+                        vec3 radial_dir = normalize(current_pos_local);
+                        float frag_elevation = dot(radial_dir, ring_normal);
+                        float abs_elev = abs(frag_elevation);
+                        float form_factor = abs_elev * (1.0 - abs_elev) * (1.0 - abs_elev) * 6.75;
+                        float ring_area = (outer_r * outer_r - inner_r * inner_r);
+                        float solid_angle = ring_area / max(dist_to_center * dist_to_center, ring_area) * 0.1;
+                        
+                        float same_hemisphere = sun_elevation * frag_elevation;
+                        if (same_hemisphere > 0.0) {
+                            shine_intensity = effective_sun_elev * form_factor * solid_angle * opacity * 3.5 * ring_shadow_factor;
+                        } else {
+                            shine_intensity = effective_sun_elev * form_factor * solid_angle * opacity * 1.25 * ring_shadow_factor;
+                        }
+                    } else {
+                        // Moon-style calculation (for bodies orbiting within the ring system)
+                        float sin_elev = clamp((abs(moon_h) + inner_r * 0.001) / d_ring, 0.0, 1.0);
+                        float ring_area = (outer_r * outer_r - inner_r * inner_r);
+                        float d_eff = max(d_ring, inner_r * 0.05); 
+                        float solid_angle = (ring_area * sin_elev) / max(d_eff * d_eff, ring_area * 0.1) * 0.15;
+                        
+                        float same_hemisphere = sun_elevation * moon_h;
+                        float ring_brightness = (same_hemisphere > 0.0) ? (effective_sun_elev * opacity * 1.25) : (effective_sun_elev * opacity * 0.3);
+                        shine_intensity = ring_brightness * solid_angle * ring_shadow_factor;
+                    }
+                    
+                    vec3 L_ring = L_ring_unnorm / d_ring;
+                    float cos_theta_ring = dot(current_pos_sph / sample_len, L_ring);
+                    float vis_fraction_ring = smoothstep(-cos_planet - 0.05, -cos_planet + 0.05, cos_theta_ring);
+                    vec3 transmittance_to_ring = get_transmittance_precomputed(v_norm, cos_theta_ring);
+                    vec3 rs_attenuation = current_transmittance * transmittance_to_ring * vis_fraction_ring;
+                    
+                    total_rayleigh_rs[k] += rho_R * rs_attenuation * int_factor * shine_intensity;
+                    total_mie_rs[k]      += rho_M * rs_attenuation * int_factor * shine_intensity;
+                }
+            }
+
             current_transmittance *= step_transmittance;
 
             current_pos_sph += step_dir_sph;
@@ -2409,6 +2527,63 @@ void main() {
             phase_M * beta_M * total_mie +
             total_ms
         );
+
+        if (u_planetshine_enabled && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
+            float cos_theta_ps = dot(ray_dir, body_planetshine_dir);
+            float phase_R_ps = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_ps * cos_theta_ps);
+            float phase_M_ps = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_theta_ps * cos_theta_ps))
+                          / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta_ps, 1.5));
+            scattered += body_planetshine_color * (
+                phase_R_ps * beta_R * total_rayleigh_ps +
+                phase_M_ps * beta_M * total_mie_ps
+            );
+        }
+
+        if (u_ringshine_enabled) {
+            for (int k = 0; k < u_num_ring_planes; k++) {
+                vec3 ring_center_rel = u_ring_center[k];
+                vec3 ring_center_loc = (ring_center_rel - u_body_offset) * u_au_to_km;
+                vec3 ring_normal = u_ring_normal[k];
+                float inner_r = u_ring_params[k].x * u_au_to_km;
+                float outer_r = u_ring_params[k].y * u_au_to_km;
+                
+                vec3 frag_to_center = ring_center_loc - (cam_local + s_mid * ray_dir);
+                float dist_to_center = length(frag_to_center);
+                if (dist_to_center > outer_r * 20.0 || dist_to_center < 1e-6) continue;
+                
+                float moon_h = dot((cam_local + s_mid * ray_dir) - ring_center_loc, ring_normal);
+                vec3 closest_plane_pt = (cam_local + s_mid * ray_dir) - moon_h * ring_normal;
+                vec3 center_to_plane_pt = closest_plane_pt - ring_center_loc;
+                float rho = length(center_to_plane_pt);
+                
+                vec3 closest_ring_pt;
+                if (rho < 1e-5) {
+                    closest_ring_pt = ring_center_loc + inner_r * vec3(1.0, 0.0, 0.0); 
+                } else if (rho < inner_r) {
+                    closest_ring_pt = ring_center_loc + (center_to_plane_pt / rho) * inner_r;
+                } else if (rho > outer_r) {
+                    closest_ring_pt = ring_center_loc + (center_to_plane_pt / rho) * outer_r;
+                } else {
+                    closest_ring_pt = closest_plane_pt; 
+                }
+                
+                vec3 L_ring_unnorm = closest_ring_pt - (cam_local + s_mid * ray_dir);
+                vec3 L_ring = normalize(L_ring_unnorm);
+                
+                float cos_theta_ring = dot(ray_dir, L_ring);
+                float phase_R_rs = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_ring * cos_theta_ring);
+                float phase_M_rs = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_theta_ring * cos_theta_ring))
+                              / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta_ring, 1.5));
+                
+                vec3 ring_tint = u_ring_colors[k] * 1.2;
+                vec3 ring_light_color = ring_tint * star_color * irradiance;
+                
+                scattered += ring_light_color * u_sun_intensity * (
+                    phase_R_rs * beta_R * total_rayleigh_rs[k] +
+                    phase_M_rs * beta_M * total_mie_rs[k]
+                );
+            }
+        }
 
         final_transmittance = current_transmittance;
     }

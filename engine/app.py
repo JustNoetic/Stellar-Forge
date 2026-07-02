@@ -363,6 +363,10 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                             occ = t_val * t_val * (3.0 - 2.0 * t_val) # Smoothstep
                             
                         max_occ = min(1.0, (beta * beta) / max(1e-12, alpha * alpha))
+                        # Scale by the relative area of the shadow caster vs the illuminated body.
+                        # This prevents small objects (like the Moon) from casting a 100% shadow over large objects (like Earth).
+                        scale_area = min(1.0, (radii[k] / max(1e-6, radii[j])) ** 2)
+                        max_occ *= scale_area
                         shadow_factor *= (1.0 - max_occ * occ)
                         
             if shadow_factor > 0.001:
@@ -1551,11 +1555,14 @@ class App:
                     saved_snap = self.shared_state["system_snapshot_out"]
                     is_ephem_enter = self.shared_state.get("ephemeris_enter", False)
                     is_ephem_exit = self.shared_state.get("ephemeris_exit", False)
+                    to_keplerian = self.shared_state.get("to_keplerian", False)
                     self.shared_state["system_switch_complete"] = False
                     self.shared_state["system_new_bundle"] = None
                     self.shared_state["system_snapshot_out"] = None
                     self.shared_state["ephemeris_enter"] = False
                     self.shared_state["ephemeris_exit"] = False
+                    self.shared_state["to_keplerian"] = False
+                    self._ephem_mapping_ver = None
     
                 # Store snapshot of old system in SystemManager
                 old_name = active_system_name
@@ -1567,10 +1574,16 @@ class App:
                     ephemeris_mode_active = True
                     active_system_name = "Ephemeris Mode"
                     self.shared_state["ephemeris_mode"] = True
+                    keplerian_mode_active = False
+                    self.shared_state["keplerian_mode"] = False
                 elif is_ephem_exit:
                     ephemeris_mode_active = False
                     active_system_name = switch_req_name
                     self.shared_state["ephemeris_mode"] = False
+                    if to_keplerian:
+                        keplerian_mode_active = True
+                        self.shared_state["keplerian_mode"] = True
+                        self.shared_state["keplerian_reextract"] = True
                 else:
                     active_system_name = switch_req_name
     
@@ -2147,9 +2160,11 @@ class App:
                 et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
                 et = et_epoch + display_t * 365.25 * 86400.0
                 
-                if getattr(self, "_ephem_mapping_ver", None) != id(bodies_data):
+                if (getattr(self, "_ephem_mapping_ver", None) != id(bodies_data) or 
+                    getattr(self, "_ephem_mapping_len", 0) != len(bodies_data)):
                     self._ephem_mapping = sys_mgr_spice.get_body_mapping(bodies_data, et_epoch)
                     self._ephem_mapping_ver = id(bodies_data)
+                    self._ephem_mapping_len = len(bodies_data)
                     
                 sys_mgr_spice.populate_states_fast(et, self._ephem_mapping, pos_snap_render, vel_snap_render, spice_valid_mask)
     
@@ -2876,6 +2891,9 @@ class App:
                         mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
                         if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
                             build_atmo_lut(atmo, mass_sm_curr, is_cmp)
+                            sv_key = (bi_curr, is_cmp)
+                            if sv_key in self.sky_view_cache:
+                                del self.sky_view_cache[sv_key]
 
             
             ctx.enable(moderngl.DEPTH_TEST)
@@ -3916,6 +3934,38 @@ class App:
                 self._show_ephem_download_modal = True
                 sys_mgr_spice.download_kernels_async(on_complete=_on_spice_ready)
 
+            def _trigger_ephem_exit(to_keplerian=False):
+                target_name = SystemManager.SOLAR_SYSTEM_NAME
+                nonlocal switch_req_name
+                switch_req_name = target_name
+                existing_snap = sys_mgr.get_snapshot(target_name)
+                if existing_snap is not None:
+                    req = {
+                        "old_bodies_data": bodies_data,
+                        "old_visual_data": visual_data,
+                        "old_atmo_bodies": atmo_bodies,
+                        "old_ring_bodies": ring_bodies,
+                        "old_star_idx": star_idx,
+                        "restore_snapshot": existing_snap,
+                        "ephemeris_exit": True,
+                        "to_keplerian": to_keplerian
+                    }
+                else:
+                    raw_data = sys_mgr.load_system_data(target_name)
+                    new_bndl = load_system_from_data(raw_data)
+                    req = {
+                        "old_bodies_data": bodies_data,
+                        "old_visual_data": visual_data,
+                        "old_atmo_bodies": atmo_bodies,
+                        "old_ring_bodies": ring_bodies,
+                        "old_star_idx": star_idx,
+                        "new_bundle": new_bndl,
+                        "ephemeris_exit": True,
+                        "to_keplerian": to_keplerian
+                    }
+                with self.shared_state["lock"]:
+                    self.shared_state["system_switch_request"] = req
+
             # ── Simulation Physics Mode ──
             imgui.text_colored("Simulation Physics Mode", 0.6, 0.9, 1.0)
             cur_mode = 0
@@ -3927,24 +3977,30 @@ class App:
             c0 = imgui.radio_button("N-Body", cur_mode == 0)
             imgui.same_line()
             c1 = imgui.radio_button("Keplerian", cur_mode == 1)
-            if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+            if active_system_name == SystemManager.SOLAR_SYSTEM_NAME or ephemeris_mode_active:
                 imgui.same_line()
                 c2 = imgui.radio_button("Ephemeris", cur_mode == 2)
             else:
                 c2 = False
 
             if c0 and cur_mode != 0:
-                ephemeris_mode_active = False
-                keplerian_mode_active = False
-                self.shared_state["ephemeris_mode"] = False
-                self.shared_state["keplerian_mode"] = False
+                if cur_mode == 2:
+                    _trigger_ephem_exit(to_keplerian=False)
+                else:
+                    ephemeris_mode_active = False
+                    keplerian_mode_active = False
+                    self.shared_state["ephemeris_mode"] = False
+                    self.shared_state["keplerian_mode"] = False
             elif c1 and cur_mode != 1:
-                ephemeris_mode_active = False
-                keplerian_mode_active = True
-                self.shared_state["ephemeris_mode"] = False
-                self.shared_state["keplerian_mode"] = True
-                with self.shared_state["lock"]:
-                    self.shared_state["keplerian_reextract"] = True
+                if cur_mode == 2:
+                    _trigger_ephem_exit(to_keplerian=True)
+                else:
+                    ephemeris_mode_active = False
+                    keplerian_mode_active = True
+                    self.shared_state["ephemeris_mode"] = False
+                    self.shared_state["keplerian_mode"] = True
+                    with self.shared_state["lock"]:
+                        self.shared_state["keplerian_reextract"] = True
             elif c2 and cur_mode != 2:
                 if not sys_mgr_spice.settings_initialized:
                     imgui.open_popup("Ephemeris Setup")
@@ -3958,6 +4014,8 @@ class App:
                     keplerian_mode_active = False
                     self.shared_state["ephemeris_mode"] = False
                     self.shared_state["keplerian_mode"] = False
+                    with self.shared_state["lock"]:
+                        self.shared_state["keplerian_export"] = True
                 imgui.separator()
 
             if active_system_name == SystemManager.SOLAR_SYSTEM_NAME and not ephemeris_mode_active:
@@ -4083,33 +4141,7 @@ class App:
                         self.shared_state["system_switch_request"] = req
                     
                 if imgui.button("Return to N-Body Mode", width=-1):
-                    target_name = SystemManager.SOLAR_SYSTEM_NAME
-                    switch_req_name = target_name
-                    existing_snap = sys_mgr.get_snapshot(target_name)
-                    if existing_snap is not None:
-                        req = {
-                            "old_bodies_data": bodies_data,
-                            "old_visual_data": visual_data,
-                            "old_atmo_bodies": atmo_bodies,
-                            "old_ring_bodies": ring_bodies,
-                            "old_star_idx": star_idx,
-                            "restore_snapshot": existing_snap,
-                            "ephemeris_exit": True
-                        }
-                    else:
-                        raw_data = sys_mgr.load_system_data(target_name)
-                        new_bndl = load_system_from_data(raw_data)
-                        req = {
-                            "old_bodies_data": bodies_data,
-                            "old_visual_data": visual_data,
-                            "old_atmo_bodies": atmo_bodies,
-                            "old_ring_bodies": ring_bodies,
-                            "old_star_idx": star_idx,
-                            "new_bundle": new_bndl,
-                            "ephemeris_exit": True
-                        }
-                    with self.shared_state["lock"]:
-                        self.shared_state["system_switch_request"] = req
+                    _trigger_ephem_exit(to_keplerian=False)
                 imgui.separator()
             
             for k in range(len(tree_indices_snap)):
@@ -5170,7 +5202,6 @@ class App:
                                                         "scatter": fmt(r['scatter']),
                                                         "asymmetry": fmt(r['asymmetry']),
                                                         "backscatter": fmt(r['backscatter']),
-                                                        "shadow_grad": r['shadow_grad'],
                                                         "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
                                                     })
                                                     
@@ -5208,7 +5239,6 @@ class App:
                                             "scatter": fmt(r['scatter']),
                                             "asymmetry": fmt(r['asymmetry']),
                                             "backscatter": fmt(r['backscatter']),
-                                            "shadow_grad": r['shadow_grad'],
                                             "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
                                         })
                                 
@@ -5387,6 +5417,9 @@ class App:
                                 if changed_m:
                                     atmo_item['beta_mie'] = b_mie * 1e-6
                                     atmo_item['_dirty'] = True
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
                                 changed_hm, new_hm = imgui.drag_float("Aerosol Scale (km)", atmo_item.get('h_mie', 1.2), 0.1, 0.1, 1000.0)
                                 if changed_hm:
                                     atmo_item['h_mie'] = new_hm
@@ -5394,7 +5427,13 @@ class App:
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
-                                _, atmo_item['mie_g'] = imgui.slider_float("Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
+                                changed_mg, new_mg = imgui.slider_float("Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
+                                if changed_mg:
+                                    atmo_item['mie_g'] = new_mg
+                                    atmo_item['_dirty'] = True
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
                                 
                                 # Aerosol Angstrom Exponent (Auto vs Manual)
                                 is_manual = ('mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None)

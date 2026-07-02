@@ -478,7 +478,12 @@ class SpiceManager:
         km_to_au = self.KM_TO_AU
         sec_to_yr = self.SEC_TO_YR
         
-        for idx, sp_id in enumerate(mapping):
+        max_idx = min(len(mapping), pos_out.shape[0])
+        if valid_out is not None:
+            max_idx = min(max_idx, valid_out.shape[0])
+            
+        for idx in range(max_idx):
+            sp_id = mapping[idx]
             if sp_id is not None:
                 try:
                     state, _ = spice.spkgeo(sp_id, et, 'ECLIPJ2000', 0)
