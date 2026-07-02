@@ -595,6 +595,7 @@ void main() {
                         float sin_theta = dot(dir_radial, T);
                         R_eff = r_star_proj * sqrt( pow(cos_theta / max(1e-6, abs(denom)), 2.0) + pow(sin_theta, 2.0) );
                     }
+                    R_eff = max(R_eff, fwidth(d) * 0.75);
                     
                     float plane_occlusion = 0.0;
                     
@@ -724,7 +725,7 @@ void main() {
                     float shadow_occlusion = 1.0;
                     if (dot(N, L) < 0.0) {
                         float anti_solar = max(0.0, dot(N, -L));
-                        shadow_occlusion = 1.0 - (anti_solar * 0.85);
+                        shadow_occlusion = 1.0 - (anti_solar * 0.92);
                     }
                     float noon_fade = 1.0 - max(0.0, dot(N, L));
                     
@@ -1195,6 +1196,21 @@ uniform sampler2D u_ring_gradients;
 
 out vec4 out_color;
 
+uniform bool u_is_textured;
+uniform sampler2D u_ring_texture;
+
+float HenyeyGreensteinPhaseFunction(float eccentricity, float viewDirDotLight) {
+    return (1.0 - eccentricity * eccentricity) / (4.0 * 3.14159265358979 * pow(max(1e-6, 1.0 + eccentricity * eccentricity - 2.0 * eccentricity * viewDirDotLight), 1.5));
+}
+
+float GetRingPhaseFunctions(float dotLight, float alpha) {
+    float multipleScatteringLerp = clamp((alpha - 0.1) / 0.2, 0.0, 1.0);
+    vec2 strengths = mix(vec2(2.0, 0.0), vec2(0.5, 10.0), multipleScatteringLerp);
+    float pf_forward = HenyeyGreensteinPhaseFunction(0.85, dotLight);
+    float pf_backward = HenyeyGreensteinPhaseFunction(-0.2, dotLight);
+    return strengths.x * pf_forward + strengths.y * pf_backward;
+}
+
 float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_vec) {
     if (r_minor < 1e-6 || r_eq < 1e-6) return r_eq;
     float perp_len = length(perp_vec);
@@ -1236,7 +1252,12 @@ void main() {
         
         if (r >= inner_r - dr && r <= outer_r + dr) {
             float t = (r - inner_r) / max(1e-6, outer_r - inner_r);
-            vec4 tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0));
+            vec4 tex_val;
+            if (u_is_textured) {
+                tex_val = texture(u_ring_texture, vec2(clamp(t, 0.0, 1.0), 0.5));
+            } else {
+                tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0));
+            }
             tex_val.rgb = pow(tex_val.rgb, vec3(2.2));
             float alpha = tex_val.a;
             vec3 r_color = tex_val.rgb;
@@ -1278,7 +1299,10 @@ void main() {
         }
     }
     
-    if (total_tau <= 1e-6) discard;
+    if (total_tau <= 1e-6) {
+        out_color = vec4(0.0);
+        return;
+    }
     
     float physical_alpha = 1.0 - exp(-total_tau);
     float faded_alpha = 1.0 - exp(-total_faded_tau);
@@ -1326,18 +1350,6 @@ void main() {
         
         float cos_theta = -dot(L, V);
         
-        float denom_rock = 1.0 + g_rock * g_rock - 2.0 * g_rock * cos_theta;
-        float rocky_phase = (1.0 - g_rock * g_rock) / (denom_rock * sqrt(denom_rock));
-        rocky_phase = min(rocky_phase, 2.5);
-        
-        float denom_rock_back = 1.0 + g_rock * g_rock + 2.0 * g_rock * cos_theta;
-        float rocky_phase_back = (1.0 - g_rock * g_rock) / (denom_rock_back * sqrt(denom_rock_back));
-        rocky_phase_back = min(rocky_phase_back, 2.5);
-        
-        float denom_dust = 1.0 + g_dust * g_dust - 2.0 * g_dust * cos_theta;
-        float dusty_phase = (1.0 - g_dust * g_dust) / (denom_dust * sqrt(denom_dust));
-        dusty_phase *= 0.15;
-        
         float sun_side = dot(N, L);
         
         float star_ang_radius = star_radius / dist_to_star;
@@ -1350,16 +1362,54 @@ void main() {
         float v_star = clamp(sun_side / sin_alpha_local, -1.0, 1.0);
         float f_top = (v_star * sqrt(max(0.0, 1.0 - v_star*v_star)) + asin(v_star)) / 3.14159265358979 + 0.5;
         float same_side = (cam_side > 0.0) ? f_top : (1.0 - f_top);
-        
-        float rock_reflect_s = rock_reflect * solar_elevation * rocky_phase;
-        float rock_transmit_s = rock_transmit * solar_elevation * rocky_phase;
-        float backscatter_leak = rock_reflect * solar_elevation * rocky_phase_back * (1.0 - f_color.a) * 1.5;
-        rock_transmit_s += backscatter_leak;
-        
-        float reflected_s = rock_reflect_s + dust_reflect * dusty_phase;
-        float transmitted_s = rock_transmit_s + dust_transmit * dusty_phase;
-        
-        float direct_illum_s = mix(transmitted_s, reflected_s, same_side);
+
+        float direct_illum_s = 0.0;
+        if (u_is_textured) {
+            float cosViewRayVertical  = max(abs(cam_side),  1e-5);
+            float cosLightRayVertical = max(abs(sun_side), 1e-5);
+
+            float columnDensity = -log(max(1.0 - f_color.a, 1e-5));
+
+            float viewDensity = columnDensity / cosViewRayVertical;
+            float lightDensity = columnDensity / cosLightRayVertical;
+            float scatteredLight = 0.0;
+
+            bool onLitSide = (cam_side * sun_side) >= 0.0;
+
+            if (onLitSide) {
+                scatteredLight = viewDensity / (viewDensity + lightDensity) * (1.0 - exp(-viewDensity - lightDensity));
+            } else {
+                float denominator = lightDensity - viewDensity;
+                if (abs(denominator) > 1e-6) {
+                    scatteredLight = (exp(-viewDensity) - exp(-lightDensity)) * viewDensity / (lightDensity - viewDensity);
+                } else {
+                    scatteredLight = viewDensity * exp(-viewDensity);
+                }
+            }
+            direct_illum_s = scatteredLight * GetRingPhaseFunctions(cos_theta, f_color.a);
+        } else {
+            float denom_rock = 1.0 + g_rock * g_rock - 2.0 * g_rock * cos_theta;
+            float rocky_phase = (1.0 - g_rock * g_rock) / (denom_rock * sqrt(denom_rock));
+            rocky_phase = min(rocky_phase, 2.5);
+            
+            float denom_rock_back = 1.0 + g_rock * g_rock + 2.0 * g_rock * cos_theta;
+            float rocky_phase_back = (1.0 - g_rock * g_rock) / (denom_rock_back * sqrt(denom_rock_back));
+            rocky_phase_back = min(rocky_phase_back, 2.5);
+            
+            float denom_dust = 1.0 + g_dust * g_dust - 2.0 * g_dust * cos_theta;
+            float dusty_phase = (1.0 - g_dust * g_dust) / (denom_dust * sqrt(denom_dust));
+            dusty_phase *= 0.15;
+            
+            float rock_reflect_s = rock_reflect * solar_elevation * rocky_phase;
+            float rock_transmit_s = rock_transmit * solar_elevation * rocky_phase;
+            float backscatter_leak = rock_reflect * solar_elevation * rocky_phase_back * (1.0 - f_color.a) * 1.5;
+            rock_transmit_s += backscatter_leak;
+            
+            float reflected_s = rock_reflect_s + dust_reflect * dusty_phase;
+            float transmitted_s = rock_transmit_s + dust_transmit * dusty_phase;
+            
+            direct_illum_s = mix(transmitted_s, reflected_s, same_side);
+        }
         
         // Inverse-square falloff
         if (u_hdr_enabled) {
@@ -1899,6 +1949,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             float sin_theta = dot(dir_radial, T);
             R_eff = r_star_proj * sqrt( pow(cos_theta / max(1e-6, abs(denom)), 2.0) + pow(sin_theta, 2.0) );
         }
+        R_eff = max(R_eff, fwidth(d) * 0.75);
         
         float plane_occlusion = 0.0;
         
@@ -2709,6 +2760,18 @@ atmo_fragment_shader = sky_view_lut_fragment_shader.replace(
 ).replace(
     "    if (s_start >= s_end) {\n        out_color = vec4(0.0, 0.0, 0.0, 1.0);\n        out_transmittance = vec4(1.0, 1.0, 1.0, 1.0);\n        return;\n    }",
     "    if (s_start >= s_end) discard;"
+).replace(
+    "layout(location = 0, index = 0) out vec4 out_color;",
+    "layout(location = 0) out vec4 out_color;"
+).replace(
+    "layout(location = 0, index = 1) out vec4 out_transmittance;",
+    ""
+).replace(
+    "out_transmittance = vec4(transmittance, 1.0);",
+    ""
+).replace(
+    "out_color = vec4(scattered, 1.0);",
+    "out_color = vec4(scattered, 1.0 - clamp((transmittance.r + transmittance.g + transmittance.b) / 3.0, 0.0, 1.0));"
 )
 
 

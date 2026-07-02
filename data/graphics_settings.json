@@ -10,16 +10,16 @@
         512
     ],
     "hdr_enabled": true,
-    "exposure": 453.5196228027344,
+    "exposure": 226.7598114013672,
     "bloom_intensity": 0.05000000074505806,
     "bloom_threshold": 1.0,
     "msaa_samples": 4,
-    "show_orbits": true,
+    "show_orbits": false,
     "orbit_fade_dir_idx": 0,
     "orbit_min_alpha": 0.3,
     "show_habitable_zone": false,
     "planetshine_enabled": true,
     "ringshine_enabled": true,
     "inspector_frame": 0,
-    "fov": 45.0
+    "fov": 11.0
 }

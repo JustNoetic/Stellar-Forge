@@ -239,16 +239,16 @@ def create_icosphere_mesh(subdivisions=4):
     i_arr = np.array(faces, dtype='i4').ravel()
     return v_arr.ravel(), i_arr
 
-def generate_ring_shadow_grad(sorted_gradient, tex_sampled=None):
+def generate_ring_shadow_grad(sorted_gradient, tex_sampled=None, res=4096):
     if sorted_gradient:
         grad_p = np.array([g['p'] for g in sorted_gradient])
         grad_a = np.array([g['a'] for g in sorted_gradient])
-        tex_p = np.linspace(0.0, 1.0, 256)
+        tex_p = np.linspace(0.0, 1.0, res)
         shadow_grad_a = np.interp(tex_p, grad_p, grad_a).astype('f4')
     else:
-        shadow_grad_a = np.ones(256, dtype='f4')
+        shadow_grad_a = np.ones(res, dtype='f4')
         
-    shadow_grad = np.ones((256, 4), dtype='f4')
+    shadow_grad = np.ones((res, 4), dtype='f4')
     if tex_sampled is not None:
         shadow_grad[:, 0:3] = tex_sampled[:, 0:3]
         shadow_grad[:, 3] = tex_sampled[:, 3] * shadow_grad_a

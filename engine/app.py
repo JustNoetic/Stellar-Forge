@@ -834,61 +834,169 @@ class App:
         self.planet_textures = []
         self.planet_normal_textures = []
         self.planet_specular_textures = []
-        self.texture_slices = {} # name -> slice_idx
+        self.texture_slices = {} # name_lower -> 1-based slice_idx
+        self.ring_textures = {}  # name_lower -> PIL.Image (1024, 1)
+        self.ring_gl_textures = {} # name_lower -> ModernGL Texture
+
         textures_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'textures')
         if os.path.exists(textures_dir):
-            files = glob.glob(os.path.join(textures_dir, '*.png')) + glob.glob(os.path.join(textures_dir, '*.jpg'))
+            # Gather subdirectories + the root directory as candidates
+            target_dirs = []
+            for entry in os.listdir(textures_dir):
+                entry_path = os.path.join(textures_dir, entry)
+                if os.path.isdir(entry_path):
+                    target_dirs.append((entry, entry_path)) # (folder_name, path)
             
-            base_names = set()
-            for f in files:
-                name = os.path.splitext(os.path.basename(f))[0]
-                if name.endswith("_ring") or name.endswith("_rings") or name.endswith("_normal") or name.endswith("_specular"): continue
-                base_names.add(name)
-                
-            for name in sorted(list(base_names)):
-                try:
-                    # Diffuse
-                    d_path = os.path.join(textures_dir, name + ".png")
-                    if not os.path.exists(d_path): d_path = os.path.join(textures_dir, name + ".jpg")
-                    img = Image.open(d_path).convert('RGBA')
-                    img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
-                    self.planet_textures.append(img.tobytes())
+            # Also add root textures_dir as a special candidate to support files stored directly in it
+            target_dirs.append(("", textures_dir))
+
+            for folder_name, path in target_dirs:
+                if path == textures_dir:
+                    # Root folder backward compatibility
+                    files = glob.glob(os.path.join(textures_dir, '*.png')) + glob.glob(os.path.join(textures_dir, '*.jpg'))
+                    base_names = set()
+                    for f in files:
+                        name = os.path.splitext(os.path.basename(f))[0]
+                        if name.endswith("_ring") or name.endswith("_rings") or name.endswith("_normal") or name.endswith("_specular"):
+                            continue
+                        base_names.add(name)
                     
-                    # Normal
-                    n_path = os.path.join(textures_dir, name + "_normal.png")
-                    if not os.path.exists(n_path): n_path = os.path.join(textures_dir, name + "_normal.jpg")
-                    if os.path.exists(n_path):
-                        img_n = Image.open(n_path).convert('RGBA')
-                        img_n = img_n.resize((2048, 1024), Image.Resampling.LANCZOS)
-                        self.planet_normal_textures.append(img_n.tobytes())
-                    else:
-                        self.planet_normal_textures.append(Image.new('RGBA', (2048, 1024), (128, 128, 255, 255)).tobytes())
+                    for name in sorted(list(base_names)):
+                        name_lower = name.lower()
+                        if name_lower in self.texture_slices:
+                            continue # Already loaded from subdirectory
+                        try:
+                            # Diffuse
+                            d_path = os.path.join(textures_dir, name + ".png")
+                            if not os.path.exists(d_path): d_path = os.path.join(textures_dir, name + ".jpg")
+                            img = Image.open(d_path).convert('RGBA')
+                            img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
+                            self.planet_textures.append(img.tobytes())
+                            
+                            # Normal
+                            n_path = os.path.join(textures_dir, name + "_normal.png")
+                            if not os.path.exists(n_path): n_path = os.path.join(textures_dir, name + "_normal.jpg")
+                            if os.path.exists(n_path):
+                                img_n = Image.open(n_path).convert('RGBA')
+                                img_n = img_n.resize((2048, 1024), Image.Resampling.LANCZOS)
+                                self.planet_normal_textures.append(img_n.tobytes())
+                            else:
+                                self.planet_normal_textures.append(Image.new('RGBA', (2048, 1024), (128, 128, 255, 255)).tobytes())
+                                
+                            # Specular
+                            s_path = os.path.join(textures_dir, name + "_specular.png")
+                            if not os.path.exists(s_path): s_path = os.path.join(textures_dir, name + "_specular.jpg")
+                            if os.path.exists(s_path):
+                                img_s = Image.open(s_path).convert('L')
+                                img_s = img_s.resize((2048, 1024), Image.Resampling.LANCZOS)
+                                self.planet_specular_textures.append(img_s.tobytes())
+                            else:
+                                self.planet_specular_textures.append(Image.new('L', (2048, 1024), 0).tobytes())
+                                
+                            self.texture_slices[name_lower] = len(self.planet_textures)
+                        except Exception as e:
+                            print(f"Failed to load root planet textures for {name}: {e}")
+                            
+                    # Rings directly in root
+                    ring_files = glob.glob(os.path.join(textures_dir, '*_ring.png')) + glob.glob(os.path.join(textures_dir, '*_rings.png'))
+                    for f in ring_files:
+                        name = os.path.splitext(os.path.basename(f))[0].replace("_rings", "").replace("_ring", "")
+                        name_lower = name.lower()
+                        if name_lower in self.ring_textures:
+                            continue # Already loaded from subdirectory
+                        try:
+                            img = Image.open(f).convert('RGBA')
+                            self.ring_gl_textures[name_lower] = img
+                            
+                            img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
+                            self.ring_textures[name_lower] = img_ds
+                        except Exception as e:
+                            print(f"Failed to load root ring texture {f}: {e}")
+                else:
+                    # Subdirectory (e.g. Earth, Saturn)
+                    obj_name = folder_name
+                    name_lower = obj_name.lower()
+                    
+                    files = glob.glob(os.path.join(path, '*.png')) + glob.glob(os.path.join(path, '*.jpg'))
+                    
+                    d_path = None
+                    n_path = None
+                    s_path = None
+                    r_path = None
+                    
+                    # 1. Look for explicit matches first
+                    for f in files:
+                        fname = os.path.splitext(os.path.basename(f))[0]
+                        fname_lower = fname.lower()
                         
-                    # Specular
-                    s_path = os.path.join(textures_dir, name + "_specular.png")
-                    if not os.path.exists(s_path): s_path = os.path.join(textures_dir, name + "_specular.jpg")
-                    if os.path.exists(s_path):
-                        img_s = Image.open(s_path).convert('L')
-                        img_s = img_s.resize((2048, 1024), Image.Resampling.LANCZOS)
-                        self.planet_specular_textures.append(img_s.tobytes())
-                    else:
-                        self.planet_specular_textures.append(Image.new('L', (2048, 1024), 0).tobytes())
-                        
-                    self.texture_slices[name] = len(self.planet_textures)
-                except Exception as e:
-                    print(f"Failed to load planet textures for {name}: {e}")
-        
-        self.ring_textures = {}
-        if os.path.exists(textures_dir):
-            files = glob.glob(os.path.join(textures_dir, '*_ring.png')) + glob.glob(os.path.join(textures_dir, '*_rings.png'))
-            for f in files:
-                name = os.path.splitext(os.path.basename(f))[0].replace("_rings", "").replace("_ring", "")
-                try:
-                    img = Image.open(f).convert('RGBA')
-                    img = img.resize((1024, 1), Image.Resampling.LANCZOS)
-                    self.ring_textures[name] = img
-                except Exception as e:
-                    print(f"Failed to load ring texture {f}: {e}")
+                        if fname_lower == name_lower:
+                            d_path = f
+                        elif fname_lower == name_lower + "_normal" or fname_lower == "normal" or fname_lower == "diffuse_normal":
+                            n_path = f
+                        elif fname_lower == name_lower + "_specular" or fname_lower == "specular" or fname_lower == "diffuse_specular":
+                            s_path = f
+                        elif fname_lower in [name_lower + "_ring", name_lower + "_rings", "ring", "rings"]:
+                            r_path = f
+
+                    # 2. Fallbacks if explicit matches not found
+                    if not d_path:
+                        for f in files:
+                            fname = os.path.splitext(os.path.basename(f))[0]
+                            fname_lower = fname.lower()
+                            if fname_lower in ["diffuse", "albedo", "color", "map"]:
+                                d_path = f
+                                break
+                    if not n_path:
+                        for f in files:
+                            fname = os.path.splitext(os.path.basename(f))[0]
+                            fname_lower = fname.lower()
+                            if fname_lower in ["bump", "n", "nm"]:
+                                n_path = f
+                                break
+                    if not s_path:
+                        for f in files:
+                            fname = os.path.splitext(os.path.basename(f))[0]
+                            fname_lower = fname.lower()
+                            if fname_lower in ["spec", "s", "specular_map"]:
+                                s_path = f
+                                break
+                    
+                    if d_path or n_path or s_path:
+                        try:
+                            if d_path:
+                                img = Image.open(d_path).convert('RGBA')
+                            else:
+                                img = Image.new('RGBA', (2048, 1024), (255, 255, 255, 255))
+                            img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
+                            self.planet_textures.append(img.tobytes())
+                            
+                            if n_path:
+                                img_n = Image.open(n_path).convert('RGBA')
+                                img_n = img_n.resize((2048, 1024), Image.Resampling.LANCZOS)
+                                self.planet_normal_textures.append(img_n.tobytes())
+                            else:
+                                self.planet_normal_textures.append(Image.new('RGBA', (2048, 1024), (128, 128, 255, 255)).tobytes())
+                                
+                            if s_path:
+                                img_s = Image.open(s_path).convert('L')
+                                img_s = img_s.resize((2048, 1024), Image.Resampling.LANCZOS)
+                                self.planet_specular_textures.append(img_s.tobytes())
+                            else:
+                                self.planet_specular_textures.append(Image.new('L', (2048, 1024), 0).tobytes())
+                                
+                            self.texture_slices[name_lower] = len(self.planet_textures)
+                        except Exception as e:
+                            print(f"Failed to load planet textures in folder {path}: {e}")
+                            
+                    if r_path:
+                        try:
+                            img = Image.open(r_path).convert('RGBA')
+                            self.ring_gl_textures[name_lower] = img
+                            
+                            img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
+                            self.ring_textures[name_lower] = img_ds
+                        except Exception as e:
+                            print(f"Failed to load ring texture in folder {path}: {e}")
         
         if has_j2:
             oblate_indices = np.array([x[0] for x in oblate_physics_list], dtype=np.int32)
@@ -1152,6 +1260,8 @@ class App:
         prog_ephem_orbits = ctx.program(vertex_shader=ephem_orbit_vertex_shader, fragment_shader=ephem_orbit_fragment_shader)
     
         prog_rings = ctx.program(vertex_shader=ring_vertex_shader, fragment_shader=ring_fragment_shader)
+        if 'u_ring_texture' in prog_rings:
+            prog_rings['u_ring_texture'].value = 4
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
         
@@ -1252,23 +1362,55 @@ class App:
             bitangent = np.cross(pole_n, tangent)
             R_ring = np.column_stack([tangent, pole_n, bitangent])
             
-            for ring_seg in rings_data:
-                inner_r = ring_seg['inner'] * body_radius_au
-                outer_r = ring_seg['outer'] * body_radius_au
-                r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
-                r_opacity = ring_seg.get('opacity', 1.0)
-                r_scatter = ring_seg.get('scatter', 2.5)
-                r_asymmetry = ring_seg.get('asymmetry', 0.7)
-                r_backscatter = ring_seg.get('backscatter', -0.3)
+            b_name = bodies_data[body_idx]['name']
+            name_lower = b_name.lower()
+            if name_lower in self.ring_textures and len(rings_data) > 0:
+                # Combine all segments into 1 single layer spanning the innermost to outermost radii
+                min_inner = min(seg['inner'] for seg in rings_data)
+                max_outer = max(seg['outer'] for seg in rings_data)
+                inner_r = min_inner * body_radius_au
+                outer_r = max_outer * body_radius_au
                 
-                sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                b_name = bodies_data[body_idx]['name']
-                tex_sampled = None
-                if b_name in self.ring_textures:
-                    img_data = np.frombuffer(self.ring_textures[b_name].tobytes(), dtype=np.uint8).astype('f4') / 255.0
-                    img_data = img_data.reshape(1024, 4)
-                    tex_sampled = img_data[::4, :] # take 256 samples
-                shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled)
+                # Compute weighted average parameters (weight = opacity * width)
+                total_w = 0.0
+                sum_color = np.zeros(3)
+                sum_opacity = 0.0
+                sum_scatter = 0.0
+                sum_asymmetry = 0.0
+                sum_backscatter = 0.0
+                
+                for seg in rings_data:
+                    w = seg.get('opacity', 1.0) * (seg['outer'] - seg['inner'])
+                    if w < 1e-9:
+                        w = 1e-9
+                    total_w += w
+                    sum_color += np.array(hex_to_rgb(seg.get('color', '#ffffff'))) * w
+                    sum_opacity += seg.get('opacity', 1.0) * w
+                    sum_scatter += seg.get('scatter', 2.5) * w
+                    sum_asymmetry += seg.get('asymmetry', 0.7) * w
+                    sum_backscatter += seg.get('backscatter', -0.3) * w
+                    
+                if total_w > 0.0:
+                    r_color = tuple(sum_color / total_w)
+                    r_opacity = sum_opacity / total_w
+                    r_scatter = sum_scatter / total_w
+                    r_asymmetry = sum_asymmetry / total_w
+                    r_backscatter = sum_backscatter / total_w
+                else:
+                    first = rings_data[0]
+                    r_color = hex_to_rgb(first.get('color', '#ffffff'))
+                    r_opacity = first.get('opacity', 1.0)
+                    r_scatter = first.get('scatter', 2.5)
+                    r_asymmetry = first.get('asymmetry', 0.7)
+                    r_backscatter = first.get('backscatter', -0.3)
+                
+                # Sample the texture
+                img_data = np.frombuffer(self.ring_textures[name_lower].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                img_data = img_data.reshape(4096, 4)
+                tex_sampled = img_data # take 4096 samples
+                
+                # Generate shadow gradient from texture (no procedural gradient)
+                shadow_grad = generate_ring_shadow_grad(sorted_gradient=[], tex_sampled=tex_sampled)
                 
                 ring_precomputed.append({
                     'body_idx': body_idx,
@@ -1281,18 +1423,47 @@ class App:
                     'backscatter': r_backscatter,
                     'shadow_grad': shadow_grad,
                     'raw_color': r_color,
-                    'gradient': sorted_gradient,
+                    'gradient': [],
                     'row_idx': len(ring_precomputed),
                 })
+            else:
+                # Procedural or non-textured rings (original logic)
+                for ring_seg in rings_data:
+                    inner_r = ring_seg['inner'] * body_radius_au
+                    outer_r = ring_seg['outer'] * body_radius_au
+                    r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
+                    r_opacity = ring_seg.get('opacity', 1.0)
+                    r_scatter = ring_seg.get('scatter', 2.5)
+                    r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                    r_backscatter = ring_seg.get('backscatter', -0.3)
+                    
+                    sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
+                    
+                    shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                    
+                    ring_precomputed.append({
+                        'body_idx': body_idx,
+                        'pole': pole_n.astype('f4'),
+                        'inner_r': inner_r,
+                        'outer_r': outer_r,
+                        'opacity': r_opacity,
+                        'scatter': r_scatter,
+                        'asymmetry': r_asymmetry,
+                        'backscatter': r_backscatter,
+                        'shadow_grad': shadow_grad,
+                        'raw_color': r_color,
+                        'gradient': sorted_gradient,
+                        'row_idx': len(ring_precomputed),
+                    })
     
         ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
-        ring_gradient_data = np.zeros((16, 256, 4), dtype='f4')
+        ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
         for j, ring in enumerate(ring_precomputed):
             if j >= 16: break
             ring_gradient_data[j, :, :] = ring['shadow_grad']
         
-        ring_gradient_tex = ctx.texture((256, 16), 4, ring_gradient_data.tobytes(), dtype='f4')
-        ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.NEAREST)
+        ring_gradient_tex = ctx.texture((4096, 16), 4, ring_gradient_data.tobytes(), dtype='f4')
+        ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
     
@@ -1463,8 +1634,9 @@ class App:
         for i, b in enumerate(bodies_data):
             if b.get('type') == 'Star':
                 is_star_arr[i] = 1.0
-            if b['name'] in self.texture_slices:
-                tex_idx_arr[i] = float(self.texture_slices[b['name']])
+            name_lower = b['name'].lower()
+            if name_lower in self.texture_slices:
+                tex_idx_arr[i] = float(self.texture_slices[name_lower])
             
             # Default to 24 hours if undefined, convert to seconds
             r_hours = b.get('rotation_period', 24.0)
@@ -1561,6 +1733,18 @@ class App:
             self.u_planet_specular_textures_obj.use(location=5) # Use texture unit 5
             if 'u_planet_specular_textures' in prog_spheres:
                 prog_spheres['u_planet_specular_textures'].value = 5
+
+        # Convert ring PIL images into ModernGL textures
+        for name_lower, img in list(self.ring_gl_textures.items()):
+            try:
+                tex = ctx.texture(img.size, 4, img.tobytes())
+                tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+                tex.repeat_x = False
+                tex.repeat_y = False
+                tex.build_mipmaps()
+                self.ring_gl_textures[name_lower] = tex
+            except Exception as e:
+                print(f"Failed to compile OpenGL texture for ring {name_lower}: {e}")
 
         n_orbits = 0
         n_orbits_hi = 0
@@ -1794,7 +1978,7 @@ class App:
     
                 ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
                 # Rebuild ring render groups
-                ring_gradient_data_sw = np.zeros((16, 256), dtype='f4')
+                ring_gradient_data_sw = np.zeros((16, 4096, 4), dtype='f4')
                 for j, ring in enumerate(ring_precomputed):
                     if j >= 16: break
                     ring_gradient_data_sw[j, :] = ring['shadow_grad']
@@ -3028,9 +3212,7 @@ class App:
             ctx.disable(moderngl.BLEND)
             ctx.disable(moderngl.CULL_FACE)
 
-            if self.hdr_msaa_fbo:
-                ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
-                self.hdr_resolve_fbo.use()
+
     
     
             ctx.enable(moderngl.BLEND)
@@ -3155,7 +3337,7 @@ class App:
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, 0x88F9) # GL_SRC1_COLOR for Dual-Source Blending
+                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                 ctx.depth_func = '<='
                 ctx.enable(moderngl.CULL_FACE)
                 ctx.cull_face = 'front'
@@ -3403,7 +3585,7 @@ class App:
                         ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                         ctx.enable(moderngl.BLEND)
                         ctx.enable(moderngl.CULL_FACE)
-                        ctx.blend_func = (moderngl.ONE, 0x88F9)
+                        ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                         
                         self.sky_view_lut_tex_color.use(location=6)
                         self.sky_view_lut_tex_trans.use(location=7)
@@ -3482,6 +3664,13 @@ class App:
                         
                         body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
                         prog_rings['u_num_ring_planes'].value = len(body_rings)
+                        b_name = bodies_data[bi]['name']
+                        name_lower = b_name.lower()
+                        is_textured = name_lower in self.ring_textures
+                        if 'u_is_textured' in prog_rings:
+                            prog_rings['u_is_textured'].value = is_textured
+                        if is_textured and name_lower in self.ring_gl_textures:
+                            self.ring_gl_textures[name_lower].use(location=4)
                         for idx, r in enumerate(body_rings):
                             if idx >= 16: break
                             prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
@@ -3542,6 +3731,13 @@ class App:
                         u_ring_caster_mask_hi_uni.value = 0
                         body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
                         prog_rings['u_num_ring_planes'].value = len(body_rings)
+                        b_name = self.bodies_data_cmp[bi]['name']
+                        name_lower = b_name.lower()
+                        is_textured = name_lower in self.ring_textures
+                        if 'u_is_textured' in prog_rings:
+                            prog_rings['u_is_textured'].value = is_textured
+                        if is_textured and name_lower in self.ring_gl_textures:
+                            self.ring_gl_textures[name_lower].use(location=4)
                         for idx, r in enumerate(body_rings):
                             if idx >= 16: break
                             prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
@@ -3605,6 +3801,10 @@ class App:
     
             # --- Pass 2: Atmosphere in front of rings ---
             render_atmosphere_pass(2)
+            
+            if self.hdr_msaa_fbo:
+                ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
+                self.hdr_resolve_fbo.use()
             
 
             force_layout = getattr(self, "_last_fb_width", 0) != self.fb_width or getattr(self, "_last_fb_height", 0) != self.fb_height
@@ -3874,6 +4074,7 @@ class App:
                     changed_rs, self.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", self.camera.get("ringshine_enabled", True))
                     if changed_rs:
                         settings_changed = True
+
                     
                     if settings_changed:
                         self.save_settings()
