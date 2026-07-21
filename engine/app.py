@@ -291,6 +291,56 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     
     return props, trans, thick
 
+
+def _build_tex_idx_arr(bodies_data, texture_slices):
+    """Build the per-body texture-array slice index (1-based; 0 = no texture)."""
+    n = len(bodies_data)
+    arr = np.zeros(n, dtype='f4')
+    for i, b in enumerate(bodies_data):
+        name_lower = b['name'].lower()
+        if name_lower in texture_slices:
+            arr[i] = float(texture_slices[name_lower])
+    return arr
+
+
+def _build_rot_period_arr(bodies_data):
+    """Build per-body rotation period in seconds.
+
+    If a body has an explicit ``rotation_period`` (hours), use it. Otherwise apply
+    the tidal-locking criterion used by the Body Inspector: when the body's
+    semi-major axis is inside the tidal-lock radius estimated from the
+    parent/body mass ratio and body radius, set the rotation period equal to the
+    orbital period (synchronous rotation). Falls back to 24h otherwise.
+    """
+    n = len(bodies_data)
+    # name -> mass (M_sun) for parent lookup
+    mass_by_name = {}
+    for b in bodies_data:
+        mass_by_name[b.get('name')] = float(b.get('m', 0.0))
+    arr = np.zeros(n, dtype='f4')
+    for i, b in enumerate(bodies_data):
+        r_hours = b.get('rotation_period', None)
+        if r_hours is None or r_hours == 0.0:
+            # Try tidal locking: needs a parent, a positive mass and a radius.
+            parent_name = b.get('parent', b.get('parentId'))
+            body_m = float(b.get('m', 0.0))
+            r_rsun = float(b.get('r', 0.0))  # radius in solar radii
+            a_val = float(b.get('a', 0.0))
+            parent_m = mass_by_name.get(parent_name, 0.0) if parent_name else 0.0
+            if parent_m > 0.0 and body_m > 0.0 and r_rsun > 0.0 and a_val > 0.0:
+                r_km = r_rsun * SOLAR_RADIUS_KM
+                r_tid = 0.00084 * ((parent_m ** 2 / body_m) ** (1.0 / 6.0)) * math.sqrt(r_km)
+                if a_val < r_tid:
+                    # Synchronous rotation: rotation period == orbital period.
+                    total_m = parent_m + body_m
+                    p_years = math.sqrt(a_val ** 3 / total_m) if total_m > 0.0 else 0.0
+                    r_hours = p_years * 365.25 * 24.0
+            if r_hours is None or r_hours == 0.0:
+                r_hours = 24.0  # fallback
+        arr[i] = r_hours * 3600.0
+    return arr
+
+
 @njit
 def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled):
     N = len(pos)
@@ -474,6 +524,16 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             
     return planetshine_dirs, planetshine_colors
 
+def halton(index, base):
+    result = 0.0
+    f = 1.0 / base
+    i = index
+    while i > 0:
+        result += f * (i % base)
+        i = i // base
+        f = f / base
+    return result
+
 class App:
     def __init__(self):
         self.window_width, self.window_height = 1280, 720
@@ -520,13 +580,11 @@ class App:
             "bloom_intensity": 0.05,
             "bloom_threshold": 1.0,
             "msaa_samples": 4,
-            "sky_view_mode": 0,
-            "sky_view_hybrid_dist": 1.1,
-            "sky_view_quality": 2,
-            "sky_view_custom_res": (1024, 512),
             "inspector_frame": 0,
+            "shadow_caster_budget": 32,
+            "taa_enabled": True,
+            "atmo_render_scale": 0.5,
         }
-        self.sky_view_cache = {}
         
         # Post-Processing FBOs
         self.hdr_msaa_fbo = None
@@ -536,6 +594,25 @@ class App:
         self.bloom_texs = []
         self.last_fb_size = (0, 0)
         self.last_msaa_samples = -1
+        
+        # Atmosphere low-res rendering resources
+        self.atmo_lowres_tex = None
+        self.atmo_lowres_fbo = None
+        self.prog_atmo_composite = None
+        self.quad_vao_atmo_comp = None
+        self.last_atmo_res = (0, 0)
+        
+        # TAA state and resources
+        self.taa_history_tex = None
+        self.taa_output_tex = None
+        self.taa_output_fbo = None
+        self.taa_history_fbo = None
+        self.depth_texture = None
+        self.prog_taa = None
+        self.quad_vao_taa = None
+        self.prev_vp = None
+        self.prev_cam_origin = None
+        self.taa_frame_index = 0
         
         self.quad_vao_down = None
         self.quad_vao_up = None
@@ -577,10 +654,7 @@ class App:
                 with open(settings_path, 'r') as f:
                     saved = json.load(f)
                 for k, v in saved.items():
-                    if k == "sky_view_custom_res" and isinstance(v, list):
-                        self.camera[k] = tuple(v)
-                    else:
-                        self.camera[k] = v
+                    self.camera[k] = v
         except Exception as e:
             print(f"Failed to load settings: {e}")
 
@@ -594,10 +668,6 @@ class App:
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
-                "sky_view_mode": self.camera.get("sky_view_mode", 0),
-                "sky_view_hybrid_dist": self.camera.get("sky_view_hybrid_dist", 1.1),
-                "sky_view_quality": self.camera.get("sky_view_quality", 2),
-                "sky_view_custom_res": list(self.camera.get("sky_view_custom_res", (1024, 512))),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
@@ -611,6 +681,9 @@ class App:
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
+                "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
+                "taa_enabled": self.camera.get("taa_enabled", True),
+                "atmo_render_scale": self.camera.get("atmo_render_scale", 0.5),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -1268,6 +1341,8 @@ class App:
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
         self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
+        self.prog_taa = ctx.program(vertex_shader=taa_resolve_shader_vs, fragment_shader=taa_resolve_shader_fs)
+        self.prog_atmo_composite = ctx.program(vertex_shader=atmo_composite_shader_vs, fragment_shader=atmo_composite_shader_fs)
         
         quad_vertices = np.array([
             -1.0, -1.0,
@@ -1279,6 +1354,8 @@ class App:
         self.quad_vao_down = ctx.vertex_array(self.prog_bloom_down, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_up = ctx.vertex_array(self.prog_bloom_up, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_comp = ctx.vertex_array(self.prog_composite, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_taa = ctx.vertex_array(self.prog_taa, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_atmo_comp = ctx.vertex_array(self.prog_atmo_composite, [(quad_vbo, '2f', 'in_position')])
         
         # Compile Habitable Zone Shader
         self.prog_hz = ctx.program(vertex_shader=hz_vertex_shader, fragment_shader=hz_fragment_shader)
@@ -1329,20 +1406,9 @@ class App:
         
         self.prog_atmo_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=atmo_lut_fragment_shader)
         self.prog_multi_scatter_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=multi_scatter_lut_fragment_shader)
-        self.prog_sky_view_lut_pass = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=sky_view_lut_pass_fragment_shader)
         lut_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
         self.lut_vao = ctx.vertex_array(self.prog_atmo_lut, [(lut_vbo, '2f', 'in_position')])
         self.multi_scatter_vao = ctx.vertex_array(self.prog_multi_scatter_lut, [(lut_vbo, '2f', 'in_position')])
-        self.sky_view_vao = ctx.vertex_array(self.prog_sky_view_lut_pass, [(lut_vbo, '2f', 'in_position')])
-        
-        q_idx_init = self.camera.get("sky_view_quality", 2)
-        q_dims_init = [(256, 128), (512, 256), (1024, 512), (2048, 1024), (4096, 2048)]
-        init_w, init_h = self.camera.get("sky_view_custom_res", (1024, 512)) if q_idx_init == 5 else q_dims_init[min(4, max(0, q_idx_init))]
-        self.sky_view_lut_tex_color = ctx.texture((init_w, init_h), 4, dtype='f2')
-        self.sky_view_lut_tex_trans = ctx.texture((init_w, init_h), 4, dtype='f2')
-        self.sky_view_lut_tex_color.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.sky_view_lut_tex_trans.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.sky_view_lut_fbo = ctx.framebuffer(color_attachments=[self.sky_view_lut_tex_color, self.sky_view_lut_tex_trans])
         
         if 'u_transmittance_lut' in prog_atmo: prog_atmo['u_transmittance_lut'].value = 1
         if 'u_multi_scatter_lut' in prog_atmo: prog_atmo['u_multi_scatter_lut'].value = 3
@@ -1629,22 +1695,20 @@ class App:
     
         visual_arr = np.array(visual_data, dtype='f4')
         is_star_arr = np.zeros(num_bodies, dtype='f4')
-        tex_idx_arr = np.zeros(num_bodies, dtype='f4')
-        rot_period_arr = np.zeros(num_bodies, dtype='f4')
         for i, b in enumerate(bodies_data):
             if b.get('type') == 'Star':
                 is_star_arr[i] = 1.0
-            name_lower = b['name'].lower()
-            if name_lower in self.texture_slices:
-                tex_idx_arr[i] = float(self.texture_slices[name_lower])
-            
-            # Default to 24 hours if undefined, convert to seconds
-            r_hours = b.get('rotation_period', 24.0)
-            if r_hours == 0.0: r_hours = 24.0 # Prevent div zero
-            rot_period_arr[i] = r_hours * 3600.0
-            
+        tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
+        rot_period_arr = _build_rot_period_arr(bodies_data)
+        # Store as instance attrs so they get rebuilt on system switch.
+        self.tex_idx_arr = tex_idx_arr
+        self.rot_period_arr = rot_period_arr
+        # Build matching arrays for the comparison system.
+        self.tex_idx_arr_cmp = _build_tex_idx_arr(bodies_data_cmp, self.texture_slices)
+        self.rot_period_arr_cmp = _build_rot_period_arr(bodies_data_cmp)
+        
         non_star_mask = is_star_arr == 0.0
-        non_star_indices = np.where(non_star_mask)[0][:64]
+        non_star_indices = np.where(non_star_mask)[0]
         n_casters_fixed = len(non_star_indices)
     
         inst_data_lo = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
@@ -1709,6 +1773,8 @@ class App:
                 (2048, 1024, len(self.planet_textures)), 4, tex_data, dtype='f1'
             )
             self.u_planet_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            # Wrap along longitude (u wraps 0->1 around the sphere); clamp latitude.
+            self.u_planet_textures_obj.repeat_x = True
             self.u_planet_textures_obj.build_mipmaps()
             self.u_planet_textures_obj.use(location=3) # Use texture unit 3
             if 'u_planet_textures' in prog_spheres:
@@ -1719,6 +1785,7 @@ class App:
                 (2048, 1024, len(self.planet_normal_textures)), 4, normal_tex_data, dtype='f1'
             )
             self.u_planet_normal_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            self.u_planet_normal_textures_obj.repeat_x = True
             self.u_planet_normal_textures_obj.build_mipmaps()
             self.u_planet_normal_textures_obj.use(location=4) # Use texture unit 4
             if 'u_planet_normal_textures' in prog_spheres:
@@ -1729,6 +1796,7 @@ class App:
                 (2048, 1024, len(self.planet_specular_textures)), 1, spec_tex_data, dtype='f1'
             )
             self.u_planet_specular_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            self.u_planet_specular_textures_obj.repeat_x = True
             self.u_planet_specular_textures_obj.build_mipmaps()
             self.u_planet_specular_textures_obj.use(location=5) # Use texture unit 5
             if 'u_planet_specular_textures' in prog_spheres:
@@ -1840,10 +1908,9 @@ class App:
             atmo['lut_mass'] = mass_sm
             
         print("[Render Loop] Entering main render loop")
-        frame_counter = 0
-        last_sky_view_body_key = None
+        self.frame_counter = 0
         while not glfw.window_should_close(window):
-            frame_counter += 1
+            self.frame_counter += 1
             # ── System Switch — render-side rebuild ──
             with self.shared_state["lock"]:
                 switch_complete = self.shared_state.get("system_switch_complete", False)
@@ -1900,8 +1967,11 @@ class App:
                 for i, b in enumerate(bodies_data):
                     if b.get('type') == 'Star':
                         is_star_arr[i] = 1.0
+                # Rebuild texture/rotation arrays for the new system bodies.
+                self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
+                self.rot_period_arr = _build_rot_period_arr(bodies_data)
                 non_star_mask = is_star_arr == 0.0
-                non_star_indices = np.where(non_star_mask)[0][:64]
+                non_star_indices = np.where(non_star_mask)[0]
                 n_casters_fixed = len(non_star_indices)
                 star_radius_au = visual_data[star_idx][3] if star_idx < len(visual_data) else SOLAR_RADII_TO_AU
     
@@ -2053,6 +2123,9 @@ class App:
                 for i, b in enumerate(self.bodies_data_cmp):
                     if b.get('type') == 'Star':
                         self.is_star_arr_cmp[i] = 1.0
+                # Rebuild comparison texture/rotation arrays for the new system bodies.
+                self.tex_idx_arr_cmp = _build_tex_idx_arr(self.bodies_data_cmp, self.texture_slices)
+                self.rot_period_arr_cmp = _build_rot_period_arr(self.bodies_data_cmp)
                 
                 last_orbit_pos_snap_cmp = None
                 last_comparison_offset_au = None
@@ -2200,8 +2273,11 @@ class App:
                             inst_data_lo = np.vstack([inst_data_lo, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                             inst_data_hi = np.vstack([inst_data_hi, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                             focused_mask = np.append(focused_mask, False)
+                            # Grow texture/rotation arrays for the new body.
+                            self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
+                            self.rot_period_arr = _build_rot_period_arr(bodies_data)
                             
-                            non_star_indices = np.where(is_star_arr == 0.0)[0][:64]
+                            non_star_indices = np.where(is_star_arr == 0.0)[0]
                             n_casters_fixed = len(non_star_indices)
     
                         elif op["action"] == "DELETE":
@@ -2238,13 +2314,16 @@ class App:
                             inst_data_lo = np.delete(inst_data_lo, idx, axis=0)
                             inst_data_hi = np.delete(inst_data_hi, idx, axis=0)
                             focused_mask = np.delete(focused_mask, idx)
+                            # Keep texture/rotation arrays in sync after deletion.
+                            self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
+                            self.rot_period_arr = _build_rot_period_arr(bodies_data)
                             
                             if star_idx == idx:
                                 star_idx = 0
                             elif star_idx > idx:
                                 star_idx -= 1
                                 
-                            non_star_indices = np.where(is_star_arr == 0.0)[0][:64]
+                            non_star_indices = np.where(is_star_arr == 0.0)[0]
                             n_casters_fixed = len(non_star_indices)
                             
                             if self.camera["tracking_idx"] == idx:
@@ -2327,7 +2406,7 @@ class App:
                                 min_px = 3.0 if op["type"] == "Star" else (1.0 if op["type"] == "Moon" else 2.0)
                                 visual_arr[idx][4] = min_px
                                 visual_data[idx][4] = min_px
-                                non_star_indices = np.where(is_star_arr == 0.0)[0][:64]
+                                non_star_indices = np.where(is_star_arr == 0.0)[0]
                                 n_casters_fixed = len(non_star_indices)
     
                     sys_mgr.save_system_data(active_system_name, bodies_data)
@@ -2351,7 +2430,8 @@ class App:
                 tl_times = self.shared_state["timeline_times"]
                 tl_pos_buf = self.shared_state["timeline_pos"]
                 tl_vel_buf = self.shared_state["timeline_vel"]
-    
+
+            cmp_sim_t = 0.0
             if self.comparison_enabled:
                 self.time_ctrl_cmp["paused"] = self.time_ctrl["paused"]
                 self.time_ctrl_cmp["multiplier"] = self.time_ctrl["multiplier"]
@@ -2371,6 +2451,7 @@ class App:
                     if len(self.tree_indices_snap_cmp) == len(self.shared_state_cmp["tree_indices"]):
                         np.copyto(self.tree_indices_snap_cmp, self.shared_state_cmp["tree_indices"])
                         np.copyto(self.tree_depths_snap_cmp, self.shared_state_cmp["tree_depths"])
+                    cmp_sim_t = self.shared_state_cmp["t"]
 
             now = time.perf_counter()
             dt_render = min(now - last_render_time, 0.1)
@@ -2385,19 +2466,30 @@ class App:
                 imgui.end_frame()
                 continue
             
-            msaa_samples = self.camera.get("msaa_samples", 4)
+            taa_enabled = self.camera.get("taa_enabled", True)
+            msaa_samples = 0 if taa_enabled else self.camera.get("msaa_samples", 4)
             if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples:
                 self.last_fb_size = (self.fb_width, self.fb_height)
                 self.last_msaa_samples = msaa_samples
                 
                 # Release old
-                if self.hdr_msaa_fbo: self.hdr_msaa_fbo.release()
-                if self.hdr_resolve_fbo: self.hdr_resolve_fbo.release()
-                if self.hdr_resolve_tex: self.hdr_resolve_tex.release()
+                if self.hdr_msaa_fbo: self.hdr_msaa_fbo.release(); self.hdr_msaa_fbo = None
+                if self.hdr_resolve_fbo: self.hdr_resolve_fbo.release(); self.hdr_resolve_fbo = None
+                if self.hdr_resolve_tex: self.hdr_resolve_tex.release(); self.hdr_resolve_tex = None
+                if self.taa_history_tex: self.taa_history_tex.release(); self.taa_history_tex = None
+                if self.taa_output_tex: self.taa_output_tex.release(); self.taa_output_tex = None
+                if self.taa_output_fbo: self.taa_output_fbo.release(); self.taa_output_fbo = None
+                if self.taa_history_fbo: self.taa_history_fbo.release(); self.taa_history_fbo = None
+                if self.depth_texture: self.depth_texture.release(); self.depth_texture = None
+                self.prev_vp = None
+                self.prev_cam_origin = None
                 for fbo in self.bloom_fbos: fbo.release()
                 for tex in self.bloom_texs: tex.release()
                 self.bloom_fbos = []
                 self.bloom_texs = []
+                if self.atmo_lowres_tex: self.atmo_lowres_tex.release(); self.atmo_lowres_tex = None
+                if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
+                self.last_atmo_res = (0, 0)
                 
                 # Rebuild
                 self.hdr_resolve_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
@@ -2405,16 +2497,31 @@ class App:
                 self.hdr_resolve_tex.repeat_x = False
                 self.hdr_resolve_tex.repeat_y = False
                 
+                self.depth_texture = ctx.depth_texture((self.fb_width, self.fb_height))
+                self.depth_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                self.depth_texture.repeat_x = False
+                self.depth_texture.repeat_y = False
+                
+                self.taa_history_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                self.taa_history_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.taa_history_tex.repeat_x = False
+                self.taa_history_tex.repeat_y = False
+                
+                self.taa_output_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                self.taa_output_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.taa_output_tex.repeat_x = False
+                self.taa_output_tex.repeat_y = False
+                self.taa_output_fbo = ctx.framebuffer(color_attachments=[self.taa_output_tex])
+                self.taa_history_fbo = ctx.framebuffer(color_attachments=[self.taa_history_tex], depth_attachment=self.depth_texture)
+                
                 if msaa_samples > 0:
                     msaa_color = ctx.renderbuffer((self.fb_width, self.fb_height), components=4, samples=msaa_samples, dtype='f4')
                     msaa_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height), samples=msaa_samples)
                     self.hdr_msaa_fbo = ctx.framebuffer(color_attachments=[msaa_color], depth_attachment=msaa_depth)
-                    resolve_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height))
-                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=resolve_depth)
+                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
                 else:
                     self.hdr_msaa_fbo = None
-                    resolve_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height))
-                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=resolve_depth)
+                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
                 
                 # Bloom chain (5 levels)
                 bw, bh = self.fb_width // 2, self.fb_height // 2
@@ -2429,6 +2536,20 @@ class App:
                     self.bloom_fbos.append(ctx.framebuffer(color_attachments=[btex]))
                     bw //= 2
                     bh //= 2
+
+            atmo_scale = self.camera.get("atmo_render_scale", 0.5)
+            target_atmo_w = max(1, int(self.fb_width * atmo_scale))
+            target_atmo_h = max(1, int(self.fb_height * atmo_scale))
+            if self.last_atmo_res != (target_atmo_w, target_atmo_h):
+                if self.atmo_lowres_tex: self.atmo_lowres_tex.release(); self.atmo_lowres_tex = None
+                if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
+                
+                self.atmo_lowres_tex = ctx.texture((target_atmo_w, target_atmo_h), 4, dtype='f4')
+                self.atmo_lowres_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.atmo_lowres_tex.repeat_x = False
+                self.atmo_lowres_tex.repeat_y = False
+                self.atmo_lowres_fbo = ctx.framebuffer(color_attachments=[self.atmo_lowres_tex])
+                self.last_atmo_res = (target_atmo_w, target_atmo_h)
 
             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
             if self.hdr_msaa_fbo:
@@ -2630,6 +2751,15 @@ class App:
             depth_C = 1.0 / max(near, 1e-13)
             aspect_ratio = self.fb_width / max(self.fb_height, 1)
             projection = matrix44.create_perspective_projection_matrix(self.camera["fov"], aspect_ratio, near, far, dtype='f4')
+            self.unjittered_projection = projection.copy()
+            if self.camera.get("taa_enabled", True):
+                self.taa_frame_index = (self.taa_frame_index + 1) % 8
+                hx = halton(self.taa_frame_index, 2)
+                hy = halton(self.taa_frame_index, 3)
+                jitter_x = 2.0 * (hx - 0.5) / self.fb_width
+                jitter_y = 2.0 * (hy - 0.5) / self.fb_height
+                projection[2, 0] -= jitter_x
+                projection[2, 1] -= jitter_y
     
             n_ring_planes = 0
             ring_centers_buf[:] = 0
@@ -2651,8 +2781,17 @@ class App:
             
             ring_coplanar_mask_buf[:] = compute_ring_coplanar_masks(n_ring_planes, ring_centers_buf, ring_normals_buf)
     
-            caster_indices = non_star_indices
-            n_casters_fixed = min(len(caster_indices), 64)
+            # Dynamic Caster Selection: Sort non-star bodies by camera-relative angular size
+            if len(non_star_indices) > 0:
+                dists_to_cam = np.sqrt(np.sum(pos_rel_all[non_star_indices] * pos_rel_all[non_star_indices], axis=1))
+                visual_scores = body_radii[non_star_indices] / np.maximum(dists_to_cam, 1e-6)
+                sorted_sub_indices = np.argsort(visual_scores)[::-1]
+                caster_indices = non_star_indices[sorted_sub_indices]
+            else:
+                caster_indices = non_star_indices
+                
+            caster_budget = self.camera.get("shadow_caster_budget", 32)
+            n_casters_fixed = min(len(caster_indices), caster_budget)
             
             compute_ring_culling(
                 pos_rel_all, body_radii, star_idx,
@@ -2736,8 +2875,8 @@ class App:
                 all_instances[:num_bodies, 13:16] = visual_arr[:, 9:12]
                 all_instances[:num_bodies, 19] = visual_arr[:, 12]
                 all_instances[:num_bodies, 23] = visual_arr[:, 13]
-                all_instances[:num_bodies, 24] = tex_idx_arr
-                all_instances[:num_bodies, 25] = ((self.shared_state["t"] * 31557600.0) / rot_period_arr) * (2.0 * math.pi)
+                all_instances[:num_bodies, 24] = self.tex_idx_arr[:num_bodies]
+                all_instances[:num_bodies, 25] = ((self.shared_state["t"] * 31557600.0) / self.rot_period_arr[:num_bodies]) * (2.0 * math.pi)
             
             if self.comparison_enabled:
                 cmp_pos_rel = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -2750,6 +2889,9 @@ class App:
                     all_instances[num_bodies:, 13:16] = self.visual_arr_cmp[:, 9:12]
                     all_instances[num_bodies:, 19] = self.visual_arr_cmp[:, 12]
                     all_instances[num_bodies:, 23] = self.visual_arr_cmp[:, 13]
+                # Texture slice index + spin angle for comparison bodies (independent clock).
+                all_instances[num_bodies:, 24] = self.tex_idx_arr_cmp[:self.num_bodies_cmp]
+                all_instances[num_bodies:, 25] = ((cmp_sim_t * 31557600.0) / self.rot_period_arr_cmp[:self.num_bodies_cmp]) * (2.0 * math.pi)
             
             # Precalculate planetshine bounce light direction & color on CPU using Numba
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
@@ -3148,7 +3290,7 @@ class App:
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, self.prog_sky_view_lut_pass):
+            for prog in (prog_spheres, prog_rings, prog_atmo):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -3191,9 +3333,6 @@ class App:
                         mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
                         if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
                             build_atmo_lut(atmo, mass_sm_curr, is_cmp)
-                            sv_key = (bi_curr, is_cmp)
-                            if sv_key in self.sky_view_cache:
-                                del self.sky_view_cache[sv_key]
 
             
             ctx.enable(moderngl.DEPTH_TEST)
@@ -3256,25 +3395,26 @@ class App:
 
                     ctx.memory_barrier()
 
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    
-                    if n_orbits_hi > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 4000
-                        prog_gpu_orbits['u_base_instance'].value = 0
-                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
+                    if not self.camera.get("taa_enabled", True):
+                        prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
                         
-                    if n_orbits_med > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 500
-                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
-                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
-                        
-                    if n_orbits_low > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 100
-                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
-                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
+                        if n_orbits_hi > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 4000
+                            prog_gpu_orbits['u_base_instance'].value = 0
+                            prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
+                            
+                        if n_orbits_med > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 500
+                            prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
+                            prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
+                            
+                        if n_orbits_low > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 100
+                            prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                            prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
                 if self.comparison_enabled and self.n_orbits_cmp > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -3312,28 +3452,28 @@ class App:
                         
                     ctx.memory_barrier()
 
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    
-                    if self.n_orbits_hi_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 4000
-                        prog_gpu_orbits['u_base_instance'].value = 0
-                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
+                    if not self.camera.get("taa_enabled", True):
+                        prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
                         
-                    if self.n_orbits_med_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 500
-                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
-                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
-                        
-                    if self.n_orbits_low_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 100
-                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
-                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
+                        if self.n_orbits_hi_cmp > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 4000
+                            prog_gpu_orbits['u_base_instance'].value = 0
+                            prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
+                            
+                        if self.n_orbits_med_cmp > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 500
+                            prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
+                            prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
+                            
+                        if self.n_orbits_low_cmp > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 100
+                            prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
+                            prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
 
             def render_atmosphere_pass(clip_mode):
-                nonlocal last_sky_view_body_key
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
@@ -3502,7 +3642,7 @@ class App:
                     self.atmo_staging_int_view[28] = n_active
                     self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
                     self.atmo_staging_int_view[30] = body_idx_in_unified
-                    self.atmo_staging[31] = 0.0
+                    self.atmo_staging[31] = float(self.frame_counter % 8)
                     self.atmo_staging[32:64] = active_casters_buf.ravel()
                     self.atmo_staging[64:96] = active_poles_obl_buf.ravel()
                     self.atmo_staging[96:104] = active_caster_r_minor_buf
@@ -3512,86 +3652,6 @@ class App:
                     # Single buffer upload per atmosphere body
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
                     
-                    # Generate Sky View LUT for this specific planet
-                    sv_mode = self.camera.get("sky_view_mode", 0)
-                    if sv_mode == 0:
-                        dist_mult = self.camera.get("sky_view_hybrid_dist", 1.1)
-                        use_sky_view = (dist_to_body < atmo['atmo_radius_au'] * dist_mult)
-                    elif sv_mode == 1:
-                        use_sky_view = False
-                    else:
-                        use_sky_view = True
-                    if 'u_use_sky_view_lut' in prog_atmo:
-                        prog_atmo['u_use_sky_view_lut'].value = use_sky_view
-                        
-                    if use_sky_view:
-                        body_key = (bi, is_cmp)
-                        
-                        # Calculate relative camera position and relative sun position in AU
-                        pos_star = cmp_pos_rel[self.star_idx_cmp] if is_cmp else pos_rel_all[star_idx]
-                        rel_cam_pos = cam_pos - body_pos_rel
-                        rel_sun_pos = pos_star - body_pos_rel
-                        
-                        cam_alt = np.linalg.norm(rel_cam_pos)
-                        sun_dist = np.linalg.norm(rel_sun_pos)
-                        
-                        if cam_alt > 1e-9 and sun_dist > 1e-9:
-                            dot_prod = np.dot(rel_cam_pos, rel_sun_pos) / (cam_alt * sun_dist)
-                            sun_angle = np.arccos(np.clip(dot_prod, -1.0, 1.0))
-                        else:
-                            sun_angle = 0.0
-                            
-                        # Check threshold to skip rendering if camera altitude and solar zenith angle are stable
-                        need_update = True
-                        if last_sky_view_body_key == body_key and body_key in self.sky_view_cache:
-                            cached_alt, cached_angle = self.sky_view_cache[body_key]
-                            alt_diff = abs(cam_alt - cached_alt) / max(1e-9, cached_alt)
-                            angle_diff = abs(sun_angle - cached_angle)
-                            if alt_diff <= 0.0005 and angle_diff <= 0.00087: # 0.05% altitude diff or 0.05 degrees (0.00087 rad)
-                                need_update = False
-                                
-                        if need_update:
-                            ctx.disable(moderngl.BLEND)
-                            ctx.disable(moderngl.CULL_FACE)
-                            self.sky_view_lut_fbo.use()
-                            self.sky_view_lut_fbo.clear(0.0, 0.0, 0.0, 0.0)
-                            ctx.viewport = (0, 0, self.sky_view_lut_tex_color.width, self.sky_view_lut_tex_color.height)
-                            
-                            prog = self.prog_sky_view_lut_pass
-                            if 'u_camera_pos' in prog: prog['u_camera_pos'].write(cam_pos)
-                            if 'u_atmo_quality' in prog: prog['u_atmo_quality'].value = atmo_quality
-                            if 'u_num_ring_planes' in prog: prog['u_num_ring_planes'].value = n_ring_planes
-                            if n_ring_planes > 0:
-                                if 'u_ring_center' in prog: prog['u_ring_center'].write(ring_centers_buf)
-                                if 'u_ring_normal' in prog: prog['u_ring_normal'].write(ring_normals_buf)
-                                if 'u_ring_params' in prog: prog['u_ring_params'].write(ring_params_buf)
-                                
-                            if 'u_atmo_clip_mode' in prog: prog['u_atmo_clip_mode'].value = 0
-                            if 'u_eclipse_lut' in prog: prog['u_eclipse_lut'].value = 2
-                            if 'u_transmittance_lut' in prog: prog['u_transmittance_lut'].value = 1
-                            if 'u_multi_scatter_lut' in prog: prog['u_multi_scatter_lut'].value = 3
-                            
-                            if 'lut_tex' in atmo: atmo['lut_tex'].use(location=1)
-                            if 'lut_multi_scatter' in atmo: atmo['lut_multi_scatter'].use(location=3)
-                            eclipse_lut_tex.use(location=2)
-                            
-                            self.sky_view_vao.render(moderngl.TRIANGLE_STRIP)
-                            last_sky_view_body_key = body_key
-                            self.sky_view_cache[body_key] = (cam_alt, sun_angle)
-                            
-                        if self.hdr_resolve_fbo:
-                            self.hdr_resolve_fbo.use()
-                            
-                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                        ctx.enable(moderngl.BLEND)
-                        ctx.enable(moderngl.CULL_FACE)
-                        ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-                        
-                        self.sky_view_lut_tex_color.use(location=6)
-                        self.sky_view_lut_tex_trans.use(location=7)
-                        if 'u_sky_view_lut_color' in prog_atmo: prog_atmo['u_sky_view_lut_color'].value = 6
-                        if 'u_sky_view_lut_transmittance' in prog_atmo: prog_atmo['u_sky_view_lut_transmittance'].value = 7
-
                     vao_atmo.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
@@ -3601,8 +3661,34 @@ class App:
                 ctx.depth_func = '<'
                 ctx.disable(moderngl.BLEND)
 
+            def execute_atmosphere_pass(clip_mode):
+                atmo_scale = self.camera.get("atmo_render_scale", 0.5)
+                use_lowres = (atmo_scale < 1.0 and self.atmo_lowres_fbo is not None)
+                if use_lowres:
+                    self.atmo_lowres_fbo.use()
+                    ctx.viewport = (0, 0, *self.last_atmo_res)
+                    ctx.clear(0.0, 0.0, 0.0, 0.0)
+                
+                render_atmosphere_pass(clip_mode)
+                
+                if use_lowres:
+                    if self.hdr_msaa_fbo:
+                        self.hdr_msaa_fbo.use()
+                    else:
+                        self.hdr_resolve_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                    ctx.disable(moderngl.DEPTH_TEST)
+                    self.atmo_lowres_tex.use(location=0)
+                    self.prog_atmo_composite['u_atmo_texture'].value = 0
+                    self.quad_vao_atmo_comp.render(moderngl.TRIANGLE_STRIP)
+                    ctx.depth_mask = True
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.disable(moderngl.BLEND)
+
             # --- Pass 1: Atmosphere behind rings ---
-            render_atmosphere_pass(1)
+            execute_atmosphere_pass(1)
     
             # --- Render Rings ---
             if ring_render_groups or (self.comparison_enabled and self.ring_render_groups_cmp):
@@ -3745,30 +3831,41 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
                             prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
                             prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
-                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
-                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
-                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
-                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
-                ctx.depth_mask = True
-                ctx.disable(moderngl.BLEND)
+                        body_pos_rel = cmp_pos_rel[bi]
+                        
+                        b_rot = self.rot_snap_cmp[bi]
+                        b_mat = matrix44.create_from_quaternion(b_rot, dtype='f4')
+                        inv_b_rot = matrix44.inverse(b_mat)
+                        u_ring_inv_rotation.write(inv_b_rot.astype('f4'))
+                        
+                        r_in, r_out = group['r_inner'], group['r_outer']
+                        u_ring_body_offset.write(body_pos_rel.astype('f4'))
+                        u_ring_params.write(np.array([r_in, r_out, 0.0, 0.0], dtype='f4'))
+                        
+                        body_shine_dir = self.instances_snap_cmp[bi * 7 + 4].xyz
+                        body_shine_col = self.instances_snap_cmp[bi * 7 + 5].xyz
+                        if u_ring_planetshine_dir is not None:
+                            u_ring_planetshine_dir.write(body_shine_dir.astype('f4'))
+                        if u_ring_planetshine_color is not None:
+                            u_ring_planetshine_color.write(body_shine_col.astype('f4'))
+                        
+                        tex_ring = group['texture']
+                        tex_ring.use(location=0)
+                        self.ring_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.ring_num_vertices)
             
-            # --- Render Habitable Zones ---
-            if show_habitable_zone:
+            # Render Habitable Zone Visualizer
+            if self.camera.get("show_habitable_zone", False) and self.hz_vao is not None:
+                ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                ctx.disable(moderngl.CULL_FACE)
                 ctx.depth_mask = False
                 
-                self.prog_hz['projection'].write(projection)
-                self.prog_hz['view'].write(view)
-                self.prog_hz['u_depth_C'].value = depth_C
-                self.prog_hz['u_far'].value = far
-                self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
+                self.prog_hz['u_view'].write(view.astype('f4').tobytes())
+                self.prog_hz['u_proj'].write(projection.astype('f4').tobytes())
                 
-                # Primary system stars
-                for i, body in enumerate(bodies_data):
-                    if body.get('type') == 'Star':
-                        sp = body.get('star_props', {})
+                for i in range(num_bodies):
+                    sp = stellar_props[i]
+                    if sp.get('is_star', False):
                         lum = sp.get('lum', 1.0)
                         
                         hz_inner = math.sqrt(lum / 1.1)
@@ -3776,15 +3873,14 @@ class App:
                         
                         self.prog_hz['u_inner_r'].value = hz_inner
                         self.prog_hz['u_outer_r'].value = hz_outer
-                        self.prog_hz['u_body_offset'].write(pos_rel_all[i])
+                        self.prog_hz['u_body_offset'].write(pos_rel_all[i].astype('f4'))
                         
                         self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
-                        
-                # Comparison system stars
+
                 if self.comparison_enabled:
-                    for i, body in enumerate(self.bodies_data_cmp):
-                        if body.get('type') == 'Star':
-                            sp = body.get('star_props', {})
+                    for i in range(num_bodies_cmp):
+                        sp = self.stellar_props_cmp[i]
+                        if sp.get('is_star', False):
                             lum = sp.get('lum', 1.0)
                             
                             hz_inner = math.sqrt(lum / 1.1)
@@ -3800,7 +3896,7 @@ class App:
                 ctx.disable(moderngl.BLEND)
     
             # --- Pass 2: Atmosphere in front of rings ---
-            render_atmosphere_pass(2)
+            execute_atmosphere_pass(2)
             
             if self.hdr_msaa_fbo:
                 ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
@@ -3965,55 +4061,20 @@ class App:
                         if changed_adapt:
                             self.camera["atmo_adaptive_steps"] = adaptive_steps
                             settings_changed = True
-                    
-                    imgui.separator()
-                    imgui.text("Sky View Rendering")
-                    
-                    # Sky View Mode
-                    sv_modes = ["Auto/Hybrid", "Pure Ray Marching", "Pure Sky View LUT"]
-                    changed_mode, self.camera["sky_view_mode"] = imgui.combo("Rendering Mode", self.camera.get("sky_view_mode", 0), sv_modes)
-                    if changed_mode:
-                        settings_changed = True
-                    
-                    # Hybrid Distance
-                    if self.camera["sky_view_mode"] == 0:
-                        changed_hd, self.camera["sky_view_hybrid_dist"] = imgui.slider_float("Hybrid Switch Distance", self.camera.get("sky_view_hybrid_dist", 1.1), 0.1, 10.0, "%.1f x Atmo Radius")
-                        if changed_hd:
+
+                        atmo_scale_val = self.camera.get("atmo_render_scale", 0.5)
+                        changed_scale, atmo_scale_val = imgui.slider_float("Atmosphere Resolution", atmo_scale_val, 0.25, 1.0, "%.2f")
+                        if changed_scale:
+                            atmo_scale_val = round(atmo_scale_val * 4) / 4.0
+                            self.camera["atmo_render_scale"] = atmo_scale_val
                             settings_changed = True
-                        
-                    # Sky View Quality
-                    sv_qualities = ["Low (256x128)", "Medium (512x256)", "High (1024x512)", "Ultra (2048x1024)", "Extreme (4096x2048)", "Custom"]
-                    changed_q, new_q = imgui.combo("LUT Quality", self.camera.get("sky_view_quality", 2), sv_qualities)
-                    if changed_q:
-                        self.camera["sky_view_quality"] = new_q
+                    
+                    # Shadow Caster Budget
+                    caster_budget = self.camera.get("shadow_caster_budget", 32)
+                    changed_budget, caster_budget = imgui.slider_int("Shadow Caster Budget", caster_budget, 4, 64)
+                    if changed_budget:
+                        self.camera["shadow_caster_budget"] = caster_budget
                         settings_changed = True
-                        
-                    if self.camera.get("sky_view_quality", 2) == 5:
-                        cw, ch = self.camera.get("sky_view_custom_res", (1024, 512))
-                        _, cw = imgui.input_int("Custom Width", cw)
-                        _, ch = imgui.input_int("Custom Height", ch)
-                        self.camera["sky_view_custom_res"] = (max(16, cw), max(16, ch))
-                        if imgui.button("Apply Custom Resolution"):
-                            self.camera["sky_view_quality_changed"] = True
-                            settings_changed = True
-                            
-                    if changed_q or self.camera.pop("sky_view_quality_changed", False):
-                        q_idx = self.camera.get("sky_view_quality", 2)
-                        q_dims = [(256, 128), (512, 256), (1024, 512), (2048, 1024), (4096, 2048)]
-                        w, h = self.camera.get("sky_view_custom_res", (1024, 512)) if q_idx == 5 else q_dims[q_idx]
-                        
-                        # Release old resources
-                        if hasattr(self, 'sky_view_lut_fbo') and self.sky_view_lut_fbo:
-                            self.sky_view_lut_fbo.release()
-                            self.sky_view_lut_tex_color.release()
-                            self.sky_view_lut_tex_trans.release()
-                            
-                        # Recreate
-                        self.sky_view_lut_tex_color = ctx.texture((w, h), 4, dtype='f2')
-                        self.sky_view_lut_tex_trans = ctx.texture((w, h), 4, dtype='f2')
-                        self.sky_view_lut_tex_color.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                        self.sky_view_lut_tex_trans.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                        self.sky_view_lut_fbo = ctx.framebuffer(color_attachments=[self.sky_view_lut_tex_color, self.sky_view_lut_tex_trans])
                     
                     imgui.separator()
                     
@@ -4034,15 +4095,24 @@ class App:
                     if changed_bt:
                         settings_changed = True
                     
+                    # TAA
+                    changed_taa, taa_enabled_val = imgui.checkbox("TAA (Temporal Anti-Aliasing)", self.camera.get("taa_enabled", True))
+                    if changed_taa:
+                        self.camera["taa_enabled"] = taa_enabled_val
+                        settings_changed = True
+
                     # MSAA
                     msaa_options = [0, 2, 4, 8]
                     msaa_labels = ["Off", "2x", "4x", "8x"]
                     current_msaa = self.camera.get("msaa_samples", 4)
                     current_idx = msaa_options.index(current_msaa) if current_msaa in msaa_options else 2
-                    changed_msaa, new_msaa_idx = imgui.combo("MSAA", current_idx, msaa_labels)
-                    if changed_msaa:
-                        self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
-                        settings_changed = True
+                    if self.camera.get("taa_enabled", True):
+                        imgui.text_disabled("MSAA: Auto-disabled by TAA")
+                    else:
+                        changed_msaa, new_msaa_idx = imgui.combo("MSAA", current_idx, msaa_labels)
+                        if changed_msaa:
+                            self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
+                            settings_changed = True
 
                     # Orbit Lines
                     changed_so, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
@@ -6259,6 +6329,144 @@ class App:
                             print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
                 imgui.end()
     
+            # --- TAA Resolve ---
+            cur_tracking_idx = self.camera["tracking_idx"]
+            cur_tracking_is_cmp = self.camera.get("tracking_is_cmp", False)
+            target_changed = (getattr(self, "prev_tracking_idx", None) != cur_tracking_idx or 
+                              getattr(self, "prev_tracking_is_cmp", None) != cur_tracking_is_cmp)
+            
+            if target_changed or self.prev_vp is None:
+                if self.taa_history_tex:
+                    self.taa_history_tex.write(np.zeros((self.fb_width, self.fb_height, 4), dtype='f4').tobytes())
+            
+            if self.camera.get("taa_enabled", True) and self.taa_output_fbo is not None:
+                self.taa_output_fbo.use()
+                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                ctx.disable(moderngl.DEPTH_TEST)
+                ctx.disable(moderngl.BLEND)
+                
+                self.hdr_resolve_tex.use(location=0)
+                if self.taa_history_tex:
+                    self.taa_history_tex.use(location=1)
+                if self.depth_texture:
+                    self.depth_texture.use(location=2)
+                    
+                self.prog_taa['u_current_color'].value = 0
+                self.prog_taa['u_history_color'].value = 1
+                self.prog_taa['u_depth_texture'].value = 2
+                
+                cur_vp = np.asarray(view, dtype=np.float32) @ np.asarray(projection, dtype=np.float32)
+                try:
+                    inv_view = np.linalg.inv(np.asarray(view, dtype=np.float32))
+                except:
+                    inv_view = np.eye(4, dtype=np.float32)
+                    
+                self.prog_taa['u_proj'].write(projection.astype('f4').tobytes())
+                self.prog_taa['u_inv_view'].write(inv_view.astype('f4').tobytes())
+                self.prog_taa['u_prev_view_proj'].write(self.prev_vp.astype('f4').tobytes() if self.prev_vp is not None else cur_vp.astype('f4').tobytes())
+                
+                self.prog_taa['u_texel_size'].value = (1.0 / self.fb_width, 1.0 / self.fb_height)
+                self.prog_taa['u_depth_C'].value = depth_C
+                self.prog_taa['u_far'].value = far
+                
+                self.quad_vao_taa.render(moderngl.TRIANGLE_STRIP)
+                
+                # Ping-pong textures
+                self.taa_history_tex, self.taa_output_tex = self.taa_output_tex, self.taa_history_tex
+                self.taa_output_fbo.release()
+                self.taa_output_fbo = ctx.framebuffer(color_attachments=[self.taa_output_tex])
+                if self.taa_history_fbo: self.taa_history_fbo.release()
+                self.taa_history_fbo = ctx.framebuffer(color_attachments=[self.taa_history_tex], depth_attachment=self.depth_texture)
+
+            resolved_tex = self.taa_history_tex if (self.camera.get("taa_enabled", True) and self.taa_history_tex is not None) else self.hdr_resolve_tex
+
+            # --- Post-TAA Render Pass (Orbits & HZ when TAA is enabled) ---
+            if self.camera.get("taa_enabled", True) and self.taa_history_fbo is not None:
+                self.taa_history_fbo.use()
+                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                ctx.enable(moderngl.DEPTH_TEST)
+                ctx.depth_func = '<'
+                ctx.depth_mask = False
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                
+                import OpenGL.GL as gl
+                gl.glEnable(gl.GL_LINE_SMOOTH)
+                gl.glHint(gl.GL_LINE_SMOOTH_HINT, gl.GL_NICEST)
+                
+                if show_orbits and n_orbits > 0:
+                    prog_gpu_orbits['projection'].write(self.unjittered_projection)
+                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    if n_orbits_hi > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 4000
+                        prog_gpu_orbits['u_base_instance'].value = 0
+                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
+                    if n_orbits_med > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 500
+                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
+                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
+                    if n_orbits_low > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 100
+                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
+                        
+                if show_orbits and self.comparison_enabled and self.n_orbits_cmp > 0:
+                    prog_gpu_orbits['projection'].write(self.unjittered_projection)
+                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    if self.n_orbits_hi_cmp > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 4000
+                        prog_gpu_orbits['u_base_instance'].value = 0
+                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
+                    if self.n_orbits_med_cmp > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 500
+                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
+                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
+                    if self.n_orbits_low_cmp > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 100
+                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
+                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
+                        
+                gl.glDisable(gl.GL_LINE_SMOOTH)
+                        
+                if show_habitable_zone:
+                    self.prog_hz['projection'].write(self.unjittered_projection)
+                    self.prog_hz['view'].write(view)
+                    self.prog_hz['u_depth_C'].value = depth_C
+                    self.prog_hz['u_far'].value = far
+                    self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
+                    
+                    for i, body in enumerate(bodies_data):
+                        if body.get('type') == 'Star':
+                            sp = body.get('star_props', {})
+                            lum = sp.get('lum', 1.0)
+                            hz_inner = math.sqrt(lum / 1.1)
+                            hz_outer = math.sqrt(lum / 0.53)
+                            self.prog_hz['u_inner_r'].value = hz_inner
+                            self.prog_hz['u_outer_r'].value = hz_outer
+                            self.prog_hz['u_body_offset'].write(pos_rel_all[i])
+                            self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
+                            
+                    if self.comparison_enabled:
+                        for i, body in enumerate(self.bodies_data_cmp):
+                            if body.get('type') == 'Star':
+                                sp = body.get('star_props', {})
+                                lum = sp.get('lum', 1.0)
+                                hz_inner = math.sqrt(lum / 1.1)
+                                hz_outer = math.sqrt(lum / 0.53)
+                                self.prog_hz['u_inner_r'].value = hz_inner
+                                self.prog_hz['u_outer_r'].value = hz_outer
+                                self.prog_hz['u_body_offset'].write(cmp_pos_rel[i].astype('f4'))
+                                self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
+                
+                ctx.depth_mask = True
+                ctx.disable(moderngl.BLEND)
+
             # --- Post Processing ---
             # Bloom Downsample
             ctx.disable(moderngl.DEPTH_TEST)
@@ -6268,9 +6476,9 @@ class App:
             if len(self.bloom_fbos) == 5:
                 self.bloom_fbos[0].use()
                 ctx.viewport = (0, 0, self.bloom_texs[0].width, self.bloom_texs[0].height)
-                self.hdr_resolve_tex.use(location=0)
+                resolved_tex.use(location=0)
                 self.prog_bloom_down['u_texture'].value = 0
-                self.prog_bloom_down['u_texel_size'].value = (1.0 / self.hdr_resolve_tex.width, 1.0 / self.hdr_resolve_tex.height)
+                self.prog_bloom_down['u_texel_size'].value = (1.0 / resolved_tex.width, 1.0 / resolved_tex.height)
                 self.prog_bloom_down['u_threshold'].value = self.camera.get("bloom_threshold", 1.0)
                 self.quad_vao_down.render(moderngl.TRIANGLE_STRIP)
                 
@@ -6300,7 +6508,7 @@ class App:
                 ctx.disable(moderngl.BLEND)
                 ctx.screen.use()
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                self.hdr_resolve_tex.use(location=0)
+                resolved_tex.use(location=0)
                 self.bloom_texs[0].use(location=1)
                 self.prog_composite['u_main_texture'].value = 0
                 self.prog_composite['u_bloom_texture'].value = 1
@@ -6312,6 +6520,11 @@ class App:
             ctx.disable(moderngl.DEPTH_TEST)
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            
+            # Store TAA historical state for next frame
+            self.prev_vp = (np.asarray(view, dtype=np.float32) @ np.asarray(self.unjittered_projection, dtype=np.float32)).copy()
+            self.prev_tracking_idx = self.camera["tracking_idx"]
+            self.prev_tracking_is_cmp = self.camera.get("tracking_is_cmp", False)
             
             imgui.render()
      
