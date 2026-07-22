@@ -166,7 +166,8 @@ uniform float u_far;
 
 void main() {
     float d = texture(u_depth_texture, v_texcoord).r;
-    vec3 current_color = texture(u_current_color, v_texcoord).rgb;
+    vec4 current_sample = texture(u_current_color, v_texcoord);
+    vec3 current_color = current_sample.rgb;
 
     // Figure out where to sample the history buffer for this pixel.
     bool is_background = (d >= 0.99999);
@@ -202,7 +203,7 @@ void main() {
 
         // If reprojected coordinates are out of screen bounds, discard history
         if (prev_uv.x < 0.0 || prev_uv.x > 1.0 || prev_uv.y < 0.0 || prev_uv.y > 1.0) {
-            out_color = vec4(current_color, 1.0);
+            out_color = vec4(current_color, current_sample.a);
             return;
         }
     }
@@ -227,11 +228,13 @@ void main() {
     vec3 box_min = mean - gamma * stddev;
     vec3 box_max = mean + gamma * stddev;
 
-    vec3 history_color = texture(u_history_color, prev_uv).rgb;
+    vec4 history_sample = texture(u_history_color, prev_uv);
+    vec3 history_color = history_sample.rgb;
     history_color = clamp(history_color, box_min, box_max);
 
     float blend = 0.1; // 10% current, 90% history
-    out_color = vec4(mix(history_color, current_color, blend), 1.0);
+    float blended_alpha = mix(history_sample.a, current_sample.a, blend);
+    out_color = vec4(mix(history_color, current_color, blend), blended_alpha);
 }
 """
 

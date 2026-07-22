@@ -300,9 +300,9 @@ class StarCalculator:
             v_crit_km_s = math.sqrt((cls.G * (current_mass * cls.MSUN)) / (r_eq * cls.RSUN)) / 1000
             v_eq_km_s = v_crit_km_s * rot_frac
 
-        # Habitable Zone
-        hz_inner = round(math.sqrt(apparent_lum / 1.1), 3) if apparent_lum > 0 else 0
-        hz_outer = round(math.sqrt(apparent_lum / 0.53), 3) if apparent_lum > 0 else 0
+        # Habitable Zone (optimistic boundaries: Recent Venus to Early Mars)
+        hz_inner = round(math.sqrt(apparent_lum / 1.78), 3) if apparent_lum > 0 else 0
+        hz_outer = round(math.sqrt(apparent_lum / 0.32), 3) if apparent_lum > 0 else 0
 
         # Pulsation (Instability Strip)
         is_pulsating = False

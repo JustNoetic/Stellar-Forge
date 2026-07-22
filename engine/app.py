@@ -908,8 +908,12 @@ class App:
         self.planet_normal_textures = []
         self.planet_specular_textures = []
         self.texture_slices = {} # name_lower -> 1-based slice_idx
-        self.ring_textures = {}  # name_lower -> PIL.Image (1024, 1)
-        self.ring_gl_textures = {} # name_lower -> ModernGL Texture
+        self.ring_textures_front = {}  # name_lower -> PIL.Image (4096, 1)
+        self.ring_textures_back = {}   # name_lower -> PIL.Image (4096, 1)
+        self.ring_gl_textures_front = {} # name_lower -> ModernGL Texture
+        self.ring_gl_textures_back = {}  # name_lower -> ModernGL Texture
+        self.ring_textures = self.ring_textures_front
+        self.ring_gl_textures = self.ring_gl_textures_front
 
         textures_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'textures')
         if os.path.exists(textures_dir):
@@ -930,7 +934,7 @@ class App:
                     base_names = set()
                     for f in files:
                         name = os.path.splitext(os.path.basename(f))[0]
-                        if name.endswith("_ring") or name.endswith("_rings") or name.endswith("_normal") or name.endswith("_specular"):
+                        if name.endswith("_ring") or name.endswith("_rings") or name.endswith("_normal") or name.endswith("_specular") or name.endswith("_front") or name.endswith("_back"):
                             continue
                         base_names.add(name)
                     
@@ -971,20 +975,50 @@ class App:
                             print(f"Failed to load root planet textures for {name}: {e}")
                             
                     # Rings directly in root
-                    ring_files = glob.glob(os.path.join(textures_dir, '*_ring.png')) + glob.glob(os.path.join(textures_dir, '*_rings.png'))
+                    ring_files = glob.glob(os.path.join(textures_dir, '*_ring*.png')) + glob.glob(os.path.join(textures_dir, '*_rings*.png'))
+                    ring_base_names = set()
                     for f in ring_files:
-                        name = os.path.splitext(os.path.basename(f))[0].replace("_rings", "").replace("_ring", "")
-                        name_lower = name.lower()
-                        if name_lower in self.ring_textures:
-                            continue # Already loaded from subdirectory
-                        try:
-                            img = Image.open(f).convert('RGBA')
-                            self.ring_gl_textures[name_lower] = img
+                        bname = os.path.splitext(os.path.basename(f))[0]
+                        clean_name = bname.replace("_rings_front", "").replace("_ring_front", "").replace("_rings_back", "").replace("_ring_back", "").replace("_front", "").replace("_back", "").replace("_rings", "").replace("_ring", "")
+                        if clean_name:
+                            ring_base_names.add(clean_name)
                             
-                            img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
-                            self.ring_textures[name_lower] = img_ds
+                    for name in sorted(list(ring_base_names)):
+                        name_lower = name.lower()
+                        if name_lower in self.ring_textures_front:
+                            continue # Already loaded from subdirectory
+                        
+                        f_front = None
+                        f_back = None
+                        f_single = None
+                        for ext in ['.png', '.jpg']:
+                            for pattern in [f"{name}_ring_front{ext}", f"{name}_rings_front{ext}", f"{name}_front{ext}"]:
+                                p = os.path.join(textures_dir, pattern)
+                                if os.path.exists(p): f_front = p; break
+                            for pattern in [f"{name}_ring_back{ext}", f"{name}_rings_back{ext}", f"{name}_back{ext}"]:
+                                p = os.path.join(textures_dir, pattern)
+                                if os.path.exists(p): f_back = p; break
+                            for pattern in [f"{name}_ring{ext}", f"{name}_rings{ext}"]:
+                                p = os.path.join(textures_dir, pattern)
+                                if os.path.exists(p): f_single = p; break
+                        
+                        try:
+                            if f_front:
+                                img_front = Image.open(f_front).convert('RGBA')
+                                img_back = Image.open(f_back).convert('RGBA') if f_back else img_front
+                                self.ring_gl_textures_front[name_lower] = img_front
+                                self.ring_gl_textures_back[name_lower] = img_back
+                                self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
+                                self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
+                            elif f_single:
+                                img = Image.open(f_single).convert('RGBA')
+                                self.ring_gl_textures_front[name_lower] = img
+                                self.ring_gl_textures_back[name_lower] = img
+                                img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
+                                self.ring_textures_front[name_lower] = img_ds
+                                self.ring_textures_back[name_lower] = img_ds
                         except Exception as e:
-                            print(f"Failed to load root ring texture {f}: {e}")
+                            print(f"Failed to load root ring texture {name}: {e}")
                 else:
                     # Subdirectory (e.g. Earth, Saturn)
                     obj_name = folder_name
@@ -995,7 +1029,9 @@ class App:
                     d_path = None
                     n_path = None
                     s_path = None
-                    r_path = None
+                    r_front_path = None
+                    r_back_path = None
+                    r_single_path = None
                     
                     # 1. Look for explicit matches first
                     for f in files:
@@ -1008,8 +1044,12 @@ class App:
                             n_path = f
                         elif fname_lower == name_lower + "_specular" or fname_lower == "specular" or fname_lower == "diffuse_specular":
                             s_path = f
+                        elif fname_lower in [name_lower + "_ring_front", name_lower + "_rings_front", name_lower + "_front", "ring_front", "rings_front", "front"]:
+                            r_front_path = f
+                        elif fname_lower in [name_lower + "_ring_back", name_lower + "_rings_back", name_lower + "_back", "ring_back", "rings_back", "back"]:
+                            r_back_path = f
                         elif fname_lower in [name_lower + "_ring", name_lower + "_rings", "ring", "rings"]:
-                            r_path = f
+                            r_single_path = f
 
                     # 2. Fallbacks if explicit matches not found
                     if not d_path:
@@ -1061,13 +1101,24 @@ class App:
                         except Exception as e:
                             print(f"Failed to load planet textures in folder {path}: {e}")
                             
-                    if r_path:
+                    if r_front_path:
                         try:
-                            img = Image.open(r_path).convert('RGBA')
-                            self.ring_gl_textures[name_lower] = img
-                            
+                            img_front = Image.open(r_front_path).convert('RGBA')
+                            img_back = Image.open(r_back_path).convert('RGBA') if r_back_path else img_front
+                            self.ring_gl_textures_front[name_lower] = img_front
+                            self.ring_gl_textures_back[name_lower] = img_back
+                            self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
+                            self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
+                        except Exception as e:
+                            print(f"Failed to load front/back ring textures in folder {path}: {e}")
+                    elif r_single_path:
+                        try:
+                            img = Image.open(r_single_path).convert('RGBA')
+                            self.ring_gl_textures_front[name_lower] = img
+                            self.ring_gl_textures_back[name_lower] = img
                             img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
-                            self.ring_textures[name_lower] = img_ds
+                            self.ring_textures_front[name_lower] = img_ds
+                            self.ring_textures_back[name_lower] = img_ds
                         except Exception as e:
                             print(f"Failed to load ring texture in folder {path}: {e}")
         
@@ -1333,8 +1384,10 @@ class App:
         prog_ephem_orbits = ctx.program(vertex_shader=ephem_orbit_vertex_shader, fragment_shader=ephem_orbit_fragment_shader)
     
         prog_rings = ctx.program(vertex_shader=ring_vertex_shader, fragment_shader=ring_fragment_shader)
-        if 'u_ring_texture' in prog_rings:
-            prog_rings['u_ring_texture'].value = 4
+        if 'u_ring_texture_front' in prog_rings:
+            prog_rings['u_ring_texture_front'].value = 4
+        if 'u_ring_texture_back' in prog_rings:
+            prog_rings['u_ring_texture_back'].value = 5
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
         
@@ -1428,16 +1481,30 @@ class App:
             bitangent = np.cross(pole_n, tangent)
             R_ring = np.column_stack([tangent, pole_n, bitangent])
             
-            b_name = bodies_data[body_idx]['name']
+            b_data = bodies_data[body_idx]
+            b_name = b_data['name']
             name_lower = b_name.lower()
-            if name_lower in self.ring_textures and len(rings_data) > 0:
-                # Combine all segments into 1 single layer spanning the innermost to outermost radii
-                min_inner = min(seg['inner'] for seg in rings_data)
-                max_outer = max(seg['outer'] for seg in rings_data)
-                inner_r = min_inner * body_radius_au
-                outer_r = max_outer * body_radius_au
+            if name_lower in self.ring_textures_front and len(rings_data) > 0:
+                tex_inner_f = b_data.get('ring_texture_inner')
+                tex_outer_f = b_data.get('ring_texture_outer')
                 
-                # Compute weighted average parameters (weight = opacity * width)
+                if tex_inner_f is not None and tex_outer_f is not None:
+                    tex_min_inner = float(tex_inner_f)
+                    tex_max_outer = float(tex_outer_f)
+                    procedural_segments = [seg for seg in rings_data if seg['outer'] <= tex_min_inner + 1e-4 or seg['inner'] >= tex_max_outer - 1e-4]
+                else:
+                    tex_min_inner = min(seg['inner'] for seg in rings_data)
+                    tex_max_outer = max(seg['outer'] for seg in rings_data)
+                    procedural_segments = []
+                    
+                inner_r = tex_min_inner * body_radius_au
+                outer_r = tex_max_outer * body_radius_au
+                
+                # Compute weighted average parameters for textured region
+                textured_segs = [seg for seg in rings_data if seg['inner'] >= tex_min_inner - 1e-4 and seg['outer'] <= tex_max_outer + 1e-4]
+                if not textured_segs:
+                    textured_segs = rings_data
+                    
                 total_w = 0.0
                 sum_color = np.zeros(3)
                 sum_opacity = 0.0
@@ -1445,7 +1512,7 @@ class App:
                 sum_asymmetry = 0.0
                 sum_backscatter = 0.0
                 
-                for seg in rings_data:
+                for seg in textured_segs:
                     w = seg.get('opacity', 1.0) * (seg['outer'] - seg['inner'])
                     if w < 1e-9:
                         w = 1e-9
@@ -1456,27 +1523,27 @@ class App:
                     sum_asymmetry += seg.get('asymmetry', 0.7) * w
                     sum_backscatter += seg.get('backscatter', -0.3) * w
                     
+                # For textured rings, color and opacity come directly from the texture map
+                r_color = (1.0, 1.0, 1.0)
+                r_opacity = 1.0
                 if total_w > 0.0:
-                    r_color = tuple(sum_color / total_w)
-                    r_opacity = sum_opacity / total_w
                     r_scatter = sum_scatter / total_w
                     r_asymmetry = sum_asymmetry / total_w
                     r_backscatter = sum_backscatter / total_w
                 else:
-                    first = rings_data[0]
-                    r_color = hex_to_rgb(first.get('color', '#ffffff'))
-                    r_opacity = first.get('opacity', 1.0)
+                    first = textured_segs[0]
                     r_scatter = first.get('scatter', 2.5)
                     r_asymmetry = first.get('asymmetry', 0.7)
                     r_backscatter = first.get('backscatter', -0.3)
                 
                 # Sample the texture
-                img_data = np.frombuffer(self.ring_textures[name_lower].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                img_data = np.frombuffer(self.ring_textures_front[name_lower].tobytes(), dtype=np.uint8).astype('f4') / 255.0
                 img_data = img_data.reshape(4096, 4)
                 tex_sampled = img_data # take 4096 samples
                 
                 # Generate shadow gradient from texture (no procedural gradient)
                 shadow_grad = generate_ring_shadow_grad(sorted_gradient=[], tex_sampled=tex_sampled)
+                colors5 = compute_5_ring_colors(tex_sampled=tex_sampled, raw_color=r_color)
                 
                 ring_precomputed.append({
                     'body_idx': body_idx,
@@ -1490,8 +1557,43 @@ class App:
                     'shadow_grad': shadow_grad,
                     'raw_color': r_color,
                     'gradient': [],
+                    'tex_sampled': tex_sampled,
+                    '5colors': colors5,
+                    'is_textured': True,
                     'row_idx': len(ring_precomputed),
                 })
+                
+                # Append remaining outer/inner procedural segments outside texture range
+                for ring_seg in procedural_segments:
+                    p_inner_r = ring_seg['inner'] * body_radius_au
+                    p_outer_r = ring_seg['outer'] * body_radius_au
+                    p_r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
+                    p_r_opacity = ring_seg.get('opacity', 1.0)
+                    p_r_scatter = ring_seg.get('scatter', 2.5)
+                    p_r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                    p_r_backscatter = ring_seg.get('backscatter', -0.3)
+                    
+                    sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
+                    shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                    colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=p_r_color, gradient=sorted_gradient)
+                    
+                    ring_precomputed.append({
+                        'body_idx': body_idx,
+                        'pole': pole_n.astype('f4'),
+                        'inner_r': p_inner_r,
+                        'outer_r': p_outer_r,
+                        'opacity': p_r_opacity,
+                        'scatter': p_r_scatter,
+                        'asymmetry': p_r_asymmetry,
+                        'backscatter': p_r_backscatter,
+                        'shadow_grad': shadow_grad,
+                        'raw_color': p_r_color,
+                        'gradient': sorted_gradient,
+                        'tex_sampled': None,
+                        '5colors': colors5,
+                        'is_textured': False,
+                        'row_idx': len(ring_precomputed),
+                    })
             else:
                 # Procedural or non-textured rings (original logic)
                 for ring_seg in rings_data:
@@ -1506,6 +1608,7 @@ class App:
                     sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
                     
                     shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                    colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=r_color, gradient=sorted_gradient)
                     
                     ring_precomputed.append({
                         'body_idx': body_idx,
@@ -1519,6 +1622,9 @@ class App:
                         'shadow_grad': shadow_grad,
                         'raw_color': r_color,
                         'gradient': sorted_gradient,
+                        'tex_sampled': None,
+                        '5colors': colors5,
+                        'is_textured': False,
                         'row_idx': len(ring_precomputed),
                     })
     
@@ -1643,6 +1749,7 @@ class App:
         uniform_ring_normals = prog_spheres['u_ring_normal']
         uniform_ring_params = prog_spheres['u_ring_params']
         uniform_ring_colors = prog_spheres.get('u_ring_colors', None)
+        uniform_ring_5colors = prog_spheres.get('u_ring_5colors', None)
         uniform_ring_coplanar_mask = prog_spheres.get('u_ring_coplanar_mask', None)
         uniform_caster_max_bend = prog_spheres.get('u_caster_max_bend', None)
         uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
@@ -1727,6 +1834,7 @@ class App:
         ring_normals_buf = np.zeros((16, 3), dtype='f4')
         ring_params_buf = np.zeros((16, 3), dtype='f4')
         ring_colors_buf = np.zeros((16, 3), dtype='f4')
+        ring_5colors_buf = np.zeros((16, 5, 3), dtype='f4')
         ring_coplanar_mask_buf = np.zeros(16, dtype='u4')
         all_instances = np.zeros((num_bodies, INSTANCE_FLOATS), dtype='f4')
         cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
@@ -1803,16 +1911,27 @@ class App:
                 prog_spheres['u_planet_specular_textures'].value = 5
 
         # Convert ring PIL images into ModernGL textures
-        for name_lower, img in list(self.ring_gl_textures.items()):
+        for name_lower, img in list(self.ring_gl_textures_front.items()):
             try:
                 tex = ctx.texture(img.size, 4, img.tobytes())
                 tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
                 tex.repeat_x = False
                 tex.repeat_y = False
                 tex.build_mipmaps()
-                self.ring_gl_textures[name_lower] = tex
+                self.ring_gl_textures_front[name_lower] = tex
             except Exception as e:
-                print(f"Failed to compile OpenGL texture for ring {name_lower}: {e}")
+                print(f"Failed to compile OpenGL front texture for ring {name_lower}: {e}")
+
+        for name_lower, img in list(self.ring_gl_textures_back.items()):
+            try:
+                tex = ctx.texture(img.size, 4, img.tobytes())
+                tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+                tex.repeat_x = False
+                tex.repeat_y = False
+                tex.build_mipmaps()
+                self.ring_gl_textures_back[name_lower] = tex
+            except Exception as e:
+                print(f"Failed to compile OpenGL back texture for ring {name_lower}: {e}")
 
         n_orbits = 0
         n_orbits_hi = 0
@@ -2038,11 +2157,17 @@ class App:
                         r_asymmetry = ring_seg.get('asymmetry', 0.7)
                         r_backscatter = ring_seg.get('backscatter', -0.3)
                         sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient)
+                        name_lower_sw = bodies_data[body_idx_r]['name'].lower()
+                        tex_sampled_sw = None
+                        if name_lower_sw in self.ring_textures:
+                            img_data = np.frombuffer(self.ring_textures[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                            tex_sampled_sw = img_data.reshape(4096, 4)
+                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled_sw)
                         ring_precomputed.append({
                             'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
                             'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
+                            'tex_sampled': tex_sampled_sw,
                             'row_idx': len(ring_precomputed),
                         })
     
@@ -2169,11 +2294,17 @@ class App:
                         r_asymmetry = ring_seg.get('asymmetry', 0.7)
                         r_backscatter = ring_seg.get('backscatter', -0.3)
                         sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient)
+                        name_lower_sw = self.bodies_data_cmp[body_idx_r]['name'].lower()
+                        tex_sampled_sw = None
+                        if name_lower_sw in self.ring_textures:
+                            img_data = np.frombuffer(self.ring_textures[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                            tex_sampled_sw = img_data.reshape(4096, 4)
+                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled_sw)
                         self.ring_precomputed_cmp.append({
                             'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
                             'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
                             'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
+                            'tex_sampled': tex_sampled_sw,
                             'row_idx': len(self.ring_precomputed_cmp),
                         })
                         
@@ -2766,6 +2897,7 @@ class App:
             ring_normals_buf[:] = 0
             ring_params_buf[:] = 0
             ring_colors_buf[:] = 0
+            ring_5colors_buf[:] = 0
             
             for ring in ring_precomputed:
                 if n_ring_planes >= 16:
@@ -2777,6 +2909,10 @@ class App:
                 ring_params_buf[n_ring_planes, 1] = ring['outer_r']
                 ring_params_buf[n_ring_planes, 2] = ring['opacity']
                 ring_colors_buf[n_ring_planes, 0:3] = ring['raw_color']
+                if '5colors' in ring:
+                    ring_5colors_buf[n_ring_planes, :, :] = ring['5colors']
+                else:
+                    ring_5colors_buf[n_ring_planes, :, :] = ring['raw_color']
                 n_ring_planes += 1
             
             ring_coplanar_mask_buf[:] = compute_ring_coplanar_masks(n_ring_planes, ring_centers_buf, ring_normals_buf)
@@ -3268,6 +3404,8 @@ class App:
                 uniform_ring_params.write(ring_params_buf)
                 if uniform_ring_colors:
                     uniform_ring_colors.write(ring_colors_buf)
+                if uniform_ring_5colors:
+                    uniform_ring_5colors.write(ring_5colors_buf)
                 if uniform_ring_coplanar_mask is not None:
                     uniform_ring_coplanar_mask.write(ring_coplanar_mask_buf)
             
@@ -3395,26 +3533,25 @@ class App:
 
                     ctx.memory_barrier()
 
-                    if not self.camera.get("taa_enabled", True):
-                        prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    
+                    if n_orbits_hi > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 4000
+                        prog_gpu_orbits['u_base_instance'].value = 0
+                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
                         
-                        if n_orbits_hi > 0:
-                            prog_gpu_orbits['u_orbit_res'].value = 4000
-                            prog_gpu_orbits['u_base_instance'].value = 0
-                            prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
-                            
-                        if n_orbits_med > 0:
-                            prog_gpu_orbits['u_orbit_res'].value = 500
-                            prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
-                            prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
-                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
-                            
-                        if n_orbits_low > 0:
-                            prog_gpu_orbits['u_orbit_res'].value = 100
-                            prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
-                            prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
-                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
+                    if n_orbits_med > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 500
+                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
+                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
+                        
+                    if n_orbits_low > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 100
+                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
                 if self.comparison_enabled and self.n_orbits_cmp > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -3452,26 +3589,25 @@ class App:
                         
                     ctx.memory_barrier()
 
-                    if not self.camera.get("taa_enabled", True):
-                        prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    
+                    if self.n_orbits_hi_cmp > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 4000
+                        prog_gpu_orbits['u_base_instance'].value = 0
+                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
                         
-                        if self.n_orbits_hi_cmp > 0:
-                            prog_gpu_orbits['u_orbit_res'].value = 4000
-                            prog_gpu_orbits['u_base_instance'].value = 0
-                            prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
-                            
-                        if self.n_orbits_med_cmp > 0:
-                            prog_gpu_orbits['u_orbit_res'].value = 500
-                            prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
-                            prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
-                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
-                            
-                        if self.n_orbits_low_cmp > 0:
-                            prog_gpu_orbits['u_orbit_res'].value = 100
-                            prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
-                            prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
-                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
+                    if self.n_orbits_med_cmp > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 500
+                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
+                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
+                        
+                    if self.n_orbits_low_cmp > 0:
+                        prog_gpu_orbits['u_orbit_res'].value = 100
+                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
+                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
 
             def render_atmosphere_pass(clip_mode):
                 if not sorted_atmos:
@@ -3752,11 +3888,14 @@ class App:
                         prog_rings['u_num_ring_planes'].value = len(body_rings)
                         b_name = bodies_data[bi]['name']
                         name_lower = b_name.lower()
-                        is_textured = name_lower in self.ring_textures
+                        is_textured = name_lower in self.ring_textures_front
                         if 'u_is_textured' in prog_rings:
                             prog_rings['u_is_textured'].value = is_textured
-                        if is_textured and name_lower in self.ring_gl_textures:
-                            self.ring_gl_textures[name_lower].use(location=4)
+                        if is_textured:
+                            if name_lower in self.ring_gl_textures_front:
+                                self.ring_gl_textures_front[name_lower].use(location=4)
+                            if name_lower in self.ring_gl_textures_back:
+                                self.ring_gl_textures_back[name_lower].use(location=5)
                         for idx, r in enumerate(body_rings):
                             if idx >= 16: break
                             prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
@@ -3767,6 +3906,7 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
                             prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
                             prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
+                            prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 
                 if self.comparison_enabled and self.ring_render_groups_cmp:
@@ -3819,11 +3959,14 @@ class App:
                         prog_rings['u_num_ring_planes'].value = len(body_rings)
                         b_name = self.bodies_data_cmp[bi]['name']
                         name_lower = b_name.lower()
-                        is_textured = name_lower in self.ring_textures
+                        is_textured = name_lower in self.ring_textures_front
                         if 'u_is_textured' in prog_rings:
                             prog_rings['u_is_textured'].value = is_textured
-                        if is_textured and name_lower in self.ring_gl_textures:
-                            self.ring_gl_textures[name_lower].use(location=4)
+                        if is_textured:
+                            if name_lower in self.ring_gl_textures_front:
+                                self.ring_gl_textures_front[name_lower].use(location=4)
+                            if name_lower in self.ring_gl_textures_back:
+                                self.ring_gl_textures_back[name_lower].use(location=5)
                         for idx, r in enumerate(body_rings):
                             if idx >= 16: break
                             prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
@@ -3831,6 +3974,10 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
                             prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
                             prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
+                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
+                            prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
                         body_pos_rel = cmp_pos_rel[bi]
                         
                         b_rot = self.rot_snap_cmp[bi]
@@ -3860,16 +4007,20 @@ class App:
                 ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
                 ctx.depth_mask = False
                 
-                self.prog_hz['u_view'].write(view.astype('f4').tobytes())
-                self.prog_hz['u_proj'].write(projection.astype('f4').tobytes())
+                self.prog_hz['view'].write(view.astype('f4').tobytes())
+                self.prog_hz['projection'].write(projection.astype('f4').tobytes())
+                self.prog_hz['u_depth_C'].value = depth_C
+                self.prog_hz['u_far'].value = far
+                self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
                 
                 for i in range(num_bodies):
-                    sp = stellar_props[i]
-                    if sp.get('is_star', False):
+                    body = bodies_data[i]
+                    if body.get('type') == 'Star':
+                        sp = body.get('star_props', {})
                         lum = sp.get('lum', 1.0)
                         
-                        hz_inner = math.sqrt(lum / 1.1)
-                        hz_outer = math.sqrt(lum / 0.53)
+                        hz_inner = math.sqrt(lum / 1.78)
+                        hz_outer = math.sqrt(lum / 0.32)
                         
                         self.prog_hz['u_inner_r'].value = hz_inner
                         self.prog_hz['u_outer_r'].value = hz_outer
@@ -3879,12 +4030,13 @@ class App:
 
                 if self.comparison_enabled:
                     for i in range(num_bodies_cmp):
-                        sp = self.stellar_props_cmp[i]
-                        if sp.get('is_star', False):
+                        body = self.bodies_data_cmp[i]
+                        if body.get('type') == 'Star':
+                            sp = body.get('star_props', {})
                             lum = sp.get('lum', 1.0)
                             
-                            hz_inner = math.sqrt(lum / 1.1)
-                            hz_outer = math.sqrt(lum / 0.53)
+                            hz_inner = math.sqrt(lum / 1.78)
+                            hz_outer = math.sqrt(lum / 0.32)
                             
                             self.prog_hz['u_inner_r'].value = hz_inner
                             self.prog_hz['u_outer_r'].value = hz_outer
@@ -5547,8 +5699,11 @@ class App:
                             
                             def fmt(val, dec=5): return round(float(val), dec)
                             
-                            if is_hidden_combo and active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
-                                system_file = "data/system.json"
+                            if is_hidden_combo:
+                                if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                                    system_file = "data/system.json"
+                                else:
+                                    system_file = sys_mgr._system_json_path(active_system_name)
                                 try:
                                     with open(system_file, "r") as f:
                                         sys_data = json.load(f)
@@ -5885,10 +6040,10 @@ class App:
                                     changed_in, new_in = imgui.drag_float(f"Inner Radius (km)##{i}", ring_item['inner_r'] * 149597870.7, 10.0, body_r_km, ring_item['outer_r'] * 149597870.7 - 10)
                                     changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
                                     changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
-                                    changed_op, new_op = imgui.slider_float(f"Opacity##{i}", ring_item['opacity'], 0.0, 1.0)
-                                    changed_scat, new_scat = imgui.slider_float(f"Forward Scatter Mult##{i}", ring_item['scatter'], 0.0, 10.0)
-                                    changed_asym, new_asym = imgui.slider_float(f"Forward Scatter Asym##{i}", ring_item['asymmetry'], 0.0, 0.999)
-                                    changed_bks, new_bks = imgui.slider_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), -0.999, 0.0)
+                                    changed_op, new_op = imgui.drag_float(f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 1.0, "%.4f")
+                                    changed_scat, new_scat = imgui.drag_float(f"Forward Scatter Mult##{i}", ring_item['scatter'], 0.01, 0.0, 100.0, "%.4f")
+                                    changed_asym, new_asym = imgui.drag_float(f"Forward Scatter Asym##{i}", ring_item['asymmetry'], 0.005, -0.999, 0.999, "%.4f")
+                                    changed_bks, new_bks = imgui.drag_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.999, 0.999, "%.4f")
                                     
                                     grad_changed = False
                                     grad_sort_needed = False
@@ -5901,11 +6056,11 @@ class App:
                                         stops_to_remove = []
                                         for j, stop in enumerate(grad):
                                             imgui.push_item_width(100)
-                                            changed_p, n_p = imgui.slider_float(f"Pos##{i}_{id(stop)}", stop['p'], 0.0, 1.0)
+                                            changed_p, n_p = imgui.drag_float(f"Pos##{i}_{id(stop)}", stop['p'], 0.005, 0.0, 1.0, "%.4f")
                                             if imgui.is_item_deactivated_after_edit():
                                                 grad_sort_needed = True
                                             imgui.same_line()
-                                            changed_a, n_a = imgui.slider_float(f"Alpha##{i}_{id(stop)}", stop['a'], 0.0, 1.0)
+                                            changed_a, n_a = imgui.drag_float(f"Alpha##{i}_{id(stop)}", stop['a'], 0.005, 0.0, 1.0, "%.4f")
                                             imgui.same_line()
                                             if imgui.button(f"X##{i}_{id(stop)}"):
                                                 stops_to_remove.append(j)
@@ -5936,7 +6091,7 @@ class App:
                                         if changed_asym: ring_item['asymmetry'] = new_asym
                                         if changed_bks: ring_item['backscatter'] = new_bks
                                         
-                                        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'])
+                                        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=ring_item.get('tex_sampled'))
                                         ring_item['shadow_grad'] = shadow_grad
                                         rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
                                     
@@ -6380,92 +6535,6 @@ class App:
 
             resolved_tex = self.taa_history_tex if (self.camera.get("taa_enabled", True) and self.taa_history_tex is not None) else self.hdr_resolve_tex
 
-            # --- Post-TAA Render Pass (Orbits & HZ when TAA is enabled) ---
-            if self.camera.get("taa_enabled", True) and self.taa_history_fbo is not None:
-                self.taa_history_fbo.use()
-                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                ctx.enable(moderngl.DEPTH_TEST)
-                ctx.depth_func = '<'
-                ctx.depth_mask = False
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                
-                import OpenGL.GL as gl
-                gl.glEnable(gl.GL_LINE_SMOOTH)
-                gl.glHint(gl.GL_LINE_SMOOTH_HINT, gl.GL_NICEST)
-                
-                if show_orbits and n_orbits > 0:
-                    prog_gpu_orbits['projection'].write(self.unjittered_projection)
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    if n_orbits_hi > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 4000
-                        prog_gpu_orbits['u_base_instance'].value = 0
-                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
-                    if n_orbits_med > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 500
-                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
-                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
-                    if n_orbits_low > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 100
-                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
-                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
-                        
-                if show_orbits and self.comparison_enabled and self.n_orbits_cmp > 0:
-                    prog_gpu_orbits['projection'].write(self.unjittered_projection)
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    if self.n_orbits_hi_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 4000
-                        prog_gpu_orbits['u_base_instance'].value = 0
-                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
-                    if self.n_orbits_med_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 500
-                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
-                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
-                    if self.n_orbits_low_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 100
-                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
-                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
-                        
-                gl.glDisable(gl.GL_LINE_SMOOTH)
-                        
-                if show_habitable_zone:
-                    self.prog_hz['projection'].write(self.unjittered_projection)
-                    self.prog_hz['view'].write(view)
-                    self.prog_hz['u_depth_C'].value = depth_C
-                    self.prog_hz['u_far'].value = far
-                    self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
-                    
-                    for i, body in enumerate(bodies_data):
-                        if body.get('type') == 'Star':
-                            sp = body.get('star_props', {})
-                            lum = sp.get('lum', 1.0)
-                            hz_inner = math.sqrt(lum / 1.1)
-                            hz_outer = math.sqrt(lum / 0.53)
-                            self.prog_hz['u_inner_r'].value = hz_inner
-                            self.prog_hz['u_outer_r'].value = hz_outer
-                            self.prog_hz['u_body_offset'].write(pos_rel_all[i])
-                            self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
-                            
-                    if self.comparison_enabled:
-                        for i, body in enumerate(self.bodies_data_cmp):
-                            if body.get('type') == 'Star':
-                                sp = body.get('star_props', {})
-                                lum = sp.get('lum', 1.0)
-                                hz_inner = math.sqrt(lum / 1.1)
-                                hz_outer = math.sqrt(lum / 0.53)
-                                self.prog_hz['u_inner_r'].value = hz_inner
-                                self.prog_hz['u_outer_r'].value = hz_outer
-                                self.prog_hz['u_body_offset'].write(cmp_pos_rel[i].astype('f4'))
-                                self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
-                
-                ctx.depth_mask = True
-                ctx.disable(moderngl.BLEND)
 
             # --- Post Processing ---
             # Bloom Downsample

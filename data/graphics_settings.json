@@ -1,21 +1,21 @@
 {
     "atmo_quality": 2,
-    "atmo_steps_max": 8,
+    "atmo_steps_max": 5,
     "atmo_adaptive_steps": false,
     "hdr_enabled": true,
-    "exposure": 4956.15966796875,
+    "exposure": 93.702392578125,
     "bloom_intensity": 0.05000000074505806,
     "bloom_threshold": 1.0,
     "msaa_samples": 4,
-    "show_orbits": true,
+    "show_orbits": false,
     "orbit_fade_dir_idx": 0,
     "orbit_min_alpha": 0.3,
     "show_habitable_zone": false,
     "planetshine_enabled": true,
     "ringshine_enabled": true,
     "inspector_frame": 0,
-    "fov": 35.0,
+    "fov": 45.0,
     "shadow_caster_budget": 8,
     "taa_enabled": false,
-    "atmo_render_scale": 0.75
+    "atmo_render_scale": 1.0
 }

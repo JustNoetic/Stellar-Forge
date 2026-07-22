@@ -256,6 +256,36 @@ def generate_ring_shadow_grad(sorted_gradient, tex_sampled=None, res=4096):
         shadow_grad[:, 3] = shadow_grad_a
     return shadow_grad
 
+def compute_5_ring_colors(tex_sampled=None, raw_color=(1.0, 1.0, 1.0), gradient=None):
+    colors = np.zeros((5, 3), dtype='f4')
+    base_color = np.array(raw_color, dtype='f4')
+    if tex_sampled is not None:
+        n_samples = len(tex_sampled)
+        band_size = n_samples // 5
+        for k in range(5):
+            start = k * band_size
+            end = (k + 1) * band_size if k < 4 else n_samples
+            slice_data = tex_sampled[start:end]
+            rgbs = slice_data[:, 0:3]
+            alphas = slice_data[:, 3:4]
+            total_alpha = np.sum(alphas)
+            if total_alpha > 1e-4:
+                avg_rgb = np.sum(rgbs * alphas, axis=0) / total_alpha
+            else:
+                avg_rgb = np.mean(rgbs, axis=0)
+            colors[k] = avg_rgb * base_color
+    elif gradient and len(gradient) > 0:
+        grad_p = np.array([g['p'] for g in gradient])
+        grad_a = np.array([g['a'] for g in gradient])
+        u_pts = np.array([0.1, 0.3, 0.5, 0.7, 0.9], dtype='f4')
+        alphas = np.interp(u_pts, grad_p, grad_a)
+        for k in range(5):
+            colors[k] = base_color * alphas[k]
+    else:
+        for k in range(5):
+            colors[k] = base_color
+    return colors
+
 def generate_ring_geometry(pole_render, min_r, max_r):
     pole_n = pole_render / np.linalg.norm(pole_render)
     ref = np.array([0., 0., 1.])
@@ -335,7 +365,7 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
             'num_indices': len(indices),
         })
         
-    ring_gradient_data = np.zeros((16, 256, 4), dtype='f4')
+    ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
     for j, ring in enumerate(ring_precomputed):
         if j >= 16: break
         ring_gradient_data[j, :, :] = ring['shadow_grad']
