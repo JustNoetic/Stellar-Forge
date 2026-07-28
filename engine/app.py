@@ -1394,6 +1394,10 @@ class App:
             prog_rings['u_ring_texture_back'].value = 5
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
+        if 'u_ringshine_lut' in prog_atmo:
+            prog_atmo['u_ringshine_lut'].value = 6
+        if 'u_ringshine_cdf_lut' in prog_atmo:
+            prog_atmo['u_ringshine_cdf_lut'].value = 7
         
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -3509,14 +3513,8 @@ class App:
             uniform_screen_height.value = self.fb_height
             uniform_fov_factor.value = fov_factor
             uniform_num_ring_planes.value = n_ring_planes
-            if 'u_planetshine_enabled' in prog_spheres:
-                prog_spheres['u_planetshine_enabled'].value = self.camera.get("planetshine_enabled", True)
             if 'u_camera_pos' in prog_spheres:
                 prog_spheres['u_camera_pos'].value = tuple(cam_pos)
-            if 'u_ringshine_enabled' in prog_spheres:
-                prog_spheres['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
-            if 'u_ringshine_band_count' in prog_spheres:
-                prog_spheres['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 10))
             if uniform_caster_max_bend is not None:
                 uniform_caster_max_bend.write(caster_max_bend_buf)
             if u_ring_caster_max_bend is not None:
@@ -3558,6 +3556,12 @@ class App:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
                     prog['u_hdr_enabled'].value = hdr_enabled
+                if 'u_planetshine_enabled' in prog:
+                    prog['u_planetshine_enabled'].value = self.camera.get("planetshine_enabled", True)
+                if 'u_ringshine_enabled' in prog:
+                    prog['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
+                if 'u_ringshine_band_count' in prog:
+                    prog['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 10))
                     
             # --- Prepare and sort atmosphere bodies ---
             sorted_atmos = []
