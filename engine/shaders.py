@@ -397,12 +397,12 @@ float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
     float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
     float k = floor((angle + PI) / TWO_PI);
     float u = clamp(abs(a_mod) / PI, 0.0, 1.0);
-    
+
     // Remap coordinates to texel centers to avoid GL_CLAMP_TO_EDGE flat spots (derivative kinks)
     float u_tex = 0.5 / 128.0 + u * (127.0 / 128.0);
     float v_tex_mapped = 0.5 / 128.0 + v_tex * (127.0 / 128.0);
     float sin_lat_mapped = 0.5 / 64.0 + sin_lat * (63.0 / 64.0);
-    
+
     float base_cdf = texture(u_ringshine_cdf_lut, vec3(u_tex, v_tex_mapped, sin_lat_mapped)).r;
     float signed_cdf = (a_mod < 0.0) ? -base_cdf : base_cdf;
     return 2.0 * k + signed_cdf;
@@ -1550,14 +1550,6 @@ void main() {
             }
 
             if (tau > 0.0) {
-                vec3 V_dir = normalize(u_camera_pos - f_world_pos);
-                vec3 N_dir = normalize(f_normal);
-                float min_view_mu = mix(0.18, 0.04, clamp(raw_a_physical, 0.0, 1.0));
-                float view_mu = max(min_view_mu, abs(dot(N_dir, V_dir)));
-
-                tau /= view_mu;
-                tau_faded /= view_mu;
-
                 total_color_front += plane_color * r_color_front * tau;
                 total_color_back  += plane_color * r_color_back  * tau;
                 total_color_fwd   += plane_color * r_color_fwd   * tau;
@@ -1576,8 +1568,15 @@ void main() {
         return;
     }
 
-    float physical_alpha = 1.0 - exp(-total_tau);
-    float faded_alpha = 1.0 - exp(-total_faded_tau);
+    vec3 V = normalize(u_camera_pos - f_world_pos);
+    vec3 N = normalize(f_normal);
+    float cam_side = dot(N, V);
+
+    float min_cam_mu = mix(0.18, 0.04, clamp(1.0 - exp(-total_tau), 0.0, 1.0));
+    float cosViewRayVertical = max(abs(cam_side), min_cam_mu);
+
+    float physical_alpha = 1.0 - exp(-total_tau / cosViewRayVertical);
+    float faded_alpha = 1.0 - exp(-total_faded_tau / cosViewRayVertical);
 
     vec3 f_color_front = total_color_front / max(1e-6, total_tau);
     vec3 f_color_back  = total_color_back  / max(1e-6, total_tau);
@@ -1587,10 +1586,6 @@ void main() {
     float f_asymmetry = total_asym / max(1e-6, total_tau);
     float f_backscatter = total_backscatter / max(1e-6, total_tau);
 
-
-    vec3 V = normalize(u_camera_pos - f_world_pos);
-    vec3 N = normalize(f_normal);
-    float cam_side = dot(N, V);
 
     // Phase angle for opposition surge: dot(V, L) computed per-star below
     // cos_theta = -dot(L, V) is the scattering angle, but for opposition we need dot(V, L)
@@ -1638,7 +1633,7 @@ void main() {
         float min_light_mu = mix(0.18, 0.04, clamp(f_color.a, 0.0, 1.0));
         float cosViewRayVertical  = max(abs(cam_side),  min_cam_mu);
         float cosLightRayVertical = max(abs(sun_side), min_light_mu);
-        float columnDensity = -log(max(1.0 - f_color.a, 1e-5));
+        float columnDensity = total_tau;
         float viewDensity = columnDensity / cosViewRayVertical;
         float lightDensity = columnDensity / cosLightRayVertical;
         float scatteredLight = 0.0;
@@ -1663,12 +1658,12 @@ void main() {
             float pf_current = GetRingPhaseFunctions(cos_theta, f_color.a);
             float pf_norm = pf_current / max(1e-4, pf_ref);
             if (onLitSide) {
-                single_scatter_s = (1.0 - exp(-lightDensity)) * pf_norm;
+                // Exposure compensation for baked texture photograph
+                single_scatter_s = scatteredLight * pf_norm * 2.0;
                 ms_s = 0.05 * (1.0 - exp(-columnDensity));
             } else {
-                // f_color_back includes unlit transmission curve U(r). Line-of-sight extinction exp(-viewDensity) causes grazing edge-on view to extinguish to dark black.
-                float view_extinction = exp(-viewDensity);
-                single_scatter_s = pf_norm * 0.8 * view_extinction;
+                // Dimmer unlit/transmission side to simulate rock/dense ice absorption
+                single_scatter_s = scatteredLight * pf_norm * 0.2;
                 ms_s = 0.0;
             }
         } else {
@@ -1870,8 +1865,10 @@ void main() {
 
             float irradiance = u_hdr_enabled ? (star_lum / max(dist_host_star * dist_host_star, 1e-8)) : 1.0;
 
-            // Illuminated phase of planet as seen from the ring point: strictly matches planet's illuminated day hemisphere
-            float planet_phase = pow(max(0.0, dot(L_host, -L_planet)), 1.5);
+            // Illuminated phase of planet as seen from the ring point: exact Lambertian spherical phase function
+            float cos_a_p = clamp(dot(L_host, -L_planet), -1.0, 1.0);
+            float a_p = acos(cos_a_p);
+            float planet_phase = (sin(a_p) + (3.141592653589793 - a_p) * cos_a_p) / 3.141592653589793;
 
             // Planetshine flux reaching the ring point
             vec3 planetshine_irradiance = u_host_planet_color * star_color * irradiance * planet_phase * solid_angle * 0.8;
@@ -2089,11 +2086,11 @@ float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
     float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
     float k = floor((angle + PI) / TWO_PI);
     float u = clamp(abs(a_mod) / PI, 0.0, 1.0);
-    
+
     float u_tex = 0.5 / 128.0 + u * (127.0 / 128.0);
     float v_tex_mapped = 0.5 / 128.0 + v_tex * (127.0 / 128.0);
     float sin_lat_mapped = 0.5 / 64.0 + sin_lat * (63.0 / 64.0);
-    
+
     float base_cdf = texture(u_ringshine_cdf_lut, vec3(u_tex, v_tex_mapped, sin_lat_mapped)).r;
     float signed_cdf = (a_mod < 0.0) ? -base_cdf : base_cdf;
     return 2.0 * k + signed_cdf;
@@ -2671,7 +2668,7 @@ void main() {
 
         vec3 total_rayleigh_ps = vec3(0.0);
         vec3 total_mie_ps = vec3(0.0);
-        
+
         vec3 total_rayleigh_rs = vec3(0.0);
         vec3 total_mie_rs = vec3(0.0);
 
@@ -2777,7 +2774,7 @@ void main() {
                 total_rayleigh_ps += rho_R * ps_attenuation * int_factor;
                 total_mie_ps      += rho_M * ps_attenuation * int_factor;
             }
-            
+
             if (u_ringshine_enabled) {
                 vec3 rs_attenuation = current_transmittance;
                 total_rayleigh_rs += rho_R * rs_attenuation * int_factor;
@@ -2822,85 +2819,85 @@ void main() {
             vec3 ringshine_irradiance = vec3(0.0);
             vec3 N = normalize(mid_pos);
             vec3 L_dir = L_mid;
-            
+
             vec3 ring_normal = u_ring_normal[0];
             float sun_elevation = dot(L_dir, ring_normal);
             float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
             float cos_sun_elev = sqrt(1.0 - sin_sun_elev * sin_sun_elev);
-            
+
             vec3 antiL = -L_dir;
             vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
             float len_antiL_eq = length(antiL_eq_raw);
             vec3 antiL_eq = len_antiL_eq > 1e-5 ? antiL_eq_raw / len_antiL_eq : vec3(-1.0, 0.0, 0.0);
-            
+
             vec3 N_eq_raw = N - ring_normal * dot(N, ring_normal);
             float len_N_eq = length(N_eq_raw);
             vec3 N_eq = len_N_eq > 1e-5 ? N_eq_raw / len_N_eq : vec3(1.0, 0.0, 0.0);
-            
+
             vec3 cross_rel = cross(antiL_eq, N_eq);
             float sin_rel = dot(cross_rel, ring_normal);
             float cos_rel = clamp(dot(N_eq, antiL_eq), -1.0, 1.0);
             float phi_center = atan(sin_rel, cos_rel);
-            
+
             float frag_elevation = dot(N, ring_normal);
             float sin_lat = clamp(abs(frag_elevation), 0.001, 0.999);
             float same_hemisphere = sun_elevation * frag_elevation;
             float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
-            
+
             float NdotL = dot(N, L_dir);
             float day_face = smoothstep(0.0, 0.1, NdotL) * max(0.0, NdotL);
             float noon_fade = mix(1.0, 0.4, day_face);
             float face_multiplier = mix(1.0, 1.0 * noon_fade, same_hemi_t);
-            
+
             float host_radius = u_planet_radius_km / u_au_to_km;
             int band_count = clamp(u_ringshine_band_count, 4, 128);
-            
+
             for (int j = 0; j < 1; j++) {
                 if ((u_ring_mask & (1u << j)) == 0u) continue;
                 float inner_r = u_ring_params[j].x;
                 float outer_r = u_ring_params[j].y;
                 float dr = (outer_r - inner_r) / float(band_count);
-                
+
                 for (int m = 0; m < band_count; m++) {
                     float r_mid = inner_r + (float(m) + 0.5) * dr;
                     float frac_mid = (r_mid - inner_r) / max(1e-5, outer_r - inner_r);
                     vec4 ring_texel = texture(u_ring_gradients, vec2(frac_mid, (float(j) + 0.5) / 16.0));
                     if (ring_texel.a < 1e-4) continue;
-                    
+
                     float alpha_val = clamp(ring_texel.a, 0.0, 0.999);
                     float tau_band = -log(max(1e-4, 1.0 - alpha_val));
                     float trans_factor = exp(-tau_band / max(sin_sun_elev, 0.05));
-                    
+
                     vec3 band_color_sunlit = ring_texel.rgb * alpha_val;
                     vec3 band_color_unlit = ring_texel.rgb * trans_factor * alpha_val * 2.0;
-                    vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);                    
+                    vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
                     float norm_r = r_mid / max(1e-5, host_radius);
                     float v_tex = clamp((norm_r - 1.0) / 4.0, 0.0, 1.0);
-                    
+
                     float delta_alpha_shadow = 0.0;
                     if (norm_r <= 1.0 / sin_sun_elev) {
                         float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
                         delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
                     }
-                    
+
                     float psi1 = -delta_alpha_shadow - phi_center;
                     float psi2 = +delta_alpha_shadow - phi_center;
-                    
+
                     float cdf1 = eval_ringshine_cdf(psi1, v_tex, sin_lat);
                     float cdf2 = eval_ringshine_cdf(psi2, v_tex, sin_lat);
                     float shadow_fraction = clamp(0.5 * (cdf2 - cdf1), 0.0, 1.0);
                     float band_illum = max(0.0, 1.0 - shadow_fraction);
-                    
+
                     float u_tex_lut = 0.5 / 256.0 + sin_lat * (255.0 / 256.0);
                     float v_tex_lut = 0.5 / 256.0 + v_tex * (255.0 / 256.0);
                     float kernel_val = texture(u_ringshine_lut, vec2(u_tex_lut, v_tex_lut)).r;
-                    
+
                     ringshine_irradiance += band_color * kernel_val * dr * band_illum;
                 }
             }
             float opacity = u_ring_params[0].z;
             ringshine_irradiance *= (sin_sun_elev * opacity * face_multiplier * 0.318309886 / max(1e-5, host_radius));
-            
+
             float ambient_phase = 1.0 / (4.0 * PI);
             scattered += star_color * u_sun_intensity * irradiance * ringshine_irradiance * (
                 ambient_phase * beta_R * total_rayleigh_rs +

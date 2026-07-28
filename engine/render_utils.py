@@ -328,6 +328,122 @@ def generate_ring_geometry(pole_render, min_r, max_r):
     
     return verts, normals, indices
 
+@njit(cache=True)
+def bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, segment_opacities, segment_shadow_grads):
+    res = len(tex_radii)
+    n_segs = len(segment_inners)
+    combined = np.zeros((res, 4), dtype=np.float32)
+    
+    for i in range(res):
+        r = tex_radii[i]
+        
+        # Accumulate RGB and Alpha for this radius
+        existing_alpha = 0.0
+        existing_r = 0.0
+        existing_g = 0.0
+        existing_b = 0.0
+        
+        for j in range(n_segs):
+            inner = segment_inners[j]
+            outer = segment_outers[j]
+            if r >= inner and r <= outer:
+                # Interpolate in this segment's shadow_grad
+                seg_res = segment_shadow_grads[j].shape[0]
+                t = (r - inner) / max(1e-6, outer - inner)
+                if t < 0.0: t = 0.0
+                if t > 1.0: t = 1.0
+                
+                # Simple linear interpolation
+                idx_float = t * (seg_res - 1)
+                idx_low = int(math.floor(idx_float))
+                idx_high = int(math.ceil(idx_float))
+                weight = idx_float - idx_low
+                
+                grad = segment_shadow_grads[j]
+                
+                # Interpolated RGB and Alpha
+                r_val = (1.0 - weight) * grad[idx_low, 0] + weight * grad[idx_high, 0]
+                g_val = (1.0 - weight) * grad[idx_low, 1] + weight * grad[idx_high, 1]
+                b_val = (1.0 - weight) * grad[idx_low, 2] + weight * grad[idx_high, 2]
+                a_val = (1.0 - weight) * grad[idx_low, 3] + weight * grad[idx_high, 3]
+                
+                seg_alpha = a_val * segment_opacities[j]
+                
+                # Combine alpha (transmittance-based blending)
+                new_alpha = existing_alpha + seg_alpha - existing_alpha * seg_alpha
+                
+                # Blend RGB based on alpha weights
+                total_alpha = existing_alpha + seg_alpha
+                if total_alpha > 1e-6:
+                    existing_r = (existing_r * existing_alpha + r_val * seg_alpha) / total_alpha
+                    existing_g = (existing_g * existing_alpha + g_val * seg_alpha) / total_alpha
+                    existing_b = (existing_b * existing_alpha + b_val * seg_alpha) / total_alpha
+                else:
+                    existing_r = r_val
+                    existing_g = g_val
+                    existing_b = b_val
+                    
+                existing_alpha = new_alpha
+                
+        combined[i, 0] = existing_r
+        combined[i, 1] = existing_g
+        combined[i, 2] = existing_b
+        combined[i, 3] = existing_alpha
+        
+    return combined
+
+
+def bake_unified_shadow_profile(active_rings, min_r, max_r, res=4096):
+    n = len(active_rings)
+    tex_radii = np.linspace(min_r, max_r, res, dtype=np.float32)
+    segment_inners = np.array([r['inner_r'] for r in active_rings], dtype=np.float32)
+    segment_outers = np.array([r['outer_r'] for r in active_rings], dtype=np.float32)
+    segment_opacities = np.array([r['opacity'] for r in active_rings], dtype=np.float32)
+    
+    # Build 3D array of shadow_grads
+    segment_shadow_grads = np.zeros((n, res, 4), dtype=np.float32)
+    for j, ring in enumerate(active_rings):
+        segment_shadow_grads[j] = ring['shadow_grad']
+        
+    return bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, segment_opacities, segment_shadow_grads)
+
+
+def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
+    # Group rings by body
+    rings_by_body = {}
+    for r in ring_precomputed:
+        rings_by_body.setdefault(r['body_idx'], []).append(r)
+        
+    # Assign unified_idx for each body (up to 4)
+    body_indices = {bi: i for i, bi in enumerate(rings_by_body.keys())}
+    
+    ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
+    
+    # 1. Bake unified shadow profile for each body into rows 0 to len(body_indices)-1
+    for bi, unified_idx in body_indices.items():
+        if unified_idx >= 4:
+            break
+        body_rings = rings_by_body[bi]
+        # Filter active rings (opacity >= 0.005)
+        active_rings = [r for r in body_rings if r['opacity'] >= 0.005]
+        if active_rings:
+            min_r = min(r['inner_r'] for r in active_rings)
+            max_r = max(r['outer_r'] for r in active_rings)
+            combined_shadow = bake_unified_shadow_profile(active_rings, min_r, max_r)
+            ring_gradient_data[unified_idx, :, :] = combined_shadow
+            
+    # 2. Copy individual segment profiles into rows 4 to 15
+    for j, ring in enumerate(ring_precomputed):
+        row_idx = 4 + j
+        if row_idx >= 16:
+            break
+        ring_gradient_data[row_idx, :, :] = ring['shadow_grad']
+        ring['row_idx'] = row_idx
+        
+    ring_gradient_tex.write(ring_gradient_data.tobytes())
+    return body_indices
+
+
 def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex):
     rings = [r for r in ring_precomputed if r['body_idx'] == bi]
     
@@ -365,9 +481,7 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
             'num_indices': len(indices),
         })
         
-    ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
-    for j, ring in enumerate(ring_precomputed):
-        if j >= 16: break
-        ring_gradient_data[j, :, :] = ring['shadow_grad']
-    ring_gradient_tex.write(ring_gradient_data.tobytes())
+    body_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
+    return body_indices
+
 

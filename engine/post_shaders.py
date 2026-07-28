@@ -16,6 +16,17 @@ uniform sampler2D u_texture;
 uniform vec2 u_texel_size;
 uniform float u_threshold;
 
+vec3 apply_thresh(vec3 tap, float thresh) {
+    if (thresh <= 0.0) return tap;
+    float brightness = max(tap.r, max(tap.g, tap.b));
+    if (brightness >= thresh) {
+        tap *= smoothstep(thresh, thresh + 0.5, brightness);
+        tap *= 0.2;
+        return tap / (1.0 + tap * 0.05);
+    }
+    return vec3(0.0);
+}
+
 void main() {
     // 13-tap downsample for smooth, anti-aliased bloom extraction
     vec2 texel = u_texel_size;
@@ -40,27 +51,26 @@ void main() {
     // Apply threshold (only on first pass, u_threshold > 0.0)
     // We apply it per-tap rather than post-accumulation to prevent small bright sources
     // from becoming pixelated/blocky after the 13-tap filter smears them.
-    vec3 color = vec3(0.0);
-    
-    vec3 taps[13] = vec3[](a, b, c, d, e, f, g, h, i, j, k, l, m);
-    
     if (u_threshold > 0.0) {
-        for (int idx=0; idx<13; idx++) {
-            float brightness = max(taps[idx].r, max(taps[idx].g, taps[idx].b));
-            if (brightness >= u_threshold) {
-                taps[idx] *= smoothstep(u_threshold, u_threshold + 0.5, brightness);
-                taps[idx] *= 0.2;
-                taps[idx] = taps[idx] / (1.0 + taps[idx] * 0.05);
-            } else {
-                taps[idx] = vec3(0.0);
-            }
-        }
+        a = apply_thresh(a, u_threshold);
+        b = apply_thresh(b, u_threshold);
+        c = apply_thresh(c, u_threshold);
+        d = apply_thresh(d, u_threshold);
+        e = apply_thresh(e, u_threshold);
+        f = apply_thresh(f, u_threshold);
+        g = apply_thresh(g, u_threshold);
+        h = apply_thresh(h, u_threshold);
+        i = apply_thresh(i, u_threshold);
+        j = apply_thresh(j, u_threshold);
+        k = apply_thresh(k, u_threshold);
+        l = apply_thresh(l, u_threshold);
+        m = apply_thresh(m, u_threshold);
     }
     
-    color = taps[4] * 0.125;
-    color += (taps[0]+taps[2]+taps[6]+taps[8])*0.03125;
-    color += (taps[1]+taps[3]+taps[5]+taps[7])*0.0625;
-    color += (taps[9]+taps[10]+taps[11]+taps[12])*0.125;
+    vec3 color = e * 0.125;
+    color += (a + c + g + i) * 0.03125;
+    color += (b + d + f + h) * 0.0625;
+    color += (j + k + l + m) * 0.125;
     
     out_color = vec4(color, 1.0);
 }

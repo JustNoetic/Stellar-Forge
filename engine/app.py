@@ -303,42 +303,145 @@ def _build_tex_idx_arr(bodies_data, texture_slices):
     return arr
 
 
-def _build_rot_period_arr(bodies_data):
-    """Build per-body rotation period in seconds.
-
-    If a body has an explicit ``rotation_period`` (hours), use it. Otherwise apply
-    the tidal-locking criterion used by the Body Inspector: when the body's
-    semi-major axis is inside the tidal-lock radius estimated from the
-    parent/body mass ratio and body radius, set the rotation period equal to the
-    orbital period (synchronous rotation). Falls back to 24h otherwise.
+def _build_rotation_props(bodies_data):
+    """Build per-body rotation properties:
+    - rot_period_arr: period in seconds
+    - w0_arr: initial prime meridian angle W0 at epoch (radians)
+    - tidally_locked_arr: boolean mask for tidal locking
+    - parent_idx_arr: index of parent body (-1 if root/none)
+    - pole_n_arr: precomputed unit vector of body rotation axis in render space
+    - tangent_arr: precomputed tangent basis vector
+    - bitangent_arr: precomputed bitangent basis vector
     """
     n = len(bodies_data)
-    # name -> mass (M_sun) for parent lookup
-    mass_by_name = {}
-    for b in bodies_data:
-        mass_by_name[b.get('name')] = float(b.get('m', 0.0))
-    arr = np.zeros(n, dtype='f4')
+    name_to_idx = {b.get('name'): i for i, b in enumerate(bodies_data)}
+    mass_by_name = {b.get('name'): float(b.get('m', 0.0)) for b in bodies_data}
+    
+    rot_period_arr = np.zeros(n, dtype='f4')
+    w0_arr = np.zeros(n, dtype='f4')
+    tidally_locked_arr = np.zeros(n, dtype=bool)
+    parent_idx_arr = np.full(n, -1, dtype=int)
+    
+    pole_n_arr = np.zeros((n, 3), dtype='f8')
+    tangent_arr = np.zeros((n, 3), dtype='f8')
+    bitangent_arr = np.zeros((n, 3), dtype='f8')
+    
     for i, b in enumerate(bodies_data):
+        parent_name = b.get('parent', b.get('parentId'))
+        if parent_name in name_to_idx:
+            parent_idx_arr[i] = name_to_idx[parent_name]
+            
+        w0_deg = b.get('W0', 0.0)
+        w0_arr[i] = math.radians(float(w0_deg))
+        
+        is_locked = b.get('tidally_locked', False)
         r_hours = b.get('rotation_period', None)
+        
+        if is_locked or b.get('type') == 'Moon':
+            tidally_locked_arr[i] = True
+            
         if r_hours is None or r_hours == 0.0:
-            # Try tidal locking: needs a parent, a positive mass and a radius.
-            parent_name = b.get('parent', b.get('parentId'))
             body_m = float(b.get('m', 0.0))
-            r_rsun = float(b.get('r', 0.0))  # radius in solar radii
+            r_rsun = float(b.get('r', 0.0))
             a_val = float(b.get('a', 0.0))
             parent_m = mass_by_name.get(parent_name, 0.0) if parent_name else 0.0
             if parent_m > 0.0 and body_m > 0.0 and r_rsun > 0.0 and a_val > 0.0:
                 r_km = r_rsun * SOLAR_RADIUS_KM
                 r_tid = 0.00084 * ((parent_m ** 2 / body_m) ** (1.0 / 6.0)) * math.sqrt(r_km)
                 if a_val < r_tid:
-                    # Synchronous rotation: rotation period == orbital period.
+                    tidally_locked_arr[i] = True
                     total_m = parent_m + body_m
                     p_years = math.sqrt(a_val ** 3 / total_m) if total_m > 0.0 else 0.0
                     r_hours = p_years * 365.25 * 24.0
             if r_hours is None or r_hours == 0.0:
-                r_hours = 24.0  # fallback
-        arr[i] = r_hours * 3600.0
-    return arr
+                r_hours = 24.0
+                
+        rot_period_arr[i] = float(r_hours) * 3600.0
+        
+        # Precompute pole vectors
+        pole_ra = float(b.get('pole_ra', 0.0))
+        pole_dec = float(b.get('pole_dec', 90.0))
+        pole_ecl = pole_to_ecliptic(pole_ra, pole_dec)
+        pole_ren = np.array([pole_ecl[0], pole_ecl[2], -pole_ecl[1]], dtype=np.float64)
+        pole_norm = np.linalg.norm(pole_ren)
+        pole_n = pole_ren / pole_norm if pole_norm > 0 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        if abs(np.dot(pole_n, ref)) > 0.999:
+            ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        tangent = np.cross(pole_n, ref)
+        t_norm = np.linalg.norm(tangent)
+        if t_norm > 0:
+            tangent /= t_norm
+        bitangent = np.cross(pole_n, tangent)
+        b_norm = np.linalg.norm(bitangent)
+        if b_norm > 0:
+            bitangent /= b_norm
+            
+        pole_n_arr[i] = pole_n
+        tangent_arr[i] = tangent
+        bitangent_arr[i] = bitangent
+        
+    return rot_period_arr, w0_arr, tidally_locked_arr, parent_idx_arr, pole_n_arr, tangent_arr, bitangent_arr
+
+
+@njit(cache=True)
+def compute_body_rotation_angles_jit(sim_t_sec, rot_period_arr, w0_arr, tidally_locked_arr, parent_idx_arr, pos_snap_render, pole_n_arr, tangent_arr, bitangent_arr):
+    n = len(rot_period_arr)
+    angles = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        if tidally_locked_arr[i] and parent_idx_arr[i] >= 0:
+            p_idx = parent_idx_arr[i]
+            r_moon = pos_snap_render[i]
+            r_parent = pos_snap_render[p_idx]
+            
+            # to_parent vector
+            to_parent_x = r_parent[0] - r_moon[0]
+            to_parent_y = r_parent[1] - r_moon[1]
+            to_parent_z = r_parent[2] - r_moon[2]
+            
+            norm = math.sqrt(to_parent_x*to_parent_x + to_parent_y*to_parent_y + to_parent_z*to_parent_z)
+            if norm > 1e-12:
+                to_parent_nx = to_parent_x / norm
+                to_parent_ny = to_parent_y / norm
+                to_parent_nz = to_parent_z / norm
+                
+                pole_n = pole_n_arr[i]
+                tangent = tangent_arr[i]
+                bitangent = bitangent_arr[i]
+                
+                # dot product of to_parent_n and pole_n
+                dot_val = to_parent_nx * pole_n[0] + to_parent_ny * pole_n[1] + to_parent_nz * pole_n[2]
+                
+                # d_eq = to_parent_n - dot_val * pole_n
+                d_eq_x = to_parent_nx - dot_val * pole_n[0]
+                d_eq_y = to_parent_ny - dot_val * pole_n[1]
+                d_eq_z = to_parent_nz - dot_val * pole_n[2]
+                
+                d_norm = math.sqrt(d_eq_x*d_eq_x + d_eq_y*d_eq_y + d_eq_z*d_eq_z)
+                if d_norm > 1e-12:
+                    d_eq_nx = d_eq_x / d_norm
+                    d_eq_ny = d_eq_y / d_norm
+                    d_eq_nz = d_eq_z / d_norm
+                    
+                    # dot with tangent and bitangent
+                    cos_w = d_eq_nx * tangent[0] + d_eq_ny * tangent[1] + d_eq_nz * tangent[2]
+                    sin_w = d_eq_nx * bitangent[0] + d_eq_ny * bitangent[1] + d_eq_nz * bitangent[2]
+                    
+                    angles[i] = math.atan2(sin_w, cos_w)
+                else:
+                    angles[i] = w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
+            else:
+                angles[i] = w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
+        else:
+            w0 = w0_arr[i]
+            p_sec = rot_period_arr[i]
+            if p_sec != 0.0:
+                angles[i] = w0 + (sim_t_sec / p_sec) * (2.0 * math.pi)
+            else:
+                angles[i] = w0
+    return angles
+
 
 
 @njit
@@ -1608,16 +1711,12 @@ class App:
                         'row_idx': len(ring_precomputed),
                     })
     
-        ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
-        ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
-        for j, ring in enumerate(ring_precomputed):
-            if j >= 16: break
-            ring_gradient_data[j, :, :] = ring['shadow_grad']
-        
-        ring_gradient_tex = ctx.texture((4096, 16), 4, ring_gradient_data.tobytes(), dtype='f4')
+        ring_gradient_tex = ctx.texture((4096, 16), 4, dtype='f4')
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
+        self.body_ring_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
+
 
         def build_ringshine_lut(ctx):
             res_x, res_y = 256, 256
@@ -1853,14 +1952,11 @@ class App:
         for i, b in enumerate(bodies_data):
             if b.get('type') == 'Star':
                 is_star_arr[i] = 1.0
-        tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
-        rot_period_arr = _build_rot_period_arr(bodies_data)
-        # Store as instance attrs so they get rebuilt on system switch.
-        self.tex_idx_arr = tex_idx_arr
-        self.rot_period_arr = rot_period_arr
-        # Build matching arrays for the comparison system.
+        self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
+        self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, self.pole_n_arr, self.tangent_arr, self.bitangent_arr = _build_rotation_props(bodies_data)
         self.tex_idx_arr_cmp = _build_tex_idx_arr(bodies_data_cmp, self.texture_slices)
-        self.rot_period_arr_cmp = _build_rot_period_arr(bodies_data_cmp)
+        self.rot_period_arr_cmp, self.w0_arr_cmp, self.tidally_locked_arr_cmp, self.parent_idx_arr_cmp, self.pole_n_arr_cmp, self.tangent_arr_cmp, self.bitangent_arr_cmp = _build_rotation_props(bodies_data_cmp)
+
         
         non_star_mask = is_star_arr == 0.0
         non_star_indices = np.where(non_star_mask)[0]
@@ -2136,7 +2232,8 @@ class App:
                         is_star_arr[i] = 1.0
                 # Rebuild texture/rotation arrays for the new system bodies.
                 self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
-                self.rot_period_arr = _build_rot_period_arr(bodies_data)
+                self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, self.pole_n_arr, self.tangent_arr, self.bitangent_arr = _build_rotation_props(bodies_data)
+
                 non_star_mask = is_star_arr == 0.0
                 non_star_indices = np.where(non_star_mask)[0]
                 n_casters_fixed = len(non_star_indices)
@@ -2296,13 +2393,8 @@ class App:
                                 'tex_sampled': None, '5colors': colors5, 'is_textured': False, 'row_idx': len(ring_precomputed),
                             })
     
-                ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
-                # Rebuild ring render groups
-                ring_gradient_data_sw = np.zeros((16, 4096, 4), dtype='f4')
-                for j, ring in enumerate(ring_precomputed):
-                    if j >= 16: break
-                    ring_gradient_data_sw[j, :] = ring['shadow_grad']
-                ring_gradient_tex.write(ring_gradient_data_sw.tobytes())
+                self.body_ring_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
+
     
                 rings_by_body_sw = {}
                 for ring in ring_precomputed:
@@ -2375,7 +2467,8 @@ class App:
                         self.is_star_arr_cmp[i] = 1.0
                 # Rebuild comparison texture/rotation arrays for the new system bodies.
                 self.tex_idx_arr_cmp = _build_tex_idx_arr(self.bodies_data_cmp, self.texture_slices)
-                self.rot_period_arr_cmp = _build_rot_period_arr(self.bodies_data_cmp)
+                self.rot_period_arr_cmp, self.w0_arr_cmp, self.tidally_locked_arr_cmp, self.parent_idx_arr_cmp, self.pole_n_arr_cmp, self.tangent_arr_cmp, self.bitangent_arr_cmp = _build_rotation_props(self.bodies_data_cmp)
+
                 
                 last_orbit_pos_snap_cmp = None
                 last_comparison_offset_au = None
@@ -2531,7 +2624,8 @@ class App:
                             focused_mask = np.append(focused_mask, False)
                             # Grow texture/rotation arrays for the new body.
                             self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
-                            self.rot_period_arr = _build_rot_period_arr(bodies_data)
+                            self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, self.pole_n_arr, self.tangent_arr, self.bitangent_arr = _build_rotation_props(bodies_data)
+
                             
                             non_star_indices = np.where(is_star_arr == 0.0)[0]
                             n_casters_fixed = len(non_star_indices)
@@ -2572,7 +2666,8 @@ class App:
                             focused_mask = np.delete(focused_mask, idx)
                             # Keep texture/rotation arrays in sync after deletion.
                             self.tex_idx_arr = _build_tex_idx_arr(bodies_data, self.texture_slices)
-                            self.rot_period_arr = _build_rot_period_arr(bodies_data)
+                            self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, self.pole_n_arr, self.tangent_arr, self.bitangent_arr = _build_rotation_props(bodies_data)
+
                             
                             if star_idx == idx:
                                 star_idx = 0
@@ -2601,7 +2696,8 @@ class App:
                             for r in ring_precomputed:
                                 if r['body_idx'] > idx: r['body_idx'] -= 1
                                 
-                            ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
+                            self.body_ring_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
+
                             ring_render_groups = [g for g in ring_render_groups if g['body_idx'] != idx]
                             for g in ring_render_groups:
                                 if g['body_idx'] > idx: g['body_idx'] -= 1
@@ -3024,21 +3120,37 @@ class App:
             ring_colors_buf[:] = 0
             ring_5colors_buf[:] = 0
             
-            for ring in ring_precomputed:
-                if n_ring_planes >= 16:
+            n_ring_planes = len(self.body_ring_indices)
+            for bi, unified_idx in self.body_ring_indices.items():
+                if unified_idx >= 16:
                     break
-                bi = ring['body_idx']
-                ring_centers_buf[n_ring_planes] = pos_rel_all[bi]
-                ring_normals_buf[n_ring_planes] = ring['pole']
-                ring_params_buf[n_ring_planes, 0] = ring['inner_r']
-                ring_params_buf[n_ring_planes, 1] = ring['outer_r']
-                ring_params_buf[n_ring_planes, 2] = ring['opacity']
-                ring_colors_buf[n_ring_planes, 0:3] = ring['raw_color']
-                if '5colors' in ring:
-                    ring_5colors_buf[n_ring_planes, :, :] = ring['5colors']
+                body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                active_rings = [r for r in body_rings if r['opacity'] >= 0.005]
+                
+                if active_rings:
+                    min_r = min(r['inner_r'] for r in active_rings)
+                    max_r = max(r['outer_r'] for r in active_rings)
+                    opacity = 0.63212055
+                    pole = active_rings[0]['pole']
+                    raw_color = active_rings[0]['raw_color']
+                    colors5 = active_rings[0].get('5colors', raw_color)
                 else:
-                    ring_5colors_buf[n_ring_planes, :, :] = ring['raw_color']
-                n_ring_planes += 1
+                    min_r, max_r, opacity = 0.0, 0.0, 0.0
+                    pole = body_rings[0]['pole'] if body_rings else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    raw_color = (0.0, 0.0, 0.0)
+                    colors5 = raw_color
+                    
+                ring_centers_buf[unified_idx] = pos_rel_all[bi]
+                ring_normals_buf[unified_idx] = pole
+                ring_params_buf[unified_idx, 0] = min_r
+                ring_params_buf[unified_idx, 1] = max_r
+                ring_params_buf[unified_idx, 2] = opacity
+                ring_colors_buf[unified_idx, 0:3] = raw_color
+                if isinstance(colors5, np.ndarray):
+                    ring_5colors_buf[unified_idx, :, :] = colors5
+                else:
+                    ring_5colors_buf[unified_idx, :, :] = raw_color
+
             
             ring_coplanar_mask_buf[:] = compute_ring_coplanar_masks(n_ring_planes, ring_centers_buf, ring_normals_buf)
     
@@ -3137,7 +3249,12 @@ class App:
                 all_instances[:num_bodies, 19] = visual_arr[:, 12]
                 all_instances[:num_bodies, 23] = visual_arr[:, 13]
                 all_instances[:num_bodies, 24] = self.tex_idx_arr[:num_bodies]
-                all_instances[:num_bodies, 25] = ((self.shared_state["t"] * 31557600.0) / self.rot_period_arr[:num_bodies]) * (2.0 * math.pi)
+                sim_t_sec = float(self.shared_state["t"]) * 31557600.0
+                all_instances[:num_bodies, 25] = compute_body_rotation_angles_jit(
+                    sim_t_sec, self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr
+                )
+
+
             
             if self.comparison_enabled:
                 cmp_pos_rel = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -3152,7 +3269,12 @@ class App:
                     all_instances[num_bodies:, 23] = self.visual_arr_cmp[:, 13]
                 # Texture slice index + spin angle for comparison bodies (independent clock).
                 all_instances[num_bodies:, 24] = self.tex_idx_arr_cmp[:self.num_bodies_cmp]
-                all_instances[num_bodies:, 25] = ((cmp_sim_t * 31557600.0) / self.rot_period_arr_cmp[:self.num_bodies_cmp]) * (2.0 * math.pi)
+                cmp_t_sec = float(cmp_sim_t) * 31557600.0
+                all_instances[num_bodies:, 25] = compute_body_rotation_angles_jit(
+                    cmp_t_sec, self.rot_period_arr_cmp, self.w0_arr_cmp, self.tidally_locked_arr_cmp, self.parent_idx_arr_cmp, self.pos_snap_cmp, self.pole_n_arr_cmp, self.tangent_arr_cmp, self.bitangent_arr_cmp
+                )
+
+
             
             # Precalculate planetshine bounce light direction & color on CPU using Numba
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
@@ -4010,7 +4132,7 @@ class App:
                                 u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
-                        k = ring_idx_by_body.get(bi)
+                        k = self.body_ring_indices.get(bi)
                         if k is not None:
                             u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
                             u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
@@ -6241,11 +6363,11 @@ class App:
                                         
                                         shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=ring_item.get('tex_sampled'))
                                         ring_item['shadow_grad'] = shadow_grad
-                                        rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+                                        self.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
                                     
                                     if imgui.button(f"Remove Layer##{i}"):
                                         ring_precomputed[:] = [r for r in ring_precomputed if r is not ring_item]
-                                        rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+                                        self.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
                                     
                                     imgui.tree_pop()
                                     
@@ -6268,7 +6390,7 @@ class App:
                                         'raw_color': color, 'gradient': grad,
                                         'row_idx': len(ring_precomputed)
                                     })
-                                    rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+                                    self.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
                     
                 imgui.end()
     
