@@ -571,12 +571,14 @@ class App:
             "atmo_quality": 1,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
+            "atmo_jitter": True,
             "show_orbits": True,
             "orbit_fade_dir_idx": 0,
             "orbit_min_alpha": 0.3,
             "show_habitable_zone": False,
             "planetshine_enabled": True,
             "ringshine_enabled": True,
+            "ringshine_band_count": 10,
             "bloom_intensity": 0.05,
             "bloom_threshold": 1.0,
             "msaa_samples": 4,
@@ -668,6 +670,7 @@ class App:
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
+                "atmo_jitter": self.camera.get("atmo_jitter", True),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
@@ -679,6 +682,7 @@ class App:
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
                 "planetshine_enabled": self.camera.get("planetshine_enabled", True),
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
+                "ringshine_band_count": self.camera.get("ringshine_band_count", 10),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
@@ -1429,34 +1433,6 @@ class App:
         self.hz_vao = ctx.vertex_array(self.prog_hz, [(self.hz_vbo, '3f', 'in_position')])
         self.hz_num_vertices = len(vertices) // 3
 
-        def build_eclipse_lut(ctx):
-            LUT_SIZE = 256
-            x_arr = np.linspace(0.0, 2.0, LUT_SIZE, dtype='f4')
-            y_arr = np.linspace(0.0, 1.0, LUT_SIZE, dtype='f4')
-            x_grid, y_grid = np.meshgrid(x_arr, y_arr, indexing='xy')
-            x_safe = np.maximum(x_grid, 1e-9)
-            d1 = (1.0 - y_grid**2 + x_grid**2) / (2.0 * x_safe)
-            d2 = x_grid - d1
-            theta1 = 2.0 * np.arccos(np.clip(d1, -1.0, 1.0))
-            theta2 = 2.0 * np.arccos(np.clip(d2 / np.maximum(y_grid, 1e-9), -1.0, 1.0))
-            area = 0.5 * ( (theta1 - np.sin(theta1)) + y_grid**2 * (theta2 - np.sin(theta2)) )
-            area = np.where(x_grid >= 1.0 + y_grid, 0.0, area)
-            area = np.where(x_grid <= 1.0 - y_grid, math.pi * y_grid**2, area)
-            area_frac = area / math.pi
-            lut_data = area_frac.astype('f4').tobytes()
-            lut_tex = ctx.texture((LUT_SIZE, LUT_SIZE), 1, lut_data, dtype='f4')
-            lut_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            lut_tex.repeat_x = False
-            lut_tex.repeat_y = False
-            return lut_tex
-            
-        eclipse_lut_tex = build_eclipse_lut(ctx)
-        eclipse_lut_tex.use(location=2)
-        
-        if 'u_eclipse_lut' in prog_spheres: prog_spheres['u_eclipse_lut'].value = 2
-        if 'u_eclipse_lut' in prog_rings: prog_rings['u_eclipse_lut'].value = 2
-        if 'u_eclipse_lut' in prog_atmo: prog_atmo['u_eclipse_lut'].value = 2
-        
         self.prog_atmo_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=atmo_lut_fragment_shader)
         self.prog_multi_scatter_lut = ctx.program(vertex_shader=atmo_lut_vertex_shader, fragment_shader=multi_scatter_lut_fragment_shader)
         lut_vbo = ctx.buffer(np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4'))
@@ -1638,6 +1614,69 @@ class App:
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
+
+        def build_ringshine_lut(ctx):
+            res_x, res_y = 256, 256
+            sin_lats = np.linspace(0.001, 0.999, res_x, dtype=np.float32)
+            radii = np.linspace(1.001, 5.0, res_y, dtype=np.float32)
+
+            sin_lat_grid = sin_lats[None, :]
+            cos_lat_grid = np.sqrt(np.maximum(0.0, 1.0 - sin_lat_grid**2))
+            r_grid = radii[:, None]
+
+            num_alpha = 180
+            alpha = np.linspace(0.0, 2.0 * np.pi, num_alpha, endpoint=False, dtype=np.float32)[:, None, None]
+
+            cos_alpha = np.cos(alpha)
+            d2 = r_grid**2 + 1.0 - 2.0 * r_grid * cos_lat_grid * cos_alpha
+            d = np.sqrt(np.maximum(d2, 1e-6))
+
+            ndotl = np.maximum(0.0, (r_grid * cos_lat_grid * cos_alpha - 1.0) / d)
+            ring_mu = sin_lat_grid / d
+
+            d_alpha = (2.0 * np.pi) / num_alpha
+            diff_irradiance = (ndotl * ring_mu / np.maximum(d2, 1e-6)) * r_grid * d_alpha
+
+            lut_data = np.sum(diff_irradiance, axis=0, dtype=np.float32)
+
+            tex = ctx.texture((res_x, res_y), 1, lut_data.tobytes(), dtype='f4')
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            tex.repeat_x = False
+            tex.repeat_y = False
+
+            # Precompute 3D Cumulative Distribution Function (CDF) Texture (64x128x128)
+            res_cdf_lat, res_cdf_r, res_cdf_theta = 64, 128, 128
+            cdf_sin_lats = np.linspace(0.001, 0.999, res_cdf_lat, dtype=np.float32)[:, None, None]
+            cdf_cos_lats = np.sqrt(np.maximum(0.0, 1.0 - cdf_sin_lats**2))
+            cdf_radii = np.linspace(1.001, 5.0, res_cdf_r, dtype=np.float32)[None, :, None]
+            cdf_thetas = np.linspace(0.0, np.pi, res_cdf_theta, dtype=np.float32)[None, None, :]
+
+            cdf_cos_alpha = np.cos(cdf_thetas)
+            cdf_d2 = cdf_radii**2 + 1.0 - 2.0 * cdf_radii * cdf_cos_lats * cdf_cos_alpha
+            cdf_d = np.sqrt(np.maximum(cdf_d2, 1e-6))
+
+            cdf_ndotl = np.maximum(0.0, (cdf_radii * cdf_cos_lats * cdf_cos_alpha - 1.0) / cdf_d)
+            cdf_ring_mu = cdf_sin_lats / cdf_d
+            cdf_d_alpha = np.pi / max(1, res_cdf_theta - 1)
+            cdf_diff_irrad = (cdf_ndotl * cdf_ring_mu / np.maximum(cdf_d2, 1e-6)) * cdf_radii * cdf_d_alpha
+
+            # Smooth trapezoidal integration for C1 continuous CDF
+            trapz_step = 0.5 * (cdf_diff_irrad[:, :, :-1] + cdf_diff_irrad[:, :, 1:])
+            cdf_cum_irrad = np.zeros_like(cdf_diff_irrad)
+            cdf_cum_irrad[:, :, 1:] = np.cumsum(trapz_step, axis=2)
+
+            cdf_totals = cdf_cum_irrad[:, :, -1:]
+            cdf_normalized = np.where(cdf_totals > 1e-12, cdf_cum_irrad / cdf_totals, 1.0).astype(np.float32)
+
+            cdf_tex = ctx.texture3d((res_cdf_theta, res_cdf_r, res_cdf_lat), 1, cdf_normalized.tobytes(), dtype='f4')
+            cdf_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            cdf_tex.repeat_x = False
+            cdf_tex.repeat_y = False
+            cdf_tex.repeat_z = False
+
+            return tex, cdf_tex
+
+        ringshine_lut_tex, ringshine_cdf_tex = build_ringshine_lut(ctx)
     
         ring_render_groups = []
         rings_by_body_init = {}
@@ -1755,6 +1794,10 @@ class App:
         uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
         if 'u_ring_gradients' in prog_spheres:
             prog_spheres['u_ring_gradients'].value = 0
+        if 'u_ringshine_lut' in prog_spheres:
+            prog_spheres['u_ringshine_lut'].value = 6
+        if 'u_ringshine_cdf_lut' in prog_spheres:
+            prog_spheres['u_ringshine_cdf_lut'].value = 7
     
         star_idx = 0
         for i, b in enumerate(bodies_data):
@@ -1790,6 +1833,7 @@ class App:
         u_atmo_ring_params = prog_atmo.get('u_ring_params', None)
         u_atmo_ring_coplanar_mask = prog_atmo.get('u_ring_coplanar_mask', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
+        u_atmo_jitter = prog_atmo.get('u_atmo_jitter', None)
 
         self.atmo_ssbo = ctx.buffer(reserve=576)
         self.atmo_ssbo.bind_to_storage_buffer(binding=8)
@@ -1861,7 +1905,7 @@ class App:
         orbit_fade_dir_idx = self.camera.get("orbit_fade_dir_idx", 0)
         orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
         orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
-        atmo_quality = self.camera.get("atmo_quality", 1)
+        atmo_quality = min(self.camera.get("atmo_quality", 1), 2)
         now_dt = datetime.datetime.now()
         jump_date = [now_dt.year, now_dt.month, now_dt.day, now_dt.hour, now_dt.minute]
         scrub_index = [0]
@@ -2148,28 +2192,105 @@ class App:
                     tangent_r /= np.linalg.norm(tangent_r)
                     bitangent_r = np.cross(pole_n_r, tangent_r)
                     R_ring_sw = np.column_stack([tangent_r, pole_n_r, bitangent_r])
-                    for ring_seg in rings_data_r:
-                        inner_r = ring_seg['inner'] * body_radius_au_r
-                        outer_r = ring_seg['outer'] * body_radius_au_r
-                        r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
-                        r_opacity = ring_seg.get('opacity', 1.0)
-                        r_scatter = ring_seg.get('scatter', 2.5)
-                        r_asymmetry = ring_seg.get('asymmetry', 0.7)
-                        r_backscatter = ring_seg.get('backscatter', -0.3)
-                        sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                        name_lower_sw = bodies_data[body_idx_r]['name'].lower()
-                        tex_sampled_sw = None
-                        if name_lower_sw in self.ring_textures:
-                            img_data = np.frombuffer(self.ring_textures[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
-                            tex_sampled_sw = img_data.reshape(4096, 4)
-                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled_sw)
+                    b_data_sw = bodies_data[body_idx_r]
+                    name_lower_sw = b_data_sw['name'].lower()
+                    
+                    if name_lower_sw in self.ring_textures_front and len(rings_data_r) > 0:
+                        tex_inner_f = b_data_sw.get('ring_texture_inner')
+                        tex_outer_f = b_data_sw.get('ring_texture_outer')
+                        
+                        if tex_inner_f is not None and tex_outer_f is not None:
+                            tex_min_inner = float(tex_inner_f)
+                            tex_max_outer = float(tex_outer_f)
+                            procedural_segments = [seg for seg in rings_data_r if seg['outer'] <= tex_min_inner + 1e-4 or seg['inner'] >= tex_max_outer - 1e-4]
+                        else:
+                            tex_min_inner = min(seg['inner'] for seg in rings_data_r)
+                            tex_max_outer = max(seg['outer'] for seg in rings_data_r)
+                            procedural_segments = []
+                            
+                        inner_r = tex_min_inner * body_radius_au_r
+                        outer_r = tex_max_outer * body_radius_au_r
+                        
+                        textured_segs = [seg for seg in rings_data_r if seg['inner'] >= tex_min_inner - 1e-4 and seg['outer'] <= tex_max_outer + 1e-4]
+                        if not textured_segs:
+                            textured_segs = rings_data_r
+                            
+                        total_w = 0.0
+                        sum_scatter = 0.0
+                        sum_asymmetry = 0.0
+                        sum_backscatter = 0.0
+                        
+                        for seg in textured_segs:
+                            w = seg.get('opacity', 1.0) * (seg['outer'] - seg['inner'])
+                            if w < 1e-9: w = 1e-9
+                            total_w += w
+                            sum_scatter += seg.get('scatter', 2.5) * w
+                            sum_asymmetry += seg.get('asymmetry', 0.7) * w
+                            sum_backscatter += seg.get('backscatter', -0.3) * w
+                            
+                        r_color = (1.0, 1.0, 1.0)
+                        r_opacity = 1.0
+                        if total_w > 0.0:
+                            r_scatter = sum_scatter / total_w
+                            r_asymmetry = sum_asymmetry / total_w
+                            r_backscatter = sum_backscatter / total_w
+                        else:
+                            first = textured_segs[0]
+                            r_scatter = first.get('scatter', 2.5)
+                            r_asymmetry = first.get('asymmetry', 0.7)
+                            r_backscatter = first.get('backscatter', -0.3)
+                        
+                        img_data = np.frombuffer(self.ring_textures_front[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                        img_data = img_data.reshape(4096, 4)
+                        tex_sampled_sw = img_data
+                        
+                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient=[], tex_sampled=tex_sampled_sw)
+                        colors5 = compute_5_ring_colors(tex_sampled=tex_sampled_sw, raw_color=r_color)
+                        
                         ring_precomputed.append({
                             'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
                             'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
-                            'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
-                            'tex_sampled': tex_sampled_sw,
-                            'row_idx': len(ring_precomputed),
+                            'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': [],
+                            'tex_sampled': tex_sampled_sw, '5colors': colors5, 'is_textured': True, 'row_idx': len(ring_precomputed)
                         })
+                        
+                        for ring_seg in procedural_segments:
+                            p_inner_r = ring_seg['inner'] * body_radius_au_r
+                            p_outer_r = ring_seg['outer'] * body_radius_au_r
+                            p_r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
+                            p_r_opacity = ring_seg.get('opacity', 1.0)
+                            p_r_scatter = ring_seg.get('scatter', 2.5)
+                            p_r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                            p_r_backscatter = ring_seg.get('backscatter', -0.3)
+                            
+                            sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
+                            shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                            colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=p_r_color, gradient=sorted_gradient)
+                            
+                            ring_precomputed.append({
+                                'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': p_inner_r, 'outer_r': p_outer_r,
+                                'opacity': p_r_opacity, 'scatter': p_r_scatter, 'asymmetry': p_r_asymmetry, 'backscatter': p_r_backscatter,
+                                'shadow_grad': shadow_grad_r, 'raw_color': p_r_color, 'gradient': sorted_gradient,
+                                'tex_sampled': None, '5colors': colors5, 'is_textured': False, 'row_idx': len(ring_precomputed)
+                            })
+                    else:
+                        for ring_seg in rings_data_r:
+                            inner_r = ring_seg['inner'] * body_radius_au_r
+                            outer_r = ring_seg['outer'] * body_radius_au_r
+                            r_color = hex_to_rgb(ring_seg.get('color', '#ffffff'))
+                            r_opacity = ring_seg.get('opacity', 1.0)
+                            r_scatter = ring_seg.get('scatter', 2.5)
+                            r_asymmetry = ring_seg.get('asymmetry', 0.7)
+                            r_backscatter = ring_seg.get('backscatter', -0.3)
+                            sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
+                            shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                            colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=r_color, gradient=sorted_gradient)
+                            ring_precomputed.append({
+                                'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
+                                'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
+                                'shadow_grad': shadow_grad_r, 'raw_color': r_color, 'gradient': sorted_gradient,
+                                'tex_sampled': None, '5colors': colors5, 'is_textured': False, 'row_idx': len(ring_precomputed),
+                            })
     
                 ring_idx_by_body = {r['body_idx']: i for i, r in enumerate(ring_precomputed)}
                 # Rebuild ring render groups
@@ -3394,6 +3515,8 @@ class App:
                 prog_spheres['u_camera_pos'].value = tuple(cam_pos)
             if 'u_ringshine_enabled' in prog_spheres:
                 prog_spheres['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
+            if 'u_ringshine_band_count' in prog_spheres:
+                prog_spheres['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 10))
             if uniform_caster_max_bend is not None:
                 uniform_caster_max_bend.write(caster_max_bend_buf)
             if u_ring_caster_max_bend is not None:
@@ -3423,6 +3546,8 @@ class App:
             uniform_orbit_depth_C.value = depth_C
     
             ring_gradient_tex.use(location=0)
+            ringshine_lut_tex.use(location=6)
+            ringshine_cdf_tex.use(location=7)
             
             # Pass Exposure and HDR setting to shaders
             exposure = self.camera.get("exposure", 1.0)
@@ -3633,6 +3758,8 @@ class App:
                 
                 if u_atmo_clip_mode is not None:
                     u_atmo_clip_mode.value = clip_mode
+                if u_atmo_jitter is not None:
+                    u_atmo_jitter.value = 1 if self.camera.get("atmo_jitter", True) else 0
     
                 # Pre-build lookup tables outside the loop
                 atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
@@ -4196,11 +4323,15 @@ class App:
                 if expanded:
                     settings_changed = False
                     # Atmosphere Quality
-                    changed_aq, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Extreme (Brute Force)"])
+                    changed_aq, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)"])
                     if changed_aq:
                         self.camera["atmo_quality"] = atmo_quality
                         settings_changed = True
                     
+                    if atmo_quality > 2:
+                        atmo_quality = 2
+                        self.camera["atmo_quality"] = 2
+                        settings_changed = True
                     if atmo_quality > 0:
                         max_steps = self.camera.get("atmo_steps_max", 32)
                         changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
@@ -4212,6 +4343,12 @@ class App:
                         changed_adapt, adaptive_steps = imgui.checkbox("Adaptive Step Count", adaptive_steps)
                         if changed_adapt:
                             self.camera["atmo_adaptive_steps"] = adaptive_steps
+                            settings_changed = True
+
+                        atmo_jitter = self.camera.get("atmo_jitter", True)
+                        changed_jit, atmo_jitter = imgui.checkbox("Interleaved Gradient Noise (IGN)", atmo_jitter)
+                        if changed_jit:
+                            self.camera["atmo_jitter"] = atmo_jitter
                             settings_changed = True
 
                         atmo_scale_val = self.camera.get("atmo_render_scale", 0.5)
@@ -4296,6 +4433,13 @@ class App:
                     changed_rs, self.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", self.camera.get("ringshine_enabled", True))
                     if changed_rs:
                         settings_changed = True
+                    if self.camera.get("ringshine_enabled", True):
+                        imgui.indent()
+                        changed_rsb, new_rsb = imgui.slider_int("Ringshine Bands", int(self.camera.get("ringshine_band_count", 10)), 4, 128)
+                        if changed_rsb:
+                            self.camera["ringshine_band_count"] = new_rsb
+                            settings_changed = True
+                        imgui.unindent()
 
                     
                     if settings_changed:

@@ -306,13 +306,15 @@ uniform vec3 u_ring_params[MAX_RING_PLANES];
 uniform vec3 u_ring_colors[MAX_RING_PLANES];
 uniform vec3 u_ring_5colors[MAX_RING_PLANES * 5];
 uniform sampler2D u_ring_gradients;
+uniform sampler2D u_ringshine_lut;
+uniform sampler3D u_ringshine_cdf_lut;
 uniform int u_num_ring_planes;
 uniform float u_caster_max_bend[64];
 uniform uint u_ring_coplanar_mask[16];
 uniform int u_atmo_quality;
 uniform bool u_planetshine_enabled;
 uniform bool u_ringshine_enabled;
-uniform sampler2D u_eclipse_lut;
+uniform int u_ringshine_band_count;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform vec3 u_camera_pos;
@@ -334,6 +336,29 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
     float denom = sqrt((x / r_eq) * (x / r_eq) + (y / r_minor) * (y / r_minor));
     if (denom < 1e-6) return r_eq;
     return perp_len / denom;
+}
+
+// Shared analytical eclipse penumbra + atmospheric refraction tint.
+// Inputs are per-caster quantities already resolved by the caller.
+vec3 casterShadowTerm(float alpha, float beta, float gamma,
+                      float penumbra_outer, float penumbra_inner,
+                      float max_bend, vec3 atmo_tint) {
+    float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
+    float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
+    vec3 sh = vec3(1.0 - occ);
+    if (max_bend > 0.0 && gamma < penumbra_outer) {
+        float req_bend = beta - gamma;
+        float optical_depth = max(0.0, req_bend);
+        float atmospheric_transmission = exp(-optical_depth * 150.0);
+        float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+        float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
+        vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+        float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+        float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
+        float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
+        sh += deep_tint * refraction_intensity * atmo_blend;
+    }
+    return clamp(sh, 0.0, 1.0);
 }
 
 void main() {
@@ -538,35 +563,9 @@ void main() {
                 float alpha = local_star_radius_over_dist;
                 float beta = caster_r * inv_dist;
                 float gamma = sqrt(perp_sq) * inv_dist;
-
                 float penumbra_outer = alpha + beta;
                 float penumbra_inner = max(0.0, beta - alpha);
-
-                float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
-                float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
-
-                vec3 caster_shadow = vec3(1.0 - occ);
-
-                float max_bend = u_caster_max_bend[j];
-                if (max_bend > 0.0 && gamma < penumbra_outer) {
-                    float req_bend = beta - gamma;
-
-                    float optical_depth = max(0.0, req_bend);
-                    float atmospheric_transmission = exp(-optical_depth * 150.0);
-                    float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
-
-                    float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
-                    vec3 atmo_tint = u_caster_atmos[j].xyz;
-                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
-
-                    float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
-                    float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
-                    float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-
-                    caster_shadow += deep_tint * refraction_intensity * atmo_blend;
-                }
-
-                shadow *= clamp(caster_shadow, 0.0, 1.0);
+                shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j].xyz);
             }
 
             // === Ring shadow on planet surface ===
@@ -729,53 +728,88 @@ void main() {
 
                 vec3 ring_tint = u_ring_colors[k];
                 if (is_host_planet) {
-                    // --- HOST PLANET MACRO APPROXIMATION ---
-                    float sin_lat = abs(frag_elevation);
-                    float cos_lat = sqrt(max(0.0, 1.0 - sin_lat * sin_lat));
-                    float vis_in = clamp((inner_r * cos_lat - dist_to_center) / max(inner_r, 1e-5), 0.0, 1.0);
-                    float vis_out = clamp((outer_r * cos_lat - dist_to_center) / max(outer_r, 1e-5), 0.0, 1.0);
-                    float horizon_vis = 0.5 * (vis_in + vis_out);
+                    // --- PRE-INTEGRATED LUT RINGSHINE WITH EXACT 3D CYLINDER SHADOW & CDF MIDNIGHT PROPAGATION ---
+                    float host_radius = host_caster_idx >= 0 ? u_casters[host_caster_idx].w : inner_r * 0.7;
+                    float sin_lat = clamp(abs(frag_elevation), 0.001, 0.999);
 
-                    // Tighter equatorial falloff (hugs the equator closely)
-                    float lat_decay = pow(cos_lat, 3.5);
-                    float form_factor = sin_lat * lat_decay * 4.0 * horizon_vis;
-                    float r_mid = 0.5 * (inner_r + outer_r);
-                    float ring_area = (outer_r * outer_r - inner_r * inner_r);
-                    float solid_angle = (ring_area / (r_mid * r_mid + dist_to_center * dist_to_center)) * 0.1;
+                    // Fragment equator normal vector (in ring plane)
+                    vec3 N_eq_raw = N - ring_normal * dot(N, ring_normal);
+                    float len_N_eq = length(N_eq_raw);
+                    vec3 N_eq = len_N_eq > 1e-5 ? N_eq_raw / len_N_eq : vec3(1.0, 0.0, 0.0);
 
-                    // Multi-sample color tint from 5 radial bands
-                    vec3 weighted_color = vec3(0.0);
-                    float total_weight = 0.0;
-                    for (int m = 0; m < 5; m++) {
-                        float r_m0 = mix(inner_r, outer_r, float(m) / 5.0);
-                        float r_m1 = mix(inner_r, outer_r, float(m + 1) / 5.0);
-                        float sub_mid = 0.5 * (r_m0 + r_m1);
-                        float sub_area = (r_m1 * r_m1 - r_m0 * r_m0);
-                        float w = sub_area / (sub_mid * sub_mid + dist_to_center * dist_to_center);
-                        weighted_color += u_ring_5colors[k * 5 + m] * w;
-                        total_weight += w;
-                    }
-                    if (total_weight > 1e-8) {
-                        ring_tint = weighted_color / total_weight;
+                    // Anti-solar vector projection in ring plane
+                    vec3 antiL = -L;
+                    vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
+                    float len_antiL_eq = length(antiL_eq_raw);
+                    vec3 antiL_eq = len_antiL_eq > 1e-5 ? antiL_eq_raw / len_antiL_eq : vec3(-1.0, 0.0, 0.0);
+
+                    // Azimuth angle theta_center between anti-solar vector and surface fragment meridian
+                    float cos_rel = clamp(dot(N_eq, antiL_eq), -1.0, 1.0);
+                    float theta_center = acos(cos_rel);
+
+                    float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
+                    float cos_sun_elev = sqrt(max(0.0, 1.0 - sin_sun_elev * sin_sun_elev));
+
+                    int band_count = clamp(u_ringshine_band_count, 4, 128);
+                    vec3 total_ring_irradiance = vec3(0.0);
+                    float log_r_ratio = log(max(1.001, outer_r / max(1e-5, inner_r)));
+
+                    for (int m = 0; m < band_count; m++) {
+                        float u0 = float(m) / float(band_count);
+                        float u1 = float(m + 1) / float(band_count);
+                        float u_mid = 0.5 * (u0 + u1);
+
+                        // Logarithmic 1/d^2 distance-weighted radial placement (concentrates samples on inner dense ring material)
+                        float r_m0 = inner_r * exp(u0 * log_r_ratio);
+                        float r_m1 = inner_r * exp(u1 * log_r_ratio);
+                        float r_mid = inner_r * exp(u_mid * log_r_ratio);
+                        float dr = (r_m1 - r_m0) / max(1e-5, host_radius);
+                        float frac_mid = clamp((r_mid - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
+
+                        // Sample ring color & density FIRST — early exit on empty ring gaps before shadow math!
+                        vec4 ring_texel = texture(u_ring_gradients, vec2(frac_mid, (float(k) + 0.5) / 16.0));
+                        if (ring_texel.a < 1e-4) continue;
+                        vec3 band_color = ring_texel.rgb * ring_texel.a;
+
+                        float norm_r = r_mid / max(1e-5, host_radius);
+
+                        // Exact 3D Cylinder Shadow Half-Angle on Ring Plane at Radius norm_r
+                        float delta_alpha_shadow = 0.0;
+                        if (norm_r <= 1.0 / sin_sun_elev) {
+                            float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
+                            delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
+                        }
+
+                        // Calculate physical shadow fraction using precomputed 3D CDF LUT
+                        float t1 = theta_center - delta_alpha_shadow;
+                        float t2 = theta_center + delta_alpha_shadow;
+                        float v_tex = clamp((norm_r - 1.0) / 4.0, 0.0, 1.0);
+
+                        float cdf1 = (t1 < 0.0)
+                            ? -texture(u_ringshine_cdf_lut, vec3(clamp(-t1 / 3.14159265, 0.0, 1.0), v_tex, sin_lat)).r
+                            :  texture(u_ringshine_cdf_lut, vec3(clamp( t1 / 3.14159265, 0.0, 1.0), v_tex, sin_lat)).r;
+                        float cdf2 = (t2 < 0.0)
+                            ? -texture(u_ringshine_cdf_lut, vec3(clamp(-t2 / 3.14159265, 0.0, 1.0), v_tex, sin_lat)).r
+                            :  texture(u_ringshine_cdf_lut, vec3(clamp( t2 / 3.14159265, 0.0, 1.0), v_tex, sin_lat)).r;
+
+                        float shadow_fraction = clamp(0.5 * (cdf2 - cdf1), 0.0, 1.0);
+                        float band_illum = max(0.0, 1.0 - shadow_fraction);
+
+                        float kernel_val = texture(u_ringshine_lut, vec2(sin_lat, v_tex)).r;
+
+                        // Combined per-band physical irradiance
+                        total_ring_irradiance += band_color * kernel_val * dr * band_illum;
                     }
 
                     float same_hemisphere = sun_elevation * frag_elevation;
-                    float shadow_occlusion = 1.0;
-                    if (dot(N, L) < 0.0) {
-                        float anti_solar = max(0.0, dot(N, -L));
-                        shadow_occlusion = 1.0 - (anti_solar * 0.92);
-                    }
                     float day_face = max(0.0, dot(N, L));
                     float noon_fade = mix(1.0, 0.4, day_face);
 
-                    if (same_hemisphere > 0.0) {
-                        // Lit side of hemisphere: brighter ringshine from lit ring face
-                        shine_intensity = effective_sun_elev * form_factor * solid_angle * opacity * 4.0 * noon_fade;
-                    } else {
-                        // Unlit side of hemisphere: darker ringshine from unlit ring face
-                        shine_intensity = effective_sun_elev * form_factor * solid_angle * opacity * 0.75;
-                    }
-                    shine_intensity *= shadow_occlusion;
+                    float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
+                    float face_multiplier = mix(0.2, 1.0 * noon_fade, same_hemi_t);
+                    // Apply 1/PI (~0.3183) physical BRDF normalization factor
+                    shine_intensity = effective_sun_elev * opacity * face_multiplier * 0.318309886;
+                    ring_tint = total_ring_irradiance;
 
                 } else {
                     // --- DEDICATED MOON RINGSHINE ---
@@ -868,7 +902,7 @@ void main() {
 
                 float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star * dist_to_star, 1e-8)) : 1.0;
 
-                ring_shine += ring_tint * 1.2 * star_color * shine_intensity * irradiance;
+                ring_shine += ring_tint * star_color * shine_intensity * irradiance;
             }
         }
 
@@ -1220,7 +1254,6 @@ uniform int u_clip_mode;
 uniform uint u_caster_mask_lo;
 uniform uint u_caster_mask_hi;
 uniform bool u_planetshine_enabled;
-uniform sampler2D u_eclipse_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform float u_au_to_km;
@@ -1308,6 +1341,15 @@ float AnalyticMultipleScattering(float mu_v, float mu_0, float tau, bool onLitSi
     }
 }
 
+float AnalyticalSelfShadowing(float sun_side_abs) {
+    // Incident solar flux scale: mu_0 = |N . L| = sin(solar elevation)
+    // Radiative transfer (scatteredLight & AnalyticMultipleScattering) already accounts for
+    // line-of-sight self-absorption (1/mu_v) and solar path extinction (1/mu_0) inside the slab.
+    float mu_0 = max(0.001, sun_side_abs);
+    return clamp(mu_0 / 0.45, 0.0, 1.0);
+}
+
+
 float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_vec) {
     if (r_minor < 1e-6 || r_eq < 1e-6) return r_eq;
     float perp_len = length(perp_vec);
@@ -1324,6 +1366,28 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
     return perp_len / denom;
 }
 
+// Shared analytical eclipse penumbra + atmospheric refraction tint.
+vec3 casterShadowTerm(float alpha, float beta, float gamma,
+                      float penumbra_outer, float penumbra_inner,
+                      float max_bend, vec3 atmo_tint) {
+    float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
+    float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
+    vec3 sh = vec3(1.0 - occ);
+    if (max_bend > 0.0 && gamma < penumbra_outer) {
+        float req_bend = beta - gamma;
+        float optical_depth = max(0.0, req_bend);
+        float atmospheric_transmission = exp(-optical_depth * 150.0);
+        float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
+        float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
+        vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+        float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
+        float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
+        float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
+        sh += deep_tint * refraction_intensity * atmo_blend;
+    }
+    return clamp(sh, 0.0, 1.0);
+}
+
 void main() {
     if (u_clip_mode != 0) {
         vec3 to_cam = u_camera_pos - u_host_planet_pos;
@@ -1337,6 +1401,7 @@ void main() {
 
     vec3 total_color_front = vec3(0.0);
     vec3 total_color_back = vec3(0.0);
+    vec3 total_color_fwd = vec3(0.0);
     float total_tau = 0.0;
     float total_faded_tau = 0.0;
     float total_scatter = 0.0;
@@ -1367,6 +1432,9 @@ void main() {
             float alpha = tex_val_front.a;
             vec3 r_color_front = tex_val_front.rgb;
             vec3 r_color_back  = tex_val_back.rgb;
+            float fwd_lum = pow(tex_val_back.a, 2.2);
+            float back_lum = max(1e-4, dot(r_color_front, vec3(0.2126, 0.7152, 0.0722)));
+            vec3 r_color_fwd = r_color_front * (fwd_lum / back_lum);
 
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
 
@@ -1401,6 +1469,7 @@ void main() {
 
                 total_color_front += plane_color * r_color_front * tau;
                 total_color_back  += plane_color * r_color_back  * tau;
+                total_color_fwd   += plane_color * r_color_fwd   * tau;
                 total_scatter += u_ring_planes[i].scatter * tau;
                 total_asym += u_ring_planes[i].asymmetry * tau;
                 total_backscatter += u_ring_planes[i].backscatter * tau;
@@ -1421,6 +1490,7 @@ void main() {
 
     vec3 f_color_front = total_color_front / max(1e-6, total_tau);
     vec3 f_color_back  = total_color_back  / max(1e-6, total_tau);
+    vec3 f_color_fwd   = total_color_fwd   / max(1e-6, total_tau);
     vec4 f_color = vec4(f_color_front, physical_alpha);
     float f_scatter = total_scatter / max(1e-6, total_tau);
     float f_asymmetry = total_asym / max(1e-6, total_tau);
@@ -1529,10 +1599,10 @@ void main() {
 
         direct_illum_s = single_scatter_s + ms_s;
 
-        // Ring self-shadowing / incident solar elevation scaling: flux scales with sin(solar elevation) = |sun_side|
-        // At Saturn solstice (inclination 26.73 deg), sin(26.73 deg) ~ 0.45. At equinox (edge-on), elevation factor -> 0.
-        float solar_elevation_scale = clamp(abs(sun_side) / 0.45, 0.0, 1.0);
-        direct_illum_s *= solar_elevation_scale;
+        // Geometric incident flux scaling (solar elevation)
+        // Self-shadowing & line-of-sight self-absorption are unified in scatteredLight / AnalyticMultipleScattering
+        float self_shadow_factor = AnalyticalSelfShadowing(abs(sun_side));
+        direct_illum_s *= self_shadow_factor;
 
         // Inverse-square falloff
         if (u_hdr_enabled) {
@@ -1589,34 +1659,9 @@ void main() {
             float alpha = local_star_radius_over_dist;
             float beta = caster_r * inv_dist;
             float gamma = sqrt(perp_sq) * inv_dist;
-
             float penumbra_outer = alpha + beta;
             float penumbra_inner = max(0.0, beta - alpha);
-
-            float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
-            float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
-
-            vec3 caster_shadow = vec3(1.0 - occ);
-
-            float max_bend = u_caster_max_bend[j];
-            if (max_bend > 0.0 && gamma < penumbra_outer) {
-                float req_bend = beta - gamma;
-
-                float optical_depth = max(0.0, req_bend);
-                float atmospheric_transmission = exp(-optical_depth * 150.0);
-                float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
-
-                float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
-                vec3 atmo_tint = u_caster_atmos[j].xyz;
-                vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
-
-                float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
-                float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
-                float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-
-                caster_shadow += deep_tint * refraction_intensity * atmo_blend;
-            }
-            shadow_s *= clamp(caster_shadow, 0.0, 1.0);
+            shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j].xyz);
         }
 
         if (u_host_planet_radius > 0.0) {
@@ -1660,41 +1705,21 @@ void main() {
                         float alpha = local_star_radius_over_dist;
                         float beta = host_r * inv_dist;
                         float gamma = sqrt(perp_sq) * inv_dist;
-
                         float penumbra_outer = alpha + beta;
                         float penumbra_inner = max(0.0, beta - alpha);
-
-                        float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
-                        float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
-
-                        vec3 host_shadow = vec3(1.0 - occ);
-
-                        if (host_atmo_h > 0.0 && gamma < penumbra_outer) {
-                            float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.05);
-                            float req_bend = beta - gamma;
-
-                            float optical_depth = max(0.0, req_bend);
-                            float atmospheric_transmission = exp(-optical_depth * 150.0);
-                            float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
-
-                            float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
-                            vec3 atmo_tint = u_host_planet_atmo.xyz;
-                            vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
-
-                            float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
-                            float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
-                            float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-
-                            host_shadow += deep_tint * refraction_intensity * atmo_blend;
-                        }
-                        shadow_s *= clamp(host_shadow, 0.0, 1.0);
+                        float max_bend = host_atmo_h > 0.0
+                            ? clamp(2.0 * 0.00029 * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.05)
+                            : 0.0;
+                        shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, max_bend, u_host_planet_atmo.xyz);
                     }
                 }
             }
         }
 
         float lit_blend = smoothstep(-0.02, 0.02, cam_side * sun_side);
-        vec3 active_ring_color = (total_textured_tau > 0.5 * total_tau) ? mix(f_color_back, f_color_front, lit_blend) : f_color_front;
+        float fwd_blend = smoothstep(-0.3, 0.7, cos_theta);
+        vec3 lit_color_star = (total_textured_tau > 0.5 * total_tau) ? mix(f_color_front, f_color_fwd, fwd_blend) : f_color_front;
+        vec3 active_ring_color = (total_textured_tau > 0.5 * total_tau) ? mix(f_color_back, lit_color_star, lit_blend) : f_color_front;
         total_direct_illum_color += star_color * active_ring_color * direct_illum_s * shadow_s;
     }
 
@@ -1961,6 +1986,7 @@ uniform sampler2D u_multi_scatter_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform bool u_planetshine_enabled;
+uniform int  u_atmo_jitter;
 
 layout(location = 0) out vec4 out_color;
 
@@ -2523,7 +2549,7 @@ void main() {
         float cos_sun = cos(alpha_sun_local);
         float sin_sun = sin_star;
 
-        float jitter = interleaved_gradient_noise(gl_FragCoord.xy, u_frame_counter);
+        float jitter = (u_atmo_jitter != 0) ? interleaved_gradient_noise(gl_FragCoord.xy, u_frame_counter) : 0.5;
         vec3 step_dir_sph = ray_dir_sph * step_size;
         vec3 current_pos_sph = cam_local_sph + (s_start + jitter * step_size) * ray_dir_sph;
 
@@ -2554,20 +2580,18 @@ void main() {
             vec3 int_factor = (vec3(1.0) - step_transmittance) / max(step_extinction, 1e-6);
 
             vec3 sun_dir_sph = sun_dir_sph_const;
-            if (u_atmo_quality == 3) {
-                vec3 current_pos_local = cam_local + current_s * ray_dir;
-                vec3 s_dir_loc = normalize(sun_pos_local - current_pos_local);
-                sun_dir_sph = normalize(toSphericalSpace(s_dir_loc, u_pole_obl));
-            }
-
             float light_cos_theta = dot(current_pos_sph, sun_dir_sph) / sample_len;
             float h_norm = clamp(altitude * inv_atmo_thickness, 0.0, 1.0);
 
             float sin_planet = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
             float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
 
-            float cos_outer = cos_planet * cos_sun - sin_planet * sin_sun;
-            float cos_inner = cos_planet * cos_sun + sin_planet * sin_sun;
+            float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * u_planet_radius_km / max(1e-6, u_h_rayleigh * 2.0)), 0.001, 0.05);
+            float effective_star_rad = sin_star + max_bend;
+            float cos_sun_eff = sqrt(max(0.0, 1.0 - effective_star_rad * effective_star_rad));
+
+            float cos_outer = cos_planet * cos_sun_eff - sin_planet * effective_star_rad;
+            float cos_inner = cos_planet * cos_sun_eff + sin_planet * effective_star_rad;
 
             float neg_light_cos = -light_cos_theta;
             float vis_fraction = 1.0;
@@ -2575,20 +2599,13 @@ void main() {
             if (neg_light_cos > cos_inner) {
                 vis_fraction = 0.0;
             } else if (neg_light_cos > cos_outer) {
-                if (u_atmo_quality == 3) {
-                    float alpha_planet = asin(clamp(sin_planet, 0.0, 0.9999));
-                    float separation = acos(clamp(neg_light_cos, -1.0, 1.0));
-                    float x_vis = (separation - alpha_planet) / max(alpha_sun_local, 1e-7);
-                    vis_fraction = (acos(clamp(-x_vis, -1.0, 1.0)) + x_vis * sqrt(max(0.0, 1.0 - x_vis * x_vis))) / PI;
-                } else {
-                    float x_vis = (cos_planet * cos_sun - neg_light_cos) / max(1e-7, sin_planet * sin_sun);
-                    vis_fraction = smoothstep(-1.0, 1.0, x_vis);
-                }
+                float x_vis = (cos_planet * cos_sun_eff - neg_light_cos) / max(1e-7, sin_planet * effective_star_rad);
+                vis_fraction = smoothstep(-1.0, 1.0, x_vis);
             }
 
-            float disc_top_cos = min(light_cos_theta + sin_star, 1.0);
-            float disc_bot_cos = max(light_cos_theta - sin_star, -cos_planet);
-            float effective_cos = (disc_top_cos + disc_bot_cos) * 0.5;
+            float disc_top_cos = min(light_cos_theta + effective_star_rad, 1.0);
+            float disc_bot_cos = max(light_cos_theta - effective_star_rad, -cos_planet + 1e-5);
+            float effective_cos = max(-cos_planet + 1e-5, (disc_top_cos + disc_bot_cos) * 0.5);
 
             float v_norm = sqrt(h_norm);
             vec3 transmittance_to_sun = get_transmittance_precomputed(v_norm, effective_cos);
@@ -2621,16 +2638,6 @@ void main() {
 
                         sample_shadow *= sh_mult.x * sh_mult.y * sh_mult.z * sh_mult.w;
                     }
-                }
-            } else if (u_atmo_quality == 3) {
-                if (u_num_active_casters > 0 || u_ring_mask != 0u) {
-                    vec3 sample_pos_local = frag_local + current_s * ray_dir;
-                    vec3 sample_render = sample_pos_local / u_au_to_km + planet_center_render;
-                    vec3 sample_to_star = star_pos - sample_render;
-                    float dist_sample_star = length(sample_to_star);
-                    sample_shadow = compute_shadow(sample_render, sample_to_star / max(dist_sample_star, 1e-6), dist_sample_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
-                } else {
-                    sample_shadow = global_eclipse_shadow;
                 }
             }
 
