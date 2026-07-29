@@ -1535,6 +1535,8 @@ class App:
             prog_atmo['u_ringshine_lut'].value = 6
         if 'u_ringshine_cdf_lut' in prog_atmo:
             prog_atmo['u_ringshine_cdf_lut'].value = 7
+        if 'u_ringshine_map' in prog_atmo:
+            prog_atmo['u_ringshine_map'].value = 8
         
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -1814,6 +1816,17 @@ class App:
             return tex, cdf_tex
 
         ringshine_lut_tex, ringshine_cdf_tex = build_ringshine_lut(ctx)
+
+        self.ringshine_map_tex = ctx.texture((128, 1040), 4, dtype='f4')
+        self.ringshine_map_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.ringshine_map_tex.repeat_x = True
+        self.ringshine_map_tex.repeat_y = False
+        self.ringshine_map_fbo = ctx.framebuffer(color_attachments=[self.ringshine_map_tex])
+        self.prog_ringshine_map = ctx.program(vertex_shader=ringshine_map_vertex_shader, fragment_shader=ringshine_map_fragment_shader)
+        if 'u_ring_gradients' in self.prog_ringshine_map: self.prog_ringshine_map['u_ring_gradients'].value = 0
+        if 'u_ringshine_lut' in self.prog_ringshine_map: self.prog_ringshine_map['u_ringshine_lut'].value = 6
+        if 'u_ringshine_cdf_lut' in self.prog_ringshine_map: self.prog_ringshine_map['u_ringshine_cdf_lut'].value = 7
+        self.ringshine_map_vao = ctx.vertex_array(self.prog_ringshine_map, [(lut_vbo, '2f', 'in_position')])
     
         ring_render_groups = []
         rings_by_body_init = {}
@@ -1935,6 +1948,8 @@ class App:
             prog_spheres['u_ringshine_lut'].value = 6
         if 'u_ringshine_cdf_lut' in prog_spheres:
             prog_spheres['u_ringshine_cdf_lut'].value = 7
+        if 'u_ringshine_map' in prog_spheres:
+            prog_spheres['u_ringshine_map'].value = 8
     
         star_idx = 0
         for i, b in enumerate(bodies_data):
@@ -2011,7 +2026,7 @@ class App:
         caster_max_bend_buf = np.zeros(64, dtype='f4')
         ring_centers_buf = np.zeros((16, 3), dtype='f4')
         ring_normals_buf = np.zeros((16, 3), dtype='f4')
-        ring_params_buf = np.zeros((16, 3), dtype='f4')
+        ring_params_buf = np.zeros((16, 4), dtype='f4')
         ring_colors_buf = np.zeros((16, 3), dtype='f4')
         ring_5colors_buf = np.zeros((16, 5, 3), dtype='f4')
         ring_coplanar_mask_buf = np.zeros(16, dtype='u4')
@@ -2330,7 +2345,7 @@ class App:
                 caster_max_bend_buf = np.zeros(64, dtype='f4')
                 ring_centers_buf = np.zeros((16, 3), dtype='f4')
                 ring_normals_buf = np.zeros((16, 3), dtype='f4')
-                ring_params_buf = np.zeros((16, 3), dtype='f4')
+                ring_params_buf = np.zeros((16, 4), dtype='f4')
                 ring_colors_buf = np.zeros((16, 3), dtype='f4')
                 ring_coplanar_mask_buf = np.zeros(16, dtype='u4')
                 cull_mask_lo = np.zeros(num_bodies, dtype=np.uint32)
@@ -3224,6 +3239,7 @@ class App:
                 ring_params_buf[unified_idx, 0] = min_r
                 ring_params_buf[unified_idx, 1] = max_r
                 ring_params_buf[unified_idx, 2] = opacity
+                ring_params_buf[unified_idx, 3] = body_radii[bi]
                 ring_colors_buf[unified_idx, 0:3] = raw_color
                 if isinstance(colors5, np.ndarray):
                     ring_5colors_buf[unified_idx, :, :] = colors5
@@ -3759,6 +3775,35 @@ class App:
             ring_gradient_tex.use(location=0)
             ringshine_lut_tex.use(location=6)
             ringshine_cdf_tex.use(location=7)
+
+            if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
+                self.ringshine_map_fbo.use()
+                ctx.viewport = (0, 0, 128, 1040)
+                star_pos = pos_rel_all[star_idx]
+                host_pos = ring_centers_buf[0]
+                l_dir = star_pos - host_pos
+                l_norm = np.linalg.norm(l_dir)
+                if l_norm > 1e-6: l_dir /= l_norm
+                else: l_dir = np.array([0.0, 1.0, 0.0], dtype='f4')
+                if 'u_sun_dir' in self.prog_ringshine_map:
+                    self.prog_ringshine_map['u_sun_dir'].value = tuple(l_dir.astype('f4'))
+                if 'u_num_ring_planes' in self.prog_ringshine_map:
+                    self.prog_ringshine_map['u_num_ring_planes'].value = n_ring_planes
+                if 'u_ring_normal' in self.prog_ringshine_map:
+                    self.prog_ringshine_map['u_ring_normal'].write(ring_normals_buf)
+                if 'u_ring_params' in self.prog_ringshine_map:
+                    self.prog_ringshine_map['u_ring_params'].write(ring_params_buf)
+                if 'u_ringshine_band_count' in self.prog_ringshine_map:
+                    self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 256))
+                self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
+
+                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                if self.hdr_msaa_fbo:
+                    self.hdr_msaa_fbo.use()
+                else:
+                    self.hdr_resolve_fbo.use()
+
+            self.ringshine_map_tex.use(location=8)
             
             # Pass Exposure and HDR setting to shaders
             exposure = self.camera.get("exposure", 1.0)
@@ -4694,7 +4739,7 @@ class App:
                         settings_changed = True
                     if self.camera.get("ringshine_enabled", True):
                         imgui.indent()
-                        changed_rsb, new_rsb = imgui.slider_int("Ringshine Bands", int(self.camera.get("ringshine_band_count", 10)), 4, 128)
+                        changed_rsb, new_rsb = imgui.slider_int("Ringshine Bands", int(self.camera.get("ringshine_band_count", 256)), 4, 1024)
                         if changed_rsb:
                             self.camera["ringshine_band_count"] = new_rsb
                             settings_changed = True

@@ -268,6 +268,7 @@ sphere_fragment_shader = """
 #define MAX_CASTERS 64
 #define MAX_STARS 16
 #define MAX_RING_PLANES 16
+#define PI 3.14159265358979323846
 
 in vec3 f_color;
 in vec3 f_world_pos;
@@ -310,12 +311,13 @@ layout(std140, binding = 1) uniform SceneData {
 // Ring shadow planes (sphere-only)
 uniform vec3 u_ring_center[MAX_RING_PLANES];
 uniform vec3 u_ring_normal[MAX_RING_PLANES];
-uniform vec3 u_ring_params[MAX_RING_PLANES];
+uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform vec3 u_ring_colors[MAX_RING_PLANES];
 uniform vec3 u_ring_5colors[MAX_RING_PLANES * 5];
 uniform sampler2D u_ring_gradients;
 uniform sampler2D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
+uniform sampler2D u_ringshine_map;
 uniform int u_num_ring_planes;
 uniform float u_caster_max_bend[64];
 uniform uint u_ring_coplanar_mask[16];
@@ -400,7 +402,6 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
 }
 
 float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
-    float PI = 3.14159265358979323846;
     float TWO_PI = 6.28318530717958647692;
     float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
     float k = floor((angle + PI) / TWO_PI);
@@ -803,68 +804,17 @@ void main() {
                     float cos_rel = clamp(dot(N_eq, antiL_eq), -1.0, 1.0);
                     float phi_center = atan(sin_rel, cos_rel);
 
-                    float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
-                    float cos_sun_elev = sqrt(max(0.0, 1.0 - sin_sun_elev * sin_sun_elev));
-
-                    int band_count = clamp(u_ringshine_band_count, 4, 128);
-                    vec3 total_ring_irradiance = vec3(0.0);
-                    float log_r_ratio = log(max(1.001, outer_r / max(1e-5, inner_r)));
-
                     float same_hemisphere = sun_elevation * frag_elevation;
                     float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
 
-                    for (int m = 0; m < band_count; m++) {
-                        float u0 = float(m) / float(band_count);
-                        float u1 = float(m + 1) / float(band_count);
-                        float u_mid = 0.5 * (u0 + u1);
+                    float x_prime = phi_center / PI;
+                    float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                        // Logarithmic 1/d^2 distance-weighted radial placement (concentrates samples on inner dense ring material)
-                        float r_m0 = inner_r * exp(u0 * log_r_ratio);
-                        float r_m1 = inner_r * exp(u1 * log_r_ratio);
-                        float r_mid = inner_r * exp(u_mid * log_r_ratio);
-                        float dr = (r_m1 - r_m0) / max(1e-5, host_radius);
-                        float frac_mid = clamp((r_mid - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
+                    float y_prime = frag_elevation;
+                    float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
-                        // Sample ring color & density FIRST — early exit on empty ring gaps before shadow math!
-                        vec4 ring_texel = texture(u_ring_gradients, vec2(frac_mid, (float(k) + 0.5) / 16.0));
-                        if (ring_texel.a < 1e-4) continue;
-
-                        // Physical optical transmission (T = exp(-tau / sin_theta_sun)) vs sunlit reflection
-                        float alpha_val = clamp(ring_texel.a, 0.0, 0.999);
-                        float tau_band = -log(max(1e-4, 1.0 - alpha_val));
-                        float trans_factor = exp(-tau_band / max(sin_sun_elev, 0.05));
-
-                        vec3 band_color_sunlit = ring_texel.rgb * alpha_val;
-                        vec3 band_color_unlit = ring_texel.rgb * trans_factor * alpha_val * 2.0;
-                        vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
-
-                        float norm_r = r_mid / max(1e-5, host_radius);
-
-                        // Exact 3D Cylinder Shadow Half-Angle on Ring Plane at Radius norm_r
-                        float delta_alpha_shadow = 0.0;
-                        if (norm_r <= 1.0 / sin_sun_elev) {
-                            float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
-                            delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
-                        }
-
-                        // Calculate physical shadow fraction using continuous circular 3D CDF LUT evaluation
-                        float psi1 = -delta_alpha_shadow - phi_center;
-                        float psi2 = +delta_alpha_shadow - phi_center;
-                        float v_tex = clamp((norm_r - 1.0) / 4.0, 0.0, 1.0);
-
-                        float cdf1 = eval_ringshine_cdf(psi1, v_tex, sin_lat);
-                        float cdf2 = eval_ringshine_cdf(psi2, v_tex, sin_lat);
-
-                        float shadow_fraction = clamp(0.5 * (cdf2 - cdf1), 0.0, 1.0);
-                        float band_illum = max(0.0, 1.0 - shadow_fraction);
-
-                        float u_tex_lut = 0.5 / 256.0 + sin_lat * (255.0 / 256.0);
-                        float v_tex_lut = 0.5 / 256.0 + v_tex * (255.0 / 256.0);
-                        float kernel_val = texture(u_ringshine_lut, vec2(u_tex_lut, v_tex_lut)).r;
-
-                        // Combined per-band physical irradiance
-                        total_ring_irradiance += band_color * kernel_val * dr * band_illum;
-                    }
+                    vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
+                    vec3 total_ring_irradiance = texture(u_ringshine_map, map_uv).rgb;
 
                     float NdotL = dot(N, L);
                     float day_face = smoothstep(-0.05, 0.05, NdotL) * max(0.0, NdotL);
@@ -872,7 +822,7 @@ void main() {
 
                     float face_multiplier = mix(1.0, 1.0 * noon_fade, same_hemi_t);
                     // Apply 1/PI (~0.3183) physical BRDF normalization factor
-                    shine_intensity = effective_sun_elev * opacity * face_multiplier * 0.318309886;
+                    shine_intensity = effective_sun_elev * face_multiplier * 0.318309886;
                     ring_tint = total_ring_irradiance;
 
                 } else {
@@ -958,11 +908,11 @@ void main() {
                         float same_hemisphere = sun_elevation * moon_h;
                         float alpha_avg = clamp(opacity, 0.0, 0.999);
                         float tau_moon = -log(max(1e-4, 1.0 - alpha_avg));
-                        float moon_trans_factor = exp(-tau_moon / max(effective_sun_elev, 0.05));
+                        float moon_trans_factor = exp(-0.35 * tau_moon / max(effective_sun_elev, 0.087));
 
                         float ring_brightness = (same_hemisphere > 0.0)
-                            ? (effective_sun_elev * opacity * 1.25)
-                            : (effective_sun_elev * opacity * moon_trans_factor * 2.0);
+                            ? (effective_sun_elev * opacity * 2.0)
+                            : (effective_sun_elev * opacity * moon_trans_factor * 0.4);
 
                         shine_intensity = NdotL_ring * ring_brightness * solid_angle * ring_shadow_factor;
                     }
@@ -2084,7 +2034,7 @@ uniform int u_num_ring_planes;
 uniform int u_atmo_quality;
 uniform vec3 u_ring_center[MAX_RING_PLANES];
 uniform vec3 u_ring_normal[MAX_RING_PLANES];
-uniform vec3 u_ring_params[MAX_RING_PLANES];
+uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform int u_atmo_clip_mode;
 
 uniform uint u_ring_coplanar_mask[16];
@@ -2098,6 +2048,7 @@ uniform int  u_atmo_jitter;
 
 uniform sampler2D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
+uniform sampler2D u_ringshine_map;
 uniform bool u_ringshine_enabled;
 uniform int u_ringshine_band_count;
 
@@ -2882,49 +2833,17 @@ void main() {
 
             for (int j = 0; j < 1; j++) {
                 if ((u_ring_mask & (1u << j)) == 0u) continue;
-                float inner_r = u_ring_params[j].x;
-                float outer_r = u_ring_params[j].y;
-                float dr = (outer_r - inner_r) / float(band_count);
+                float x_prime = phi_center / PI;
+                float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                for (int m = 0; m < band_count; m++) {
-                    float r_mid = inner_r + (float(m) + 0.5) * dr;
-                    float frac_mid = (r_mid - inner_r) / max(1e-5, outer_r - inner_r);
-                    vec4 ring_texel = texture(u_ring_gradients, vec2(frac_mid, (float(j) + 0.5) / 16.0));
-                    if (ring_texel.a < 1e-4) continue;
+                float y_prime = frag_elevation;
+                float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
-                    float alpha_val = clamp(ring_texel.a, 0.0, 0.999);
-                    float tau_band = -log(max(1e-4, 1.0 - alpha_val));
-                    float trans_factor = exp(-tau_band / max(sin_sun_elev, 0.05));
-
-                    vec3 band_color_sunlit = ring_texel.rgb * alpha_val;
-                    vec3 band_color_unlit = ring_texel.rgb * trans_factor * alpha_val * 2.0;
-                    vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
-                    float norm_r = r_mid / max(1e-5, host_radius);
-                    float v_tex = clamp((norm_r - 1.0) / 4.0, 0.0, 1.0);
-
-                    float delta_alpha_shadow = 0.0;
-                    if (norm_r <= 1.0 / sin_sun_elev) {
-                        float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
-                        delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
-                    }
-
-                    float psi1 = -delta_alpha_shadow - phi_center;
-                    float psi2 = +delta_alpha_shadow - phi_center;
-
-                    float cdf1 = eval_ringshine_cdf(psi1, v_tex, sin_lat);
-                    float cdf2 = eval_ringshine_cdf(psi2, v_tex, sin_lat);
-                    float shadow_fraction = clamp(0.5 * (cdf2 - cdf1), 0.0, 1.0);
-                    float band_illum = max(0.0, 1.0 - shadow_fraction);
-
-                    float u_tex_lut = 0.5 / 256.0 + sin_lat * (255.0 / 256.0);
-                    float v_tex_lut = 0.5 / 256.0 + v_tex * (255.0 / 256.0);
-                    float kernel_val = texture(u_ringshine_lut, vec2(u_tex_lut, v_tex_lut)).r;
-
-                    ringshine_irradiance += band_color * kernel_val * dr * band_illum;
-                }
+                vec2 map_uv = vec2(phi_uv, (float(j) + elev_uv) / 16.0);
+                ringshine_irradiance += texture(u_ringshine_map, map_uv).rgb;
             }
             float opacity = u_ring_params[0].z;
-            ringshine_irradiance *= (sin_sun_elev * opacity * face_multiplier * 0.318309886 / max(1e-5, host_radius));
+            ringshine_irradiance *= (sin_sun_elev * face_multiplier * 0.318309886);
 
             float ambient_phase = 1.0 / (4.0 * PI);
             scattered += star_color * u_sun_intensity * irradiance * ringshine_irradiance * (
@@ -3190,5 +3109,138 @@ void main() {
 
     vec3 psi = L2nd / max(vec3(1.0) - fms_avg, 1e-6);
     out_color = vec4(psi, 1.0);
+}
+"""
+
+
+ringshine_map_vertex_shader = """
+#version 460 core
+in vec2 in_position;
+out vec2 f_uv;
+void main() {
+    f_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
+
+ringshine_map_fragment_shader = """
+#version 460 core
+#define PI 3.14159265358979323846
+in vec2 f_uv;
+out vec4 out_color;
+
+uniform sampler2D u_ring_gradients;
+uniform sampler2D u_ringshine_lut;
+uniform sampler3D u_ringshine_cdf_lut;
+
+uniform vec3 u_sun_dir;
+uniform int u_num_ring_planes;
+uniform vec3 u_ring_normal[16];
+uniform vec4 u_ring_params[16];
+uniform int u_ringshine_band_count;
+
+float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
+    float TWO_PI = 6.28318530717958647692;
+    float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
+    float k = floor((angle + PI) / TWO_PI);
+    float u = clamp(abs(a_mod) / PI, 0.0, 1.0);
+
+    float u_tex = 0.5 / 128.0 + u * (127.0 / 128.0);
+    float v_tex_mapped = 0.5 / 128.0 + v_tex * (127.0 / 128.0);
+    float sin_lat_mapped = 0.5 / 64.0 + sin_lat * (63.0 / 64.0);
+
+    float base_cdf = texture(u_ringshine_cdf_lut, vec3(u_tex, v_tex_mapped, sin_lat_mapped)).r;
+    float signed_cdf = (a_mod < 0.0) ? -base_cdf : base_cdf;
+    return 2.0 * k + signed_cdf;
+}
+
+void main() {
+    float slot = f_uv.y * 16.0;
+    int k = int(floor(slot));
+    float local_v = fract(slot);
+
+    if (k >= u_num_ring_planes) {
+        out_color = vec4(0.0);
+        return;
+    }
+
+    vec3 ring_normal = u_ring_normal[k];
+    float inner_r = u_ring_params[k].x;
+    float outer_r = u_ring_params[k].y;
+    float opacity = u_ring_params[k].z;
+    float host_radius = u_ring_params[k].w > 1e-5 ? u_ring_params[k].w : inner_r * 0.7;
+
+    if (opacity < 1e-4 || outer_r <= inner_r) {
+        out_color = vec4(0.0);
+        return;
+    }
+
+    float x = f_uv.x * 2.0 - 1.0;
+    float phi_center = sign(x) * pow(abs(x), 1.5) * PI;
+
+    float y = local_v * 2.0 - 1.0;
+    float frag_elevation = sign(y) * pow(abs(y), 1.5);
+    float sin_lat = clamp(abs(frag_elevation), 0.001, 0.999);
+
+    vec3 L = u_sun_dir;
+    float sun_elevation = dot(L, ring_normal);
+    float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
+    float cos_sun_elev = sqrt(max(0.0, 1.0 - sin_sun_elev * sin_sun_elev));
+
+    float same_hemisphere = sun_elevation * frag_elevation;
+    float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
+
+    int band_count = clamp(u_ringshine_band_count, 4, 1024);
+    vec3 total_ring_irradiance = vec3(0.0);
+    float log_r_ratio = log(max(1.001, outer_r / max(1e-5, inner_r)));
+
+    for (int m = 0; m < band_count; m++) {
+        float u0 = float(m) / float(band_count);
+        float u1 = float(m + 1) / float(band_count);
+        float u_mid = 0.5 * (u0 + u1);
+
+        float r_m0 = inner_r * exp(u0 * log_r_ratio);
+        float r_m1 = inner_r * exp(u1 * log_r_ratio);
+        float r_mid = inner_r * exp(u_mid * log_r_ratio);
+        float dr = (r_m1 - r_m0) / max(1e-5, host_radius);
+        float frac_mid = clamp((r_mid - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
+
+        vec4 ring_texel = texture(u_ring_gradients, vec2(frac_mid, (float(k) + 0.5) / 16.0));
+        if (ring_texel.a < 1e-4) continue;
+
+        float alpha_phys = clamp(ring_texel.a * opacity, 0.0, 0.999);
+        float tau_phys = -log(max(1e-4, 1.0 - alpha_phys));
+        float trans_factor = exp(-0.35 * tau_phys / max(sin_sun_elev, 0.087));
+
+        vec3 band_color_sunlit = ring_texel.rgb * alpha_phys * 2.0;
+        vec3 band_color_unlit = ring_texel.rgb * trans_factor * alpha_phys * 0.4;
+        vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
+
+        float norm_r = r_mid / max(1e-5, host_radius);
+
+        float delta_alpha_shadow = 0.0;
+        if (norm_r <= 1.0 / sin_sun_elev) {
+            float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
+            delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
+        }
+
+        float psi1 = -delta_alpha_shadow - phi_center;
+        float psi2 = +delta_alpha_shadow - phi_center;
+        float v_tex = clamp((norm_r - 1.0) / 4.0, 0.0, 1.0);
+
+        float cdf1 = eval_ringshine_cdf(psi1, v_tex, sin_lat);
+        float cdf2 = eval_ringshine_cdf(psi2, v_tex, sin_lat);
+
+        float shadow_fraction = clamp(0.5 * (cdf2 - cdf1), 0.0, 1.0);
+        float band_illum = max(0.0, 1.0 - shadow_fraction);
+
+        float u_tex_lut = 0.5 / 256.0 + sin_lat * (255.0 / 256.0);
+        float v_tex_lut = 0.5 / 256.0 + v_tex * (255.0 / 256.0);
+        float kernel_val = texture(u_ringshine_lut, vec2(u_tex_lut, v_tex_lut)).r;
+
+        total_ring_irradiance += band_color * kernel_val * dr * band_illum;
+    }
+
+    out_color = vec4(total_ring_irradiance, 1.0);
 }
 """
