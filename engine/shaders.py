@@ -551,11 +551,9 @@ void main() {
             float specular = pow(NdotH, 64.0) * spec_intensity * diffuse;
 
             // Inverse-square falloff
-            if (u_hdr_enabled) {
-                float falloff = star_lum / (dist_to_star * dist_to_star);
-                diffuse *= falloff;
-                specular *= falloff;
-            }
+            float falloff = star_lum / (dist_to_star * dist_to_star);
+            diffuse *= falloff;
+            specular *= falloff;
 
             // === Analytical eclipse shadows ===
             vec3 shadow = vec3(1.0);
@@ -2277,20 +2275,25 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
 }
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    float a = dot(dir, dir);
-    float b = dot(origin, dir);
+    vec3 v_pc = -origin;
+    float d_center = length(v_pc);
+    if (d_center < 1e-6) {
+        return vec2(-radius, radius);
+    }
+    vec3 d_center_dir = v_pc / d_center;
+    float dir_len = length(dir);
+    vec3 d_dir = dir / max(dir_len, 1e-12);
 
-    // Improved precision for large distances
-    vec3 p = origin - (b / a) * dir;
-    float p2 = dot(p, p);
+    float t_proj = d_center * dot(d_center_dir, d_dir);
+    vec3 cross_vec = cross(d_center_dir, d_dir);
+    float p = d_center * length(cross_vec);
+    float p2 = p * p;
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt((r2 - p2) / a);
-    float t_closest = -b / a;
-
-    return vec2(t_closest - d, t_closest + d);
+    float d = sqrt(max(0.0, r2 - p2));
+    return vec2((t_proj - d) / max(dir_len, 1e-12), (t_proj + d) / max(dir_len, 1e-12));
 }
 
 vec3 get_transmittance(float r, float cos_theta) {
@@ -2818,7 +2821,7 @@ void main() {
         float phase_M = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_theta * cos_theta))
                       / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
 
-        float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star_au * dist_to_star_au, 1e-8)) : 1.0;
+        float irradiance = star_lum / max(dist_to_star_au * dist_to_star_au, 1e-8);
 
         scattered += star_color * u_sun_intensity * irradiance * (
             phase_R * beta_R * total_rayleigh +
@@ -2969,20 +2972,25 @@ uniform float u_ozone_peak_km = 25.0;
 uniform float u_ozone_width_km = 8.0;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    float a = dot(dir, dir);
-    float b = dot(origin, dir);
+    vec3 v_pc = -origin;
+    float d_center = length(v_pc);
+    if (d_center < 1e-6) {
+        return vec2(-radius, radius);
+    }
+    vec3 d_center_dir = v_pc / d_center;
+    float dir_len = length(dir);
+    vec3 d_dir = dir / max(dir_len, 1e-12);
 
-    // Improved precision for large distances
-    vec3 p = origin - (b / a) * dir;
-    float p2 = dot(p, p);
+    float t_proj = d_center * dot(d_center_dir, d_dir);
+    vec3 cross_vec = cross(d_center_dir, d_dir);
+    float p = d_center * length(cross_vec);
+    float p2 = p * p;
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt((r2 - p2) / a);
-    float t_closest = -b / a;
-
-    return vec2(t_closest - d, t_closest + d);
+    float d = sqrt(max(0.0, r2 - p2));
+    return vec2((t_proj - d) / max(dir_len, 1e-12), (t_proj + d) / max(dir_len, 1e-12));
 }
 
 void main() {
@@ -3056,20 +3064,25 @@ uniform float u_ozone_width_km = 8.0;
 uniform sampler2D u_transmittance_lut;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    float a = dot(dir, dir);
-    float b = dot(origin, dir);
+    vec3 v_pc = -origin;
+    float d_center = length(v_pc);
+    if (d_center < 1e-6) {
+        return vec2(-radius, radius);
+    }
+    vec3 d_center_dir = v_pc / d_center;
+    float dir_len = length(dir);
+    vec3 d_dir = dir / max(dir_len, 1e-12);
 
-    // Improved precision for large distances
-    vec3 p = origin - (b / a) * dir;
-    float p2 = dot(p, p);
+    float t_proj = d_center * dot(d_center_dir, d_dir);
+    vec3 cross_vec = cross(d_center_dir, d_dir);
+    float p = d_center * length(cross_vec);
+    float p2 = p * p;
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt((r2 - p2) / a);
-    float t_closest = -b / a;
-
-    return vec2(t_closest - d, t_closest + d);
+    float d = sqrt(max(0.0, r2 - p2));
+    return vec2((t_proj - d) / max(dir_len, 1e-12), (t_proj + d) / max(dir_len, 1e-12));
 }
 
 vec3 get_transmittance(float r, float cos_theta) {
@@ -3166,10 +3179,11 @@ void main() {
                 vec3 trans_to_sun = get_transmittance(p_len, p_cos_sun);
 
                 float NdotL = max(0.0, p_cos_sun);
-                vec3 ground_albedo = u_ground_albedo;
-                vec3 ground_lum = (ground_albedo / 3.14159265358979) * NdotL * trans_to_sun;
+                vec3 effective_ground_albedo = max(u_ground_albedo, w0_M * clamp((beta_M * u_h_mie - vec3(0.5)) / 2.0, vec3(0.0), vec3(1.0)));
+                vec3 ground_lum = (effective_ground_albedo / 3.14159265358979) * NdotL * trans_to_sun;
 
                 lum += transmittance_accum * ground_lum;
+                fms += transmittance_accum * effective_ground_albedo;
             }
 
             lum_total += lum;

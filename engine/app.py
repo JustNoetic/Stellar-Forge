@@ -830,10 +830,11 @@ class App:
         is_shift = glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS
         
         if is_shift:
-            fov_speed = 2.0
-            if yoffset > 0: self.camera["fov"] -= fov_speed
-            elif yoffset < 0: self.camera["fov"] += fov_speed
-            self.camera["fov"] = max(1.0, min(120.0, self.camera["fov"]))
+            if yoffset > 0:
+                self.camera["fov"] *= (0.85 ** yoffset)
+            elif yoffset < 0:
+                self.camera["fov"] *= (1.0 / (0.85 ** abs(yoffset)))
+            self.camera["fov"] = max(0.001, min(120.0, self.camera["fov"]))
         else:
             r_target = 0.0
             if self.camera["tracking_idx"] is not None:
@@ -895,14 +896,16 @@ class App:
         dx_eff = dx * cos_r + dy * sin_r
         dy_eff = -dx * sin_r + dy * cos_r
         
+        fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
+        
         if self.camera["left_dragging"]:
-            sensitivity = 0.3
+            sensitivity = 0.3 * fov_ratio
             self.camera["yaw"] += dx_eff * sensitivity
             self.camera["pitch"] -= dy_eff * sensitivity
             self.camera["pitch"] = max(-89.9, min(89.9, self.camera["pitch"])) 
             
         elif self.camera["right_dragging"]:
-            pan_speed = self.camera["distance_actual"] * 0.001
+            pan_speed = self.camera["distance_actual"] * 0.001 * fov_ratio
             yaw_rad = math.radians(self.camera["yaw_actual"])
             pitch_rad = math.radians(self.camera["pitch_actual"])
             
@@ -4507,7 +4510,17 @@ class App:
             if imgui.button("Graphics & Quality Settings..."):
                 self.camera["show_settings_modal"] = True
                 
-            imgui.text(f"FOV: {self.camera['fov']:.1f} deg")
+            fov_val = self.camera['fov']
+            if fov_val >= 1.0:
+                fov_fmt = "%.1f deg"
+            elif fov_val >= 0.01:
+                fov_fmt = "%.3f deg"
+            else:
+                fov_fmt = "%.5f deg"
+            changed_fov, new_fov = imgui.slider_float("FOV", fov_val, 0.001, 120.0, fov_fmt, imgui.SLIDER_FLAGS_LOGARITHMIC)
+            if changed_fov:
+                self.camera["fov"] = max(0.001, min(120.0, new_fov))
+                self.save_settings()
             if imgui.button("Reset FOV"):
                 self.camera["fov"] = 45.0
                 self.save_settings()
