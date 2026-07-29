@@ -2054,6 +2054,19 @@ class App:
         self.u_planet_normal_textures_obj = None
         self.u_planet_specular_textures_obj = None
         
+        # Anisotropic filtering is the key to eliminating spherical-mapping moire:
+        # equirectangular UVs compress longitude toward the poles, so the isotropic
+        # mip selection from textureGrad under-samples along one axis and produces
+        # catastrophic aliasing/moire across the whole planet when zoomed in. Pull
+        # the device maximum once and apply it to every mipmapped surface texture.
+        try:
+            max_aniso = float(ctx.max_anisotropy or 1.0)
+        except Exception:
+            max_aniso = 1.0
+        # Use a high but slightly conservative anisotropy cap (16x is the typical
+        # device max; values above the max are clamped by the driver anyway).
+        aniso_value = max(1.0, min(max_aniso, 16.0))
+
         if self.planet_textures:
             tex_data = b''.join(self.planet_textures)
             self.u_planet_textures_obj = ctx.texture_array(
@@ -2063,6 +2076,7 @@ class App:
             # Wrap along longitude (u wraps 0->1 around the sphere); clamp latitude.
             self.u_planet_textures_obj.repeat_x = True
             self.u_planet_textures_obj.build_mipmaps()
+            self.u_planet_textures_obj.anisotropy = aniso_value
             self.u_planet_textures_obj.use(location=3) # Use texture unit 3
             if 'u_planet_textures' in prog_spheres:
                 prog_spheres['u_planet_textures'].value = 3
@@ -2074,6 +2088,7 @@ class App:
             self.u_planet_normal_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
             self.u_planet_normal_textures_obj.repeat_x = True
             self.u_planet_normal_textures_obj.build_mipmaps()
+            self.u_planet_normal_textures_obj.anisotropy = aniso_value
             self.u_planet_normal_textures_obj.use(location=4) # Use texture unit 4
             if 'u_planet_normal_textures' in prog_spheres:
                 prog_spheres['u_planet_normal_textures'].value = 4
@@ -2085,6 +2100,7 @@ class App:
             self.u_planet_specular_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
             self.u_planet_specular_textures_obj.repeat_x = True
             self.u_planet_specular_textures_obj.build_mipmaps()
+            self.u_planet_specular_textures_obj.anisotropy = aniso_value
             self.u_planet_specular_textures_obj.use(location=5) # Use texture unit 5
             if 'u_planet_specular_textures' in prog_spheres:
                 prog_spheres['u_planet_specular_textures'].value = 5
@@ -2097,6 +2113,7 @@ class App:
                 tex.repeat_x = False
                 tex.repeat_y = False
                 tex.build_mipmaps()
+                tex.anisotropy = aniso_value
                 self.ring_gl_textures_front[name_lower] = tex
             except Exception as e:
                 print(f"Failed to compile OpenGL front texture for ring {name_lower}: {e}")
@@ -2108,6 +2125,7 @@ class App:
                 tex.repeat_x = False
                 tex.repeat_y = False
                 tex.build_mipmaps()
+                tex.anisotropy = aniso_value
                 self.ring_gl_textures_back[name_lower] = tex
             except Exception as e:
                 print(f"Failed to compile OpenGL back texture for ring {name_lower}: {e}")
@@ -3407,6 +3425,16 @@ class App:
                 else:
                     tracking_idx_uni = self.camera["tracking_idx"]
             prog_culling_compute['u_tracking_idx'].value = tracking_idx_uni
+            if 'u_camera_pos' in prog_culling_compute:
+                prog_culling_compute['u_camera_pos'].value = tuple(cam_pos)
+            if 'u_screen_height' in prog_culling_compute:
+                prog_culling_compute['u_screen_height'].value = float(self.window_height)
+            if 'u_fov_factor' in prog_culling_compute:
+                prog_culling_compute['u_fov_factor'].value = float(1.0 / math.tan(math.radians(self.camera["fov"] / 2.0)))
+            if 'u_lod_thresh_ultra' in prog_culling_compute:
+                prog_culling_compute['u_lod_thresh_ultra'].value = 300.0
+            if 'u_lod_thresh_hi' in prog_culling_compute:
+                prog_culling_compute['u_lod_thresh_hi'].value = 40.0
             
             all_instances_buffer.bind_to_storage_buffer(binding=2)
             vis_lo_buffer.bind_to_storage_buffer(binding=3)

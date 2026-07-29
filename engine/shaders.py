@@ -38,6 +38,11 @@ uniform vec3 u_ring_normals[16];
 uniform float u_ring_outer_radii[16];
 
 uniform int u_tracking_idx;
+uniform vec3 u_camera_pos;
+uniform float u_screen_height;
+uniform float u_fov_factor;
+uniform float u_lod_thresh_ultra;
+uniform float u_lod_thresh_hi;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -125,15 +130,18 @@ void main() {
     instances[idx * 7 + 3].z = uintBitsToFloat(mask_hi);
     instances[idx * 7 + 3].w = uintBitsToFloat(r_mask);
 
-    // 3. Lodge into visible buffers
+    // 3. Lodge into visible buffers based on screen-space size & tracking state
     if (visible) {
-        bool is_ultra = (int(idx) == u_tracking_idx);
-        bool is_focused = (focused_mask[idx] > 0u) || (f2.x > 0.5);
+        float cam_dist = length(pos - u_camera_pos);
+        float apparent_px = (cam_dist > 1e-6) ? ((r / cam_dist) * u_screen_height * u_fov_factor) : 10000.0;
+
+        bool is_ultra = (int(idx) == u_tracking_idx) || (apparent_px >= u_lod_thresh_ultra);
+        bool is_hi = (apparent_px >= u_lod_thresh_hi) || (f2.x > 0.5);
 
         if (is_ultra) {
             uint slot = atomicAdd(cmds[2].instanceCount, 1u);
             vis_ultra[slot] = idx;
-        } else if (is_focused) {
+        } else if (is_hi) {
             uint slot = atomicAdd(cmds[1].instanceCount, 1u);
             vis_hi[slot] = idx;
         } else {
@@ -2275,25 +2283,20 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
 }
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    vec3 v_pc = -origin;
-    float d_center = length(v_pc);
-    if (d_center < 1e-6) {
-        return vec2(-radius, radius);
-    }
-    vec3 d_center_dir = v_pc / d_center;
-    float dir_len = length(dir);
-    vec3 d_dir = dir / max(dir_len, 1e-12);
+    float a = dot(dir, dir);
+    float b = dot(origin, dir);
 
-    float t_proj = d_center * dot(d_center_dir, d_dir);
-    vec3 cross_vec = cross(d_center_dir, d_dir);
-    float p = d_center * length(cross_vec);
-    float p2 = p * p;
+    // Improved precision for large distances
+    vec3 p = origin - (b / a) * dir;
+    float p2 = dot(p, p);
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt(max(0.0, r2 - p2));
-    return vec2((t_proj - d) / max(dir_len, 1e-12), (t_proj + d) / max(dir_len, 1e-12));
+    float d = sqrt((r2 - p2) / a);
+    float t_closest = -b / a;
+
+    return vec2(t_closest - d, t_closest + d);
 }
 
 vec3 get_transmittance(float r, float cos_theta) {
@@ -2972,25 +2975,20 @@ uniform float u_ozone_peak_km = 25.0;
 uniform float u_ozone_width_km = 8.0;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    vec3 v_pc = -origin;
-    float d_center = length(v_pc);
-    if (d_center < 1e-6) {
-        return vec2(-radius, radius);
-    }
-    vec3 d_center_dir = v_pc / d_center;
-    float dir_len = length(dir);
-    vec3 d_dir = dir / max(dir_len, 1e-12);
+    float a = dot(dir, dir);
+    float b = dot(origin, dir);
 
-    float t_proj = d_center * dot(d_center_dir, d_dir);
-    vec3 cross_vec = cross(d_center_dir, d_dir);
-    float p = d_center * length(cross_vec);
-    float p2 = p * p;
+    // Improved precision for large distances
+    vec3 p = origin - (b / a) * dir;
+    float p2 = dot(p, p);
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt(max(0.0, r2 - p2));
-    return vec2((t_proj - d) / max(dir_len, 1e-12), (t_proj + d) / max(dir_len, 1e-12));
+    float d = sqrt((r2 - p2) / a);
+    float t_closest = -b / a;
+
+    return vec2(t_closest - d, t_closest + d);
 }
 
 void main() {
@@ -3064,25 +3062,20 @@ uniform float u_ozone_width_km = 8.0;
 uniform sampler2D u_transmittance_lut;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    vec3 v_pc = -origin;
-    float d_center = length(v_pc);
-    if (d_center < 1e-6) {
-        return vec2(-radius, radius);
-    }
-    vec3 d_center_dir = v_pc / d_center;
-    float dir_len = length(dir);
-    vec3 d_dir = dir / max(dir_len, 1e-12);
+    float a = dot(dir, dir);
+    float b = dot(origin, dir);
 
-    float t_proj = d_center * dot(d_center_dir, d_dir);
-    vec3 cross_vec = cross(d_center_dir, d_dir);
-    float p = d_center * length(cross_vec);
-    float p2 = p * p;
+    // Improved precision for large distances
+    vec3 p = origin - (b / a) * dir;
+    float p2 = dot(p, p);
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt(max(0.0, r2 - p2));
-    return vec2((t_proj - d) / max(dir_len, 1e-12), (t_proj + d) / max(dir_len, 1e-12));
+    float d = sqrt((r2 - p2) / a);
+    float t_closest = -b / a;
+
+    return vec2(t_closest - d, t_closest + d);
 }
 
 vec3 get_transmittance(float r, float cos_theta) {
