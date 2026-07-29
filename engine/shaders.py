@@ -1308,6 +1308,7 @@ uniform vec3 u_host_planet_pos;
 uniform float u_host_planet_radius;
 uniform vec3 u_host_planet_color;
 uniform vec4 u_host_planet_atmo;
+uniform float u_host_planet_refractivity;  // surface (n_mix - 1) for eclipse refraction
 uniform vec3 u_camera_pos;
 uniform vec4 u_host_planet_pole_obl;
 uniform float u_host_planet_R_minor;
@@ -1794,7 +1795,7 @@ void main() {
                         float penumbra_outer = alpha + beta;
                         float penumbra_inner = max(0.0, beta - alpha);
                         float max_bend = host_atmo_h > 0.0
-                            ? clamp(2.0 * 0.00029 * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.05)
+                            ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.05)
                             : 0.0;
                         shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, max_bend, u_host_planet_atmo.xyz);
                     }
@@ -1974,11 +1975,17 @@ layout(std430, binding = 8) buffer AtmoData {
     bool  u_atmo_adaptive_steps;
     int   u_body_idx;
     float u_frame_counter;
+    vec3  u_mie_albedo;          // per-channel single-scattering albedo (omega_0)
+    float u_refractivity;        // surface (n_mix - 1), drives eclipse refraction
     vec4  u_active_casters[8];
     vec4  u_active_caster_poles_obl[8];
     float u_active_caster_R_minor[8];
     vec4  u_active_caster_atmos[8];
     float u_active_max_bend[8];
+    float u_ozone_peak_km;
+    float u_ozone_width_km;
+    float _atmo_pad0;
+    float _atmo_pad1;
 };
 
 out vec3 f_world_pos;
@@ -2052,11 +2059,17 @@ layout(std430, binding = 8) buffer AtmoData {
     bool  u_atmo_adaptive_steps;
     int   u_body_idx;
     float u_frame_counter;
+    vec3  u_mie_albedo;          // per-channel single-scattering albedo (omega_0)
+    float u_refractivity;        // surface (n_mix - 1), drives eclipse refraction
     vec4  u_active_casters[8];
     vec4  u_active_caster_poles_obl[8];
     float u_active_caster_R_minor[8];
     vec4  u_active_caster_atmos[8];
     float u_active_max_bend[8];
+    float u_ozone_peak_km;
+    float u_ozone_width_km;
+    float _atmo_pad0;
+    float _atmo_pad1;
 };
 
 uniform sampler2D u_ring_gradients;
@@ -2386,7 +2399,10 @@ void main() {
     if (s_start >= s_end) discard;
 
     vec3 beta_R = u_beta_rayleigh * 1000.0;
-    vec3 beta_M = u_beta_mie * 1000.0;
+    vec3 beta_M_ext = u_beta_mie * 1000.0;       // Mie extinction
+    vec3 w0_M = clamp(u_mie_albedo, vec3(0.0), vec3(1.0));
+    vec3 beta_M = beta_M_ext * w0_M;            // Mie scattering = omega_0 * extinction
+    vec3 beta_M_abs = beta_M_ext * (vec3(1.0) - w0_M); // Mie absorption
     vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
@@ -2684,9 +2700,9 @@ void main() {
 
             float rho_R = exp(-altitude / u_h_rayleigh);
             float rho_M = exp(-altitude / u_h_mie);
-            float rho_O = exp(-pow((altitude - 25.0) / 8.0, 2.0));
+            float rho_O = exp(-pow((altitude - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
 
-            vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
+            vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
             vec3 step_transmittance = exp(-step_extinction * step_size);
             vec3 int_factor = (vec3(1.0) - step_transmittance) / max(step_extinction, 1e-6);
 
@@ -2697,7 +2713,11 @@ void main() {
             float sin_planet = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
             float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
 
-            float max_bend = clamp(2.0 * 0.00029 * sqrt(3.14159265359 * u_planet_radius_km / max(1e-6, u_h_rayleigh * 2.0)), 0.001, 0.05);
+            // Atmospheric refraction limit (max bending angle) for this body.
+            // Derived from the surface refractivity (n_mix - 1) instead of a
+            // hard-coded Earth-only 0.00029 constant, so Venus/Mars/Titan/gas
+            // giants refract eclipses according to their own gas mixtures.
+            float max_bend = clamp(2.0 * max(u_refractivity, 0.0) * sqrt(3.14159265359 * u_planet_radius_km / max(1e-6, u_h_rayleigh * 2.0)), 0.001, 0.05);
             float effective_star_rad = sin_star + max_bend;
             float cos_sun_eff = sqrt(max(0.0, 1.0 - effective_star_rad * effective_star_rad));
 
@@ -2942,6 +2962,9 @@ uniform vec3 u_beta_rayleigh;
 uniform vec3 u_beta_mie;
 uniform vec3 u_beta_abs_mixed;
 uniform vec3 u_beta_abs_layered;
+uniform vec3 u_mie_albedo;
+uniform float u_ozone_peak_km = 25.0;
+uniform float u_ozone_width_km = 8.0;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float a = dot(dir, dir);
@@ -2993,15 +3016,18 @@ void main() {
 
         od_rayleigh += exp(-h_sample / u_h_rayleigh) * step_size;
         od_mie += exp(-h_sample / u_h_mie) * step_size;
-        od_ozone += exp(-pow((h_sample - 25.0) / 8.0, 2.0)) * step_size;
+        od_ozone += exp(-pow((h_sample - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0)) * step_size;
     }
 
     vec3 beta_R = u_beta_rayleigh * 1000.0;
-    vec3 beta_M = u_beta_mie * 1000.0;
+    vec3 beta_M_ext = u_beta_mie * 1000.0;
+    vec3 w0_M = clamp(u_mie_albedo, vec3(0.0), vec3(1.0));
+    vec3 beta_M = beta_M_ext * w0_M;              // Mie scattering
+    vec3 beta_M_abs = beta_M_ext * (vec3(1.0) - w0_M); // Mie absorption
     vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
-    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M * od_mie + beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone));
+    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M_ext * od_mie + beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone));
     out_color = vec4(transmittance, 1.0);
 }
 """
@@ -3019,8 +3045,11 @@ uniform vec3 u_beta_rayleigh;
 uniform vec3 u_beta_mie;
 uniform vec3 u_beta_abs_mixed;
 uniform vec3 u_beta_abs_layered;
+uniform vec3 u_mie_albedo;
 uniform float u_mie_g;
 uniform vec3 u_ground_albedo;
+uniform float u_ozone_peak_km = 25.0;
+uniform float u_ozone_width_km = 8.0;
 
 uniform sampler2D u_transmittance_lut;
 
@@ -3059,7 +3088,10 @@ void main() {
     vec3 sun_dir = vec3(sin_sun_zenith, cos_sun_zenith, 0.0);
 
     vec3 beta_R = u_beta_rayleigh * 1000.0;
-    vec3 beta_M = u_beta_mie * 1000.0;
+    vec3 beta_M_ext = u_beta_mie * 1000.0;
+    vec3 w0_M = clamp(u_mie_albedo, vec3(0.0), vec3(1.0));
+    vec3 beta_M = beta_M_ext * w0_M;              // Mie scattering
+    vec3 beta_M_abs = beta_M_ext * (vec3(1.0) - w0_M); // Mie absorption
     vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
@@ -3101,10 +3133,10 @@ void main() {
 
                 float rho_R = exp(-h_sample / u_h_rayleigh);
                 float rho_M = exp(-h_sample / u_h_mie);
-                float rho_O = exp(-pow((h_sample - 25.0) / 8.0, 2.0));
+                float rho_O = exp(-pow((h_sample - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
 
                 vec3 scattering = beta_R * rho_R + beta_M * rho_M;
-                vec3 extinction = scattering + beta_A_mixed * rho_R + beta_A_layered * rho_O;
+                vec3 extinction = scattering + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
 
                 vec3 sample_transmittance = exp(-extinction * step_size);
 

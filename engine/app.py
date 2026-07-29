@@ -35,7 +35,7 @@ from physics_core import _extract_render_state, _update_hierarchy_core
 from render_utils import *
 from shaders import *
 from post_shaders import *
-from atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients
+from atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 _PERF_ENABLED = _os.environ.get("STELLAR_FORGE_PERF") == "1"
 _PERF_TRACKER = None
 
@@ -222,12 +222,22 @@ class ModernGLGlfwRenderer(GlfwRenderer):
     def shutdown(self):
         self.modern_renderer.shutdown()
 
-def compute_max_bend(caster_r_au, atmo_h_km):
+def compute_max_bend(caster_r_au, atmo_h_km, refractivity=0.00029):
+    """Maximum atmospheric refraction angle (radians) for a spherical shell.
+
+    Derives the classic astronomical-refraction scale from the body's actual
+    surface refractivity (n_mix - 1) instead of hard-coding Earth's 0.00029.
+    The horizontal refraction of a plane-parallel exponential atmosphere is
+        R = 2 * (n-1) * sqrt(pi * R_p / (2 H))
+    (the '2 * 0.00029 * sqrt(...)' form with the Earth constant replaced by
+    the body's own (n-1)). Clamped to [0.001, 0.05] rad to stay numerically
+    well-conditioned in the eclipse shaders.
+    """
     if atmo_h_km <= 0.0 or caster_r_au <= 0.0:
         return 0.0
     caster_r_km = caster_r_au * 149597870.7
     val = (3.141592653589793 * caster_r_km) / max(1e-6, atmo_h_km * 2.0)
-    max_bend = 2.0 * 0.00029 * math.sqrt(val)
+    max_bend = 2.0 * max(refractivity, 0.0) * math.sqrt(val)
     return max(0.001, min(0.05, max_bend))
 
 @njit(cache=True)
@@ -273,7 +283,14 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     h_m = atmo.get('h_mie', 1.2)
     od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
     od_m = compute_mie_coefficients(beta_m, atmo.get('mie_angstrom', None)) * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
-    od_o3 = props['beta_abs_layered'] * 1000.0 * 1200.0  # Slant path through stratospheric ozone
+    # Ozone slant path through its stratospheric Chapman layer: replace the
+    # hard-coded 1200 km chord with the same sqrt(2*pi*R*H) geometry used for
+    # Rayleigh/Mie, using the Chapman peak altitude as the effective layer
+    # scale. This makes the slant path scale correctly with planet radius and
+    # ozone peak altitude across bodies (Earth/Mars/Venus/Titan).
+    z_o3_peak_km = props.get('ozone_peak_km', 25.0)
+    ozone_slant_km = math.sqrt(2.0 * math.pi * R_km * max(1.0, z_o3_peak_km))
+    od_o3 = props['beta_abs_layered'] * 1000.0 * ozone_slant_km
     od_mixed = props['beta_abs_mixed'] * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
     tau = od_r + od_m + od_o3 + od_mixed
     direct_trans = np.exp(-tau)
@@ -689,6 +706,7 @@ class App:
             "shadow_caster_budget": 32,
             "taa_enabled": True,
             "atmo_render_scale": 0.5,
+            "screenshot_res_idx": 1,
         }
         
         # Post-Processing FBOs
@@ -718,6 +736,13 @@ class App:
         self.prev_vp = None
         self.prev_cam_origin = None
         self.taa_frame_index = 0
+        
+        # Screenshot capture state
+        self._screenshot_request = None      # (width, height) tuple when capture requested
+        self._screenshot_capturing = False   # True during the high-res render frame
+        self._screenshot_orig_fb = None      # (orig_w, orig_h) saved during capture
+        self._screenshot_toast = None        # (message, timestamp) for status notification
+        self._screenshot_saving = False      # True while background save thread is running
         
         self.quad_vao_down = None
         self.quad_vao_up = None
@@ -791,6 +816,7 @@ class App:
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
                 "taa_enabled": self.camera.get("taa_enabled", True),
                 "atmo_render_scale": self.camera.get("atmo_render_scale", 0.5),
+                "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -923,6 +949,11 @@ class App:
             elif key == glfw.KEY_EQUAL:
                 multiplier = 2.0 if (mods & glfw.MOD_SHIFT) else 1.1
                 self.camera["exposure"] *= multiplier
+            elif key == glfw.KEY_F12 and action == glfw.PRESS:
+                if not self._screenshot_capturing and not self._screenshot_saving:
+                    _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]
+                    _ss_idx = max(0, min(len(_ss_presets) - 1, self.camera.get("screenshot_res_idx", 1)))
+                    self._screenshot_request = _ss_presets[_ss_idx]
     
     def resize_callback(self, window, width, height):
         if self.impl: self.impl.resize_callback(window, width, height)
@@ -1918,6 +1949,7 @@ class App:
         u_ring_host_R_minor = prog_rings.get('u_host_planet_R_minor', None)
         u_ring_host_color = prog_rings.get('u_host_planet_color', None)
         u_ring_host_atmo = prog_rings.get('u_host_planet_atmo', None)
+        u_ring_host_refractivity = prog_rings.get('u_host_planet_refractivity', None)
         u_ring_camera_pos = prog_rings['u_camera_pos']
         u_ring_body_offset = prog_rings['u_body_offset']
         u_ring_clip_mode = prog_rings['u_clip_mode']
@@ -1938,9 +1970,9 @@ class App:
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
         u_atmo_jitter = prog_atmo.get('u_atmo_jitter', None)
 
-        self.atmo_ssbo = ctx.buffer(reserve=576)
+        self.atmo_ssbo = ctx.buffer(reserve=608)
         self.atmo_ssbo.bind_to_storage_buffer(binding=8)
-        self.atmo_staging = np.zeros(144, dtype=np.float32)
+        self.atmo_staging = np.zeros(152, dtype=np.float32)
         self.atmo_staging_int_view = self.atmo_staging.view(np.int32)
 
 
@@ -2112,6 +2144,7 @@ class App:
             beta_mie = compute_mie_coefficients(atmo.get('beta_mie', 2.0e-6), atmo.get('mie_angstrom', None))
             beta_abs_mixed = props['beta_abs_mixed']
             beta_abs_layered = props['beta_abs_layered']
+            mie_albedo = np.asarray(atmo.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32)), dtype=np.float32)
             
             bi = atmo['body_idx']
             if is_cmp and hasattr(self, 'visual_arr_cmp') and self.visual_arr_cmp is not None and len(self.visual_arr_cmp) > bi:
@@ -2127,6 +2160,12 @@ class App:
             self.prog_atmo_lut['u_beta_mie'].value = tuple(beta_mie)
             self.prog_atmo_lut['u_beta_abs_mixed'].value = tuple(beta_abs_mixed)
             self.prog_atmo_lut['u_beta_abs_layered'].value = tuple(beta_abs_layered)
+            if 'u_mie_albedo' in self.prog_atmo_lut:
+                self.prog_atmo_lut['u_mie_albedo'].value = tuple(mie_albedo)
+            if 'u_ozone_peak_km' in self.prog_atmo_lut:
+                self.prog_atmo_lut['u_ozone_peak_km'].value = float(props.get('ozone_peak_km', 25.0))
+            if 'u_ozone_width_km' in self.prog_atmo_lut:
+                self.prog_atmo_lut['u_ozone_width_km'].value = float(props.get('ozone_width_km', 8.0))
             
             fbo.use()
             self.lut_vao.render(moderngl.TRIANGLE_STRIP)
@@ -2145,6 +2184,12 @@ class App:
             self.prog_multi_scatter_lut['u_beta_mie'].value = tuple(beta_mie)
             self.prog_multi_scatter_lut['u_beta_abs_mixed'].value = tuple(beta_abs_mixed)
             self.prog_multi_scatter_lut['u_beta_abs_layered'].value = tuple(beta_abs_layered)
+            if 'u_mie_albedo' in self.prog_multi_scatter_lut:
+                self.prog_multi_scatter_lut['u_mie_albedo'].value = tuple(mie_albedo)
+            if 'u_ozone_peak_km' in self.prog_multi_scatter_lut:
+                self.prog_multi_scatter_lut['u_ozone_peak_km'].value = float(props.get('ozone_peak_km', 25.0))
+            if 'u_ozone_width_km' in self.prog_multi_scatter_lut:
+                self.prog_multi_scatter_lut['u_ozone_width_km'].value = float(props.get('ozone_width_km', 8.0))
             if 'u_mie_g' in self.prog_multi_scatter_lut:
                 self.prog_multi_scatter_lut['u_mie_g'].value = float(atmo.get('mie_g', 0.8))
             if 'u_ground_albedo' in self.prog_multi_scatter_lut:
@@ -2818,8 +2863,21 @@ class App:
                 imgui.end_frame()
                 continue
             
+            # Screenshot: temporarily override resolution for high-res capture
+            _ss_orig_fb = None
+            if self._screenshot_request and not self._screenshot_capturing:
+                _ss_orig_fb = (self.fb_width, self.fb_height)
+                self._screenshot_orig_fb = _ss_orig_fb
+                self.fb_width, self.fb_height = self._screenshot_request
+                self._screenshot_capturing = True
+                self._screenshot_request = None
+                self._screenshot_toast = ("Capturing...", time.time())
+            
             taa_enabled = self.camera.get("taa_enabled", True)
             msaa_samples = 0 if taa_enabled else self.camera.get("msaa_samples", 4)
+            # Disable MSAA for screenshot frames to avoid massive VRAM usage
+            if self._screenshot_capturing:
+                msaa_samples = 0
             if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples:
                 self.last_fb_size = (self.fb_width, self.fb_height)
                 self.last_msaa_samples = msaa_samples
@@ -3586,7 +3644,9 @@ class App:
                     scale_height_km = float(props.get('scale_height_km', 8.5))
                     caster_atmos_buf[i_c, 0:3] = trans
                     caster_atmos_buf[i_c, 3] = thick_km
-                    caster_max_bend_buf[i_c] = compute_max_bend(body_radii[b_idx], scale_height_km)
+                    caster_max_bend_buf[i_c] = compute_max_bend(
+                        body_radii[b_idx], scale_height_km,
+                        float(props.get('refractivity', 0.00029)))
                 else:
                     caster_atmos_buf[i_c] = 0.0
                     caster_max_bend_buf[i_c] = 0.0
@@ -4009,7 +4069,9 @@ class App:
                             scale_height_km = float(props_c.get('scale_height_km', 8.5))
                             active_atmos_buf[i_ac, 0:3] = trans_c
                             active_atmos_buf[i_ac, 3] = thick_km
-                            active_max_bend_buf[i_ac] = compute_max_bend(rad_c, scale_height_km)
+                            active_max_bend_buf[i_ac] = compute_max_bend(
+                                rad_c, scale_height_km,
+                                float(props_c.get('refractivity', 0.00029)))
                             
                     # Write all per-body atmosphere parameters into self.atmo_staging (std430 alignment)
                     self.atmo_staging[0:3] = body_pos_rel
@@ -4032,11 +4094,17 @@ class App:
                     self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
                     self.atmo_staging_int_view[30] = body_idx_in_unified
                     self.atmo_staging[31] = float(self.frame_counter % 8)
-                    self.atmo_staging[32:64] = active_casters_buf.ravel()
-                    self.atmo_staging[64:96] = active_poles_obl_buf.ravel()
-                    self.atmo_staging[96:104] = active_caster_r_minor_buf
-                    self.atmo_staging[104:136] = active_atmos_buf.ravel()
-                    self.atmo_staging[136:144] = active_max_bend_buf
+                    self.atmo_staging[32:35] = atmo.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32))
+                    # index 35: u_refractivity (surface n_mix - 1, drives eclipse refraction)
+                    self.atmo_staging[35] = float(props.get('refractivity', 0.00029))
+                    self.atmo_staging[36:68] = active_casters_buf.ravel()
+                    self.atmo_staging[68:100] = active_poles_obl_buf.ravel()
+                    self.atmo_staging[100:108] = active_caster_r_minor_buf
+                    self.atmo_staging[108:140] = active_atmos_buf.ravel()
+                    self.atmo_staging[140:148] = active_max_bend_buf
+                    self.atmo_staging[148:152] = [float(props.get('ozone_peak_km', 25.0)),
+                                                  float(props.get('ozone_width_km', 8.0)),
+                                                  0.0, 0.0]  # pad to 608 bytes
 
                     # Single buffer upload per atmosphere body
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
@@ -4130,8 +4198,12 @@ class App:
                                 props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
                                 scale_height_km = float(props_c.get('scale_height_km', 8.5))
                                 u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = 0.0
                         k = self.body_ring_indices.get(bi)
                         if k is not None:
                             u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
@@ -4204,8 +4276,12 @@ class App:
                                 props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
                                 scale_height_km = float(props_c.get('scale_height_km', 8.5))
                                 u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = 0.0
                         u_ring_caster_mask_lo_uni.value = 0
                         u_ring_caster_mask_hi_uni.value = 0
                         body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
@@ -4441,6 +4517,28 @@ class App:
             if imgui.button("Reset FOV"):
                 self.camera["fov"] = 45.0
                 self.save_settings()
+            
+            imgui.separator()
+            imgui.text_colored("Screenshot", 0.6, 0.9, 1.0)
+            _ss_res_labels = ["4K (3840x2160)", "8K (7680x4320)", "16K (15360x8640)"]
+            _ss_res_idx = self.camera.get("screenshot_res_idx", 1)
+            _ss_changed, _ss_new_idx = imgui.combo("Resolution##ss", _ss_res_idx, _ss_res_labels)
+            if _ss_changed:
+                self.camera["screenshot_res_idx"] = _ss_new_idx
+                self.save_settings()
+            _ss_can_capture = not self._screenshot_capturing and not self._screenshot_saving
+            if not _ss_can_capture:
+                imgui.push_style_var(imgui.STYLE_ALPHA, 0.5)
+            if imgui.button("Capture Screenshot (F12)"):
+                if _ss_can_capture:
+                    _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]
+                    _ss_idx_clamped = max(0, min(len(_ss_presets) - 1, self.camera.get("screenshot_res_idx", 1)))
+                    self._screenshot_request = _ss_presets[_ss_idx_clamped]
+            if not _ss_can_capture:
+                imgui.pop_style_var()
+            if self._screenshot_saving:
+                imgui.same_line()
+                imgui.text_colored("Saving...", 1.0, 1.0, 0.4)
             
             if self.camera.get("show_settings_modal", False):
                 imgui.set_next_window_size(320, 320, imgui.FIRST_USE_EVER)
@@ -5420,21 +5518,23 @@ class App:
                                 
                                 beta_R = props['beta_rayleigh']
                                 beta_M = compute_mie_coefficients(atmo_item.get('beta_mie', 2.0e-6), atmo_item.get('mie_angstrom', None))
+                                mie_alb = np.asarray(atmo_item.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32)), dtype=np.float64)
                                 beta_O3 = props['beta_abs_layered']
                                 beta_mixed = props['beta_abs_mixed']
                                 
                                 tau_R = beta_R * H_r_m
-                                tau_M = beta_M * H_m_m
+                                tau_M_ext = beta_M * H_m_m
+                                tau_M_sca = tau_M_ext * mie_alb
                                 tau_O3 = beta_O3 * 14179.6
                                 tau_mixed = beta_mixed * H_r_m
                                 
-                                tau_total = tau_R + tau_M + tau_O3 + tau_mixed
+                                tau_total = tau_R + tau_M_ext + tau_O3 + tau_mixed
                                 
                                 T_surf = np.exp(-tau_total)
                                 p_surf = c * (T_surf ** 2)
                                 
                                 p_Rayleigh = 0.69 * (1.0 - np.exp(-tau_R)) * np.exp(-2.0 * tau_O3)
-                                p_Mie = 0.75 * 0.9 * (1.0 - np.exp(-tau_M)) * np.exp(-2.0 * tau_O3)
+                                p_Mie = 0.75 * 0.9 * (1.0 - np.exp(-tau_M_sca)) * np.exp(-2.0 * tau_O3)
                                 
                                 p_rgb = p_surf + (1.0 - p_surf) * (p_Rayleigh + p_Mie)
                                 p_rgb = np.clip(p_rgb, 0.0, 1.0)
@@ -6192,15 +6292,18 @@ class App:
                                     comp_keys = list(comp.keys())
                                     gas_changed = False
                                     for gas in comp_keys:
-                                        changed, new_val = imgui.slider_float(f"{gas}##slider", comp[gas], 0.0, 1.0)
+                                        changed, new_pct = imgui.slider_float(f"{gas}##slider", comp[gas] * 100.0, 0.0, 100.0, "%.1f%%")
                                         if changed:
-                                            comp[gas] = new_val
+                                            comp[gas] = new_pct / 100.0
                                             gas_changed = True
                                             
                                         imgui.same_line()
                                         if imgui.button(f"X##{gas}"):
                                             del comp[gas]
                                             gas_changed = True
+                                            
+                                    total_pct = sum(comp.values()) * 100.0
+                                    imgui.text_disabled(f"Total: {total_pct:.1f}%  (auto-normalized)")
                                             
                                     available_gases = [g for g in GAS_PROPERTIES.keys() if g not in comp]
                                     if available_gases:
@@ -6214,7 +6317,7 @@ class App:
                                             
                                         imgui.same_line()
                                         if imgui.button("Add Gas"):
-                                            comp[available_gases[atmo_item['selected_gas']]] = 0.1
+                                            comp[available_gases[atmo_item['selected_gas']]] = 0.10
                                             gas_changed = True
                                             
                                     if gas_changed:
@@ -6242,6 +6345,21 @@ class App:
                                 changed_mg, new_mg = imgui.slider_float("Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
                                 if changed_mg:
                                     atmo_item['mie_g'] = new_mg
+                                    atmo_item['_dirty'] = True
+                                    if 'lut_tex' in atmo_item:
+                                        atmo_item['lut_tex'].release()
+                                        del atmo_item['lut_tex']
+                                
+                                # Aerosol single-scattering albedo (omega_0): 1.0 = conservatively scattering (bright haze/clouds),
+                                # <1.0 = absorbing (dark haze, e.g. Titan tholins). Lower = darker.
+                                cur_alb = atmo_item.get('mie_albedo', None)
+                                if cur_alb is None:
+                                    cur_alb_val = 1.0
+                                else:
+                                    cur_alb_val = float(np.mean(cur_alb))
+                                changed_alb, new_alb = imgui.slider_float("Aerosol Albedo (w0)", cur_alb_val, 0.0, 1.0)
+                                if changed_alb:
+                                    atmo_item['mie_albedo'] = np.array([new_alb, new_alb, new_alb], dtype=np.float32)
                                     atmo_item['_dirty'] = True
                                     if 'lut_tex' in atmo_item:
                                         atmo_item['lut_tex'].release()
@@ -6292,6 +6410,7 @@ class App:
                                         'beta_mie': 2.0e-6,
                                         'h_mie': 1.2,
                                         'mie_g': 0.758,
+                                        'mie_albedo': np.array([1.0, 1.0, 1.0], dtype=np.float32),
                                         'intensity': 1.0
                                     }
                                     atmo_bodies.append(new_atmo)
@@ -6845,6 +6964,63 @@ class App:
                     
                 # Final Composite
                 ctx.disable(moderngl.BLEND)
+                
+                # Screenshot: capture composited result to a temporary high-res FBO
+                if self._screenshot_capturing:
+                    ss_w, ss_h = self.fb_width, self.fb_height
+                    ss_tex = ctx.texture((ss_w, ss_h), 4)  # 8-bit RGBA for final sRGB output
+                    ss_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    ss_fbo = ctx.framebuffer(color_attachments=[ss_tex])
+                    ss_fbo.use()
+                    ctx.viewport = (0, 0, ss_w, ss_h)
+                    resolved_tex.use(location=0)
+                    self.bloom_texs[0].use(location=1)
+                    self.prog_composite['u_main_texture'].value = 0
+                    self.prog_composite['u_bloom_texture'].value = 1
+                    self.prog_composite['u_bloom_intensity'].value = self.camera.get("bloom_intensity", 0.05)
+                    self.quad_vao_comp.render(moderngl.TRIANGLE_STRIP)
+                    
+                    # Read composited pixels
+                    raw_pixels = ss_fbo.read(components=3)
+                    ss_fbo.release()
+                    ss_tex.release()
+                    
+                    # Restore original resolution
+                    if self._screenshot_orig_fb:
+                        self.fb_width, self.fb_height = self._screenshot_orig_fb
+                    self.last_fb_size = (0, 0)       # Force FBO rebuild next frame
+                    self.last_msaa_samples = -1
+                    self.last_atmo_res = (0, 0)
+                    self._screenshot_capturing = False
+                    self._screenshot_orig_fb = None
+                    
+                    # Save PNG in a background thread
+                    _ss_cap_w, _ss_cap_h = ss_w, ss_h
+                    _ss_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _ss_filename = f"screenshots/StellarForge_{_ss_cap_w}x{_ss_cap_h}_{_ss_timestamp}.png"
+                    self._screenshot_saving = True
+                    self._screenshot_toast = (f"Saving {_ss_cap_w}\u00d7{_ss_cap_h}...", time.time())
+                    _ss_self_ref = self
+                    def _save_screenshot_bg(_raw, _w, _h, _fname, _self):
+                        try:
+                            from PIL import Image
+                            import os
+                            os.makedirs("screenshots", exist_ok=True)
+                            img = Image.frombytes('RGB', (_w, _h), _raw)
+                            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                            img.save(_fname, 'PNG', optimize=False)
+                            _self._screenshot_toast = (f"Saved: {_fname}", time.time())
+                        except Exception as e:
+                            _self._screenshot_toast = (f"Screenshot failed: {e}", time.time())
+                        finally:
+                            _self._screenshot_saving = False
+                    threading.Thread(
+                        target=_save_screenshot_bg,
+                        args=(raw_pixels, _ss_cap_w, _ss_cap_h, _ss_filename, _ss_self_ref),
+                        daemon=True
+                    ).start()
+                
+                # Normal composite to screen for display
                 ctx.screen.use()
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 resolved_tex.use(location=0)
@@ -6859,6 +7035,26 @@ class App:
             ctx.disable(moderngl.DEPTH_TEST)
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            
+            # Screenshot toast notification
+            if self._screenshot_toast:
+                _toast_msg, _toast_time = self._screenshot_toast
+                _toast_elapsed = time.time() - _toast_time
+                if self._screenshot_saving or _toast_elapsed < 4.0:
+                    _toast_alpha = 1.0 if self._screenshot_saving or _toast_elapsed < 3.0 else max(0.0, 1.0 - (_toast_elapsed - 3.0))
+                    imgui.set_next_window_position(self.fb_width - 340, self.fb_height - 50, imgui.ALWAYS)
+                    imgui.set_next_window_size(330, 40)
+                    imgui.set_next_window_bg_alpha(0.75 * _toast_alpha)
+                    imgui.push_style_var(imgui.STYLE_ALPHA, _toast_alpha)
+                    imgui.begin("##screenshot_toast", False, imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SCROLLBAR | imgui.WINDOW_NO_INPUTS)
+                    if self._screenshot_saving:
+                        imgui.text_colored(_toast_msg, 1.0, 1.0, 0.4)
+                    else:
+                        imgui.text_colored(_toast_msg, 0.4, 1.0, 0.4)
+                    imgui.end()
+                    imgui.pop_style_var()
+                elif _toast_elapsed >= 4.0:
+                    self._screenshot_toast = None
             
             # Store TAA historical state for next frame
             self.prev_vp = (np.asarray(view, dtype=np.float32) @ np.asarray(self.unjittered_projection, dtype=np.float32)).copy()

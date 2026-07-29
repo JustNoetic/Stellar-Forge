@@ -100,7 +100,11 @@
         "N2": 0.035,
         "SO2": 0.00015
       },
-      "height": 297.97
+      "height": 297.97,
+      "beta_mie": 2.0e-5,
+      "h_mie": 15.0,
+      "mie_g": 0.80,
+      "mie_albedo": [0.98, 0.98, 0.92]
     },
     "sv": {
       "x": 0.09883766826832031,
@@ -319,7 +323,7 @@
       "surface_pressure": 0.0,
       "temperature": 130.0,
       "composition": {
-        "CO2": 1.0
+        "SO2": 1.0
       },
       "height": 13.72
     },
@@ -516,7 +520,8 @@
       "temperature": 134.0,
       "composition": {
         "H2": 0.963,
-        "He": 0.032
+        "He": 0.0325,
+        "CH4": 0.0045
       },
       "height": 662.76
     },
