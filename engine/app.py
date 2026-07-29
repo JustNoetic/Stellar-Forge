@@ -3975,13 +3975,7 @@ class App:
                     if atmo_quality == 1:
                         n_samples = max(4, self.camera.get("atmo_steps_max", 32) // 2)
                     else:
-                        max_steps = self.camera.get("atmo_steps_max", 32)
-                        if apparent_px < 50:
-                            n_samples = max(4, max_steps // 4)
-                        elif apparent_px < 200:
-                            n_samples = max(4, max_steps // 2)
-                        else:
-                            n_samples = max_steps
+                        n_samples = self.camera.get("atmo_steps_max", 32)
                             
                     if is_cmp:
                         mass_sm = self.mass_snap_cmp[atmo['body_idx']]
@@ -5543,62 +5537,64 @@ class App:
                                 p_v = float(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
                                 
                             if p_v > 0.0 and body_r_km > 0.0:
-                                diam_km = body_r_km * 2.0
-                                abs_mag_h = 5.0 * math.log10(1329.0 / (diam_km * math.sqrt(p_v)))
                                 imgui.text(f"  Geom Albedo: {p_v:.3f}")
-                                imgui.text(f"  Abs Mag (H): {abs_mag_h:+.2f}")
                                 
-                                # Calculate system-specific absolute magnitude and apparent magnitude
-                                star_idx_local = -1
-                                for k, b in enumerate(cur_bodies_data):
-                                    if b.get('type') == 'Star':
-                                        star_idx_local = k
-                                        break
+                                is_solar = (self.comparison_system_name if insp_is_cmp else active_system_name) == SystemManager.SOLAR_SYSTEM_NAME
+                                if is_solar:
+                                    diam_km = body_r_km * 2.0
+                                    abs_mag_h = 5.0 * math.log10(1329.0 / (diam_km * math.sqrt(p_v)))
+                                    
+                                    # Calculate system-specific absolute magnitude and apparent magnitude
+                                    star_idx_local = -1
+                                    for k, b in enumerate(cur_bodies_data):
+                                        if b.get('type') == 'Star':
+                                            star_idx_local = k
+                                            break
+                                            
+                                    if star_idx_local != -1:
+                                        star_body = cur_bodies_data[star_idx_local]
+                                        star_lum = star_body.get('star_props', {}).get('lum', 1.0)
                                         
-                                if star_idx_local != -1:
-                                    star_body = cur_bodies_data[star_idx_local]
-                                    star_lum = star_body.get('star_props', {}).get('lum', 1.0)
-                                    
-                                    # Direction from star to planet
-                                    star_pos = cur_pos_snap_render[star_idx_local]
-                                    planet_pos = cur_pos_snap_render[insp_idx]
-                                    to_planet = planet_pos - star_pos
-                                    d_sp = np.linalg.norm(to_planet)
-                                    if d_sp > 1e-12:
-                                        L_dir = to_planet / d_sp
-                                    else:
-                                        L_dir = np.array([0.0, 1.0, 0.0])
+                                        # Direction from star to planet
+                                        star_pos = cur_pos_snap_render[star_idx_local]
+                                        planet_pos = cur_pos_snap_render[insp_idx]
+                                        to_planet = planet_pos - star_pos
+                                        d_sp = np.linalg.norm(to_planet)
+                                        if d_sp > 1e-12:
+                                            L_dir = to_planet / d_sp
+                                        else:
+                                            L_dir = np.array([0.0, 1.0, 0.0])
+                                            
+                                        star_pole = self.visual_arr_cmp[star_idx_local, 5:8] if insp_is_cmp else visual_arr[star_idx_local, 5:8]
+                                        sin_lat = abs(np.dot(L_dir, star_pole))
                                         
-                                    star_pole = self.visual_arr_cmp[star_idx_local, 5:8] if insp_is_cmp else visual_arr[star_idx_local, 5:8]
-                                    sin_lat = abs(np.dot(L_dir, star_pole))
-                                    
-                                    star_sp = star_body.get('star_props', {})
-                                    if star_sp.get('rot_frac', 0.0) > 0.0:
-                                        lum_eq = star_sp.get('lum_eq', star_lum)
-                                        lum_pole = star_sp.get('lum_pole', star_lum)
-                                        star_lum_dir = lum_eq * (1.0 - sin_lat) + lum_pole * sin_lat
-                                    else:
-                                        star_lum_dir = star_lum
+                                        star_sp = star_body.get('star_props', {})
+                                        if star_sp.get('rot_frac', 0.0) > 0.0:
+                                            lum_eq = star_sp.get('lum_eq', star_lum)
+                                            lum_pole = star_sp.get('lum_pole', star_lum)
+                                            star_lum_dir = lum_eq * (1.0 - sin_lat) + lum_pole * sin_lat
+                                        else:
+                                            star_lum_dir = star_lum
+                                            
+                                        # System absolute magnitude accounts for local star illumination
+                                        abs_mag_sys = abs_mag_h - 2.5 * math.log10(max(star_lum_dir, 1e-10))
                                         
-                                    # System absolute magnitude accounts for local star illumination
-                                    abs_mag_sys = abs_mag_h - 2.5 * math.log10(max(star_lum_dir, 1e-10))
-                                    
-                                    # Apparent magnitude accounts for distance to star, distance to camera, and phase angle
-                                    to_cam = cam_world_pos_f8 - planet_pos
-                                    d_pc = np.linalg.norm(to_cam)
-                                    
-                                    if d_sp > 1e-12 and d_pc > 1e-12:
-                                        cos_alpha = np.dot(to_planet, -to_cam) / (d_sp * d_pc)
-                                        alpha = math.acos(min(1.0, max(-1.0, cos_alpha)))
-                                    else:
-                                        alpha = 0.0
+                                        # Apparent magnitude accounts for distance to star, distance to camera, and phase angle
+                                        to_cam = cam_world_pos_f8 - planet_pos
+                                        d_pc = np.linalg.norm(to_cam)
                                         
-                                    # Lambertian phase function
-                                    phi = max(1e-10, (1.0 - alpha / math.pi) * math.cos(alpha) + (1.0 / math.pi) * math.sin(alpha))
-                                    app_mag = abs_mag_sys + 5.0 * math.log10(max(d_sp * d_pc, 1e-10)) - 2.5 * math.log10(phi)
-                                    
-                                    imgui.text(f"  Sys Abs Mag: {abs_mag_sys:+.2f}")
-                                    imgui.text(f"  App Mag (m): {app_mag:+.2f}")
+                                        if d_sp > 1e-12 and d_pc > 1e-12:
+                                            cos_alpha = np.dot(to_planet, -to_cam) / (d_sp * d_pc)
+                                            alpha = math.acos(min(1.0, max(-1.0, cos_alpha)))
+                                        else:
+                                            alpha = 0.0
+                                            
+                                        # Lambertian phase function
+                                        phi = max(1e-10, (1.0 - alpha / math.pi) * math.cos(alpha) + (1.0 / math.pi) * math.sin(alpha))
+                                        app_mag = abs_mag_sys + 5.0 * math.log10(max(d_sp * d_pc, 1e-10)) - 2.5 * math.log10(phi)
+                                        
+                                        imgui.text(f"  Abs Mag (H): {abs_mag_sys:+.2f}")
+                                        imgui.text(f"  App Mag (m): {app_mag:+.2f}")
                                 
                             rot_period_hours = body_info.get('rotation_period', 0.0)
                             if self.camera["edit_mode"] and not insp_is_cmp:

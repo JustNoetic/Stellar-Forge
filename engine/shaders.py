@@ -579,7 +579,8 @@ void main() {
                 if (dist_sq < caster_r * caster_r * 1.0404) continue; // Skip self
 
                 float dist_to_caster = sqrt(dist_sq);
-                float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
+                vec3 cross_vec = cross(frag_to_caster, L);
+                float perp_sq = dot(cross_vec, cross_vec);
 
                 // Bounding cone early out using maximum equatorial radius
                 float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
@@ -2152,7 +2153,8 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         if (dist_sq < caster_r * caster_r * 1.0404) continue;
 
         float dist_to_caster = sqrt(dist_sq);
-        float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
+        vec3 cross_vec = cross(s_to_c, L_dir);
+        float perp_sq = dot(cross_vec, cross_vec);
 
         vec3 perp_vec = s_to_c - t_proj * L_dir;
         float caster_r_minor = u_active_caster_R_minor[i];
@@ -2563,8 +2565,8 @@ void main() {
                 vec3 shadow_start = vec3(1.0);
                 vec3 shadow_end = vec3(1.0);
 
-                vec3 start_render = planet_center_render + (O + s_start * V) / u_au_to_km;
-                vec3 end_render = planet_center_render + (O + s_end * V) / u_au_to_km;
+                vec3 start_render = O + s_start * V;
+                vec3 end_render = O + s_end * V;
                 vec3 L_start = L_mid;
                 float sr_start = star_radius / max(dist_mid_star, 1e-6);
                 vec3 L_end = L_mid;
