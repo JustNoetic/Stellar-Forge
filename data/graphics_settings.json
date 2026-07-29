@@ -1,10 +1,10 @@
 {
     "atmo_quality": 2,
-    "atmo_steps_max": 9,
+    "atmo_steps_max": 10,
     "atmo_adaptive_steps": false,
     "atmo_jitter": false,
     "hdr_enabled": true,
-    "exposure": 0.879738450050354,
+    "exposure": 153.82354736328125,
     "bloom_intensity": 0.05000000074505806,
     "bloom_threshold": 1.5800000429153442,
     "msaa_samples": 0,
@@ -14,11 +14,11 @@
     "show_habitable_zone": false,
     "planetshine_enabled": true,
     "ringshine_enabled": true,
-    "ringshine_band_count": 8,
+    "ringshine_band_count": 9,
     "inspector_frame": 0,
-    "fov": 0.001,
+    "fov": 38.250000000000014,
     "shadow_caster_budget": 8,
     "taa_enabled": false,
     "atmo_render_scale": 1.0,
-    "screenshot_res_idx": 1
+    "screenshot_res_idx": 2
 }
