@@ -24,6 +24,7 @@ import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from numba import njit
 import datetime
+import os
 import os as _os
 from system_manager import SystemManager, SystemSnapshot, derive_star_properties, temperature_to_rgb, rgb_to_hex
 from spice_manager import SpiceManager
@@ -307,6 +308,154 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     atmo['_dirty'] = False
     
     return props, trans, thick
+
+def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=None, ring_render_groups=None, ring_gradient_tex=None):
+    import os
+    from PIL import Image
+    name_lower = body_name.lower()
+
+    root_dir = getattr(app, 'root_dir', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    base_textures = os.path.join(root_dir, 'textures')
+
+    system_name = getattr(app, 'loaded_system_name', 'Solar System') or 'Solar System'
+
+    cand_sys_body = os.path.join(base_textures, system_name, body_name)
+    cand_solar_body = os.path.join(base_textures, 'Solar System', body_name)
+    cand_legacy_body = os.path.join(base_textures, body_name)
+
+    if os.path.exists(cand_sys_body):
+        textures_dir = cand_sys_body
+    elif os.path.exists(cand_solar_body):
+        textures_dir = cand_solar_body
+    elif os.path.exists(cand_legacy_body):
+        textures_dir = cand_legacy_body
+    else:
+        textures_dir = os.path.join(base_textures, system_name, body_name)
+
+    os.makedirs(textures_dir, exist_ok=True)
+
+    front_path = os.path.join(textures_dir, f"{body_name}_ring_front.png")
+    back_path = os.path.join(textures_dir, f"{body_name}_ring_back.png")
+
+    img_front = app.ring_textures_front.get(name_lower)
+    img_back = app.ring_textures_back.get(name_lower)
+
+    if img_front is None:
+        print(f"[Texture Editor] No front ring texture found for {body_name}")
+        return False
+
+    if img_back is None:
+        img_back = img_front.copy()
+
+    arr_front = np.array(img_front, dtype=np.float32) / 255.0
+    arr_back = np.array(img_back, dtype=np.float32) / 255.0
+
+    hue = ring_item.get('hue_shift', 0.0)
+    sat = ring_item.get('saturation', 1.0)
+    bri = ring_item.get('brightness', 1.0)
+    op = ring_item.get('opacity', 1.0)
+    unlit = ring_item.get('unlit_factor', 1.0)
+    boost = ring_item.get('alpha_boost', 1.0)
+
+    def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0, unlit_mult=1.0, alpha_boost=1.0):
+        out = arr_rgba.copy()
+        rgb = out[..., :3]
+        maxc = np.max(rgb, axis=-1)
+        minc = np.min(rgb, axis=-1)
+        rangec = maxc - minc
+
+        hsv = np.zeros_like(rgb)
+        hsv[..., 2] = maxc * brightness
+
+        mask = rangec > 1e-6
+        hsv[..., 1][mask] = (rangec[mask] / (maxc[mask] + 1e-6)) * saturation
+
+        rc = np.zeros_like(maxc)
+        gc = np.zeros_like(maxc)
+        bc = np.zeros_like(maxc)
+        rc[mask] = (maxc[mask] - rgb[..., 0][mask]) / (rangec[mask] + 1e-6)
+        gc[mask] = (maxc[mask] - rgb[..., 1][mask]) / (rangec[mask] + 1e-6)
+        bc[mask] = (maxc[mask] - rgb[..., 2][mask]) / (rangec[mask] + 1e-6)
+
+        h = np.zeros_like(maxc)
+        r_mask = (rgb[..., 0] == maxc) & mask
+        g_mask = (rgb[..., 1] == maxc) & mask
+        b_mask = (rgb[..., 2] == maxc) & mask
+
+        h[r_mask] = bc[r_mask] - gc[r_mask]
+        h[g_mask] = 2.0 + rc[g_mask] - bc[g_mask]
+        h[b_mask] = 4.0 + gc[b_mask] - rc[b_mask]
+        h = (h / 6.0 + hue_shift) % 1.0
+        hsv[..., 0] = h
+
+        h6 = hsv[..., 0] * 6.0
+        i = np.floor(h6).astype(int) % 6
+        f = h6 - np.floor(h6)
+        v = np.clip(hsv[..., 2] * unlit_mult, 0.0, 1.0)
+        s = np.clip(hsv[..., 1], 0.0, 1.0)
+
+        p = v * (1.0 - s)
+        q = v * (1.0 - s * f)
+        t = v * (1.0 - s * (1.0 - f))
+
+        rgb_new = np.zeros_like(rgb)
+        idx0 = (i == 0); rgb_new[idx0] = np.stack([v[idx0], t[idx0], p[idx0]], axis=-1)
+        idx1 = (i == 1); rgb_new[idx1] = np.stack([q[idx1], v[idx1], p[idx1]], axis=-1)
+        idx2 = (i == 2); rgb_new[idx2] = np.stack([p[idx2], v[idx2], t[idx2]], axis=-1)
+        idx3 = (i == 3); rgb_new[idx3] = np.stack([p[idx3], q[idx3], v[idx3]], axis=-1)
+        idx4 = (i == 4); rgb_new[idx4] = np.stack([t[idx4], p[idx4], v[idx4]], axis=-1)
+        idx5 = (i == 5); rgb_new[idx5] = np.stack([v[idx5], p[idx5], q[idx5]], axis=-1)
+
+        out[..., :3] = np.clip(rgb_new, 0.0, 1.0)
+        alpha_val = np.clip(out[..., 3] * opacity_mult, 0.0, 1.0)
+        if abs(alpha_boost - 1.0) > 1e-4:
+            mask_nz = alpha_val > 1e-5
+            alpha_val[mask_nz] = np.clip(np.power(alpha_val[mask_nz], 1.0 / max(0.01, alpha_boost)), 0.0, 1.0)
+        out[..., 3] = alpha_val
+        return out
+
+    baked_front = apply_hsba_np(arr_front, hue, sat, bri, opacity_mult=op, unlit_mult=1.0, alpha_boost=boost)
+    baked_back = apply_hsba_np(arr_back, hue, sat, bri, opacity_mult=op, unlit_mult=unlit, alpha_boost=boost)
+
+    baked_front_u8 = np.clip(baked_front * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    baked_back_u8 = np.clip(baked_back * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    img_front_new = Image.fromarray(baked_front_u8, mode='RGBA')
+    img_back_new = Image.fromarray(baked_back_u8, mode='RGBA')
+
+    os.makedirs(textures_dir, exist_ok=True)
+    img_front_new.save(front_path)
+    img_back_new.save(back_path)
+    print(f"[Texture Editor] Baked and saved ring textures to {front_path} and {back_path}")
+
+    app.ring_textures_front[name_lower] = img_front_new
+    app.ring_textures_back[name_lower] = img_back_new
+
+    ctx = app.ctx
+    aniso_value = app.camera.get("anisotropy", 16.0)
+    tex_f = ctx.texture(img_front_new.size, 4, img_front_new.tobytes())
+    tex_f.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    tex_f.repeat_x = False; tex_f.repeat_y = False; tex_f.build_mipmaps(); tex_f.anisotropy = aniso_value
+
+    tex_b = ctx.texture(img_back_new.size, 4, img_back_new.tobytes())
+    tex_b.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    tex_b.repeat_x = False; tex_b.repeat_y = False; tex_b.build_mipmaps(); tex_b.anisotropy = aniso_value
+
+    app.ring_gl_textures_front[name_lower] = tex_f
+    app.ring_gl_textures_back[name_lower] = tex_b
+
+    ring_item['unlit_factor'] = 1.0
+    ring_item['saturation'] = 1.0
+    ring_item['hue_shift'] = 0.0
+    ring_item['brightness'] = 1.0
+    ring_item['opacity'] = 1.0
+    ring_item['alpha_boost'] = 1.0
+
+    if ring_precomputed is not None and ring_render_groups is not None and ring_gradient_tex is not None:
+        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=np.array(img_front_new, dtype='f4')/255.0)
+        ring_item['shadow_grad'] = shadow_grad
+        app.body_ring_indices = rebuild_ring_render_group(ring_item['body_idx'], ctx, app.prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+    return True
 
 
 def _build_tex_idx_arr(bodies_data, texture_slices):
@@ -1060,10 +1209,10 @@ class App:
         if os.path.exists(textures_dir):
             # Gather subdirectories + the root directory as candidates
             target_dirs = []
-            for entry in os.listdir(textures_dir):
-                entry_path = os.path.join(textures_dir, entry)
-                if os.path.isdir(entry_path):
-                    target_dirs.append((entry, entry_path)) # (folder_name, path)
+            for root, dirs, files in os.walk(textures_dir):
+                for dir_name in dirs:
+                    folder_path = os.path.join(root, dir_name)
+                    target_dirs.append((dir_name, folder_path))
             
             # Also add root textures_dir as a special candidate to support files stored directly in it
             target_dirs.append(("", textures_dir))
@@ -1474,6 +1623,7 @@ class App:
         glfw.make_context_current(window)
         glfw.swap_interval(0)
         ctx = moderngl.create_context()
+        self.ctx = ctx
         ctx.enable(moderngl.DEPTH_TEST) 
     
         
@@ -1537,6 +1687,8 @@ class App:
             prog_atmo['u_ringshine_cdf_lut'].value = 7
         if 'u_ringshine_map' in prog_atmo:
             prog_atmo['u_ringshine_map'].value = 8
+        if 'u_depth_texture' in prog_atmo:
+            prog_atmo['u_depth_texture'].value = 9
         
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -3224,7 +3376,7 @@ class App:
                 if active_rings:
                     min_r = min(r['inner_r'] for r in active_rings)
                     max_r = max(r['outer_r'] for r in active_rings)
-                    opacity = 0.63212055
+                    opacity = 1.0
                     pole = active_rings[0]['pole']
                     raw_color = active_rings[0]['raw_color']
                     colors5 = active_rings[0].get('5colors', raw_color)
@@ -3793,6 +3945,20 @@ class App:
                     self.prog_ringshine_map['u_ring_normal'].write(ring_normals_buf)
                 if 'u_ring_params' in self.prog_ringshine_map:
                     self.prog_ringshine_map['u_ring_params'].write(ring_params_buf)
+                for idx, r in enumerate(ring_precomputed[:n_ring_planes]):
+                    if idx >= 16: break
+                    if f'u_ring_planes[{idx}].unlit_factor' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                    if f'u_ring_planes[{idx}].saturation' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                    if f'u_ring_planes[{idx}].hue_shift' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                    if f'u_ring_planes[{idx}].brightness' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                    if f'u_ring_planes[{idx}].alpha_boost' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
+                    if f'u_ring_planes[{idx}].is_textured' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
                 if 'u_ringshine_band_count' in self.prog_ringshine_map:
                     self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 256))
                 self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
@@ -3877,8 +4043,11 @@ class App:
             ctx.disable(moderngl.CULL_FACE)
 
 
+            # --- Pass 2: Orbit Lines ---
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            ctx.enable(moderngl.DEPTH_TEST)
+            ctx.depth_mask = True
             
             if show_orbits:
                 if n_orbits > 0:
@@ -4192,7 +4361,15 @@ class App:
                     self.atmo_lowres_fbo.use()
                     ctx.viewport = (0, 0, *self.last_atmo_res)
                     ctx.clear(0.0, 0.0, 0.0, 0.0)
+                    if 'u_screen_res' in prog_atmo:
+                        prog_atmo['u_screen_res'].value = (float(self.last_atmo_res[0]), float(self.last_atmo_res[1]))
+                else:
+                    if 'u_screen_res' in prog_atmo:
+                        prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
                 
+                if self.depth_texture:
+                    self.depth_texture.use(location=9)
+
                 render_atmosphere_pass(clip_mode)
                 
                 if use_lowres:
@@ -4299,6 +4476,11 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
                             prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                             prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                            prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                            prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
                 
                 if self.comparison_enabled and self.ring_render_groups_cmp:
@@ -4374,6 +4556,11 @@ class App:
                             prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
                             prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
                             prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                            prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                            prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
                         body_pos_rel = cmp_pos_rel[bi]
                         
                         b_rot = self.rot_snap_cmp[bi]
@@ -5974,99 +6161,99 @@ class App:
                             if imgui.button("Apply Changes", width=-1):
                                 ed = self.camera["edit_data"]
                             
-                            rot_hours = ed["rotation_period"]
-                            m_val = ed["mass"]
-                            r_km = ed["radius"]
-                            f = 0.0
-                            j2 = 0.0
-                            j4 = 0.0
-                            if rot_hours > 0.0 and m_val > 0.0 and r_km > 0.0:
-                                omega = 2.0 * math.pi / (rot_hours * 3600.0)
-                                r_eq_m = r_km * 1000.0
-                                mass_kg = m_val * 1.98847e30
-                                G_SI = 6.6743e-11
-                                m_param = (omega**2 * r_eq_m**3) / (G_SI * mass_kg)
-                                b_type = ed["type"]
-                                if b_type == "Moon" or b_type == "Dwarf Planet":
-                                    chi = 1.25
-                                elif b_type == "Terrestrial":
-                                    chi = 0.95
-                                else:
-                                    chi = 0.65
-                                f = chi * m_param
-                                j2 = m_param * (chi - 0.5)
-                                j4 = -0.15 * (f**2)
-                            
-                            pole_render = visual_arr[insp_idx, 5:8]
-                            pole_ecl = [float(pole_render[0]), float(-pole_render[2]), float(pole_render[1])]
-                            
-                            payload = {
-                                "action": "UPDATE",
-                                "idx": insp_idx,
-                                "name": body_name,
-                                "mass": ed["mass"],
-                                "radius": ed["radius"],
-                                "type": ed["type"],
-                                "rotation_period": rot_hours,
-                                "oblateness": f,
-                                "J2": j2,
-                                "j4": j4,
-                                "pole_ecl": pole_ecl
-                            }
-                            if ed["type"] == "Star" and ed.get("_preview"):
-                                pr = ed["_preview"]
-                                hx = pr["visual"]["colorHex"].lstrip('#')
-                                payload["color"] = [int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0]
-                                payload["star_props"] = {
-                                    "mode": ed.get("star_mode", "evolution"),
-                                    "mass": ed["mass"] if ed.get("star_mode") == "evolution" else pr["physical"]["mass_msun"],
-                                    "metallicity": ed.get("metallicity", 0.0),
-                                    "age_pct": ed.get("age_pct", 46.0) / 100.0,
-                                    "evo_path": ed.get("evo_path", "standard"),
-                                    "radius": pr["physical"]["radius_rsun"],
-                                    "temp": pr["physical"]["temp_k"],
-                                    "lum": pr["physical"]["lum_lsun"],
-                                    "locked_rad": ed.get("locked_rad", True),
-                                    "locked_temp": ed.get("locked_temp", True),
-                                    "locked_lum": ed.get("locked_lum", False),
-                                    "class": pr["classification"]["fullDesignation"],
-                                    "stage": pr["evolution"]["phase"]
+                                rot_hours = ed["rotation_period"]
+                                m_val = ed["mass"]
+                                r_km = ed["radius"]
+                                f = 0.0
+                                j2 = 0.0
+                                j4 = 0.0
+                                if rot_hours > 0.0 and m_val > 0.0 and r_km > 0.0:
+                                    omega = 2.0 * math.pi / (rot_hours * 3600.0)
+                                    r_eq_m = r_km * 1000.0
+                                    mass_kg = m_val * 1.98847e30
+                                    G_SI = 6.6743e-11
+                                    m_param = (omega**2 * r_eq_m**3) / (G_SI * mass_kg)
+                                    b_type = ed["type"]
+                                    if b_type == "Moon" or b_type == "Dwarf Planet":
+                                        chi = 1.25
+                                    elif b_type == "Terrestrial":
+                                        chi = 0.95
+                                    else:
+                                        chi = 0.65
+                                    f = chi * m_param
+                                    j2 = m_param * (chi - 0.5)
+                                    j4 = -0.15 * (f**2)
+                                
+                                pole_render = visual_arr[insp_idx, 5:8]
+                                pole_ecl = [float(pole_render[0]), float(-pole_render[2]), float(pole_render[1])]
+                                
+                                payload = {
+                                    "action": "UPDATE",
+                                    "idx": insp_idx,
+                                    "name": body_name,
+                                    "mass": ed["mass"],
+                                    "radius": ed["radius"],
+                                    "type": ed["type"],
+                                    "rotation_period": rot_hours,
+                                    "oblateness": f,
+                                    "J2": j2,
+                                    "j4": j4,
+                                    "pole_ecl": pole_ecl
                                 }
-                            if parent_idx >= 0:
-                                p_pos = pos_snap_render[parent_idx]
-                                p_vel = vel_snap_render[parent_idx]
-                                ppx, ppy, ppz = p_pos[0], -p_pos[2], p_pos[1]
-                                pvx, pvy, pvz = p_vel[0], -p_vel[2], p_vel[1]
-                                parent_m = mass_snap[parent_idx]
-                                
-                                c_pos, c_vel = get_cartesian_from_keplerian(
-                                    parent_m, ed["mass"], ed["a"], ed["e"], 
-                                    ed["inc"], ed["Omega"], ed["omega"], ed["M"]
-                                )
-                                
-                                if self.camera["inspector_frame"] == 1:
-                                    pole_render = visual_arr[parent_idx, 5:8]
-                                    pole_ecl = np.array([pole_render[0], -pole_render[2], pole_render[1]])
-                                    c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl)
+                                if ed["type"] == "Star" and ed.get("_preview"):
+                                    pr = ed["_preview"]
+                                    hx = pr["visual"]["colorHex"].lstrip('#')
+                                    payload["color"] = [int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0]
+                                    payload["star_props"] = {
+                                        "mode": ed.get("star_mode", "evolution"),
+                                        "mass": ed["mass"] if ed.get("star_mode") == "evolution" else pr["physical"]["mass_msun"],
+                                        "metallicity": ed.get("metallicity", 0.0),
+                                        "age_pct": ed.get("age_pct", 46.0) / 100.0,
+                                        "evo_path": ed.get("evo_path", "standard"),
+                                        "radius": pr["physical"]["radius_rsun"],
+                                        "temp": pr["physical"]["temp_k"],
+                                        "lum": pr["physical"]["lum_lsun"],
+                                        "locked_rad": ed.get("locked_rad", True),
+                                        "locked_temp": ed.get("locked_temp", True),
+                                        "locked_lum": ed.get("locked_lum", False),
+                                        "class": pr["classification"]["fullDesignation"],
+                                        "stage": pr["evolution"]["phase"]
+                                    }
+                                if parent_idx >= 0:
+                                    p_pos = pos_snap_render[parent_idx]
+                                    p_vel = vel_snap_render[parent_idx]
+                                    ppx, ppy, ppz = p_pos[0], -p_pos[2], p_pos[1]
+                                    pvx, pvy, pvz = p_vel[0], -p_vel[2], p_vel[1]
+                                    parent_m = mass_snap[parent_idx]
                                     
-                                new_ecl_x = ppx + c_pos[0]
-                                new_ecl_y = ppy + c_pos[1]
-                                new_ecl_z = ppz + c_pos[2]
+                                    c_pos, c_vel = get_cartesian_from_keplerian(
+                                        parent_m, ed["mass"], ed["a"], ed["e"], 
+                                        ed["inc"], ed["Omega"], ed["omega"], ed["M"]
+                                    )
+                                    
+                                    if self.camera["inspector_frame"] == 1:
+                                        pole_render = visual_arr[parent_idx, 5:8]
+                                        pole_ecl = np.array([pole_render[0], -pole_render[2], pole_render[1]])
+                                        c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl)
+                                        
+                                    new_ecl_x = ppx + c_pos[0]
+                                    new_ecl_y = ppy + c_pos[1]
+                                    new_ecl_z = ppz + c_pos[2]
+                                    
+                                    new_ecl_vx = pvx + c_vel[0]
+                                    new_ecl_vy = pvy + c_vel[1]
+                                    new_ecl_vz = pvz + c_vel[2]
+                                    
+                                    payload["pos"] = [new_ecl_x, new_ecl_y, new_ecl_z]
+                                    payload["vel"] = [new_ecl_vx, new_ecl_vy, new_ecl_vz]
                                 
-                                new_ecl_vx = pvx + c_vel[0]
-                                new_ecl_vy = pvy + c_vel[1]
-                                new_ecl_vz = pvz + c_vel[2]
+                                with self.shared_state["lock"]:
+                                    self.shared_state["crud_queue"].append(payload)
+                                    
+                                body_info['r'] = ed["radius"] / 696340.0
+                                visual_arr[insp_idx, 3] = body_info['r'] * SOLAR_RADII_TO_AU
                                 
-                                payload["pos"] = [new_ecl_x, new_ecl_y, new_ecl_z]
-                                payload["vel"] = [new_ecl_vx, new_ecl_vy, new_ecl_vz]
-                            
-                            with self.shared_state["lock"]:
-                                self.shared_state["crud_queue"].append(payload)
-                                
-                            body_info['r'] = ed["radius"] / 696340.0
-                            visual_arr[insp_idx, 3] = body_info['r'] * SOLAR_RADII_TO_AU
-                            
-                            self.camera["edit_mode"] = False
+                                self.camera["edit_mode"] = False
                             
                     imgui.separator()
                     
@@ -6504,15 +6691,43 @@ class App:
                             rings = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
                             
                             for i, ring_item in enumerate(rings):
-                                if imgui.tree_node(f"Ring Layer {i}"):
+                                is_tex_layer = ring_item.get('is_textured', False)
+                                node_title = f"Textured Ring Layer {i}" if is_tex_layer else f"Ring Layer {i}"
+                                if imgui.tree_node(node_title):
                                     changed_in, new_in = imgui.drag_float(f"Inner Radius (km)##{i}", ring_item['inner_r'] * 149597870.7, 10.0, body_r_km, ring_item['outer_r'] * 149597870.7 - 10)
                                     changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
                                     changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
-                                    changed_op, new_op = imgui.drag_float(f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 1.0, "%.4f")
-                                    changed_scat, new_scat = imgui.drag_float(f"Forward Scatter Mult##{i}", ring_item['scatter'], 0.01, 0.0, 100.0, "%.4f")
-                                    changed_asym, new_asym = imgui.drag_float(f"Forward Scatter Asym##{i}", ring_item['asymmetry'], 0.005, -0.999, 0.999, "%.4f")
+                                    changed_op, new_op = imgui.drag_float(f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 2.0, "%.4f")
+                                    changed_scat, new_scat = imgui.drag_float(f"Forward Scatter Mult##{i}", ring_item.get('scatter', 2.5), 0.01, 0.0, 100.0, "%.4f")
+                                    changed_asym, new_asym = imgui.drag_float(f"Forward Scatter Asym##{i}", ring_item.get('asymmetry', 0.7), 0.005, -0.999, 0.999, "%.4f")
                                     changed_bks, new_bks = imgui.drag_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.999, 0.999, "%.4f")
                                     
+                                    changed_unlit = False
+                                    changed_sat = False
+                                    changed_hue = False
+                                    changed_bri = False
+                                    changed_boost = False
+
+                                    if is_tex_layer:
+                                        if imgui.tree_node(f"Texture Editor##{i}"):
+                                            changed_unlit, new_unlit = imgui.drag_float(f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
+                                            changed_sat, new_sat = imgui.drag_float(f"Saturation##{i}", ring_item.get('saturation', 1.0), 0.01, 0.0, 3.0, "%.2f")
+                                            changed_hue, new_hue = imgui.drag_float(f"Hue Shift##{i}", ring_item.get('hue_shift', 0.0), 0.005, -1.0, 1.0, "%.3f")
+                                            changed_bri, new_bri = imgui.drag_float(f"Brightness##{i}", ring_item.get('brightness', 1.0), 0.01, 0.0, 3.0, "%.2f")
+                                            changed_boost, new_boost = imgui.drag_float(f"Alpha Boost##{i}", ring_item.get('alpha_boost', 1.0), 0.01, 0.1, 5.0, "%.2f")
+                                            if imgui.button(f"Reset Edits##{i}"):
+                                                ring_item['unlit_factor'] = 1.0
+                                                ring_item['saturation'] = 1.0
+                                                ring_item['hue_shift'] = 0.0
+                                                ring_item['brightness'] = 1.0
+                                                ring_item['alpha_boost'] = 1.0
+                                                changed_unlit = True
+                                            imgui.same_line()
+                                            if imgui.button(f"Bake & Save Textures##{i}"):
+                                                b_name = bodies_data[insp_idx]['name']
+                                                bake_and_export_ring_textures(self, b_name, ring_item, ring_precomputed, ring_render_groups, ring_gradient_tex)
+                                            imgui.tree_pop()
+
                                     grad_changed = False
                                     grad_sort_needed = False
                                     if imgui.tree_node(f"Alpha Gradient##{i}"):
@@ -6550,7 +6765,7 @@ class App:
                                             
                                         imgui.tree_pop()
                                     
-                                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or grad_changed:
+                                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or changed_unlit or changed_sat or changed_hue or changed_bri or changed_boost or grad_changed:
                                         if changed_in: ring_item['inner_r'] = new_in / 149597870.7
                                         if changed_out: ring_item['outer_r'] = new_out / 149597870.7
                                         if changed_col: ring_item['raw_color'] = new_col
@@ -6558,6 +6773,11 @@ class App:
                                         if changed_scat: ring_item['scatter'] = new_scat
                                         if changed_asym: ring_item['asymmetry'] = new_asym
                                         if changed_bks: ring_item['backscatter'] = new_bks
+                                        if changed_unlit: ring_item['unlit_factor'] = new_unlit
+                                        if changed_sat: ring_item['saturation'] = new_sat
+                                        if changed_hue: ring_item['hue_shift'] = new_hue
+                                        if changed_bri: ring_item['brightness'] = new_bri
+                                        if changed_boost: ring_item['alpha_boost'] = new_boost
                                         
                                         shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=ring_item.get('tex_sampled'))
                                         ring_item['shadow_grad'] = shadow_grad
