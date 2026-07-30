@@ -2317,7 +2317,8 @@ void main() {
                 float inner_r_km = u_ring_params[k].x * u_au_to_km;
                 float outer_r_km = u_ring_params[k].y * u_au_to_km;
 
-                if (dist_from_center >= inner_r_km && dist_from_center <= outer_r_km) {
+                float dr = fwidth(dist_from_center) * 1.5;
+                if (dist_from_center >= inner_r_km - dr && dist_from_center <= outer_r_km + dr) {
                     if (s_ring < closest_s_ring) {
                         closest_s_ring = s_ring;
                     }

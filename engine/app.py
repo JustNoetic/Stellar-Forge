@@ -3877,12 +3877,9 @@ class App:
             ctx.disable(moderngl.CULL_FACE)
 
 
-    
-    
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
             
-
             if show_orbits:
                 if n_orbits > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -3994,7 +3991,7 @@ class App:
                         prog_gpu_orbits['u_orbit_res'].value = 100
                         prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)    
+                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
 
             def render_atmosphere_pass(clip_mode):
                 if not sorted_atmos:
