@@ -1,0 +1,151 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 2) buffer AllInstances {
+    vec4 instances[];
+};
+
+layout(std430, binding = 3) buffer VisLo { uint vis_lo[]; };
+layout(std430, binding = 4) buffer VisHi { uint vis_hi[]; };
+layout(std430, binding = 5) buffer VisUltra { uint vis_ultra[]; };
+
+struct DrawCmd {
+    uint count;
+    uint instanceCount;
+    uint firstIndex;
+    uint baseVertex;
+    uint baseInstance;
+};
+
+layout(std430, binding = 6) buffer DrawCmds {
+    DrawCmd cmds[3]; // lo=0, hi=1, ultra=2
+};
+
+layout(std430, binding = 7) buffer FocusMask {
+    uint focused_mask[];
+};
+
+uniform int u_num_bodies;
+uniform int u_star_idx;
+uniform int u_n_casters;
+uniform int u_caster_indices[64];
+uniform vec4 u_frustum_planes[6];
+
+uniform int u_n_rings;
+uniform vec3 u_ring_centers[16];
+uniform vec3 u_ring_normals[16];
+uniform float u_ring_outer_radii[16];
+
+uniform int u_tracking_idx;
+uniform vec3 u_camera_pos;
+uniform float u_screen_height;
+uniform float u_fov_factor;
+uniform float u_lod_thresh_ultra;
+uniform float u_lod_thresh_hi;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(u_num_bodies)) return;
+
+    vec4 f0 = instances[idx * 7 + 0];
+    vec4 f1 = instances[idx * 7 + 1];
+    vec4 f2 = instances[idx * 7 + 2];
+
+    vec3 pos = f0.xyz;
+    float r = f1.z;
+
+    // 1. Frustum Culling
+    bool visible = true;
+    for (int p = 0; p < 6; p++) {
+        float dist = dot(pos, u_frustum_planes[p].xyz) + u_frustum_planes[p].w;
+        if (dist < -r) {
+            visible = false;
+            break;
+        }
+    }
+
+    // 2. Caster & Ring Masks
+    uint mask_lo = 0;
+    uint mask_hi = 0;
+    uint r_mask = 0;
+
+    vec3 star_pos = instances[u_star_idx * 7 + 0].xyz;
+    float star_r = instances[u_star_idx * 7 + 1].z;
+
+    if (idx != uint(u_star_idx)) {
+        vec3 L = star_pos - pos;
+        float dist_star = length(L);
+        if (dist_star >= 1e-6) {
+            vec3 L_dir = L / dist_star;
+
+            for (int c = 0; c < u_n_casters; c++) {
+                int j = u_caster_indices[c];
+                if (j == int(idx) || j == u_star_idx) continue;
+
+                vec3 p_j = instances[j * 7 + 0].xyz;
+                float r_j = instances[j * 7 + 1].z;
+
+                vec3 vec = p_j - pos;
+                float t = dot(vec, L_dir);
+                if (t > -(r + r_j) && t < dist_star + r_j) {
+                    vec3 perp = vec - t * L_dir;
+                    float d = length(perp);
+                    float r_cone = r_j + star_r * max(0.0, t) / dist_star + r;
+                    if (d < r_cone) {
+                        if (c < 32) mask_lo |= (1u << c);
+                        else mask_hi |= (1u << (c - 32));
+                    }
+                }
+            }
+
+            for (int k = 0; k < u_n_rings; k++) {
+                vec3 C_k = u_ring_centers[k];
+                vec3 N_k = u_ring_normals[k];
+                float r_out = u_ring_outer_radii[k];
+
+                float denom = dot(L_dir, N_k);
+                if (abs(denom) > 1e-8) {
+                    vec3 vec_c = C_k - pos;
+                    float dist_centers = length(vec_c);
+                    if (dist_centers < 1e-6) {
+                        r_mask |= (1u << k);
+                    } else {
+                        float s = dot(vec_c, N_k) / denom;
+                        if (s > -r && s < dist_star + r) {
+                            vec3 hit = pos + s * L_dir;
+                            float d = length(hit - C_k);
+                            float r_cone = star_r * max(0.0, s) / dist_star + r;
+                            if (d < r_out + r_cone) {
+                                r_mask |= (1u << k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    instances[idx * 7 + 3].y = uintBitsToFloat(mask_lo);
+    instances[idx * 7 + 3].z = uintBitsToFloat(mask_hi);
+    instances[idx * 7 + 3].w = uintBitsToFloat(r_mask);
+
+    // 3. Lodge into visible buffers based on screen-space size & tracking state
+    if (visible) {
+        float cam_dist = length(pos - u_camera_pos);
+        float apparent_px = (cam_dist > 1e-6) ? ((r / cam_dist) * u_screen_height * u_fov_factor) : 10000.0;
+
+        bool is_ultra = (int(idx) == u_tracking_idx) || (apparent_px >= u_lod_thresh_ultra);
+        bool is_hi = (apparent_px >= u_lod_thresh_hi) || (f2.x > 0.5);
+
+        if (is_ultra) {
+            uint slot = atomicAdd(cmds[2].instanceCount, 1u);
+            vis_ultra[slot] = idx;
+        } else if (is_hi) {
+            uint slot = atomicAdd(cmds[1].instanceCount, 1u);
+            vis_hi[slot] = idx;
+        } else {
+            uint slot = atomicAdd(cmds[0].instanceCount, 1u);
+            vis_lo[slot] = idx;
+        }
+    }
+}

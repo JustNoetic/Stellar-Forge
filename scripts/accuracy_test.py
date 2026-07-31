@@ -2,15 +2,14 @@ import sys
 import json
 import time
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../engine')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import math
 import numpy as np
-from physics_core import Simulation
-from spice_manager import SpiceManager
-from physics_core import attach_custom_forces
-from constants import C_AU_YR, SOLAR_RADII_TO_AU, AU_TO_KM
-from math_utils import pole_to_ecliptic
+from engine.physics.physics_core import Simulation, attach_custom_forces
+from engine.ephemeris.spice_manager import SpiceManager
+from engine.core.constants import C_AU_YR, SOLAR_RADII_TO_AU, AU_TO_KM
+from engine.core.math_utils import pole_to_ecliptic
 from fetch_horizons import query_horizons, parse_state_vector, HORIZONS_IDS, PARENT_NAIF
 
 START_TIME = "2025-01-01 12:00"

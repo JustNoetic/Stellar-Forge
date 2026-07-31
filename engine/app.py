@@ -25,19 +25,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from numba import njit
 import datetime
 import os
-import os as _os
-from system_manager import SystemManager, SystemSnapshot, derive_star_properties, temperature_to_rgb, rgb_to_hex
-from spice_manager import SpiceManager
+from engine.ephemeris.system_manager import SystemManager, SystemSnapshot, derive_star_properties, temperature_to_rgb, rgb_to_hex
+from engine.ephemeris.spice_manager import SpiceManager
 
-from constants import *
-from math_utils import *
-from physics_core import *
-from physics_core import _extract_render_state, _update_hierarchy_core
-from render_utils import *
-from shaders import *
-from post_shaders import *
-from atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
-_PERF_ENABLED = _os.environ.get("STELLAR_FORGE_PERF") == "1"
+from engine.core.constants import *
+from engine.core.math_utils import *
+from engine.physics.physics_core import *
+from engine.physics.physics_core import _extract_render_state, _update_hierarchy_core
+from engine.rendering.render_utils import *
+from engine.rendering.shaders import *
+from engine.rendering.post_shaders import *
+from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
+_PERF_ENABLED = os.environ.get("STELLAR_FORGE_PERF") == "1"
 _PERF_TRACKER = None
 
 class _NullCtx:
@@ -73,737 +72,21 @@ def _PERF_INSTALL_TRACKER(tracker):
 import OpenGL.GL as gl
 import ctypes
 
-class ModernGLImGuiRenderer(object):
-    def __init__(self, ctx):
-        self.ctx = ctx
-        self.io = imgui.get_io()
-        self.textures = {}
-        
-        self.prog = ctx.program(
-            vertex_shader="""
-                #version 330 core
-                uniform mat4 ProjMtx;
-                in vec2 Position;
-                in vec2 UV;
-                in vec4 Color;
-                out vec2 Frag_UV;
-                out vec4 Frag_Color;
-                void main() {
-                    Frag_UV = UV;
-                    Frag_Color = Color;
-                    gl_Position = ProjMtx * vec4(Position.xy, 0.0, 1.0);
-                }
-            """,
-            fragment_shader="""
-                #version 330 core
-                uniform sampler2D Texture;
-                in vec2 Frag_UV;
-                in vec4 Frag_Color;
-                out vec4 Out_Color;
-                void main() {
-                    Out_Color = Frag_Color * texture(Texture, Frag_UV.st);
-                }
-            """
-        )
-        self.proj_mtx_uniform = self.prog['ProjMtx']
-        self.texture_uniform = self.prog['Texture']
-        self.texture_uniform.value = 0
-        
-        self.vbo = ctx.buffer(reserve=1024 * 1024)
-        self.ibo = ctx.buffer(reserve=1024 * 1024)
-        
-        self.vao = ctx.vertex_array(
-            self.prog,
-            [(self.vbo, '2f 2f 4f1', 'Position', 'UV', 'Color')],
-            index_buffer=self.ibo
-        )
-        
-        self.font_texture = None
-        self.refresh_font_texture()
-        
-    def refresh_font_texture(self):
-        width, height, pixels = self.io.fonts.get_tex_data_as_rgba32()
-        if self.font_texture:
-            if self.font_texture.glo in self.textures:
-                del self.textures[self.font_texture.glo]
-            self.font_texture.release()
-        self.font_texture = self.ctx.texture((width, height), 4, data=pixels)
-        self.font_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.io.fonts.texture_id = self.font_texture.glo
-        self.textures[self.font_texture.glo] = self.font_texture
-        self.io.fonts.clear_tex_data()
-        
-    def render(self, draw_data):
-        io = self.io
-        display_width, display_height = io.display_size
-        fb_width = int(display_width * io.display_fb_scale[0])
-        fb_height = int(display_height * io.display_fb_scale[1])
-        if fb_width == 0 or fb_height == 0:
-            return
-            
-        draw_data.scale_clip_rects(*io.display_fb_scale)
-        
-        ortho_projection = np.array([
-             [ 2.0/display_width,  0.0,                   0.0, 0.0],
-             [ 0.0,                2.0/-display_height,   0.0, 0.0],
-             [ 0.0,                0.0,                  -1.0, 0.0],
-             [-1.0,                1.0,                   0.0, 1.0]
-        ], dtype='f4')
-        self.proj_mtx_uniform.write(ortho_projection.tobytes())
-        
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
-        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-        self.ctx.depth_mask = False
-        
-        self.ctx.viewport = (0, 0, fb_width, fb_height)
-        
-        for commands in draw_data.commands_lists:
-            vtx_bytes_size = commands.vtx_buffer_size * imgui.VERTEX_SIZE
-            idx_bytes_size = commands.idx_buffer_size * imgui.INDEX_SIZE
-            
-            vtx_data = ctypes.string_at(commands.vtx_buffer_data, vtx_bytes_size)
-            idx_data = ctypes.string_at(commands.idx_buffer_data, idx_bytes_size)
-            
-            if self.vbo.size < vtx_bytes_size:
-                self.vbo.orphan(vtx_bytes_size)
-            self.vbo.write(vtx_data)
-            
-            if self.ibo.size < idx_bytes_size:
-                self.ibo.orphan(idx_bytes_size)
-            self.ibo.write(idx_data)
-            
-            idx_buffer_offset = 0
-            for command in commands.commands:
-                texture = self.textures.get(command.texture_id)
-                if texture:
-                    texture.use(location=0)
-                else:
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, command.texture_id)
-                
-                x, y, z, w = command.clip_rect
-                self.ctx.scissor = (int(x), int(fb_height - w), int(z - x), int(w - y))
-                
-                self.vao.render(moderngl.TRIANGLES, vertices=command.elem_count, first=idx_buffer_offset // imgui.INDEX_SIZE)
-                idx_buffer_offset += command.elem_count * imgui.INDEX_SIZE
-                
-        self.ctx.scissor = None
-        self.ctx.depth_mask = True
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        
-    def shutdown(self):
-        if self.vao:
-            self.vao.release()
-        if self.vbo:
-            self.vbo.release()
-        if self.ibo:
-            self.ibo.release()
-        if self.prog:
-            self.prog.release()
-        if self.font_texture:
-            self.font_texture.release()
+from engine.rendering.imgui_renderer import ModernGLImGuiRenderer, ModernGLGlfwRenderer
+from engine.rendering.planetshine import (
+    compute_max_bend,
+    compute_ring_coplanar_masks,
+    get_cached_atmosphere_properties,
+    _build_tex_idx_arr,
+    _build_rotation_props,
+    compute_body_rotation_angles_jit,
+    compute_planetshine_numba,
+    halton
+)
+from engine.rendering.texture_baker import apply_hsba_np, bake_and_export_ring_textures
+from engine.core.input_handler import InputHandlerMixin
 
-class ModernGLGlfwRenderer(GlfwRenderer):
-    def __init__(self, window, ctx, attach_callbacks=True):
-        self.modern_renderer = ModernGLImGuiRenderer(ctx)
-        super().__init__(window, attach_callbacks)
-        # Base class init calls refresh_font_texture which registers our ModernGL font texture.
-        # But _invalidate_device_objects resets io.fonts.texture_id to 0. We must restore it.
-        font_id = self.modern_renderer.font_texture.glo if self.modern_renderer.font_texture else 0
-        self._invalidate_device_objects()
-        self.io.fonts.texture_id = font_id
-        
-    def refresh_font_texture(self):
-        self.modern_renderer.refresh_font_texture()
-        self._font_texture = 0
-        
-    def render(self, draw_data):
-        self.modern_renderer.render(draw_data)
-        
-    def shutdown(self):
-        self.modern_renderer.shutdown()
-
-def compute_max_bend(caster_r_au, atmo_h_km, refractivity=0.00029):
-    """Maximum atmospheric refraction angle (radians) for a spherical shell.
-
-    Derives the classic astronomical-refraction scale from the body's actual
-    surface refractivity (n_mix - 1) instead of hard-coding Earth's 0.00029.
-    The horizontal refraction of a plane-parallel exponential atmosphere is
-        R = 2 * (n-1) * sqrt(pi * R_p / (2 H))
-    (the '2 * 0.00029 * sqrt(...)' form with the Earth constant replaced by
-    the body's own (n-1)). Clamped to [0.001, 0.05] rad to stay numerically
-    well-conditioned in the eclipse shaders.
-    """
-    if atmo_h_km <= 0.0 or caster_r_au <= 0.0:
-        return 0.0
-    caster_r_km = caster_r_au * 149597870.7
-    val = (3.141592653589793 * caster_r_km) / max(1e-6, atmo_h_km * 2.0)
-    max_bend = 2.0 * max(refractivity, 0.0) * math.sqrt(val)
-    return max(0.001, min(0.05, max_bend))
-
-@njit(cache=True)
-def compute_ring_coplanar_masks(n_ring_planes, centers, normals):
-    masks = np.zeros(16, dtype=np.uint32)
-    for k in range(n_ring_planes):
-        mask = 0
-        c_k = centers[k]
-        n_k = normals[k]
-        for j in range(n_ring_planes):
-            c_j = centers[j]
-            n_j = normals[j]
-            dx = c_k[0] - c_j[0]
-            dy = c_k[1] - c_j[1]
-            dz = c_k[2] - c_j[2]
-            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-            dot_prod = n_k[0] * n_j[0] + n_k[1] * n_j[1] + n_k[2] * n_j[2]
-            if dist < 1e-5 and dot_prod > 0.999:
-                mask |= (1 << j)
-        masks[k] = mask
-    return masks
-
-def get_cached_atmosphere_properties(atmo, mass_sm):
-    mass_kg = mass_sm * 1.98847e30
-    R_km = atmo.get('planet_radius_km', 0.0)
-    
-    if not atmo.get('_dirty', True) and \
-       atmo.get('_cached_mass') == mass_sm and \
-       atmo.get('_cached_radius') == R_km:
-        return atmo['_cached_props'], atmo['_cached_trans'], atmo['_cached_thick']
-
-    g_m_s2 = (6.67430e-11 * mass_kg) / ((R_km * 1000.0) ** 2) if R_km > 0 else 9.81
-    props = compute_atmosphere_properties(
-        atmo.get('surface_pressure', 1.0),
-        atmo.get('temperature', 288.15),
-        atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-        g_m_s2
-    )
-    
-    beta_r = props['beta_rayleigh']
-    beta_m = atmo.get('beta_mie', 2.0e-6)
-    h_r = props['scale_height_km']
-    h_m = atmo.get('h_mie', 1.2)
-    od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
-    od_m = compute_mie_coefficients(beta_m, atmo.get('mie_angstrom', None)) * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
-    # Ozone slant path through its stratospheric Chapman layer: replace the
-    # hard-coded 1200 km chord with the same sqrt(2*pi*R*H) geometry used for
-    # Rayleigh/Mie, using the Chapman peak altitude as the effective layer
-    # scale. This makes the slant path scale correctly with planet radius and
-    # ozone peak altitude across bodies (Earth/Mars/Venus/Titan).
-    z_o3_peak_km = props.get('ozone_peak_km', 25.0)
-    ozone_slant_km = math.sqrt(2.0 * math.pi * R_km * max(1.0, z_o3_peak_km))
-    od_o3 = props['beta_abs_layered'] * 1000.0 * ozone_slant_km
-    od_mixed = props['beta_abs_mixed'] * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
-    tau = od_r + od_m + od_o3 + od_mixed
-    direct_trans = np.exp(-tau)
-    forward_scatter = tau * np.exp(-tau * 0.8) * 0.3
-    multi_scatter = 0.02 * np.exp(-tau * 0.2)
-    trans = np.clip(direct_trans + forward_scatter + multi_scatter, 0.0, 1.0)
-    thick = atmo.get('atmo_radius_au', 0.0) - atmo.get('surface_radius_au', 0.0)
-    
-    atmo['_cached_mass'] = mass_sm
-    atmo['_cached_radius'] = R_km
-    atmo['_cached_props'] = props
-    atmo['_cached_trans'] = trans
-    atmo['_cached_thick'] = thick
-    atmo['_dirty'] = False
-    
-    return props, trans, thick
-
-def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=None, ring_render_groups=None, ring_gradient_tex=None):
-    import os
-    from PIL import Image
-    name_lower = body_name.lower()
-
-    root_dir = getattr(app, 'root_dir', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    base_textures = os.path.join(root_dir, 'textures')
-
-    system_name = getattr(app, 'loaded_system_name', 'Solar System') or 'Solar System'
-
-    cand_sys_body = os.path.join(base_textures, system_name, body_name)
-    cand_solar_body = os.path.join(base_textures, 'Solar System', body_name)
-    cand_legacy_body = os.path.join(base_textures, body_name)
-
-    if os.path.exists(cand_sys_body):
-        textures_dir = cand_sys_body
-    elif os.path.exists(cand_solar_body):
-        textures_dir = cand_solar_body
-    elif os.path.exists(cand_legacy_body):
-        textures_dir = cand_legacy_body
-    else:
-        textures_dir = os.path.join(base_textures, system_name, body_name)
-
-    os.makedirs(textures_dir, exist_ok=True)
-
-    front_path = os.path.join(textures_dir, f"{body_name}_ring_front.png")
-    back_path = os.path.join(textures_dir, f"{body_name}_ring_back.png")
-
-    img_front = app.ring_textures_front.get(name_lower)
-    img_back = app.ring_textures_back.get(name_lower)
-
-    if img_front is None:
-        print(f"[Texture Editor] No front ring texture found for {body_name}")
-        return False
-
-    if img_back is None:
-        img_back = img_front.copy()
-
-    arr_front = np.array(img_front, dtype=np.float32) / 255.0
-    arr_back = np.array(img_back, dtype=np.float32) / 255.0
-
-    hue = ring_item.get('hue_shift', 0.0)
-    sat = ring_item.get('saturation', 1.0)
-    bri = ring_item.get('brightness', 1.0)
-    op = ring_item.get('opacity', 1.0)
-    unlit = ring_item.get('unlit_factor', 1.0)
-    boost = ring_item.get('alpha_boost', 1.0)
-
-    def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0, unlit_mult=1.0, alpha_boost=1.0):
-        out = arr_rgba.copy()
-        rgb = out[..., :3]
-        maxc = np.max(rgb, axis=-1)
-        minc = np.min(rgb, axis=-1)
-        rangec = maxc - minc
-
-        hsv = np.zeros_like(rgb)
-        hsv[..., 2] = maxc * brightness
-
-        mask = rangec > 1e-6
-        hsv[..., 1][mask] = (rangec[mask] / (maxc[mask] + 1e-6)) * saturation
-
-        rc = np.zeros_like(maxc)
-        gc = np.zeros_like(maxc)
-        bc = np.zeros_like(maxc)
-        rc[mask] = (maxc[mask] - rgb[..., 0][mask]) / (rangec[mask] + 1e-6)
-        gc[mask] = (maxc[mask] - rgb[..., 1][mask]) / (rangec[mask] + 1e-6)
-        bc[mask] = (maxc[mask] - rgb[..., 2][mask]) / (rangec[mask] + 1e-6)
-
-        h = np.zeros_like(maxc)
-        r_mask = (rgb[..., 0] == maxc) & mask
-        g_mask = (rgb[..., 1] == maxc) & mask
-        b_mask = (rgb[..., 2] == maxc) & mask
-
-        h[r_mask] = bc[r_mask] - gc[r_mask]
-        h[g_mask] = 2.0 + rc[g_mask] - bc[g_mask]
-        h[b_mask] = 4.0 + gc[b_mask] - rc[b_mask]
-        h = (h / 6.0 + hue_shift) % 1.0
-        hsv[..., 0] = h
-
-        h6 = hsv[..., 0] * 6.0
-        i = np.floor(h6).astype(int) % 6
-        f = h6 - np.floor(h6)
-        v = np.clip(hsv[..., 2] * unlit_mult, 0.0, 1.0)
-        s = np.clip(hsv[..., 1], 0.0, 1.0)
-
-        p = v * (1.0 - s)
-        q = v * (1.0 - s * f)
-        t = v * (1.0 - s * (1.0 - f))
-
-        rgb_new = np.zeros_like(rgb)
-        idx0 = (i == 0); rgb_new[idx0] = np.stack([v[idx0], t[idx0], p[idx0]], axis=-1)
-        idx1 = (i == 1); rgb_new[idx1] = np.stack([q[idx1], v[idx1], p[idx1]], axis=-1)
-        idx2 = (i == 2); rgb_new[idx2] = np.stack([p[idx2], v[idx2], t[idx2]], axis=-1)
-        idx3 = (i == 3); rgb_new[idx3] = np.stack([p[idx3], q[idx3], v[idx3]], axis=-1)
-        idx4 = (i == 4); rgb_new[idx4] = np.stack([t[idx4], p[idx4], v[idx4]], axis=-1)
-        idx5 = (i == 5); rgb_new[idx5] = np.stack([v[idx5], p[idx5], q[idx5]], axis=-1)
-
-        out[..., :3] = np.clip(rgb_new, 0.0, 1.0)
-        alpha_val = np.clip(out[..., 3] * opacity_mult, 0.0, 1.0)
-        if abs(alpha_boost - 1.0) > 1e-4:
-            mask_nz = alpha_val > 1e-5
-            alpha_val[mask_nz] = np.clip(np.power(alpha_val[mask_nz], 1.0 / max(0.01, alpha_boost)), 0.0, 1.0)
-        out[..., 3] = alpha_val
-        return out
-
-    baked_front = apply_hsba_np(arr_front, hue, sat, bri, opacity_mult=op, unlit_mult=1.0, alpha_boost=boost)
-    baked_back = apply_hsba_np(arr_back, hue, sat, bri, opacity_mult=op, unlit_mult=unlit, alpha_boost=boost)
-
-    baked_front_u8 = np.clip(baked_front * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    baked_back_u8 = np.clip(baked_back * 255.0 + 0.5, 0, 255).astype(np.uint8)
-
-    img_front_new = Image.fromarray(baked_front_u8, mode='RGBA')
-    img_back_new = Image.fromarray(baked_back_u8, mode='RGBA')
-
-    os.makedirs(textures_dir, exist_ok=True)
-    img_front_new.save(front_path)
-    img_back_new.save(back_path)
-    print(f"[Texture Editor] Baked and saved ring textures to {front_path} and {back_path}")
-
-    app.ring_textures_front[name_lower] = img_front_new
-    app.ring_textures_back[name_lower] = img_back_new
-
-    ctx = app.ctx
-    aniso_value = app.camera.get("anisotropy", 16.0)
-    tex_f = ctx.texture(img_front_new.size, 4, img_front_new.tobytes())
-    tex_f.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-    tex_f.repeat_x = False; tex_f.repeat_y = False; tex_f.build_mipmaps(); tex_f.anisotropy = aniso_value
-
-    tex_b = ctx.texture(img_back_new.size, 4, img_back_new.tobytes())
-    tex_b.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-    tex_b.repeat_x = False; tex_b.repeat_y = False; tex_b.build_mipmaps(); tex_b.anisotropy = aniso_value
-
-    app.ring_gl_textures_front[name_lower] = tex_f
-    app.ring_gl_textures_back[name_lower] = tex_b
-
-    ring_item['unlit_factor'] = 1.0
-    ring_item['saturation'] = 1.0
-    ring_item['hue_shift'] = 0.0
-    ring_item['brightness'] = 1.0
-    ring_item['opacity'] = 1.0
-    ring_item['alpha_boost'] = 1.0
-
-    if ring_precomputed is not None and ring_render_groups is not None and ring_gradient_tex is not None:
-        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=np.array(img_front_new, dtype='f4')/255.0)
-        ring_item['shadow_grad'] = shadow_grad
-        app.body_ring_indices = rebuild_ring_render_group(ring_item['body_idx'], ctx, app.prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
-    return True
-
-
-def _build_tex_idx_arr(bodies_data, texture_slices):
-    """Build the per-body texture-array slice index (1-based; 0 = no texture)."""
-    n = len(bodies_data)
-    arr = np.zeros(n, dtype='f4')
-    for i, b in enumerate(bodies_data):
-        name_lower = b['name'].lower()
-        if name_lower in texture_slices:
-            arr[i] = float(texture_slices[name_lower])
-    return arr
-
-
-def _build_rotation_props(bodies_data):
-    """Build per-body rotation properties:
-    - rot_period_arr: period in seconds
-    - w0_arr: initial prime meridian angle W0 at epoch (radians)
-    - tidally_locked_arr: boolean mask for tidal locking
-    - parent_idx_arr: index of parent body (-1 if root/none)
-    - pole_n_arr: precomputed unit vector of body rotation axis in render space
-    - tangent_arr: precomputed tangent basis vector
-    - bitangent_arr: precomputed bitangent basis vector
-    """
-    n = len(bodies_data)
-    name_to_idx = {b.get('name'): i for i, b in enumerate(bodies_data)}
-    mass_by_name = {b.get('name'): float(b.get('m', 0.0)) for b in bodies_data}
-    
-    rot_period_arr = np.zeros(n, dtype='f4')
-    w0_arr = np.zeros(n, dtype='f4')
-    tidally_locked_arr = np.zeros(n, dtype=bool)
-    parent_idx_arr = np.full(n, -1, dtype=int)
-    
-    pole_n_arr = np.zeros((n, 3), dtype='f8')
-    tangent_arr = np.zeros((n, 3), dtype='f8')
-    bitangent_arr = np.zeros((n, 3), dtype='f8')
-    
-    for i, b in enumerate(bodies_data):
-        parent_name = b.get('parent', b.get('parentId'))
-        if parent_name in name_to_idx:
-            parent_idx_arr[i] = name_to_idx[parent_name]
-            
-        w0_deg = b.get('W0', 0.0)
-        w0_arr[i] = math.radians(float(w0_deg))
-        
-        is_locked = b.get('tidally_locked', False)
-        r_hours = b.get('rotation_period', None)
-        
-        if is_locked or b.get('type') == 'Moon':
-            tidally_locked_arr[i] = True
-            
-        if r_hours is None or r_hours == 0.0:
-            body_m = float(b.get('m', 0.0))
-            r_rsun = float(b.get('r', 0.0))
-            a_val = float(b.get('a', 0.0))
-            parent_m = mass_by_name.get(parent_name, 0.0) if parent_name else 0.0
-            if parent_m > 0.0 and body_m > 0.0 and r_rsun > 0.0 and a_val > 0.0:
-                r_km = r_rsun * SOLAR_RADIUS_KM
-                r_tid = 0.00084 * ((parent_m ** 2 / body_m) ** (1.0 / 6.0)) * math.sqrt(r_km)
-                if a_val < r_tid:
-                    tidally_locked_arr[i] = True
-                    total_m = parent_m + body_m
-                    p_years = math.sqrt(a_val ** 3 / total_m) if total_m > 0.0 else 0.0
-                    r_hours = p_years * 365.25 * 24.0
-            if r_hours is None or r_hours == 0.0:
-                r_hours = 24.0
-                
-        rot_period_arr[i] = float(r_hours) * 3600.0
-        
-        # Precompute pole vectors
-        pole_ra = float(b.get('pole_ra', 0.0))
-        pole_dec = float(b.get('pole_dec', 90.0))
-        pole_ecl = pole_to_ecliptic(pole_ra, pole_dec)
-        pole_ren = np.array([pole_ecl[0], pole_ecl[2], -pole_ecl[1]], dtype=np.float64)
-        pole_norm = np.linalg.norm(pole_ren)
-        pole_n = pole_ren / pole_norm if pole_norm > 0 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        
-        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        if abs(np.dot(pole_n, ref)) > 0.999:
-            ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        tangent = np.cross(pole_n, ref)
-        t_norm = np.linalg.norm(tangent)
-        if t_norm > 0:
-            tangent /= t_norm
-        bitangent = np.cross(pole_n, tangent)
-        b_norm = np.linalg.norm(bitangent)
-        if b_norm > 0:
-            bitangent /= b_norm
-            
-        pole_n_arr[i] = pole_n
-        tangent_arr[i] = tangent
-        bitangent_arr[i] = bitangent
-        
-    return rot_period_arr, w0_arr, tidally_locked_arr, parent_idx_arr, pole_n_arr, tangent_arr, bitangent_arr
-
-
-@njit(cache=True)
-def compute_body_rotation_angles_jit(sim_t_sec, rot_period_arr, w0_arr, tidally_locked_arr, parent_idx_arr, pos_snap_render, pole_n_arr, tangent_arr, bitangent_arr):
-    n = len(rot_period_arr)
-    angles = np.zeros(n, dtype=np.float32)
-    for i in range(n):
-        if tidally_locked_arr[i] and parent_idx_arr[i] >= 0:
-            p_idx = parent_idx_arr[i]
-            r_moon = pos_snap_render[i]
-            r_parent = pos_snap_render[p_idx]
-            
-            # to_parent vector
-            to_parent_x = r_parent[0] - r_moon[0]
-            to_parent_y = r_parent[1] - r_moon[1]
-            to_parent_z = r_parent[2] - r_moon[2]
-            
-            norm = math.sqrt(to_parent_x*to_parent_x + to_parent_y*to_parent_y + to_parent_z*to_parent_z)
-            if norm > 1e-12:
-                to_parent_nx = to_parent_x / norm
-                to_parent_ny = to_parent_y / norm
-                to_parent_nz = to_parent_z / norm
-                
-                pole_n = pole_n_arr[i]
-                tangent = tangent_arr[i]
-                bitangent = bitangent_arr[i]
-                
-                # dot product of to_parent_n and pole_n
-                dot_val = to_parent_nx * pole_n[0] + to_parent_ny * pole_n[1] + to_parent_nz * pole_n[2]
-                
-                # d_eq = to_parent_n - dot_val * pole_n
-                d_eq_x = to_parent_nx - dot_val * pole_n[0]
-                d_eq_y = to_parent_ny - dot_val * pole_n[1]
-                d_eq_z = to_parent_nz - dot_val * pole_n[2]
-                
-                d_norm = math.sqrt(d_eq_x*d_eq_x + d_eq_y*d_eq_y + d_eq_z*d_eq_z)
-                if d_norm > 1e-12:
-                    d_eq_nx = d_eq_x / d_norm
-                    d_eq_ny = d_eq_y / d_norm
-                    d_eq_nz = d_eq_z / d_norm
-                    
-                    # dot with tangent and bitangent
-                    cos_w = d_eq_nx * tangent[0] + d_eq_ny * tangent[1] + d_eq_nz * tangent[2]
-                    sin_w = d_eq_nx * bitangent[0] + d_eq_ny * bitangent[1] + d_eq_nz * bitangent[2]
-                    
-                    angles[i] = math.atan2(sin_w, cos_w)
-                else:
-                    angles[i] = w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
-            else:
-                angles[i] = w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
-        else:
-            w0 = w0_arr[i]
-            p_sec = rot_period_arr[i]
-            if p_sec != 0.0:
-                angles[i] = w0 + (sim_t_sec / p_sec) * (2.0 * math.pi)
-            else:
-                angles[i] = w0
-    return angles
-
-
-
-@njit
-def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled):
-    N = len(pos)
-    num_stars = len(star_positions)
-    
-    planetshine_dirs = np.zeros((N, 3), dtype=np.float32)
-    planetshine_colors = np.zeros((N, 3), dtype=np.float32)
-    
-    if num_stars == 0:
-        return planetshine_dirs, planetshine_colors
-        
-    # =========================================================================
-    # PASS 1: Precalculate Shadows & Irradiance for all potential casters
-    # j_lit[j, s] stores the shadowed irradiance received by body j from star s
-    # star_dirs[j, s] stores the normalized vector from body j to star s
-    # =========================================================================
-    j_lit = np.zeros((N, num_stars), dtype=np.float32)
-    star_dirs = np.zeros((N, num_stars, 3), dtype=np.float32)
-    
-    for j in range(N):
-        if is_star[j] > 0.5: 
-            continue
-            
-        for s in range(num_stars):
-            cx = star_positions[s, 0] - pos[j, 0]
-            cy = star_positions[s, 1] - pos[j, 1]
-            cz = star_positions[s, 2] - pos[j, 2]
-            c_dist = np.sqrt(cx*cx + cy*cy + cz*cz)
-            
-            if c_dist < 1e-6: 
-                continue
-                
-            cx /= c_dist
-            cy /= c_dist
-            cz /= c_dist
-            
-            star_dirs[j, s, 0] = cx
-            star_dirs[j, s, 1] = cy
-            star_dirs[j, s, 2] = cz
-            
-            # ECLIPSE CHECK: Does body 'j' sit inside the shadow of body 'k'?
-            shadow_factor = 1.0
-            for k in range(N):
-                if k == j or is_star[k] > 0.5: 
-                    continue
-                
-                vk_x = pos[k, 0] - pos[j, 0]
-                vk_y = pos[k, 1] - pos[j, 1]
-                vk_z = pos[k, 2] - pos[j, 2]
-                t = vk_x * cx + vk_y * cy + vk_z * cz
-                
-                if t > 0.0 and t < c_dist:
-                    dist_sq_k = vk_x*vk_x + vk_y*vk_y + vk_z*vk_z
-                    perp_sq = max(0.0, dist_sq_k - t*t)
-                    
-                    r_penumbra = radii[k] + t * (star_radii[s] / c_dist)
-                    if perp_sq < r_penumbra * r_penumbra:
-                        inv_t = 1.0 / t
-                        beta = radii[k] * inv_t
-                        gamma = np.sqrt(perp_sq) * inv_t
-                        alpha = star_radii[s] / c_dist
-                        
-                        p_out = alpha + beta
-                        p_in = max(0.0, beta - alpha)
-                        
-                        if gamma < p_in:
-                            occ = 1.0
-                        else:
-                            t_val = max(0.0, min(1.0, (gamma - p_out) / (p_in - p_out + 1e-12)))
-                            occ = t_val * t_val * (3.0 - 2.0 * t_val) # Smoothstep
-                            
-                        max_occ = min(1.0, (beta * beta) / max(1e-12, alpha * alpha))
-                        # Scale by the relative area of the shadow caster vs the illuminated body.
-                        # This prevents small objects (like the Moon) from casting a 100% shadow over large objects (like Earth).
-                        scale_area = min(1.0, (radii[k] / max(1e-6, radii[j])) ** 2)
-                        max_occ *= scale_area
-                        shadow_factor *= (1.0 - max_occ * occ)
-                        
-            if shadow_factor > 0.001:
-                irradiance = (star_lums[s] / max(c_dist * c_dist, 1e-8)) if hdr_enabled else 1.0
-                j_lit[j, s] = shadow_factor * irradiance
-
-    # =========================================================================
-    # PASS 2: Distribute light to receivers
-    # =========================================================================
-    for i in range(N):
-        if is_star[i] > 0.5:
-            continue
-            
-        pos_i = pos[i]
-        
-        total_dir_x, total_dir_y, total_dir_z = 0.0, 0.0, 0.0
-        total_color_r, total_color_g, total_color_b = 0.0, 0.0, 0.0
-        total_weight = 0.0
-        
-        for j in range(N):
-            if i == j or is_star[j] > 0.5:
-                continue
-                
-            pos_j = pos[j]
-            r_j = radii[j]
-            
-            dx = pos_j[0] - pos_i[0]
-            dy = pos_j[1] - pos_i[1]
-            dz = pos_j[2] - pos_i[2]
-            dist_sq = dx*dx + dy*dy + dz*dz
-            
-            # Distance Falloff Culling (This makes Pass 2 basically O(N))
-            min_dist = r_j * 1.05
-            max_dist = r_j * 300.0 
-            if dist_sq < min_dist * min_dist or dist_sq > max_dist * max_dist:
-                continue
-                
-            solid_angle = (r_j * r_j) / dist_sq
-            if solid_angle < 1e-8:
-                continue
-            
-            for s in range(num_stars):
-                # If body j is completely in the dark from this star, skip!
-                if j_lit[j, s] < 1e-6:
-                    continue
-                
-                cx = star_dirs[j, s, 0]
-                cy = star_dirs[j, s, 1]
-                cz = star_dirs[j, s, 2]
-                
-                # CRESCENT SHIFT: Move the apparent light emission point towards the sun
-                shift_x = pos_j[0] + cx * r_j * 0.7
-                shift_y = pos_j[1] + cy * r_j * 0.7
-                shift_z = pos_j[2] + cz * r_j * 0.7
-                
-                dir_to_caster_x = shift_x - pos_i[0]
-                dir_to_caster_y = shift_y - pos_i[1]
-                dir_to_caster_z = shift_z - pos_i[2]
-                
-                d_c_sq = dir_to_caster_x**2 + dir_to_caster_y**2 + dir_to_caster_z**2
-                d_c = np.sqrt(d_c_sq)
-                if d_c > 1e-6:
-                    dir_to_caster_x /= d_c
-                    dir_to_caster_y /= d_c
-                    dir_to_caster_z /= d_c
-                else:
-                    continue
-
-                # Lambertian Phase Function
-                cos_a = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
-                cos_a = max(-1.0, min(1.0, cos_a))
-                a = np.arccos(cos_a)
-                phase = (np.sin(a) + (np.pi - a) * cos_a) / np.pi
-                
-                # Apply the precalculated shadowed irradiance
-                light_r = star_colors[s, 0] * phase * j_lit[j, s]
-                light_g = star_colors[s, 1] * phase * j_lit[j, s]
-                light_b = star_colors[s, 2] * phase * j_lit[j, s]
-            
-                boost = 1.5 
-                bounce_r = colors[j, 0] * light_r * solid_angle * (2.0 / 3.0) * boost
-                bounce_g = colors[j, 1] * light_g * solid_angle * (2.0 / 3.0) * boost
-                bounce_b = colors[j, 2] * light_b * solid_angle * (2.0 / 3.0) * boost
-                
-                lum = bounce_r * 0.2126 + bounce_g * 0.7152 + bounce_b * 0.0722
-                
-                total_dir_x += dir_to_caster_x * lum
-                total_dir_y += dir_to_caster_y * lum
-                total_dir_z += dir_to_caster_z * lum
-                
-                total_color_r += bounce_r
-                total_color_g += bounce_g
-                total_color_b += bounce_b
-                total_weight += lum
-            
-        if total_weight > 1e-12:
-            inv_w = 1.0 / total_weight
-            planetshine_dirs[i, 0] = total_dir_x * inv_w
-            planetshine_dirs[i, 1] = total_dir_y * inv_w
-            planetshine_dirs[i, 2] = total_dir_z * inv_w
-        
-        planetshine_colors[i, 0] = total_color_r
-        planetshine_colors[i, 1] = total_color_g
-        planetshine_colors[i, 2] = total_color_b
-            
-    return planetshine_dirs, planetshine_colors
-
-def halton(index, base):
-    result = 0.0
-    f = 1.0 / base
-    i = index
-    while i > 0:
-        result += f * (i % base)
-        i = i // base
-        f = f / base
-    return result
-
-class App:
+class App(InputHandlerMixin):
     def __init__(self):
         self.window_width, self.window_height = 1280, 720
         self.fb_width, self.fb_height = 1280, 720
@@ -856,8 +139,17 @@ class App:
             "taa_enabled": True,
             "atmo_render_scale": 0.5,
             "screenshot_res_idx": 1,
+            "anisotropy": 16.0,
         }
-        
+        self.time_ctrl = {
+            "multiplier": 1.0,
+            "paused": False,
+        }
+
+        self._screenshot_request = None
+        self._screenshot_capturing = False
+        self._screenshot_saving = False
+
         # Post-Processing FBOs
         self.hdr_msaa_fbo = None
         self.hdr_resolve_fbo = None
@@ -5556,7 +4848,7 @@ class App:
                                     ed["evo_path"] = "standard"
                                 
                                 try:
-                                    from star_calc import StarCalculator
+                                    from engine.physics.star_calc import StarCalculator
                                     age_pct = ed["age_pct"] / 100.0
                                     preview = StarCalculator.forge(mode="evolution", evo_path=ed.get("evo_path", "standard"), mass=ed["mass"], metallicity=ed["metallicity"], age_pct=age_pct)
                                     ed["radius"] = preview["physical"]["radius_rsun"] * 696340.0
@@ -5590,7 +4882,7 @@ class App:
                                     ed["_preview"] = None
                                 else:
                                     try:
-                                        from star_calc import StarCalculator
+                                        from engine.physics.star_calc import StarCalculator
                                         preview = StarCalculator.forge(mode="surface", mass=1.0, metallicity=0.0,
                                             radius=ed["s_rad"] if ed["locked_rad"] else None,
                                             temp=ed["s_temp"] if ed["locked_temp"] else None,
@@ -7008,7 +6300,7 @@ class App:
                             cd["evo_path"] = "standard"
                         
                         try:
-                            from star_calc import StarCalculator
+                            from engine.physics.star_calc import StarCalculator
                             age_pct = cd["age_pct"] / 100.0
                             
                             preview = StarCalculator.forge(mode="evolution", evo_path=cd.get("evo_path", "standard"), mass=cd["mass"], metallicity=cd["metallicity"], age_pct=age_pct, rot_frac=cd.get("rot_frac", 0.0))
@@ -7051,7 +6343,7 @@ class App:
                             pr, pg, pb = 1, 1, 1
                         else:
                             try:
-                                from star_calc import StarCalculator
+                                from engine.physics.star_calc import StarCalculator
                                 preview = StarCalculator.forge(mode="surface", mass=1.0, metallicity=0.0,
                                     radius=cd["radius"] if cd["locked_rad"] else None,
                                     temp=cd["temp"] if cd["locked_temp"] else None,

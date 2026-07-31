@@ -1,0 +1,131 @@
+#version 460 core
+layout(local_size_x = 256) in;
+
+// Orbital element data stored in SSBO — doubles for precision
+struct OrbitData {
+    dvec4 d0;  // e_hat.xyz, sl_p
+    dvec4 d1;  // q_hat.xyz, e_mag
+    dvec4 d2;  // bary_rel.xyz, cos_theta0
+    dvec4 d3;  // color.rgb, sin_theta0
+    dvec4 d4;  // empty, theta_max, is_patched, padding
+};
+
+layout(std430, binding = 0) buffer OrbitBuffer {
+    OrbitData orbits[];
+};
+
+layout(std430, binding = 1) buffer OrbitVertexBuffer {
+    dvec4 vertices[]; // xyz = pos, w = alpha
+};
+
+uniform float u_fade_dir;
+uniform float u_min_alpha;
+uniform int u_orbit_res;
+uniform int u_base_instance;
+uniform int u_max_instances;
+uniform int u_vertex_base_offset;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(u_max_instances * u_orbit_res)) return;
+
+    uint instance_id = idx / uint(u_orbit_res);
+    uint vertex_id = idx % uint(u_orbit_res);
+
+    OrbitData od = orbits[instance_id + u_base_instance];
+
+    dvec3 e_hat = od.d0.xyz;
+    double sl_p = od.d0.w;
+    dvec3 q_hat = od.d1.xyz;
+    double e_mag = od.d1.w;
+    dvec3 bary_rel = od.d2.xyz;
+    double cos_A = od.d2.w;
+    double sin_A = od.d3.w;
+
+    float delta_angle = float(od.d4.y);
+    float is_patched = float(od.d4.z);
+
+    float t = float(vertex_id) / float(u_orbit_res - 1);
+    float angle_B;
+    if (delta_angle > 9.0) {
+        angle_B = t * 2.0 * 3.14159265358979;
+    } else {
+        angle_B = t * delta_angle;
+    }
+
+    dvec3 pos;
+
+    if (e_mag < 0.999) {
+        double cos_E0 = cos_A;
+        double sin_E0 = sin_A;
+
+        double cos_B;
+        double sin_B;
+
+        if (vertex_id == uint(u_orbit_res - 1) && delta_angle > 9.0) {
+            cos_B = 1.0lf;
+            sin_B = 0.0lf;
+        } else {
+            cos_B = double(cos(angle_B));
+            sin_B = double(sin(angle_B));
+        }
+
+        double cos_E = cos_E0 * cos_B - sin_E0 * sin_B;
+        double sin_E = sin_E0 * cos_B + cos_E0 * sin_B;
+
+        double a = sl_p / (1.0 - e_mag * e_mag);
+        double x = a * (cos_E - e_mag);
+        double y = a * sqrt(1.0 - e_mag * e_mag) * sin_E;
+
+        pos = bary_rel + x * e_hat + y * q_hat;
+    } else {
+        double cos_B = double(cos(angle_B));
+        double sin_B = double(sin(angle_B));
+
+        double cos_a = cos_A * cos_B - sin_A * sin_B;
+        double sin_a = sin_A * cos_B + cos_A * sin_B;
+
+        double denom = 1.0lf + e_mag * cos_a;
+        double r = sl_p / max(denom, 1e-5lf);
+
+        pos = bary_rel + (cos_a * e_hat + sin_a * q_hat) * r;
+    }
+
+    float t_curr = float(od.d4.x);
+    float alpha = 1.0;
+    if (delta_angle > 9.0) {
+        if (u_fade_dir > 0.0) alpha = mix(u_min_alpha, 1.0, t);
+        else alpha = mix(1.0, u_min_alpha, t);
+    } else {
+        if (u_fade_dir > 0.0) {
+            if (t > t_curr) alpha = u_min_alpha;
+            else {
+                float fraction = t / max(t_curr, 0.001);
+                alpha = mix(u_min_alpha, 1.0, fraction);
+            }
+        } else {
+            if (t < t_curr) alpha = u_min_alpha;
+            else {
+                float fraction = (t - t_curr) / max(1.0 - t_curr, 0.001);
+                alpha = mix(1.0, u_min_alpha, fraction);
+            }
+        }
+    }
+
+    if (is_patched > 0.5) {
+        float dash = fract(float(vertex_id) / 10.0);
+        if (dash > 0.5) alpha = 0.0;
+        else alpha = mix(1.0, u_min_alpha, t);
+    }
+
+    if (e_mag >= 0.999) {
+        float dist_from_bary = float(length(pos - bary_rel));
+        float q = float(sl_p / (1.0lf + e_mag));
+        float r_max_draw = max(300.0, q * 10.0);
+        float fade_start = max(150.0, r_max_draw * 0.5);
+        float fade_out = 1.0 - smoothstep(fade_start, r_max_draw, dist_from_bary);
+        alpha *= fade_out;
+    }
+
+    vertices[u_vertex_base_offset + idx] = dvec4(pos, double(alpha));
+}

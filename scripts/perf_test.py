@@ -33,6 +33,7 @@ import cProfile
 import pstats
 import os
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../engine')))
 import time
 
@@ -142,8 +143,8 @@ def main():
     if os.environ.get("STELLAR_FORGE_PERF") != "1":
         os.environ["STELLAR_FORGE_PERF"] = "1"
 
-    import app as ap
-    import physics_core as pc
+    import engine.app as ap
+    import engine.physics.physics_core as pc
     import glfw
 
     tracker = PerfTracker()

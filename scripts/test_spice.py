@@ -1,8 +1,8 @@
 import sys
 import os
 import json
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'engine')))
-from spice_manager import SpiceManager
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from engine.ephemeris.spice_manager import SpiceManager
 
 sm = SpiceManager()
 sm.load_kernels()
