@@ -7,9 +7,12 @@ Velocities are converted from AU/day to AU/yr to match REBOUND units.
 Usage:  python fetch_horizons.py
 Output: Updates system.json in-place, adding "sv" field to each body.
 """
-import json, time, re, sys
+import json, time, re, sys, ssl
 import urllib.request
 import urllib.parse
+import numpy as np
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 # JPL Horizons REST API
 API_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
@@ -100,6 +103,16 @@ PARENT_NAIF = {
 }
 
 
+# Outer planet system barycenter NAIF IDs
+BARY_MAP = {
+    "Jupiter": "5",
+    "Saturn":  "6",
+    "Uranus":  "7",
+    "Neptune": "8",
+    "Pluto":   "9",
+}
+
+
 def get_parent_center(body_name, parent_name):
     """Get the Horizons CENTER string for querying relative to parent."""
     if parent_name is None:
@@ -108,6 +121,50 @@ def get_parent_center(body_name, parent_name):
     if parent_naif:
         return f"500@{parent_naif}"
     return "500@10"  # fallback to Sun
+
+
+def apply_barycentric_velocity_alignment(bodies, start_time="2026-01-01 12:00", stop_time="2026-01-01 12:01", state_vectors=None):
+    """Align planet initial velocities so subsystem barycenter velocity matches JPL system barycenter velocity."""
+    print("\n--- Applying Subsystem Barycentric Velocity Alignment ---")
+    for p_name, bary_id in BARY_MAP.items():
+        p_body = next((b for b in bodies if b["name"] == p_name), None)
+        if not p_body:
+            continue
+            
+        sv_dict = state_vectors.get(p_name) if state_vectors is not None else p_body.get("sv")
+        if not sv_dict:
+            continue
+            
+        p_mass = p_body.get("m", 0.0)
+        moons = [b for b in bodies if b.get("parentId") == p_name and ((state_vectors is not None and b["name"] in state_vectors) or ("sv" in b))]
+        if not moons:
+            continue
+            
+        tot_mass = p_mass + sum(m.get("m", 0.0) for m in moons)
+        
+        try:
+            resp_bary = query_horizons(bary_id, "500@10", start_time=start_time, stop_time=stop_time)
+            sv_bary = parse_state_vector(resp_bary)
+            if not sv_bary:
+                continue
+                
+            v_jpl_bary = np.array([sv_bary['vx'], sv_bary['vy'], sv_bary['vz']])
+            v_center = np.array([sv_dict['vx'], sv_dict['vy'], sv_dict['vz']])
+            
+            sim_moon_momentum = np.zeros(3)
+            for m in moons:
+                msv = state_vectors[m["name"]] if state_vectors is not None else m["sv"]
+                sim_moon_momentum += m.get("m", 0.0) * np.array([msv['vx'], msv['vy'], msv['vz']])
+                
+            v_sim_subsys = v_center + sim_moon_momentum / tot_mass
+            delta_v = v_jpl_bary - v_sim_subsys
+            
+            sv_dict['vx'] += float(delta_v[0])
+            sv_dict['vy'] += float(delta_v[1])
+            sv_dict['vz'] += float(delta_v[2])
+            print(f"  [{p_name:12s}] Applied barycentric velocity alignment (|delta_v| = {np.linalg.norm(delta_v)*149597870.7:.2f} km/yr)")
+        except Exception as e:
+            print(f"  [{p_name:12s}] Barycentric alignment skipped ({e})")
 
 
 import os
@@ -286,6 +343,7 @@ def main():
     print(f"{'='*70}")
     
     if success > 0:
+        apply_barycentric_velocity_alignment(bodies)
         # Write updated system.json
         data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../data/system.json')
         with open(data_path, "w") as f:

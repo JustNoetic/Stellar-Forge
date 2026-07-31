@@ -176,10 +176,11 @@ Errors are decomposed into standard astronomical **RTN (Radial, Transverse/Along
 | **Earth** | 0.05 km | -0.05 km | -0.00 km | 0.00 km |
 | **Moon** | 0.90 km | 0.90 km | -0.01 km | 0.03 km |
 | **Mars** | 0.08 km | 0.07 km | -0.03 km | 0.00 km |
-| **Jupiter** | 0.69 km | 0.14 km | 0.67 km | 0.01 km |
-| **Saturn** | 0.17 km | 0.15 km | 0.05 km | -0.06 km |
-| **Neptune** | 11.15 km | -10.38 km | -2.35 km | -3.33 km |
-| **Pluto** | 19.88 km | 14.14 km | -8.14 km | 11.35 km |
+| **Jupiter** | 0.07 km | -0.02 km | 0.07 km | 0.00 km |
+| **Saturn** | 0.05 km | 0.04 km | 0.01 km | -0.01 km |
+| **Uranus** | 88.98 km | -50.56 km | 73.17 km | -2.74 km |
+| **Neptune** | 0.08 km | 0.05 km | -0.06 km | -0.01 km |
+| **Pluto** | 1.87 km | -1.87 km | 0.07 km | -0.05 km |
 | **Ceres** | 0.15 km | 0.09 km | -0.12 km | -0.00 km |
 | **Vesta** | 0.20 km | 0.16 km | -0.12 km | 0.00 km |
 | **Pallas** | 0.05 km | 0.03 km | -0.03 km | 0.02 km |
@@ -189,10 +190,10 @@ Errors are decomposed into standard astronomical **RTN (Radial, Transverse/Along
 | **Europa** *(Jovian Moon)* | 15.14 km | 2.41 km | 0.98 km | -14.91 km |
 | **Ganymede** *(Jovian Moon)* | 24.72 km | 24.41 km | 0.30 km | -3.88 km |
 | **Callisto** *(Jovian Moon)* | 18.00 km | 17.98 km | 0.13 km | 0.65 km |
-| **Titan** *(Saturnian Moon)* | 54.93 km | -54.93 km | -0.02 km | -0.13 km |
-| **Hyperion** *(Saturnian Moon)* | 58.07 km | -57.92 km | 4.04 km | 0.20 km |
+| **Titan** *(Saturnian Moon)* | 10.25 km | -10.25 km | -0.01 km | -0.01 km |
+| **Hyperion** *(Saturnian Moon)* | 9.55 km | -9.51 km | 0.84 km | -0.02 km |
 | **Charon** *(Plutonian Moon)* | 17.58 km | -17.58 km | -0.00 km | 0.00 km |
-| **Triton** *(Neptunian Moon)* | 230.37 km | -229.30 km | -0.02 km | 22.25 km |
+| **Triton** *(Neptunian Moon)* | 18.98 km | -16.89 km | -0.01 km | 8.65 km |
 
 *\*Note: Major planets and dwarf planets achieve sub-kilometer to near-zero positional drift over a full orbital year ($< 0.05 \text{ km}$ for Earth and Eris!). Small close-in moons reflect expected high-frequency tidal and multi-body resonance drift when unmodelled by point-mass dynamics.*
 

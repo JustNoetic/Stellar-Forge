@@ -10,7 +10,10 @@ from engine.physics.physics_core import Simulation, attach_custom_forces
 from engine.ephemeris.spice_manager import SpiceManager
 from engine.core.constants import C_AU_YR, SOLAR_RADII_TO_AU, AU_TO_KM
 from engine.core.math_utils import pole_to_ecliptic
-from fetch_horizons import query_horizons, parse_state_vector, HORIZONS_IDS, PARENT_NAIF
+from fetch_horizons import query_horizons, parse_state_vector, HORIZONS_IDS, PARENT_NAIF, apply_barycentric_velocity_alignment
+
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 START_TIME = "2025-01-01 12:00"
 STOP_TIME = "2025-01-02"
@@ -21,7 +24,7 @@ END_STOP = "2026-01-02"
 def get_parent_center(body_name, parent_name):
     if body_name == "Sun":
         return "500@0"
-    if parent_name == "Sun":
+    if parent_name == "Sun" or parent_name is None:
         return "500@10"
     parent_naif = HORIZONS_IDS.get(parent_name, PARENT_NAIF.get(parent_name))
     if parent_naif:
@@ -37,30 +40,48 @@ def main():
     sim = Simulation()
     sim.G = 39.476926421373
     
-    
-    print(f"\n--- Fetching 2015 Starting State Vectors from JPL Horizons ---")
+    print(f"\n--- Fetching 2025 Starting State Vectors from JPL Horizons ---")
     start_vectors = {}
     for body in bodies:
         name = body["name"]
-        parent = body.get("parent")  # deliberately use invalid key to force parent=None
+        parent_name = body.get("parentId")
         body_id = HORIZONS_IDS.get(name)
         if not body_id:
             print(f"Skipping {name} (No Horizons ID)")
             continue
-        center = get_parent_center(name, parent)
+        center = get_parent_center(name, parent_name)
         
         print(f"Querying {name} at {START_TIME}...")
         resp = query_horizons(body_id, center, start_time=START_TIME, stop_time=STOP_TIME)
         sv = parse_state_vector(resp)
         if sv:
             start_vectors[name] = sv
-            m = body.get("m", 0.0)
-            if name == "Sun":
-                sim.add(m=m, x=0, y=0, z=0, vx=0, vy=0, vz=0)
-            else:
-                sim.add(m=m, x=sv["x"], y=sv["y"], z=sv["z"], vx=sv["vx"], vy=sv["vy"], vz=sv["vz"])
         else:
             print(f"Failed to parse {name}")
+
+    apply_barycentric_velocity_alignment(bodies, start_time=START_TIME, stop_time=STOP_TIME, state_vectors=start_vectors)
+
+    for body in bodies:
+        name = body["name"]
+        if name not in start_vectors:
+            continue
+        sv = start_vectors[name]
+        m = body.get("m", 0.0)
+        parent_name = body.get("parentId")
+
+        if name == "Sun":
+            sim.add(m=m, x=0, y=0, z=0, vx=0, vy=0, vz=0)
+        elif parent_name and parent_name in start_vectors and parent_name != "Sun":
+            p_sv = start_vectors[parent_name]
+            sim.add(m=m, 
+                    x=p_sv["x"] + sv["x"], 
+                    y=p_sv["y"] + sv["y"], 
+                    z=p_sv["z"] + sv["z"], 
+                    vx=p_sv["vx"] + sv["vx"], 
+                    vy=p_sv["vy"] + sv["vy"], 
+                    vz=p_sv["vz"] + sv["vz"])
+        else:
+            sim.add(m=m, x=sv["x"], y=sv["y"], z=sv["z"], vx=sv["vx"], vy=sv["vy"], vz=sv["vz"])
 
     sim.move_to_com()
 
