@@ -312,20 +312,35 @@ graph TD
 
 ```
 Stellar-Forge/
-├── engine/                      # Core engine python modules
-│   ├── app.py                   # Main window, rendering loops, ImGui UI & event handling
+├── engine/                      # Core engine modules & architecture
+│   ├── app.py                   # Main window, rendering loops, ImGui UI & event orchestrator
 │   ├── main.py                  # Entry point script with fault handling and crash loggers
-│   ├── physics_core.py          # Numba-compiled IAS15 integrator, custom forces & physics loop
-│   ├── kepler_analytical.py     # Analytical Keplerian Jacobi coordinate propagation engine
-│   ├── system_manager.py        # System I/O, state snapshots, stellar property derivation
-│   ├── spice_manager.py         # NAIF SPICE kernel manager, automated kernel downloader
-│   ├── star_calc.py             # Stellar classification, HR diagram statistics & HZ bounds
-│   ├── shaders.py               # GLSL shader strings for celestial bodies, atmospheres & LUTs
-│   ├── post_shaders.py          # GLSL post-processing shaders (Bloom, HDR Tone Mapping)
-│   ├── render_utils.py          # ModernGL buffer helpers, icosphere mesh (3 LODs) & ring geometry generators
-│   ├── math_utils.py            # Numba vector ops, Kepler solvers & orbital<->cartesian frame rotations
-│   ├── atmosphere_physics.py    # Physical atmosphere parameters (Rayleigh, Mie, absorption coefficients, scale height)
-│   └── constants.py             # Physical, astronomical constants & conversion ratios
+│   ├── __init__.py              # Master package re-exporter with sys.modules aliases
+│   ├── core/                    # Physical constants, SIMD/Numba math & input callbacks
+│   │   ├── constants.py
+│   │   ├── math_utils.py
+│   │   └── input_handler.py
+│   ├── physics/                 # Numerical N-body integration, Kepler solver & stellar physics
+│   │   ├── physics_core.py      # IAS15 integrator, custom forces (GR 1PN, J2/J4) & physics loop
+│   │   ├── kepler_analytical.py # Analytical Keplerian Jacobi propagation kernel
+│   │   ├── atmosphere_physics.py# Physical atmosphere parameters & gas composition table
+│   │   └── star_calc.py        # Stellar evolution, HR classification & HZ bounds
+│   ├── rendering/               # ModernGL render pass pipelines, planetshine, texture baking & shaders
+│   │   ├── render_utils.py
+│   │   ├── imgui_renderer.py
+│   │   ├── planetshine.py
+│   │   ├── texture_baker.py
+│   │   ├── shader_loader.py
+│   │   ├── shaders.py
+│   │   └── post_shaders.py
+│   ├── ephemeris/               # Presets & NASA SPICE kernel manager
+│   │   ├── system_manager.py
+│   │   └── spice_manager.py
+│   └── glsl/                    # Dedicated GLSL shader source code (.vert, .frag, .comp)
+│       ├── compute/
+│       ├── celestial/
+│       ├── atmosphere/
+│       └── post/
 ├── data/                        # Simulation data & system presets
 │   ├── systems/                 # System JSON profiles (Solar System, Achernar, Ephemeris Mode, ...)
 │   │   └── <Name>/{meta.json, system.json}

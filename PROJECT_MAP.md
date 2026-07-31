@@ -23,18 +23,33 @@
 Stellar-Forge/
 ├── engine/
 │   ├── main.py                 # Entry point. faulthandler + try/except crash logger.
-│   ├── app.py                  # ★ MAIN: App class, GLFW window, render loop, ImGui UI (6400+ lines)
-│   ├── physics_core.py         # ★ IAS15 integrator, custom forces, physics_loop thread, Simulation class
-│   ├── kepler_analytical.py    # Analytical Jacobi-coordinate Keplerian propagation (Numba)
-│   ├── system_manager.py       # System I/O, SystemSnapshot, derive_star_properties, spectral class
-│   ├── spice_manager.py        # SpiceManager: kernel download/load, SPICE state queries, ephemeris system
-│   ├── star_calc.py            # StarCalculator: stellar evolution, HR classification, HZ bounds
-│   ├── shaders.py              # All GLSL strings (culling, sphere, orbit, ring, atmo, HZ, LUTs)
-│   ├── post_shaders.py         # GLSL: bloom down/up-sample, composite, TAA resolve
-│   ├── render_utils.py         # Mesh/geometry/frustum/ring helpers + time formatting (Numba + pure)
-│   ├── math_utils.py           # Numba vector ops, Kepler solvers, orbital<->cartesian, pole frames
-│   ├── atmosphere_physics.py   # Rayleigh/Mie/absorption coefficients, scale heights, gas table
-│   └── constants.py            # Physical & astronomical constants
+│   ├── app.py                  # ★ MAIN: App class, GLFW window, render loop, ImGui UI
+│   ├── __init__.py             # Master package re-exporter with sys.modules aliases
+│   ├── core/                   # Base constants, SIMD/Numba math, GLFW input
+│   │   ├── constants.py        # Physical & astronomical constants
+│   │   ├── math_utils.py      # Numba vector ops, Kepler solvers, orbital<->cartesian
+│   │   └── input_handler.py    # GLFW input callbacks & settings persistence (InputHandlerMixin)
+│   ├── physics/                # N-body numerical integration & celestial dynamics
+│   │   ├── physics_core.py     # ★ IAS15 integrator, GR/J2 forces, physics_loop thread, Simulation class
+│   │   ├── kepler_analytical.py# Analytical Jacobi-coordinate Keplerian propagation (Numba)
+│   │   ├── atmosphere_physics.py # Rayleigh/Mie/absorption coefficients, scale heights
+│   │   └── star_calc.py        # StarCalculator: stellar evolution, HR classification, HZ bounds
+│   ├── rendering/              # Graphics pipeline, shader management, Planetshine & baking
+│   │   ├── render_utils.py     # Mesh/geometry/frustum helpers + time formatting
+│   │   ├── imgui_renderer.py   # ModernGL + ImGui GLFW render bridge
+│   │   ├── planetshine.py      # Planetshine & JIT rotation angle calculations
+│   │   ├── texture_baker.py    # Procedural ring HSBA baking & texture exporter
+│   │   ├── shader_loader.py    # GLSL shader loader with in-memory caching
+│   │   ├── shaders.py          # Shader re-exports & uniform bindings
+│   │   └── post_shaders.py     # Post-processing shader re-exports (Bloom, TAA, HDR)
+│   ├── ephemeris/              # Astronomical data & JPL Horizons/SPICE integration
+│   │   ├── system_manager.py   # System I/O, SystemSnapshot, derive_star_properties
+│   │   └── spice_manager.py    # SpiceManager: kernel download/load, SPICE state queries
+│   └── glsl/                   # Dedicated GLSL shader source files
+│       ├── compute/            # Frustum culling & orbit compute shaders (.comp)
+│       ├── celestial/          # Sphere, orbit, ring, HZ shaders (.vert, .frag)
+│       ├── atmosphere/         # Raymarching & LUT generation shaders (.vert, .frag)
+│       └── post/               # Bloom, composite, TAA & ringshine shaders (.vert, .frag)
 ├── data/
 │   ├── system.json             # Active default system
 │   ├── systems/<Name>/{meta.json,system.json}   # System presets (Solar System, Achernar, Ephemeris Mode)
@@ -51,7 +66,7 @@ Stellar-Forge/
 ├── exports/                    # Exported cosmetic JSON per body
 ├── run.bat                     # Windows one-click venv + deps + launch
 ├── imgui.ini                   # Saved ImGui layout
-└── readme.md / PROJECT_MAP.md  # Docs
+└── README.md / PROJECT_MAP.md  # Docs
 ```
 
 ---
@@ -66,20 +81,20 @@ For each file: responsibilities, key symbols (with approximate line numbers), an
   dumps `main_error.txt`.
 - **Edit when:** changing startup/error handling/CLI args.
 
-### 3.2 `engine/constants.py` (16 lines)
+### 3.2 `engine/core/constants.py` (16 lines)
 - `SECONDS_PER_YEAR`, `C_AU_YR`, `FOV_DEG`, `G` (AU³/M☉/yr²), `OBLIQUITY`,
   `ORBIT_RESOLUTION` (200), `ORBIT_STRIDE_BYTES` (28), `SOLAR_RADIUS_KM`, `AU_TO_KM`,
   `SOLAR_RADII_TO_AU`.
 - **Edit when:** tuning physical constants or orbit buffer sizes.
 
-### 3.3 `engine/atmosphere_physics.py` (135 lines)
+### 3.3 `engine/physics/atmosphere_physics.py` (135 lines)
 - `GAS_PROPERTIES` (dict): per-gas Rayleigh coefficients, molar mass, absorption.
 - `compute_atmosphere_properties(pressure_atm, temperature_k, composition, gravity_m_s2)` (~L33)
   → returns beta_rayleigh, beta_mie, absorption, scale heights. **Pure Python (cached by app).**
 - `compute_mie_coefficients(base_beta, angstrom_exponent)` (~L120).
 - **Edit when:** changing scattering physics, gas composition table, atmosphere LUT inputs.
 
-### 3.4 `engine/math_utils.py` (197 lines) — all `@njit(cache=True)`
+### 3.4 `engine/core/math_utils.py` (197 lines) — all `@njit(cache=True)`
 - `fast_cross`, `fast_norm` — vector ops.
 - `pole_to_ecliptic(pole_ra_deg, pole_dec_deg)`, `build_equatorial_frame(pole_ecl)` — pole frames.
 - `kepler_solve(M, e, tol)` — Newton solver for Kepler's equation.
@@ -90,7 +105,7 @@ For each file: responsibilities, key symbols (with approximate line numbers), an
 - `vector_orbital_to_cartesian(a,e,n_vec,e_vec,M,μ)` — vector-form orbit → cartesian (precession).
 - **Edit when:** changing orbital math, frame transforms, Kepler solver.
 
-### 3.5 `engine/kepler_analytical.py` (478 lines) — `@njit(cache=True, nogil=True)`
+### 3.5 `engine/physics/kepler_analytical.py` (478 lines) — `@njit(cache=True, nogil=True)`
 - `state_to_kepler_vectors(rx,ry,rz,vx,vy,vz,μ)` (~L34) → orbit normal `n` + eccentricity vector `e`.
 - `extract_all_kepler_elements(pos, vel, mass, parent_indices, subsys_pos/vel/mass, t_current, G, …)` (~L112)
   → batch osculating elements + J2/GR/third-body precession vectors for whole system.
@@ -99,7 +114,7 @@ For each file: responsibilities, key symbols (with approximate line numbers), an
     Jacobi→Cartesian top-down placement.
 - **Edit when:** changing analytical mode, precession model, barycentric placement logic.
 
-### 3.6 `engine/physics_core.py` (2506 lines) — core physics
+### 3.6 `engine/physics/physics_core.py` (2506 lines) — core physics
 Numba kernels:
 - `compute_custom_forces(arr, …)` (~L24) — **GR 1PN + J2/J4 oblate harmonics** acceleration extras.
 - `compute_all_accelerations(arr, …)` (~L235) — pairwise Newtonian + custom forces.
@@ -136,7 +151,7 @@ Classes:
 **Edit when:** integrator algorithm, forces (GR/J2/J4), hierarchy rebuild, orbit computation,
 system loading/bundle shape, Simulation data layout.
 
-### 3.7 `engine/system_manager.py` (510 lines)
+### 3.7 `engine/ephemeris/system_manager.py` (510 lines)
 Top-level functions:
 - `derive_star_properties(mass, metallicity, age)` (~L21) → temp, lum, radius, spectral class.
 - `get_spectral_class(temp, lum_class)` (~L142).
@@ -161,7 +176,7 @@ Classes:
 **Edit when:** system file I/O, presets, snapshot persistence, star property derivation,
 spectral classification.
 
-### 3.8 `engine/spice_manager.py` (735 lines)
+### 3.8 `engine/ephemeris/spice_manager.py` (735 lines)
 - `SpiceManager` (~L7):
   - `__init__()` (~L120) — loads `ephemeris_settings.json`, ensures `data/kernels/`.
   - `cancel_download()`, `_cleanup_partial_downloads()`.
@@ -179,7 +194,7 @@ spectral classification.
 
 **Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build.
 
-### 3.9 `engine/star_calc.py` (365 lines)
+### 3.9 `engine/physics/star_calc.py` (365 lines)
 - `StarCalculator` (~L3) — all `@staticmethod`/`@classmethod`:
   - `calc_lum(r,t)`, `calc_rad(l,t)`, `calc_temp(l,r)`.
   - `ms_mass_from_lum(l)`, `ms_lum_from_mass(m)`.
@@ -190,30 +205,27 @@ spectral classification.
 
 **Edit when:** stellar evolution models, HR diagram classification, HZ computation, star UI inputs.
 
-### 3.10 `engine/shaders.py` (2795 lines) — GLSL string constants
-- `culling_compute_shader` (~L1) — GPU frustum/occlusion culling compute (writes indirect draw cmds).
-- `sphere_vertex_shader` (~L147), `sphere_fragment_shader` (~L258) — PBR planet/star spheres
-  (eclipse LUT, planetshine, ringshine, textures).
-- `orbit_compute_shader` (~L844) — compute orbit polylines from elements.
-- `orbit_vertex_shader` (~L978), `orbit_fragment_shader` (~L1029).
-- `ephem_orbit_vertex_shader` (~L1045), `ephem_orbit_fragment_shader` (~L1075) — ephemeris orbits.
-- `ring_vertex_shader` (~L1090), `ring_fragment_shader` (~L1133) — planetary rings
-  (phase function, self-shadow, ringshine, eclipse).
-- `hz_vertex_shader` (~L1634), `hz_fragment_shader` (~L1658) — habitable zone visualization.
-- `atmo_vertex_shader` (~L1675), `atmo_fragment_shader` (~L1740) — atmosphere raymarching.
-- `atmo_lut_vertex_shader` (~L2563), `atmo_lut_fragment_shader` (~L2573) — transmittance LUT.
-- `multi_scatter_lut_fragment_shader` (~L2650) — multi-scattering LUT.
+### 3.10 `engine/rendering/shaders.py` & `engine/glsl/` — Shader Management & Source Code
+- `engine/rendering/shader_loader.py`: In-memory GLSL loader (`load_shader`) loading source files from `engine/glsl/`.
+- `engine/rendering/shaders.py`: Dynamically re-exports loaded GLSL shaders:
+  - `culling_compute_shader` (`glsl/compute/culling.comp`) — GPU frustum/occlusion culling compute.
+  - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres.
+  - `orbit_compute_shader` (`glsl/compute/orbit.comp`), `orbit_*` (`glsl/celestial/orbit.*`).
+  - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`).
+  - `ring_*` (`glsl/celestial/ring.*`), `hz_*` (`glsl/celestial/hz.*`).
+  - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*`.
 
-**Edit when:** any rendering/eclipse/atmo/ring/orbit/culling shader code.
+**Edit when:** editing GLSL shader logic inside `engine/glsl/` or uniform bindings in `shaders.py`.
 
-### 3.11 `engine/post_shaders.py` (227 lines) — GLSL string constants
-- `bloom_downsample_shader_vs/fs` (~L1/11), `bloom_upsample_shader_fs` (~L71) — HDR bloom pyramid.
-- `composite_shader_fs` (~L106) — tonemap (ACES/Reinhard) + exposure + bloom composite.
-- `taa_resolve_shader_fs` (~L150) — temporal anti-aliasing resolve.
+### 3.11 `engine/rendering/post_shaders.py` — Post-Processing GLSL
+- Re-exports post-processing shaders loaded from `engine/glsl/post/`:
+  - `bloom_downsample.frag`, `bloom_upsample.frag` — HDR bloom pyramid.
+  - `composite.frag` — tonemap (ACES) + exposure + bloom composite.
+  - `taa_resolve.frag` — temporal anti-aliasing resolve.
 
 **Edit when:** bloom, tonemapping, exposure, TAA.
 
-### 3.12 `engine/render_utils.py` (343 lines)
+### 3.12 `engine/rendering/render_utils.py` (343 lines)
 - `hex_to_rgb`, `sample_gradient` — color helpers.
 - `format_time_speed(multiplier)` (~L26), `format_sim_time(t_years)` (~L47),
   `sim_time_from_date(y,m,d,h,mn)` (~L98) — UI time strings.
@@ -412,26 +424,28 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Want to… | File | Symbol / Region |
 |---|---|---|
 | Change launch/crash handling | `engine/main.py` | top-level |
-| Tune physical constants | `engine/constants.py` | — |
-| Change Newtonian/GR/J2/J4 forces | `engine/physics_core.py` | `compute_custom_forces`, `compute_all_accelerations` |
-| Change IAS15 integrator | `engine/physics_core.py` | `ias15_step_numba` + helpers |
-| Change analytical Keplerian mode | `engine/kepler_analytical.py` | `propagate_keplerian_system_numba`, `extract_all_kepler_elements` |
-| Change hierarchy/parent-tree logic | `engine/physics_core.py` | `_update_hierarchy_core`, `build_tree_order` |
-| Change physics thread / system switching | `engine/physics_core.py` | `physics_loop` |
-| Change how systems load from JSON | `engine/physics_core.py` | `load_system_from_data` |
-| Change system file I/O / presets | `engine/system_manager.py` | `SystemManager`, `SystemSnapshot` |
-| Change star classification/evolution | `engine/star_calc.py`, `engine/system_manager.py` | `StarCalculator.forge`, `derive_star_properties` |
-| Change SPICE / Ephemeris Mode | `engine/spice_manager.py` | `SpiceManager` |
-| Change scattering physics / gas table | `engine/atmosphere_physics.py` | `compute_atmosphere_properties`, `GAS_PROPERTIES` |
-| Change orbital math / frame rotations | `engine/math_utils.py` | — |
-| Change sphere/ring/atmo/orbit/HZ shaders | `engine/shaders.py` | matching `*_shader` string |
-| Change bloom/tonemap/TAA | `engine/post_shaders.py` | — |
-| Change mesh/ring geometry, frustum culling | `engine/render_utils.py` | — |
-| Change camera, input, UI, render loop | `engine/app.py` | `class App`, `run()`, callbacks |
-| Change eclipse LUT build | `engine/app.py` | `build_eclipse_lut` (~L1318) |
-| Change atmosphere LUT build | `engine/app.py` | `build_atmo_lut` (~L1765) |
-| Change planetshine CPU precompute | `engine/app.py` | `compute_planetshine_numba` (~L295) |
-| Change Body Inspector | `engine/app.py` | inspector block (~L4544–5832) |
+| Tune physical constants | `engine/core/constants.py` | — |
+| Change Newtonian/GR/J2/J4 forces | `engine/physics/physics_core.py` | `compute_custom_forces`, `compute_all_accelerations` |
+| Change IAS15 integrator | `engine/physics/physics_core.py` | `ias15_step_numba` + helpers |
+| Change analytical Keplerian mode | `engine/physics/kepler_analytical.py` | `propagate_keplerian_system_numba`, `extract_all_kepler_elements` |
+| Change hierarchy/parent-tree logic | `engine/physics/physics_core.py` | `_update_hierarchy_core`, `build_tree_order` |
+| Change physics thread / system switching | `engine/physics/physics_core.py` | `physics_loop` |
+| Change how systems load from JSON | `engine/physics/physics_core.py` | `load_system_from_data` |
+| Change system file I/O / presets | `engine/ephemeris/system_manager.py` | `SystemManager`, `SystemSnapshot` |
+| Change star classification/evolution | `engine/physics/star_calc.py`, `engine/ephemeris/system_manager.py` | `StarCalculator.forge`, `derive_star_properties` |
+| Change SPICE / Ephemeris Mode | `engine/ephemeris/spice_manager.py` | `SpiceManager` |
+| Change scattering physics / gas table | `engine/physics/atmosphere_physics.py` | `compute_atmosphere_properties`, `GAS_PROPERTIES` |
+| Change orbital math / frame rotations | `engine/core/math_utils.py` | — |
+| Change sphere/ring/atmo/orbit/HZ shaders | `engine/glsl/` (`celestial/`, `atmosphere/`, `compute/`) | GLSL files loaded via `engine/rendering/shaders.py` |
+| Change bloom/tonemap/TAA shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
+| Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
+| Change planetshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
+| Change ring texture baking | `engine/rendering/texture_baker.py` | `bake_and_export_ring_textures` |
+| Change GLFW input callbacks & settings persistence | `engine/core/input_handler.py` | `InputHandlerMixin` |
+| Change camera, UI, main render loop | `engine/app.py` | `class App`, `run()` |
+| Change eclipse LUT build | `engine/app.py` | `build_eclipse_lut` |
+| Change atmosphere LUT build | `engine/app.py` | `build_atmo_lut` |
+| Change Body Inspector | `engine/app.py` | inspector block |
 | Change system-switch / ephemeris modal | `engine/app.py` | `_trigger_ephem_switch/exit`, `_render_ephem_setup_modal` |
 | Fetch real ephemerides offline | `scripts/fetch_horizons.py` | `main` |
 | Validate physics accuracy | `scripts/accuracy_test.py` | `main` |
