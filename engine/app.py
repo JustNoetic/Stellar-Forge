@@ -3857,27 +3857,7 @@ class App(InputHandlerMixin):
                             prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
                             prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
                             prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
-                        body_pos_rel = cmp_pos_rel[bi]
-                        
-                        b_rot = self.rot_snap_cmp[bi]
-                        b_mat = matrix44.create_from_quaternion(b_rot, dtype='f4')
-                        inv_b_rot = matrix44.inverse(b_mat)
-                        u_ring_inv_rotation.write(inv_b_rot.astype('f4'))
-                        
-                        r_in, r_out = group['r_inner'], group['r_outer']
-                        u_ring_body_offset.write(body_pos_rel.astype('f4'))
-                        u_ring_params.write(np.array([r_in, r_out, 0.0, 0.0], dtype='f4'))
-                        
-                        body_shine_dir = self.instances_snap_cmp[bi * 7 + 4].xyz
-                        body_shine_col = self.instances_snap_cmp[bi * 7 + 5].xyz
-                        if u_ring_planetshine_dir is not None:
-                            u_ring_planetshine_dir.write(body_shine_dir.astype('f4'))
-                        if u_ring_planetshine_color is not None:
-                            u_ring_planetshine_color.write(body_shine_col.astype('f4'))
-                        
-                        tex_ring = group['texture']
-                        tex_ring.use(location=0)
-                        self.ring_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.ring_num_vertices)
+                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
             
             # Render Habitable Zone Visualizer
             if self.camera.get("show_habitable_zone", False) and self.hz_vao is not None:
