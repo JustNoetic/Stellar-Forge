@@ -14,3 +14,9 @@ SOLAR_RADIUS_KM = 696340.0
 AU_TO_KM = 149597870.7
 SOLAR_RADII_TO_AU = SOLAR_RADIUS_KM / AU_TO_KM  # 0.00465474... (exact)
 
+# Light Year Constants
+LY_TO_AU = 63241.07708426963  # 1 Light Year in AU (9,460,730,472,580.8 km / 149,597,870.7 km)
+AU_TO_LY = 1.0 / LY_TO_AU
+LY_TO_KM = LY_TO_AU * AU_TO_KM  # ~9,460,730,472,580.8 km
+DEFAULT_LY_THRESHOLD_AU = 0.1 * LY_TO_AU  # Default threshold distance (0.1 ly ~ 6,324.1 AU)
+

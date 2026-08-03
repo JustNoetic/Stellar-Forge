@@ -44,6 +44,19 @@ def format_time_speed(multiplier):
     else:
         return f"{sign_str}{multiplier / 31557600:.1f} years/s"
 
+def format_distance_au(dist_au, threshold_au=None, precision=5, show_unit=True):
+    """Format a distance in AU, dynamically switching to light years ('ly') if crossing threshold_au."""
+    if threshold_au is None:
+        threshold_au = DEFAULT_LY_THRESHOLD_AU
+    abs_dist = abs(dist_au)
+    if threshold_au > 0 and abs_dist >= threshold_au:
+        dist_ly = dist_au / LY_TO_AU
+        unit_str = " ly" if show_unit else ""
+        return f"{dist_ly:.{precision}f}{unit_str}"
+    else:
+        unit_str = " AU" if show_unit else ""
+        return f"{dist_au:.{precision}f}{unit_str}"
+
 def format_sim_time(t_years):
     # Try spiceypy first if ephemeris mode is active
     try:

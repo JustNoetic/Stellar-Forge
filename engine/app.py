@@ -123,6 +123,7 @@ class App(InputHandlerMixin):
             "inspect_bary": False,
             "edit_mode": False,
             "edit_data": {},
+            "ly_threshold_au": DEFAULT_LY_THRESHOLD_AU,
             "show_settings_modal": False,
             "atmo_quality": 1,
             "atmo_steps_max": 32,
@@ -4744,6 +4745,15 @@ class App(InputHandlerMixin):
                 
                 changed_offset, self.comparison_offset_au = imgui.drag_float("Offset (AU)##cmp_offset", self.comparison_offset_au, 0.1)
 
+            imgui.separator()
+            if imgui.collapsing_header("Distance Unit Settings")[0]:
+                cur_thresh_ly = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU) / LY_TO_AU
+                changed_thresh, new_thresh_ly = imgui.drag_float("AU -> Light Year (ly)##ly_thresh", cur_thresh_ly, 0.01, 0.001, 1000.0, format="%.3f ly")
+                if changed_thresh:
+                    self.camera["ly_threshold_au"] = max(0.0001, new_thresh_ly) * LY_TO_AU
+                thresh_au_val = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
+                imgui.text_colored(f"Switch Threshold: {thresh_au_val:,.1f} AU ({thresh_au_val/LY_TO_AU:.3f} ly)", 0.7, 0.7, 0.7)
+
             imgui.end()
     
             insp_is_cmp = self.camera.get("inspected_is_cmp", False)
@@ -4958,20 +4968,26 @@ class App(InputHandlerMixin):
                         else:
                             imgui.text("  Surface G: {:.3e} m/s² ({:.3e} g)".format(g_m_s2, g_earth))
                     
+                    thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
                     target_pos = cur_subsys_pos_buf[insp_idx].copy() if inspect_bary else cur_pos_snap_render[insp_idx].copy()
                     if insp_is_cmp:
                         target_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                     dist_to_center_km = np.linalg.norm(target_pos - cam_world_pos_f8) * 149597870.7
+                    dist_to_center_au = dist_to_center_km / 149597870.7
                     if inspect_bary:
-                        imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
+                        if dist_to_center_km > 1.49597e7:
+                            imgui.text(f"  Cam Dist: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
+                        else:
+                            imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
                     else:
                         dist_to_surface_km = dist_to_center_km - body_r_km
+                        dist_to_surface_au = dist_to_surface_km / 149597870.7
                         if dist_to_center_km > 1.49597e7:
-                            imgui.text(f"  Cam Dist: {dist_to_center_km / 149597870.7:.5f} AU")
+                            imgui.text(f"  Cam Dist: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
                         else:
                             imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
                         if dist_to_surface_km > 1.49597e7:
-                            imgui.text(f"  Altitude: {dist_to_surface_km / 149597870.7:.5f} AU")
+                            imgui.text(f"  Altitude: {format_distance_au(dist_to_surface_au, threshold_au=thresh_au)}")
                         elif dist_to_surface_km > 0:
                             imgui.text(f"  Altitude: {dist_to_surface_km:,.0f} km")
                         else:
@@ -5255,13 +5271,14 @@ class App(InputHandlerMixin):
                                     d_roche_km = 2.44 * body_r_km * ((parent_m / body_m)**(1.0/3.0))
                                     d_roche_au = d_roche_km / 149597870.7
                                     
+                                    thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
                                     parent_type = cur_bodies_data[parent_idx].get('type', '')
                                     if parent_type == 'Star':
-                                        imgui.text("  Tidal Lock Rad: {:.4f} AU".format(r_tid))
-                                        imgui.text("  Roche Limit:    {:.5f} AU ({:,.0f} km)".format(d_roche_au, d_roche_km))
+                                        imgui.text(f"  Tidal Lock Rad: {format_distance_au(r_tid, threshold_au=thresh_au, precision=4)}")
+                                        imgui.text(f"  Roche Limit:    {format_distance_au(d_roche_au, threshold_au=thresh_au, precision=5)} ({d_roche_km:,.0f} km)")
                                     else:
-                                        imgui.text("  Tidal Lock Rad: {:,.0f} km ({:.5f} AU)".format(r_tid * 149597870.7, r_tid))
-                                        imgui.text("  Roche Limit:    {:,.0f} km ({:.5f} AU)".format(d_roche_km, d_roche_au))
+                                        imgui.text(f"  Tidal Lock Rad: {r_tid * 149597870.7:,.0f} km ({format_distance_au(r_tid, threshold_au=thresh_au, precision=5)})")
+                                        imgui.text(f"  Roche Limit:    {d_roche_km:,.0f} km ({format_distance_au(d_roche_au, threshold_au=thresh_au, precision=5)})")
                                         
                                     a_val = body_info.get('a', 1.0)
                                     if a_val < r_tid:
@@ -5354,10 +5371,11 @@ class App(InputHandlerMixin):
                             use_km = oe_a < 0.01
                             AU_TO_KM = 149597870.7
                             
+                            thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
                             if use_km:
                                 imgui.text(f"  Semi-major:  {oe_a * AU_TO_KM:,.0f} km")
                             else:
-                                imgui.text(f"  Semi-major:  {oe_a:.6f} AU")
+                                imgui.text(f"  Semi-major:  {format_distance_au(oe_a, threshold_au=thresh_au, precision=6)}")
                             imgui.text(f"  Eccentricity: {oe_e:.6f}")
                             imgui.text(f"  Inclination:  {oe_inc:.4f}\u00b0")
                             imgui.text(u"  \u03A9 (RAAN):       {oe_Omega:.4f}\u00b0".format(oe_Omega=oe_Omega))
@@ -5376,14 +5394,15 @@ class App(InputHandlerMixin):
                         
                         periapsis = oe_a * (1.0 - oe_e)
                         apoapsis = oe_a * (1.0 + oe_e)
+                        thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
                         if use_km:
                             imgui.text(f"  Periapsis:   {periapsis * AU_TO_KM:,.0f} km")
                             imgui.text(f"  Apoapsis:    {apoapsis * AU_TO_KM:,.0f} km")
                             imgui.text(f"  Distance:    {dist_au * AU_TO_KM:,.0f} km")
                         else:
-                            imgui.text(f"  Periapsis:   {periapsis:.6f} AU")
-                            imgui.text(f"  Apoapsis:    {apoapsis:.6f} AU")
-                            imgui.text(f"  Distance:    {dist_au:.6f} AU")
+                            imgui.text(f"  Periapsis:   {format_distance_au(periapsis, threshold_au=thresh_au, precision=6)}")
+                            imgui.text(f"  Apoapsis:    {format_distance_au(apoapsis, threshold_au=thresh_au, precision=6)}")
+                            imgui.text(f"  Distance:    {format_distance_au(dist_au, threshold_au=thresh_au, precision=6)}")
                         imgui.text(f"  Velocity:    {vel_km_s:.3f} km/s")
                         
                         if oe_a > 0 and oe_e < 1.0 and not inspect_bary:
@@ -5438,8 +5457,9 @@ class App(InputHandlerMixin):
                                     
                         if roche_violates:
                             imgui.text_colored("Warning: Orbit is within parent's Roche limit!", 1.0, 0.3, 0.3)
-                            imgui.text_colored("  Roche Limit: {:.5f} AU ({:,.0f} km)".format(d_roche_au, d_roche_km), 0.7, 0.7, 0.7)
-                            imgui.text_colored("  Periapsis: {:.5f} AU".format(periapsis_au), 0.7, 0.7, 0.7)
+                            thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
+                            imgui.text_colored(f"  Roche Limit: {format_distance_au(d_roche_au, threshold_au=thresh_au, precision=5)} ({d_roche_km:,.0f} km)", 0.7, 0.7, 0.7)
+                            imgui.text_colored(f"  Periapsis: {format_distance_au(periapsis_au, threshold_au=thresh_au, precision=5)}", 0.7, 0.7, 0.7)
                             imgui.text_colored("[Apply Changes Disabled]", 0.5, 0.5, 0.5)
                         else:
                             if imgui.button("Apply Changes", width=-1):
@@ -6163,7 +6183,8 @@ class App(InputHandlerMixin):
                             ad["a"] = ((278.5 / T_eq_target)**2) * math.sqrt(star_lum) * math.sqrt(1.0 - albedo)
                         else:
                             ad["a"] = 1.0
-                        imgui.text("  Calculated Semi-Major: {:.6f} AU".format(ad["a"]))
+                        thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
+                        imgui.text(f"  Calculated Semi-Major: {format_distance_au(ad['a'], threshold_au=thresh_au, precision=6)}")
                     else:
                         if is_moon:
                             _, ad["a"] = imgui.input_double("Semi-Major Axis (km)", ad["a"], format="%.1f")
@@ -6195,9 +6216,10 @@ class App(InputHandlerMixin):
                             roche_violates = True
                             
                     if roche_violates:
+                        thresh_au = self.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
                         imgui.text_colored("Warning: Within parent's Roche limit!", 1.0, 0.3, 0.3)
-                        imgui.text_colored("  Roche: {:.5f} AU ({:,.0f} km)".format(d_roche_au, d_roche_km), 0.7, 0.7, 0.7)
-                        imgui.text_colored("  Periapsis: {:.5f} AU".format(periapsis_au), 0.7, 0.7, 0.7)
+                        imgui.text_colored(f"  Roche: {format_distance_au(d_roche_au, threshold_au=thresh_au, precision=5)} ({d_roche_km:,.0f} km)", 0.7, 0.7, 0.7)
+                        imgui.text_colored(f"  Periapsis: {format_distance_au(periapsis_au, threshold_au=thresh_au, precision=5)}", 0.7, 0.7, 0.7)
                         imgui.text_colored("[Spawn Disabled]", 0.5, 0.5, 0.5)
                     else:
                         if imgui.button("Spawn Body", width=-1):
