@@ -64,7 +64,7 @@ layout(std430, binding = 8) buffer AtmoData {
     float u_active_max_bend[8];
     float u_ozone_peak_km;
     float u_ozone_width_km;
-    float _atmo_pad0;
+    float u_planet_clip_km;
     float _atmo_pad1;
 };
 
@@ -329,7 +329,7 @@ void main() {
     vec2 s_atmo = raySphereIntersect(cam_local_sph, ray_dir_sph, u_atmo_radius_km);
     if (s_atmo.x > s_atmo.y) discard;
 
-    vec2 s_planet = raySphereIntersect(cam_local_sph, ray_dir_sph, u_planet_radius_km);
+    vec2 s_planet = raySphereIntersect(cam_local_sph, ray_dir_sph, u_planet_clip_km);
 
     float s_start = max(0.0, s_atmo.x);
     float s_end = s_atmo.y;

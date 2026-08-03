@@ -2,6 +2,7 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import math
 import OpenGL
 OpenGL.ERROR_CHECKING = False
 import glfw
@@ -17,7 +18,197 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return super().default(obj)
 
-import math
+def _camera_align_up(up_world):
+    """Return the 3x3 rotation R that maps the local +Y axis onto unit `up_world`.
+
+    Used to build the surface-relative view frame when the camera is landed:
+    fwd_world = R @ fwd_local, where fwd_local = (cos(yaw)cos(pitch), sin(pitch), sin(yaw)cos(pitch)).
+    """
+    up_world = np.asarray(up_world, dtype='f8')
+    n = np.linalg.norm(up_world)
+    if n < 1e-12:
+        return np.eye(3, dtype='f8')
+    up_world = up_world / n
+    from_v = np.array([0.0, 1.0, 0.0], dtype='f8')
+    d = max(-1.0, min(1.0, float(np.dot(from_v, up_world))))
+    if d > 0.999999:
+        return np.eye(3, dtype='f8')
+    if d < -0.999999:
+        return np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], dtype='f8')
+    axis = np.cross(from_v, up_world)
+    axis = axis / np.linalg.norm(axis)
+    theta = math.acos(d)
+    K = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]], dtype='f8')
+    return np.eye(3, dtype='f8') + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
+
+def _camera_forward(yaw_deg, pitch_deg):
+    yaw_rad = math.radians(yaw_deg)
+    pitch_rad = math.radians(pitch_deg)
+    return np.array([
+        math.cos(yaw_rad) * math.cos(pitch_rad),
+        math.sin(pitch_rad),
+        math.sin(yaw_rad) * math.cos(pitch_rad)], dtype='f8')
+
+def _camera_yaw_pitch_from(fwd):
+    fwd = np.asarray(fwd, dtype='f8')
+    n = np.linalg.norm(fwd)
+    if n < 1e-300:
+        return 0.0, 0.0
+    fwd = fwd / n
+    yaw = math.degrees(math.atan2(fwd[2], fwd[0]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, fwd[1]))))
+    return yaw, pitch
+
+def _ellipsoid_surface_radius(r_eq, f, pole, u):
+    """Surface radius of an oblate spheroid (semi-major r_eq, flattening f)
+    in the unit direction u (pole = unit spin axis)."""
+    r_eq = float(r_eq)
+    f = float(f)
+    if f <= 0.0:
+        return r_eq
+    pole = np.asarray(pole, dtype='f8')
+    if np.linalg.norm(pole) < 1e-12:
+        return r_eq
+    pole = pole / np.linalg.norm(pole)
+    u = np.asarray(u, dtype='f8')
+    n_u = np.linalg.norm(u)
+    if n_u < 1e-12:
+        return r_eq * (1.0 - f)
+    u = u / n_u
+    b = r_eq * (1.0 - f)
+    cos_t = float(np.dot(u, pole))
+    sin_t2 = max(0.0, 1.0 - cos_t * cos_t)
+    denom = b * b * sin_t2 + r_eq * r_eq * cos_t * cos_t
+    if denom < 1e-30:
+        return b
+    return math.sqrt((r_eq * r_eq * b * b) / denom)
+
+_ICOSPHERE_SAG_CACHE = {}
+
+def _icosphere_max_sag(subdivisions):
+    """Max inward sag of the tessellated icosphere from its circumsphere,
+    as a fraction of the radius (1 - inradius/circumradius)."""
+    if subdivisions not in _ICOSPHERE_SAG_CACHE:
+        mesh_verts, mesh_idx = create_icosphere_mesh(subdivisions=subdivisions)
+        v3 = mesh_verts.reshape(-1, 6)[:, 0:3]
+        i3 = mesh_idx.reshape(-1, 3)
+        a = v3[i3[:, 0]]
+        b_v = v3[i3[:, 1]]
+        c_v = v3[i3[:, 2]]
+        nrm = np.cross(b_v - a, c_v - a)
+        denom = np.maximum(np.linalg.norm(nrm, axis=1), 1e-12)
+        d = np.abs(np.einsum('ij,ij->i', a, nrm)) / denom
+        _ICOSPHERE_SAG_CACHE[subdivisions] = float(1.0 - d.min())
+    return _ICOSPHERE_SAG_CACHE[subdivisions]
+
+def _camera_rot_axis(axis, angle):
+    """Rodrigues 3x3 rotation matrix about unit `axis` by `angle` radians."""
+    axis = np.asarray(axis, dtype='f8')
+    n = np.linalg.norm(axis)
+    if n < 1e-12:
+        return np.eye(3, dtype='f8')
+    axis = axis / n
+    K = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]], dtype='f8')
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return np.eye(3, dtype='f8') + s * K + (1.0 - c) * (K @ K)
+
+def _camera_screen_up(fwd, roll_rad):
+    """Screen-space up of the current view: world +Y projected onto the plane
+    perpendicular to `fwd`, then rotated by roll about the view axis.
+
+    This is the actual up vector the look-at view renders, so drags rotated about
+    it always follow the cursor on screen, at any pitch (unlike raw world +Y)."""
+    fwd = np.asarray(fwd, dtype='f8')
+    n = np.linalg.norm(fwd)
+    if n < 1e-12:
+        return np.array([0.0, 1.0, 0.0], dtype='f8')
+    fwd = fwd / n
+    up_proj = np.array([0.0, 1.0, 0.0], dtype='f8') - float(np.dot(fwd, np.array([0.0, 1.0, 0.0], dtype='f8'))) * fwd
+    nup = np.linalg.norm(up_proj)
+    if nup > 1e-9:
+        up = up_proj / nup
+    else:
+        # looking straight up/down: pick a stable perpendicular instead
+        up = np.array([1.0, 0.0, 0.0], dtype='f8')
+        up = up - float(np.dot(fwd, up)) * fwd
+        nup = np.linalg.norm(up)
+        up = up / nup if nup > 1e-9 else np.array([0.0, 0.0, 1.0], dtype='f8')
+    if abs(roll_rad) > 1e-9:
+        up = _camera_rot_axis(fwd, -roll_rad) @ up
+    return up
+
+def _camera_orient_from_view(fwd, roll_rad):
+    """Orientation matrix (columns: right, up, back) matching the rendered view
+    (row-vector convention): look_at(pos, pos+fwd, Y) followed by Rz(roll)."""
+    up = _camera_screen_up(fwd, roll_rad)
+    right = np.cross(fwd, up)
+    nr = np.linalg.norm(right)
+    if nr > 1e-9:
+        right = right / nr
+    else:
+        right = np.array([1.0, 0.0, 0.0], dtype='f8')
+    return np.column_stack([right, up, -fwd])
+
+def _camera_euler_from_orient(R):
+    """Extract (yaw, pitch, roll) reproducing the orientation matrix exactly."""
+    fwd = -R[:, 2]
+    yaw = math.degrees(math.atan2(fwd[2], fwd[0]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, fwd[1]))))
+    up = R[:, 1]
+    up_ref = _camera_screen_up(fwd, 0.0)
+    right_ref = np.cross(fwd, up_ref)
+    roll = math.degrees(math.atan2(-float(np.dot(up, right_ref)), float(np.dot(up, up_ref))))
+    return yaw, pitch, roll
+
+def _camera_pivot_apply(cam, dx, dy, sensitivity):
+    """LMB trackball pivot: track a full orientation matrix so the image rotates
+    rigidly with the cursor at any pitch/roll (roll-aware, no pole spinning)."""
+    if cam.get("cam_look", "aim") == "aim":
+        rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
+        r = np.linalg.norm(rel)
+        fwd = -rel / r if r > 1e-300 else _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    else:
+        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    roll_rad = math.radians(cam.get("roll_actual", 0.0))
+    R = _camera_orient_from_view(fwd, roll_rad)
+    R = _camera_rot_axis(R[:, 1], math.radians(-dx * sensitivity)) @ (_camera_rot_axis(R[:, 0], math.radians(-dy * sensitivity)) @ R)
+    yaw_new, pitch_new, roll_new = _camera_euler_from_orient(R)
+    cam["yaw"] = cam["yaw_actual"] = yaw_new
+    cam["pitch"] = cam["pitch_actual"] = pitch_new
+    cam["roll"] = cam["roll_actual"] = roll_new
+
+def _camera_orbit_apply(cam, dx, dy, sensitivity):
+    """RMB trackball orbit: rotate the camera position about the pivot using the
+    camera's own screen axes (radius preserved). Direct (no smoothing)."""
+    rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
+    r = np.linalg.norm(rel)
+    if r < 1e-300:
+        return
+    if cam.get("cam_look", "aim") == "aim":
+        fwd = -rel / r
+    else:
+        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    roll_rad = math.radians(cam.get("roll_actual", 0.0))
+    up = _camera_screen_up(fwd, roll_rad)
+    right = np.cross(fwd, up)
+    nr = np.linalg.norm(right)
+    if nr > 1e-9:
+        right = right / nr
+    else:
+        right = np.array([1.0, 0.0, 0.0], dtype='f8')
+    # drag right -> orbit right; drag down -> orbit up
+    rel_new = _camera_rot_axis(up, math.radians(-dx * sensitivity)) @ (_camera_rot_axis(right, math.radians(-dy * sensitivity)) @ rel)
+    r_new = np.linalg.norm(rel_new)
+    if r_new > 1e-300:
+        rel_new = rel_new / r_new * r
+    cam["cam_pos_rel"] = rel_new.tolist()
+    cam["cam_look"] = "aim"
+
 import threading
 import time
 from pyrr import matrix44
@@ -98,12 +289,17 @@ class App(InputHandlerMixin):
         self.pick_request = None
         self.camera = {
             "target": np.array([0.0, 0.0, 0.0], dtype='f8'),
-            "target_offset": np.array([0.0, 0.0, 0.0], dtype='f8'),
-            "pan_offset": np.array([0.0, 0.0, 0.0], dtype='f8'),
+            # Camera offset (AU, f8) from the tracked pivot (body / barycenter / target).
+            # Default eye pose reproduces the legacy 45 AU orbit view (yaw -90, pitch 25).
+            "cam_pos_rel": np.array([0.0, -19.02, 40.78], dtype='f8'),
+            "cam_vel": np.zeros(3, dtype='f8'),
+            "flight_speed": 0.1,           # AU/s, adjusted by scroll wheel
+            "cam_mode": "flight",          # kept for save-file compat (no landed state anymore)
+            "cam_look": "aim",             # "aim" (at pivot) | "free" (yaw/pitch)
+            "keys": {},                    # held WASD states
+            "approach_delta": 0.0,         # LMB+RMB vertical drag (exp scale factor)
             "exposure": 1.0,
             "hdr_enabled": True,
-            "distance": 45.0,     
-            "distance_actual": 45.0,
             "fov": 45.0,
             "yaw": -90.0,         
             "yaw_actual": -90.0,
@@ -259,6 +455,7 @@ class App(InputHandlerMixin):
                 "ringshine_band_count": self.camera.get("ringshine_band_count", 10),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
+                "flight_speed": self.camera.get("flight_speed", 0.1),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
                 "taa_enabled": self.camera.get("taa_enabled", True),
                 "atmo_render_scale": self.camera.get("atmo_render_scale", 0.5),
@@ -282,31 +479,10 @@ class App(InputHandlerMixin):
                 self.camera["fov"] *= (1.0 / (0.85 ** abs(yoffset)))
             self.camera["fov"] = max(0.001, min(120.0, self.camera["fov"]))
         else:
-            r_target = 0.0
-            if self.camera["tracking_idx"] is not None:
-                track_idx = self.camera["tracking_idx"]
-                is_cmp = self.camera.get("tracking_is_cmp", False)
-                if is_cmp and hasattr(self, "body_radii_cmp") and self.body_radii_cmp is not None:
-                    if track_idx < len(self.body_radii_cmp):
-                        r_target = float(self.body_radii_cmp[track_idx])
-                elif hasattr(self, "body_radii") and self.body_radii is not None:
-                    if track_idx < len(self.body_radii):
-                        r_target = float(self.body_radii[track_idx])
-            
-            # Calculate height above target surface
-            h = max(1e-11, self.camera["distance"] - r_target)
-            
-            # Zoom speed is proportional to height (easier ground move)
-            zoom_speed = max(1e-10, h * 0.2)
-            
-            if yoffset > 0:
-                self.camera["distance"] -= zoom_speed
-            elif yoffset < 0:
-                self.camera["distance"] += zoom_speed
-                
-            # Prevent clipping into the ground (safety buffer ~30 meters)
-            min_dist = r_target + 2e-7
-            self.camera["distance"] = max(min_dist, self.camera["distance"])
+            # Scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
+            speed = self.camera.get("flight_speed", 0.1)
+            speed *= (2.0 ** yoffset)
+            self.camera["flight_speed"] = max(1e-12, min(5.0, speed))
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)
@@ -320,10 +496,12 @@ class App(InputHandlerMixin):
                 self.camera["click_start_x"], self.camera["click_start_y"] = x, y
             elif action == glfw.RELEASE: 
                 self.camera["left_dragging"] = False
-                dx = x - self.camera.get("click_start_x", x)
-                dy = y - self.camera.get("click_start_y", y)
-                if dx*dx + dy*dy < 25:
-                    self.pick_request = (x, y)
+                # Don't pick when ending an LMB+RMB approach gesture (RMB still held).
+                if not self.camera.get("right_dragging", False):
+                    dx = x - self.camera.get("click_start_x", x)
+                    dy = y - self.camera.get("click_start_y", y)
+                    if dx*dx + dy*dy < 25:
+                        self.pick_request = (x, y)
                 
         elif button == glfw.MOUSE_BUTTON_RIGHT:
             if action == glfw.PRESS:
@@ -335,44 +513,25 @@ class App(InputHandlerMixin):
         dx = xpos - self.camera["last_x"]
         dy = ypos - self.camera["last_y"]
         
-        roll_rad = math.radians(self.camera.get("roll_actual", 0.0))
-        cos_r = math.cos(roll_rad)
-        sin_r = math.sin(roll_rad)
-        
-        dx_eff = dx * cos_r + dy * sin_r
-        dy_eff = -dx * sin_r + dy * cos_r
-        
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
         
-        if self.camera["left_dragging"]:
+        if self.camera["left_dragging"] and self.camera["right_dragging"]:
+            # LMB+RMB: radial approach / recede toward the tracked body's surface.
+            # Drag down (dy > 0) = move closer; drag up = pull back. Applied per-frame
+            # as an exponential scale so the gesture feels uniform at any distance.
+            self.camera["approach_delta"] += dy * 0.0125
+        elif self.camera["left_dragging"]:
+            # LMB: trackball pivot in place (free look), direct (no smoothing).
+            # Rotates about the camera's own screen axes so the view always
+            # follows the cursor regardless of ecliptic orientation.
             sensitivity = 0.3 * fov_ratio
-            self.camera["yaw"] += dx_eff * sensitivity
-            self.camera["pitch"] -= dy_eff * sensitivity
-            self.camera["pitch"] = max(-89.9, min(89.9, self.camera["pitch"])) 
-            
+            _camera_pivot_apply(self.camera, dx, dy, sensitivity)
+            self.camera["cam_look"] = "free"
         elif self.camera["right_dragging"]:
-            pan_speed = self.camera["distance_actual"] * 0.001 * fov_ratio
-            yaw_rad = math.radians(self.camera["yaw_actual"])
-            pitch_rad = math.radians(self.camera["pitch_actual"])
-            
-            front = np.array([
-                math.cos(yaw_rad) * math.cos(pitch_rad),
-                math.sin(pitch_rad),
-                math.sin(yaw_rad) * math.cos(pitch_rad)
-            ], dtype='f4')
-            front /= np.linalg.norm(front)
-            
-            right = np.cross(front, np.array([0.0, 1.0, 0.0], dtype='f4'))
-            right /= np.linalg.norm(right)
-            
-            up = np.cross(right, front)
-            up /= np.linalg.norm(up)
-            
-            pan_vec = -right * dx_eff * pan_speed + up * dy_eff * pan_speed
-            if self.camera["tracking_idx"] is not None:
-                self.camera["pan_offset"] += pan_vec
-            else:
-                self.camera["target"] += pan_vec
+            # RMB: trackball orbit around the pivot, direct (no smoothing).
+            # Screen-space: dragging right always orbits the camera right.
+            sensitivity = 0.3 * fov_ratio
+            _camera_orbit_apply(self.camera, dx, dy, sensitivity)
     
         self.camera["last_x"], self.camera["last_y"] = xpos, ypos
     
@@ -382,6 +541,12 @@ class App(InputHandlerMixin):
     def key_callback(self, window, key, scancode, action, mods):
         if self.impl: self.impl.keyboard_callback(window, key, scancode, action, mods)
         if imgui.get_io().want_capture_keyboard: return
+        
+        # WASD: track held state for free-flight / surface walking
+        flight_keys = {glfw.KEY_W: "w", glfw.KEY_A: "a", glfw.KEY_S: "s", glfw.KEY_D: "d"}
+        if key in flight_keys:
+            self.camera["keys"][flight_keys[key]] = (action != glfw.RELEASE)
+            return
     
         if action == glfw.PRESS or action == glfw.REPEAT:
             if key == glfw.KEY_SPACE and action == glfw.PRESS:
@@ -1959,9 +2124,15 @@ class App(InputHandlerMixin):
                 self.camera["inspect_bary"] = False
                 self.camera["edit_mode"] = False
                 self.camera["target"] = np.array([0.0, 0.0, 0.0], dtype='f8')
-                self.camera["target_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
-                self.camera["pan_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
-                self.camera["distance"] = 45.0
+                self.camera["cam_pos_rel"] = np.array([0.0, -19.02, 40.78], dtype='f8')
+                self.camera["cam_pos_rel_prev"] = self.camera["cam_pos_rel"].copy()
+                self.camera["cam_vel"] = np.zeros(3, dtype='f8')
+                self.camera["cam_look"] = "aim"
+                self.camera["keys"] = {}
+                self.camera["approach_delta"] = 0.0
+                self.camera["yaw"] = self.camera["yaw_actual"] = -90.0
+                self.camera["pitch"] = self.camera["pitch_actual"] = 25.0
+                self.camera["roll"] = self.camera["roll_actual"] = 0.0
     
                 cached_hierarchy_ver = -1
                 last_orbit_pos_snap = None
@@ -2489,53 +2660,150 @@ class App(InputHandlerMixin):
                     self.camera["roll"] -= 60.0 * dt_render
 
             self.body_radii = body_radii
-            
-            # Enforce minimum distance to prevent clipping into the ground
-            r_target = 0.0
-            if self.camera["tracking_idx"] is not None:
-                track_idx = self.camera["tracking_idx"]
-                is_cmp = self.camera.get("tracking_is_cmp", False)
-                if is_cmp and hasattr(self, "body_radii_cmp") and self.body_radii_cmp is not None:
-                    if track_idx < len(self.body_radii_cmp):
-                        r_target = float(self.body_radii_cmp[track_idx])
-                elif hasattr(self, "body_radii") and self.body_radii is not None:
-                    if track_idx < len(self.body_radii):
-                        r_target = float(self.body_radii[track_idx])
-            
-            min_dist = r_target + 2e-7  # Target radius + ~30 meters safety buffer
-            self.camera["distance"] = max(min_dist, self.camera["distance"])
-            self.camera["distance_actual"] = max(min_dist, self.camera["distance_actual"])
+
+            # ── Camera: Space Engine-style free flight / orbit / landing ──
+            cam = self.camera
+            LAND_ALT_AU = 1e-10   # ~15 m stick height above the surface
+            rel_prev = np.array(cam.get("cam_pos_rel_prev", cam["cam_pos_rel"]), dtype='f8')
+            rel = np.array(cam["cam_pos_rel"], dtype='f8')
 
             lerp_factor = 1.0 - math.exp(-15.0 * dt_render)
-            self.camera["distance_actual"] += (self.camera["distance"] - self.camera["distance_actual"]) * lerp_factor
-            self.camera["yaw_actual"] += (self.camera["yaw"] - self.camera["yaw_actual"]) * lerp_factor
-            self.camera["pitch_actual"] += (self.camera["pitch"] - self.camera["pitch_actual"]) * lerp_factor
-            self.camera["roll_actual"] += (self.camera["roll"] - self.camera["roll_actual"]) * lerp_factor
-            self.camera["target_offset"] *= math.exp(-10.0 * dt_render)
-    
+            cam["yaw_actual"] += (cam["yaw"] - cam["yaw_actual"]) * lerp_factor
+            cam["pitch_actual"] += (cam["pitch"] - cam["pitch_actual"]) * lerp_factor
+            cam["roll_actual"] += (cam["roll"] - cam["roll_actual"]) * lerp_factor
+
             compute_barycenters(pos_snap_render, vel_snap_render, mass_snap, parent_snap,
                                 subsys_pos_buf, subsys_vel_buf, subsys_mass_buf)
             if self.comparison_enabled:
                 compute_barycenters(self.pos_snap_cmp, self.vel_snap_cmp, self.mass_snap_cmp, self.parent_snap_cmp,
                                     self.subsys_pos_buf_cmp, self.subsys_vel_buf_cmp, self.subsys_mass_buf_cmp)
-    
-            if self.camera["tracking_idx"] is not None:
-                track_idx = self.camera["tracking_idx"]
-                if self.camera.get("tracking_is_cmp", False):
-                    if self.camera["tracking_mode"] == "barycenter":
+
+            # Resolve the camera pivot (tracked body / barycenter, or free target)
+            if cam["tracking_idx"] is not None:
+                track_idx = cam["tracking_idx"]
+                if cam.get("tracking_is_cmp", False):
+                    if cam["tracking_mode"] == "barycenter":
                         base_pos = self.subsys_pos_buf_cmp[track_idx].copy() + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                     else:
                         base_pos = self.pos_snap_cmp[track_idx].copy() + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                 else:
-                    if self.camera["tracking_mode"] == "barycenter":
+                    if cam["tracking_mode"] == "barycenter":
                         base_pos = subsys_pos_buf[track_idx].copy()
                     else:
                         base_pos = pos_snap_render[track_idx].copy()
-                self.camera["target"] = base_pos.copy()
             else:
-                base_pos = np.array(self.camera["target"], dtype='f8')
-                
-            cam_origin = base_pos + self.camera["target_offset"] + self.camera["pan_offset"]
+                base_pos = np.array(cam["target"], dtype='f8')
+
+            # Tracked body surface radius (used for approach gesture & landing).
+            # Oblate bodies: track_r is the equatorial radius; the surface is an
+            # ellipsoid, so the clamp uses the radius along the camera's direction.
+            track_r = 0.0
+            track_f = 0.0
+            track_pole = np.array([0.0, 1.0, 0.0], dtype='f8')
+            if cam["tracking_idx"] is not None and cam["tracking_mode"] == "body":
+                t_idx = cam["tracking_idx"]
+                if cam.get("tracking_is_cmp", False):
+                    if hasattr(self, "body_radii_cmp") and self.body_radii_cmp is not None and t_idx < len(self.body_radii_cmp):
+                        track_r = float(self.body_radii_cmp[t_idx])
+                        track_f = float(self.bodies_data_cmp[t_idx].get('oblateness', 0.0))
+                        if hasattr(self, "pole_n_arr_cmp") and t_idx < len(self.pole_n_arr_cmp):
+                            track_pole = np.array(self.pole_n_arr_cmp[t_idx], dtype='f8')
+                elif hasattr(self, "body_radii") and self.body_radii is not None and t_idx < len(self.body_radii):
+                    track_r = float(self.body_radii[t_idx])
+                    track_f = float(bodies_data[t_idx].get('oblateness', 0.0))
+                    if hasattr(self, "pole_n_arr") and t_idx < len(self.pole_n_arr):
+                        track_pole = np.array(self.pole_n_arr[t_idx], dtype='f8')
+
+            # 1) LMB+RMB approach gesture: radial move toward the tracked body's surface
+            if cam["approach_delta"] != 0.0:
+                r_ap = np.linalg.norm(rel)
+                if r_ap > 1e-300 and cam["tracking_idx"] is not None and cam["tracking_mode"] == "body" and track_r > 0.0:
+                    rel *= math.exp(-cam["approach_delta"])
+                    min_r = _ellipsoid_surface_radius(track_r, track_f, track_pole, rel) + LAND_ALT_AU
+                    r_ap = np.linalg.norm(rel)
+                    if r_ap < min_r:
+                        rel = rel / max(r_ap, 1e-300) * min_r
+                else:
+                    # no tracked surface: dolly along the view direction
+                    dolly = cam["approach_delta"] * max(1e-4, np.linalg.norm(rel))
+                    if cam["cam_look"] == "aim":
+                        fwd_a = -rel / max(np.linalg.norm(rel), 1e-300)
+                    else:
+                        fwd_a = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
+                    rel += fwd_a * dolly
+                cam["approach_delta"] = 0.0
+
+            # 2) Ground clamp: never clip below the tracked body's surface.
+            #    No landed state / no horizon snapping: while pinned at the stick
+            #    height the camera simply rides the body's rotation so the ground
+            #    stays put beneath it.
+            grounded = (track_r > 0.0 and cam["tracking_mode"] == "body" and
+                        np.linalg.norm(rel) <= _ellipsoid_surface_radius(track_r, track_f, track_pole, rel) + LAND_ALT_AU)
+            if grounded and cam["tracking_idx"] is not None and not cam.get("tracking_is_cmp", False):
+                spin_angles = compute_body_rotation_angles_jit(
+                    float(self.shared_state["t"]) * 31557600.0,
+                    self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr,
+                    pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr)
+                t_idx = cam["tracking_idx"]
+                if t_idx < len(spin_angles):
+                    spin_angle = float(spin_angles[t_idx])
+                    prev_spin = getattr(self, "_contact_prev_spin", None)
+                    self._contact_prev_spin = spin_angle
+                    if prev_spin is not None:
+                        d_spin = spin_angle - prev_spin
+                        if abs(d_spin) > 1e-12:
+                            rel = _camera_rot_axis(self.pole_n_arr[t_idx], d_spin) @ rel
+            else:
+                self._contact_prev_spin = None
+
+            # 3) WASD flight (screen-space strafe)
+            keys = cam.get("keys", {})
+            w_key = keys.get("w", False)
+            s_key = keys.get("s", False)
+            a_key = keys.get("a", False)
+            d_key = keys.get("d", False)
+
+            if cam["cam_look"] == "aim":
+                r_f = np.linalg.norm(rel)
+                if r_f > 1e-300:
+                    front = -rel / r_f
+                else:
+                    front = np.array([0.0, 0.0, -1.0], dtype='f8')
+            else:
+                front = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
+            # screen-space strafe: A/D move along the camera's own right
+            # (roll-aware), never along the ecliptic horizontal
+            roll_rad_f = math.radians(cam["roll_actual"])
+            right_v = _camera_orient_from_view(front, roll_rad_f)[:, 0]
+            nr_r = np.linalg.norm(right_v)
+            if nr_r > 1e-9:
+                right_v = right_v / nr_r
+            else:
+                right_v = np.array([1.0, 0.0, 0.0], dtype='f8')
+            move = np.zeros(3, dtype='f8')
+            if w_key: move += front
+            if s_key: move -= front
+            if d_key: move += right_v
+            if a_key: move -= right_v
+            nm = np.linalg.norm(move)
+            if nm > 1e-12:
+                rel = rel + (move / nm) * cam["flight_speed"] * dt_render
+
+            # 3b) floor: push back out of the ground after movement
+            if track_r > 0.0 and cam["tracking_mode"] == "body":
+                r_s = np.linalg.norm(rel)
+                r_floor = _ellipsoid_surface_radius(track_r, track_f, track_pole, rel) + LAND_ALT_AU
+                if r_s <= r_floor:
+                    if r_s > 1e-300:
+                        rel = rel / r_s * r_floor
+                    else:
+                        rel = track_pole * r_floor
+
+            cam["cam_pos_rel"] = rel
+            cam["cam_pos_rel_prev"] = rel.copy()
+            cam["cam_vel"][:] = (rel - rel_prev) / max(dt_render, 1e-9)
+
+            cam_origin = base_pos
     
             if hierarchy_ver != cached_hierarchy_ver:
                 cached_children_map = {}
@@ -2614,20 +2882,31 @@ class App(InputHandlerMixin):
                 cull_mask_hi = cull_mask_hi & spice_valid_mask
                 cull_ring_mask = cull_ring_mask & spice_valid_mask
             
-            yaw_rad, pitch_rad = math.radians(self.camera["yaw_actual"]), math.radians(self.camera["pitch_actual"])
-            cam_pos_f8 = np.array([-math.cos(yaw_rad) * math.cos(pitch_rad) * self.camera["distance_actual"],
-                                   -math.sin(pitch_rad) * self.camera["distance_actual"],
-                                   -math.sin(yaw_rad) * math.cos(pitch_rad) * self.camera["distance_actual"]], dtype='f8')
-                                   
-            cam_pos = cam_pos_f8.astype('f4')
-            view_f8 = matrix44.create_look_at(cam_pos_f8, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], dtype='f8')
+            # Build the view matrix from the current camera state
+            cam_pos_f8 = np.array(rel, dtype='f8')
+            yaw_rad_v, pitch_rad_v = math.radians(cam["yaw_actual"]), math.radians(cam["pitch_actual"])
+            if cam["cam_look"] == "aim":
+                view_f8 = matrix44.create_look_at(cam_pos_f8, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], dtype='f8')
+            else:
+                fwd_v = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
+                view_f8 = matrix44.create_look_at(cam_pos_f8, cam_pos_f8 + fwd_v, [0.0, 1.0, 0.0], dtype='f8')
             
-            roll_rad = math.radians(self.camera["roll_actual"])
+            roll_rad = math.radians(cam["roll_actual"])
             if abs(roll_rad) > 1e-6:
                 view_f8 = matrix44.multiply(view_f8, matrix44.create_from_z_rotation(roll_rad, dtype='f8'))
             view = view_f8.astype('f4')
-                
-            near = max(self.camera["distance_actual"] * 0.0000001, 1e-13)
+            cam_pos = cam_pos_f8.astype('f4')
+
+            # Adaptive near plane: scale with the nearest surface so landing stays valid
+            if num_bodies > 0:
+                d_surf = np.linalg.norm(pos_snap_render - cam_origin, axis=1) - body_radii
+                near_surf = float(np.min(d_surf))
+                if self.comparison_enabled and self.num_bodies_cmp > 0:
+                    d_surf_cmp = np.linalg.norm(self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8'), axis=1) - self.body_radii_cmp
+                    near_surf = min(near_surf, float(np.min(d_surf_cmp)))
+                near = min(max(near_surf * 0.02, 1e-13), 1e-4)
+            else:
+                near = 1e-4
             
             # Incorporate both primary and comparison system body relative positions and radii
             max_dist_from_target = 0.0
@@ -2643,7 +2922,8 @@ class App(InputHandlerMixin):
                 max_dist_from_target = max(max_dist_from_target, max_dist_from_target_cmp)
                 
             # Set the far plane with a wide margin using logarithmic depth to prevent clipping of wide orbits/bodies
-            far = max(self.camera["distance_actual"] * 50.0, (self.camera["distance_actual"] + max_dist_from_target) * 20.0, 100000.0)
+            dist_from_pivot = float(np.linalg.norm(rel))
+            far = max(dist_from_pivot * 50.0, (dist_from_pivot + max_dist_from_target) * 20.0, 100000.0)
             depth_C = 1.0 / max(near, 1e-13)
             aspect_ratio = self.fb_width / max(self.fb_height, 1)
             projection_f8 = matrix44.create_perspective_projection_matrix(self.camera["fov"], aspect_ratio, near, far, dtype='f8')
@@ -2779,6 +3059,8 @@ class App(InputHandlerMixin):
                 if best_idx != -1:
                     self.camera["tracking_idx"] = best_idx
                     self.camera["tracking_is_cmp"] = best_is_cmp
+                    # auto-aim at the newly selected body (legacy pick behavior)
+                    self.camera["cam_look"] = "aim"
 
     
             if not hasattr(self, '_all_instances_cache') or self._all_instances_cache.shape[0] != total_render_bodies:
@@ -3647,6 +3929,25 @@ class App(InputHandlerMixin):
                                                   float(props.get('ozone_width_km', 8.0)),
                                                   0.0, 0.0]  # pad to 608 bytes
 
+                    # Inner clip radius for the atmosphere march: the planet is an
+                    # icosphere whose flat faces sag below the analytic ellipsoid,
+                    # leaving an empty band between the surface and the atmosphere
+                    # bottom at the limb.  Shrink the clip sphere by the max sag of
+                    # the mesh LOD that body actually renders with (same rule as the
+                    # culling compute shader) so the atmosphere covers the polyhedron.
+                    _atmo_rad_au = self.body_radii_cmp[bi] if is_cmp else body_radii[bi]
+                    _apparent_px = (float(_atmo_rad_au) / max(dist_to_body, 1e-12)) * self.window_height * fov_factor
+                    _tracking_idx_uni = -1
+                    if self.camera["tracking_idx"] is not None:
+                        _tracking_idx_uni = self.camera["tracking_idx"] + (num_bodies if self.camera.get("tracking_is_cmp", False) else 0)
+                    if (body_idx_in_unified == _tracking_idx_uni) or (_apparent_px >= 300.0):
+                        _lod_subdiv = 6
+                    elif _apparent_px >= 40.0:
+                        _lod_subdiv = 4
+                    else:
+                        _lod_subdiv = 1
+                    self.atmo_staging[150] = float(atmo['planet_radius_km']) * (1.0 - _icosphere_max_sag(_lod_subdiv))
+
                     # Single buffer upload per atmosphere body
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
                     
@@ -3935,6 +4236,27 @@ class App(InputHandlerMixin):
             
             imgui.text("Current Date:")
             imgui.text(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d} UTC")
+            
+            imgui.separator()
+            imgui.text_colored("Camera", 0.6, 0.9, 1.0)
+            if self.camera.get("cam_look", "aim") == "aim" and self.camera["tracking_idx"] is not None:
+                track_name = "?"
+                t_idx = self.camera["tracking_idx"]
+                if self.camera.get("tracking_is_cmp", False):
+                    if t_idx < len(self.bodies_data_cmp):
+                        track_name = self.bodies_data_cmp[t_idx].get('name', '?')
+                elif t_idx < len(bodies_data):
+                    track_name = bodies_data[t_idx].get('name', '?')
+                mode_label = f"Orbit: {track_name}"
+            else:
+                mode_label = "Flight"
+            imgui.text(f"Mode: {mode_label}")
+            imgui.text(f"Velocity: {format_flight_speed(self.camera.get('flight_speed', 0.0))}")
+            speed_log_cam = math.log10(max(self.camera.get("flight_speed", 0.1), 1e-13))
+            _, self.camera["flight_speed"] = imgui.slider_float("##flyspeed", speed_log_cam, -13.0, 0.7, "")
+            self.camera["flight_speed"] = 10 ** self.camera["flight_speed"]
+            imgui.text("WASD fly | Scroll velocity | LMB pivot | RMB orbit | LMB+RMB approach")
+            imgui.text("The camera cannot clip through a tracked body's surface")
             
             imgui.separator()
             imgui.text("Time Controls")
@@ -5568,6 +5890,7 @@ class App(InputHandlerMixin):
                     if is_tracking_body:
                         imgui.text_colored("Tracking Body", 0.3, 1.0, 0.3)
                     elif imgui.button("Track Body"):
+                        # Preserve the camera's world position while re-basing it on the new body
                         if self.camera["tracking_idx"] is not None:
                             old_track_is_cmp = self.camera.get("tracking_is_cmp", False)
                             if self.camera["tracking_mode"] == "barycenter":
@@ -5577,19 +5900,27 @@ class App(InputHandlerMixin):
                             old_pos = old_pos_arr[self.camera["tracking_idx"]].copy()
                             if old_track_is_cmp:
                                 old_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                            old_pos += self.camera["pan_offset"]
                         else:
-                            old_pos = self.camera["target"].copy()
+                            old_pos = np.array(self.camera["target"], dtype='f8')
+                        world_pos = old_pos + np.array(self.camera["cam_pos_rel"], dtype='f8')
                         
                         new_pos = cur_pos_snap_render[insp_idx].copy()
                         if insp_is_cmp:
                             new_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                             
-                        self.camera["target_offset"] += (old_pos - new_pos)
-                        self.camera["pan_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
+                        self.camera["cam_pos_rel"] = (world_pos - new_pos).astype('f8')
                         self.camera["tracking_idx"] = insp_idx
                         self.camera["tracking_is_cmp"] = insp_is_cmp
                         self.camera["tracking_mode"] = "body"
+                        self.camera["cam_look"] = "aim"
+                        # Never re-base inside the new body's surface
+                        r_new = float(cur_visual_arr[insp_idx, 3])
+                        rel_new = np.array(self.camera["cam_pos_rel"], dtype='f8')
+                        if r_new > 0.0:
+                            rn = np.linalg.norm(rel_new)
+                            if rn > 1e-300 and rn < r_new + 1e-10:
+                                rel_new = rel_new / rn * (r_new + 1e-10)
+                                self.camera["cam_pos_rel"] = rel_new
                     
                     imgui.same_line()
                     
@@ -5605,28 +5936,35 @@ class App(InputHandlerMixin):
                             old_pos = old_pos_arr[self.camera["tracking_idx"]].copy()
                             if old_track_is_cmp:
                                 old_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                            old_pos += self.camera["pan_offset"]
                         else:
-                            old_pos = self.camera["target"].copy()
+                            old_pos = np.array(self.camera["target"], dtype='f8')
+                        world_pos = old_pos + np.array(self.camera["cam_pos_rel"], dtype='f8')
                             
                         new_pos = cur_subsys_pos_buf[insp_idx].copy()
                         if insp_is_cmp:
                             new_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                             
-                        self.camera["target_offset"] += (old_pos - new_pos)
-                        self.camera["pan_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
+                        self.camera["cam_pos_rel"] = (world_pos - new_pos).astype('f8')
                         self.camera["tracking_idx"] = insp_idx
                         self.camera["tracking_is_cmp"] = insp_is_cmp
                         self.camera["tracking_mode"] = "barycenter"
+                        self.camera["cam_look"] = "aim"
                     
                     if is_tracking_this:
                         if imgui.button("Untrack"):
-                            self.camera["target"] = self.camera["target"].copy() + self.camera["pan_offset"]
-                            self.camera["target_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
-                            self.camera["pan_offset"] = np.array([0.0, 0.0, 0.0], dtype='f8')
+                            # keep the camera exactly where it is: pin the pivot to the body position
+                            if self.camera["tracking_mode"] == "barycenter":
+                                old_pos_arr = self.subsys_pos_buf_cmp if self.camera.get("tracking_is_cmp", False) else subsys_pos_buf
+                            else:
+                                old_pos_arr = self.pos_snap_cmp if self.camera.get("tracking_is_cmp", False) else pos_snap_render
+                            old_pos = old_pos_arr[insp_idx].copy()
+                            if self.camera.get("tracking_is_cmp", False):
+                                old_pos += np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                            self.camera["target"] = old_pos
                             self.camera["tracking_idx"] = None
                             self.camera["tracking_is_cmp"] = False
                             self.camera["tracking_mode"] = "body"
+                            self.camera["cam_look"] = "free"
                             
                     
                     if not inspect_bary:

@@ -65,27 +65,10 @@ class InputHandlerMixin:
                 self.camera["fov"] *= (1.0 / (0.85 ** abs(yoffset)))
             self.camera["fov"] = max(0.001, min(120.0, self.camera["fov"]))
         else:
-            r_target = 0.0
-            if self.camera["tracking_idx"] is not None:
-                track_idx = self.camera["tracking_idx"]
-                is_cmp = self.camera.get("tracking_is_cmp", False)
-                if is_cmp and hasattr(self, "body_radii_cmp") and self.body_radii_cmp is not None:
-                    if track_idx < len(self.body_radii_cmp):
-                        r_target = float(self.body_radii_cmp[track_idx])
-                elif hasattr(self, "body_radii") and self.body_radii is not None:
-                    if track_idx < len(self.body_radii):
-                        r_target = float(self.body_radii[track_idx])
-            
-            h = max(1e-11, self.camera["distance"] - r_target)
-            zoom_speed = max(1e-10, h * 0.2)
-            
-            if yoffset > 0:
-                self.camera["distance"] -= zoom_speed
-            elif yoffset < 0:
-                self.camera["distance"] += zoom_speed
-                
-            min_dist = r_target + 2e-7
-            self.camera["distance"] = max(min_dist, self.camera["distance"])
+            # Scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
+            speed = self.camera.get("flight_speed", 0.1)
+            speed *= (2.0 ** yoffset)
+            self.camera["flight_speed"] = max(1e-12, min(5.0, speed))
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)
@@ -99,10 +82,12 @@ class InputHandlerMixin:
                 self.camera["click_start_x"], self.camera["click_start_y"] = x, y
             elif action == glfw.RELEASE: 
                 self.camera["left_dragging"] = False
-                dx = x - self.camera.get("click_start_x", x)
-                dy = y - self.camera.get("click_start_y", y)
-                if dx*dx + dy*dy < 25:
-                    self.pick_request = (x, y)
+                # Don't pick when ending an LMB+RMB approach gesture (RMB still held).
+                if not self.camera.get("right_dragging", False):
+                    dx = x - self.camera.get("click_start_x", x)
+                    dy = y - self.camera.get("click_start_y", y)
+                    if dx*dx + dy*dy < 25:
+                        self.pick_request = (x, y)
                 
         elif button == glfw.MOUSE_BUTTON_RIGHT:
             if action == glfw.PRESS:
@@ -114,44 +99,20 @@ class InputHandlerMixin:
         dx = xpos - self.camera["last_x"]
         dy = ypos - self.camera["last_y"]
         
-        roll_rad = math.radians(self.camera.get("roll_actual", 0.0))
-        cos_r = math.cos(roll_rad)
-        sin_r = math.sin(roll_rad)
-        
-        dx_eff = dx * cos_r + dy * sin_r
-        dy_eff = -dx * sin_r + dy * cos_r
-        
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
         
-        if self.camera["left_dragging"]:
+        if self.camera["left_dragging"] and self.camera["right_dragging"]:
+            # LMB+RMB: radial approach / recede toward the tracked body's surface.
+            self.camera["approach_delta"] += dy * 0.0125
+        elif self.camera["left_dragging"]:
+            # LMB: trackball pivot in place (free look), direct (no smoothing).
             sensitivity = 0.3 * fov_ratio
-            self.camera["yaw"] += dx_eff * sensitivity
-            self.camera["pitch"] -= dy_eff * sensitivity
-            self.camera["pitch"] = max(-89.9, min(89.9, self.camera["pitch"])) 
-            
+            _camera_pivot_apply(self.camera, dx, dy, sensitivity)
+            self.camera["cam_look"] = "free"
         elif self.camera["right_dragging"]:
-            pan_speed = self.camera["distance_actual"] * 0.001 * fov_ratio
-            yaw_rad = math.radians(self.camera["yaw_actual"])
-            pitch_rad = math.radians(self.camera["pitch_actual"])
-            
-            front = np.array([
-                math.cos(yaw_rad) * math.cos(pitch_rad),
-                math.sin(pitch_rad),
-                math.sin(yaw_rad) * math.cos(pitch_rad)
-            ], dtype='f4')
-            front /= np.linalg.norm(front)
-            
-            right = np.cross(front, np.array([0.0, 1.0, 0.0], dtype='f4'))
-            right /= np.linalg.norm(right)
-            
-            up = np.cross(right, front)
-            up /= np.linalg.norm(up)
-            
-            pan_vec = -right * dx_eff * pan_speed + up * dy_eff * pan_speed
-            if self.camera["tracking_idx"] is not None:
-                self.camera["pan_offset"] += pan_vec
-            else:
-                self.camera["target"] += pan_vec
+            # RMB: trackball orbit around the pivot, direct (no smoothing).
+            sensitivity = 0.3 * fov_ratio
+            _camera_orbit_apply(self.camera, dx, dy, sensitivity)
     
         self.camera["last_x"], self.camera["last_y"] = xpos, ypos
     
@@ -161,6 +122,12 @@ class InputHandlerMixin:
     def key_callback(self, window, key, scancode, action, mods):
         if self.impl: self.impl.keyboard_callback(window, key, scancode, action, mods)
         if imgui.get_io().want_capture_keyboard: return
+    
+        # WASD: track held state for free-flight / surface walking
+        flight_keys = {glfw.KEY_W: "w", glfw.KEY_A: "a", glfw.KEY_S: "s", glfw.KEY_D: "d"}
+        if key in flight_keys:
+            self.camera["keys"][flight_keys[key]] = (action != glfw.RELEASE)
+            return
     
         if action == glfw.PRESS or action == glfw.REPEAT:
             if key == glfw.KEY_SPACE and action == glfw.PRESS:
@@ -187,3 +154,144 @@ class InputHandlerMixin:
         if self.impl: self.impl.resize_callback(window, width, height)
         self.window_width, self.window_height = max(1, width), max(1, height)
         self.fb_width, self.fb_height = glfw.get_framebuffer_size(window)
+
+def _camera_align_up(up_world):
+    """Return the 3x3 rotation R that maps the local +Y axis onto unit `up_world`."""
+    up_world = np.asarray(up_world, dtype='f8')
+    n = np.linalg.norm(up_world)
+    if n < 1e-12:
+        return np.eye(3, dtype='f8')
+    up_world = up_world / n
+    from_v = np.array([0.0, 1.0, 0.0], dtype='f8')
+    d = max(-1.0, min(1.0, float(np.dot(from_v, up_world))))
+    if d > 0.999999:
+        return np.eye(3, dtype='f8')
+    if d < -0.999999:
+        return np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]], dtype='f8')
+    axis = np.cross(from_v, up_world)
+    axis = axis / np.linalg.norm(axis)
+    theta = math.acos(d)
+    K = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]], dtype='f8')
+    return np.eye(3, dtype='f8') + math.sin(theta) * K + (1.0 - math.cos(theta)) * (K @ K)
+
+def _camera_forward(yaw_deg, pitch_deg):
+    yaw_rad = math.radians(yaw_deg)
+    pitch_rad = math.radians(pitch_deg)
+    return np.array([
+        math.cos(yaw_rad) * math.cos(pitch_rad),
+        math.sin(pitch_rad),
+        math.sin(yaw_rad) * math.cos(pitch_rad)], dtype='f8')
+
+def _camera_yaw_pitch_from(fwd):
+    fwd = np.asarray(fwd, dtype='f8')
+    n = np.linalg.norm(fwd)
+    if n < 1e-300:
+        return 0.0, 0.0
+    fwd = fwd / n
+    yaw = math.degrees(math.atan2(fwd[2], fwd[0]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, fwd[1]))))
+    return yaw, pitch
+
+def _camera_rot_axis(axis, angle):
+    """Rodrigues 3x3 rotation matrix about unit `axis` by `angle` radians."""
+    axis = np.asarray(axis, dtype='f8')
+    n = np.linalg.norm(axis)
+    if n < 1e-12:
+        return np.eye(3, dtype='f8')
+    axis = axis / n
+    K = np.array([[0.0, -axis[2], axis[1]],
+                  [axis[2], 0.0, -axis[0]],
+                  [-axis[1], axis[0], 0.0]], dtype='f8')
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return np.eye(3, dtype='f8') + s * K + (1.0 - c) * (K @ K)
+
+def _camera_screen_up(fwd, roll_rad):
+    """Screen-space up of the current view: world +Y projected onto the plane
+    perpendicular to `fwd`, then rotated by roll about the view axis."""
+    fwd = np.asarray(fwd, dtype='f8')
+    n = np.linalg.norm(fwd)
+    if n < 1e-12:
+        return np.array([0.0, 1.0, 0.0], dtype='f8')
+    fwd = fwd / n
+    up_proj = np.array([0.0, 1.0, 0.0], dtype='f8') - float(np.dot(fwd, np.array([0.0, 1.0, 0.0], dtype='f8'))) * fwd
+    nup = np.linalg.norm(up_proj)
+    if nup > 1e-9:
+        up = up_proj / nup
+    else:
+        # looking straight up/down: pick a stable perpendicular instead
+        up = np.array([1.0, 0.0, 0.0], dtype='f8')
+        up = up - float(np.dot(fwd, up)) * fwd
+        nup = np.linalg.norm(up)
+        up = up / nup if nup > 1e-9 else np.array([0.0, 0.0, 1.0], dtype='f8')
+    if abs(roll_rad) > 1e-9:
+        up = _camera_rot_axis(fwd, -roll_rad) @ up
+    return up
+
+def _camera_orient_from_view(fwd, roll_rad):
+    """Orientation matrix (columns: right, up, back) matching the rendered view
+    (row-vector convention): look_at(pos, pos+fwd, Y) followed by Rz(roll)."""
+    up = _camera_screen_up(fwd, roll_rad)
+    right = np.cross(fwd, up)
+    nr = np.linalg.norm(right)
+    if nr > 1e-9:
+        right = right / nr
+    else:
+        right = np.array([1.0, 0.0, 0.0], dtype='f8')
+    return np.column_stack([right, up, -fwd])
+
+def _camera_euler_from_orient(R):
+    """Extract (yaw, pitch, roll) reproducing the orientation matrix exactly."""
+    fwd = -R[:, 2]
+    yaw = math.degrees(math.atan2(fwd[2], fwd[0]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, fwd[1]))))
+    up = R[:, 1]
+    up_ref = _camera_screen_up(fwd, 0.0)
+    right_ref = np.cross(fwd, up_ref)
+    roll = math.degrees(math.atan2(-float(np.dot(up, right_ref)), float(np.dot(up, up_ref))))
+    return yaw, pitch, roll
+
+def _camera_pivot_apply(cam, dx, dy, sensitivity):
+    """LMB trackball pivot: track a full orientation matrix so the image rotates
+    rigidly with the cursor at any pitch/roll (roll-aware, no pole spinning)."""
+    if cam.get("cam_look", "aim") == "aim":
+        rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
+        r = np.linalg.norm(rel)
+        fwd = -rel / r if r > 1e-300 else _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    else:
+        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    roll_rad = math.radians(cam.get("roll_actual", 0.0))
+    R = _camera_orient_from_view(fwd, roll_rad)
+    R = _camera_rot_axis(R[:, 1], math.radians(-dx * sensitivity)) @ (_camera_rot_axis(R[:, 0], math.radians(-dy * sensitivity)) @ R)
+    yaw_new, pitch_new, roll_new = _camera_euler_from_orient(R)
+    cam["yaw"] = cam["yaw_actual"] = yaw_new
+    cam["pitch"] = cam["pitch_actual"] = pitch_new
+    cam["roll"] = cam["roll_actual"] = roll_new
+
+def _camera_orbit_apply(cam, dx, dy, sensitivity):
+    """RMB trackball orbit: rotate the camera position about the pivot using the
+    camera's own screen axes (radius preserved, no smoothing)."""
+    rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
+    r = np.linalg.norm(rel)
+    if r < 1e-300:
+        return
+    if cam.get("cam_look", "aim") == "aim":
+        fwd = -rel / r
+    else:
+        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    roll_rad = math.radians(cam.get("roll_actual", 0.0))
+    up = _camera_screen_up(fwd, roll_rad)
+    right = np.cross(fwd, up)
+    nr = np.linalg.norm(right)
+    if nr > 1e-9:
+        right = right / nr
+    else:
+        right = np.array([1.0, 0.0, 0.0], dtype='f8')
+    rel_new = _camera_rot_axis(up, math.radians(-dx * sensitivity)) @ (_camera_rot_axis(right, math.radians(-dy * sensitivity)) @ rel)
+    r_new = np.linalg.norm(rel_new)
+    if r_new > 1e-300:
+        rel_new = rel_new / r_new * r
+    cam["cam_pos_rel"] = rel_new.tolist()
+    cam["cam_look"] = "aim"

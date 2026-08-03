@@ -23,6 +23,19 @@ def sample_gradient(sorted_grad, p):
             return g0['a'] * (1.0 - t) + g1['a'] * t
     return 1.0
 
+def format_flight_speed(speed_au_s):
+    """Format a camera flight speed (AU/s) as a human-readable velocity."""
+    C_MS = 299792458.0
+    m_s = abs(float(speed_au_s)) * 149597870700.0
+    if m_s >= C_MS * 0.5:
+        return f"{m_s / C_MS:.2f} c"
+    elif m_s >= 1000.0:
+        return f"{m_s / 1000.0:.2f} km/s"
+    elif m_s >= 1.0:
+        return f"{m_s:.2f} m/s"
+    else:
+        return f"{m_s * 1000.0:.2f} mm/s"
+
 def format_time_speed(multiplier):
     """Convert a speed multiplier (in seconds/second) to a human-readable string."""
     sign_str = "-" if multiplier < 0 else ""

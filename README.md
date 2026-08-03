@@ -44,13 +44,15 @@ pip install numpy scipy moderngl glfw pyrr imgui numba spiceypy requests PyOpenG
 ### 3. Keyboard & Mouse Controls
 
 #### 🖱️ Mouse Navigation
-* **Left Mouse Button (Drag)**: Orbit / rotate the camera (yaw and pitch).
+* **Left Mouse Button (Drag)**: Pivot the camera in place (free look).
 * **Left Mouse Button (Click)**: Select / pick a celestial body in the viewport.
-* **Right Mouse Button (Drag)**: Pan the camera target (shifts the look-at target).
-* **Scroll Wheel**: Zoom in/out (zoom speed dynamically scales with altitude above the surface to prevent ground-clipping).
+* **Right Mouse Button (Drag)**: Orbit the camera around the tracked body (keeps distance).
+* **Left + Right Mouse Button (Drag)**: Approach / recede from the tracked body's surface (drag down = move closer, up = pull back).
+* **Scroll Wheel**: Change flight velocity (~2× per notch, capped at 5 AU/s).
 * **Shift + Scroll Wheel**: Adjust Field of View (FOV) ($1.0^\circ - 120.0^\circ$).
 
 #### ⌨️ Keyboard Commands
+* **W / S / A / D (hold)**: Fly forward / backward / strafe in flight mode; walk along the surface when landed.
 * **Space**: Pause / resume simulation time.
 * **Up / Right Arrow**: Double the simulation speed (time multiplier, capped at $10^{12}\times$).
 * **Down / Left Arrow**: Halve the simulation speed (minimum $1.0\times$).
