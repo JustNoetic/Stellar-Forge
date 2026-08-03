@@ -270,7 +270,7 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                         alpha = star_radii[s] / c_dist
                         
                         p_out = alpha + beta
-                        p_in = max(0.0, beta - alpha)
+                        p_in = abs(beta - alpha)
                         
                         if gamma < p_in:
                             occ = 1.0

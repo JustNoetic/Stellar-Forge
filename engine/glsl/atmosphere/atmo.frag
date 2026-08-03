@@ -177,7 +177,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         float gamma = sqrt(perp_sq) * inv_dist;
 
         float penumbra_outer = alpha + beta;
-        float penumbra_inner = max(0.0, beta - alpha);
+        float penumbra_inner = abs(beta - alpha);
 
         float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
         float occ = max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma);
@@ -453,7 +453,7 @@ void main() {
 
         vec3 star_color = mix(eq_color, pole_color, star_sin_lat);
         float star_lum = mix(eq_lum, pole_lum, star_sin_lat);
-        float star_radius_au = star_radius / u_au_to_km;
+        float star_radius_au = star_radius;
         float sin_star = star_radius_au / max(dist_to_star_au, star_radius_au + 1e-6);
 
         vec3 sun_pos_local = (star_pos - planet_center_render) * u_au_to_km;
@@ -610,7 +610,7 @@ void main() {
                             if (p2 < rp * rp) {
                                 float inv_d = 1.0 / dist;
                                 float alpha = sr_start; float beta = r * inv_d; float gamma = sqrt(p2) * inv_d;
-                                float po = alpha + beta; float pi = max(0.0, beta - alpha);
+                                float po = alpha + beta; float pi = abs(beta - alpha);
                                 float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
                                 vec3 sh = vec3(1.0 - occ);
                                 float max_bend = u_active_max_bend[c];
@@ -650,7 +650,7 @@ void main() {
                             if (p2 < rp * rp) {
                                 float inv_d = 1.0 / dist;
                                 float alpha = sr_end; float beta = r * inv_d; float gamma = sqrt(p2) * inv_d;
-                                float po = alpha + beta; float pi = max(0.0, beta - alpha);
+                                float po = alpha + beta; float pi = abs(beta - alpha);
                                 float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
                                 vec3 sh = vec3(1.0 - occ);
                                 float max_bend = u_active_max_bend[c];
@@ -767,15 +767,26 @@ void main() {
             float neg_light_cos = -light_cos_theta;
             float vis_fraction = 1.0;
 
+            float max_occ = min(1.0, (sin_planet * sin_planet) / max(1e-9, effective_star_rad * effective_star_rad));
+            float min_vis = 1.0 - max_occ;
+
             if (neg_light_cos > cos_inner) {
-                vis_fraction = 0.0;
+                vis_fraction = min_vis;
             } else if (neg_light_cos > cos_outer) {
                 float x_vis = (cos_planet * cos_sun_eff - neg_light_cos) / max(1e-7, sin_planet * effective_star_rad);
-                vis_fraction = smoothstep(-1.0, 1.0, x_vis);
+                float s = smoothstep(-1.0, 1.0, x_vis);
+                vis_fraction = mix(min_vis, 1.0, s);
             }
 
-            float disc_top_cos = min(light_cos_theta + effective_star_rad, 1.0);
-            float disc_bot_cos = max(light_cos_theta - effective_star_rad, -cos_planet + 1e-5);
+            float sin_Z = sqrt(max(0.0, 1.0 - light_cos_theta * light_cos_theta));
+            float exact_disc_top_cos = light_cos_theta * cos_sun_eff + sin_Z * effective_star_rad;
+            float exact_disc_bot_cos = light_cos_theta * cos_sun_eff - sin_Z * effective_star_rad;
+            
+            float disc_top_cos = exact_disc_top_cos;
+            if (light_cos_theta > cos_sun_eff) {
+                disc_top_cos = 1.0;
+            }
+            float disc_bot_cos = max(exact_disc_bot_cos, -cos_planet + 1e-5);
             float effective_cos = max(-cos_planet + 1e-5, (disc_top_cos + disc_bot_cos) * 0.5);
 
             float v_norm = sqrt(h_norm);

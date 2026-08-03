@@ -1757,10 +1757,7 @@ def load_system_from_data(bodies_data_raw):
         color = hex_to_rgb(body.get('color', '#ffffff'))
         radius_au = body.get('r', 1.0) * SOLAR_RADII_TO_AU
 
-        obj_type = body.get('type', 'Unknown')
-        if obj_type == "Star": min_px = 3.0
-        elif obj_type == "Moon": min_px = 1.0
-        else: min_px = 2.0
+        min_px = 1.0
 
         pole_ecl = np.array([0.0, 0.0, 1.0], dtype='f8')
         pole_render = np.array([0.0, 1.0, 0.0], dtype='f8')

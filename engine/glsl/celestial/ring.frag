@@ -243,6 +243,9 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
 }
 
 void main() {
+    if (f_clip_z <= 0.0) discard;
+    gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
+
     if (u_clip_mode != 0) {
         vec3 to_cam = u_camera_pos - u_host_planet_pos;
         vec3 to_frag = f_world_pos - u_host_planet_pos;
@@ -508,7 +511,7 @@ void main() {
             float beta = caster_r * inv_dist;
             float gamma = sqrt(perp_sq) * inv_dist;
             float penumbra_outer = alpha + beta;
-            float penumbra_inner = max(0.0, beta - alpha);
+            float penumbra_inner = abs(beta - alpha);
             shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j].xyz);
         }
 
@@ -554,7 +557,7 @@ void main() {
                         float beta = host_r * inv_dist;
                         float gamma = sqrt(perp_sq) * inv_dist;
                         float penumbra_outer = alpha + beta;
-                        float penumbra_inner = max(0.0, beta - alpha);
+                        float penumbra_inner = abs(beta - alpha);
                         float max_bend = host_atmo_h > 0.0
                             ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.05)
                             : 0.0;

@@ -22,6 +22,6 @@ void main() {
     }
 
     f_color = vec4(final_rgb, 1.0);
-    gl_Position = projection * view_rot * vec4(eye_pos, 1.0);
+    gl_Position = projection * view_rot * vec4(float(eye_pos.x), float(eye_pos.y), float(eye_pos.z), 1.0);
     f_clip_z = gl_Position.w;
 }

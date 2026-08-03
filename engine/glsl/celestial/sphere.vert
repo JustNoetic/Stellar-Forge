@@ -39,6 +39,9 @@ out vec3 f_normal;
 out float f_is_star;
 out float f_clip_z;
 out float f_brightness_scale;
+out float f_subpixel_factor;
+flat out vec2 f_center_px;
+flat out float f_clamped_min_px;
 flat out uvec2 f_caster_mask;
 flat out uint f_ring_mask;
 flat out vec3 f_planetshine_dir;
@@ -77,17 +80,28 @@ void main() {
     f_caster_mask = in_caster_mask;
     f_ring_mask = in_ring_mask;
     f_is_star = in_is_star;
+    float aspect = projection[1][1] / max(1e-6, projection[0][0]);
+    float screen_width = screen_height * aspect;
+
+    vec4 center_clip = projection * view * vec4(in_offset, 1.0);
+    vec2 center_ndc = center_clip.xy / max(1e-6, center_clip.w);
+    f_center_px = (center_ndc * 0.5 + 0.5) * vec2(screen_width, screen_height);
+
     float dist = length((view * vec4(in_offset, 1.0)).xyz);
     float apparent_px = (in_radius / dist) * screen_height * fov_factor;
     float final_radius = in_radius;
     float brightness_scale = 1.0;
 
-    if (apparent_px < in_min_size) {
-        final_radius = (in_min_size * dist) / (screen_height * fov_factor);
-        float ratio = apparent_px / in_min_size;
-        brightness_scale = ratio;
+    float clamped_min_px = max(in_min_size, 2.0);
+    f_clamped_min_px = clamped_min_px;
+
+    if (apparent_px < clamped_min_px) {
+        final_radius = (clamped_min_px * dist) / (screen_height * fov_factor);
+        float ratio = apparent_px / clamped_min_px;
+        brightness_scale = ratio * ratio;
     }
     f_brightness_scale = brightness_scale;
+    f_subpixel_factor = smoothstep(2.0, 1.0, apparent_px);
 
     f_local_pos = in_position;
     vec3 scaled_pos = in_position;
@@ -103,6 +117,5 @@ void main() {
     f_world_pos = world_pos;
     f_normal = adj_normal;
     gl_Position = projection * view * vec4(world_pos, 1.0);
-    gl_Position.z = (log2(max(1e-6, u_depth_C * gl_Position.w + 1.0)) / log2(u_depth_C * u_far + 1.0) * 2.0 - 1.0) * gl_Position.w;
     f_clip_z = gl_Position.w;
 }

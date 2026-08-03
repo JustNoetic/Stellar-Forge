@@ -172,7 +172,7 @@ def compute_ring_culling(
 
 @njit(cache=True)
 def extract_frustum_planes(vp):
-    planes = np.empty((6, 4), dtype=np.float32)
+    planes = np.empty((6, 4), dtype=vp.dtype)
     planes[0, :] = vp[:, 3] + vp[:, 0]
     planes[1, :] = vp[:, 3] - vp[:, 0]
     planes[2, :] = vp[:, 3] + vp[:, 1]
@@ -182,7 +182,7 @@ def extract_frustum_planes(vp):
     for i in range(6):
         x, y, z = planes[i, 0], planes[i, 1], planes[i, 2]
         length = math.sqrt(x*x + y*y + z*z)
-        if length > 1e-8:
+        if length > 1e-12:
             planes[i] /= length
     return planes
 

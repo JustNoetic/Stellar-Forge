@@ -50,6 +50,7 @@ class PerfTracker:
         self.frame_times = []  # list of seconds (per-frame deltas)
         import threading
         self._local = threading.local()
+        self._lock = threading.Lock()
 
     def begin(self, name):
         # Auto-close any open section so timings are not lost on a missed end().
@@ -64,55 +65,60 @@ class PerfTracker:
         if open_name is None:
             return
         dt = time.perf_counter() - self._local.open_time
-        s = self.sections.get(open_name)
-        if s is None:
-            s = {'total': 0.0, 'count': 0, 'min': float('inf'), 'max': 0.0, 'last': 0.0}
-            self.sections[open_name] = s
-        s['total'] += dt
-        s['count'] += 1
-        s['min'] = min(s['min'], dt)
-        s['max'] = max(s['max'], dt)
-        s['last'] = dt
+        with self._lock:
+            s = self.sections.get(open_name)
+            if s is None:
+                s = {'total': 0.0, 'count': 0, 'min': float('inf'), 'max': 0.0, 'last': 0.0}
+                self.sections[open_name] = s
+            s['total'] += dt
+            s['count'] += 1
+            s['min'] = min(s['min'], dt)
+            s['max'] = max(s['max'], dt)
+            s['last'] = dt
         self._local.open_name = None
 
     def record_frame(self, dt):
-        self.frame_times.append(dt)
+        with self._lock:
+            self.frame_times.append(dt)
 
     def report(self):
-        lines = ["=== Stellar-Forge Performance Report ==="]
-        if self.frame_times:
-            n = len(self.frame_times)
-            avg = sum(self.frame_times) / n
-            sorted_ft = sorted(self.frame_times)
-            p1 = sorted_ft[max(0, int(n * 0.01))]
-            p50 = sorted_ft[min(n - 1, int(n * 0.50))]
-            p99 = sorted_ft[min(n - 1, int(n * 0.99))]
-            lines.append("")
-            lines.append(f"Frames measured : {n}")
-            lines.append(f"Avg frame time  : {avg * 1000:7.2f} ms  ({1 / avg:5.1f} FPS)")
-            lines.append(f"Min frame time  : {min(self.frame_times) * 1000:7.2f} ms  ({1 / min(self.frame_times):5.1f} FPS)")
-            lines.append(f"Max frame time  : {max(self.frame_times) * 1000:7.2f} ms  ({1 / max(self.frame_times):5.1f} FPS)")
-            lines.append(f"50%ile          : {p50 * 1000:7.2f} ms  ({1 / p50:5.1f} FPS)")
-            lines.append(f" 1% low (99%ile): {p99 * 1000:7.2f} ms  ({1 / p99:5.1f} FPS)")
-            lines.append(f" 1% high ( 1%ile): {p1 * 1000:7.2f} ms  ({1 / p1:5.1f} FPS)")
-        if self.sections:
-            total = sum(s['total'] for s in self.sections.values())
-            lines.append("")
-            lines.append("--- Per-section CPU cost (sorted by total time) ---")
-            header = f"  {'section':<32s}  {'total ms':>10s}  {'count':>7s}  {'avg ms':>9s}  {'min ms':>9s}  {'max ms':>9s}  {'%':>5s}"
-            lines.append(header)
-            for name, s in sorted(self.sections.items(), key=lambda x: -x[1]['total']):
-                pct = (s['total'] / total * 100) if total > 0 else 0
-                avg_ms = (s['total'] / s['count']) * 1000 if s['count'] > 0 else 0
-                lines.append(
-                    f"  {name:<32s}  {s['total'] * 1000:10.2f}  {s['count']:7d}  "
-                    f"{avg_ms:9.3f}  {s['min'] * 1000:9.3f}  {s['max'] * 1000:9.3f}  {pct:5.1f}"
-                )
-        return "\n".join(lines)
+        with self._lock:
+            lines = ["=== Stellar-Forge Performance Report ==="]
+            if self.frame_times:
+                n = len(self.frame_times)
+                avg = sum(self.frame_times) / n
+                sorted_ft = sorted(self.frame_times)
+                p1 = sorted_ft[max(0, int(n * 0.01))]
+                p50 = sorted_ft[min(n - 1, int(n * 0.50))]
+                p99 = sorted_ft[min(n - 1, int(n * 0.99))]
+                lines.append("")
+                lines.append(f"Frames measured : {n}")
+                lines.append(f"Avg frame time  : {avg * 1000:7.2f} ms  ({1 / avg:5.1f} FPS)")
+                lines.append(f"Min frame time  : {min(self.frame_times) * 1000:7.2f} ms  ({1 / min(self.frame_times):5.1f} FPS)")
+                lines.append(f"Max frame time  : {max(self.frame_times) * 1000:7.2f} ms  ({1 / max(self.frame_times):5.1f} FPS)")
+                lines.append(f"50%ile          : {p50 * 1000:7.2f} ms  ({1 / p50:5.1f} FPS)")
+                lines.append(f" 1% low (99%ile): {p99 * 1000:7.2f} ms  ({1 / p99:5.1f} FPS)")
+                lines.append(f" 1% high ( 1%ile): {p1 * 1000:7.2f} ms  ({1 / p1:5.1f} FPS)")
+            if self.sections:
+                total = sum(s['total'] for s in self.sections.values())
+                lines.append("")
+                lines.append("--- Per-section CPU cost (sorted by total time) ---")
+                header = f"  {'section':<35s}  {'total ms':>10s}  {'count':>7s}  {'avg ms':>9s}  {'min ms':>9s}  {'max ms':>9s}  {'%':>5s}"
+                lines.append(header)
+                for name, s in sorted(self.sections.items(), key=lambda x: -x[1]['total']):
+                    pct = (s['total'] / total * 100) if total > 0 else 0
+                    avg_ms = (s['total'] / s['count']) * 1000 if s['count'] > 0 else 0
+                    lines.append(
+                        f"  {name:<35s}  {s['total'] * 1000:10.2f}  {s['count']:7d}  "
+                        f"{avg_ms:9.3f}  {s['min'] * 1000:9.3f}  {s['max'] * 1000:9.3f}  {pct:5.1f}"
+                    )
+            return "\n".join(lines)
 
 
 def patch_function(module, name, tracker, label):
     """Wrap module.<name> with a tracker.begin(label)/end() pair."""
+    if not hasattr(module, name):
+        return
     orig = getattr(module, name)
     def wrapped(*args, **kwargs):
         tracker.begin(label)
@@ -125,6 +131,7 @@ def patch_function(module, name, tracker, label):
 
 
 def main():
+    ap_mod = None
     ap = argparse.ArgumentParser(description="Stellar-Forge performance audit harness")
     ap.add_argument("--mode", default="standard", choices=["quick", "standard", "stress"])
     ap.add_argument("--profile", action="store_true", help="Enable cProfile (slows run)")
@@ -143,40 +150,51 @@ def main():
     if os.environ.get("STELLAR_FORGE_PERF") != "1":
         os.environ["STELLAR_FORGE_PERF"] = "1"
 
-    import engine.app as ap
+    import engine.app as ap_mod
     import engine.physics.physics_core as pc
+    import engine.physics.kepler_analytical as ka
+    import engine.rendering.planetshine as ps
+    import engine.ephemeris.spice_manager as sm
     import glfw
 
     tracker = PerfTracker()
-    if getattr(ap, "_PERF_TRACKER", None) is not None:
-        tracker = ap._PERF_TRACKER
+    if getattr(ap_mod, "_PERF_TRACKER", None) is not None:
+        tracker = ap_mod._PERF_TRACKER
     else:
-        ap._PERF_TRACKER = tracker
-        if hasattr(ap, "_PERF_INSTALL_TRACKER"):
-            ap._PERF_INSTALL_TRACKER(tracker)
+        ap_mod._PERF_TRACKER = tracker
+        if hasattr(ap_mod, "_PERF_INSTALL_TRACKER"):
+            ap_mod._PERF_INSTALL_TRACKER(tracker)
 
-    # Patch CPU hot-path functions on both physics_core and app modules.
+    # Patch CPU hot-path functions across physics, math, rendering and app modules.
+    modules_to_patch = [pc, ka, ps, sm, ap_mod]
     patch_targets = [
+        ("ias15_step_numba", "ias15_step_numba"),
+        ("compute_all_accelerations", "compute_all_accelerations"),
+        ("compute_custom_forces", "compute_custom_forces"),
         ("compute_barycenters", "compute_barycenters"),
         ("compute_all_orbits_batch", "compute_all_orbits_batch"),
         ("update_hierarchy", "update_hierarchy"),
+        ("propagate_keplerian_system_numba", "propagate_keplerian_system_numba"),
+        ("extract_all_kepler_elements", "extract_all_kepler_elements"),
+        ("compute_planetshine_numba", "compute_planetshine_numba"),
+        ("compute_body_rotation_angles_jit", "compute_body_rotation_angles_jit"),
+        ("populate_states_fast", "populate_states_fast"),
     ]
-    if hasattr(pc, "compute_j2_numba"):
-        patch_targets.append(("compute_j2_numba", "compute_j2_numba"))
     for fn_name, label in patch_targets:
-        if hasattr(pc, fn_name):
-            patch_function(pc, fn_name, tracker, label)
-        if hasattr(ap, fn_name):
-            patch_function(ap, fn_name, tracker, label)
+        for m in modules_to_patch:
+            if hasattr(m, fn_name):
+                patch_function(m, fn_name, tracker, label)
 
     # Instantiate the application.
-    app_instance = ap.App()
+    app_instance = ap_mod.App()
 
     # Apply options to time_ctrl before starting the app.
     if args.sim_speed != 1.0:
         app_instance.time_ctrl["multiplier"] = args.sim_speed
     if args.no_physics:
         app_instance.time_ctrl["paused"] = True
+    else:
+        app_instance.time_ctrl["paused"] = False
 
     # Set up frame-time capture by patching swap_buffers.
     warmup_done = [False]

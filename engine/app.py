@@ -2139,7 +2139,7 @@ class App(InputHandlerMixin):
                             subsys_vel_buf = np.vstack([subsys_vel_buf, vel])
                             subsys_mass_buf = np.append(subsys_mass_buf, mass)
                             
-                            min_px = 3.0 if btype == "Star" else (1.0 if btype == "Moon" else 2.0)
+                            min_px = 1.0
                             new_vis = np.array([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0, color[0], color[1], color[2], 0.0, 0.0], dtype='f4')
                             visual_arr = np.vstack([visual_arr, new_vis])
                             visual_colors_f8 = np.vstack([visual_colors_f8, np.array(color, dtype='f8')])
@@ -2284,7 +2284,7 @@ class App(InputHandlerMixin):
                             if "type" in op:
                                 bodies_data[idx]["type"] = op["type"]
                                 is_star_arr[idx] = 1.0 if op["type"] == "Star" else 0.0
-                                min_px = 3.0 if op["type"] == "Star" else (1.0 if op["type"] == "Moon" else 2.0)
+                                min_px = 1.0
                                 visual_arr[idx][4] = min_px
                                 visual_data[idx][4] = min_px
                                 non_star_indices = np.where(is_star_arr == 0.0)[0]
@@ -2619,11 +2619,12 @@ class App(InputHandlerMixin):
                                    -math.sin(yaw_rad) * math.cos(pitch_rad) * self.camera["distance_actual"]], dtype='f8')
                                    
             cam_pos = cam_pos_f8.astype('f4')
-            view = matrix44.create_look_at(cam_pos, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], dtype='f4')
+            view_f8 = matrix44.create_look_at(cam_pos_f8, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], dtype='f8')
             
             roll_rad = math.radians(self.camera["roll_actual"])
             if abs(roll_rad) > 1e-6:
-                view = matrix44.multiply(view, matrix44.create_from_z_rotation(roll_rad, dtype='f4'))
+                view_f8 = matrix44.multiply(view_f8, matrix44.create_from_z_rotation(roll_rad, dtype='f8'))
+            view = view_f8.astype('f4')
                 
             near = max(self.camera["distance_actual"] * 0.0000001, 1e-13)
             
@@ -2640,11 +2641,12 @@ class App(InputHandlerMixin):
                 max_dist_from_target_cmp = float(np.max(dists_target_cmp + self.body_radii_cmp))
                 max_dist_from_target = max(max_dist_from_target, max_dist_from_target_cmp)
                 
-            # Set the far plane dynamically to ensure no clipping, with a minimum of 100.0 AU
-            far = max(self.camera["distance_actual"] + max_dist_from_target * 2.0 + 10.0, 100.0)
+            # Set the far plane with a wide margin using logarithmic depth to prevent clipping of wide orbits/bodies
+            far = max(self.camera["distance_actual"] * 50.0, (self.camera["distance_actual"] + max_dist_from_target) * 20.0, 100000.0)
             depth_C = 1.0 / max(near, 1e-13)
             aspect_ratio = self.fb_width / max(self.fb_height, 1)
-            projection = matrix44.create_perspective_projection_matrix(self.camera["fov"], aspect_ratio, near, far, dtype='f4')
+            projection_f8 = matrix44.create_perspective_projection_matrix(self.camera["fov"], aspect_ratio, near, far, dtype='f8')
+            projection = projection_f8.astype('f4')
             self.unjittered_projection = projection.copy()
             if self.camera.get("taa_enabled", True):
                 self.taa_frame_index = (self.taa_frame_index + 1) % 8
@@ -2716,8 +2718,9 @@ class App(InputHandlerMixin):
                 num_bodies, cull_ring_caster_lo, cull_ring_caster_hi
             )
             
-            vp_matrix = np.asarray(view, dtype=np.float32) @ np.asarray(projection, dtype=np.float32)
-            frustum_planes = extract_frustum_planes(vp_matrix)
+            vp_matrix_f8 = view_f8 @ projection_f8
+            frustum_planes = extract_frustum_planes(vp_matrix_f8).astype(np.float32)
+            vp_matrix = view @ projection
             
             if self.pick_request is not None:
                 px, py = self.pick_request
@@ -3323,18 +3326,23 @@ class App(InputHandlerMixin):
 
             
             ctx.enable(moderngl.DEPTH_TEST)
-            ctx.depth_mask = True
             ctx.enable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            vis_lo_buffer.bind_to_storage_buffer(binding=3)
-            vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
-            
+
+            # Pass 1: High/Ultra 3D meshes write opaque depth
+            ctx.depth_mask = True
             vis_hi_buffer.bind_to_storage_buffer(binding=3)
             vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
             
             vis_ultra_buffer.bind_to_storage_buffer(binding=3)
             vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
+
+            # Pass 2: Low LOD / subpixel bodies test depth but do not write depth to allow smooth transit blending
+            ctx.depth_mask = False
+            vis_lo_buffer.bind_to_storage_buffer(binding=3)
+            vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
+
             ctx.disable(moderngl.BLEND)
             ctx.disable(moderngl.CULL_FACE)
 
