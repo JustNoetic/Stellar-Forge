@@ -183,8 +183,10 @@ def _camera_pivot_apply(cam, dx, dy, sensitivity):
     cam["roll"] = cam["roll_actual"] = roll_new
 
 def _camera_orbit_apply(cam, dx, dy, sensitivity):
-    """RMB trackball orbit: rotate the camera position about the pivot using the
-    camera's own screen axes (radius preserved). Direct (no smoothing)."""
+    """RMB orbit: rotate the camera position about the pivot. Horizontal drags
+    rotate about the world vertical (turntable: pitch preserved, horizon stays
+    level, no roll/tumble near the poles); vertical drags rotate about the
+    view's own right axis. Radius preserved. Direct (no smoothing)."""
     rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
     r = np.linalg.norm(rel)
     if r < 1e-300:
@@ -201,8 +203,16 @@ def _camera_orbit_apply(cam, dx, dy, sensitivity):
         right = right / nr
     else:
         right = np.array([1.0, 0.0, 0.0], dtype='f8')
-    # drag right -> orbit right; drag down -> orbit up
-    rel_new = _camera_rot_axis(up, math.radians(-dx * sensitivity)) @ (_camera_rot_axis(right, math.radians(-dy * sensitivity)) @ rel)
+    # Keep the vertical-drag axis sign-continuous: the yaw parameterization
+    # flips by 180 deg when pitch crosses +/-90, which would otherwise flip
+    # the recomputed axis every step and trap the orbit just past the pole.
+    right_prev = cam.get("orbit_right", None)
+    if right_prev is not None and float(np.dot(right, right_prev)) < 0.0:
+        right = -right
+    cam["orbit_right"] = right
+    # drag right -> orbit right about the ecliptic vertical (no pole roll);
+    # drag down -> orbit up about the view's right axis
+    rel_new = _camera_rot_axis(np.array([0.0, 1.0, 0.0], dtype='f8'), math.radians(-dx * sensitivity)) @ (_camera_rot_axis(right, math.radians(-dy * sensitivity)) @ rel)
     r_new = np.linalg.norm(rel_new)
     if r_new > 1e-300:
         rel_new = rel_new / r_new * r
@@ -264,6 +274,64 @@ def _PERF_INSTALL_TRACKER(tracker):
     global _PERF_TRACKER
     _PERF_TRACKER = tracker
 
+_GPU_PERF_ENABLED = os.environ.get("STELLAR_FORGE_GPU_PERF") == "1"
+
+if _GPU_PERF_ENABLED:
+    class _GpuPerfQuery:
+        """GL_TIME_ELAPSED query for one render pass, recorded into the PerfTracker.
+
+        The query is ENDED right after its pass (timer queries must never
+        overlap — a second BeginQuery while one is active is GL_INVALID_OPERATION),
+        but the .elapsed READ is deferred to the next frame boundary so the
+        read never stalls the pipeline mid-frame.
+        """
+        __slots__ = ('_name', '_tracker', '_query', '_done')
+
+        def __init__(self, ctx, name):
+            self._name = name
+            self._tracker = _PERF_TRACKER
+            q = ctx.query(time=True)
+            q.__enter__()
+            self._query = q
+            self._done = False
+
+        def end(self):
+            if not self._done:
+                self._done = True
+                self._query.__exit__(None, None, None)
+
+        def finish(self):
+            dt = float(self._query.elapsed) * 1e-9
+            if self._tracker is not None:
+                self._tracker.record_gpu(self._name, dt)
+
+    _GPU_PENDING = []
+
+    def _perf_gpu_begin(ctx, name):
+        q = _GpuPerfQuery(ctx, name)
+        _GPU_PENDING.append(q)
+        return q
+
+    def _perf_gpu_end(q):
+        if q is not None:
+            q.end()
+
+    def _perf_gpu_flush():
+        global _GPU_PENDING
+        pending = _GPU_PENDING
+        _GPU_PENDING = []
+        for q in pending:
+            q.finish()
+else:
+    def _perf_gpu_begin(ctx, name):
+        return None
+
+    def _perf_gpu_end(q):
+        pass
+
+    def _perf_gpu_flush():
+        pass
+
 import OpenGL.GL as gl
 import ctypes
 
@@ -280,6 +348,8 @@ from engine.rendering.planetshine import (
 )
 from engine.rendering.texture_baker import apply_hsba_np, bake_and_export_ring_textures
 from engine.core.input_handler import InputHandlerMixin
+
+_ROT_FOLLOW_ALT_AU = 200.0 / AU_TO_KM  # camera rides the body's rotation below 200 km altitude
 
 class App(InputHandlerMixin):
     def __init__(self):
@@ -307,6 +377,7 @@ class App(InputHandlerMixin):
             "pitch_actual": 25.0,
             "roll": 0.0,
             "roll_actual": 0.0,
+            "horizon_align": True,           # below 200 km, smoothly roll-level the view
             "left_dragging": False,
             "right_dragging": False,
             "last_x": 0.0,
@@ -460,6 +531,7 @@ class App(InputHandlerMixin):
                 "taa_enabled": self.camera.get("taa_enabled", True),
                 "atmo_render_scale": self.camera.get("atmo_render_scale", 0.5),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
+                "horizon_align": self.camera.get("horizon_align", True),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -651,6 +723,29 @@ class App(InputHandlerMixin):
         has_j2 = bundle["has_j2"]
         has_gr = bundle["has_gr"]
         phys_star_idx = bundle["phys_star_idx"]
+
+        # Perf harness hook: track a named body at a close orbit so the GPU
+        # has real work (atmosphere + rings + ringshine fill the viewport).
+        _perf_target = getattr(self, "_perf_target_body", None)
+        if _perf_target:
+            _found = False
+            for _i, _b in enumerate(bodies_data):
+                if str(_b.get("name", "")).strip().lower() == str(_perf_target).strip().lower():
+                    _rad = float(visual_data[_i][3]) if _i < len(visual_data) else 0.0
+                    self.camera["tracking_idx"] = _i
+                    self.camera["tracking_mode"] = "body"
+                    self.camera["tracking_is_cmp"] = False
+                    self.camera["cam_look"] = "aim"
+                    if _rad > 0.0:
+                        _dist = max(_rad * 3.5, _rad + 1e-9)
+                        _off = np.array([0.0, -0.9, 0.6], dtype='f8')
+                        _off = _off / np.linalg.norm(_off) * _dist
+                        self.camera["cam_pos_rel"] = _off
+                    print(f"[Perf] GPU target: tracking '{_b.get('name')}' (idx {_i}, radius {_rad:.6e} AU)")
+                    _found = True
+                    break
+            if not _found:
+                print(f"[Perf] Target body '{_perf_target}' not found in system; keeping default camera")
     
         import os
         from PIL import Image
@@ -1869,6 +1964,7 @@ class App(InputHandlerMixin):
         self.frame_counter = 0
         while not glfw.window_should_close(window):
             self.frame_counter += 1
+            _perf_gpu_flush()
             # ── System Switch — render-side rebuild ──
             with self.shared_state["lock"]:
                 switch_complete = self.shared_state.get("system_switch_complete", False)
@@ -2733,28 +2829,64 @@ class App(InputHandlerMixin):
                     rel += fwd_a * dolly
                 cam["approach_delta"] = 0.0
 
-            # 2) Ground clamp: never clip below the tracked body's surface.
-            #    No landed state / no horizon snapping: while pinned at the stick
-            #    height the camera simply rides the body's rotation so the ground
-            #    stays put beneath it.
-            grounded = (track_r > 0.0 and cam["tracking_mode"] == "body" and
-                        np.linalg.norm(rel) <= _ellipsoid_surface_radius(track_r, track_f, track_pole, rel) + LAND_ALT_AU)
-            if grounded and cam["tracking_idx"] is not None and not cam.get("tracking_is_cmp", False):
-                spin_angles = compute_body_rotation_angles_jit(
-                    float(self.shared_state["t"]) * 31557600.0,
-                    self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr,
-                    pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr)
-                t_idx = cam["tracking_idx"]
-                if t_idx < len(spin_angles):
-                    spin_angle = float(spin_angles[t_idx])
-                    prev_spin = getattr(self, "_contact_prev_spin", None)
-                    self._contact_prev_spin = spin_angle
-                    if prev_spin is not None:
-                        d_spin = spin_angle - prev_spin
-                        if abs(d_spin) > 1e-12:
-                            rel = _camera_rot_axis(self.pole_n_arr[t_idx], d_spin) @ rel
+            # 2) Rotation follow: below 200 km altitude the camera rides the
+            #    tracked body's rotation (full strength at the surface, fading
+            #    out smoothly toward the 200 km threshold) so the ground stays
+            #    put beneath it without a hard "landed" switch.
+            rot_follow = (track_r > 0.0 and cam["tracking_mode"] == "body" and
+                          cam["tracking_idx"] is not None and not cam.get("tracking_is_cmp", False))
+            if rot_follow:
+                alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
+                if alt_au < _ROT_FOLLOW_ALT_AU:
+                    rot_weight = 1.0 - alt_au / _ROT_FOLLOW_ALT_AU
+                    spin_angles = compute_body_rotation_angles_jit(
+                        float(self.shared_state["t"]) * 31557600.0,
+                        self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr,
+                        pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr)
+                    t_idx = cam["tracking_idx"]
+                    if t_idx < len(spin_angles):
+                        spin_angle = float(spin_angles[t_idx])
+                        prev_spin = getattr(self, "_contact_prev_spin", None)
+                        self._contact_prev_spin = spin_angle
+                        if prev_spin is not None:
+                            d_spin = spin_angle - prev_spin
+                            if abs(d_spin) > 1e-12:
+                                rel = _camera_rot_axis(self.pole_n_arr[t_idx], d_spin * rot_weight) @ rel
+                    else:
+                        self._contact_prev_spin = None
+                else:
+                    self._contact_prev_spin = None
             else:
                 self._contact_prev_spin = None
+
+            # 2b) Horizon alignment: below the same 200 km threshold, gently roll
+            #     the camera (like holding Q/E) so the view is level to the local
+            #     ground horizon — the local vertical (radial from the body's
+            #     center through the camera) projects straight up-screen, so the
+            #     ground/sky line appears horizontal regardless of the body's
+            #     axial tilt. Degenerate (no-op) when looking straight along the
+            #     local vertical. Interruptible: manual roll still works, the
+            #     view just levels back within a few seconds. Toggleable via
+            #     cam["horizon_align"].
+            if cam.get("horizon_align", True) and cam.get("tracking_idx") is not None and track_r > 0.0:
+                alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
+                if alt_au < _ROT_FOLLOW_ALT_AU:
+                    align_strength = 1.0 - alt_au / _ROT_FOLLOW_ALT_AU
+                    if cam["cam_look"] == "aim":
+                        fwd_al = -rel / max(np.linalg.norm(rel), 1e-300)
+                    else:
+                        fwd_al = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
+                    up_al = _camera_screen_up(fwd_al, 0.0)
+                    local_up = rel / max(np.linalg.norm(rel), 1e-300)
+                    ref = local_up - float(np.dot(local_up, fwd_al)) * fwd_al
+                    np_ref = np.linalg.norm(ref)
+                    if np_ref > 1e-6:
+                        ref = ref / np_ref
+                        roll_target = -math.degrees(math.atan2(
+                            float(np.dot(np.cross(up_al, ref), fwd_al)),
+                            float(np.dot(up_al, ref))))
+                        roll_diff = (cam["roll"] - roll_target + 180.0) % 360.0 - 180.0
+                        cam["roll"] -= 1.5 * align_strength * roll_diff * dt_render
 
             # 3) WASD flight (screen-space strafe)
             keys = cam.get("keys", {})
@@ -3193,8 +3325,10 @@ class App(InputHandlerMixin):
             draw_cmds_buffer.bind_to_storage_buffer(binding=6)
             focused_mask_buffer.bind_to_storage_buffer(binding=7)
             
+            _gq = _perf_gpu_begin(ctx, "gpu_culling")
             prog_culling_compute.run((total_render_bodies + 255) // 256, 1, 1)
             ctx.memory_barrier()
+            _perf_gpu_end(_gq)
     
             if not show_orbits:
                 n_orbits = 0
@@ -3543,7 +3677,9 @@ class App(InputHandlerMixin):
                         self.prog_ringshine_map[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
                 if 'u_ringshine_band_count' in self.prog_ringshine_map:
                     self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 256))
+                _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
                 self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
+                _perf_gpu_end(_gq)
 
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 if self.hdr_msaa_fbo:
@@ -3614,6 +3750,7 @@ class App(InputHandlerMixin):
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
             # Pass 1: High/Ultra 3D meshes write opaque depth
+            _gq = _perf_gpu_begin(ctx, "gpu_spheres")
             ctx.depth_mask = True
             vis_hi_buffer.bind_to_storage_buffer(binding=3)
             vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
@@ -3625,6 +3762,7 @@ class App(InputHandlerMixin):
             ctx.depth_mask = False
             vis_lo_buffer.bind_to_storage_buffer(binding=3)
             vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
+            _perf_gpu_end(_gq)
 
             ctx.disable(moderngl.BLEND)
             ctx.disable(moderngl.CULL_FACE)
@@ -3636,6 +3774,7 @@ class App(InputHandlerMixin):
             ctx.enable(moderngl.DEPTH_TEST)
             ctx.depth_mask = True
             
+            _gq = _perf_gpu_begin(ctx, "gpu_orbits")
             if show_orbits:
                 if n_orbits > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -3748,6 +3887,7 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
+            _perf_gpu_end(_gq)
 
             def render_atmosphere_pass(clip_mode):
                 if not sorted_atmos:
@@ -3995,9 +4135,12 @@ class App(InputHandlerMixin):
                     ctx.disable(moderngl.BLEND)
 
             # --- Pass 1: Atmosphere behind rings ---
+            _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
             execute_atmosphere_pass(1)
+            _perf_gpu_end(_gq)
     
             # --- Render Rings ---
+            _gq = _perf_gpu_begin(ctx, "gpu_rings")
             if ring_render_groups or (self.comparison_enabled and self.ring_render_groups_cmp):
                 ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
@@ -4168,8 +4311,10 @@ class App(InputHandlerMixin):
                             prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
                             prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+            _perf_gpu_end(_gq)
             
             # Render Habitable Zone Visualizer
+            _gq = _perf_gpu_begin(ctx, "gpu_hz")
             if self.camera.get("show_habitable_zone", False) and self.hz_vao is not None:
                 ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
@@ -4215,9 +4360,12 @@ class App(InputHandlerMixin):
                 
                 ctx.depth_mask = True
                 ctx.disable(moderngl.BLEND)
+            _perf_gpu_end(_gq)
     
             # --- Pass 2: Atmosphere in front of rings ---
+            _gq = _perf_gpu_begin(ctx, "gpu_atmo_front")
             execute_atmosphere_pass(2)
+            _perf_gpu_end(_gq)
             
             if self.hdr_msaa_fbo:
                 ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
@@ -4255,8 +4403,7 @@ class App(InputHandlerMixin):
             speed_log_cam = math.log10(max(self.camera.get("flight_speed", 0.1), 1e-13))
             _, self.camera["flight_speed"] = imgui.slider_float("##flyspeed", speed_log_cam, -13.0, 0.7, "")
             self.camera["flight_speed"] = 10 ** self.camera["flight_speed"]
-            imgui.text("WASD fly | Scroll velocity | LMB pivot | RMB orbit | LMB+RMB approach")
-            imgui.text("The camera cannot clip through a tracked body's surface")
+            _, self.camera["horizon_align"] = imgui.checkbox("Auto-level horizon", self.camera.get("horizon_align", True))
             
             imgui.separator()
             imgui.text("Time Controls")
@@ -5302,7 +5449,22 @@ class App(InputHandlerMixin):
                         else:
                             imgui.text(f"  Cam Dist: {dist_to_center_km:,.0f} km")
                     else:
-                        dist_to_surface_km = dist_to_center_km - body_r_km
+                        # Altitude above the oblate ellipsoid surface along the
+                        # camera's direction (a plain sphere radius would be wrong
+                        # near the poles of a flattened body).
+                        to_cam = cam_world_pos_f8 - target_pos
+                        n_tc = np.linalg.norm(to_cam)
+                        if n_tc > 1e-12:
+                            if insp_is_cmp and hasattr(self, "pole_n_arr_cmp") and self.pole_n_arr_cmp is not None and insp_idx < len(self.pole_n_arr_cmp):
+                                pole_ref = np.array(self.pole_n_arr_cmp[insp_idx], dtype='f8')
+                            elif not insp_is_cmp and hasattr(self, "pole_n_arr") and self.pole_n_arr is not None and insp_idx < len(self.pole_n_arr):
+                                pole_ref = np.array(self.pole_n_arr[insp_idx], dtype='f8')
+                            else:
+                                pole_ref = np.array([0.0, 1.0, 0.0], dtype='f8')
+                            surf_r_km = _ellipsoid_surface_radius(body_r_km, float(body_info.get('oblateness', 0.0)), pole_ref, to_cam / n_tc)
+                            dist_to_surface_km = n_tc * 149597870.7 - surf_r_km
+                        else:
+                            dist_to_surface_km = dist_to_center_km - body_r_km
                         dist_to_surface_au = dist_to_surface_km / 149597870.7
                         if dist_to_center_km > 1.49597e7:
                             imgui.text(f"  Cam Dist: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
@@ -6826,6 +6988,7 @@ class App(InputHandlerMixin):
                 if self.taa_history_tex:
                     self.taa_history_tex.write(np.zeros((self.fb_width, self.fb_height, 4), dtype='f4').tobytes())
             
+            _gq = _perf_gpu_begin(ctx, "gpu_taa")
             if self.camera.get("taa_enabled", True) and self.taa_output_fbo is not None:
                 self.taa_output_fbo.use()
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
@@ -6864,12 +7027,14 @@ class App(InputHandlerMixin):
                 self.taa_output_fbo = ctx.framebuffer(color_attachments=[self.taa_output_tex])
                 if self.taa_history_fbo: self.taa_history_fbo.release()
                 self.taa_history_fbo = ctx.framebuffer(color_attachments=[self.taa_history_tex], depth_attachment=self.depth_texture)
+            _perf_gpu_end(_gq)
 
             resolved_tex = self.taa_history_tex if (self.camera.get("taa_enabled", True) and self.taa_history_tex is not None) else self.hdr_resolve_tex
 
 
             # --- Post Processing ---
             # Bloom Downsample
+            _gq = _perf_gpu_begin(ctx, "gpu_bloom")
             ctx.disable(moderngl.DEPTH_TEST)
             ctx.disable(moderngl.BLEND)
             
@@ -6905,6 +7070,7 @@ class App(InputHandlerMixin):
                     self.prog_bloom_up['u_texel_size'].value = (1.0 / self.bloom_texs[i+1].width, 1.0 / self.bloom_texs[i+1].height)
                     self.quad_vao_up.render(moderngl.TRIANGLE_STRIP)
                     
+                _perf_gpu_end(_gq)
                 # Final Composite
                 ctx.disable(moderngl.BLEND)
                 
@@ -6964,6 +7130,7 @@ class App(InputHandlerMixin):
                     ).start()
                 
                 # Normal composite to screen for display
+                _gq = _perf_gpu_begin(ctx, "gpu_composite")
                 ctx.screen.use()
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 resolved_tex.use(location=0)
@@ -6972,6 +7139,7 @@ class App(InputHandlerMixin):
                 self.prog_composite['u_bloom_texture'].value = 1
                 self.prog_composite['u_bloom_intensity'].value = self.camera.get("bloom_intensity", 0.05)
                 self.quad_vao_comp.render(moderngl.TRIANGLE_STRIP)
+                _perf_gpu_end(_gq)
 
             # Re-enable standard settings for ImGui
             ctx.screen.use()
@@ -7006,7 +7174,9 @@ class App(InputHandlerMixin):
             
             imgui.render()
      
+            _gq = _perf_gpu_begin(ctx, "gpu_imgui")
             self.impl.render(imgui.get_draw_data())
+            _perf_gpu_end(_gq)
             glfw.swap_buffers(window)
             
             self._last_fb_width = self.fb_width

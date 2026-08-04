@@ -19,14 +19,31 @@ Options
   --no-physics       Pause the physics thread (render-loop only benchmark)
   --fps-cap N        Cap framerate at N (default: uncapped)
   --sim-speed X      Set the time multiplier (default: 1.0)
+  --gpu              Measure per-pass GPU times with GL timer queries
+                     (GL_TIME_ELAPSED). Instrumented passes in app.py:
+                     culling, ringshine map, spheres, orbits, atmosphere
+                     (behind/front of rings), rings, HZ, TAA, bloom,
+                     composite, ImGui.
+  --target-body NAME Track NAME at a close 3.5R orbit instead of the default
+                     45 AU solar view (default: "Saturn" when --gpu is used,
+                     so the GPU gets real work: rings + atmosphere + ringshine).
+                     Combine with --no-physics to isolate the render loop and
+                     get a pure GPU-bound profile.
 
 Environment variables
----------------------
+----------------------
   STELLAR_FORGE_PERF=1   Activate the in-process PerfTracker inside main.py
                          (instrumented sub-stages: pack_instances, pack_uniforms,
                          pack_rings, render_orbits, render_spheres, render_rings,
                          imgui_draw, etc.) — only used when --mode is set AND
                          the env var is exported.
+  STELLAR_FORGE_GPU_PERF=1  Wrap the GPU render passes in GL timer queries and
+                         record per-pass GPU milliseconds into the report.
+
+Example
+-------
+  python scripts/perf_test.py --gpu --target-body Saturn --mode stress
+  python scripts/perf_test.py --gpu --no-physics --mode quick   # GPU-only frame cost
 """
 import argparse
 import cProfile
@@ -46,7 +63,8 @@ class PerfTracker:
     """
 
     def __init__(self):
-        self.sections = {}  # name -> dict
+        self.sections = {}  # name -> dict (CPU wall-clock)
+        self.gpu_sections = {}  # name -> dict (GPU GL_TIME_ELAPSED)
         self.frame_times = []  # list of seconds (per-frame deltas)
         import threading
         self._local = threading.local()
@@ -81,6 +99,44 @@ class PerfTracker:
         with self._lock:
             self.frame_times.append(dt)
 
+    def record_gpu(self, name, dt):
+        """Record a GPU pass duration (seconds) from a GL timer query."""
+        with self._lock:
+            s = self.gpu_sections.get(name)
+            if s is None:
+                s = {'total': 0.0, 'count': 0, 'min': float('inf'), 'max': 0.0, 'last': 0.0}
+                self.gpu_sections[name] = s
+            s['total'] += dt
+            s['count'] += 1
+            s['min'] = min(s['min'], dt)
+            s['max'] = max(s['max'], dt)
+            s['last'] = dt
+
+    def clear_sections(self):
+        """Drop CPU + GPU section stats (used after warmup to skip JIT/startup stalls)."""
+        with self._lock:
+            self.sections.clear()
+            self.gpu_sections.clear()
+
+    def _section_lines(self, table, total, title, note=""):
+        lines = []
+        if not table:
+            return lines
+        lines.append("")
+        lines.append(f"--- {title} ---")
+        if note:
+            lines.append(f"  {note}")
+        header = f"  {'name':<35s}  {'total ms':>10s}  {'count':>7s}  {'avg ms':>9s}  {'min ms':>9s}  {'max ms':>9s}  {'%':>5s}"
+        lines.append(header)
+        for name, s in sorted(table.items(), key=lambda x: -x[1]['total']):
+            pct = (s['total'] / total * 100) if total > 0 else 0
+            avg_ms = (s['total'] / s['count']) * 1000 if s['count'] > 0 else 0
+            lines.append(
+                f"  {name:<35s}  {s['total'] * 1000:10.2f}  {s['count']:7d}  "
+                f"{avg_ms:9.3f}  {s['min'] * 1000:9.3f}  {s['max'] * 1000:9.3f}  {pct:5.1f}"
+            )
+        return lines
+
     def report(self):
         with self._lock:
             lines = ["=== Stellar-Forge Performance Report ==="]
@@ -99,19 +155,31 @@ class PerfTracker:
                 lines.append(f"50%ile          : {p50 * 1000:7.2f} ms  ({1 / p50:5.1f} FPS)")
                 lines.append(f" 1% low (99%ile): {p99 * 1000:7.2f} ms  ({1 / p99:5.1f} FPS)")
                 lines.append(f" 1% high ( 1%ile): {p1 * 1000:7.2f} ms  ({1 / p1:5.1f} FPS)")
+                if n < 30:
+                    lines.append(f"  Note            : only {n} frames measured — "
+                                 "use --mode stress or --fps-cap 0 for a larger sample")
+
+                if self.gpu_sections:
+                    gpu_total = sum(s['total'] for s in self.gpu_sections.values())
+                    gpu_per_frame_ms = gpu_total / n * 1000
+                    frame_ms = avg * 1000
+                    if gpu_per_frame_ms >= 0.85 * frame_ms:
+                        verdict = "GPU-bound (GPU work dominates the frame)"
+                    else:
+                        verdict = f"CPU-bound (GPU work is {gpu_per_frame_ms / max(frame_ms, 1e-9) * 100:.0f}% of frame time)"
+                    lines.append("")
+                    lines.append(f"GPU work / frame : {gpu_per_frame_ms:7.2f} ms")
+                    lines.append(f"Bottleneck       : {verdict}")
+
             if self.sections:
                 total = sum(s['total'] for s in self.sections.values())
-                lines.append("")
-                lines.append("--- Per-section CPU cost (sorted by total time) ---")
-                header = f"  {'section':<35s}  {'total ms':>10s}  {'count':>7s}  {'avg ms':>9s}  {'min ms':>9s}  {'max ms':>9s}  {'%':>5s}"
-                lines.append(header)
-                for name, s in sorted(self.sections.items(), key=lambda x: -x[1]['total']):
-                    pct = (s['total'] / total * 100) if total > 0 else 0
-                    avg_ms = (s['total'] / s['count']) * 1000 if s['count'] > 0 else 0
-                    lines.append(
-                        f"  {name:<35s}  {s['total'] * 1000:10.2f}  {s['count']:7d}  "
-                        f"{avg_ms:9.3f}  {s['min'] * 1000:9.3f}  {s['max'] * 1000:9.3f}  {pct:5.1f}"
-                    )
+                lines += self._section_lines(self.sections, total,
+                    "Per-section CPU cost (sorted by total time)")
+            if self.gpu_sections:
+                gpu_total = sum(s['total'] for s in self.gpu_sections.values())
+                lines += self._section_lines(self.gpu_sections, gpu_total,
+                    "GPU pass timings (GL_TIME_ELAPSED)",
+                    "Summed per pass; reads are deferred to the next frame boundary.")
             return "\n".join(lines)
 
 
@@ -140,6 +208,8 @@ def main():
     ap.add_argument("--no-physics", action="store_true", help="Pause physics thread")
     ap.add_argument("--fps-cap", type=float, default=0.0, help="Cap framerate (0=uncapped)")
     ap.add_argument("--sim-speed", type=float, default=1.0, help="Initial time multiplier")
+    ap.add_argument("--gpu", action="store_true", help="Measure per-pass GPU times with GL timer queries")
+    ap.add_argument("--target-body", default=None, help="Track this body at a close 3.5R orbit (default: 'Saturn' when --gpu is used)")
     args = ap.parse_args()
 
     durations = {"quick": (3, 10), "standard": (5, 20), "stress": (3, 60)}
@@ -149,6 +219,8 @@ def main():
     # Activate inner-loop instrumentation if requested.
     if os.environ.get("STELLAR_FORGE_PERF") != "1":
         os.environ["STELLAR_FORGE_PERF"] = "1"
+    if args.gpu:
+        os.environ["STELLAR_FORGE_GPU_PERF"] = "1"
 
     import engine.app as ap_mod
     import engine.physics.physics_core as pc
@@ -188,6 +260,11 @@ def main():
     # Instantiate the application.
     app_instance = ap_mod.App()
 
+    # Move the camera to a heavy scene (tracked body with rings + atmosphere).
+    target_body = args.target_body if args.target_body is not None else ("Saturn" if args.gpu else None)
+    if target_body:
+        app_instance._perf_target_body = target_body
+
     # Apply options to time_ctrl before starting the app.
     if args.sim_speed != 1.0:
         app_instance.time_ctrl["multiplier"] = args.sim_speed
@@ -197,21 +274,28 @@ def main():
         app_instance.time_ctrl["paused"] = False
 
     # Set up frame-time capture by patching swap_buffers.
+    # The warmup timer starts at the FIRST swap: App() boot time (textures,
+    # Numba JIT, shader compilation) can exceed the warmup window, which would
+    # otherwise close the window before any frame was measured.
     warmup_done = [False]
-    warmup_start = time.perf_counter()
+    warmup_start = [None]
     last_swap = [time.perf_counter()]
     original_swap = glfw.swap_buffers
 
     def patched_swap(window):
         now = time.perf_counter()
+        if warmup_start[0] is None:
+            warmup_start[0] = now
+            last_swap[0] = now
+            return original_swap(window)
         if warmup_done[0]:
             tracker.record_frame(now - last_swap[0])
         last_swap[0] = now
 
-        elapsed = now - warmup_start
+        elapsed = now - warmup_start[0]
         if not warmup_done[0] and elapsed >= warmup:
             warmup_done[0] = True
-            tracker.sections.clear()  # Clear JIT stalls accumulated during warmup
+            tracker.clear_sections()  # Clear JIT stalls accumulated during warmup
             print(f"[Perf] Warmup complete at {elapsed:.1f}s")
             print(f"[Perf] Starting measurement window of {measure}s ...")
         if warmup_done[0] and elapsed >= total_runtime:
