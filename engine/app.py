@@ -481,6 +481,8 @@ class App(InputHandlerMixin):
             "atmo_quality": 1,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
+            "atmo_enabled": True,
+            "refraction_enabled": True,
             "show_orbits": True,
             "orbit_fade_dir_idx": 0,
             "orbit_min_alpha": 0.3,
@@ -3856,7 +3858,10 @@ class App(InputHandlerMixin):
                 refract_scale_height = float(props_c.get('scale_height_km', 8.5))
                 refractivity = float(props_c.get('refractivity', 0.00029))
                 planet_radius_au = closest_atmo['planet_radius_km'] / au_to_km_val
-                refract_max_bend = compute_max_bend(planet_radius_au, refract_scale_height, refractivity)
+                if self.camera.get("refraction_enabled", True):
+                    refract_max_bend = compute_max_bend(planet_radius_au, refract_scale_height, refractivity)
+                else:
+                    refract_max_bend = 0.0
 
                 b_info = self.bodies_data_cmp[bi_curr] if is_cmp else bodies_data[bi_curr]
                 pole_ref = self.pole_n_arr_cmp[bi_curr] if is_cmp else self.pole_n_arr[bi_curr]
@@ -4258,6 +4263,8 @@ class App(InputHandlerMixin):
                 ctx.disable(moderngl.BLEND)
 
             def execute_atmosphere_pass(clip_mode):
+                if not self.camera.get("atmo_enabled", True):
+                    return
                 if 'u_screen_res' in prog_atmo:
                     prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
                 
@@ -4852,6 +4859,15 @@ class App(InputHandlerMixin):
                         self.camera["show_habitable_zone"] = show_habitable_zone
                         settings_changed = True
                         
+                    imgui.separator()
+                    # Atmosphere & Refraction toggles
+                    changed_atmo, self.camera["atmo_enabled"] = imgui.checkbox("Enable Atmosphere Rendering", self.camera.get("atmo_enabled", True))
+                    if changed_atmo:
+                        settings_changed = True
+                    changed_refr, self.camera["refraction_enabled"] = imgui.checkbox("Enable Atmospheric Refraction", self.camera.get("refraction_enabled", True))
+                    if changed_refr:
+                        settings_changed = True
+
                     imgui.separator()
                     # Bounce lighting toggles
                     changed_ps, self.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", self.camera.get("planetshine_enabled", True))
