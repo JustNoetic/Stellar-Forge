@@ -1,9 +1,9 @@
 {
     "atmo_quality": 2,
-    "atmo_steps_max": 9,
+    "atmo_steps_max": 12,
     "atmo_adaptive_steps": false,
     "hdr_enabled": true,
-    "exposure": 96.33663940429688,
+    "exposure": 0.37631499767303467,
     "bloom_intensity": 0.12200000137090683,
     "bloom_threshold": 1.5800000429153442,
     "msaa_samples": 0,
@@ -15,8 +15,8 @@
     "ringshine_enabled": true,
     "ringshine_band_count": 100,
     "inspector_frame": 0,
-    "fov": 32.51250000000001,
-    "flight_speed": 0.07812511599481367,
+    "fov": 62.640750000000004,
+    "flight_speed": 7.450570384497021e-08,
     "shadow_caster_budget": 8,
     "screenshot_res_idx": 2,
     "horizon_align": true

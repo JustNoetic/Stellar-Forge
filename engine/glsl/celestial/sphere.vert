@@ -55,6 +55,7 @@ flat out vec3 f_center_pos;
 flat out float f_radius;
 flat out float f_final_radius;
 flat out float f_oblateness;
+flat out float f_bounding_radius;
 
 vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
     if (abs(angle) < 1e-7) return v;
@@ -138,6 +139,7 @@ void main() {
     // Expand bounding mesh radius to cover the refracted/ray-traced shape
     float atmo_expand = (u_refract_max_bend > 0.0) ? (dist * tan(u_refract_max_bend) * 1.5 + final_radius * 0.08) : (final_radius * 0.01);
     float bounding_radius = final_radius + atmo_expand;
+    f_bounding_radius = bounding_radius;
 
     vec3 bounding_world_pos = (scaled_pos * bounding_radius) + in_offset;
     f_world_pos = bounding_world_pos;

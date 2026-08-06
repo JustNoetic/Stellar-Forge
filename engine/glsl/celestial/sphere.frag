@@ -25,6 +25,7 @@ flat in vec3 f_center_pos;
 flat in float f_radius;
 flat in float f_final_radius;
 flat in float f_oblateness;
+flat in float f_bounding_radius;
 
 uniform vec3 u_refract_center;
 uniform float u_refract_radius;
@@ -208,15 +209,25 @@ float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
 void main() {
     if (f_clip_z <= 0.0) discard;
 
-    vec3 view_ray = normalize(f_world_pos - u_camera_pos);
+    // Body-local approach: separate small per-pixel mesh offset from large per-instance offset
+    vec3 pole_n_pre = length(f_pole) > 1e-4 ? normalize(f_pole) : vec3(0.0, 1.0, 0.0);
+    vec3 scaled_local = f_local_pos;
+    if (f_oblateness > 0.0) {
+        float pp = dot(f_local_pos, pole_n_pre);
+        scaled_local -= pole_n_pre * (pp * f_oblateness);
+    }
+    vec3 f_local_bounding = scaled_local * f_bounding_radius;  // small, per-pixel, smooth
+    vec3 cam_to_center = f_center_pos - u_camera_pos;          // flat, per-instance constant
+    vec3 view_ray = normalize(f_local_bounding + cam_to_center);
     vec3 ray_dir = view_ray;
     vec3 ray_origin = u_camera_pos;
     bool is_refract_host = length(f_center_pos - u_refract_center) < 1e-4;
 
+    float s_min_au = 0.0;
     if (u_refract_max_bend > 1e-6) {
         if (!is_refract_host) {
             vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
-            float d_km = length((f_center_pos - u_camera_pos) * u_au_to_km);
+            float d_km = length(cam_to_center * u_au_to_km);
             float alpha = compute_refraction_angle(C_km, view_ray, d_km);
             if (alpha > 1e-7) {
                 vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
@@ -225,8 +236,9 @@ void main() {
                     u_dir /= u_len;
                     ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
                     
-                    float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
-                    if (s_min_au > 0.0) {
+                    float local_s_min = -dot(u_camera_pos - u_refract_center, view_ray);
+                    if (local_s_min > 0.0) {
+                        s_min_au = local_s_min;
                         ray_origin = u_camera_pos + s_min_au * (view_ray - ray_dir);
                     }
                 }
@@ -276,12 +288,15 @@ void main() {
         }
     }
 
-    vec3 pole_n = length(f_pole) > 1e-4 ? normalize(f_pole) : vec3(0.0, 1.0, 0.0);
-    vec3 O = ray_origin - f_center_pos;
+    vec3 pole_n = pole_n_pre;
+    // Precise ray origin in body-local coordinates, avoiding catastrophic cancellation
+    // By starting from the precise bounding mesh vertex and applying the relative refraction shift.
+    float d_bounding = length(f_local_bounding + cam_to_center);
+    vec3 O_local = f_local_bounding + (d_bounding - s_min_au) * (ray_dir - view_ray);
     vec3 D = ray_dir;
 
     float f_scale = (f_oblateness > 0.0 && f_oblateness < 0.99) ? (1.0 / (1.0 - f_oblateness)) : 1.0;
-    vec3 O_sph = O + pole_n * (dot(O, pole_n) * (f_scale - 1.0));
+    vec3 O_sph = O_local + pole_n * (dot(O_local, pole_n) * (f_scale - 1.0));
     vec3 D_sph = D + pole_n * (dot(D, pole_n) * (f_scale - 1.0));
 
     float a = dot(D_sph, D_sph);
@@ -298,19 +313,19 @@ void main() {
     float h = sqrt(max(0.0, h2));
     
     float t_closest = -dot(O_sph, D_sph) * inv_a;
-    float t1 = t_closest - h;
-    float t2 = t_closest + h;
+    
+    if (h2 <= 0.0) discard;
+    float t_hit_local = t_closest - h;  // front face (negative, going back toward camera)
 
-    float t_hit = (t1 > 0.0) ? t1 : t2;
-    if (t_hit <= 0.0) discard;
-
-    vec3 hit_world_pos = ray_origin + ray_dir * t_hit;
-    vec3 P_rel = hit_world_pos - f_center_pos;
+    vec3 P_rel = O_local + ray_dir * t_hit_local;  // body-local hit position, precise
+    vec3 hit_world_pos = P_rel + f_center_pos;  // for clip_pos + depth only
 
     vec3 P_scaled = P_rel + pole_n * (dot(P_rel, pole_n) * (f_scale * f_scale - 1.0));
     vec3 hit_normal = normalize(P_scaled);
     vec3 hit_local_pos = P_rel / max(1e-6, f_radius);
 
+    // Compute depth: we need the world-space t from camera for depth buffer
+    // cam_to_hit = cam_to_center + P_rel (both body-local-scale except cam_to_center)
     vec4 clip_pos = projection * view * vec4(hit_world_pos, 1.0);
     float hit_clip_z = clip_pos.w;
     if (hit_clip_z <= 0.0) discard;
@@ -322,7 +337,7 @@ void main() {
 
     if (f_is_star > 0.5) {
         // Star is self-luminous, apply quadratic limb darkening
-        vec3 V = normalize(u_camera_pos - v_world_pos);
+        vec3 V = normalize(-(cam_to_center + P_rel));
         vec3 N = normalize(v_normal);
         float mu = max(dot(N, V), 0.0);
         
@@ -340,7 +355,7 @@ void main() {
         float star_r = 0.0046547454; // 1 solar radius in AU
         vec3 star_base_color = f_color; // fallback
         for (int s = 0; s < u_num_stars; s++) {
-            if (distance(v_world_pos, u_stars_pos_radius[s].xyz) < u_stars_pos_radius[s].w * 1.5) {
+            if (length((u_stars_pos_radius[s].xyz - f_center_pos) - P_rel) < u_stars_pos_radius[s].w * 1.5) {
                 star_r = max(u_stars_pos_radius[s].w, 1e-6);
 
                 vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
@@ -421,7 +436,7 @@ void main() {
             float sin_lat = abs(dot(frag_local_dir, pole_dir_norm));
             float lat_factor = smoothstep(0.1, 0.7, sin_lat);
 
-            vec3 primary_star_dir = normalize(u_stars_pos_radius[0].xyz - v_world_pos);
+            vec3 primary_star_dir = normalize((u_stars_pos_radius[0].xyz - f_center_pos) - P_rel);
             float sun_pole_dot = dot(primary_star_dir, pole_dir_norm);
             float frag_pole_dot = dot(frag_local_dir, pole_dir_norm);
 
@@ -462,12 +477,12 @@ void main() {
         vec3 total_diffuse_color = vec3(0.0);
         vec3 total_specular_color = vec3(0.0);
         vec3 analytical_diffuse_color = vec3(0.0);
-        vec3 V = normalize(u_camera_pos - v_world_pos);
+        vec3 V = normalize(-(cam_to_center + P_rel));
 
         for (int s = 0; s < u_num_stars; s++) {
             vec3 star_pos = u_stars_pos_radius[s].xyz;
             float star_radius = u_stars_pos_radius[s].w;
-            vec3 frag_to_star = star_pos - v_world_pos;
+            vec3 frag_to_star = (star_pos - f_center_pos) - P_rel;
             float dist_to_star = length(frag_to_star);
             if (dist_to_star < 1e-5) continue;
             vec3 L = frag_to_star / dist_to_star;
@@ -515,7 +530,7 @@ void main() {
                 float caster_r = u_casters[j].w;
                 float atmo_h = u_caster_atmos[j].w;
 
-                vec3 frag_to_caster = caster_pos - v_world_pos;
+                vec3 frag_to_caster = (caster_pos - f_center_pos) - P_rel;
                 float t_proj = dot(frag_to_caster, L);
                 if (t_proj < 0.0) continue;
 
@@ -577,10 +592,10 @@ void main() {
                     float denom = dot(L, plane_normal);
                     if (abs(denom) < 1e-8) continue;
 
-                    float t = dot(plane_center - v_world_pos, plane_normal) / denom;
+                    float t = dot((plane_center - f_center_pos) - P_rel, plane_normal) / denom;
                     if (t <= 0.0 || t >= dist_to_star) continue;
 
-                    vec3 hit = v_world_pos + t * L;
+                    vec3 hit = f_center_pos + P_rel + t * L;
                     vec3 vec_radial = hit - plane_center;
                     float d = length(vec_radial);
 
@@ -677,7 +692,7 @@ void main() {
             float outer_r = u_ring_params[k].y;
             float opacity = u_ring_params[k].z;
 
-            vec3 frag_to_center = ring_center - v_world_pos;
+            vec3 frag_to_center = (ring_center - f_center_pos) - P_rel;
             float dist_to_center = length(frag_to_center);
 
             // Fast distance cull: ignore rings if we are too far away
@@ -694,7 +709,7 @@ void main() {
             bool is_host_planet = false;
             if (host_caster_idx >= 0) {
                 float host_radius = u_casters[host_caster_idx].w;
-                is_host_planet = (distance(v_world_pos, u_casters[host_caster_idx].xyz) < host_radius * 1.5);
+                is_host_planet = (length((u_casters[host_caster_idx].xyz - f_center_pos) - P_rel) < host_radius * 1.5);
             } else {
                 is_host_planet = (dist_to_center < inner_r);
             }
@@ -707,7 +722,7 @@ void main() {
             for (int s = 0; s < u_num_stars; s++) {
                 vec3 star_pos = u_stars_pos_radius[s].xyz;
                 float star_radius = u_stars_pos_radius[s].w;
-                vec3 frag_to_star = star_pos - v_world_pos;
+                vec3 frag_to_star = (star_pos - f_center_pos) - P_rel;
                 float dist_to_star = length(frag_to_star);
                 if (dist_to_star < 1e-5) continue;
                 vec3 L = frag_to_star / dist_to_star;

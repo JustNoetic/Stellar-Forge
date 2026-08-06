@@ -324,9 +324,11 @@ vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float a = dot(dir, dir);
     float b = dot(origin, dir);
 
-    // Improved precision for large distances
-    vec3 p = origin - (b / a) * dir;
-    float p2 = dot(p, p);
+    // Use cross product for perpendicular distance — avoids catastrophic cancellation
+    // at large distances where origin and (b/a)*dir are both huge but nearly equal.
+    // |origin × dir|² / |dir|² = perpendicular distance² from ray to sphere center.
+    vec3 cross_vec = cross(origin, dir);
+    float p2 = dot(cross_vec, cross_vec) / a;
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
@@ -359,7 +361,8 @@ void main() {
     vec3 f_pos_local_au = f_local_pos * u_atmo_radius_au;
     
     vec3 ray_origin_au = u_camera_pos;
-    vec3 view_ray = normalize(f_pos_local_au + planet_center_render - u_camera_pos);
+    vec3 cam_to_body = planet_center_render - u_camera_pos;
+    vec3 view_ray = normalize(f_pos_local_au + cam_to_body);
     vec3 ray_dir = view_ray;
     bool is_refract_host = length(planet_center_render - u_refract_center) < 1e-4;
 
@@ -368,7 +371,7 @@ void main() {
 
     if (u_refract_max_bend > 1e-6) {
         vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
-        float d_km = length((planet_center_render - u_camera_pos) * u_au_to_km);
+        float d_km = length(cam_to_body * u_au_to_km);
         float alpha = compute_refraction_angle(C_km, view_ray, d_km);
         if (alpha > 1e-7) {
             vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);

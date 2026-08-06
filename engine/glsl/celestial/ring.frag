@@ -293,13 +293,15 @@ void main() {
     if (f_clip_z <= 0.0) discard;
     gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
 
-    vec3 view_ray = normalize(f_world_pos - u_camera_pos);
+    vec3 cam_to_host = u_host_planet_pos - u_camera_pos;
+    vec3 view_ray = normalize(f_local_pos + cam_to_host);
     vec3 ray_dir = view_ray;
     vec3 ray_origin = u_camera_pos;
 
+    float s_min_au = 0.0;
     if (u_refract_max_bend > 1e-6) {
         vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
-        float d_km = length((u_host_planet_pos - u_camera_pos) * u_au_to_km);
+        float d_km = length(cam_to_host * u_au_to_km);
         float alpha = compute_refraction_angle(C_km, view_ray, d_km);
         if (alpha > 1e-7) {
             vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
@@ -307,32 +309,40 @@ void main() {
             if (u_len > 1e-5) {
                 u_dir /= u_len;
                 ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
-                float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
-                if (s_min_au > 0.0) {
+                float local_s_min = -dot(u_camera_pos - u_refract_center, view_ray);
+                if (local_s_min > 0.0) {
+                    s_min_au = local_s_min;
                     ray_origin = u_camera_pos + s_min_au * (view_ray - ray_dir);
                 }
             }
         }
     }
 
+    // Precise ray origin in body-local coordinates, avoiding catastrophic cancellation
+    // By starting from the precise bounding mesh vertex and applying the relative refraction shift.
+    float d_bounding = length(f_local_pos + cam_to_host);
+    vec3 O_local = f_local_pos + (d_bounding - s_min_au) * (ray_dir - view_ray);
+
+    // Body-local ray-plane intersection for precision
     vec3 pole_n = length(u_host_planet_pole_obl.xyz) > 1e-4 ? normalize(u_host_planet_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
     float d_n = dot(ray_dir, pole_n);
     if (abs(d_n) < 1e-6) discard;
 
-    vec3 to_cam = ray_origin - u_host_planet_pos;
-    float t = -dot(to_cam, pole_n) / d_n;
-    if (t <= 0.0) discard;
+    // Intersect ray with ring plane
+    // Ring plane passes through host planet center, normal = pole_n
+    // From O_local along ray_dir: t where dot(O_local + t * ray_dir, pole_n) = 0
+    float t_local = -dot(O_local, pole_n) / d_n;
 
-    vec3 hit_pos = ray_origin + ray_dir * t;
+    vec3 hit_local = O_local + ray_dir * t_local;  // body-local hit, ring-radius scale
+    vec3 hit_pos = hit_local + u_host_planet_pos;  // world-space, for depth/clip only
 
     if (u_clip_mode != 0) {
-        vec3 to_frag = hit_pos - u_host_planet_pos;
-        float d = dot(to_frag, to_cam);
+        float d = dot(hit_local, -cam_to_host);
         if (u_clip_mode == 1 && d > 0.0) discard;
         if (u_clip_mode == 2 && d <= 0.0) discard;
     }
 
-    float r = length(hit_pos - u_host_planet_pos);
+    float r = length(hit_local);
 
     vec3 total_color_front = vec3(0.0);
     vec3 total_color_back = vec3(0.0);
@@ -454,7 +464,7 @@ void main() {
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = u_stars_pos_radius[s].w;
-        vec3 frag_to_star = star_pos - hit_pos;
+        vec3 frag_to_star = (star_pos - u_host_planet_pos) - hit_local;
         float dist_to_star = length(frag_to_star);
         if (dist_to_star < 1e-5) continue;
         vec3 L = frag_to_star / dist_to_star;
@@ -550,7 +560,7 @@ void main() {
             float caster_r = u_casters[j].w;
             float atmo_h = u_caster_atmos[j].w;
 
-            vec3 frag_to_caster = caster_pos - hit_pos;
+            vec3 frag_to_caster = (caster_pos - u_host_planet_pos) - hit_local;
             float t_proj = dot(frag_to_caster, L);
             if (t_proj < 0.0) continue;
 
@@ -594,7 +604,7 @@ void main() {
         }
 
         if (u_host_planet_radius > 0.0) {
-            vec3 frag_to_host = u_host_planet_pos - hit_pos;
+            vec3 frag_to_host = -hit_local;
             float t_proj = dot(frag_to_host, L);
 
             if (t_proj > 0.0 && t_proj < dist_to_star) {
@@ -654,7 +664,7 @@ void main() {
 
     vec3 total_planetshine = vec3(0.0);
     if (u_host_planet_radius > 0.0) {
-        vec3 frag_to_host = u_host_planet_pos - f_world_pos;
+        vec3 frag_to_host = -f_local_pos;
         float dist_host_sq = dot(frag_to_host, frag_to_host);
         float dist_host = sqrt(dist_host_sq);
 
