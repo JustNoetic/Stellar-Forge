@@ -474,9 +474,9 @@ void main() {
                 float inner_r_km = u_ring_params[k].x * u_au_to_km;
                 float outer_r_km = u_ring_params[k].y * u_au_to_km;
 
-                float dr = fwidth(dist_from_center) * 1.5;
+                float span = max(1e-6, outer_r_km - inner_r_km);
+                float dr = min(fwidth(dist_from_center) * 1.5, span * 0.05);
                 if (dist_from_center >= inner_r_km - dr && dist_from_center <= outer_r_km + dr) {
-                    float span = max(1e-6, outer_r_km - inner_r_km);
                     float p_hit = (dist_from_center - inner_r_km) / span;
                     float dp = max(dr / span, 1.5 / 4096.0);
                     

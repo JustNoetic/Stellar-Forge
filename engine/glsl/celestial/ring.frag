@@ -348,7 +348,7 @@ void main() {
     for (int i=0; i<u_num_ring_planes; i++) {
         float inner_r = u_ring_planes[i].inner_r;
         float outer_r = u_ring_planes[i].outer_r;
-        float dr = fwidth(r) * 0.75;
+        float dr = min(fwidth(r) * 0.75, (outer_r - inner_r) * 0.05);
 
         if (r >= inner_r - dr && r <= outer_r + dr) {
             float t = (r - inner_r) / max(1e-6, outer_r - inner_r);
