@@ -8,6 +8,22 @@ def hex_to_rgb(hex_str):
     hex_str = hex_str.lstrip('#')
     return tuple(int(hex_str[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
+def hex_to_linear_rgb(hex_str):
+    hex_str = hex_str.lstrip('#')
+    srgb = tuple(int(hex_str[i:i+2], 16) / 255.0 for i in (0, 2, 4))
+    return np.array([math.pow(c, 2.2) for c in srgb], dtype=np.float64)
+
+def compute_texture_spherical_mean(img):
+    """Compute the latitude-weighted (cos phi) mean linear RGB color of an equirectangular image map."""
+    arr = np.asarray(img.convert('RGB'), dtype=np.float32) / 255.0
+    arr_lin = np.power(arr, 2.2)
+    H, W, _ = arr_lin.shape
+    weights = np.cos(np.linspace(-np.pi/2.0 + np.pi/(2.0*H), np.pi/2.0 - np.pi/(2.0*H), H))
+    row_means = np.mean(arr_lin, axis=1) # shape (H, 3)
+    mean_rgb = np.average(row_means, axis=0, weights=weights)
+    return np.asarray(mean_rgb, dtype=np.float64)
+
+
 def sample_gradient(sorted_grad, p):
     if not sorted_grad:
         return 1.0

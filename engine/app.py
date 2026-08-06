@@ -117,35 +117,58 @@ def _camera_rot_axis(axis, angle):
     s = math.sin(angle)
     return np.eye(3, dtype='f8') + s * K + (1.0 - c) * (K @ K)
 
-def _camera_screen_up(fwd, roll_rad):
-    """Screen-space up of the current view: world +Y projected onto the plane
-    perpendicular to `fwd`, then rotated by roll about the view axis.
-
-    This is the actual up vector the look-at view renders, so drags rotated about
-    it always follow the cursor on screen, at any pitch (unlike raw world +Y)."""
+def _camera_get_up(cam, fwd):
+    """Retrieve and orthogonalize the continuous camera UP vector."""
     fwd = np.asarray(fwd, dtype='f8')
-    n = np.linalg.norm(fwd)
-    if n < 1e-12:
+    n_fwd = np.linalg.norm(fwd)
+    if n_fwd < 1e-12:
         return np.array([0.0, 1.0, 0.0], dtype='f8')
-    fwd = fwd / n
-    up_proj = np.array([0.0, 1.0, 0.0], dtype='f8') - float(np.dot(fwd, np.array([0.0, 1.0, 0.0], dtype='f8'))) * fwd
-    nup = np.linalg.norm(up_proj)
-    if nup > 1e-9:
-        up = up_proj / nup
+    fwd = fwd / n_fwd
+    
+    raw_up = np.array(cam.get("up", [0.0, 1.0, 0.0]), dtype='f8')
+    if np.linalg.norm(raw_up) < 1e-6:
+        raw_up = np.array([0.0, 1.0, 0.0], dtype='f8')
+    
+    up_proj = raw_up - float(np.dot(raw_up, fwd)) * fwd
+    n_up = np.linalg.norm(up_proj)
+    if n_up > 1e-6:
+        return up_proj / n_up
+    
+    alt = np.array([1.0, 0.0, 0.0], dtype='f8')
+    alt_proj = alt - float(np.dot(alt, fwd)) * fwd
+    n_alt = np.linalg.norm(alt_proj)
+    if n_alt > 1e-6:
+        return alt_proj / n_alt
+    alt2 = np.array([0.0, 0.0, 1.0], dtype='f8')
+    alt_proj2 = alt2 - float(np.dot(alt2, fwd)) * fwd
+    return alt_proj2 / np.linalg.norm(alt_proj2)
+
+def _camera_screen_up(fwd, roll_rad, cam=None):
+    """Screen-space up of the current view."""
+    if cam is not None and "up" in cam:
+        up = _camera_get_up(cam, fwd)
     else:
-        # looking straight up/down: pick a stable perpendicular instead
-        up = np.array([1.0, 0.0, 0.0], dtype='f8')
-        up = up - float(np.dot(fwd, up)) * fwd
-        nup = np.linalg.norm(up)
-        up = up / nup if nup > 1e-9 else np.array([0.0, 0.0, 1.0], dtype='f8')
+        fwd = np.asarray(fwd, dtype='f8')
+        n = np.linalg.norm(fwd)
+        if n < 1e-12:
+            return np.array([0.0, 1.0, 0.0], dtype='f8')
+        fwd = fwd / n
+        up_proj = np.array([0.0, 1.0, 0.0], dtype='f8') - float(np.dot(fwd, np.array([0.0, 1.0, 0.0], dtype='f8'))) * fwd
+        nup = np.linalg.norm(up_proj)
+        if nup > 1e-9:
+            up = up_proj / nup
+        else:
+            up = np.array([1.0, 0.0, 0.0], dtype='f8')
+            up = up - float(np.dot(fwd, up)) * fwd
+            nup = np.linalg.norm(up)
+            up = up / nup if nup > 1e-9 else np.array([0.0, 0.0, 1.0], dtype='f8')
     if abs(roll_rad) > 1e-9:
         up = _camera_rot_axis(fwd, -roll_rad) @ up
     return up
 
-def _camera_orient_from_view(fwd, roll_rad):
-    """Orientation matrix (columns: right, up, back) matching the rendered view
-    (row-vector convention): look_at(pos, pos+fwd, Y) followed by Rz(roll)."""
-    up = _camera_screen_up(fwd, roll_rad)
+def _camera_orient_from_view(fwd, roll_rad, cam=None):
+    """Orientation matrix (columns: right, up, back) matching rendered view."""
+    up = _camera_screen_up(fwd, roll_rad, cam)
     right = np.cross(fwd, up)
     nr = np.linalg.norm(right)
     if nr > 1e-9:
@@ -165,59 +188,122 @@ def _camera_euler_from_orient(R):
     roll = math.degrees(math.atan2(-float(np.dot(up, right_ref)), float(np.dot(up, up_ref))))
     return yaw, pitch, roll
 
+def _oblate_surface_normal(rel, f=0.0, pole=None):
+    """Compute the true outward surface normal vector of an oblate spheroid.
+    `rel` is relative position from body center, `f` is oblateness, `pole` is unit spin axis."""
+    rel = np.asarray(rel, dtype='f8')
+    r_norm = np.linalg.norm(rel)
+    if r_norm < 1e-300:
+        return np.array([0.0, 1.0, 0.0], dtype='f8')
+    
+    radial = rel / r_norm
+    if f <= 0.0 or pole is None:
+        return radial
+    
+    pole = np.asarray(pole, dtype='f8')
+    p_norm = np.linalg.norm(pole)
+    if p_norm < 1e-12:
+        return radial
+    pole = pole / p_norm
+    
+    f_clamped = min(0.9, max(0.0, float(f)))
+    scale_para = 1.0 / ((1.0 - f_clamped) ** 2)
+    
+    para_len = float(np.dot(rel, pole))
+    N = rel + (scale_para - 1.0) * para_len * pole
+    n_len = np.linalg.norm(N)
+    if n_len > 1e-12:
+        return N / n_len
+    return radial
+
+def _camera_get_ref_up(cam, rel):
+    """Determine the reference vertical axis for horizon-aligned FPS rotation, taking oblate planet geometry into account."""
+    f = float(cam.get("track_f", 0.0))
+    pole = cam.get("track_pole", None)
+    return _oblate_surface_normal(rel, f, pole)
+
 def _camera_pivot_apply(cam, dx, dy, sensitivity):
-    """LMB trackball pivot: track a full orientation matrix so the image rotates
-    rigidly with the cursor at any pitch/roll (roll-aware, no pole spinning)."""
+    """LMB trackball/FPS pivot: rotate view direction and up vector in place (free look)."""
     if cam.get("cam_look", "aim") == "aim":
         rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
         r = np.linalg.norm(rel)
         fwd = -rel / r if r > 1e-300 else _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
     else:
+        rel = np.asarray(cam.get("cam_pos_rel", [0.0, 0.0, 1.0]), dtype='f8')
         fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
-    roll_rad = math.radians(cam.get("roll_actual", 0.0))
-    R = _camera_orient_from_view(fwd, roll_rad)
-    R = _camera_rot_axis(R[:, 1], math.radians(-dx * sensitivity)) @ (_camera_rot_axis(R[:, 0], math.radians(-dy * sensitivity)) @ R)
-    yaw_new, pitch_new, roll_new = _camera_euler_from_orient(R)
-    cam["yaw"] = cam["yaw_actual"] = yaw_new
-    cam["pitch"] = cam["pitch_actual"] = pitch_new
-    cam["roll"] = cam["roll_actual"] = roll_new
-
-def _camera_orbit_apply(cam, dx, dy, sensitivity):
-    """RMB orbit: rotate the camera position about the pivot. Horizontal drags
-    rotate about the world vertical (turntable: pitch preserved, horizon stays
-    level, no roll/tumble near the poles); vertical drags rotate about the
-    view's own right axis. Radius preserved. Direct (no smoothing)."""
-    rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
-    r = np.linalg.norm(rel)
-    if r < 1e-300:
-        return
-    if cam.get("cam_look", "aim") == "aim":
-        fwd = -rel / r
-    else:
-        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
-    roll_rad = math.radians(cam.get("roll_actual", 0.0))
-    up = _camera_screen_up(fwd, roll_rad)
+    
+    up = _camera_get_up(cam, fwd)
     right = np.cross(fwd, up)
     nr = np.linalg.norm(right)
     if nr > 1e-9:
         right = right / nr
     else:
         right = np.array([1.0, 0.0, 0.0], dtype='f8')
-    # Keep the vertical-drag axis sign-continuous: the yaw parameterization
-    # flips by 180 deg when pitch crosses +/-90, which would otherwise flip
-    # the recomputed axis every step and trap the orbit just past the pole.
-    right_prev = cam.get("orbit_right", None)
-    if right_prev is not None and float(np.dot(right, right_prev)) < 0.0:
-        right = -right
-    cam["orbit_right"] = right
-    # drag right -> orbit right about the ecliptic vertical (no pole roll);
-    # drag down -> orbit up about the view's right axis
-    rel_new = _camera_rot_axis(np.array([0.0, 1.0, 0.0], dtype='f8'), math.radians(-dx * sensitivity)) @ (_camera_rot_axis(right, math.radians(-dy * sensitivity)) @ rel)
+    up = np.cross(right, fwd)
+    up = up / np.linalg.norm(up)
+
+    if cam.get("horizon_align", True) and cam.get("is_near_surface", False):
+        h_axis = _camera_get_ref_up(cam, rel)
+    else:
+        h_axis = up
+
+    R = _camera_rot_axis(h_axis, math.radians(-dx * sensitivity)) @ _camera_rot_axis(right, math.radians(-dy * sensitivity))
+    fwd_new = R @ fwd
+    fwd_new = fwd_new / np.linalg.norm(fwd_new)
+    up_new = R @ up
+    up_new = up_new / np.linalg.norm(up_new)
+
+    yaw_new, pitch_new = _camera_yaw_pitch_from(fwd_new)
+    cam["yaw"] = cam["yaw_actual"] = yaw_new
+    cam["pitch"] = cam["pitch_actual"] = pitch_new
+    cam["up"] = up_new.tolist()
+
+def _camera_orbit_apply(cam, dx, dy, sensitivity):
+    """RMB screen-space orbit: rotate camera position about pivot using screen-space axes.
+    Guarantees horizontal mouse drag always orbits left/right on screen (including at poles),
+    and vertical drag orbits up/down on screen, with continuous cam['up'] to prevent 180° pole flips.
+    Preserves free look direction if cam['cam_look'] == 'free' without snapping to 'aim'."""
+    rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
+    r = np.linalg.norm(rel)
+    if r < 1e-300:
+        return
+
+    is_free = (cam.get("cam_look", "aim") == "free")
+    if is_free:
+        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    else:
+        fwd = -rel / r
+
+    up = _camera_get_up(cam, fwd)
+    right = np.cross(fwd, up)
+    nr = np.linalg.norm(right)
+    if nr > 1e-9:
+        right = right / nr
+    else:
+        right = np.array([1.0, 0.0, 0.0], dtype='f8')
+    up = np.cross(right, fwd)
+    up = up / np.linalg.norm(up)
+
+    R_h = _camera_rot_axis(up, math.radians(dx * sensitivity))
+    R_v = _camera_rot_axis(right, math.radians(dy * sensitivity))
+    R = R_h @ R_v
+
+    rel_new = R @ rel
     r_new = np.linalg.norm(rel_new)
     if r_new > 1e-300:
         rel_new = rel_new / r_new * r
+    up_new = R @ up
+    up_new = up_new / np.linalg.norm(up_new)
+
+    if is_free:
+        fwd_new = R @ fwd
+        fwd_new = fwd_new / np.linalg.norm(fwd_new)
+        yaw_new, pitch_new = _camera_yaw_pitch_from(fwd_new)
+        cam["yaw"] = cam["yaw_actual"] = yaw_new
+        cam["pitch"] = cam["pitch_actual"] = pitch_new
+
     cam["cam_pos_rel"] = rel_new.tolist()
-    cam["cam_look"] = "aim"
+    cam["up"] = up_new.tolist()
 
 import threading
 import time
@@ -240,7 +326,8 @@ from engine.physics.physics_core import _extract_render_state, _update_hierarchy
 from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.post_shaders import *
-from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
+from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption, compute_cloud_layer_properties
+
 _PERF_ENABLED = os.environ.get("STELLAR_FORGE_PERF") == "1"
 _PERF_TRACKER = None
 
@@ -343,8 +430,7 @@ from engine.rendering.planetshine import (
     _build_tex_idx_arr,
     _build_rotation_props,
     compute_body_rotation_angles_jit,
-    compute_planetshine_numba,
-    halton
+    compute_planetshine_numba
 )
 from engine.rendering.texture_baker import apply_hsba_np, bake_and_export_ring_textures
 from engine.core.input_handler import InputHandlerMixin
@@ -395,7 +481,6 @@ class App(InputHandlerMixin):
             "atmo_quality": 1,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
-            "atmo_jitter": True,
             "show_orbits": True,
             "orbit_fade_dir_idx": 0,
             "orbit_min_alpha": 0.3,
@@ -408,8 +493,6 @@ class App(InputHandlerMixin):
             "msaa_samples": 4,
             "inspector_frame": 0,
             "shadow_caster_budget": 32,
-            "taa_enabled": True,
-            "atmo_render_scale": 0.5,
             "screenshot_res_idx": 1,
             "anisotropy": 16.0,
         }
@@ -423,7 +506,6 @@ class App(InputHandlerMixin):
         self._screenshot_saving = False
 
         # Post-Processing FBOs
-        self.hdr_msaa_fbo = None
         self.hdr_resolve_fbo = None
         self.hdr_resolve_tex = None
         self.bloom_fbos = []
@@ -431,24 +513,17 @@ class App(InputHandlerMixin):
         self.last_fb_size = (0, 0)
         self.last_msaa_samples = -1
         
-        # Atmosphere low-res rendering resources
-        self.atmo_lowres_tex = None
-        self.atmo_lowres_fbo = None
+        # Orbit-line MSAA resources (only orbit lines are multisampled)
+        self.orbit_msaa_fbo = None
+        self.orbit_resolved_tex = None
+        self.orbit_resolve_fbo = None
+        
+        # Atmosphere rendering resources
         self.prog_atmo_composite = None
         self.quad_vao_atmo_comp = None
-        self.last_atmo_res = (0, 0)
         
-        # TAA state and resources
-        self.taa_history_tex = None
-        self.taa_output_tex = None
-        self.taa_output_fbo = None
-        self.taa_history_fbo = None
         self.depth_texture = None
-        self.prog_taa = None
-        self.quad_vao_taa = None
-        self.prev_vp = None
         self.prev_cam_origin = None
-        self.taa_frame_index = 0
         
         # Screenshot capture state
         self._screenshot_request = None      # (width, height) tuple when capture requested
@@ -511,7 +586,6 @@ class App(InputHandlerMixin):
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
-                "atmo_jitter": self.camera.get("atmo_jitter", True),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
@@ -528,8 +602,6 @@ class App(InputHandlerMixin):
                 "fov": self.camera.get("fov", 45.0),
                 "flight_speed": self.camera.get("flight_speed", 0.1),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
-                "taa_enabled": self.camera.get("taa_enabled", True),
-                "atmo_render_scale": self.camera.get("atmo_render_scale", 0.5),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
                 "horizon_align": self.camera.get("horizon_align", True),
             }
@@ -755,6 +827,9 @@ class App(InputHandlerMixin):
         self.planet_normal_textures = []
         self.planet_specular_textures = []
         self.texture_slices = {} # name_lower -> 1-based slice_idx
+        self.cloud_texture_slices = {} # name_lower -> 1-based slice_idx in planet_textures
+        self.texture_mean_colors = {} # name_lower -> np.ndarray([r,g,b]) in linear space
+
         self.ring_textures_front = {}  # name_lower -> PIL.Image (4096, 1)
         self.ring_textures_back = {}   # name_lower -> PIL.Image (4096, 1)
         self.ring_gl_textures_front = {} # name_lower -> ModernGL Texture
@@ -796,6 +871,8 @@ class App(InputHandlerMixin):
                             img = Image.open(d_path).convert('RGBA')
                             img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
                             self.planet_textures.append(img.tobytes())
+                            self.texture_mean_colors[name_lower] = compute_texture_spherical_mean(img)
+
                             
                             # Normal
                             n_path = os.path.join(textures_dir, name + "_normal.png")
@@ -929,6 +1006,9 @@ class App(InputHandlerMixin):
                                 img = Image.new('RGBA', (2048, 1024), (255, 255, 255, 255))
                             img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
                             self.planet_textures.append(img.tobytes())
+                            if d_path:
+                                self.texture_mean_colors[name_lower] = compute_texture_spherical_mean(img)
+
                             
                             if n_path:
                                 img_n = Image.open(n_path).convert('RGBA')
@@ -1227,6 +1307,8 @@ class App(InputHandlerMixin):
         prog_culling_compute = ctx.compute_shader(culling_compute_shader)
     
         prog_gpu_orbits = ctx.program(vertex_shader=orbit_vertex_shader, fragment_shader=orbit_fragment_shader)
+        if 'u_scene_depth' in prog_gpu_orbits:
+            prog_gpu_orbits['u_scene_depth'].value = 9
         prog_orbit_compute = ctx.compute_shader(orbit_compute_shader)
     
         prog_ephem_orbits = ctx.program(vertex_shader=ephem_orbit_vertex_shader, fragment_shader=ephem_orbit_fragment_shader)
@@ -1250,7 +1332,6 @@ class App(InputHandlerMixin):
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
         self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
-        self.prog_taa = ctx.program(vertex_shader=taa_resolve_shader_vs, fragment_shader=taa_resolve_shader_fs)
         self.prog_atmo_composite = ctx.program(vertex_shader=atmo_composite_shader_vs, fragment_shader=atmo_composite_shader_fs)
         
         quad_vertices = np.array([
@@ -1263,7 +1344,6 @@ class App(InputHandlerMixin):
         self.quad_vao_down = ctx.vertex_array(self.prog_bloom_down, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_up = ctx.vertex_array(self.prog_bloom_up, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_comp = ctx.vertex_array(self.prog_composite, [(quad_vbo, '2f', 'in_position')])
-        self.quad_vao_taa = ctx.vertex_array(self.prog_taa, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_comp = ctx.vertex_array(self.prog_atmo_composite, [(quad_vbo, '2f', 'in_position')])
         
         # Compile Habitable Zone Shader
@@ -1695,7 +1775,6 @@ class App(InputHandlerMixin):
         u_atmo_ring_params = prog_atmo.get('u_ring_params', None)
         u_atmo_ring_coplanar_mask = prog_atmo.get('u_ring_coplanar_mask', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
-        u_atmo_jitter = prog_atmo.get('u_atmo_jitter', None)
 
         self.atmo_ssbo = ctx.buffer(reserve=608)
         self.atmo_ssbo.bind_to_storage_buffer(binding=8)
@@ -2625,33 +2704,27 @@ class App(InputHandlerMixin):
                 self._screenshot_request = None
                 self._screenshot_toast = ("Capturing...", time.time())
             
-            taa_enabled = self.camera.get("taa_enabled", True)
-            msaa_samples = 0 if taa_enabled else self.camera.get("msaa_samples", 4)
-            # Disable MSAA for screenshot frames to avoid massive VRAM usage
+            # Orbit-line MSAA is disabled for screenshot frames to avoid massive VRAM usage
             if self._screenshot_capturing:
                 msaa_samples = 0
+            else:
+                msaa_samples = self.camera.get("msaa_samples", 4)
             if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples:
                 self.last_fb_size = (self.fb_width, self.fb_height)
                 self.last_msaa_samples = msaa_samples
                 
                 # Release old
-                if self.hdr_msaa_fbo: self.hdr_msaa_fbo.release(); self.hdr_msaa_fbo = None
                 if self.hdr_resolve_fbo: self.hdr_resolve_fbo.release(); self.hdr_resolve_fbo = None
                 if self.hdr_resolve_tex: self.hdr_resolve_tex.release(); self.hdr_resolve_tex = None
-                if self.taa_history_tex: self.taa_history_tex.release(); self.taa_history_tex = None
-                if self.taa_output_tex: self.taa_output_tex.release(); self.taa_output_tex = None
-                if self.taa_output_fbo: self.taa_output_fbo.release(); self.taa_output_fbo = None
-                if self.taa_history_fbo: self.taa_history_fbo.release(); self.taa_history_fbo = None
+                if self.orbit_msaa_fbo: self.orbit_msaa_fbo.release(); self.orbit_msaa_fbo = None
+                if self.orbit_resolve_fbo: self.orbit_resolve_fbo.release(); self.orbit_resolve_fbo = None
+                if self.orbit_resolved_tex: self.orbit_resolved_tex.release(); self.orbit_resolved_tex = None
                 if self.depth_texture: self.depth_texture.release(); self.depth_texture = None
-                self.prev_vp = None
                 self.prev_cam_origin = None
                 for fbo in self.bloom_fbos: fbo.release()
                 for tex in self.bloom_texs: tex.release()
                 self.bloom_fbos = []
                 self.bloom_texs = []
-                if self.atmo_lowres_tex: self.atmo_lowres_tex.release(); self.atmo_lowres_tex = None
-                if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
-                self.last_atmo_res = (0, 0)
                 
                 # Rebuild
                 self.hdr_resolve_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
@@ -2664,26 +2737,21 @@ class App(InputHandlerMixin):
                 self.depth_texture.repeat_x = False
                 self.depth_texture.repeat_y = False
                 
-                self.taa_history_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
-                self.taa_history_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                self.taa_history_tex.repeat_x = False
-                self.taa_history_tex.repeat_y = False
-                
-                self.taa_output_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
-                self.taa_output_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                self.taa_output_tex.repeat_x = False
-                self.taa_output_tex.repeat_y = False
-                self.taa_output_fbo = ctx.framebuffer(color_attachments=[self.taa_output_tex])
-                self.taa_history_fbo = ctx.framebuffer(color_attachments=[self.taa_history_tex], depth_attachment=self.depth_texture)
+                self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
                 
                 if msaa_samples > 0:
-                    msaa_color = ctx.renderbuffer((self.fb_width, self.fb_height), components=4, samples=msaa_samples, dtype='f4')
-                    msaa_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height), samples=msaa_samples)
-                    self.hdr_msaa_fbo = ctx.framebuffer(color_attachments=[msaa_color], depth_attachment=msaa_depth)
-                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
+                    orbit_msaa_color = ctx.renderbuffer((self.fb_width, self.fb_height), components=4, samples=msaa_samples, dtype='f4')
+                    orbit_msaa_depth = ctx.depth_renderbuffer((self.fb_width, self.fb_height), samples=msaa_samples)
+                    self.orbit_msaa_fbo = ctx.framebuffer(color_attachments=[orbit_msaa_color], depth_attachment=orbit_msaa_depth)
+                    self.orbit_resolved_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                    self.orbit_resolved_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    self.orbit_resolved_tex.repeat_x = False
+                    self.orbit_resolved_tex.repeat_y = False
+                    self.orbit_resolve_fbo = ctx.framebuffer(color_attachments=[self.orbit_resolved_tex])
                 else:
-                    self.hdr_msaa_fbo = None
-                    self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
+                    self.orbit_msaa_fbo = None
+                    self.orbit_resolved_tex = None
+                    self.orbit_resolve_fbo = None
                 
                 # Bloom chain (5 levels)
                 bw, bh = self.fb_width // 2, self.fb_height // 2
@@ -2699,25 +2767,8 @@ class App(InputHandlerMixin):
                     bw //= 2
                     bh //= 2
 
-            atmo_scale = self.camera.get("atmo_render_scale", 0.5)
-            target_atmo_w = max(1, int(self.fb_width * atmo_scale))
-            target_atmo_h = max(1, int(self.fb_height * atmo_scale))
-            if self.last_atmo_res != (target_atmo_w, target_atmo_h):
-                if self.atmo_lowres_tex: self.atmo_lowres_tex.release(); self.atmo_lowres_tex = None
-                if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
-                
-                self.atmo_lowres_tex = ctx.texture((target_atmo_w, target_atmo_h), 4, dtype='f4')
-                self.atmo_lowres_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                self.atmo_lowres_tex.repeat_x = False
-                self.atmo_lowres_tex.repeat_y = False
-                self.atmo_lowres_fbo = ctx.framebuffer(color_attachments=[self.atmo_lowres_tex])
-                self.last_atmo_res = (target_atmo_w, target_atmo_h)
-
             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-            if self.hdr_msaa_fbo:
-                self.hdr_msaa_fbo.use()
-            else:
-                self.hdr_resolve_fbo.use()
+            self.hdr_resolve_fbo.use()
             ctx.clear(0.0, 0.0, 0.0, 1.0) 
     
             is_scrubbing = tl_active and tl_prog >= 1.0
@@ -2750,10 +2801,25 @@ class App(InputHandlerMixin):
                 sys_mgr_spice.populate_states_fast(et, self._ephem_mapping, pos_snap_render, vel_snap_render, spice_valid_mask)
     
             if not imgui.get_io().want_capture_keyboard:
+                d_roll = 0.0
                 if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
-                    self.camera["roll"] += 60.0 * dt_render
+                    d_roll += 60.0 * dt_render
                 if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
-                    self.camera["roll"] -= 60.0 * dt_render
+                    d_roll -= 60.0 * dt_render
+                if d_roll != 0.0:
+                    fwd_v = -rel / max(np.linalg.norm(rel), 1e-300) if cam["cam_look"] == "aim" else _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
+                    cur_up = _camera_get_up(cam, fwd_v)
+                    new_up = _camera_rot_axis(fwd_v, math.radians(d_roll)) @ cur_up
+                    cam["up"] = (new_up / np.linalg.norm(new_up)).tolist()
+                    cam["roll"] += d_roll
+
+                # Press F to snap camera look to tracked body center
+                if glfw.get_key(window, glfw.KEY_F) == glfw.PRESS:
+                    if not getattr(self, "_f_key_held", False):
+                        self.camera["cam_look"] = "aim"
+                        self._f_key_held = True
+                else:
+                    self._f_key_held = False
 
             self.body_radii = body_radii
 
@@ -2809,6 +2875,14 @@ class App(InputHandlerMixin):
                     track_f = float(bodies_data[t_idx].get('oblateness', 0.0))
                     if hasattr(self, "pole_n_arr") and t_idx < len(self.pole_n_arr):
                         track_pole = np.array(self.pole_n_arr[t_idx], dtype='f8')
+            
+            cam["track_f"] = track_f
+            cam["track_pole"] = track_pole.tolist()
+            if cam.get("tracking_idx") is not None and track_r > 0.0:
+                alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
+                cam["is_near_surface"] = (alt_au < _ROT_FOLLOW_ALT_AU)
+            else:
+                cam["is_near_surface"] = False
 
             # 1) LMB+RMB approach gesture: radial move toward the tracked body's surface
             if cam["approach_delta"] != 0.0:
@@ -2838,26 +2912,51 @@ class App(InputHandlerMixin):
             if rot_follow:
                 alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
                 if alt_au < _ROT_FOLLOW_ALT_AU:
-                    rot_weight = 1.0 - alt_au / _ROT_FOLLOW_ALT_AU
+                    alt_km = alt_au * AU_TO_KM
+                    if alt_km <= 50.0:
+                        rot_weight = 1.0
+                    else:
+                        t_fade = (alt_km - 50.0) / 150.0
+                        rot_weight = 1.0 - (3.0 * t_fade**2 - 2.0 * t_fade**3)
                     spin_angles = compute_body_rotation_angles_jit(
-                        float(self.shared_state["t"]) * 31557600.0,
+                        float(display_t) * 31557600.0,
                         self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr,
                         pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr)
                     t_idx = cam["tracking_idx"]
                     if t_idx < len(spin_angles):
                         spin_angle = float(spin_angles[t_idx])
                         prev_spin = getattr(self, "_contact_prev_spin", None)
+                        prev_track = getattr(self, "_contact_prev_track", None)
+                        if prev_track != t_idx:
+                            prev_spin = None
                         self._contact_prev_spin = spin_angle
+                        self._contact_prev_track = t_idx
                         if prev_spin is not None:
                             d_spin = spin_angle - prev_spin
-                            if abs(d_spin) > 1e-12:
-                                rel = _camera_rot_axis(self.pole_n_arr[t_idx], d_spin * rot_weight) @ rel
+                            d_spin = (d_spin + math.pi) % (2.0 * math.pi) - math.pi
+                            if abs(d_spin) > 1e-12 and abs(d_spin) < 0.5:
+                                pole_axis = self.pole_n_arr[t_idx]
+                                R_spin = _camera_rot_axis(pole_axis, d_spin * rot_weight)
+                                rel = R_spin @ rel
+                                cur_fwd = -rel / max(np.linalg.norm(rel), 1e-300) if cam["cam_look"] == "aim" else _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
+                                cur_up = _camera_get_up(cam, cur_fwd)
+                                new_up = R_spin @ cur_up
+                                cam["up"] = (new_up / np.linalg.norm(new_up)).tolist()
+                                if cam["cam_look"] == "free":
+                                    fwd_new = R_spin @ cur_fwd
+                                    fwd_new = fwd_new / np.linalg.norm(fwd_new)
+                                    yaw_new, pitch_new = _camera_yaw_pitch_from(fwd_new)
+                                    cam["yaw"] = cam["yaw_actual"] = yaw_new
+                                    cam["pitch"] = cam["pitch_actual"] = pitch_new
                     else:
                         self._contact_prev_spin = None
+                        self._contact_prev_track = None
                 else:
                     self._contact_prev_spin = None
+                    self._contact_prev_track = None
             else:
                 self._contact_prev_spin = None
+                self._contact_prev_track = None
 
             # 2b) Horizon alignment: below the same 200 km threshold, gently roll
             #     the camera (like holding Q/E) so the view is level to the local
@@ -2876,17 +2975,21 @@ class App(InputHandlerMixin):
                         fwd_al = -rel / max(np.linalg.norm(rel), 1e-300)
                     else:
                         fwd_al = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
-                    up_al = _camera_screen_up(fwd_al, 0.0)
-                    local_up = rel / max(np.linalg.norm(rel), 1e-300)
-                    ref = local_up - float(np.dot(local_up, fwd_al)) * fwd_al
-                    np_ref = np.linalg.norm(ref)
-                    if np_ref > 1e-6:
-                        ref = ref / np_ref
-                        roll_target = -math.degrees(math.atan2(
-                            float(np.dot(np.cross(up_al, ref), fwd_al)),
-                            float(np.dot(up_al, ref))))
-                        roll_diff = (cam["roll"] - roll_target + 180.0) % 360.0 - 180.0
-                        cam["roll"] -= 1.5 * align_strength * roll_diff * dt_render
+                    local_up = _oblate_surface_normal(rel, track_f, track_pole)
+                    target_up = local_up - float(np.dot(local_up, fwd_al)) * fwd_al
+                    n_tup = np.linalg.norm(target_up)
+                    if n_tup > 1e-6:
+                        target_up = target_up / n_tup
+                        cur_up = _camera_get_up(cam, fwd_al)
+                        c_dot = max(-1.0, min(1.0, float(np.dot(cur_up, target_up))))
+                        angle = math.acos(c_dot)
+                        if angle > 1e-6:
+                            rot_axis = np.cross(cur_up, target_up)
+                            if float(np.dot(rot_axis, fwd_al)) < 0.0:
+                                angle = -angle
+                            d_ang = angle * min(1.0, 1.5 * align_strength * dt_render)
+                            new_up = _camera_rot_axis(fwd_al, d_ang) @ cur_up
+                            cam["up"] = (new_up / np.linalg.norm(new_up)).tolist()
 
             # 3) WASD flight (screen-space strafe)
             keys = cam.get("keys", {})
@@ -2905,8 +3008,8 @@ class App(InputHandlerMixin):
                 front = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
             # screen-space strafe: A/D move along the camera's own right
             # (roll-aware), never along the ecliptic horizontal
-            roll_rad_f = math.radians(cam["roll_actual"])
-            right_v = _camera_orient_from_view(front, roll_rad_f)[:, 0]
+            cur_up_v = _camera_get_up(cam, front)
+            right_v = np.cross(front, cur_up_v)
             nr_r = np.linalg.norm(right_v)
             if nr_r > 1e-9:
                 right_v = right_v / nr_r
@@ -3018,14 +3121,14 @@ class App(InputHandlerMixin):
             cam_pos_f8 = np.array(rel, dtype='f8')
             yaw_rad_v, pitch_rad_v = math.radians(cam["yaw_actual"]), math.radians(cam["pitch_actual"])
             if cam["cam_look"] == "aim":
-                view_f8 = matrix44.create_look_at(cam_pos_f8, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], dtype='f8')
+                fwd_v = -cam_pos_f8 / max(np.linalg.norm(cam_pos_f8), 1e-300)
+                cam_up = _camera_get_up(cam, fwd_v)
+                view_f8 = matrix44.create_look_at(cam_pos_f8, [0.0, 0.0, 0.0], cam_up, dtype='f8')
             else:
                 fwd_v = _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
-                view_f8 = matrix44.create_look_at(cam_pos_f8, cam_pos_f8 + fwd_v, [0.0, 1.0, 0.0], dtype='f8')
+                cam_up = _camera_get_up(cam, fwd_v)
+                view_f8 = matrix44.create_look_at(cam_pos_f8, cam_pos_f8 + fwd_v, cam_up, dtype='f8')
             
-            roll_rad = math.radians(cam["roll_actual"])
-            if abs(roll_rad) > 1e-6:
-                view_f8 = matrix44.multiply(view_f8, matrix44.create_from_z_rotation(roll_rad, dtype='f8'))
             view = view_f8.astype('f4')
             cam_pos = cam_pos_f8.astype('f4')
 
@@ -3060,15 +3163,6 @@ class App(InputHandlerMixin):
             aspect_ratio = self.fb_width / max(self.fb_height, 1)
             projection_f8 = matrix44.create_perspective_projection_matrix(self.camera["fov"], aspect_ratio, near, far, dtype='f8')
             projection = projection_f8.astype('f4')
-            self.unjittered_projection = projection.copy()
-            if self.camera.get("taa_enabled", True):
-                self.taa_frame_index = (self.taa_frame_index + 1) % 8
-                hx = halton(self.taa_frame_index, 2)
-                hy = halton(self.taa_frame_index, 3)
-                jitter_x = 2.0 * (hx - 0.5) / self.fb_width
-                jitter_y = 2.0 * (hy - 0.5) / self.fb_height
-                projection[2, 0] -= jitter_x
-                projection[2, 1] -= jitter_y
     
             n_ring_planes = 0
             ring_centers_buf[:] = 0
@@ -3209,13 +3303,12 @@ class App(InputHandlerMixin):
                 all_instances[:num_bodies, 13:16] = visual_arr[:, 9:12]
                 all_instances[:num_bodies, 19] = visual_arr[:, 12]
                 all_instances[:num_bodies, 23] = visual_arr[:, 13]
-                all_instances[:num_bodies, 24] = self.tex_idx_arr[:num_bodies]
-                sim_t_sec = float(self.shared_state["t"]) * 31557600.0
-                all_instances[:num_bodies, 25] = compute_body_rotation_angles_jit(
-                    sim_t_sec, self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr
-                )
-
-
+            
+            all_instances[:num_bodies, 24] = self.tex_idx_arr[:num_bodies]
+            sim_t_sec = float(display_t) * 31557600.0
+            all_instances[:num_bodies, 25] = compute_body_rotation_angles_jit(
+                sim_t_sec, self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr
+            )
             
             if self.comparison_enabled:
                 cmp_pos_rel = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -3228,6 +3321,7 @@ class App(InputHandlerMixin):
                     all_instances[num_bodies:, 13:16] = self.visual_arr_cmp[:, 9:12]
                     all_instances[num_bodies:, 19] = self.visual_arr_cmp[:, 12]
                     all_instances[num_bodies:, 23] = self.visual_arr_cmp[:, 13]
+                
                 # Texture slice index + spin angle for comparison bodies (independent clock).
                 all_instances[num_bodies:, 24] = self.tex_idx_arr_cmp[:self.num_bodies_cmp]
                 cmp_t_sec = float(cmp_sim_t) * 31557600.0
@@ -3682,10 +3776,7 @@ class App(InputHandlerMixin):
                 _perf_gpu_end(_gq)
 
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                if self.hdr_msaa_fbo:
-                    self.hdr_msaa_fbo.use()
-                else:
-                    self.hdr_resolve_fbo.use()
+                self.hdr_resolve_fbo.use()
 
             self.ringshine_map_tex.use(location=8)
             
@@ -3743,9 +3834,54 @@ class App(InputHandlerMixin):
                         if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
                             build_atmo_lut(atmo, mass_sm_curr, is_cmp)
 
-            
+            # --- Active Refraction Uniform Setup ---
+            refract_center = (0.0, 0.0, 0.0)
+            refract_radius_km = 0.0
+            refract_max_bend = 0.0
+            refract_scale_height = 1.0
+            refract_pole = (0.0, 1.0, 0.0)
+            refract_oblateness = 0.0
+            au_to_km_val = 149597870.7
+
+            if sorted_atmos:
+                closest_sq_dist, closest_atmo, is_cmp = sorted_atmos[-1]
+                bi_curr = closest_atmo['body_idx']
+                mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
+                props_c, trans_c, thick_c = get_cached_atmosphere_properties(closest_atmo, mass_sm_curr)
+                cam_dist_au = math.sqrt(closest_sq_dist)
+                
+                pos_rel = cmp_pos_rel if is_cmp else pos_rel_all
+                refract_center = (float(pos_rel[bi_curr, 0]), float(pos_rel[bi_curr, 1]), float(pos_rel[bi_curr, 2]))
+                refract_radius_km = float(closest_atmo['planet_radius_km'])
+                refract_scale_height = float(props_c.get('scale_height_km', 8.5))
+                refractivity = float(props_c.get('refractivity', 0.00029))
+                planet_radius_au = closest_atmo['planet_radius_km'] / au_to_km_val
+                refract_max_bend = compute_max_bend(planet_radius_au, refract_scale_height, refractivity)
+
+                b_info = self.bodies_data_cmp[bi_curr] if is_cmp else bodies_data[bi_curr]
+                pole_ref = self.pole_n_arr_cmp[bi_curr] if is_cmp else self.pole_n_arr[bi_curr]
+                refract_pole = (float(pole_ref[0]), float(pole_ref[1]), float(pole_ref[2]))
+                refract_oblateness = float(b_info.get('oblateness', 0.0))
+
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_gpu_orbits, prog_ephem_orbits, getattr(self, 'prog_hz', None)):
+                if prog is not None:
+                    if 'u_refract_center' in prog:
+                        prog['u_refract_center'].value = refract_center
+                    if 'u_refract_radius' in prog:
+                        prog['u_refract_radius'].value = refract_radius_km
+                    if 'u_refract_max_bend' in prog:
+                        prog['u_refract_max_bend'].value = refract_max_bend
+                    if 'u_refract_scale_height' in prog:
+                        prog['u_refract_scale_height'].value = refract_scale_height
+                    if 'u_refract_pole' in prog:
+                        prog['u_refract_pole'].value = refract_pole
+                    if 'u_refract_oblateness' in prog:
+                        prog['u_refract_oblateness'].value = refract_oblateness
+                    if 'u_au_to_km' in prog:
+                        prog['u_au_to_km'].value = au_to_km_val
+
             ctx.enable(moderngl.DEPTH_TEST)
-            ctx.enable(moderngl.CULL_FACE)
+            ctx.disable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
 
@@ -3770,12 +3906,12 @@ class App(InputHandlerMixin):
 
             # --- Pass 2: Orbit Lines ---
             ctx.enable(moderngl.BLEND)
-            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
             ctx.enable(moderngl.DEPTH_TEST)
             ctx.depth_mask = True
             
             _gq = _perf_gpu_begin(ctx, "gpu_orbits")
-            if show_orbits:
+            def draw_orbits():
                 if n_orbits > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
                     orbit_ssbo_out.bind_to_storage_buffer(binding=1)
@@ -3887,13 +4023,36 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
+
+            if show_orbits and (n_orbits > 0 or (self.comparison_enabled and self.n_orbits_cmp > 0)):
+                if self.orbit_msaa_fbo is not None:
+                    # Orbit lines get their own MSAA buffer; the resolved result is
+                    # blended back over the (non-MSAA) scene afterwards.
+                    self.orbit_msaa_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.clear(0.0, 0.0, 0.0, 0.0)
+                    if self.depth_texture:
+                        self.depth_texture.use(location=9)
+                    prog_gpu_orbits['u_manual_occlusion'].value = 1
+                    draw_orbits()
+                    ctx.copy_framebuffer(self.orbit_resolve_fbo, self.orbit_msaa_fbo)
+                    self.hdr_resolve_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.disable(moderngl.DEPTH_TEST)
+                    self.orbit_resolved_tex.use(location=2)
+                    self.prog_atmo_composite['u_atmo_texture'].value = 2
+                    self.quad_vao_atmo_comp.render(moderngl.TRIANGLE_STRIP)
+                    ctx.enable(moderngl.DEPTH_TEST)
+                else:
+                    prog_gpu_orbits['u_manual_occlusion'].value = 0
+                    draw_orbits()
             _perf_gpu_end(_gq)
 
             def render_atmosphere_pass(clip_mode):
                 if not sorted_atmos:
                     return
                 ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
                 ctx.depth_func = '<='
                 ctx.enable(moderngl.CULL_FACE)
                 ctx.cull_face = 'front'
@@ -3913,8 +4072,6 @@ class App(InputHandlerMixin):
                 
                 if u_atmo_clip_mode is not None:
                     u_atmo_clip_mode.value = clip_mode
-                if u_atmo_jitter is not None:
-                    u_atmo_jitter.value = 1 if self.camera.get("atmo_jitter", True) else 0
     
                 # Pre-build lookup tables outside the loop
                 atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
@@ -4057,7 +4214,7 @@ class App(InputHandlerMixin):
                     self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
                     self.atmo_staging_int_view[30] = body_idx_in_unified
                     self.atmo_staging[31] = float(self.frame_counter % 8)
-                    self.atmo_staging[32:35] = atmo.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32))
+                    self.atmo_staging[32:35] = np.asarray(atmo.get('mie_albedo', [1.0, 1.0, 1.0]), dtype=np.float32)
                     # index 35: u_refractivity (surface n_mix - 1, drives eclipse refraction)
                     self.atmo_staging[35] = float(props.get('refractivity', 0.00029))
                     self.atmo_staging[36:68] = active_casters_buf.ravel()
@@ -4101,38 +4258,13 @@ class App(InputHandlerMixin):
                 ctx.disable(moderngl.BLEND)
 
             def execute_atmosphere_pass(clip_mode):
-                atmo_scale = self.camera.get("atmo_render_scale", 0.5)
-                use_lowres = (atmo_scale < 1.0 and self.atmo_lowres_fbo is not None)
-                if use_lowres:
-                    self.atmo_lowres_fbo.use()
-                    ctx.viewport = (0, 0, *self.last_atmo_res)
-                    ctx.clear(0.0, 0.0, 0.0, 0.0)
-                    if 'u_screen_res' in prog_atmo:
-                        prog_atmo['u_screen_res'].value = (float(self.last_atmo_res[0]), float(self.last_atmo_res[1]))
-                else:
-                    if 'u_screen_res' in prog_atmo:
-                        prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                if 'u_screen_res' in prog_atmo:
+                    prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
                 
                 if self.depth_texture:
                     self.depth_texture.use(location=9)
 
                 render_atmosphere_pass(clip_mode)
-                
-                if use_lowres:
-                    if self.hdr_msaa_fbo:
-                        self.hdr_msaa_fbo.use()
-                    else:
-                        self.hdr_resolve_fbo.use()
-                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                    ctx.enable(moderngl.BLEND)
-                    ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-                    ctx.disable(moderngl.DEPTH_TEST)
-                    self.atmo_lowres_tex.use(location=0)
-                    self.prog_atmo_composite['u_atmo_texture'].value = 0
-                    self.quad_vao_atmo_comp.render(moderngl.TRIANGLE_STRIP)
-                    ctx.depth_mask = True
-                    ctx.enable(moderngl.DEPTH_TEST)
-                    ctx.disable(moderngl.BLEND)
 
             # --- Pass 1: Atmosphere behind rings ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
@@ -4366,10 +4498,85 @@ class App(InputHandlerMixin):
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_front")
             execute_atmosphere_pass(2)
             _perf_gpu_end(_gq)
-            
-            if self.hdr_msaa_fbo:
-                ctx.copy_framebuffer(self.hdr_resolve_fbo, self.hdr_msaa_fbo)
-                self.hdr_resolve_fbo.use()
+
+            def compute_body_albedos(body_info, insp_idx, insp_is_cmp):
+                """Compute Geometric Albedo (A_g), Bond Albedo (A_b), Phase Integral (q), and Top-of-Atmosphere RGB reflectance."""
+                b_name = body_info.get('name', '').lower()
+                tex_prop = body_info.get('texture', '').lower()
+
+                if tex_prop and tex_prop in self.texture_mean_colors:
+                    p_surf = self.texture_mean_colors[tex_prop].copy()
+                elif b_name in self.texture_mean_colors:
+                    p_surf = self.texture_mean_colors[b_name].copy()
+                elif 'albedo_scale' in body_info:
+                    alb_val = float(body_info['albedo_scale'])
+                    p_surf = np.array([alb_val, alb_val, alb_val], dtype=np.float64)
+                else:
+                    p_surf = hex_to_linear_rgb(body_info.get('color', '#ffffff'))
+
+                atmo_bodies_list = self.atmo_bodies_cmp if insp_is_cmp else atmo_bodies
+                atmo_item = next((a for a in atmo_bodies_list if a.get('body_idx') == insp_idx), None)
+
+                if atmo_item:
+                    mass_snap_buf = self.mass_snap_cmp if insp_is_cmp else cur_mass_snap
+                    mass_val = mass_snap_buf[insp_idx] if (mass_snap_buf is not None and len(mass_snap_buf) > insp_idx) else 3.0e-6
+                    props, _, _ = get_cached_atmosphere_properties(atmo_item, mass_val)
+
+                    H_r_m = max(0.0, float(props['scale_height_km'])) * 1000.0
+                    H_m_m = max(0.0, float(atmo_item.get('h_mie', 1.2))) * 1000.0
+
+                    beta_R = np.nan_to_num(props['beta_rayleigh'], nan=0.0, posinf=0.0, neginf=0.0)
+                    beta_M = np.nan_to_num(compute_mie_coefficients(atmo_item.get('beta_mie', 2.0e-6), atmo_item.get('mie_angstrom', None)), nan=0.0, posinf=0.0, neginf=0.0)
+                    mie_alb = np.nan_to_num(np.asarray(atmo_item.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32)), dtype=np.float64), nan=1.0)
+                    beta_O3 = np.nan_to_num(props['beta_abs_layered'], nan=0.0, posinf=0.0, neginf=0.0)
+                    beta_mixed = np.nan_to_num(props['beta_abs_mixed'], nan=0.0, posinf=0.0, neginf=0.0)
+
+                    tau_R = beta_R * H_r_m
+                    tau_M_ext = beta_M * H_m_m
+                    tau_M_sca = tau_M_ext * mie_alb
+                    tau_O3 = beta_O3 * 14179.6
+                    tau_mixed = beta_mixed * H_r_m
+
+                    tau_total = tau_R + tau_M_ext + tau_O3 + tau_mixed
+                    T_surf = np.exp(-tau_total)
+                    p_surf_contrib = p_surf * (T_surf ** 2)
+
+                    p_Rayleigh = 0.69 * (1.0 - np.exp(-tau_R)) * np.exp(-2.0 * tau_O3)
+                    mie_g = float(atmo_item.get('mie_g', 0.76))
+                    p_mie_peak = (1.0 + mie_g) / max(1e-4, 1.0 - mie_g)
+                    p_Mie = 0.75 * np.minimum(p_mie_peak, 2.5) * (1.0 - np.exp(-tau_M_sca)) * np.exp(-2.0 * tau_O3)
+
+                    p_rgb = p_surf_contrib + (1.0 - p_surf_contrib) * (p_Rayleigh + p_Mie)
+                    p_rgb = np.clip(p_rgb, 0.0, 1.0)
+                    A_g = float(0.2126 * p_rgb[0] + 0.7152 * p_rgb[1] + 0.0722 * p_rgb[2])
+
+                    tau_scat = tau_R + tau_M_sca
+                    tau_scat_scalar = float(0.2126 * tau_scat[0] + 0.7152 * tau_scat[1] + 0.0722 * tau_scat[2])
+                    tau_R_scalar = float(0.2126 * tau_R[0] + 0.7152 * tau_R[1] + 0.0722 * tau_R[2])
+                    tau_M_scalar = float(0.2126 * tau_M_sca[0] + 0.7152 * tau_M_sca[1] + 0.0722 * tau_M_sca[2])
+
+                    w_R = tau_R_scalar / max(1e-6, tau_scat_scalar)
+                    w_M = tau_M_scalar / max(1e-6, tau_scat_scalar)
+                    q_R = 1.35
+                    q_M = 1.50 * (1.0 - 0.6 * (mie_g ** 1.2))
+                    q_atmo_scat = w_R * q_R + w_M * q_M
+
+                    f_atmo = 1.0 - math.exp(-tau_scat_scalar)
+                    b_type = body_info.get('type', 'Terrestrial')
+                    q_surf = 1.50 if b_type == 'Gas Giant' else 0.38
+                    q = (1.0 - f_atmo) * q_surf + f_atmo * q_atmo_scat
+                    A_b = float(np.clip(q * A_g, 0.0, 1.0))
+                else:
+                    p_rgb = np.clip(p_surf, 0.0, 1.0)
+                    A_g = float(0.2126 * p_rgb[0] + 0.7152 * p_rgb[1] + 0.0722 * p_rgb[2])
+                    b_type = body_info.get('type', 'Terrestrial')
+                    q = 1.50 if b_type == 'Gas Giant' else 0.38
+                    A_b = float(np.clip(q * A_g, 0.0, 1.0))
+
+                return A_g, A_b, q, p_rgb
+
+
+
             
 
             force_layout = getattr(self, "_last_fb_width", 0) != self.fb_width or getattr(self, "_last_fb_height", 0) != self.fb_height
@@ -4586,19 +4793,6 @@ class App(InputHandlerMixin):
                         if changed_adapt:
                             self.camera["atmo_adaptive_steps"] = adaptive_steps
                             settings_changed = True
-
-                        atmo_jitter = self.camera.get("atmo_jitter", True)
-                        changed_jit, atmo_jitter = imgui.checkbox("Interleaved Gradient Noise (IGN)", atmo_jitter)
-                        if changed_jit:
-                            self.camera["atmo_jitter"] = atmo_jitter
-                            settings_changed = True
-
-                        atmo_scale_val = self.camera.get("atmo_render_scale", 0.5)
-                        changed_scale, atmo_scale_val = imgui.slider_float("Atmosphere Resolution", atmo_scale_val, 0.25, 1.0, "%.2f")
-                        if changed_scale:
-                            atmo_scale_val = round(atmo_scale_val * 4) / 4.0
-                            self.camera["atmo_render_scale"] = atmo_scale_val
-                            settings_changed = True
                     
                     # Shadow Caster Budget
                     caster_budget = self.camera.get("shadow_caster_budget", 32)
@@ -4626,24 +4820,15 @@ class App(InputHandlerMixin):
                     if changed_bt:
                         settings_changed = True
                     
-                    # TAA
-                    changed_taa, taa_enabled_val = imgui.checkbox("TAA (Temporal Anti-Aliasing)", self.camera.get("taa_enabled", True))
-                    if changed_taa:
-                        self.camera["taa_enabled"] = taa_enabled_val
-                        settings_changed = True
-
-                    # MSAA
+                    # MSAA (orbit lines only)
                     msaa_options = [0, 2, 4, 8]
                     msaa_labels = ["Off", "2x", "4x", "8x"]
                     current_msaa = self.camera.get("msaa_samples", 4)
                     current_idx = msaa_options.index(current_msaa) if current_msaa in msaa_options else 2
-                    if self.camera.get("taa_enabled", True):
-                        imgui.text_disabled("MSAA: Auto-disabled by TAA")
-                    else:
-                        changed_msaa, new_msaa_idx = imgui.combo("MSAA", current_idx, msaa_labels)
-                        if changed_msaa:
-                            self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
-                            settings_changed = True
+                    changed_msaa, new_msaa_idx = imgui.combo("Orbit MSAA", current_idx, msaa_labels)
+                    if changed_msaa:
+                        self.camera["msaa_samples"] = msaa_options[new_msaa_idx]
+                        settings_changed = True
 
                     # Orbit Lines
                     changed_so, show_orbits = imgui.checkbox("Show Orbits", show_orbits)
@@ -5554,44 +5739,14 @@ class App(InputHandlerMixin):
                             imgui.text(f"  Abs Mag (M): {abs_mag:+.2f}")
                             imgui.text(f"  App Mag (m): {app_mag:+.2f}")
                         else:
-                            c = self.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
-                            atmo_item = next((a for a in (self.atmo_bodies_cmp if insp_is_cmp else atmo_bodies) if a['body_idx'] == insp_idx), None)
-                            if atmo_item:
-                                # Physically calculated geometric albedo
-                                mass_val = cur_mass_snap[insp_idx] if len(cur_mass_snap) > insp_idx else 3.0e-6
-                                props, _, _ = get_cached_atmosphere_properties(atmo_item, mass_val)
-                                
-                                H_r_m = props['scale_height_km'] * 1000.0
-                                H_m_m = atmo_item.get('h_mie', 1.2) * 1000.0
-                                
-                                beta_R = props['beta_rayleigh']
-                                beta_M = compute_mie_coefficients(atmo_item.get('beta_mie', 2.0e-6), atmo_item.get('mie_angstrom', None))
-                                mie_alb = np.asarray(atmo_item.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32)), dtype=np.float64)
-                                beta_O3 = props['beta_abs_layered']
-                                beta_mixed = props['beta_abs_mixed']
-                                
-                                tau_R = beta_R * H_r_m
-                                tau_M_ext = beta_M * H_m_m
-                                tau_M_sca = tau_M_ext * mie_alb
-                                tau_O3 = beta_O3 * 14179.6
-                                tau_mixed = beta_mixed * H_r_m
-                                
-                                tau_total = tau_R + tau_M_ext + tau_O3 + tau_mixed
-                                
-                                T_surf = np.exp(-tau_total)
-                                p_surf = c * (T_surf ** 2)
-                                
-                                p_Rayleigh = 0.69 * (1.0 - np.exp(-tau_R)) * np.exp(-2.0 * tau_O3)
-                                p_Mie = 0.75 * 0.9 * (1.0 - np.exp(-tau_M_sca)) * np.exp(-2.0 * tau_O3)
-                                
-                                p_rgb = p_surf + (1.0 - p_surf) * (p_Rayleigh + p_Mie)
-                                p_rgb = np.clip(p_rgb, 0.0, 1.0)
-                                p_v = float(0.2126 * p_rgb[0] + 0.7152 * p_rgb[1] + 0.0722 * p_rgb[2])
-                            else:
-                                p_v = float(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])
+                            A_g, A_b, q_val, _ = compute_body_albedos(body_info, insp_idx, insp_is_cmp)
+                            p_v = A_g
+
                                 
                             if p_v > 0.0 and body_r_km > 0.0:
-                                imgui.text(f"  Geom Albedo: {p_v:.3f}")
+                                imgui.text(f"  Geom Albedo: {A_g:.3f}")
+                                imgui.text(f"  Bond Albedo: {A_b:.3f} (q = {q_val:.2f})")
+
                                 
                                 is_solar = (self.comparison_system_name if insp_is_cmp else active_system_name) == SystemManager.SOLAR_SYSTEM_NAME
                                 if is_solar:
@@ -6305,25 +6460,26 @@ class App(InputHandlerMixin):
                                         break
                                     curr = p_id
                                 
-                                b_type = body_info.get('type', 'Terrestrial')
-                                if b_type == 'Gas Giant':
-                                    albedo = 0.34
-                                elif b_type == 'Dwarf Planet' or b_type == 'Moon':
-                                    albedo = 0.12
-                                else:
-                                    albedo = 0.3
-                                    
-                                t_eq_atmo = 278.5 * ((star_lum_dir / (eff_a**2))**0.25) * ((1.0 - albedo)**0.25)
-                                
+                                _, A_b, q_val, _ = compute_body_albedos(body_info, insp_idx, insp_is_cmp)
+                                albedo = A_b
+
+                                eff_a_safe = max(1e-4, eff_a) if not (math.isnan(eff_a) or math.isinf(eff_a)) else 1.0
+                                star_lum_safe = max(0.0, star_lum_dir) if not (math.isnan(star_lum_dir) or math.isinf(star_lum_dir)) else 1.0
+                                albedo_safe = min(0.9999, max(0.0, float(albedo))) if not (math.isnan(albedo) or math.isinf(albedo)) else 0.3
+                                t_eq_atmo = 278.5 * ((star_lum_safe / (eff_a_safe**2))**0.25) * ((1.0 - albedo_safe)**0.25)
+                                imgui.text(f"Bond Albedo (A_b): {albedo:.3f} (q = {q_val:.2f})")
+
                                 # Calculate temperature dynamically from greenhouse effect
                                 comp = atmo_item.get('composition', {})
                                 potencies = {'CO2': 1.0, 'H2O': 1.5, 'CH4': 25.0, 'SO2': 5.0, 'Tholin': -15.0}
                                 f_gh = sum(comp.get(gas, 0.0) * factor for gas, factor in potencies.items())
                                 f_gh = max(0.0, f_gh)
                                 
-                                press = atmo_item.get('surface_pressure', 1.0)
+                                press = max(0.0, float(atmo_item.get('surface_pressure', 1.0)))
                                 tau = (press ** 0.63) * (0.84 + 2.51 * f_gh)
                                 t_calc = t_eq_atmo * ((1.0 + 0.75 * tau) ** 0.25)
+                                if math.isnan(t_calc) or math.isinf(t_calc) or t_calc <= 0.0:
+                                    t_calc = 288.15
                                 if abs(atmo_item.get('temperature', 0.0) - t_calc) > 1e-4:
                                     atmo_item['temperature'] = t_calc
                                     atmo_item['_dirty'] = True
@@ -6978,59 +7134,7 @@ class App(InputHandlerMixin):
                             print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
                 imgui.end()
     
-            # --- TAA Resolve ---
-            cur_tracking_idx = self.camera["tracking_idx"]
-            cur_tracking_is_cmp = self.camera.get("tracking_is_cmp", False)
-            target_changed = (getattr(self, "prev_tracking_idx", None) != cur_tracking_idx or 
-                              getattr(self, "prev_tracking_is_cmp", None) != cur_tracking_is_cmp)
-            
-            if target_changed or self.prev_vp is None:
-                if self.taa_history_tex:
-                    self.taa_history_tex.write(np.zeros((self.fb_width, self.fb_height, 4), dtype='f4').tobytes())
-            
-            _gq = _perf_gpu_begin(ctx, "gpu_taa")
-            if self.camera.get("taa_enabled", True) and self.taa_output_fbo is not None:
-                self.taa_output_fbo.use()
-                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                ctx.disable(moderngl.DEPTH_TEST)
-                ctx.disable(moderngl.BLEND)
-                
-                self.hdr_resolve_tex.use(location=0)
-                if self.taa_history_tex:
-                    self.taa_history_tex.use(location=1)
-                if self.depth_texture:
-                    self.depth_texture.use(location=2)
-                    
-                self.prog_taa['u_current_color'].value = 0
-                self.prog_taa['u_history_color'].value = 1
-                self.prog_taa['u_depth_texture'].value = 2
-                
-                cur_vp = np.asarray(view, dtype=np.float32) @ np.asarray(projection, dtype=np.float32)
-                try:
-                    inv_view = np.linalg.inv(np.asarray(view, dtype=np.float32))
-                except:
-                    inv_view = np.eye(4, dtype=np.float32)
-                    
-                self.prog_taa['u_proj'].write(projection.astype('f4').tobytes())
-                self.prog_taa['u_inv_view'].write(inv_view.astype('f4').tobytes())
-                self.prog_taa['u_prev_view_proj'].write(self.prev_vp.astype('f4').tobytes() if self.prev_vp is not None else cur_vp.astype('f4').tobytes())
-                
-                self.prog_taa['u_texel_size'].value = (1.0 / self.fb_width, 1.0 / self.fb_height)
-                self.prog_taa['u_depth_C'].value = depth_C
-                self.prog_taa['u_far'].value = far
-                
-                self.quad_vao_taa.render(moderngl.TRIANGLE_STRIP)
-                
-                # Ping-pong textures
-                self.taa_history_tex, self.taa_output_tex = self.taa_output_tex, self.taa_history_tex
-                self.taa_output_fbo.release()
-                self.taa_output_fbo = ctx.framebuffer(color_attachments=[self.taa_output_tex])
-                if self.taa_history_fbo: self.taa_history_fbo.release()
-                self.taa_history_fbo = ctx.framebuffer(color_attachments=[self.taa_history_tex], depth_attachment=self.depth_texture)
-            _perf_gpu_end(_gq)
-
-            resolved_tex = self.taa_history_tex if (self.camera.get("taa_enabled", True) and self.taa_history_tex is not None) else self.hdr_resolve_tex
-
+            resolved_tex = self.hdr_resolve_tex
 
             # --- Post Processing ---
             # Bloom Downsample
@@ -7099,7 +7203,6 @@ class App(InputHandlerMixin):
                         self.fb_width, self.fb_height = self._screenshot_orig_fb
                     self.last_fb_size = (0, 0)       # Force FBO rebuild next frame
                     self.last_msaa_samples = -1
-                    self.last_atmo_res = (0, 0)
                     self._screenshot_capturing = False
                     self._screenshot_orig_fb = None
                     
@@ -7166,11 +7269,6 @@ class App(InputHandlerMixin):
                     imgui.pop_style_var()
                 elif _toast_elapsed >= 4.0:
                     self._screenshot_toast = None
-            
-            # Store TAA historical state for next frame
-            self.prev_vp = (np.asarray(view, dtype=np.float32) @ np.asarray(self.unjittered_projection, dtype=np.float32)).copy()
-            self.prev_tracking_idx = self.camera["tracking_idx"]
-            self.prev_tracking_is_cmp = self.camera.get("tracking_is_cmp", False)
             
             imgui.render()
      

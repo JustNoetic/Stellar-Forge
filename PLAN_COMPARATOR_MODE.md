@@ -322,7 +322,7 @@ New collapsing header **"Comparator Mode"** (next to "System Comparison"), conta
   or keep elements but label them as the real orbital elements (still valid — they come from the
   physics sim, not the layout). **Decision: keep showing real elements** (they're still computed
   by the physics thread); the layout is purely visual.
-- TAA jitter still works (jitters projection[2,0/1]); confirm with ortho.
+- Orbit lines are MSAA-only; confirm they composite correctly in comp mode.
 - Bloom/exposure unchanged.
 - Performance: skip orbit compute, skip caster sort, skip HZ in comp mode.
 

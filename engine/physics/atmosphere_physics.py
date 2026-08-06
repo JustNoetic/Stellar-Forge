@@ -65,11 +65,11 @@ def _chapman_ozone_profile(x_o2, pressure_pa, temperature_k, scale_height_m):
     number and the caller should treat the ozone contribution as negligible
     (the Gaussian exp(-(z-z_peak)^2 / 2 sigma^2) -> 0 everywhere relevant).
     """
-    if x_o2 <= 0.0 or scale_height_m <= 0.0:
-        # No O2: return a profile that evaluates to ~0 in the atmosphere.
+    if x_o2 <= 0.0 or scale_height_m <= 0.0 or temperature_k <= 0.0 or pressure_pa <= 0.0:
+        # No O2 or unphysical parameters: return a profile that evaluates to ~0 in the atmosphere.
         # Place the peak far below the surface so rho_O -> 0 for z >= 0.
         return (-1.0e6, max(scale_height_m, 1.0))
-    n0 = pressure_pa / (K_B * temperature_k)
+    n0 = pressure_pa / (K_B * max(1.0, temperature_k))
     arg = x_o2 * _SIGMA_O2_UV * n0 * scale_height_m
     if arg > 0.0:
         z_peak = scale_height_m * math.log(arg)
@@ -93,7 +93,7 @@ def _chapman_ozone_enhancement(x_o2, pressure_pa, temperature_k, scale_height_m)
         E = (z_peak / H) * exp(1 - z_peak / H).
     For Earth this reproduces the canonical ~246x when z_peak/H ~ 4.5.
     """
-    if x_o2 <= 0.0 or scale_height_m <= 0.0:
+    if x_o2 <= 0.0 or scale_height_m <= 0.0 or temperature_k <= 0.0 or pressure_pa <= 0.0:
         return 0.0
     z_peak, _ = _chapman_ozone_profile(x_o2, pressure_pa, temperature_k, scale_height_m)
     u = z_peak / scale_height_m
@@ -118,6 +118,27 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     if not composition:
         composition = {"N2": 1.0}
         
+    try:
+        pressure_atm = max(0.0, float(pressure_atm))
+        if math.isnan(pressure_atm) or math.isinf(pressure_atm):
+            pressure_atm = 1.0
+    except (ValueError, TypeError):
+        pressure_atm = 1.0
+
+    try:
+        temperature_k = max(1.0, float(temperature_k))
+        if math.isnan(temperature_k) or math.isinf(temperature_k):
+            temperature_k = 288.15
+    except (ValueError, TypeError):
+        temperature_k = 288.15
+
+    try:
+        gravity_m_s2 = max(1e-4, float(gravity_m_s2))
+        if math.isnan(gravity_m_s2) or math.isinf(gravity_m_s2):
+            gravity_m_s2 = 9.81
+    except (ValueError, TypeError):
+        gravity_m_s2 = 9.81
+
     comp_tuple = tuple(sorted(composition.items()))
     cache_key = (pressure_atm, temperature_k, comp_tuple, gravity_m_s2)
     
@@ -199,6 +220,11 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     # Beta Rayleigh = mixture cross section * actual number density
     beta_rayleigh = sigma_rayleigh_mix * number_density
     
+    # Ensure no NaN or Inf in output arrays
+    beta_rayleigh = np.nan_to_num(beta_rayleigh, nan=0.0, posinf=0.0, neginf=0.0)
+    beta_abs_mixed = np.nan_to_num(beta_abs_mixed, nan=0.0, posinf=0.0, neginf=0.0)
+    beta_abs_layered = np.nan_to_num(beta_abs_layered, nan=0.0, posinf=0.0, neginf=0.0)
+    
     # Top-of-atmosphere altitude derived from the vertical optical depth of
     # the most scattering-dominated rendering channel (shortest wavelength,
     # 440 nm). We solve beta_R(440) * H * exp(-z_top/H) = epsilon for z_top:
@@ -206,7 +232,7 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     # This scales correctly for both thin (Mars) and thick (Venus) atmospheres
     # without the previous log(pressure*1e6) heuristic.
     _EPSILON_TAU = 1e-6
-    h_m = scale_height_m
+    h_m = max(1.0, scale_height_m)
     # beta_rayleigh is the surface (1/m) coefficient per channel; column OD
     # at the surface is beta*H. Use the largest channel for a conservative cap.
     governing_tau = float(np.max(beta_rayleigh) * h_m)
@@ -234,6 +260,28 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     
     _atmo_cache[cache_key] = res
     return res
+
+def compute_cloud_layer_properties(pressure_atm, temperature_k, composition, gravity_m_s2):
+    """
+    Computes physical cloud layer base altitude (km) and layer thickness (km)
+    based on atmospheric scale height and surface pressure.
+    """
+    props = compute_atmosphere_properties(pressure_atm, temperature_k, composition, gravity_m_s2)
+    H_km = props['scale_height_km']
+    atmo_h_km = props['atmo_height_km']
+    
+    p0 = max(0.001, float(pressure_atm))
+    h_base_km = H_km * (0.25 + 0.15 * math.log(max(1.0, p0)))
+    h_base_km = max(1.0, min(h_base_km, 0.5 * atmo_h_km))
+    
+    h_thick_km = max(0.5, min(0.2 * H_km * math.sqrt(p0), 0.25 * atmo_h_km))
+    
+    return {
+        "cloud_base_km": float(h_base_km),
+        "cloud_thickness_km": float(h_thick_km),
+        "scale_height_km": float(H_km)
+    }
+
 
 def compute_mie_coefficients(base_beta=2.0e-6, angstrom_exponent=None):
     """
@@ -279,3 +327,85 @@ def compute_mie_absorption(beta_mie, single_scattering_albedo):
     w0 = np.clip(w0, 0.0, 1.0)
     beta_abs = beta_mie * (1.0 - w0)
     return beta_abs.astype(np.float32)
+
+
+def compute_dynamic_mie_properties(pressure_atm, temperature_k, composition, gravity_m_s2=9.81):
+    """
+    Dynamically derives aerosol Mie scattering extinction (beta_mie), scale height (h_mie),
+    asymmetry parameter (mie_g), single-scattering albedo (mie_albedo), and Angstrom exponent (mie_angstrom)
+    based on atmospheric gas composition, surface pressure, and temperature.
+    
+    This physical heuristic models condensation, photolysis haze, and dust lifting regimes:
+      - Titan-like (high Tholin or CH4 at T < 140K): Organic tholin haze (thick, amber/orange).
+      - Venus-like (SO2 present): Sulfuric acid haze deck (thick, pale yellow).
+      - Mars-like (thin CO2 atmosphere): Airborne mineral dust (thin/medium, ferric oxide blue-absorption).
+      - Gas Giant-like (H2/He dominate): Ammonia/methane cloud decks (moderate, white/cream).
+      - Earth-like (temperate, N2/O2 dominate): Clean-sky background aerosol haze (light, white).
+    """
+    if not composition:
+        composition = {"N2": 1.0}
+    
+    total_frac = sum(composition.values())
+    comp = {k: v / (total_frac if total_frac > 0 else 1.0) for k, v in composition.items()}
+    
+    p0 = max(0.0001, float(pressure_atm))
+    T0 = max(1.0, float(temperature_k))
+    
+    x_tholin = comp.get("Tholin", 0.0)
+    x_ch4 = comp.get("CH4", 0.0)
+    x_so2 = comp.get("SO2", 0.0)
+    x_co2 = comp.get("CO2", 0.0)
+    x_h2 = comp.get("H2", 0.0)
+    x_he = comp.get("He", 0.0)
+    
+    props = compute_atmosphere_properties(p0, T0, comp, gravity_m_s2)
+    H_km = props['scale_height_km']
+    
+    # 1. Titan-like photochemical tholin haze regime
+    if x_tholin > 0.005 or (x_ch4 > 0.02 and T0 < 140.0 and p0 > 0.5):
+        base_beta = 1.2e-4
+        h_mie = max(15.0, min(2.5 * H_km, 60.0))
+        mie_albedo = np.array([0.98, 0.75, 0.35], dtype=np.float32)
+        mie_g = 0.88
+        angstrom = 0.5
+        
+    # 2. Venus-like sulfuric acid cloud regime (SO2 present)
+    elif x_so2 > 0.00005:
+        base_beta = 2.0e-4
+        h_mie = max(20.0, min(2.0 * H_km, 50.0))
+        mie_albedo = np.array([0.99, 0.98, 0.80], dtype=np.float32)
+        mie_g = 0.85
+        angstrom = 0.2
+        
+    # 3. Mars-like thin CO2 dust atmosphere regime (p0 < 0.05 atm, CO2 > 0.80)
+    elif x_co2 > 0.80 and p0 < 0.05:
+        base_beta = 4.0e-5
+        h_mie = max(5.0, min(1.0 * H_km, 20.0))
+        mie_albedo = np.array([0.95, 0.85, 0.65], dtype=np.float32)
+        mie_g = 0.76
+        angstrom = 0.0
+        
+    # 4. Gas Giant ammonia/methane upper haze regime (H2/He dominated)
+    elif (x_h2 + x_he) > 0.70:
+        base_beta = 1.5e-5
+        h_mie = max(10.0, min(0.6 * H_km, 40.0))
+        mie_albedo = np.array([0.99, 0.97, 0.92], dtype=np.float32)
+        mie_g = 0.80
+        angstrom = 0.4
+        
+    # 5. Earth-like temperate terrestrial background haze regime
+    else:
+        base_beta = 2.0e-6 * math.sqrt(max(0.1, p0))
+        h_mie = max(0.8, min(0.2 * H_km, 3.0))
+        mie_albedo = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        mie_g = 0.76
+        angstrom = None  # auto-computed from base_beta
+        
+    return {
+        "beta_mie": float(base_beta),
+        "h_mie": float(h_mie),
+        "mie_albedo": mie_albedo,
+        "mie_g": float(mie_g),
+        "mie_angstrom": angstrom
+    }
+

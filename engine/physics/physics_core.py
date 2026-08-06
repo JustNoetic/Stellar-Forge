@@ -8,7 +8,7 @@ from engine.core.math_utils import *
 from engine.ephemeris.system_manager import SystemManager, SystemSnapshot, derive_star_properties
 import warnings
 from engine.rendering.render_utils import *
-from engine.physics.atmosphere_physics import compute_atmosphere_properties
+from engine.physics.atmosphere_physics import compute_atmosphere_properties, compute_dynamic_mie_properties
 from engine.physics.kepler_analytical import extract_all_kepler_elements, propagate_keplerian_system_numba
 
 def _extract_render_state(sim, num_bodies, out_pos, out_vel):
@@ -1864,6 +1864,7 @@ def load_system_from_data(bodies_data_raw):
             composition = atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01})
             g_m_s2 = (6.67430e-11 * mass_kg) / ((planet_radius_km * 1000.0) ** 2) if planet_radius_km > 0 else 9.81
             props = compute_atmosphere_properties(surface_pressure, temperature, composition, g_m_s2)
+            dyn_mie = compute_dynamic_mie_properties(surface_pressure, temperature, composition, g_m_s2)
             atmo_height_km = props['atmo_height_km']
             atmo_radius_km = planet_radius_km + atmo_height_km
             atmo_radius_au = atmo_radius_km / AU_TO_KM
@@ -1877,11 +1878,11 @@ def load_system_from_data(bodies_data_raw):
                 'temperature': float(atmo.get('temperature', 288.15)),
                 'composition': atmo.get('composition', {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
                 'intensity': float(atmo.get('intensity', 1.0)),
-                'beta_mie': float(atmo.get('beta_mie', atmo.get('mieCoefficient', 2.0e-6))),
-                'h_mie': float(atmo.get('h_mie', atmo.get('mieScaleHeight', 1.2))),
-                'mie_g': float(atmo.get('mie_g', atmo.get('mieAsymmetry', 0.758))),
-                'mie_albedo': np.asarray(atmo.get('mie_albedo', np.array([1.0, 1.0, 1.0], dtype=np.float32)), dtype=np.float32),
-                'mie_angstrom': atmo.get('mie_angstrom', None)
+                'beta_mie': float(atmo.get('beta_mie', atmo.get('mieCoefficient', dyn_mie['beta_mie']))),
+                'h_mie': float(atmo.get('h_mie', atmo.get('mieScaleHeight', dyn_mie['h_mie']))),
+                'mie_g': float(atmo.get('mie_g', atmo.get('mieAsymmetry', dyn_mie['mie_g']))),
+                'mie_albedo': np.asarray(atmo.get('mie_albedo', dyn_mie['mie_albedo']), dtype=np.float32),
+                'mie_angstrom': atmo.get('mie_angstrom', dyn_mie['mie_angstrom'])
             })
 
     # ── J2 / GR setup ──

@@ -51,23 +51,30 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
         g_m_s2
     )
     
-    beta_r = props['beta_rayleigh']
-    beta_m = atmo.get('beta_mie', 2.0e-6)
-    h_r = props['scale_height_km']
-    h_m = atmo.get('h_mie', 1.2)
-    od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
-    od_m = compute_mie_coefficients(beta_m, atmo.get('mie_angstrom', None)) * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_m)
+    beta_r = np.nan_to_num(props['beta_rayleigh'], nan=0.0, posinf=0.0, neginf=0.0)
+    beta_m = max(0.0, float(atmo.get('beta_mie', 2.0e-6)))
+    h_r = max(0.0, float(props['scale_height_km']))
+    h_m = max(0.0, float(atmo.get('h_mie', 1.2)))
+    r_km_safe = max(0.0, float(R_km))
+    
+    od_r = beta_r * 1000.0 * math.sqrt(2.0 * math.pi * r_km_safe * h_r)
+    mie_coeffs = np.nan_to_num(compute_mie_coefficients(beta_m, atmo.get('mie_angstrom', None)), nan=0.0, posinf=0.0, neginf=0.0)
+    od_m = mie_coeffs * 1000.0 * math.sqrt(2.0 * math.pi * r_km_safe * h_m)
 
-    z_o3_peak_km = props.get('ozone_peak_km', 25.0)
-    ozone_slant_km = math.sqrt(2.0 * math.pi * R_km * max(1.0, z_o3_peak_km))
-    od_o3 = props['beta_abs_layered'] * 1000.0 * ozone_slant_km
-    od_mixed = props['beta_abs_mixed'] * 1000.0 * math.sqrt(2.0 * math.pi * R_km * h_r)
+    z_o3_peak_km = max(1.0, float(props.get('ozone_peak_km', 25.0)))
+    ozone_slant_km = math.sqrt(2.0 * math.pi * r_km_safe * z_o3_peak_km)
+    beta_layered = np.nan_to_num(props['beta_abs_layered'], nan=0.0, posinf=0.0, neginf=0.0)
+    beta_mixed = np.nan_to_num(props['beta_abs_mixed'], nan=0.0, posinf=0.0, neginf=0.0)
+    
+    od_o3 = beta_layered * 1000.0 * ozone_slant_km
+    od_mixed = beta_mixed * 1000.0 * math.sqrt(2.0 * math.pi * r_km_safe * h_r)
     tau = od_r + od_m + od_o3 + od_mixed
     direct_trans = np.exp(-tau)
     forward_scatter = tau * np.exp(-tau * 0.8) * 0.3
     multi_scatter = 0.02 * np.exp(-tau * 0.2)
     trans = np.clip(direct_trans + forward_scatter + multi_scatter, 0.0, 1.0)
-    thick = atmo.get('atmo_radius_au', 0.0) - atmo.get('surface_radius_au', 0.0)
+    trans = np.nan_to_num(trans, nan=1.0)
+    thick = max(0.0, float(atmo.get('atmo_radius_au', 0.0) - atmo.get('surface_radius_au', 0.0)))
     
     atmo['_cached_mass'] = mass_sm
     atmo['_cached_radius'] = R_km
@@ -201,14 +208,14 @@ def compute_body_rotation_angles_jit(sim_t_sec, rot_period_arr, w0_arr, tidally_
                     
                     angles[i] = math.atan2(sin_w, cos_w)
                 else:
-                    angles[i] = w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
+                    angles[i] = (w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi)) % (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
             else:
-                angles[i] = w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
+                angles[i] = (w0_arr[i] + (sim_t_sec / rot_period_arr[i]) * (2.0 * math.pi)) % (2.0 * math.pi) if rot_period_arr[i] != 0.0 else 0.0
         else:
             w0 = w0_arr[i]
             p_sec = rot_period_arr[i]
             if p_sec != 0.0:
-                angles[i] = w0 + (sim_t_sec / p_sec) * (2.0 * math.pi)
+                angles[i] = (w0 + (sim_t_sec / p_sec) * (2.0 * math.pi)) % (2.0 * math.pi)
             else:
                 angles[i] = w0
     return angles

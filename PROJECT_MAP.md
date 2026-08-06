@@ -90,9 +90,9 @@ For each file: responsibilities, key symbols (with approximate line numbers), an
 ### 3.3 `engine/physics/atmosphere_physics.py` (135 lines)
 - `GAS_PROPERTIES` (dict): per-gas Rayleigh coefficients, molar mass, absorption.
 - `compute_atmosphere_properties(pressure_atm, temperature_k, composition, gravity_m_s2)` (~L33)
-  → returns beta_rayleigh, beta_mie, absorption, scale heights. **Pure Python (cached by app).**
+  → returns beta_rayleigh, beta_mie, absorption, scale heights, refractivity (surface (n-1) scaled to density). **Pure Python (cached by app).**
 - `compute_mie_coefficients(base_beta, angstrom_exponent)` (~L120).
-- **Edit when:** changing scattering physics, gas composition table, atmosphere LUT inputs.
+- **Edit when:** changing scattering physics, gas composition table, surface refractivity, atmosphere LUT inputs.
 
 ### 3.4 `engine/core/math_utils.py` (197 lines) — all `@njit(cache=True)`
 - `fast_cross`, `fast_norm` — vector ops.
@@ -209,11 +209,11 @@ spectral classification.
 - `engine/rendering/shader_loader.py`: In-memory GLSL loader (`load_shader`) loading source files from `engine/glsl/`.
 - `engine/rendering/shaders.py`: Dynamically re-exports loaded GLSL shaders:
   - `culling_compute_shader` (`glsl/compute/culling.comp`) — GPU frustum/occlusion culling compute.
-  - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres.
+  - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres (with Snell refraction ray deflection and vertex bounding expansion).
   - `orbit_compute_shader` (`glsl/compute/orbit.comp`), `orbit_*` (`glsl/celestial/orbit.*`).
   - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`).
   - `ring_*` (`glsl/celestial/ring.*`), `hz_*` (`glsl/celestial/hz.*`).
-  - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*`.
+  - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*` — volumetric sky raymarching (with Snell atmospheric refraction primary ray deflection in `atmo.frag` and proxy bounding expansion in `atmo.vert`).
 
 **Edit when:** editing GLSL shader logic inside `engine/glsl/` or uniform bindings in `shaders.py`.
 
@@ -248,7 +248,6 @@ spectral classification.
 - `compute_ring_coplanar_masks(...)` (~L234, `@njit(cache=True)`) — coplanar ring-plane masks.
 - `get_cached_atmosphere_properties(atmo, mass_sm)` (~L253) — memoized atmosphere props.
 - `compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled)` (~L295, `@njit`) — CPU planetshine precompute.
-- `halton(index, base)` (~L477) — TAA jitter sequence.
 
 **`class App`** (~L487) — the engine:
 - `__init__` (~L488) — camera dict (target, distance, fov, yaw/pitch/roll, exposure, hdr, tracking_idx,
@@ -267,14 +266,14 @@ spectral classification.
   5. Create ModernGL context, window, ImGui, compile all shader programs
      (`prog_spheres`, `prog_rings`, `prog_atmo`, `prog_culling_compute`, `prog_orbit_compute`,
       `prog_orbit`, `prog_ephem_orbit`, `prog_hz`, `prog_atmo_lut`, `prog_multi_scatter_lut`,
-      bloom/composite/taa programs) (~L1209+).
+      - bloom/composite programs) (~L1209+).
   6. `build_eclipse_lut(ctx)` (~L1318) — eclipse LUT texture (oblate star aware).
   7. Build ring render groups, body instance buffers, orbit buffers (~L1372–2150).
   8. `build_atmo_lut(atmo, mass_sm, is_cmp)` (~L1765) — transmittance + multi-scatter LUTs per body.
   9. Spawn **physics thread** running `physics_loop(...)` (~L1691 region).
   10. **Main render loop** (`while not glfw.window_should_close`): per-frame work incl.
       - System/comparison state snapshot from `shared_state` under lock (~L2359).
-      - TAA jitter, camera matrix, tracking, hierarchy refresh (~L2400–2660).
+      - Camera matrix, tracking, hierarchy refresh (~L2400–2660).
       - `compute_planetshine_numba` → planetshine dirs/colors into instance buffer (~L2819).
       - GPU culling compute dispatch (`prog_culling_compute.run`) (~L2877).
       - Orbit polyline compute + draw (~L2880–3264).

@@ -35,6 +35,13 @@ uint u_ring_mask;
 
 uniform vec3 u_camera_pos;
 
+uniform vec3 u_refract_center;
+uniform float u_refract_radius;
+uniform float u_refract_max_bend;
+uniform float u_refract_scale_height;
+uniform vec3 u_refract_pole;
+uniform float u_refract_oblateness;
+
 layout(std430, binding = 8) buffer AtmoData {
     vec3  u_body_offset;
     float u_atmo_radius_au;
@@ -83,7 +90,6 @@ uniform sampler2D u_multi_scatter_lut;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform bool u_planetshine_enabled;
-uniform int  u_atmo_jitter;
 
 uniform sampler2D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
@@ -92,6 +98,9 @@ uniform bool u_ringshine_enabled;
 uniform int u_ringshine_band_count;
 uniform sampler2D u_depth_texture;
 uniform vec2 u_screen_res;
+
+layout(location = 0, index = 0) out vec4 out_scattered;
+layout(location = 0, index = 1) out vec4 out_transmittance;
 
 float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
     float TWO_PI = 6.28318530717958647692;
@@ -107,9 +116,6 @@ float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
     float signed_cdf = (a_mod < 0.0) ? -base_cdf : base_cdf;
     return 2.0 * k + signed_cdf;
 }
-
-layout(location = 0) out vec4 out_color;
-
 vec3 toSphericalSpace(vec3 p, vec4 pole_scale) {
     float f_scale = pole_scale.w;
     if (f_scale <= 1.00001) return p;
@@ -132,6 +138,46 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
     float denom = sqrt((x / r_eq) * (x / r_eq) + (y / r_minor) * (y / r_minor));
     if (denom < 1e-6) return r_eq;
     return perp_len / denom;
+}
+
+float compute_refraction_angle(vec3 C, vec3 V, float d) {
+    if (u_refract_max_bend <= 1e-6) return 0.0;
+    float s_min = -dot(C, V);
+    vec3 P_min = C + s_min * V;
+    float r_min = length(P_min);
+    
+    float local_refract_radius = u_refract_radius;
+    if (u_refract_oblateness > 0.001 && u_refract_oblateness < 0.99) {
+        vec3 P_dir = r_min > 1e-6 ? (P_min / r_min) : vec3(0.0, 1.0, 0.0);
+        vec3 pole_dir = length(u_refract_pole) > 1e-4 ? normalize(u_refract_pole) : vec3(0.0, 1.0, 0.0);
+        float cos_t = abs(dot(P_dir, pole_dir));
+        float k = 1.0 / (1.0 - u_refract_oblateness);
+        float denom = sqrt(max(1e-6, 1.0 + (k * k - 1.0) * cos_t * cos_t));
+        local_refract_radius = u_refract_radius / denom;
+    }
+
+    if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
+    
+    float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
+    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
+    float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
+    
+    if (d < 0.1 * sigma) {
+        float kappa_0 = (delta_rmin / (sigma * 2.506628)) * exp(-(s_min * s_min) / (2.0 * sigma * sigma));
+        return 0.5 * kappa_0 * d;
+    }
+    
+    float sqrt2_sig = 1.4142135 * sigma;
+    float x_d = (d - s_min) / sqrt2_sig;
+    float x_0 = s_min / sqrt2_sig;
+    
+    float E_d = sign(x_d) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_d * x_d)));
+    float E_0 = sign(x_0) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_0 * x_0)));
+    float G_d = exp(-clamp(x_d * x_d, 0.0, 50.0));
+    float G_0 = exp(-clamp(x_0 * x_0, 0.0, 50.0));
+    
+    float alpha = delta_rmin * ( 0.5 * (E_d + E_0) * (1.0 - s_min / d) + (sigma / (d * 2.506628)) * (G_d - G_0) );
+    return max(0.0, alpha);
 }
 
 vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius, float star_obl, vec3 star_pole) {
@@ -303,12 +349,6 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
     return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
-float interleaved_gradient_noise(vec2 position, float frame) {
-    position += fract(frame * 0.6180339887498949) * vec2(1000.0, 1000.0);
-    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
-    return fract(magic.z * fract(dot(position, magic.xy)));
-}
-
 void main() {
     if (f_clip_z < 0.0) discard;
     u_ring_mask = floatBitsToUint(instances[u_body_idx * 7 + 3].w);
@@ -316,12 +356,35 @@ void main() {
     vec3 body_planetshine_color = instances[u_body_idx * 7 + 5].xyz;
 
     vec3 planet_center_render = u_body_offset;
-    vec3 cam_local_au = u_camera_pos - planet_center_render;
-    vec3 cam_local = cam_local_au * u_au_to_km;
-
     vec3 f_pos_local_au = f_local_pos * u_atmo_radius_au;
+    
+    vec3 ray_origin_au = u_camera_pos;
+    vec3 view_ray = normalize(f_pos_local_au + planet_center_render - u_camera_pos);
+    vec3 ray_dir = view_ray;
+    bool is_refract_host = length(planet_center_render - u_refract_center) < 1e-4;
+
+    if (u_refract_max_bend > 1e-6 && !is_refract_host) {
+        vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
+        float d_km = length((planet_center_render - u_camera_pos) * u_au_to_km);
+        float alpha = compute_refraction_angle(C_km, view_ray, d_km);
+        if (alpha > 1e-7) {
+            vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
+            float u_len = length(u_dir);
+            if (u_len > 1e-5) {
+                u_dir /= u_len;
+                ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
+                
+                float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
+                if (s_min_au > 0.0) {
+                    ray_origin_au = u_camera_pos + s_min_au * (view_ray - ray_dir);
+                }
+            }
+        }
+    }
+
+    vec3 cam_local_au = ray_origin_au - planet_center_render;
+    vec3 cam_local = cam_local_au * u_au_to_km;
     vec3 f_pos_local = f_pos_local_au * u_au_to_km;
-    vec3 ray_dir = normalize(f_pos_local - cam_local);
 
     vec3 ray_dir_sph = toSphericalSpace(ray_dir, u_pole_obl);
     vec3 cam_local_sph = toSphericalSpace(cam_local, u_pole_obl);
@@ -690,7 +753,7 @@ void main() {
         float cos_sun = cos(alpha_sun_local);
         float sin_sun = sin_star;
 
-        float jitter = (u_atmo_jitter != 0) ? interleaved_gradient_noise(gl_FragCoord.xy, u_frame_counter) : 0.5;
+        float jitter = 0.5;
         vec3 step_dir_sph = ray_dir_sph * step_size;
         vec3 current_pos_sph = cam_local_sph + (s_start + jitter * step_size) * ray_dir_sph;
 
@@ -737,9 +800,26 @@ void main() {
             float polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
             vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
 
-            float rho_R = exp(-altitude / u_h_rayleigh);
-            float rho_M = exp(-altitude / u_h_mie) * polar_haze_factor;
-            float rho_O = exp(-pow((altitude - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
+            vec3 pos_start = current_pos_sph - 0.5 * step_dir_sph;
+            vec3 pos_end = current_pos_sph + 0.5 * step_dir_sph;
+            float h1 = max(0.0, length(pos_start) - u_planet_radius_km);
+            float h_mid = max(0.0, altitude);
+            float h2 = max(0.0, length(pos_end) - u_planet_radius_km);
+
+            float rho_R1 = exp(-h1 / u_h_rayleigh);
+            float rho_R_mid = exp(-h_mid / u_h_rayleigh);
+            float rho_R2 = exp(-h2 / u_h_rayleigh);
+            float rho_R = (rho_R1 + 4.0 * rho_R_mid + rho_R2) * (1.0 / 6.0);
+
+            float rho_M1 = exp(-h1 / u_h_mie);
+            float rho_M_mid = exp(-h_mid / u_h_mie);
+            float rho_M2 = exp(-h2 / u_h_mie);
+            float rho_M = (rho_M1 + 4.0 * rho_M_mid + rho_M2) * (1.0 / 6.0) * polar_haze_factor;
+
+            float rho_O1 = exp(-pow((h1 - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
+            float rho_O_mid = exp(-pow((h_mid - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
+            float rho_O2 = exp(-pow((h2 - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
+            float rho_O = (rho_O1 + 4.0 * rho_O_mid + rho_O2) * (1.0 / 6.0);
 
             // Extinction uses physical beta_R to prevent artificial limb color fringing
             vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
@@ -878,10 +958,11 @@ void main() {
         float cos_theta = dot(ray_dir, L_mid);
         float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta * cos_theta);
 
-        float g = u_mie_g;
-        float g2 = g * g;
-        float phase_M = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_theta * cos_theta))
-                      / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta, 1.5));
+        float g_val = clamp(u_mie_g, 0.0, 0.88);
+        float g2_val = g_val * g_val;
+        float phase_M_scalar = (3.0 / (8.0 * PI)) * ((1.0 - g2_val) * (1.0 + cos_theta * cos_theta))
+                              / ((2.0 + g2_val) * pow(max(1e-4, 1.0 + g2_val - 2.0 * g_val * cos_theta), 1.5));
+        vec3 phase_M = vec3(phase_M_scalar);
 
         float irradiance = star_lum / max(dist_to_star_au * dist_to_star_au, 1e-8);
 
@@ -894,8 +975,9 @@ void main() {
         if (u_planetshine_enabled && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
             float cos_theta_ps = dot(ray_dir, body_planetshine_dir);
             float phase_R_ps = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_ps * cos_theta_ps);
-            float phase_M_ps = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_theta_ps * cos_theta_ps))
-                          / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * cos_theta_ps, 1.5));
+            float phase_M_ps_scalar = (3.0 / (8.0 * PI)) * ((1.0 - g2_val) * (1.0 + cos_theta_ps * cos_theta_ps))
+                                      / ((2.0 + g2_val) * pow(max(1e-4, 1.0 + g2_val - 2.0 * g_val * cos_theta_ps), 1.5));
+            vec3 phase_M_ps = vec3(phase_M_ps_scalar);
             scattered += body_planetshine_color * (
                 phase_R_ps * beta_R * total_rayleigh_ps +
                 phase_M_ps * beta_M * total_mie_ps
@@ -969,5 +1051,6 @@ void main() {
         scattered *= u_exposure;
     }
 
-    out_color = vec4(scattered, 1.0 - clamp((transmittance.r + transmittance.g + transmittance.b) / 3.0, 0.0, 1.0));
+    out_scattered = vec4(scattered, 1.0);
+    out_transmittance = vec4(clamp(transmittance, vec3(0.0), vec3(1.0)), 1.0);
 }

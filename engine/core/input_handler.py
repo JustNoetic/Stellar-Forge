@@ -27,7 +27,6 @@ class InputHandlerMixin:
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
-                "atmo_jitter": self.camera.get("atmo_jitter", True),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
@@ -43,8 +42,6 @@ class InputHandlerMixin:
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
-                "taa_enabled": self.camera.get("taa_enabled", True),
-                "atmo_render_scale": self.camera.get("atmo_render_scale", 0.5),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
             }
             with open(settings_path, 'w') as f:
@@ -208,32 +205,58 @@ def _camera_rot_axis(axis, angle):
     s = math.sin(angle)
     return np.eye(3, dtype='f8') + s * K + (1.0 - c) * (K @ K)
 
-def _camera_screen_up(fwd, roll_rad):
-    """Screen-space up of the current view: world +Y projected onto the plane
-    perpendicular to `fwd`, then rotated by roll about the view axis."""
+def _camera_get_up(cam, fwd):
+    """Retrieve and orthogonalize the continuous camera UP vector."""
     fwd = np.asarray(fwd, dtype='f8')
-    n = np.linalg.norm(fwd)
-    if n < 1e-12:
+    n_fwd = np.linalg.norm(fwd)
+    if n_fwd < 1e-12:
         return np.array([0.0, 1.0, 0.0], dtype='f8')
-    fwd = fwd / n
-    up_proj = np.array([0.0, 1.0, 0.0], dtype='f8') - float(np.dot(fwd, np.array([0.0, 1.0, 0.0], dtype='f8'))) * fwd
-    nup = np.linalg.norm(up_proj)
-    if nup > 1e-9:
-        up = up_proj / nup
+    fwd = fwd / n_fwd
+    
+    raw_up = np.array(cam.get("up", [0.0, 1.0, 0.0]), dtype='f8')
+    if np.linalg.norm(raw_up) < 1e-6:
+        raw_up = np.array([0.0, 1.0, 0.0], dtype='f8')
+    
+    up_proj = raw_up - float(np.dot(raw_up, fwd)) * fwd
+    n_up = np.linalg.norm(up_proj)
+    if n_up > 1e-6:
+        return up_proj / n_up
+    
+    alt = np.array([1.0, 0.0, 0.0], dtype='f8')
+    alt_proj = alt - float(np.dot(alt, fwd)) * fwd
+    n_alt = np.linalg.norm(alt_proj)
+    if n_alt > 1e-6:
+        return alt_proj / n_alt
+    alt2 = np.array([0.0, 0.0, 1.0], dtype='f8')
+    alt_proj2 = alt2 - float(np.dot(alt2, fwd)) * fwd
+    return alt_proj2 / np.linalg.norm(alt_proj2)
+
+def _camera_screen_up(fwd, roll_rad, cam=None):
+    """Screen-space up of the current view."""
+    if cam is not None and "up" in cam:
+        up = _camera_get_up(cam, fwd)
     else:
-        # looking straight up/down: pick a stable perpendicular instead
-        up = np.array([1.0, 0.0, 0.0], dtype='f8')
-        up = up - float(np.dot(fwd, up)) * fwd
-        nup = np.linalg.norm(up)
-        up = up / nup if nup > 1e-9 else np.array([0.0, 0.0, 1.0], dtype='f8')
+        fwd = np.asarray(fwd, dtype='f8')
+        n = np.linalg.norm(fwd)
+        if n < 1e-12:
+            return np.array([0.0, 1.0, 0.0], dtype='f8')
+        fwd = fwd / n
+        up_proj = np.array([0.0, 1.0, 0.0], dtype='f8') - float(np.dot(fwd, np.array([0.0, 1.0, 0.0], dtype='f8'))) * fwd
+        nup = np.linalg.norm(up_proj)
+        if nup > 1e-9:
+            up = up_proj / nup
+        else:
+            up = np.array([1.0, 0.0, 0.0], dtype='f8')
+            up = up - float(np.dot(fwd, up)) * fwd
+            nup = np.linalg.norm(up)
+            up = up / nup if nup > 1e-9 else np.array([0.0, 0.0, 1.0], dtype='f8')
     if abs(roll_rad) > 1e-9:
         up = _camera_rot_axis(fwd, -roll_rad) @ up
     return up
 
-def _camera_orient_from_view(fwd, roll_rad):
-    """Orientation matrix (columns: right, up, back) matching the rendered view
-    (row-vector convention): look_at(pos, pos+fwd, Y) followed by Rz(roll)."""
-    up = _camera_screen_up(fwd, roll_rad)
+def _camera_orient_from_view(fwd, roll_rad, cam=None):
+    """Orientation matrix (columns: right, up, back) matching rendered view."""
+    up = _camera_screen_up(fwd, roll_rad, cam)
     right = np.cross(fwd, up)
     nr = np.linalg.norm(right)
     if nr > 1e-9:
@@ -253,45 +276,120 @@ def _camera_euler_from_orient(R):
     roll = math.degrees(math.atan2(-float(np.dot(up, right_ref)), float(np.dot(up, up_ref))))
     return yaw, pitch, roll
 
+def _oblate_surface_normal(rel, f=0.0, pole=None):
+    """Compute the true outward surface normal vector of an oblate spheroid.
+    `rel` is relative position from body center, `f` is oblateness, `pole` is unit spin axis."""
+    rel = np.asarray(rel, dtype='f8')
+    r_norm = np.linalg.norm(rel)
+    if r_norm < 1e-300:
+        return np.array([0.0, 1.0, 0.0], dtype='f8')
+    
+    radial = rel / r_norm
+    if f <= 0.0 or pole is None:
+        return radial
+    
+    pole = np.asarray(pole, dtype='f8')
+    p_norm = np.linalg.norm(pole)
+    if p_norm < 1e-12:
+        return radial
+    pole = pole / p_norm
+    
+    f_clamped = min(0.9, max(0.0, float(f)))
+    scale_para = 1.0 / ((1.0 - f_clamped) ** 2)
+    
+    para_len = float(np.dot(rel, pole))
+    N = rel + (scale_para - 1.0) * para_len * pole
+    n_len = np.linalg.norm(N)
+    if n_len > 1e-12:
+        return N / n_len
+    return radial
+
+def _camera_get_ref_up(cam, rel):
+    """Determine the reference vertical axis for horizon-aligned FPS rotation, taking oblate planet geometry into account."""
+    f = float(cam.get("track_f", 0.0))
+    pole = cam.get("track_pole", None)
+    return _oblate_surface_normal(rel, f, pole)
+
 def _camera_pivot_apply(cam, dx, dy, sensitivity):
-    """LMB trackball pivot: track a full orientation matrix so the image rotates
-    rigidly with the cursor at any pitch/roll (roll-aware, no pole spinning)."""
+    """LMB trackball/FPS pivot: rotate view direction and up vector in place (free look)."""
     if cam.get("cam_look", "aim") == "aim":
         rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
         r = np.linalg.norm(rel)
         fwd = -rel / r if r > 1e-300 else _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
     else:
+        rel = np.asarray(cam.get("cam_pos_rel", [0.0, 0.0, 1.0]), dtype='f8')
         fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
-    roll_rad = math.radians(cam.get("roll_actual", 0.0))
-    R = _camera_orient_from_view(fwd, roll_rad)
-    R = _camera_rot_axis(R[:, 1], math.radians(-dx * sensitivity)) @ (_camera_rot_axis(R[:, 0], math.radians(-dy * sensitivity)) @ R)
-    yaw_new, pitch_new, roll_new = _camera_euler_from_orient(R)
-    cam["yaw"] = cam["yaw_actual"] = yaw_new
-    cam["pitch"] = cam["pitch_actual"] = pitch_new
-    cam["roll"] = cam["roll_actual"] = roll_new
-
-def _camera_orbit_apply(cam, dx, dy, sensitivity):
-    """RMB trackball orbit: rotate the camera position about the pivot using the
-    camera's own screen axes (radius preserved, no smoothing)."""
-    rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
-    r = np.linalg.norm(rel)
-    if r < 1e-300:
-        return
-    if cam.get("cam_look", "aim") == "aim":
-        fwd = -rel / r
-    else:
-        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
-    roll_rad = math.radians(cam.get("roll_actual", 0.0))
-    up = _camera_screen_up(fwd, roll_rad)
+    
+    up = _camera_get_up(cam, fwd)
     right = np.cross(fwd, up)
     nr = np.linalg.norm(right)
     if nr > 1e-9:
         right = right / nr
     else:
         right = np.array([1.0, 0.0, 0.0], dtype='f8')
-    rel_new = _camera_rot_axis(up, math.radians(-dx * sensitivity)) @ (_camera_rot_axis(right, math.radians(-dy * sensitivity)) @ rel)
+    up = np.cross(right, fwd)
+    up = up / np.linalg.norm(up)
+
+    if cam.get("horizon_align", True) and cam.get("is_near_surface", False):
+        h_axis = _camera_get_ref_up(cam, rel)
+    else:
+        h_axis = up
+
+    R = _camera_rot_axis(h_axis, math.radians(-dx * sensitivity)) @ _camera_rot_axis(right, math.radians(-dy * sensitivity))
+    fwd_new = R @ fwd
+    fwd_new = fwd_new / np.linalg.norm(fwd_new)
+    up_new = R @ up
+    up_new = up_new / np.linalg.norm(up_new)
+
+    yaw_new, pitch_new = _camera_yaw_pitch_from(fwd_new)
+    cam["yaw"] = cam["yaw_actual"] = yaw_new
+    cam["pitch"] = cam["pitch_actual"] = pitch_new
+    cam["up"] = up_new.tolist()
+
+def _camera_orbit_apply(cam, dx, dy, sensitivity):
+    """RMB screen-space orbit: rotate camera position about pivot using screen-space axes.
+    Guarantees horizontal mouse drag always orbits left/right on screen (including at poles),
+    and vertical drag orbits up/down on screen, with continuous cam['up'] to prevent 180° pole flips.
+    Preserves free look direction if cam['cam_look'] == 'free' without snapping to 'aim'."""
+    rel = np.asarray(cam["cam_pos_rel"], dtype='f8')
+    r = np.linalg.norm(rel)
+    if r < 1e-300:
+        return
+
+    is_free = (cam.get("cam_look", "aim") == "free")
+    if is_free:
+        fwd = _camera_forward(cam.get("yaw_actual", cam["yaw"]), cam.get("pitch_actual", cam["pitch"]))
+    else:
+        fwd = -rel / r
+
+    up = _camera_get_up(cam, fwd)
+    right = np.cross(fwd, up)
+    nr = np.linalg.norm(right)
+    if nr > 1e-9:
+        right = right / nr
+    else:
+        right = np.array([1.0, 0.0, 0.0], dtype='f8')
+    up = np.cross(right, fwd)
+    up = up / np.linalg.norm(up)
+
+    R_h = _camera_rot_axis(up, math.radians(dx * sensitivity))
+    R_v = _camera_rot_axis(right, math.radians(dy * sensitivity))
+    R = R_h @ R_v
+
+    rel_new = R @ rel
     r_new = np.linalg.norm(rel_new)
     if r_new > 1e-300:
         rel_new = rel_new / r_new * r
+    up_new = R @ up
+    up_new = up_new / np.linalg.norm(up_new)
+
+    if is_free:
+        fwd_new = R @ fwd
+        fwd_new = fwd_new / np.linalg.norm(fwd_new)
+        yaw_new, pitch_new = _camera_yaw_pitch_from(fwd_new)
+        cam["yaw"] = cam["yaw_actual"] = yaw_new
+        cam["pitch"] = cam["pitch_actual"] = pitch_new
+
     cam["cam_pos_rel"] = rel_new.tolist()
-    cam["cam_look"] = "aim"
+    cam["up"] = up_new.tolist()
+

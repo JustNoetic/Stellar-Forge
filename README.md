@@ -100,11 +100,11 @@ pip install numpy scipy moderngl glfw pyrr imgui numba spiceypy requests PyOpenG
 - **🔬 JPL Horizons Accuracy Suite**: Includes automated verification benchmarks (`accuracy_test.py`) that compare 1-year numerical integrations directly against NASA JPL Horizons ground-truth state vectors.
 - **🛠️ Comprehensive Body Inspector**: In-depth GUI panel displaying real-time physical properties, osculating Keplerian orbital elements, atmospheric composition, effective thermal equilibrium, spectral type classifications, and dynamic property sliders.
 - **☀️ Stellar Classification & Evolution**: Computes effective temperatures, spectral classes (O, B, A, F, G, K, M, L, T, Y), luminosity classes (Hypergiants to Subdwarfs), and dynamic Habitable Zone (HZ) boundaries.
-- **🌤️ Atmospheric Raymarching**: Multi-pass sky raymarching powered by precomputed Look-Up Tables (LUTs) for transmittance, single scattering, and multi-scattering across customizable planetary gas compositions.
+- **🌤️ Atmospheric Raymarching & Lensing Refraction**: Multi-pass sky raymarching powered by precomputed Look-Up Tables (LUTs) for transmittance, single scattering, and multi-scattering across customizable planetary gas compositions. Includes physical Snell's law atmospheric lensing refraction ($\alpha_0 = (n_0 - 1) \sqrt{2\pi R / H}$) that analytically bends primary view rays through celestial body impostors (`sphere.frag`) and atmospheres (`atmo.frag`) at arbitrary distances without clipping.
 - **🛰️ NASA JPL SPICE & Horizons Integration**: Real-time position playback using official NAIF SPICE kernels (`.bsp`, `.tpc`, `.tls`) with automatic kernel discovery & threaded downloading, plus REST querying of JPL Horizons state vectors. Ephemeris systems can be **exported to N-body system JSON** for further simulation.
 - **⚖️ System Comparison Mode**: Side-by-side rendering of two systems (e.g. IAS15 vs. Keplerian, or two presets) sharing the same camera, with independent time controls and a dedicated comparison inspector.
 - **⏯️ Timeline Recording & Scrubbing**: Record a system's full evolution into a position/velocity buffer and scrub or play it back frame-by-frame — useful for replaying close encounters and validating integration stability.
-- **🧊 Temporal Anti-Aliasing (TAA)**: Halton-jittered TAA resolve pass for edge stability, with optional MSAA fallback (0×/2×/4×/8×) selectable in the Graphics & Quality Settings.
+- **🧊 Orbit MSAA**: Orbit lines are rendered into a dedicated multisample buffer (0×/2×/4×/8×) so they stay crisp while the rest of the scene renders at full native resolution without MSAA.
 - **🧰 System & Body Editor**: In-app **Create New System** wizard, **Add Orbiting Body** placer, and a per-body **Export** workflow for cosmetics. Custom systems persist edits directly; the Solar System supports a developer `\`+Export shortcut to dump all cosmetics into the master `data/system.json`.
 
 ---
@@ -212,11 +212,12 @@ python scripts/accuracy_test.py
 - **Precomputed Eclipse LUT (`u_eclipse_lut`)**: Generates high-precision light attenuation lookup tables bound across spherical planet shaders (`prog_spheres`), rings (`prog_rings`), and atmosphere raymarchers (`prog_atmo`).
 - **Oblate Star Geometry**: Corrects light cone and shadow penumbra geometry for fast-rotating, oblate host stars (e.g., Achernar), projecting elliptical stellar disks during eclipses and occultations.
 
-### Physically Based Atmospheric Scattering
+### Physically Based Atmospheric Scattering & Refraction
 Utilizes a multi-step precomputation technique inspired by Bruneton e.a.:
 1. **Transmittance LUT**: Precomputes optical depth for Rayleigh and Mie scattering across altitudes and zenith angles.
 2. **Multi-Scattering LUT**: Approximates higher-order light bounces inside the atmosphere.
 3. **Real-Time Raymarching Shader**: Combines Rayleigh scattering (sky color), Mie scattering (sun halos), and gas absorption in real time.
+4. **Atmospheric Refraction & Lensing**: Computes closed-form horizontal grazing refraction angles $\alpha_0 = (n_0 - 1) \sqrt{\frac{2\pi R}{H}}$ based on gas composition, surface pressure, and temperature. Primary camera view rays are analytically bent through both planet sphere impostors (`sphere.frag`), atmospheres (`atmo.frag`), and vertex bounding proxies (`atmo.vert`, `sphere.vert`), accurately reproducing astronomical horizon refraction (~34.5') and space-to-space lensing rings (~1.15') without distance cutoffs.
 
 ### Planetary Rings, Planetshine & Ringshine
 - **Planetary Rings**: Rendered with dynamic optical depth, Phase functions (supporting forward/backward scattering asymmetry), and self-shadowing cast by the parent planet and companion bodies.
@@ -225,11 +226,11 @@ Utilizes a multi-step precomputation technique inspired by Bruneton e.a.:
   - *For the Host Planet*: Evaluated using a macro-approximation based on the ring plane's area, elevation, solid angle, and a noon-fade term.
   - *For Orbiting Moons*: Dynamically projects the closest ring element to the moon, evaluates a wrapped Lambertian light model to mimic the ring plane's broad area-light profile, and calculates soft penumbral shadow softening as the moon enters/leaves the host planet's cylindrical shadow cylinder.
 
-### HDR, Bloom & Temporal Anti-Aliasing
+### HDR, Bloom & Orbit MSAA
 1. **Bright Pass Filtering**: Isolates high-intensity pixels above a configurable threshold.
 2. **Downsample / Upsample Pyramid**: Progressive Gaussian blurring across 5 MIP levels for smooth lens flare blooming, driven by `bloom_downsample_shader_*` / `bloom_upsample_shader_fs`.
 3. **Tone Mapping**: Composite pass (`composite_shader_fs`) with ACES Film or Reinhard operators converting HDR colors to sRGB with dynamic exposure adjustment, gated by HDR Mode and bloom intensity/threshold controls.
-4. **Temporal Anti-Aliasing**: A Halton-jittered `taa_resolve_shader_fs` pass blends the current frame against a history buffer. When TAA is enabled, MSAA is auto-disabled; otherwise MSAA (0×/2×/4×/8×) is user-selectable. Orbits and habitable-zone visuals are drawn in a post-TAA pass to keep them crisp.
+4. **Orbit MSAA**: The scene renders without MSAA at full native resolution. Orbit lines are drawn into a dedicated MSAA framebuffer (0×/2×/4×/8×), resolved, and blended back over the scene so they stay crisp.
 
 ---
 
