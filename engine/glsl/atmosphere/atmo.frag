@@ -362,7 +362,15 @@ void main() {
     
     vec3 ray_origin_au = u_camera_pos;
     vec3 cam_to_body = planet_center_render - u_camera_pos;
-    vec3 view_ray = normalize(f_pos_local_au + cam_to_body);
+    
+    // Compute exact mathematical screen ray to avoid quantization noise
+    // and moire patterns caused by interpolating f_pos_local_au across the proxy mesh triangles.
+    vec2 ndc = (gl_FragCoord.xy / u_screen_res) * 2.0 - 1.0;
+    vec4 clip_ray = vec4(ndc, -1.0, 1.0);
+    vec4 eye_ray = inverse(projection) * clip_ray;
+    eye_ray = vec4(eye_ray.xy, -1.0, 0.0);
+    vec3 view_ray = normalize((inverse(view) * eye_ray).xyz);
+    
     vec3 ray_dir = view_ray;
     bool is_refract_host = f_clip_z < 1e-4;
 
@@ -580,7 +588,7 @@ void main() {
                 // Since the planet and rings already provide perfectly smooth analytical intersection bounds (s_end),
                 // we ONLY clamp to the depth buffer if it represents a distinct non-analytical object (e.g. spacecraft)
                 // clearly in front of the planet. This completely eliminates depth-buffer banding on the planet surface!
-                float error_margin = max(50.0, dist_to_center * 15.0);
+                float error_margin = max(500.0, dist_to_center * 2500.0);
                 if (s_depth < s_end - error_margin) {
                     s_end = s_depth;
                 }
