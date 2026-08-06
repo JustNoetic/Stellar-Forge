@@ -372,7 +372,7 @@ void main() {
     vec3 view_ray = normalize((inverse(view) * eye_ray).xyz);
     
     vec3 ray_dir = view_ray;
-    bool is_refract_host = f_clip_z < 1e-4;
+    bool is_refract_host = length(u_body_offset - u_refract_center) < 1e-4;
 
     vec3 ring_ray_dir = view_ray;
     vec3 ring_ray_origin_au = u_camera_pos;
