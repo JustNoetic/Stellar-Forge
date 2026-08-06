@@ -100,7 +100,7 @@ pip install numpy scipy moderngl glfw pyrr imgui numba spiceypy requests PyOpenG
 - **🔬 JPL Horizons Accuracy Suite**: Includes automated verification benchmarks (`accuracy_test.py`) that compare 1-year numerical integrations directly against NASA JPL Horizons ground-truth state vectors.
 - **🛠️ Comprehensive Body Inspector**: In-depth GUI panel displaying real-time physical properties, osculating Keplerian orbital elements, atmospheric composition, effective thermal equilibrium, spectral type classifications, and dynamic property sliders.
 - **☀️ Stellar Classification & Evolution**: Computes effective temperatures, spectral classes (O, B, A, F, G, K, M, L, T, Y), luminosity classes (Hypergiants to Subdwarfs), and dynamic Habitable Zone (HZ) boundaries.
-- **🌤️ Atmospheric Raymarching & Lensing Refraction**: Multi-pass sky raymarching powered by precomputed Look-Up Tables (LUTs) for transmittance, single scattering, and multi-scattering across customizable planetary gas compositions. Includes physical Snell's law atmospheric lensing refraction ($\alpha_0 = (n_0 - 1) \sqrt{2\pi R / H}$) that analytically bends primary view rays through celestial body impostors (`sphere.frag`) and atmospheres (`atmo.frag`) at arbitrary distances without clipping.
+- **🌤️ Atmospheric Raymarching**: Multi-pass sky raymarching powered by precomputed Look-Up Tables (LUTs) for transmittance, single scattering, and multi-scattering across customizable planetary gas compositions.
 - **🛰️ NASA JPL SPICE & Horizons Integration**: Real-time position playback using official NAIF SPICE kernels (`.bsp`, `.tpc`, `.tls`) with automatic kernel discovery & threaded downloading, plus REST querying of JPL Horizons state vectors. Ephemeris systems can be **exported to N-body system JSON** for further simulation.
 - **⚖️ System Comparison Mode**: Side-by-side rendering of two systems (e.g. IAS15 vs. Keplerian, or two presets) sharing the same camera, with independent time controls and a dedicated comparison inspector.
 - **⏯️ Timeline Recording & Scrubbing**: Record a system's full evolution into a position/velocity buffer and scrub or play it back frame-by-frame — useful for replaying close encounters and validating integration stability.
@@ -213,11 +213,13 @@ python scripts/accuracy_test.py
 - **Oblate Star Geometry**: Corrects light cone and shadow penumbra geometry for fast-rotating, oblate host stars (e.g., Achernar), projecting elliptical stellar disks during eclipses and occultations.
 
 ### Physically Based Atmospheric Scattering & Refraction
-Utilizes a multi-step precomputation technique inspired by Bruneton e.a.:
+Utilizes a multi-step precomputation technique inspired by Bruneton et al. combined with real-time atmospheric refraction:
 1. **Transmittance LUT**: Precomputes optical depth for Rayleigh and Mie scattering across altitudes and zenith angles.
 2. **Multi-Scattering LUT**: Approximates higher-order light bounces inside the atmosphere.
 3. **Real-Time Raymarching Shader**: Combines Rayleigh scattering (sky color), Mie scattering (sun halos), and gas absorption in real time.
-4. **Atmospheric Refraction & Lensing**: Computes closed-form horizontal grazing refraction angles $\alpha_0 = (n_0 - 1) \sqrt{\frac{2\pi R}{H}}$ based on gas composition, surface pressure, and temperature. Primary camera view rays are analytically bent through both planet sphere impostors (`sphere.frag`), atmospheres (`atmo.frag`), and vertex bounding proxies (`atmo.vert`, `sphere.vert`), accurately reproducing astronomical horizon refraction (~34.5') and space-to-space lensing rings (~1.15') without distance cutoffs.
+4. **Atmospheric Refraction & Lensing**: Calculates physical ray bending (`compute_refraction_angle`) derived from surface refractivity ($n_{\text{mix}} - 1$), scale height, and planetary oblateness. Applies refraction to celestial body meshes (`sphere.frag`), volumetric atmospheres (`atmo.frag`), orbits, and rings when viewed through a foreground planetary atmosphere.
+5. **Distance-Agnostic Focal Lensing**: Supports refraction at arbitrary distances (e.g. Earth's atmosphere refractive lensing and sun-hugging ring effects when viewed from lunar focal distances or when background moons set behind planetary limbs).
+6. **Refraction Bounding Mesh Expansion**: Dynamically expands proxy sphere vertex geometry (`atmo.vert`, `sphere.vert`) using `dist * tan(max_bend)` to prevent edge clipping during aggressive atmospheric refraction.
 
 ### Planetary Rings, Planetshine & Ringshine
 - **Planetary Rings**: Rendered with dynamic optical depth, Phase functions (supporting forward/backward scattering asymmetry), and self-shadowing cast by the parent planet and companion bodies.

@@ -12,6 +12,8 @@ uniform vec3 u_refract_center;
 uniform float u_refract_radius;
 uniform float u_refract_max_bend;
 uniform float u_refract_scale_height;
+uniform vec3 u_refract_pole;
+uniform float u_refract_oblateness;
 uniform float u_au_to_km;
 
 float compute_refraction_angle(vec3 C, vec3 V, float d) {
@@ -20,10 +22,20 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     vec3 P_min = C + s_min * V;
     float r_min = length(P_min);
     
-    if (r_min > u_refract_radius + u_refract_scale_height * 15.0) return 0.0;
+    float local_refract_radius = u_refract_radius;
+    if (u_refract_oblateness > 0.001 && u_refract_oblateness < 0.99) {
+        vec3 P_dir = r_min > 1e-6 ? (P_min / r_min) : vec3(0.0, 1.0, 0.0);
+        vec3 pole_dir = length(u_refract_pole) > 1e-4 ? normalize(u_refract_pole) : vec3(0.0, 1.0, 0.0);
+        float cos_t = abs(dot(P_dir, pole_dir));
+        float k = 1.0 / (1.0 - u_refract_oblateness);
+        float denom = sqrt(max(1e-6, 1.0 + (k * k - 1.0) * cos_t * cos_t));
+        local_refract_radius = u_refract_radius / denom;
+    }
+
+    if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
     
-    float r_min_clamped = max(r_min, u_refract_radius - u_refract_scale_height); 
-    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - u_refract_radius) / max(1e-4, u_refract_scale_height));
+    float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
+    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
     float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
     
     if (d < 0.1 * sigma) {
