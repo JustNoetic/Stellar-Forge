@@ -363,24 +363,30 @@ void main() {
     vec3 ray_dir = view_ray;
     bool is_refract_host = length(planet_center_render - u_refract_center) < 1e-4;
 
+    vec3 ring_ray_dir = view_ray;
+    vec3 ring_ray_origin_au = u_camera_pos;
+
     if (u_refract_max_bend > 1e-6) {
-        if (!is_refract_host) {
-            vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
-            float d_km = length((planet_center_render - u_camera_pos) * u_au_to_km);
-            float alpha = compute_refraction_angle(C_km, view_ray, d_km);
-            if (alpha > 1e-7) {
-                vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
-                float u_len = length(u_dir);
-                if (u_len > 1e-5) {
-                    u_dir /= u_len;
-                    ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
-                    
-                    float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
-                    if (s_min_au > 0.0) {
-                        ray_origin_au = u_camera_pos + s_min_au * (view_ray - ray_dir);
-                    }
+        vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
+        float d_km = length((planet_center_render - u_camera_pos) * u_au_to_km);
+        float alpha = compute_refraction_angle(C_km, view_ray, d_km);
+        if (alpha > 1e-7) {
+            vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
+            float u_len = length(u_dir);
+            if (u_len > 1e-5) {
+                u_dir /= u_len;
+                ring_ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
+                
+                float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
+                if (s_min_au > 0.0) {
+                    ring_ray_origin_au = u_camera_pos + s_min_au * (view_ray - ring_ray_dir);
                 }
             }
+        }
+        
+        if (!is_refract_host) {
+            ray_dir = ring_ray_dir;
+            ray_origin_au = ring_ray_origin_au;
         } else {
             // Terrestrial Refraction for host planet atmosphere ray marching (horizon extension)
             vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
@@ -449,6 +455,8 @@ void main() {
     vec3 frag_local = cam_local;
 
     float closest_s_ring = 1e10;
+    vec3 ring_cam_local = (ring_ray_origin_au - u_body_offset) * u_au_to_km;
+    
     for (int k = 0; k < u_num_ring_planes; k++) {
         vec3 ring_center_world_rel = u_ring_center[k];
         // Allow clipping against any ring plane in the system to support moon atmospheres with host planet rings behind them
@@ -457,19 +465,32 @@ void main() {
         vec3 ring_center_local = (ring_center_world_rel - u_body_offset) * u_au_to_km;
         vec3 ring_normal = u_ring_normal[k];
 
-        float denom = dot(ray_dir, ring_normal);
+        float denom = dot(ring_ray_dir, ring_normal);
         if (abs(denom) > 1e-8) {
-            float s_ring = dot(ring_center_local - frag_local, ring_normal) / denom;
+            float s_ring = dot(ring_center_local - ring_cam_local, ring_normal) / denom;
             if (s_ring > 0.0) {
-                vec3 hit_local = frag_local + s_ring * ray_dir;
+                vec3 hit_local = ring_cam_local + s_ring * ring_ray_dir;
                 float dist_from_center = length(hit_local - ring_center_local);
                 float inner_r_km = u_ring_params[k].x * u_au_to_km;
                 float outer_r_km = u_ring_params[k].y * u_au_to_km;
 
                 float dr = fwidth(dist_from_center) * 1.5;
                 if (dist_from_center >= inner_r_km - dr && dist_from_center <= outer_r_km + dr) {
-                    if (s_ring < closest_s_ring) {
-                        closest_s_ring = s_ring;
+                    float span = max(1e-6, outer_r_km - inner_r_km);
+                    float p_hit = (dist_from_center - inner_r_km) / span;
+                    float dp = max(dr / span, 1.5 / 4096.0);
+                    
+                    float a1 = textureLod(u_ring_gradients, vec2(clamp(p_hit - dp, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
+                    float a2 = textureLod(u_ring_gradients, vec2(clamp(p_hit + dp, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
+                    float a3 = textureLod(u_ring_gradients, vec2(clamp(p_hit, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
+                    
+                    float hit_alpha = max(max(a1, a2), a3);
+                    float ring_opacity = u_ring_params[k].z;
+                    
+                    if (hit_alpha * ring_opacity > 1e-6) {
+                        if (s_ring < closest_s_ring) {
+                            closest_s_ring = s_ring;
+                        }
                     }
                 }
             }

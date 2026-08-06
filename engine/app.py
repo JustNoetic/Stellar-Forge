@@ -3178,7 +3178,7 @@ class App(InputHandlerMixin):
                 if unified_idx >= 16:
                     break
                 body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
-                active_rings = [r for r in body_rings if r['opacity'] >= 0.005]
+                active_rings = [r for r in body_rings if r['opacity'] > 0.0]
                 
                 if active_rings:
                     min_r = min(r['inner_r'] for r in active_rings)

@@ -43,6 +43,53 @@ uniform bool u_hdr_enabled;
 uniform float u_au_to_km;
 uniform float u_caster_max_bend[64];
 
+uniform vec3 u_refract_center;
+uniform float u_refract_radius;
+uniform float u_refract_max_bend;
+uniform float u_refract_scale_height;
+uniform vec3 u_refract_pole;
+uniform float u_refract_oblateness;
+
+float compute_refraction_angle(vec3 C, vec3 V, float d) {
+    if (u_refract_max_bend <= 1e-6) return 0.0;
+    float s_min = -dot(C, V);
+    vec3 P_min = C + s_min * V;
+    float r_min = length(P_min);
+    
+    float local_refract_radius = u_refract_radius;
+    if (u_refract_oblateness > 0.001 && u_refract_oblateness < 0.99) {
+        vec3 P_dir = r_min > 1e-6 ? (P_min / r_min) : vec3(0.0, 1.0, 0.0);
+        vec3 pole_dir = length(u_refract_pole) > 1e-4 ? normalize(u_refract_pole) : vec3(0.0, 1.0, 0.0);
+        float cos_t = abs(dot(P_dir, pole_dir));
+        float k = 1.0 / (1.0 - u_refract_oblateness);
+        float denom = sqrt(max(1e-6, 1.0 + (k * k - 1.0) * cos_t * cos_t));
+        local_refract_radius = u_refract_radius / denom;
+    }
+
+    if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
+    
+    float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
+    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
+    float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
+    
+    if (d < 0.1 * sigma) {
+        float kappa_0 = (delta_rmin / (sigma * 2.506628)) * exp(-(s_min * s_min) / (2.0 * sigma * sigma));
+        return 0.5 * kappa_0 * d;
+    }
+    
+    float sqrt2_sig = 1.4142135 * sigma;
+    float x_d = (d - s_min) / sqrt2_sig;
+    float x_0 = s_min / sqrt2_sig;
+    
+    float E_d = sign(x_d) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_d * x_d)));
+    float E_0 = sign(x_0) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_0 * x_0)));
+    float G_d = exp(-clamp(x_d * x_d, 0.0, 50.0));
+    float G_0 = exp(-clamp(x_0 * x_0, 0.0, 50.0));
+    
+    float alpha = delta_rmin * ( 0.5 * (E_d + E_0) * (1.0 - s_min / d) + (sigma / (d * 2.506628)) * (G_d - G_0) );
+    return max(0.0, alpha);
+}
+
 vec3 rgb2hsv(vec3 c) {
     vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
     vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
@@ -246,15 +293,46 @@ void main() {
     if (f_clip_z <= 0.0) discard;
     gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
 
+    vec3 view_ray = normalize(f_world_pos - u_camera_pos);
+    vec3 ray_dir = view_ray;
+    vec3 ray_origin = u_camera_pos;
+
+    if (u_refract_max_bend > 1e-6) {
+        vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
+        float d_km = length((u_host_planet_pos - u_camera_pos) * u_au_to_km);
+        float alpha = compute_refraction_angle(C_km, view_ray, d_km);
+        if (alpha > 1e-7) {
+            vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
+            float u_len = length(u_dir);
+            if (u_len > 1e-5) {
+                u_dir /= u_len;
+                ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
+                float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
+                if (s_min_au > 0.0) {
+                    ray_origin = u_camera_pos + s_min_au * (view_ray - ray_dir);
+                }
+            }
+        }
+    }
+
+    vec3 pole_n = length(u_host_planet_pole_obl.xyz) > 1e-4 ? normalize(u_host_planet_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
+    float d_n = dot(ray_dir, pole_n);
+    if (abs(d_n) < 1e-6) discard;
+
+    vec3 to_cam = ray_origin - u_host_planet_pos;
+    float t = -dot(to_cam, pole_n) / d_n;
+    if (t <= 0.0) discard;
+
+    vec3 hit_pos = ray_origin + ray_dir * t;
+
     if (u_clip_mode != 0) {
-        vec3 to_cam = u_camera_pos - u_host_planet_pos;
-        vec3 to_frag = f_world_pos - u_host_planet_pos;
+        vec3 to_frag = hit_pos - u_host_planet_pos;
         float d = dot(to_frag, to_cam);
         if (u_clip_mode == 1 && d > 0.0) discard;
         if (u_clip_mode == 2 && d <= 0.0) discard;
     }
 
-    float r = length(f_local_pos);
+    float r = length(hit_pos - u_host_planet_pos);
 
     vec3 total_color_front = vec3(0.0);
     vec3 total_color_back = vec3(0.0);
@@ -350,7 +428,7 @@ void main() {
         return;
     }
 
-    vec3 V = normalize(u_camera_pos - f_world_pos);
+    vec3 V = -ray_dir;
     vec3 N = normalize(f_normal);
     float cam_side = dot(N, V);
 
@@ -376,7 +454,7 @@ void main() {
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = u_stars_pos_radius[s].w;
-        vec3 frag_to_star = star_pos - f_world_pos;
+        vec3 frag_to_star = star_pos - hit_pos;
         float dist_to_star = length(frag_to_star);
         if (dist_to_star < 1e-5) continue;
         vec3 L = frag_to_star / dist_to_star;
@@ -472,7 +550,7 @@ void main() {
             float caster_r = u_casters[j].w;
             float atmo_h = u_caster_atmos[j].w;
 
-            vec3 frag_to_caster = caster_pos - f_world_pos;
+            vec3 frag_to_caster = caster_pos - hit_pos;
             float t_proj = dot(frag_to_caster, L);
             if (t_proj < 0.0) continue;
 
@@ -516,7 +594,7 @@ void main() {
         }
 
         if (u_host_planet_radius > 0.0) {
-            vec3 frag_to_host = u_host_planet_pos - f_world_pos;
+            vec3 frag_to_host = u_host_planet_pos - hit_pos;
             float t_proj = dot(frag_to_host, L);
 
             if (t_proj > 0.0 && t_proj < dist_to_star) {

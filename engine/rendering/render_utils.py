@@ -466,8 +466,8 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
         if unified_idx >= 4:
             break
         body_rings = rings_by_body[bi]
-        # Filter active rings (opacity >= 0.005)
-        active_rings = [r for r in body_rings if r['opacity'] >= 0.005]
+        # Filter active rings (opacity > 0.0)
+        active_rings = [r for r in body_rings if r['opacity'] > 0.0]
         if active_rings:
             min_r = min(r['inner_r'] for r in active_rings)
             max_r = max(r['outer_r'] for r in active_rings)
