@@ -364,10 +364,13 @@ void main() {
     vec3 cam_to_body = planet_center_render - u_camera_pos;
     vec3 view_ray = normalize(f_pos_local_au + cam_to_body);
     vec3 ray_dir = view_ray;
-    bool is_refract_host = length(planet_center_render - u_refract_center) < 1e-4;
+    bool is_refract_host = f_clip_z < 1e-4;
 
     vec3 ring_ray_dir = view_ray;
     vec3 ring_ray_origin_au = u_camera_pos;
+
+    float s_min_au = 0.0;
+    float ring_s_min_au = 0.0;
 
     if (u_refract_max_bend > 1e-6) {
         vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
@@ -380,9 +383,10 @@ void main() {
                 u_dir /= u_len;
                 ring_ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
                 
-                float s_min_au = -dot(u_camera_pos - u_refract_center, view_ray);
-                if (s_min_au > 0.0) {
-                    ring_ray_origin_au = u_camera_pos + s_min_au * (view_ray - ring_ray_dir);
+                float local_s_min = -dot(u_camera_pos - u_refract_center, view_ray);
+                if (local_s_min > 0.0) {
+                    ring_s_min_au = local_s_min;
+                    ring_ray_origin_au = u_camera_pos + ring_s_min_au * (view_ray - ring_ray_dir);
                 }
             }
         }
@@ -390,6 +394,7 @@ void main() {
         if (!is_refract_host) {
             ray_dir = ring_ray_dir;
             ray_origin_au = ring_ray_origin_au;
+            s_min_au = ring_s_min_au;
         } else {
             // Terrestrial Refraction for host planet atmosphere ray marching (horizon extension)
             vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
@@ -436,8 +441,39 @@ void main() {
         }
     }
 
-    vec3 cam_local_au = ray_origin_au - planet_center_render;
+    // Precise ray origin in body-local coordinates, avoiding catastrophic cancellation.
+    // We use the closest approach on the unrefracted ray to find a stable anchor point.
+    float dist_to_center = length(cam_to_body);
+    float bounding_radius_au = length(f_pos_local_au);
+    float ray_shift_au = 0.0;
+    
+    vec3 cam_local_au;
+    vec3 ring_cam_local_au;
+
+    if (dist_to_center > bounding_radius_au * 4.0) {
+        // Find closest approach of the unrefracted ray relative to the planet center
+        float t_ca = -dot(f_pos_local_au, view_ray);
+        vec3 closest_approach_au = f_pos_local_au + t_ca * view_ray;
+        
+        // Place precise origin 2.0 bounding radii in front of the closest approach
+        float dist_from_f_pos = t_ca - 2.0 * bounding_radius_au;
+        vec3 precise_origin_au = f_pos_local_au + dist_from_f_pos * view_ray;
+        
+        // Compute distance from the camera to this new origin
+        float dist_to_f_pos = length(f_pos_local_au + cam_to_body);
+        ray_shift_au = dist_to_f_pos + dist_from_f_pos;
+        
+        // Apply refraction shift laterally at this distance
+        cam_local_au = precise_origin_au + (ray_shift_au - s_min_au) * (ray_dir - view_ray);
+        ring_cam_local_au = precise_origin_au + (ray_shift_au - ring_s_min_au) * (ring_ray_dir - view_ray);
+    } else {
+        cam_local_au = ray_origin_au - planet_center_render;
+        ring_cam_local_au = ring_ray_origin_au - planet_center_render;
+    }
+
     vec3 cam_local = cam_local_au * u_au_to_km;
+    vec3 ring_cam_local = ring_cam_local_au * u_au_to_km;
+
     vec3 f_pos_local = f_pos_local_au * u_au_to_km;
 
     vec3 ray_dir_sph = toSphericalSpace(ray_dir, u_pole_obl);
@@ -458,7 +494,6 @@ void main() {
     vec3 frag_local = cam_local;
 
     float closest_s_ring = 1e10;
-    vec3 ring_cam_local = (ring_ray_origin_au - u_body_offset) * u_au_to_km;
     
     for (int k = 0; k < u_num_ring_planes; k++) {
         vec3 ring_center_world_rel = u_ring_center[k];
@@ -539,8 +574,15 @@ void main() {
             float cos_angle = dot(ray_dir, cam_fw);
             if (cos_angle > 1e-4) {
                 float s_depth = (scene_clip_z * u_au_to_km) / cos_angle;
-                if (s_depth > 0.0) {
-                    s_end = min(s_end, s_depth);
+                s_depth -= ray_shift_au * u_au_to_km; // Convert from camera-relative to O_local_km relative
+                
+                // Float32 depth buffers and absolute distance calculations are heavily quantized at large distances.
+                // Since the planet and rings already provide perfectly smooth analytical intersection bounds (s_end),
+                // we ONLY clamp to the depth buffer if it represents a distinct non-analytical object (e.g. spacecraft)
+                // clearly in front of the planet. This completely eliminates depth-buffer banding on the planet surface!
+                float error_margin = max(50.0, dist_to_center * 15.0);
+                if (s_depth < s_end - error_margin) {
+                    s_end = s_depth;
                 }
             }
         }
