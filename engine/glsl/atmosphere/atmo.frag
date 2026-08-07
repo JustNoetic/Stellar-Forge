@@ -4,6 +4,10 @@
 #define MAX_RING_PLANES 16
 #define PI 3.14159265358979
 
+float get_ign(vec2 p) {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
 in vec3 f_local_pos;
 in float f_clip_z;
 
@@ -72,12 +76,13 @@ layout(std430, binding = 8) buffer AtmoData {
     float u_ozone_peak_km;
     float u_ozone_width_km;
     float u_planet_clip_km;
-    float _atmo_pad1;
+    float u_max_adaptive_steps;
 };
 
 uniform sampler2D u_ring_gradients;
 uniform int u_num_ring_planes;
 uniform int u_atmo_quality;
+uniform bool u_stochastic_noise;
 uniform vec3 u_ring_center[MAX_RING_PLANES];
 uniform vec3 u_ring_normal[MAX_RING_PLANES];
 uniform vec4 u_ring_params[MAX_RING_PLANES];
@@ -619,10 +624,16 @@ void main() {
 
     int steps = u_num_samples;
     if (u_atmo_adaptive_steps) {
+        float ray_len = s_end - s_start;
+        float atmo_thickness = max(1e-3, u_atmo_radius_km - u_planet_radius_km);
+        
         float s_closest = clamp(-dot(cam_local_sph, ray_dir_sph), s_start, s_end);
         float min_altitude = length(cam_local_sph + s_closest * ray_dir_sph) - u_planet_radius_km;
-        float step_factor = mix(0.25, 1.0, clamp(exp(-max(0.0, min_altitude) / max(1e-3, u_h_rayleigh * 2.0)), 0.0, 1.0));
-        steps = int(clamp(float(u_num_samples) * step_factor, min(4.0, float(u_num_samples)), float(u_num_samples)));
+        float alt_factor = mix(0.25, 1.0, clamp(exp(-max(0.0, min_altitude) / max(1e-3, u_h_rayleigh * 2.0)), 0.0, 1.0));
+        
+        float length_boost = clamp(sqrt(ray_len / atmo_thickness), 1.0, 4.0);
+        float max_adaptive = max(float(u_num_samples), u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
+        steps = int(clamp(float(u_num_samples) * alt_factor * length_boost, 4.0, max_adaptive));
     }
     float step_size = (s_end - s_start) / float(steps);
     vec3 scattered = vec3(0.0);
@@ -664,6 +675,13 @@ void main() {
         vec4 ring_R_eff = vec4(0.0);
         vec3 ring_A_prime = vec3(0.0);
         vec3 ring_B = vec3(0.0);
+
+        int opt_caster_count = 0;
+        vec4 c_p0[4];
+        vec4 c_p1[4];
+        vec4 c_p2[4];
+        vec4 c_p3[4];
+        vec2 c_p4[4];
 
         float s_mid = (s_start + s_end) * 0.5;
         vec3 mid_pos = frag_local + s_mid * ray_dir;
@@ -770,109 +788,90 @@ void main() {
                         }
                     }
 
-                vec3 shadow_start = vec3(1.0);
-                vec3 shadow_end = vec3(1.0);
-
-                vec3 start_render = O + s_start * V;
-                vec3 end_render = O + s_end * V;
-                vec3 L_start = L_mid;
-                float sr_start = star_radius / max(dist_mid_star, 1e-6);
-                vec3 L_end = L_mid;
-                float sr_end = sr_start;
-
-                for (int c = 0; c < u_num_active_casters; c++) {
+                opt_caster_count = 0;
+                for (int c = 0; c < u_num_active_casters && opt_caster_count < 4; c++) {
                     vec3 pos = u_active_casters[c].xyz;
-                    float rad = u_active_casters[c].w;
-                    float atmo = u_active_caster_atmos[c].w;
-                    float caster_r_minor = u_active_caster_R_minor[c];
+                    float base_rad_au = u_active_casters[c].w;
+                    float atmo_au = u_active_caster_atmos[c].w;
+                    float caster_r_minor_au = u_active_caster_R_minor[c];
                     vec3 pole = u_active_caster_poles_obl[c].xyz;
-                    vec3 atmo_tint = u_active_caster_atmos[c].xyz;
-
-                    vec3 s2c = pos - start_render;
-                    float t = dot(s2c, L_start);
-                    if (t > 0.0) {
-                        float dist_sq = dot(s2c, s2c);
-                        if (dist_sq > rad * rad * 1.0404) {
-                            float dist = sqrt(dist_sq);
-                            vec3 cross_vec = cross(s2c, L_start);
-                            float p2 = dot(cross_vec, cross_vec);
-                            float r = rad;
-                            if (caster_r_minor < rad - 1e-5) r = get_oblate_radius(r, caster_r_minor, pole, L_start, s2c - t * L_start);
-                            float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
-                            float rp = eff_r + dist * sr_start;
-                            if (p2 < rp * rp) {
-                                float inv_d = 1.0 / dist;
-                                float alpha = sr_start; float beta = r * inv_d; float gamma = sqrt(p2) * inv_d;
-                                float po = alpha + beta; float pi = abs(beta - alpha);
-                                float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
-                                vec3 sh = vec3(1.0 - occ);
-                                float max_bend = u_active_max_bend[c];
-                                if (max_bend > 0.0 && gamma < po) {
-                                    float req_bend = beta - gamma;
-
-                                    float optical_depth = max(0.0, req_bend);
-                                    float atmospheric_transmission = exp(-optical_depth * 150.0);
-                                    float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
-
-                                    float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
-                                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
-
-                                    float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
-                                    float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
-                                    float atmo_blend = smoothstep(po, pi, gamma);
-
-                                    sh += deep_tint * refraction_intensity * atmo_blend;
-                                }
-                                shadow_start *= clamp(sh, 0.0, 1.0);
-                            }
-                        }
+                    
+                    vec3 D = (pos - planet_center_render) * u_au_to_km - frag_local;
+                    float t0 = dot(D, L_mid);
+                    float t1 = -dot(V, L_mid);
+                    
+                    vec3 A = D - t0 * L_mid;
+                    vec3 B = -V - t1 * L_mid;
+                    
+                    float qa = dot(B, B);
+                    float qb = 2.0 * dot(A, B);
+                    float qc = dot(A, A);
+                    
+                    float s_mid_local = (s_start + s_end) * 0.5;
+                    vec3 perp_mid_km = A + s_mid_local * B;
+                    
+                    float r_au = base_rad_au;
+                    if (caster_r_minor_au < base_rad_au - 1e-5) {
+                        r_au = get_oblate_radius(base_rad_au, caster_r_minor_au, pole, L_mid, perp_mid_km);
                     }
-
-                    s2c = pos - end_render;
-                    t = dot(s2c, L_end);
-                    if (t > 0.0) {
-                        float dist_sq = dot(s2c, s2c);
-                        if (dist_sq > rad * rad * 1.0404) {
-                            float dist = sqrt(dist_sq);
-                            vec3 cross_vec = cross(s2c, L_end);
-                            float p2 = dot(cross_vec, cross_vec);
-                            float r = rad;
-                            if (caster_r_minor < rad - 1e-5) r = get_oblate_radius(r, caster_r_minor, pole, L_end, s2c - t * L_end);
-                            float eff_r = r + (atmo > 0.0 ? atmo * 4.0 : 0.0);
-                            float rp = eff_r + dist * sr_end;
-                            if (p2 < rp * rp) {
-                                float inv_d = 1.0 / dist;
-                                float alpha = sr_end; float beta = r * inv_d; float gamma = sqrt(p2) * inv_d;
-                                float po = alpha + beta; float pi = abs(beta - alpha);
-                                float occ = min(1.0, (beta*beta)/max(1e-9, alpha*alpha)) * smoothstep(po, pi, gamma);
-                                vec3 sh = vec3(1.0 - occ);
-                                float max_bend = u_active_max_bend[c];
-                                if (max_bend > 0.0 && gamma < po) {
-                                    float req_bend = beta - gamma;
-
-                                    float optical_depth = max(0.0, req_bend);
-                                    float atmospheric_transmission = exp(-optical_depth * 150.0);
-                                    float transmission_mask = 1.0 - smoothstep(max_bend - alpha, max_bend + alpha, req_bend);
-
-                                    float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
-                                    vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
-
-                                    float distance_falloff = min(beta, 0.05) * min(beta, 0.05);
-                                    float refraction_intensity = atmospheric_transmission * transmission_mask * 1000.0 * distance_falloff;
-                                    float atmo_blend = smoothstep(po, pi, gamma);
-
-                                    sh += deep_tint * refraction_intensity * atmo_blend;
-                                }
-                                shadow_end *= clamp(sh, 0.0, 1.0);
-                            }
-                        }
+                    float r_km = r_au * u_au_to_km;
+                    float atmo_km = atmo_au * u_au_to_km;
+                    float eff_r_km = r_km + (atmo_km > 0.0 ? atmo_km * 4.0 : 0.0);
+                    
+                    float directional_star_r_au = star_radius;
+                    if (u_stars_poles_obl[s].w < star_radius - 1e-5) {
+                        directional_star_r_au = get_oblate_radius(star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz, L_mid, perp_mid_km);
                     }
+                    float alpha_star = directional_star_r_au / max(dist_mid_star, 1e-6);
+                    
+                    float dist_approx_min_km = max(0.0, t0 + s_start * t1);
+                    float dist_approx_max_km = max(0.0, t0 + s_end * t1);
+                    float r_penumbra_max_km = eff_r_km + max(dist_approx_min_km, dist_approx_max_km) * alpha_star;
+                    
+                    float s_valid_min = s_start;
+                    float s_valid_max = s_end;
+                    
+                    if (qa > 1e-8) {
+                        float det = qb * qb - 4.0 * qa * (qc - r_penumbra_max_km * r_penumbra_max_km);
+                        if (det < 0.0) continue;
+                        
+                        float sqrt_det = sqrt(det);
+                        float s_c1 = (-qb - sqrt_det) / (2.0 * qa);
+                        float s_c2 = (-qb + sqrt_det) / (2.0 * qa);
+                        
+                        s_valid_min = max(s_start, min(s_c1, s_c2));
+                        s_valid_max = min(s_end, max(s_c1, s_c2));
+                        
+                        if (s_valid_min > s_valid_max) continue;
+                    } else {
+                        if (qc > r_penumbra_max_km * r_penumbra_max_km) continue;
+                    }
+                    
+                    float s_mid_valid = (s_valid_min + s_valid_max) * 0.5;
+                    float t_proj_mid = t0 + s_mid_valid * t1;
+                    if (t_proj_mid <= 0.0) continue;
+                    
+                    float perp_sq_mid = qa * s_mid_valid * s_mid_valid + qb * s_mid_valid + qc;
+                    float dist_to_caster_mid = sqrt(max(0.0, perp_sq_mid) + t_proj_mid * t_proj_mid);
+                    float inv_dist = 1.0 / max(dist_to_caster_mid, 1e-6);
+                    
+                    float beta = eff_r_km * inv_dist;
+                    float po = alpha_star + beta;
+                    float pi = abs(beta - alpha_star);
+                    
+                    float r_penumbra_sq = po * po * dist_to_caster_mid * dist_to_caster_mid;
+                    float occ_mult = min(1.0, (beta * beta) / max(1e-9, alpha_star * alpha_star));
+                    
+                    c_p0[opt_caster_count] = vec4(qa, qb, qc, r_penumbra_sq);
+                    c_p1[opt_caster_count] = vec4(inv_dist, po, pi, occ_mult);
+                    c_p2[opt_caster_count] = vec4(alpha_star, beta, u_active_max_bend[c], 1000.0 * min(beta, 0.05) * min(beta, 0.05));
+                    c_p3[opt_caster_count] = vec4(u_active_caster_atmos[c].xyz, 0.0);
+                    c_p4[opt_caster_count] = vec2(s_valid_min, s_valid_max);
+                    
+                    opt_caster_count++;
                 }
-                global_eclipse_shadow = shadow_start;
-                end_eclipse_shadow = shadow_end;
 
-                if (shadow_start.r > 0.999 && shadow_end.r > 0.999 && ring_count == 0) skip_volumetric_shadow = true;
-                else if (shadow_start.r < 0.001 && shadow_end.r < 0.001 && ring_count == 0) skip_volumetric_shadow = true;
+                if (opt_caster_count == 0 && ring_count == 0) skip_volumetric_shadow = true;
             }
         }
 
@@ -884,6 +883,10 @@ void main() {
         float sin_sun = sin_star;
 
         float jitter = 0.5;
+        if (u_stochastic_noise) {
+            vec2 frame_offset = vec2(u_frame_counter * 5.588238, u_frame_counter * 13.91849);
+            jitter = get_ign(gl_FragCoord.xy + frame_offset);
+        }
         vec3 step_dir_sph = ray_dir_sph * step_size;
         vec3 current_pos_sph = cam_local_sph + (s_start + jitter * step_size) * ray_dir_sph;
 
@@ -1004,7 +1007,7 @@ void main() {
 
             vec3 sample_shadow = global_eclipse_shadow;
             if (u_atmo_quality == 2 && !skip_volumetric_shadow) {
-                sample_shadow = mix(global_eclipse_shadow, end_eclipse_shadow, t_lerp);
+                sample_shadow = vec3(1.0);
 
                 float d = length(ring_A_prime + current_s * ring_B);
                 vec4 s_vec = vec4(current_s);
@@ -1045,6 +1048,39 @@ void main() {
                         }
 
                         sample_shadow *= sh_mult.x * sh_mult.y * sh_mult.z * sh_mult.w;
+                    }
+                }
+                
+                for (int c = 0; c < 4; c++) {
+                    if (c >= opt_caster_count) break;
+                    
+                    vec2 s_bounds = c_p4[c];
+                    if (current_s >= s_bounds.x && current_s <= s_bounds.y) {
+                        vec4 p0 = c_p0[c];
+                        float perp_sq = p0.x * current_s * current_s + p0.y * current_s + p0.z;
+                        if (perp_sq < p0.w) {
+                            vec4 p1 = c_p1[c];
+                            float gamma = sqrt(max(0.0, perp_sq)) * p1.x;
+                            float occ = p1.w * smoothstep(p1.y, p1.z, gamma);
+                            vec3 sh = vec3(1.0 - occ);
+                            
+                            vec4 p2 = c_p2[c];
+                            float max_bend = p2.z;
+                            if (max_bend > 0.0) {
+                                float req_bend = p2.y - gamma;
+                                float opt_depth = max(0.0, req_bend);
+                                float atmo_trans = exp(-opt_depth * 150.0);
+                                float trans_mask = 1.0 - smoothstep(max_bend - p2.x, max_bend + p2.x, req_bend);
+                                float rayleigh_depth = clamp(req_bend / max(1e-6, max_bend), 0.0, 1.0);
+                                
+                                vec3 atmo_tint = c_p3[c].xyz;
+                                vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (rayleigh_depth * 2.0));
+                                float atmo_blend = smoothstep(p1.y, p1.z, gamma);
+                                
+                                sh += deep_tint * p2.w * atmo_trans * trans_mask * atmo_blend;
+                            }
+                            sample_shadow *= clamp(sh, 0.0, 1.0);
+                        }
                     }
                 }
             }

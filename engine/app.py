@@ -481,6 +481,7 @@ class App(InputHandlerMixin):
             "atmo_quality": 1,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
+            "atmo_adaptive_steps_max": 128,
             "atmo_enabled": True,
             "refraction_enabled": True,
             "show_orbits": True,
@@ -588,6 +589,7 @@ class App(InputHandlerMixin):
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
+                "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
@@ -1770,6 +1772,7 @@ class App(InputHandlerMixin):
         if 'u_ring_gradients' in prog_atmo:
             prog_atmo['u_ring_gradients'].value = 0
         u_atmo_quality_uniform = prog_atmo.get('u_atmo_quality', None)
+        u_atmo_stochastic_uniform = prog_atmo.get('u_stochastic_noise', None)
         u_atmo_camera_pos = prog_atmo.get('u_camera_pos', None)
         u_atmo_num_ring_planes = prog_atmo.get('u_num_ring_planes', None)
         u_atmo_ring_centers = prog_atmo.get('u_ring_center', None)
@@ -3860,6 +3863,9 @@ class App(InputHandlerMixin):
                 planet_radius_au = closest_atmo['planet_radius_km'] / au_to_km_val
                 if self.camera.get("refraction_enabled", True):
                     refract_max_bend = compute_max_bend(planet_radius_au, refract_scale_height, refractivity)
+                    if cam_dist_au > 0.95:
+                        fade = max(0.0, 1.0 - (cam_dist_au - 0.95) / 0.05)
+                        refract_max_bend *= fade
                 else:
                     refract_max_bend = 0.0
 
@@ -4065,6 +4071,7 @@ class App(InputHandlerMixin):
                 ctx.depth_mask = False
     
                 if u_atmo_quality_uniform is not None: u_atmo_quality_uniform.value = atmo_quality
+                if u_atmo_stochastic_uniform is not None: u_atmo_stochastic_uniform.value = self.camera.get("atmo_stochastic", True)
                 if u_atmo_camera_pos is not None: u_atmo_camera_pos.write(cam_pos)
                 AU_TO_KM = 149597870.7
             
@@ -4229,7 +4236,7 @@ class App(InputHandlerMixin):
                     self.atmo_staging[140:148] = active_max_bend_buf
                     self.atmo_staging[148:152] = [float(props.get('ozone_peak_km', 25.0)),
                                                   float(props.get('ozone_width_km', 8.0)),
-                                                  0.0, 0.0]  # pad to 608 bytes
+                                                  0.0, float(self.camera.get('atmo_adaptive_steps_max', 128))]  # pad to 608 bytes
 
                     # Inner clip radius for the atmosphere march: the planet is an
                     # icosphere whose flat faces sag below the analytic ellipsoid,
@@ -4799,6 +4806,19 @@ class App(InputHandlerMixin):
                         changed_adapt, adaptive_steps = imgui.checkbox("Adaptive Step Count", adaptive_steps)
                         if changed_adapt:
                             self.camera["atmo_adaptive_steps"] = adaptive_steps
+                            settings_changed = True
+                            
+                        if adaptive_steps:
+                            max_adapt_steps = self.camera.get("atmo_adaptive_steps_max", 128)
+                            changed_max_adapt, max_adapt_steps = imgui.slider_int("Max Adaptive Steps", max_adapt_steps, 8, 256)
+                            if changed_max_adapt:
+                                self.camera["atmo_adaptive_steps_max"] = max_adapt_steps
+                                settings_changed = True
+                            
+                        stochastic_steps = self.camera.get("atmo_stochastic", True)
+                        changed_stoch, stochastic_steps = imgui.checkbox("Stochastic Raymarching", stochastic_steps)
+                        if changed_stoch:
+                            self.camera["atmo_stochastic"] = stochastic_steps
                             settings_changed = True
                     
                     # Shadow Caster Budget
