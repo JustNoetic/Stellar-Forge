@@ -14,11 +14,16 @@ uniform vec3 u_mie_albedo;
 uniform float u_ozone_peak_km = 25.0;
 uniform float u_ozone_width_km = 8.0;
 
+// dir is always unit length here, so 'a = dot(dir,dir)' is always 1.0 -> removed
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
+<<<<<<< HEAD
     // dir is assumed to be normalized (a = 1.0)
     float b = dot(origin, dir);
 
     // Improved precision for large distances
+=======
+    float b = dot(origin, dir);
+>>>>>>> another-optimization-test
     vec3 p = origin - b * dir;
     float p2 = dot(p, p);
     float r2 = radius * radius;
@@ -44,14 +49,28 @@ void main() {
     vec2 t_atmo = raySphereIntersect(origin, dir, u_atmo_radius_km);
     vec2 t_planet = raySphereIntersect(origin, dir, u_planet_radius_km);
 
-    float ray_len = t_atmo.y;
     if (t_planet.x > 0.0 && t_planet.x < t_atmo.y) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
+<<<<<<< HEAD
     int num_samples = 40;
+=======
+    float ray_len = t_atmo.y;
+
+    // Hoisted out of the loop: these only depend on uniforms, not on sample index
+    vec3 beta_R = u_beta_rayleigh * 1000.0;
+    vec3 beta_M_ext = u_beta_mie * 1000.0;
+    vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
+    vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
+    // Note: w0_M, beta_M (Mie scattering), beta_M_abs were computed but never
+    // used in the final transmittance expression, so they've been removed.
+
+    const int num_samples = 256;
+>>>>>>> another-optimization-test
     float step_size = ray_len / float(num_samples);
+    float inv_ozone_width = 1.0 / max(u_ozone_width_km, 1e-3);
 
     float od_rayleigh = 0.0;
     float od_mie = 0.0;
@@ -66,19 +85,21 @@ void main() {
         vec3 p = origin + t * dir;
         float h_sample = max(0.0, length(p) - u_planet_radius_km);
 
+<<<<<<< HEAD
         od_rayleigh += exp(-h_sample * inv_h_rayleigh) * step_size;
         od_mie += exp(-h_sample * inv_h_mie) * step_size;
         od_ozone += exp(-pow((h_sample - u_ozone_peak_km) * inv_ozone_width, 2.0)) * step_size;
+=======
+        float t_ozone = (h_sample - u_ozone_peak_km) * inv_ozone_width;
+
+        od_rayleigh += exp(-h_sample / u_h_rayleigh) * step_size;
+        od_mie += exp(-h_sample / u_h_mie) * step_size;
+        od_ozone += exp(-(t_ozone * t_ozone)) * step_size;
+>>>>>>> another-optimization-test
     }
 
-    vec3 beta_R = u_beta_rayleigh * 1000.0;
-    vec3 beta_M_ext = u_beta_mie * 1000.0;
-    vec3 w0_M = clamp(u_mie_albedo, vec3(0.0), vec3(1.0));
-    vec3 beta_M = beta_M_ext * w0_M;              // Mie scattering
-    vec3 beta_M_abs = beta_M_ext * (vec3(1.0) - w0_M); // Mie absorption
-    vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
-    vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
-
-    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M_ext * od_mie + beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone));
+    // Moved out of loop: computed once instead of up to 256 times
+    vec3 transmittance = exp(-(beta_R * od_rayleigh + beta_M_ext * od_mie +
+                                beta_A_mixed * od_rayleigh + beta_A_layered * od_ozone));
     out_color = vec4(transmittance, 1.0);
 }
