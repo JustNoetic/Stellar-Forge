@@ -521,8 +521,8 @@ void main() {
 
     for (int k = 0; k < u_num_ring_planes; k++) {
         vec3 ring_center_world_rel = u_ring_center[k];
-        // Clip only against the local planet's ring plane to guarantee correct layering of its own rings.
-        if (length(ring_center_world_rel - u_body_offset) > 1e-4) continue;
+        // Allow clipping against any ring plane in the system to support moon atmospheres correctly layering with host planet rings
+        // if (length(ring_center_world_rel - u_body_offset) > 1e-4) continue;
 
         vec3 ring_center_local = (ring_center_world_rel - u_body_offset) * u_au_to_km;
         vec3 ring_normal = u_ring_normal[k];
