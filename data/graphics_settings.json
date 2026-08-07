@@ -15,8 +15,8 @@
     "ringshine_enabled": true,
     "ringshine_band_count": 100,
     "inspector_frame": 0,
-    "fov": 0.04884356938709521,
-    "flight_speed": 9.536755198684851e-06,
+    "fov": 45.0,
+    "flight_speed": 0.00015258822895707094,
     "shadow_caster_budget": 8,
     "screenshot_res_idx": 2,
     "horizon_align": true

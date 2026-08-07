@@ -384,6 +384,16 @@ void main() {
     if (u_refract_max_bend > 1e-6) {
         vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
         float d_km = length(cam_to_body * u_au_to_km);
+        
+        vec3 pole_n_approx = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
+        float d_n_approx = dot(view_ray, pole_n_approx);
+        if (abs(d_n_approx) > 1e-6) {
+            float t_approx = dot(cam_to_body, pole_n_approx) / d_n_approx;
+            if (t_approx > 0.0) {
+                d_km = t_approx * u_au_to_km;
+            }
+        }
+        
         float alpha = compute_refraction_angle(C_km, view_ray, d_km);
         if (alpha > 1e-7) {
             vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
