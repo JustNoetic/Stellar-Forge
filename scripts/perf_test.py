@@ -177,9 +177,48 @@ class PerfTracker:
                     "Per-section CPU cost (sorted by total time)")
             if self.gpu_sections:
                 gpu_total = sum(s['total'] for s in self.gpu_sections.values())
-                lines += self._section_lines(self.gpu_sections, gpu_total,
-                    "GPU pass timings (GL_TIME_ELAPSED)",
-                    "Summed per pass; reads are deferred to the next frame boundary.")
+                lines.append("")
+                lines.append("--- GPU Category Breakdown (GL_TIME_ELAPSED) ---")
+                lines.append("  Summed per category; reads are deferred to the next frame boundary.")
+                lines.append(f"  {'Category / Pass':<35s}  {'total ms':>10s}  {'count':>7s}  {'avg ms':>9s}  {'% of GPU':>9s}")
+                
+                categories = [
+                    ("Atmosphere Rendering", ["gpu_atmo_behind", "gpu_atmo_front"]),
+                    ("Celestial Bodies & Geo", ["gpu_spheres", "gpu_orbits", "gpu_hz"]),
+                    ("Rings & Shadows", ["gpu_rings", "gpu_ringshine_map"]),
+                    ("Post-Processing", ["gpu_bloom", "gpu_composite", "gpu_taa"]),
+                    ("Overhead & UI", ["gpu_culling", "gpu_imgui"])
+                ]
+                
+                categorized_keys = set(k for _, keys in categories for k in keys)
+                uncategorized_keys = [k for k in self.gpu_sections.keys() if k not in categorized_keys]
+                if uncategorized_keys:
+                    categories.append(("Other Passes", uncategorized_keys))
+
+                for cat_name, keys in categories:
+                    valid_keys = [k for k in keys if k in self.gpu_sections]
+                    if not valid_keys:
+                        continue
+                    
+                    cat_total = sum(self.gpu_sections[k]['total'] for k in valid_keys)
+                    cat_count = max(sum(self.gpu_sections[k]['count'] for k in valid_keys), 1)
+                    
+                    n_frames = len(self.frame_times) if self.frame_times else 1
+                    cat_avg_ms = (cat_total / n_frames) * 1000
+                    cat_pct = (cat_total / gpu_total * 100) if gpu_total > 0 else 0
+                    
+                    lines.append(f"  [{cat_name}]".ljust(37) + f"{cat_total * 1000:10.2f}  {cat_count:7d}  {cat_avg_ms:9.3f}  {cat_pct:8.1f}%")
+                    
+                    valid_keys.sort(key=lambda k: -self.gpu_sections[k]['total'])
+                    for idx, k in enumerate(valid_keys):
+                        s = self.gpu_sections[k]
+                        k_total = s['total']
+                        k_count = s['count']
+                        k_avg_ms = (k_total / k_count) * 1000 if k_count > 0 else 0
+                        k_pct = (k_total / gpu_total * 100) if gpu_total > 0 else 0
+                        prefix = "    \\-- " if idx == len(valid_keys) - 1 else "    |-- "
+                        name_display = f"{prefix}{k}"
+                        lines.append(f"  {name_display:<35s}  {k_total * 1000:10.2f}  {k_count:7d}  {k_avg_ms:9.3f}  {k_pct:8.1f}%")
             return "\n".join(lines)
 
 
@@ -329,7 +368,7 @@ def main():
     report = tracker.report()
     print("\n" + report)
     try:
-        with open(args.output, "w") as f:
+        with open(args.output, "w", encoding="utf-8") as f:
             f.write(report + "\n")
         print(f"\n[Perf] Report saved to {args.output}")
     except OSError as e:

@@ -19,18 +19,18 @@ uniform float u_ozone_width_km = 8.0;
 uniform sampler2D u_transmittance_lut;
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
-    float a = dot(dir, dir);
+    // dir is assumed to be normalized (a = 1.0)
     float b = dot(origin, dir);
 
     // Improved precision for large distances
-    vec3 p = origin - (b / a) * dir;
+    vec3 p = origin - b * dir;
     float p2 = dot(p, p);
     float r2 = radius * radius;
 
     if (p2 > r2) return vec2(1e10, -1e10);
 
-    float d = sqrt((r2 - p2) / a);
-    float t_closest = -b / a;
+    float d = sqrt(r2 - p2);
+    float t_closest = -b;
 
     return vec2(t_closest - d, t_closest + d);
 }
@@ -90,15 +90,19 @@ void main() {
 
             float current_s = 0.5 * step_size;
             vec3 transmittance_accum = vec3(1.0);
+            
+            float inv_h_rayleigh = 1.0 / u_h_rayleigh;
+            float inv_h_mie = 1.0 / u_h_mie;
+            float inv_ozone_width = 1.0 / max(u_ozone_width_km, 1e-3);
 
             for (int s = 0; s < ray_samples; s++) {
                 vec3 p = origin + ray_dir * current_s;
                 float p_len = length(p);
                 float h_sample = max(0.0, p_len - u_planet_radius_km);
 
-                float rho_R = exp(-h_sample / u_h_rayleigh);
-                float rho_M = exp(-h_sample / u_h_mie);
-                float rho_O = exp(-pow((h_sample - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
+                float rho_R = exp(-h_sample * inv_h_rayleigh);
+                float rho_M = exp(-h_sample * inv_h_mie);
+                float rho_O = exp(-pow((h_sample - u_ozone_peak_km) * inv_ozone_width, 2.0));
 
                 vec3 scattering = beta_R * rho_R + beta_M * rho_M;
                 vec3 extinction = scattering + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
