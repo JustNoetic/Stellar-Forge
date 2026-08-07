@@ -929,14 +929,6 @@ void main() {
 
         float inv_atmo_thickness = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);
 
-        float sun_pole_dot = dot(sun_dir_sph_const, pole_dir_norm);
-        float cosPhi = abs(sun_pole_dot);
-        float tanPhi = cosPhi / sqrt(max(1.0 - cosPhi * cosPhi, 1e-4));
-        float solstice_factor = clamp(tanPhi * 1.8, 0.0, 1.0);
-
-        float effective_star_rad = sin_star + max_bend;
-        float cos_sun_eff = sqrt(max(0.0, 1.0 - effective_star_rad * effective_star_rad));
-
         vec3 initial_pos_start = current_pos_sph - 0.5 * step_dir_sph;
         float h_prev = max(0.0, length(initial_pos_start) - u_planet_radius_km);
         float rho_R_prev = exp(-h_prev / u_h_rayleigh);
