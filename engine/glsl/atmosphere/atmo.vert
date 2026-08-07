@@ -52,7 +52,7 @@ layout(std430, binding = 8) buffer AtmoData {
     float u_ozone_peak_km;
     float u_ozone_width_km;
     float u_planet_clip_km;
-    float _atmo_pad1;
+    float u_max_adaptive_steps;
 };
 
 uniform float u_refract_max_bend;
