@@ -521,8 +521,8 @@ void main() {
 
     for (int k = 0; k < u_num_ring_planes; k++) {
         vec3 ring_center_world_rel = u_ring_center[k];
-        // Allow clipping against any ring plane in the system to support moon atmospheres with host planet rings behind them
-        // if (length(ring_center_world_rel - u_body_offset) > 1e-4) continue;
+        // Clip only against the local planet's ring plane to guarantee correct layering of its own rings.
+        if (length(ring_center_world_rel - u_body_offset) > 1e-4) continue;
 
         vec3 ring_center_local = (ring_center_world_rel - u_body_offset) * u_au_to_km;
         vec3 ring_normal = u_ring_normal[k];
@@ -530,45 +530,24 @@ void main() {
         float denom = dot(ring_ray_dir, ring_normal);
         if (abs(denom) > 1e-8) {
             float s_ring = dot(ring_center_local - ring_cam_local, ring_normal) / denom;
-            if (s_ring > 0.0) {
-                vec3 hit_local = ring_cam_local + s_ring * ring_ray_dir;
-                float dist_from_center = length(hit_local - ring_center_local);
-                float inner_r_km = u_ring_params[k].x * u_au_to_km;
-                float outer_r_km = u_ring_params[k].y * u_au_to_km;
-
-                float span = max(1e-6, outer_r_km - inner_r_km);
-                float dr = min(fwidth(dist_from_center) * 1.5, span * 0.05);
-                if (dist_from_center >= inner_r_km - dr && dist_from_center <= outer_r_km + dr) {
-                    float p_hit = (dist_from_center - inner_r_km) / span;
-                    float dp = max(dr / span, 1.5 / 4096.0);
-
-                    float a1 = textureLod(u_ring_gradients, vec2(clamp(p_hit - dp, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
-                    float a2 = textureLod(u_ring_gradients, vec2(clamp(p_hit + dp, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
-                    float a3 = textureLod(u_ring_gradients, vec2(clamp(p_hit, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
-
-                    float hit_alpha = max(max(a1, a2), a3);
-                    float ring_opacity = u_ring_params[k].z;
-
-                    if (hit_alpha * ring_opacity > 1e-6) {
-                        if (s_ring < closest_s_ring) {
-                            closest_s_ring = s_ring;
-                        }
+            // ray_shift_au artificially pushes the ray origin forward to avoid precision loss.
+            // If it pushes the origin past the ring plane, s_ring becomes negative.
+            // We must accept it if it is still physically in front of the TRUE camera.
+            if (s_ring + ray_shift_au * u_au_to_km > 0.0) {
+                float ring_opacity = u_ring_params[k].z;
+                if (ring_opacity > 1e-6) {
+                    if (s_ring < closest_s_ring) {
+                        closest_s_ring = s_ring;
                     }
                 }
             }
         }
     }
 
-    if (closest_s_ring < 1e9) {
-        if (u_atmo_clip_mode == 1) {
-            s_start = max(s_start, closest_s_ring);
-        } else if (u_atmo_clip_mode == 2) {
-            s_end = min(s_end, closest_s_ring);
-        }
-    } else {
-        if (u_atmo_clip_mode == 2) {
-            s_end = s_start;
-        }
+    if (u_atmo_clip_mode == 1) {
+        s_start = max(s_start, closest_s_ring);
+    } else if (u_atmo_clip_mode == 2) {
+        s_end = min(s_end, closest_s_ring);
     }
 
     for (int i = 0; i < u_num_active_casters; i++) {

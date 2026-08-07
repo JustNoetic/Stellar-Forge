@@ -479,6 +479,7 @@ class App(InputHandlerMixin):
             "ly_threshold_au": DEFAULT_LY_THRESHOLD_AU,
             "show_settings_modal": False,
             "atmo_quality": 1,
+            "atmo_resolution": 1.0,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
             "atmo_adaptive_steps_max": 128,
@@ -515,6 +516,7 @@ class App(InputHandlerMixin):
         self.bloom_texs = []
         self.last_fb_size = (0, 0)
         self.last_msaa_samples = -1
+        self.last_atmo_res = -1.0
         
         # Orbit-line MSAA resources (only orbit lines are multisampled)
         self.orbit_msaa_fbo = None
@@ -524,6 +526,12 @@ class App(InputHandlerMixin):
         # Atmosphere rendering resources
         self.prog_atmo_composite = None
         self.quad_vao_atmo_comp = None
+        self.prog_atmo_lowres = None
+        self.prog_atmo_upsample = None
+        self.quad_vao_atmo_upsample = None
+        self.atmo_lowres_fbo = None
+        self.atmo_lowres_scatter_tex = None
+        self.atmo_lowres_trans_tex = None
         
         self.depth_texture = None
         self.prev_cam_origin = None
@@ -587,6 +595,7 @@ class App(InputHandlerMixin):
             settings_path = os.path.join("data", "graphics_settings.json")
             saved = {
                 "atmo_quality": self.camera.get("atmo_quality", 1),
+                "atmo_resolution": self.camera.get("atmo_resolution", 1.0),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
                 "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
@@ -1336,19 +1345,43 @@ class App(InputHandlerMixin):
             prog_rings['u_ring_texture_back'].value = 5
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
-        if 'u_ringshine_lut' in prog_atmo:
-            prog_atmo['u_ringshine_lut'].value = 6
-        if 'u_ringshine_cdf_lut' in prog_atmo:
-            prog_atmo['u_ringshine_cdf_lut'].value = 7
-        if 'u_ringshine_map' in prog_atmo:
-            prog_atmo['u_ringshine_map'].value = 8
-        if 'u_depth_texture' in prog_atmo:
-            prog_atmo['u_depth_texture'].value = 9
+        
+        atmo_frag_lowres_src = atmo_fragment_shader.replace(
+            "layout(location = 0, index = 0) out vec4 out_scattered;",
+            "layout(location = 0) out vec4 out_scattered;"
+        ).replace(
+            "layout(location = 0, index = 1) out vec4 out_transmittance;",
+            "layout(location = 1) out vec4 out_transmittance;"
+        )
+        prog_atmo_lowres = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_frag_lowres_src)
+        
+        for p in (prog_atmo, prog_atmo_lowres):
+            if 'u_ringshine_lut' in p:
+                p['u_ringshine_lut'].value = 6
+            if 'u_ringshine_cdf_lut' in p:
+                p['u_ringshine_cdf_lut'].value = 7
+            if 'u_ringshine_map' in p:
+                p['u_ringshine_map'].value = 8
+            if 'u_depth_texture' in p:
+                p['u_depth_texture'].value = 9
+            if 'u_transmittance_lut' in p:
+                p['u_transmittance_lut'].value = 1
+            if 'u_multi_scatter_lut' in p:
+                p['u_multi_scatter_lut'].value = 3
+            if 'u_ring_gradients' in p:
+                p['u_ring_gradients'].value = 0
         
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
         self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
         self.prog_atmo_composite = ctx.program(vertex_shader=atmo_composite_shader_vs, fragment_shader=atmo_composite_shader_fs)
+        self.prog_atmo_upsample = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=atmo_upsample_fragment_shader)
+        if 'u_lowres_scatter' in self.prog_atmo_upsample:
+            self.prog_atmo_upsample['u_lowres_scatter'].value = 0
+        if 'u_lowres_trans' in self.prog_atmo_upsample:
+            self.prog_atmo_upsample['u_lowres_trans'].value = 1
+        if 'u_highres_depth' in self.prog_atmo_upsample:
+            self.prog_atmo_upsample['u_highres_depth'].value = 9
         
         quad_vertices = np.array([
             -1.0, -1.0,
@@ -1361,6 +1394,7 @@ class App(InputHandlerMixin):
         self.quad_vao_up = ctx.vertex_array(self.prog_bloom_up, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_comp = ctx.vertex_array(self.prog_composite, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_comp = ctx.vertex_array(self.prog_atmo_composite, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_atmo_upsample = ctx.vertex_array(self.prog_atmo_upsample, [(quad_vbo, '2f', 'in_position')])
         
         # Compile Habitable Zone Shader
         self.prog_hz = ctx.program(vertex_shader=hz_vertex_shader, fragment_shader=hz_fragment_shader)
@@ -1709,6 +1743,11 @@ class App(InputHandlerMixin):
     
         vao_atmo = ctx.vertex_array(
             prog_atmo,
+            [(vbo_hi, '3f 12x', 'in_position')],
+            index_buffer=ibo_hi
+        )
+        vao_atmo_lowres = ctx.vertex_array(
+            prog_atmo_lowres,
             [(vbo_hi, '3f 12x', 'in_position')],
             index_buffer=ibo_hi
         )
@@ -2726,9 +2765,11 @@ class App(InputHandlerMixin):
                 msaa_samples = 0
             else:
                 msaa_samples = self.camera.get("msaa_samples", 4)
-            if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples:
+            atmo_res = float(self.camera.get("atmo_resolution", 1.0))
+            if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples or self.last_atmo_res != atmo_res:
                 self.last_fb_size = (self.fb_width, self.fb_height)
                 self.last_msaa_samples = msaa_samples
+                self.last_atmo_res = atmo_res
                 
                 # Release old
                 if self.hdr_resolve_fbo: self.hdr_resolve_fbo.release(); self.hdr_resolve_fbo = None
@@ -2737,6 +2778,9 @@ class App(InputHandlerMixin):
                 if self.orbit_resolve_fbo: self.orbit_resolve_fbo.release(); self.orbit_resolve_fbo = None
                 if self.orbit_resolved_tex: self.orbit_resolved_tex.release(); self.orbit_resolved_tex = None
                 if self.depth_texture: self.depth_texture.release(); self.depth_texture = None
+                if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
+                if self.atmo_lowres_scatter_tex: self.atmo_lowres_scatter_tex.release(); self.atmo_lowres_scatter_tex = None
+                if self.atmo_lowres_trans_tex: self.atmo_lowres_trans_tex.release(); self.atmo_lowres_trans_tex = None
                 self.prev_cam_origin = None
                 for fbo in self.bloom_fbos: fbo.release()
                 for tex in self.bloom_texs: tex.release()
@@ -2755,6 +2799,25 @@ class App(InputHandlerMixin):
                 self.depth_texture.repeat_y = False
                 
                 self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
+                
+                if atmo_res < 0.999:
+                    low_w = max(1, int(self.fb_width * atmo_res))
+                    low_h = max(1, int(self.fb_height * atmo_res))
+                    self.atmo_lowres_scatter_tex = ctx.texture((low_w, low_h), 4, dtype='f4')
+                    self.atmo_lowres_scatter_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    self.atmo_lowres_scatter_tex.repeat_x = False
+                    self.atmo_lowres_scatter_tex.repeat_y = False
+                    
+                    self.atmo_lowres_trans_tex = ctx.texture((low_w, low_h), 4, dtype='f4')
+                    self.atmo_lowres_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    self.atmo_lowres_trans_tex.repeat_x = False
+                    self.atmo_lowres_trans_tex.repeat_y = False
+                    
+                    self.atmo_lowres_fbo = ctx.framebuffer(color_attachments=[self.atmo_lowres_scatter_tex, self.atmo_lowres_trans_tex])
+                else:
+                    self.atmo_lowres_fbo = None
+                    self.atmo_lowres_scatter_tex = None
+                    self.atmo_lowres_trans_tex = None
                 
                 if msaa_samples > 0:
                     orbit_msaa_color = ctx.renderbuffer((self.fb_width, self.fb_height), components=4, samples=msaa_samples, dtype='f4')
@@ -3801,7 +3864,7 @@ class App(InputHandlerMixin):
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -3886,7 +3949,7 @@ class App(InputHandlerMixin):
                 refract_pole = (float(pole_ref[0]), float(pole_ref[1]), float(pole_ref[2]))
                 refract_oblateness = float(b_info.get('oblateness', 0.0))
 
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_gpu_orbits, prog_ephem_orbits, getattr(self, 'prog_hz', None)):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, getattr(self, 'prog_hz', None)):
                 if prog is not None:
                     if 'u_refract_center' in prog:
                         prog['u_refract_center'].value = refract_center
@@ -4071,31 +4134,38 @@ class App(InputHandlerMixin):
                     draw_orbits()
             _perf_gpu_end(_gq)
 
-            def render_atmosphere_pass(clip_mode):
+            def render_atmosphere_pass(clip_mode, is_lowres=False):
                 if not sorted_atmos:
                     return
-                ctx.enable(moderngl.BLEND)
-                gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+                if not is_lowres:
+                    ctx.enable(moderngl.BLEND)
+                    gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+                else:
+                    ctx.disable(moderngl.BLEND)
                 ctx.depth_func = '<='
                 ctx.enable(moderngl.CULL_FACE)
                 ctx.cull_face = 'front'
                 ctx.disable(moderngl.DEPTH_TEST)
                 ctx.depth_mask = False
+                
+                cur_prog = prog_atmo_lowres if is_lowres else prog_atmo
+                cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
     
-                if u_atmo_quality_uniform is not None: u_atmo_quality_uniform.value = atmo_quality
-                if u_atmo_stochastic_uniform is not None: u_atmo_stochastic_uniform.value = self.camera.get("atmo_stochastic", True)
-                if u_atmo_camera_pos is not None: u_atmo_camera_pos.write(cam_pos)
+                if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
+                if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
+                if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
                 AU_TO_KM = 149597870.7
             
-                if u_atmo_num_ring_planes is not None: u_atmo_num_ring_planes.value = n_ring_planes
+                if 'u_num_ring_planes' in cur_prog: cur_prog['u_num_ring_planes'].value = n_ring_planes
                 if n_ring_planes > 0:
-                    if u_atmo_ring_centers is not None: u_atmo_ring_centers.write(ring_centers_buf)
-                    if u_atmo_ring_normals is not None: u_atmo_ring_normals.write(ring_normals_buf)
-                    if u_atmo_ring_params is not None: u_atmo_ring_params.write(ring_params_buf)
-                    if u_atmo_ring_coplanar_mask is not None: u_atmo_ring_coplanar_mask.write(ring_coplanar_mask_buf.tobytes())
+                    if 'u_ring_center' in cur_prog: cur_prog['u_ring_center'].write(ring_centers_buf)
+                    if 'u_ring_normal' in cur_prog: cur_prog['u_ring_normal'].write(ring_normals_buf)
+                    if 'u_ring_params' in cur_prog: cur_prog['u_ring_params'].write(ring_params_buf)
+                    if 'u_ring_coplanar_mask' in cur_prog: cur_prog['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
+                    ring_gradient_tex.use(location=0)
                 
-                if u_atmo_clip_mode is not None:
-                    u_atmo_clip_mode.value = clip_mode
+                if 'u_atmo_clip_mode' in cur_prog:
+                    cur_prog['u_atmo_clip_mode'].value = clip_mode
     
                 # Pre-build lookup tables outside the loop
                 atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
@@ -4272,7 +4342,7 @@ class App(InputHandlerMixin):
                     # Single buffer upload per atmosphere body
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
                     
-                    vao_atmo.render(moderngl.TRIANGLES)
+                    cur_vao.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
                 ctx.enable(moderngl.DEPTH_TEST)
@@ -4284,13 +4354,51 @@ class App(InputHandlerMixin):
             def execute_atmosphere_pass(clip_mode):
                 if not self.camera.get("atmo_enabled", True):
                     return
-                if 'u_screen_res' in prog_atmo:
-                    prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                atmo_res = float(self.camera.get("atmo_resolution", 1.0))
+                is_lowres = atmo_res < 0.999 and self.atmo_lowres_fbo is not None
                 
-                if self.depth_texture:
-                    self.depth_texture.use(location=9)
+                if is_lowres:
+                    if 'u_screen_res' in prog_atmo_lowres:
+                        prog_atmo_lowres['u_screen_res'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                    if self.depth_texture:
+                        self.depth_texture.use(location=9)
+                    
+                    self.atmo_lowres_fbo.use()
+                    ctx.viewport = (0, 0, self.atmo_lowres_fbo.width, self.atmo_lowres_fbo.height)
+                    self.atmo_lowres_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
+                    
+                    render_atmosphere_pass(clip_mode, is_lowres=True)
+                    
+                    self.hdr_resolve_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.enable(moderngl.BLEND)
+                    gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+                    ctx.disable(moderngl.DEPTH_TEST)
+                    ctx.depth_mask = False
+                    
+                    self.atmo_lowres_scatter_tex.use(location=0)
+                    self.atmo_lowres_trans_tex.use(location=1)
+                    if self.depth_texture:
+                        self.depth_texture.use(location=9)
+                    
+                    if 'u_depth_C' in self.prog_atmo_upsample:
+                        self.prog_atmo_upsample['u_depth_C'].value = depth_C
+                    if 'u_far' in self.prog_atmo_upsample:
+                        self.prog_atmo_upsample['u_far'].value = far
+                    if 'u_lowres_size' in self.prog_atmo_upsample:
+                        self.prog_atmo_upsample['u_lowres_size'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                        
+                    self.quad_vao_atmo_upsample.render(moderngl.TRIANGLE_STRIP)
+                    ctx.depth_mask = True
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.disable(moderngl.BLEND)
+                else:
+                    if 'u_screen_res' in prog_atmo:
+                        prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                    if self.depth_texture:
+                        self.depth_texture.use(location=9)
 
-                render_atmosphere_pass(clip_mode)
+                    render_atmosphere_pass(clip_mode, is_lowres=False)
 
             # --- Pass 1: Atmosphere behind rings ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
@@ -4308,6 +4416,7 @@ class App(InputHandlerMixin):
                 u_ring_clip_mode.value = 0
                 if u_ring_planetshine_enabled is not None:
                     u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
+                ring_gradient_tex.use(location=0)
                 
                 if ring_render_groups:
                     for group in ring_render_groups:
@@ -4808,6 +4917,12 @@ class App(InputHandlerMixin):
                         self.camera["atmo_quality"] = 2
                         settings_changed = True
                     if atmo_quality > 0:
+                        atmo_res = float(self.camera.get("atmo_resolution", 1.0))
+                        changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")
+                        if changed_res:
+                            self.camera["atmo_resolution"] = atmo_res
+                            settings_changed = True
+                            
                         max_steps = self.camera.get("atmo_steps_max", 32)
                         changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
                         if changed_steps:
