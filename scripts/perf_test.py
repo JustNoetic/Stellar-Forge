@@ -117,6 +117,8 @@ class PerfTracker:
         with self._lock:
             self.sections.clear()
             self.gpu_sections.clear()
+            if hasattr(self, 'swap_times'):
+                self.swap_times.clear()
 
     def _section_lines(self, table, total, title, note=""):
         lines = []
@@ -163,12 +165,20 @@ class PerfTracker:
                     gpu_total = sum(s['total'] for s in self.gpu_sections.values())
                     gpu_per_frame_ms = gpu_total / n * 1000
                     frame_ms = avg * 1000
-                    if gpu_per_frame_ms >= 0.85 * frame_ms:
-                        verdict = "GPU-bound (GPU work dominates the frame)"
+                    
+                    avg_swap_ms = 0.0
+                    if hasattr(self, 'swap_times') and self.swap_times:
+                        avg_swap_ms = (sum(self.swap_times) / len(self.swap_times)) * 1000
+                    cpu_app_ms = frame_ms - avg_swap_ms
+                    
+                    if gpu_per_frame_ms >= 0.85 * cpu_app_ms:
+                        verdict = f"GPU-bound (GPU {gpu_per_frame_ms:.1f}ms > CPU app {cpu_app_ms:.1f}ms)"
                     else:
-                        verdict = f"CPU-bound (GPU work is {gpu_per_frame_ms / max(frame_ms, 1e-9) * 100:.0f}% of frame time)"
+                        verdict = f"CPU-bound (CPU app {cpu_app_ms:.1f}ms > GPU {gpu_per_frame_ms:.1f}ms)"
+                    
                     lines.append("")
                     lines.append(f"GPU work / frame : {gpu_per_frame_ms:7.2f} ms")
+                    lines.append(f"CPU app work     : {cpu_app_ms:7.2f} ms  (Swap block: {avg_swap_ms:7.2f} ms)")
                     lines.append(f"Bottleneck       : {verdict}")
 
             if self.sections:
@@ -257,11 +267,24 @@ def main():
             if hasattr(m, fn_name):
                 patch_function(m, fn_name, tracker, label)
 
+    # Force fullscreen by monkey-patching glfw.create_window
+    original_create_window = glfw.create_window
+    def patched_create_window(width, height, title, monitor, share):
+        monitor = glfw.get_primary_monitor()
+        mode = glfw.get_video_mode(monitor)
+        window = original_create_window(mode.size.width, mode.size.height, title, monitor, share)
+        if window:
+            app_instance.window_width = mode.size.width
+            app_instance.window_height = mode.size.height
+            app_instance.fb_width, app_instance.fb_height = glfw.get_framebuffer_size(window)
+        return window
+    glfw.create_window = patched_create_window
+
     # Instantiate the application.
     app_instance = ap_mod.App()
 
     # Move the camera to a heavy scene (tracked body with rings + atmosphere).
-    target_body = args.target_body if args.target_body is not None else ("Saturn" if args.gpu else None)
+    target_body = args.target_body if args.target_body is not None else "Saturn"
     if target_body:
         app_instance._perf_target_body = target_body
 
@@ -287,6 +310,28 @@ def main():
         if warmup_start[0] is None:
             warmup_start[0] = now
             last_swap[0] = now
+            
+            # Hardcoded FOV of 20 degrees and look at Saturn's equator
+            app_instance.camera["fov"] = 20.0
+            idx = app_instance.camera.get("tracking_idx")
+            if idx is not None and hasattr(app_instance, '_bundle'):
+                bodies_data = app_instance._bundle['bodies_data']
+                if idx < len(bodies_data) and str(bodies_data[idx].get("name", "")).strip().lower() == "saturn":
+                    _rad = float(app_instance._bundle['visual_data'][idx][3]) if idx < len(app_instance._bundle['visual_data']) else 0.0
+                    _dist = max(_rad * 3.5, _rad + 1e-9)
+                    import engine.core.math_utils as mu
+                    import numpy as np
+                    b = bodies_data[idx]
+                    pole_ra = float(b.get("pole_ra", 0.0))
+                    pole_dec = float(b.get("pole_dec", 90.0))
+                    pole_vec = mu.pole_to_ecliptic(pole_ra, pole_dec)
+                    up = np.array([0.0, 0.0, 1.0], dtype='f8')
+                    if abs(np.dot(pole_vec, up)) > 0.99:
+                        up = np.array([0.0, 1.0, 0.0], dtype='f8')
+                    equator_vec = np.cross(pole_vec, up)
+                    equator_vec = equator_vec / max(np.linalg.norm(equator_vec), 1e-9)
+                    app_instance.camera["cam_pos_rel"] = equator_vec * _dist
+                    
             return original_swap(window)
         if warmup_done[0]:
             tracker.record_frame(now - last_swap[0])
@@ -301,7 +346,18 @@ def main():
         if warmup_done[0] and elapsed >= total_runtime:
             print(f"[Perf] Measurement window complete ({measure}s). Stopping ...")
             glfw.set_window_should_close(window, True)
-        return original_swap(window)
+            
+        swap_t0 = time.perf_counter()
+        res = original_swap(window)
+        swap_dt = time.perf_counter() - swap_t0
+        
+        if warmup_done[0]:
+            with tracker._lock:
+                if not hasattr(tracker, 'swap_times'):
+                    tracker.swap_times = []
+                tracker.swap_times.append(swap_dt)
+                
+        return res
 
     glfw.swap_buffers = patched_swap
 

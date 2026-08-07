@@ -639,6 +639,9 @@ void main() {
     vec3 scattered = vec3(0.0);
     vec3 final_transmittance = vec3(1.0);
 
+    vec3 pole_dir_norm = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
+    float max_bend = clamp(2.0 * max(u_refractivity, 0.0) * sqrt(3.14159265359 * u_planet_radius_km / max(1e-6, u_h_rayleigh * 2.0)), 0.001, 0.05);
+
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = u_stars_pos_radius[s].w;
@@ -907,52 +910,65 @@ void main() {
 
         float inv_atmo_thickness = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);
 
+        float sun_pole_dot = dot(sun_dir_sph_const, pole_dir_norm);
+        float cosPhi = abs(sun_pole_dot);
+        float tanPhi = cosPhi / sqrt(max(1.0 - cosPhi * cosPhi, 1e-4));
+        float solstice_factor = clamp(tanPhi * 1.8, 0.0, 1.0);
+
+        float effective_star_rad = sin_star + max_bend;
+        float cos_sun_eff = sqrt(max(0.0, 1.0 - effective_star_rad * effective_star_rad));
+
+        vec3 initial_pos_start = current_pos_sph - 0.5 * step_dir_sph;
+        float h_prev = max(0.0, length(initial_pos_start) - u_planet_radius_km);
+        float rho_R_prev = exp(-h_prev / u_h_rayleigh);
+        float rho_M_prev = exp(-h_prev / u_h_mie);
+        float rho_O_prev = exp(-pow((h_prev - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
+
         for (int i = 0; i < steps; i++) {
             float sample_len = length(current_pos_sph);
             float altitude = sample_len - u_planet_radius_km;
 
             // SpaceEngine Solstice Winter Model: Blue polar atmospheric scattering appears ONLY on the winter pole during solstice
-            vec3 pole_dir_norm = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
             vec3 sample_dir_norm = current_pos_sph / max(sample_len, 1e-6);
             float sin_lat = abs(dot(sample_dir_norm, pole_dir_norm));
             float lat_factor = smoothstep(0.1, 0.7, sin_lat);
 
-            float sun_pole_dot = dot(sun_dir_sph_const, pole_dir_norm);
             float frag_pole_dot = dot(sample_dir_norm, pole_dir_norm);
 
             // Winter hemisphere condition: Sun and Sample point are on opposite sides of the equator
             float is_winter = step(sun_pole_dot * frag_pole_dot, 0.0);
-
-            // Solstice progress: cosPhi is sine of solar elevation above equator = |sun_pole_dot|
-            float cosPhi = abs(sun_pole_dot);
-            float tanPhi = cosPhi / sqrt(max(1.0 - cosPhi * cosPhi, 1e-4));
-            float solstice_factor = clamp(tanPhi * 1.8, 0.0, 1.0);
 
             float winter_solstice_effect = lat_factor * is_winter * solstice_factor;
 
             float polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
             vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
 
-            vec3 pos_start = current_pos_sph - 0.5 * step_dir_sph;
-            vec3 pos_end = current_pos_sph + 0.5 * step_dir_sph;
-            float h1 = max(0.0, length(pos_start) - u_planet_radius_km);
+            float h1 = h_prev;
+            float rho_R1 = rho_R_prev;
+            float rho_M1 = rho_M_prev;
+            float rho_O1 = rho_O_prev;
+
             float h_mid = max(0.0, altitude);
+
+            vec3 pos_end = current_pos_sph + 0.5 * step_dir_sph;
             float h2 = max(0.0, length(pos_end) - u_planet_radius_km);
 
-            float rho_R1 = exp(-h1 / u_h_rayleigh);
             float rho_R_mid = exp(-h_mid / u_h_rayleigh);
             float rho_R2 = exp(-h2 / u_h_rayleigh);
             float rho_R = (rho_R1 + 4.0 * rho_R_mid + rho_R2) * (1.0 / 6.0);
 
-            float rho_M1 = exp(-h1 / u_h_mie);
             float rho_M_mid = exp(-h_mid / u_h_mie);
             float rho_M2 = exp(-h2 / u_h_mie);
             float rho_M = (rho_M1 + 4.0 * rho_M_mid + rho_M2) * (1.0 / 6.0) * polar_haze_factor;
 
-            float rho_O1 = exp(-pow((h1 - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
             float rho_O_mid = exp(-pow((h_mid - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
             float rho_O2 = exp(-pow((h2 - u_ozone_peak_km) / max(u_ozone_width_km, 1e-3), 2.0));
             float rho_O = (rho_O1 + 4.0 * rho_O_mid + rho_O2) * (1.0 / 6.0);
+
+            h_prev = h2;
+            rho_R_prev = rho_R2;
+            rho_M_prev = rho_M2;
+            rho_O_prev = rho_O2;
 
             // Extinction uses physical beta_R to prevent artificial limb color fringing
             vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
@@ -965,14 +981,6 @@ void main() {
 
             float sin_planet = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
             float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
-
-            // Atmospheric refraction limit (max bending angle) for this body.
-            // Derived from the surface refractivity (n_mix - 1) instead of a
-            // hard-coded Earth-only 0.00029 constant, so Venus/Mars/Titan/gas
-            // giants refract eclipses according to their own gas mixtures.
-            float max_bend = clamp(2.0 * max(u_refractivity, 0.0) * sqrt(3.14159265359 * u_planet_radius_km / max(1e-6, u_h_rayleigh * 2.0)), 0.001, 0.05);
-            float effective_star_rad = sin_star + max_bend;
-            float cos_sun_eff = sqrt(max(0.0, 1.0 - effective_star_rad * effective_star_rad));
 
             float cos_outer = cos_planet * cos_sun_eff - sin_planet * effective_star_rad;
             float cos_inner = cos_planet * cos_sun_eff + sin_planet * effective_star_rad;

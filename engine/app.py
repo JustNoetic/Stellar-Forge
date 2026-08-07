@@ -711,6 +711,18 @@ class App(InputHandlerMixin):
             elif key == glfw.KEY_EQUAL:
                 multiplier = 2.0 if (mods & glfw.MOD_SHIFT) else 1.1
                 self.camera["exposure"] *= multiplier
+            elif key == glfw.KEY_F11 and action == glfw.PRESS:
+                monitor = glfw.get_window_monitor(window)
+                if monitor:
+                    w, h = getattr(self, "windowed_size", (1280, 720))
+                    x, y = getattr(self, "windowed_pos", (100, 100))
+                    glfw.set_window_monitor(window, None, x, y, w, h, glfw.DONT_CARE)
+                else:
+                    self.windowed_pos = glfw.get_window_pos(window)
+                    self.windowed_size = glfw.get_window_size(window)
+                    primary_monitor = glfw.get_primary_monitor()
+                    mode = glfw.get_video_mode(primary_monitor)
+                    glfw.set_window_monitor(window, primary_monitor, 0, 0, mode.size.width, mode.size.height, mode.refresh_rate)
             elif key == glfw.KEY_F12 and action == glfw.PRESS:
                 if not self._screenshot_capturing and not self._screenshot_saving:
                     _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]
