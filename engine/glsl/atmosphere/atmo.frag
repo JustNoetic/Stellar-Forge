@@ -145,7 +145,7 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     float s_min = -dot(C, V);
     vec3 P_min = C + s_min * V;
     float r_min = length(P_min);
-    
+
     float local_refract_radius = u_refract_radius;
     if (u_refract_oblateness > 0.001 && u_refract_oblateness < 0.99) {
         vec3 P_dir = r_min > 1e-6 ? (P_min / r_min) : vec3(0.0, 1.0, 0.0);
@@ -157,25 +157,25 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     }
 
     if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
-    
-    float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
+
+    float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height);
     float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
     float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
-    
+
     if (d < 0.1 * sigma) {
         float kappa_0 = (delta_rmin / (sigma * 2.506628)) * exp(-(s_min * s_min) / (2.0 * sigma * sigma));
         return 0.5 * kappa_0 * d;
     }
-    
+
     float sqrt2_sig = 1.4142135 * sigma;
     float x_d = (d - s_min) / sqrt2_sig;
     float x_0 = s_min / sqrt2_sig;
-    
+
     float E_d = sign(x_d) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_d * x_d)));
     float E_0 = sign(x_0) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_0 * x_0)));
     float G_d = exp(-clamp(x_d * x_d, 0.0, 50.0));
     float G_0 = exp(-clamp(x_0 * x_0, 0.0, 50.0));
-    
+
     float alpha = delta_rmin * ( 0.5 * (E_d + E_0) * (1.0 - s_min / d) + (sigma / (d * 2.506628)) * (G_d - G_0) );
     return max(0.0, alpha);
 }
@@ -359,10 +359,10 @@ void main() {
 
     vec3 planet_center_render = u_body_offset;
     vec3 f_pos_local_au = f_local_pos * u_atmo_radius_au;
-    
+
     vec3 ray_origin_au = u_camera_pos;
     vec3 cam_to_body = planet_center_render - u_camera_pos;
-    
+
     // Compute exact mathematical screen ray to avoid quantization noise
     // and moire patterns caused by interpolating f_pos_local_au across the proxy mesh triangles.
     vec2 ndc = (gl_FragCoord.xy / u_screen_res) * 2.0 - 1.0;
@@ -370,9 +370,10 @@ void main() {
     vec4 eye_ray = inverse(projection) * clip_ray;
     eye_ray = vec4(eye_ray.xy, -1.0, 0.0);
     vec3 view_ray = normalize((inverse(view) * eye_ray).xyz);
-    
+
     vec3 ray_dir = view_ray;
-    bool is_refract_host = f_clip_z < 1e-4;
+    bool is_refract_host = length(u_body_offset - u_refract_center) < 1e-4;
+
 
     vec3 ring_ray_dir = view_ray;
     vec3 ring_ray_origin_au = u_camera_pos;
@@ -390,7 +391,7 @@ void main() {
             if (u_len > 1e-5) {
                 u_dir /= u_len;
                 ring_ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
-                
+
                 float local_s_min = -dot(u_camera_pos - u_refract_center, view_ray);
                 if (local_s_min > 0.0) {
                     ring_s_min_au = local_s_min;
@@ -398,7 +399,7 @@ void main() {
                 }
             }
         }
-        
+
         if (!is_refract_host) {
             ray_dir = ring_ray_dir;
             ray_origin_au = ring_ray_origin_au;
@@ -427,15 +428,15 @@ void main() {
             if (h < u_refract_scale_height * 15.0) {
                 float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
                 float max_terr_alpha = 0.5 * u_refract_max_bend * density;
-                
+
                 if (max_terr_alpha > 1e-7) {
                     float mu = dot(view_ray, local_up);
                     float mu_horiz = -sqrt(max(0.0, 2.0 * max(h, 0.0) / local_refract_radius));
                     float delta_mu = sqrt(2.0 * u_refract_scale_height / local_refract_radius);
-                    
+
                     float x = (mu - mu_horiz) / max(1e-6, delta_mu);
                     float alpha = max_terr_alpha * exp(-x * x);
-                    
+
                     if (alpha > 1e-7) {
                         vec3 u_dir = local_up - view_ray * mu;
                         float u_len = length(u_dir);
@@ -454,7 +455,7 @@ void main() {
     float dist_to_center = length(cam_to_body);
     float bounding_radius_au = length(f_pos_local_au);
     float ray_shift_au = 0.0;
-    
+
     vec3 cam_local_au;
     vec3 ring_cam_local_au;
 
@@ -462,15 +463,15 @@ void main() {
         // Find closest approach of the unrefracted ray relative to the planet center
         float t_ca = -dot(f_pos_local_au, view_ray);
         vec3 closest_approach_au = f_pos_local_au + t_ca * view_ray;
-        
+
         // Place precise origin 2.0 bounding radii in front of the closest approach
         float dist_from_f_pos = t_ca - 2.0 * bounding_radius_au;
         vec3 precise_origin_au = f_pos_local_au + dist_from_f_pos * view_ray;
-        
+
         // Compute distance from the camera to this new origin
         float dist_to_f_pos = length(f_pos_local_au + cam_to_body);
         ray_shift_au = dist_to_f_pos + dist_from_f_pos;
-        
+
         // Apply refraction shift laterally at this distance
         cam_local_au = precise_origin_au + (ray_shift_au - s_min_au) * (ray_dir - view_ray);
         ring_cam_local_au = precise_origin_au + (ray_shift_au - ring_s_min_au) * (ring_ray_dir - view_ray);
@@ -502,7 +503,7 @@ void main() {
     vec3 frag_local = cam_local;
 
     float closest_s_ring = 1e10;
-    
+
     for (int k = 0; k < u_num_ring_planes; k++) {
         vec3 ring_center_world_rel = u_ring_center[k];
         // Allow clipping against any ring plane in the system to support moon atmospheres with host planet rings behind them
@@ -525,14 +526,14 @@ void main() {
                 if (dist_from_center >= inner_r_km - dr && dist_from_center <= outer_r_km + dr) {
                     float p_hit = (dist_from_center - inner_r_km) / span;
                     float dp = max(dr / span, 1.5 / 4096.0);
-                    
+
                     float a1 = textureLod(u_ring_gradients, vec2(clamp(p_hit - dp, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
                     float a2 = textureLod(u_ring_gradients, vec2(clamp(p_hit + dp, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
                     float a3 = textureLod(u_ring_gradients, vec2(clamp(p_hit, 0.0, 1.0), (float(k) + 0.5) / 16.0), 0.0).a;
-                    
+
                     float hit_alpha = max(max(a1, a2), a3);
                     float ring_opacity = u_ring_params[k].z;
-                    
+
                     if (hit_alpha * ring_opacity > 1e-6) {
                         if (s_ring < closest_s_ring) {
                             closest_s_ring = s_ring;
@@ -583,12 +584,12 @@ void main() {
             if (cos_angle > 1e-4) {
                 float s_depth = (scene_clip_z * u_au_to_km) / cos_angle;
                 s_depth -= ray_shift_au * u_au_to_km; // Convert from camera-relative to O_local_km relative
-                
+
                 // Float32 depth buffers and absolute distance calculations are heavily quantized at large distances.
                 // Since the planet and rings already provide perfectly smooth analytical intersection bounds (s_end),
                 // we ONLY clamp to the depth buffer if it represents a distinct non-analytical object (e.g. spacecraft)
                 // clearly in front of the planet. This completely eliminates depth-buffer banding on the planet surface!
-                float error_margin = max(500.0, dist_to_center * 2500.0);
+                float error_margin = dist_to_center * 2500.0;
                 if (s_depth < s_end - error_margin) {
                     s_end = s_depth;
                 }
@@ -980,7 +981,7 @@ void main() {
             float sin_Z = sqrt(max(0.0, 1.0 - light_cos_theta * light_cos_theta));
             float exact_disc_top_cos = light_cos_theta * cos_sun_eff + sin_Z * effective_star_rad;
             float exact_disc_bot_cos = light_cos_theta * cos_sun_eff - sin_Z * effective_star_rad;
-            
+
             float disc_top_cos = exact_disc_top_cos;
             if (light_cos_theta > cos_sun_eff) {
                 disc_top_cos = 1.0;
