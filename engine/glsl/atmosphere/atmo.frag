@@ -104,6 +104,9 @@ uniform int u_ringshine_band_count;
 uniform sampler2D u_depth_texture;
 uniform vec2 u_screen_res;
 
+uniform bool u_vrs_highres_pass;
+uniform sampler2D u_lowres_trans;
+
 layout(location = 0, index = 0) out vec4 out_scattered;
 layout(location = 0, index = 1) out vec4 out_transmittance;
 
@@ -358,6 +361,55 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
 
 void main() {
     if (f_clip_z < 0.0) discard;
+    
+    if (u_vrs_highres_pass && u_screen_res.x > 0.0 && u_screen_res.y > 0.0) {
+        vec2 depth_uv = gl_FragCoord.xy / u_screen_res;
+        
+        vec2 low_res_size = vec2(textureSize(u_lowres_trans, 0));
+        vec2 texel_pos = depth_uv * low_res_size - 0.5;
+        vec2 p_low = floor(texel_pos);
+        
+        vec2 uv00 = (p_low + vec2(0.5, 0.5)) / low_res_size;
+        vec2 uv10 = (p_low + vec2(1.5, 0.5)) / low_res_size;
+        vec2 uv01 = (p_low + vec2(0.5, 1.5)) / low_res_size;
+        vec2 uv11 = (p_low + vec2(1.5, 1.5)) / low_res_size;
+        
+        float t00_a = texture(u_lowres_trans, uv00).a;
+        float t10_a = texture(u_lowres_trans, uv10).a;
+        float t01_a = texture(u_lowres_trans, uv01).a;
+        float t11_a = texture(u_lowres_trans, uv11).a;
+        
+        bool is_atmo_edge = (t00_a > 0.0 || t10_a > 0.0 || t01_a > 0.0 || t11_a > 0.0) &&
+                            (t00_a == 0.0 || t10_a == 0.0 || t01_a == 0.0 || t11_a == 0.0);
+                            
+        float d00 = texture(u_depth_texture, uv00).r;
+        float d10 = texture(u_depth_texture, uv10).r;
+        float d01 = texture(u_depth_texture, uv01).r;
+        float d11 = texture(u_depth_texture, uv11).r;
+        
+        float max_d = max(max(d00, d10), max(d01, d11));
+        float min_d = min(min(d00, d10), min(d01, d11));
+        
+        float high_depth_raw = texture(u_depth_texture, depth_uv).r;
+        
+        float log_far_denom = log2(u_depth_C * u_far + 1.0);
+        float d00_lin = (exp2(d00 * log_far_denom) - 1.0) / u_depth_C;
+        float d10_lin = (exp2(d10 * log_far_denom) - 1.0) / u_depth_C;
+        float d01_lin = (exp2(d01 * log_far_denom) - 1.0) / u_depth_C;
+        float d11_lin = (exp2(d11 * log_far_denom) - 1.0) / u_depth_C;
+        float high_depth = (exp2(high_depth_raw * log_far_denom) - 1.0) / u_depth_C;
+        
+        float max_d_lin = max(max(d00_lin, d10_lin), max(d01_lin, d11_lin));
+        float min_d_lin = min(min(d00_lin, d10_lin), min(d01_lin, d11_lin));
+        
+        float depth_tol_edge = max(high_depth * 0.05, 0.0001);
+        bool is_depth_edge = (max_d_lin - min_d_lin) > depth_tol_edge;
+        
+        if (!is_atmo_edge && !is_depth_edge) {
+            discard; // Inner pixel, rendered efficiently in low-res pass
+        }
+    }
+
     u_ring_mask = floatBitsToUint(instances[u_body_idx * 7 + 3].w);
     vec3 body_planetshine_dir = instances[u_body_idx * 7 + 4].xyz;
     vec3 body_planetshine_color = instances[u_body_idx * 7 + 5].xyz;
@@ -569,7 +621,20 @@ void main() {
 
     if (u_screen_res.x > 0.0 && u_screen_res.y > 0.0) {
         vec2 depth_uv = gl_FragCoord.xy / u_screen_res;
-        float log_depth = texture(u_depth_texture, depth_uv).r;
+        
+        // Manually bilinear filter the high-res depth texture to prevent perfectly vertical Moiré bands
+        // caused by sub-pixel snapping when sampling a GL_NEAREST depth buffer at a lower resolution.
+        vec2 high_res_size = vec2(textureSize(u_depth_texture, 0));
+        vec2 texel_pos = depth_uv * high_res_size - 0.5;
+        vec2 p = floor(texel_pos);
+        vec2 f = fract(texel_pos);
+        
+        float d00 = texture(u_depth_texture, (p + vec2(0.5, 0.5)) / high_res_size).r;
+        float d10 = texture(u_depth_texture, (p + vec2(1.5, 0.5)) / high_res_size).r;
+        float d01 = texture(u_depth_texture, (p + vec2(0.5, 1.5)) / high_res_size).r;
+        float d11 = texture(u_depth_texture, (p + vec2(1.5, 1.5)) / high_res_size).r;
+        
+        float log_depth = mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);
         if (log_depth < 0.99999) {
             float log_far_denom = log2(u_depth_C * u_far + 1.0);
             float scene_clip_z = (exp2(log_depth * log_far_denom) - 1.0) / u_depth_C;

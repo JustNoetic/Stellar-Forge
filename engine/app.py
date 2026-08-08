@@ -478,8 +478,10 @@ class App(InputHandlerMixin):
             "edit_data": {},
             "ly_threshold_au": DEFAULT_LY_THRESHOLD_AU,
             "show_settings_modal": False,
-            "atmo_quality": 1,
+            "atmo_quality": 2,
             "atmo_resolution": 1.0,
+            "atmo_vrs_threshold_px": 100.0,
+            "atmo_stochastic": True,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
             "atmo_adaptive_steps_max": 128,
@@ -594,8 +596,10 @@ class App(InputHandlerMixin):
             os.makedirs("data", exist_ok=True)
             settings_path = os.path.join("data", "graphics_settings.json")
             saved = {
-                "atmo_quality": self.camera.get("atmo_quality", 1),
+                "atmo_quality": self.camera.get("atmo_quality", 2),
                 "atmo_resolution": self.camera.get("atmo_resolution", 1.0),
+                "atmo_vrs_threshold_px": self.camera.get("atmo_vrs_threshold_px", 100.0),
+                "atmo_stochastic": self.camera.get("atmo_stochastic", True),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
                 "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
@@ -4134,8 +4138,8 @@ class App(InputHandlerMixin):
                     draw_orbits()
             _perf_gpu_end(_gq)
 
-            def render_atmosphere_pass(clip_mode, is_lowres=False):
-                if not sorted_atmos:
+            def render_atmosphere_pass(clip_mode, atmos_to_render, is_lowres=False):
+                if not atmos_to_render:
                     return
                 if not is_lowres:
                     ctx.enable(moderngl.BLEND)
@@ -4178,7 +4182,7 @@ class App(InputHandlerMixin):
                 active_atmos_buf = np.zeros((8, 4), dtype='f4')
                 active_max_bend_buf = np.zeros(8, dtype='f4')
 
-                for sq_dist, atmo, is_cmp in sorted_atmos:
+                for sq_dist, atmo, is_cmp in atmos_to_render:
                     bi = atmo['body_idx']
                     if is_cmp:
                         body_pos_rel = cmp_pos_rel[bi].astype('f4')
@@ -4355,20 +4359,27 @@ class App(InputHandlerMixin):
                 if not self.camera.get("atmo_enabled", True):
                     return
                 atmo_res = float(self.camera.get("atmo_resolution", 1.0))
-                is_lowres = atmo_res < 0.999 and self.atmo_lowres_fbo is not None
+                use_vrs = atmo_res < 0.999 and self.atmo_lowres_fbo is not None
                 
-                if is_lowres:
-                    if 'u_screen_res' in prog_atmo_lowres:
-                        prog_atmo_lowres['u_screen_res'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
-                    if self.depth_texture:
-                        self.depth_texture.use(location=9)
-                    
+                pending_lowres_atmos = []
+                
+                def flush_lowres():
+                    if not pending_lowres_atmos:
+                        return
+                        
+                    # 1. Low-Res Pass (Inner Region)
                     self.atmo_lowres_fbo.use()
                     ctx.viewport = (0, 0, self.atmo_lowres_fbo.width, self.atmo_lowres_fbo.height)
                     self.atmo_lowres_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
                     
-                    render_atmosphere_pass(clip_mode, is_lowres=True)
+                    if 'u_screen_res' in prog_atmo_lowres:
+                        prog_atmo_lowres['u_screen_res'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                    if self.depth_texture:
+                        self.depth_texture.use(location=9)
+                        
+                    render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=True)
                     
+                    # 2. Masked Upsample Pass (Composites inner region to high-res FBO)
                     self.hdr_resolve_fbo.use()
                     ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                     ctx.enable(moderngl.BLEND)
@@ -4380,25 +4391,67 @@ class App(InputHandlerMixin):
                     self.atmo_lowres_trans_tex.use(location=1)
                     if self.depth_texture:
                         self.depth_texture.use(location=9)
-                    
+                        
                     if 'u_depth_C' in self.prog_atmo_upsample:
                         self.prog_atmo_upsample['u_depth_C'].value = depth_C
                     if 'u_far' in self.prog_atmo_upsample:
                         self.prog_atmo_upsample['u_far'].value = far
                     if 'u_lowres_size' in self.prog_atmo_upsample:
                         self.prog_atmo_upsample['u_lowres_size'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                    if 'u_vrs_enabled' in self.prog_atmo_upsample:
+                        self.prog_atmo_upsample['u_vrs_enabled'].value = True
                         
                     self.quad_vao_atmo_upsample.render(moderngl.TRIANGLE_STRIP)
+                    
+                    if 'u_vrs_enabled' in self.prog_atmo_upsample:
+                        self.prog_atmo_upsample['u_vrs_enabled'].value = False
+                        
+                    # 3. High-Res Pass (Edge Region)
+                    # Stay bound to hdr_resolve_fbo
+                    self.atmo_lowres_trans_tex.use(location=2)
+                    if 'u_lowres_trans' in prog_atmo:
+                        prog_atmo['u_lowres_trans'].value = 2
+                    if 'u_vrs_highres_pass' in prog_atmo:
+                        prog_atmo['u_vrs_highres_pass'].value = True
+                    if 'u_screen_res' in prog_atmo:
+                        prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                        
+                    render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=False)
+                    
+                    if 'u_vrs_highres_pass' in prog_atmo:
+                        prog_atmo['u_vrs_highres_pass'].value = False
+                        
                     ctx.depth_mask = True
                     ctx.enable(moderngl.DEPTH_TEST)
                     ctx.disable(moderngl.BLEND)
-                else:
-                    if 'u_screen_res' in prog_atmo:
-                        prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
-                    if self.depth_texture:
-                        self.depth_texture.use(location=9)
+                    
+                    pending_lowres_atmos.clear()
 
-                    render_atmosphere_pass(clip_mode, is_lowres=False)
+                for sq_dist, atmo, is_cmp in sorted_atmos:
+                    dist_to_body = math.sqrt(sq_dist)
+                    apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
+                    
+                    vrs_threshold = float(self.camera.get("atmo_vrs_threshold_px", 100.0))
+                    is_this_lowres = use_vrs and apparent_px >= vrs_threshold
+                    
+                    if is_this_lowres:
+                        pending_lowres_atmos.append((sq_dist, atmo, is_cmp))
+                    else:
+                        flush_lowres()
+                        
+                        # Render entirely at high-res
+                        self.hdr_resolve_fbo.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        if 'u_screen_res' in prog_atmo:
+                            prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                        if 'u_vrs_highres_pass' in prog_atmo:
+                            prog_atmo['u_vrs_highres_pass'].value = False
+                        if self.depth_texture:
+                            self.depth_texture.use(location=9)
+                            
+                        render_atmosphere_pass(clip_mode, [(sq_dist, atmo, is_cmp)], is_lowres=False)
+                        
+                flush_lowres()
 
             # --- Pass 1: Atmosphere behind rings ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
@@ -4922,6 +4975,13 @@ class App(InputHandlerMixin):
                         if changed_res:
                             self.camera["atmo_resolution"] = atmo_res
                             settings_changed = True
+                            
+                        if atmo_res < 0.999:
+                            vrs_threshold = float(self.camera.get("atmo_vrs_threshold_px", 100.0))
+                            changed_vrs, vrs_threshold = imgui.slider_float("VRS Low-Res Threshold (px)", vrs_threshold, 10.0, 1000.0, "%.1f")
+                            if changed_vrs:
+                                self.camera["atmo_vrs_threshold_px"] = vrs_threshold
+                                settings_changed = True
                             
                         max_steps = self.camera.get("atmo_steps_max", 32)
                         changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
