@@ -552,6 +552,8 @@ class App(InputHandlerMixin):
         self.prog_bloom_down = None
         self.prog_bloom_up = None
         self.prog_composite = None
+        self.prog_accum = None
+        self.quad_vao_accum = None
         self.time_ctrl = {
             "paused": True,
             "multiplier": 1.0,
@@ -741,6 +743,9 @@ class App(InputHandlerMixin):
                     _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]
                     _ss_idx = max(0, min(len(_ss_presets) - 1, self.camera.get("screenshot_res_idx", 1)))
                     self._screenshot_request = _ss_presets[_ss_idx]
+            elif key == glfw.KEY_ESCAPE and action == glfw.PRESS:
+                if getattr(self, "photo_accum_count", 0) > 1 and not getattr(self, "_screenshot_saving", False):
+                    self._accum_save_request = True
     
     def resize_callback(self, window, width, height):
         if self.impl: self.impl.resize_callback(window, width, height)
@@ -1378,6 +1383,7 @@ class App(InputHandlerMixin):
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
         self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
+        self.prog_accum = ctx.program(vertex_shader=accum_shader_vs, fragment_shader=accum_shader_fs)
         self.prog_atmo_composite = ctx.program(vertex_shader=atmo_composite_shader_vs, fragment_shader=atmo_composite_shader_fs)
         self.prog_atmo_upsample = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=atmo_upsample_fragment_shader)
         if 'u_lowres_scatter' in self.prog_atmo_upsample:
@@ -1397,6 +1403,7 @@ class App(InputHandlerMixin):
         self.quad_vao_down = ctx.vertex_array(self.prog_bloom_down, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_up = ctx.vertex_array(self.prog_bloom_up, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_comp = ctx.vertex_array(self.prog_composite, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_accum = ctx.vertex_array(self.prog_accum, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_comp = ctx.vertex_array(self.prog_atmo_composite, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_upsample = ctx.vertex_array(self.prog_atmo_upsample, [(quad_vbo, '2f', 'in_position')])
         
@@ -2765,11 +2772,12 @@ class App(InputHandlerMixin):
                 self._screenshot_toast = ("Capturing...", time.time())
             
             # Orbit-line MSAA is disabled for screenshot frames to avoid massive VRAM usage
-            if self._screenshot_capturing:
+            if getattr(self, "_screenshot_capturing", False):
                 msaa_samples = 0
+                atmo_res = 1.0
             else:
                 msaa_samples = self.camera.get("msaa_samples", 4)
-            atmo_res = float(self.camera.get("atmo_resolution", 1.0))
+                atmo_res = float(self.camera.get("atmo_resolution", 1.0))
             if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples or self.last_atmo_res != atmo_res:
                 self.last_fb_size = (self.fb_width, self.fb_height)
                 self.last_msaa_samples = msaa_samples
@@ -2785,6 +2793,10 @@ class App(InputHandlerMixin):
                 if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
                 if self.atmo_lowres_scatter_tex: self.atmo_lowres_scatter_tex.release(); self.atmo_lowres_scatter_tex = None
                 if self.atmo_lowres_trans_tex: self.atmo_lowres_trans_tex.release(); self.atmo_lowres_trans_tex = None
+                if getattr(self, "accum_fbo_a", None): self.accum_fbo_a.release(); self.accum_fbo_a = None
+                if getattr(self, "accum_tex_a", None): self.accum_tex_a.release(); self.accum_tex_a = None
+                if getattr(self, "accum_fbo_b", None): self.accum_fbo_b.release(); self.accum_fbo_b = None
+                if getattr(self, "accum_tex_b", None): self.accum_tex_b.release(); self.accum_tex_b = None
                 self.prev_cam_origin = None
                 for fbo in self.bloom_fbos: fbo.release()
                 for tex in self.bloom_texs: tex.release()
@@ -2803,6 +2815,15 @@ class App(InputHandlerMixin):
                 self.depth_texture.repeat_y = False
                 
                 self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
+                
+                self.accum_tex_a = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                self.accum_tex_a.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.accum_fbo_a = ctx.framebuffer(color_attachments=[self.accum_tex_a])
+                self.accum_tex_b = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                self.accum_tex_b.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.accum_fbo_b = ctx.framebuffer(color_attachments=[self.accum_tex_b])
+                self.photo_accum_count = 0
+                self.photo_accum_last_cam = None
                 
                 if atmo_res < 0.999:
                     low_w = max(1, int(self.fb_width * atmo_res))
@@ -4311,7 +4332,7 @@ class App(InputHandlerMixin):
                     self.atmo_staging_int_view[28] = n_active
                     self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
                     self.atmo_staging_int_view[30] = body_idx_in_unified
-                    self.atmo_staging[31] = float(self.frame_counter % 8)
+                    self.atmo_staging[31] = float(self.frame_counter % 1024)
                     self.atmo_staging[32:35] = np.asarray(atmo.get('mie_albedo', [1.0, 1.0, 1.0]), dtype=np.float32)
                     # index 35: u_refractivity (surface n_mix - 1, drives eclipse refraction)
                     self.atmo_staging[35] = float(props.get('refractivity', 0.00029))
@@ -4358,8 +4379,8 @@ class App(InputHandlerMixin):
             def execute_atmosphere_pass(clip_mode):
                 if not self.camera.get("atmo_enabled", True):
                     return
-                atmo_res = float(self.camera.get("atmo_resolution", 1.0))
-                use_vrs = atmo_res < 0.999 and self.atmo_lowres_fbo is not None
+                atmo_res = 1.0 if getattr(self, "_screenshot_capturing", False) else float(self.camera.get("atmo_resolution", 1.0))
+                use_vrs = atmo_res < 0.999 and getattr(self, "atmo_lowres_fbo", None) is not None
                 
                 pending_lowres_atmos = []
                 
@@ -4952,6 +4973,47 @@ class App(InputHandlerMixin):
             if self._screenshot_saving:
                 imgui.same_line()
                 imgui.text_colored("Saving...", 1.0, 1.0, 0.4)
+            
+            imgui.separator()
+            imgui.text_colored("Accumulation Settings", 0.6, 0.9, 1.0)
+            
+            p_enabled = self.camera.setdefault("photo_accum_enabled", True)
+            s_enabled = self.camera.setdefault("screenshot_accum_enabled", True)
+            
+            changed_p, new_p = imgui.checkbox("Pause Accumulation", p_enabled)
+            if changed_p:
+                self.camera["photo_accum_enabled"] = new_p
+                self.save_settings()
+                
+            imgui.same_line()
+            changed_s, new_s = imgui.checkbox("Screenshot Accumulation", s_enabled)
+            if changed_s:
+                self.camera["screenshot_accum_enabled"] = new_s
+                self.save_settings()
+                
+            if self.camera["photo_accum_enabled"]:
+                accum_target = self.camera.setdefault("photo_accum_target", 0)
+                changed, new_accum = imgui.slider_int("Pause Target Frames", accum_target, 0, 1000, format="%d (0=∞)")
+                if changed:
+                    self.camera["photo_accum_target"] = new_accum
+                    self.save_settings()
+                    
+            if self.camera["screenshot_accum_enabled"]:
+                ss_target = self.camera.setdefault("screenshot_accum_target", 16)
+                changed, new_ss = imgui.slider_int("Screenshot Target Frames", ss_target, 1, 128)
+                if changed:
+                    self.camera["screenshot_accum_target"] = new_ss
+                    self.save_settings()
+            
+            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", True)
+            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", True)
+            if is_pause_accum or is_ss_accum:
+                count = getattr(self, "photo_accum_count", 0)
+                imgui.text(f"Accumulated: {count} frames")
+                if is_pause_accum and count > 1:
+                    imgui.text_colored("Press ESC to save accumulated frame", 0.4, 1.0, 0.4)
+            else:
+                imgui.text_colored("Pause to start accumulation", 0.5, 0.5, 0.5)
             
             if self.camera.get("show_settings_modal", False):
                 imgui.set_next_window_size(320, 320, imgui.FIRST_USE_EVER)
@@ -7357,7 +7419,47 @@ class App(InputHandlerMixin):
                             print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
                 imgui.end()
     
-            resolved_tex = self.hdr_resolve_tex
+            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", True)
+            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", True)
+            
+            if is_pause_accum or is_ss_accum:
+                cam_state_current = (
+                    self.fb_width, self.fb_height, self.camera["cam_pos_rel"].tobytes(),
+                    self.camera["yaw"], self.camera["pitch"], self.camera["roll"]
+                )
+                if not hasattr(self, "photo_accum_count"):
+                    self.photo_accum_count = 0
+                if getattr(self, "photo_accum_last_cam", None) != cam_state_current:
+                    self.photo_accum_count = 0
+                    self.photo_accum_last_cam = cam_state_current
+
+                target_frames = self.camera.get("screenshot_accum_target", 16) if is_ss_accum else self.camera.get("photo_accum_target", 0)
+                
+                if target_frames == 0 or self.photo_accum_count < target_frames:
+                    if self.photo_accum_count == 0:
+                        ctx.copy_framebuffer(self.accum_fbo_a, self.hdr_resolve_fbo)
+                        self.photo_accum_count = 1
+                    else:
+                        self.accum_fbo_b.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.disable(moderngl.DEPTH_TEST)
+                        ctx.disable(moderngl.BLEND)
+                        self.accum_tex_a.use(location=0)
+                        self.hdr_resolve_tex.use(location=1)
+                        if 'u_history' in self.prog_accum: self.prog_accum['u_history'].value = 0
+                        if 'u_current' in self.prog_accum: self.prog_accum['u_current'].value = 1
+                        if 'u_blend_weight' in self.prog_accum: self.prog_accum['u_blend_weight'].value = 1.0 / (self.photo_accum_count + 1)
+                        self.quad_vao_accum.render(moderngl.TRIANGLE_STRIP)
+                        
+                        # Swap A and B
+                        self.accum_fbo_a, self.accum_fbo_b = self.accum_fbo_b, self.accum_fbo_a
+                        self.accum_tex_a, self.accum_tex_b = self.accum_tex_b, self.accum_tex_a
+                        self.photo_accum_count += 1
+                resolved_tex = self.accum_tex_a
+            else:
+                if hasattr(self, "photo_accum_count"):
+                    self.photo_accum_count = 0
+                resolved_tex = self.hdr_resolve_tex
 
             # --- Post Processing ---
             # Bloom Downsample
@@ -7402,7 +7504,17 @@ class App(InputHandlerMixin):
                 ctx.disable(moderngl.BLEND)
                 
                 # Screenshot: capture composited result to a temporary high-res FBO
-                if self._screenshot_capturing:
+                save_now = False
+                if getattr(self, "_accum_save_request", False):
+                    save_now = True
+                elif getattr(self, "_screenshot_capturing", False):
+                    if self.camera.get("screenshot_accum_enabled", True):
+                        if getattr(self, "photo_accum_count", 0) >= self.camera.get("screenshot_accum_target", 16):
+                            save_now = True
+                    else:
+                        save_now = True
+
+                if save_now:
                     ss_w, ss_h = self.fb_width, self.fb_height
                     ss_tex = ctx.texture((ss_w, ss_h), 4)  # 8-bit RGBA for final sRGB output
                     ss_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -7424,10 +7536,11 @@ class App(InputHandlerMixin):
                     # Restore original resolution
                     if self._screenshot_orig_fb:
                         self.fb_width, self.fb_height = self._screenshot_orig_fb
-                    self.last_fb_size = (0, 0)       # Force FBO rebuild next frame
-                    self.last_msaa_samples = -1
+                        self.last_fb_size = (0, 0)       # Force FBO rebuild next frame
+                        self.last_msaa_samples = -1
                     self._screenshot_capturing = False
                     self._screenshot_orig_fb = None
+                    self._accum_save_request = False
                     
                     # Save PNG in a background thread
                     _ss_cap_w, _ss_cap_h = ss_w, ss_h

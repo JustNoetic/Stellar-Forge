@@ -11,3 +11,7 @@ composite_shader_fs = load_shader("post/composite.frag")
 
 atmo_composite_shader_vs = bloom_downsample_shader_vs
 atmo_composite_shader_fs = load_shader("post/atmo_composite.frag")
+
+accum_shader_vs = bloom_downsample_shader_vs
+accum_shader_fs = load_shader("post/accum.frag")
+
