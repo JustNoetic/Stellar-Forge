@@ -2039,9 +2039,14 @@ class App(InputHandlerMixin):
             
             bi = atmo['body_idx']
             if is_cmp and hasattr(self, 'visual_arr_cmp') and self.visual_arr_cmp is not None and len(self.visual_arr_cmp) > bi:
-                albedo = self.visual_arr_cmp[bi, 0:3]
+                v_color = self.visual_arr_cmp[bi, 0:3]
+                b_list = self.bodies_data_cmp if hasattr(self, 'bodies_data_cmp') else bodies_data
             else:
-                albedo = visual_arr[bi, 0:3]
+                v_color = visual_arr[bi, 0:3]
+                b_list = bodies_data
+            
+            b_info = b_list[bi] if (b_list is not None and bi < len(b_list)) else {}
+            albedo, _, _ = compute_surface_albedo(b_info, self.texture_mean_colors, v_color)
             
             self.prog_atmo_lut['u_planet_radius_km'].value = float(atmo['planet_radius_km'])
             self.prog_atmo_lut['u_atmo_radius_km'].value = float(atmo['atmo_radius_km'])
@@ -4710,18 +4715,14 @@ class App(InputHandlerMixin):
 
             def compute_body_albedos(body_info, insp_idx, insp_is_cmp):
                 """Compute Geometric Albedo (A_g), Bond Albedo (A_b), Phase Integral (q), and Top-of-Atmosphere RGB reflectance."""
-                b_name = body_info.get('name', '').lower()
-                tex_prop = body_info.get('texture', '').lower()
-
-                if tex_prop and tex_prop in self.texture_mean_colors:
-                    p_surf = self.texture_mean_colors[tex_prop].copy()
-                elif b_name in self.texture_mean_colors:
-                    p_surf = self.texture_mean_colors[b_name].copy()
-                elif 'albedo_scale' in body_info:
-                    alb_val = float(body_info['albedo_scale'])
-                    p_surf = np.array([alb_val, alb_val, alb_val], dtype=np.float64)
+                if insp_is_cmp and hasattr(self, 'visual_arr_cmp') and self.visual_arr_cmp is not None and len(self.visual_arr_cmp) > insp_idx:
+                    v_color = self.visual_arr_cmp[insp_idx, 0:3]
+                elif hasattr(self, 'visual_arr') and visual_arr is not None and len(visual_arr) > insp_idx:
+                    v_color = visual_arr[insp_idx, 0:3]
                 else:
-                    p_surf = hex_to_linear_rgb(body_info.get('color', '#ffffff'))
+                    v_color = None
+
+                p_surf, _, _ = compute_surface_albedo(body_info, self.texture_mean_colors, v_color)
 
                 atmo_bodies_list = self.atmo_bodies_cmp if insp_is_cmp else atmo_bodies
                 atmo_item = next((a for a in atmo_bodies_list if a.get('body_idx') == insp_idx), None)
@@ -4772,8 +4773,15 @@ class App(InputHandlerMixin):
 
                     f_atmo = 1.0 - math.exp(-tau_scat_scalar)
                     b_type = body_info.get('type', 'Terrestrial')
-                    q_surf = 1.50 if b_type == 'Gas Giant' else 0.38
-                    q = (1.0 - f_atmo) * q_surf + f_atmo * q_atmo_scat
+                    # Base q for the surface. Airless rocky bodies have high backscatter (q~0.38).
+                    # Bodies with atmospheres have smoothed scattering (q approaches 1.0+).
+                    if b_type == 'Gas Giant':
+                        base_q_surf = 1.50
+                    else:
+                        # Interpolate from Moon-like (0.38) to Earth/Venus-like (1.25) based on atmospheric optical depth
+                        atmo_weight = min(1.0, tau_scat_scalar * 2.0)
+                        base_q_surf = 0.38 * (1.0 - atmo_weight) + 1.25 * atmo_weight
+                    q = (1.0 - f_atmo) * base_q_surf + f_atmo * q_atmo_scat
                     A_b = float(np.clip(q * A_g, 0.0, 1.0))
                 else:
                     p_rgb = np.clip(p_surf, 0.0, 1.0)
@@ -6027,8 +6035,11 @@ class App(InputHandlerMixin):
                             A_g, A_b, q_val, _ = compute_body_albedos(body_info, insp_idx, insp_is_cmp)
                             p_v = A_g
 
-                                
                             if p_v > 0.0 and body_r_km > 0.0:
+                                v_c = self.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
+                                _, A_surf, surf_src = compute_surface_albedo(body_info, self.texture_mean_colors, v_c)
+                                src_label = "texture map" if surf_src == 'texture' else ("albedo scale" if surf_src == 'albedo_scale' else "base color")
+                                imgui.text(f"  Surface Albedo: {A_surf:.3f} ({src_label})")
                                 imgui.text(f"  Geom Albedo: {A_g:.3f}")
                                 imgui.text(f"  Bond Albedo: {A_b:.3f} (q = {q_val:.2f})")
 
@@ -6158,13 +6169,8 @@ class App(InputHandlerMixin):
                                     break
                                 curr = p_id
                             
-                            b_type = body_info.get('type', 'Terrestrial')
-                            if b_type == 'Gas Giant':
-                                albedo = 0.34
-                            elif b_type == 'Dwarf Planet' or b_type == 'Moon':
-                                albedo = 0.12
-                            else:
-                                albedo = 0.3
+                            A_g_calc, A_b_calc, _, _ = compute_body_albedos(body_info, insp_idx, insp_is_cmp)
+                            albedo = A_b_calc
                                 
                             T_eq = 278.5 * ((star_lum_dir / (eff_a**2))**0.25) * ((1.0 - albedo)**0.25)
                             T_surf = T_eq
@@ -6752,6 +6758,10 @@ class App(InputHandlerMixin):
                                 star_lum_safe = max(0.0, star_lum_dir) if not (math.isnan(star_lum_dir) or math.isinf(star_lum_dir)) else 1.0
                                 albedo_safe = min(0.9999, max(0.0, float(albedo))) if not (math.isnan(albedo) or math.isinf(albedo)) else 0.3
                                 t_eq_atmo = 278.5 * ((star_lum_safe / (eff_a_safe**2))**0.25) * ((1.0 - albedo_safe)**0.25)
+                                v_c_atmo = self.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
+                                _, A_surf_atmo, surf_src_atmo = compute_surface_albedo(body_info, self.texture_mean_colors, v_c_atmo)
+                                src_label_atmo = "texture map" if surf_src_atmo == 'texture' else ("albedo scale" if surf_src_atmo == 'albedo_scale' else "base color")
+                                imgui.text(f"Surface Albedo: {A_surf_atmo:.3f} ({src_label_atmo})")
                                 imgui.text(f"Bond Albedo (A_b): {albedo:.3f} (q = {q_val:.2f})")
 
                                 # Calculate temperature dynamically from greenhouse effect
@@ -7110,13 +7120,8 @@ class App(InputHandlerMixin):
                         _, ad["target_temp_k"] = imgui.input_double("Target Temp (K)", ad["target_temp_k"], format="%.1f")
                         
                         star_lum = bodies_data[parent_idx_c].get("star_props", {}).get("lum", 1.0)
-                        b_type = ad["type"]
-                        if b_type == 'Gas Giant':
-                            albedo = 0.34
-                        elif b_type == 'Dwarf Planet' or b_type == 'Moon':
-                            albedo = 0.12
-                        else:
-                            albedo = 0.3
+                        _, A_surf_spawn, _ = compute_surface_albedo(ad, self.texture_mean_colors)
+                        albedo = A_surf_spawn
                             
                         # Greenhouse effect for spawning is 0.0 because atmosphere is not configured yet
                         T_eq_target = ad["target_temp_k"]

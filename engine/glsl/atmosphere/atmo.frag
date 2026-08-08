@@ -1195,7 +1195,8 @@ void main() {
 
         float irradiance = star_lum / max(dist_to_star_au * dist_to_star_au, 1e-8);
 
-        scattered += star_color * u_sun_intensity * irradiance * (
+        float atmo_sun_intensity = u_sun_intensity * PI;
+        scattered += star_color * atmo_sun_intensity * irradiance * (
             phase_R * beta_R * total_rayleigh +
             phase_M * beta_M * total_mie +
             total_ms
@@ -1265,7 +1266,7 @@ void main() {
             ringshine_irradiance *= (sin_sun_elev * face_multiplier * 0.318309886);
 
             float ambient_phase = 1.0 / (4.0 * PI);
-            scattered += star_color * u_sun_intensity * irradiance * ringshine_irradiance * (
+            scattered += star_color * atmo_sun_intensity * irradiance * ringshine_irradiance * (
                 ambient_phase * beta_R * total_rayleigh_rs +
                 ambient_phase * beta_M * total_mie_rs
             );

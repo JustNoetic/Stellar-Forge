@@ -23,6 +23,45 @@ def compute_texture_spherical_mean(img):
     mean_rgb = np.average(row_means, axis=0, weights=weights)
     return np.asarray(mean_rgb, dtype=np.float64)
 
+def compute_surface_albedo(body_info, texture_mean_colors=None, visual_color=None):
+    """Compute the linear RGB surface reflectance vector (p_surf), scalar surface albedo (A_surf),
+    and source category ('texture', 'albedo_scale', or 'color') for a body.
+    
+    If a texture map is present and cached in texture_mean_colors, returns the spherical latitude-weighted mean.
+    Otherwise, if albedo_scale is defined, uses albedo_scale.
+    Otherwise, uses the visual_color (if provided) or parses body_info['color'].
+    """
+    b_name = body_info.get('name', '').lower()
+    tex_prop = body_info.get('texture', '').lower()
+    
+    source_type = 'color'
+    p_surf = None
+    if texture_mean_colors:
+        if tex_prop and tex_prop in texture_mean_colors:
+            p_surf = np.asarray(texture_mean_colors[tex_prop], dtype=np.float64).copy()
+            source_type = 'texture'
+        elif b_name in texture_mean_colors:
+            p_surf = np.asarray(texture_mean_colors[b_name], dtype=np.float64).copy()
+            source_type = 'texture'
+
+    if p_surf is None:
+        if 'albedo_scale' in body_info:
+            alb_val = float(body_info['albedo_scale'])
+            p_surf = np.array([alb_val, alb_val, alb_val], dtype=np.float64)
+            source_type = 'albedo_scale'
+        elif visual_color is not None:
+            p_surf = np.asarray(visual_color, dtype=np.float64).copy()
+            source_type = 'color'
+        else:
+            color_str = body_info.get('color', '#ffffff')
+            p_surf = hex_to_linear_rgb(color_str)
+            source_type = 'color'
+
+    p_surf = np.clip(p_surf, 0.0, 1.0)
+    A_surf = float(0.2126 * p_surf[0] + 0.7152 * p_surf[1] + 0.0722 * p_surf[2])
+    return p_surf, A_surf, source_type
+
+
 
 def sample_gradient(sorted_grad, p):
     if not sorted_grad:
