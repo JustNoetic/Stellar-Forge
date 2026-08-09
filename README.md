@@ -6,7 +6,7 @@
 [![NASA SPICE](https://img.shields.io/badge/Ephemeris-NASA%20JPL%20SPICE-red.svg)](https://naif.jpl.nasa.gov/naif/)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-**Stellar-Forge** is a state-of-the-art, interactive N-body gravitational simulation engine and astronomical sandbox built with Python, ModernGL (OpenGL 4.6), Numba JIT acceleration, and PyImGui. It ships with **three switchable simulation modes** — a 15th-order **IAS15** N-body integrator, an **analytical Keplerian** propagator, and live **NASA SPICE ephemeris playback** — and provides physically based atmospheric raymarching, general relativity orbital precession, higher-order zonal harmonic oblate gravity ($J_2, J_4$), eclipse shadow lookup tables (supporting oblate star geometry), temporal anti-aliasing (TAA) and HDR bloom post-processing, a comprehensive body inspector, side-by-side **system comparison**, **timeline recording & scrubbing**, an in-app **system / body editor**, and seamless integration with NASA JPL SPICE kernels and Horizons ephemeris data.
+**Stellar-Forge** is a state-of-the-art, interactive N-body gravitational simulation engine and astronomical sandbox built with Python, ModernGL (OpenGL 4.6), Numba JIT acceleration, and PyImGui. It ships with **three switchable simulation modes** — a 15th-order **IAS15** N-body integrator, an **analytical Keplerian** propagator, and live **NASA SPICE ephemeris playback** — and provides physically based atmospheric raymarching, general relativity orbital precession, higher-order zonal harmonic oblate gravity ($J_2, J_4$), eclipse shadow lookup tables (supporting oblate star geometry), HDR bloom post-processing, jitter accumulation for high-quality screenshots and scene rendering, a comprehensive body inspector, side-by-side **system comparison**, **timeline recording & scrubbing**, an in-app **system / body editor**, and seamless integration with NASA JPL SPICE kernels and Horizons ephemeris data.
 
 ---
 
@@ -302,8 +302,8 @@ graph TD
         J --> CMP{Comparison?}
         CMP -->|yes| J2[Second System Instance Pass]
         J --> K[Rings, Orbits & HZ Visuals]
-        K --> TAA[TAA Resolve or MSAA]
-        TAA --> L[HDR Bloom Pyramid & Tonemapping]
+        K --> ACCUM[Jitter Accumulation for Screenshots / Scene]
+        ACCUM --> L[HDR Bloom Pyramid & Tonemapping]
         L --> M[ImGui Overlay, Inspector, Modals]
         M -.->|switch req / mode / timeline ctrl| H
     end
@@ -353,7 +353,7 @@ Stellar-Forge/
 │   ├── kernels/                 # Storage for downloaded NAIF SPICE kernels (.bsp/.tpc/.tls)
 │   ├── system.json              # Active default planetary system data
 │   ├── ephemeris_settings.json  # Configuration for SPICE playback dates & active kernels
-│   ├── graphics_settings.json   # Persistent graphics/quality settings (exposure, bloom, TAA, MSAA, atmo quality)
+│   ├── graphics_settings.json   # Persistent graphics/quality settings (exposure, bloom, accumulation, MSAA, atmo quality)
 │   └── horizons_cache.json      # Cache file for fetched JPL Horizons API queries
 ├── textures/                    # Planet diffuse / normal / specular + ring textures (loaded at startup)
 ├── scripts/                     # Utility and benchmark scripts

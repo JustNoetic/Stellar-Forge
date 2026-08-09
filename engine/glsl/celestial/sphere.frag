@@ -430,29 +430,6 @@ void main() {
             // Decode sRGB to Linear
             local_f_color = pow(tex_color.rgb, vec3(2.2));
 
-            // SpaceEngine Solstice Winter Model: Blue polar atmosphere/cloud deck appears ONLY on the winter pole during solstice
-            vec3 pole_dir_norm = length(f_pole) > 1e-4 ? normalize(f_pole) : vec3(0.0, 1.0, 0.0);
-            vec3 frag_local_dir = normalize(v_local_pos);
-            float sin_lat = abs(dot(frag_local_dir, pole_dir_norm));
-            float lat_factor = smoothstep(0.1, 0.7, sin_lat);
-
-            vec3 primary_star_dir = normalize((u_stars_pos_radius[0].xyz - f_center_pos) - P_rel);
-            float sun_pole_dot = dot(primary_star_dir, pole_dir_norm);
-            float frag_pole_dot = dot(frag_local_dir, pole_dir_norm);
-
-            // Winter hemisphere condition: Sun and Fragment are on opposite sides of the equatorial plane
-            float is_winter = step(sun_pole_dot * frag_pole_dot, 0.0);
-
-            // Solstice progress: cosPhi is sine of solar elevation above equator = |sun_pole_dot|
-            float cosPhi = abs(sun_pole_dot);
-            float tanPhi = cosPhi / sqrt(max(1.0 - cosPhi * cosPhi, 1e-4));
-            float solstice_factor = clamp(tanPhi * 1.8, 0.0, 1.0);
-
-            float winter_solstice_effect = lat_factor * is_winter * solstice_factor;
-
-            vec3 blue_polar_cloud = vec3(0.15, 0.45, 0.95) * dot(local_f_color, vec3(0.299, 0.587, 0.114));
-            local_f_color = mix(local_f_color, blue_polar_cloud, winter_solstice_effect * 0.75);
-
             // Analytical TBN Mapping
             vec3 map_normal = textureGrad(u_planet_normal_textures, vec3(uv, f_tex_idx - 1.0), dx, dy).rgb;
             map_normal = map_normal * 2.0 - 1.0;

@@ -326,7 +326,7 @@ from engine.physics.physics_core import _extract_render_state, _update_hierarchy
 from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.post_shaders import *
-from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption, compute_cloud_layer_properties
+from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 
 _PERF_ENABLED = os.environ.get("STELLAR_FORGE_PERF") == "1"
 _PERF_TRACKER = None
@@ -869,7 +869,6 @@ class App(InputHandlerMixin):
         self.planet_normal_textures = []
         self.planet_specular_textures = []
         self.texture_slices = {} # name_lower -> 1-based slice_idx
-        self.cloud_texture_slices = {} # name_lower -> 1-based slice_idx in planet_textures
         self.texture_mean_colors = {} # name_lower -> np.ndarray([r,g,b]) in linear space
 
         self.ring_textures_front = {}  # name_lower -> PIL.Image (4096, 1)
@@ -6879,7 +6878,7 @@ class App(InputHandlerMixin):
                                         atmo_item['lut_tex'].release()
                                         del atmo_item['lut_tex']
                                 
-                                # Aerosol single-scattering albedo (omega_0): 1.0 = conservatively scattering (bright haze/clouds),
+                                # Aerosol single-scattering albedo (omega_0): 1.0 = conservatively scattering (bright haze),
                                 # <1.0 = absorbing (dark haze, e.g. Titan tholins). Lower = darker.
                                 cur_alb = atmo_item.get('mie_albedo', None)
                                 if cur_alb is None:

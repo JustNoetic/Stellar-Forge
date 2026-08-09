@@ -261,38 +261,17 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     _atmo_cache[cache_key] = res
     return res
 
-def compute_cloud_layer_properties(pressure_atm, temperature_k, composition, gravity_m_s2):
-    """
-    Computes physical cloud layer base altitude (km) and layer thickness (km)
-    based on atmospheric scale height and surface pressure.
-    """
-    props = compute_atmosphere_properties(pressure_atm, temperature_k, composition, gravity_m_s2)
-    H_km = props['scale_height_km']
-    atmo_h_km = props['atmo_height_km']
-    
-    p0 = max(0.001, float(pressure_atm))
-    h_base_km = H_km * (0.25 + 0.15 * math.log(max(1.0, p0)))
-    h_base_km = max(1.0, min(h_base_km, 0.5 * atmo_h_km))
-    
-    h_thick_km = max(0.5, min(0.2 * H_km * math.sqrt(p0), 0.25 * atmo_h_km))
-    
-    return {
-        "cloud_base_km": float(h_base_km),
-        "cloud_thickness_km": float(h_thick_km),
-        "scale_height_km": float(H_km)
-    }
-
 
 def compute_mie_coefficients(base_beta=2.0e-6, angstrom_exponent=None):
     """
     Computes Mie scattering coefficients using the Angstrom exponent approximation.
     base_beta is the scattering coefficient at 550nm.
     If angstrom_exponent is None, it is calculated automatically from the aerosol concentration:
-    thick aerosol decks (clouds) are assumed to have large particles (angstrom -> 0),
+    thick aerosol decks are assumed to have large particles (angstrom -> 0),
     while thin background hazes are assumed to have small particles (angstrom -> 1.2).
     """
     if angstrom_exponent is None:
-        # Clear skies (base_beta -> 0) yields 1.2, thick cloud decks (base_beta >= 2.0e-5) yields ~ 0.0
+        # Clear skies (base_beta -> 0) yields 1.2, thick aerosol decks (base_beta >= 2.0e-5) yields ~ 0.0
         angstrom_exponent = 1.2 * math.exp(-base_beta / 5.0e-6)
         
     lambda_0 = 550e-9
@@ -339,7 +318,7 @@ def compute_dynamic_mie_properties(pressure_atm, temperature_k, composition, gra
       - Titan-like (high Tholin or CH4 at T < 140K): Organic tholin haze (thick, amber/orange).
       - Venus-like (SO2 present): Sulfuric acid haze deck (thick, pale yellow).
       - Mars-like (thin CO2 atmosphere): Airborne mineral dust (thin/medium, ferric oxide blue-absorption).
-      - Gas Giant-like (H2/He dominate): Ammonia/methane cloud decks (moderate, white/cream).
+      - Gas Giant-like (H2/He dominate): Ammonia/methane haze decks (moderate, white/cream).
       - Earth-like (temperate, N2/O2 dominate): Clean-sky background aerosol haze (light, white).
     """
     if not composition:
@@ -369,7 +348,7 @@ def compute_dynamic_mie_properties(pressure_atm, temperature_k, composition, gra
         mie_g = 0.88
         angstrom = 0.5
         
-    # 2. Venus-like sulfuric acid cloud regime (SO2 present)
+    # 2. Venus-like sulfuric acid haze regime (SO2 present)
     elif x_so2 > 0.00005:
         base_beta = 2.0e-4
         h_mie = max(20.0, min(2.0 * H_km, 50.0))

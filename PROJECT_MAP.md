@@ -41,7 +41,7 @@ Stellar-Forge/
 │   │   ├── texture_baker.py    # Procedural ring HSBA baking & texture exporter
 │   │   ├── shader_loader.py    # GLSL shader loader with in-memory caching
 │   │   ├── shaders.py          # Shader re-exports & uniform bindings
-│   │   └── post_shaders.py     # Post-processing shader re-exports (Bloom, TAA, HDR)
+│   │   └── post_shaders.py     # Post-processing shader re-exports (Bloom, HDR)
 │   ├── ephemeris/              # Astronomical data & JPL Horizons/SPICE integration
 │   │   ├── system_manager.py   # System I/O, SystemSnapshot, derive_star_properties
 │   │   └── spice_manager.py    # SpiceManager: kernel download/load, SPICE state queries
@@ -49,7 +49,7 @@ Stellar-Forge/
 │       ├── compute/            # Frustum culling & orbit compute shaders (.comp)
 │       ├── celestial/          # Sphere, orbit, ring, HZ shaders (.vert, .frag)
 │       ├── atmosphere/         # Raymarching & LUT generation shaders (.vert, .frag)
-│       └── post/               # Bloom, composite, TAA & ringshine shaders (.vert, .frag)
+│       └── post/               # Bloom, composite, accumulation & ringshine shaders (.vert, .frag)
 ├── data/
 │   ├── system.json             # Active default system
 │   ├── systems/<Name>/{meta.json,system.json}   # System presets (Solar System, Achernar, Ephemeris Mode)
@@ -221,9 +221,9 @@ spectral classification.
 - Re-exports post-processing shaders loaded from `engine/glsl/post/`:
   - `bloom_downsample.frag`, `bloom_upsample.frag` — HDR bloom pyramid.
   - `composite.frag` — tonemap (ACES) + exposure + bloom composite.
-  - `taa_resolve.frag` — temporal anti-aliasing resolve.
+  - `accum.frag` — jitter accumulation resolve for screenshots and scene.
 
-**Edit when:** bloom, tonemapping, exposure, TAA.
+**Edit when:** bloom, tonemapping, exposure, accumulation.
 
 ### 3.12 `engine/rendering/render_utils.py` (343 lines)
 - `hex_to_rgb`, `sample_gradient` — color helpers.
@@ -289,7 +289,7 @@ spectral classification.
         Body Inspector panel (~L4544–5832) — orbital/physical/thermal/atmosphere/stellar tabs,
         cosmetics, ring editing (`rebuild_ring_render_group`), export.
         Add-body mode (~L5832), Create System modal (~L5984).
-      - TAA resolve (~L6192), post-TAA orbits/HZ (~L6243), bloom + composite (~L6330).
+      - Accumulation resolve (~L6192), post-accum orbits/HZ (~L6243), bloom + composite (~L6330).
   11. Teardown: stop physics thread, release GL objects, save settings, GLFW destroy.
 
 **Edit when:** UI, rendering pipeline, camera, input, modal dialogs, system switching,
@@ -437,7 +437,7 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change scattering physics / gas table | `engine/physics/atmosphere_physics.py` | `compute_atmosphere_properties`, `GAS_PROPERTIES` |
 | Change orbital math / frame rotations | `engine/core/math_utils.py` | — |
 | Change sphere/ring/atmo/orbit/HZ shaders | `engine/glsl/` (`celestial/`, `atmosphere/`, `compute/`) | GLSL files loaded via `engine/rendering/shaders.py` |
-| Change bloom/tonemap/TAA shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
+| Change bloom/tonemap/Accumulation shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
 | Change planetshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
 | Change ring texture baking | `engine/rendering/texture_baker.py` | `bake_and_export_ring_textures` |
