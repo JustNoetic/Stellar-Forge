@@ -56,6 +56,8 @@ flat out float f_radius;
 flat out float f_final_radius;
 flat out float f_oblateness;
 flat out float f_bounding_radius;
+flat out vec3 f_my_atmo_tint;
+flat out float f_my_atmo_h;
 
 vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
     if (abs(angle) < 1e-7) return v;
@@ -144,6 +146,18 @@ void main() {
     vec3 bounding_world_pos = (scaled_pos * bounding_radius) + in_offset;
     f_world_pos = bounding_world_pos;
     f_normal = adj_normal;
+
+    vec3 my_atmo_tint = vec3(0.0);
+    float my_atmo_h = 0.0;
+    for (int j = 0; j < u_num_casters; j++) {
+        if (distance(u_casters[j].xyz, in_offset) < 1e-4) {
+            my_atmo_tint = u_caster_atmos[j].xyz;
+            my_atmo_h = u_caster_atmos[j].w;
+            break;
+        }
+    }
+    f_my_atmo_tint = my_atmo_tint;
+    f_my_atmo_h = my_atmo_h;
 
     gl_Position = projection * view * vec4(bounding_world_pos, 1.0);
     f_clip_z = gl_Position.w;

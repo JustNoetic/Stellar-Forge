@@ -501,6 +501,10 @@ class App(InputHandlerMixin):
             "shadow_caster_budget": 32,
             "screenshot_res_idx": 1,
             "anisotropy": 16.0,
+            "photo_accum_enabled": False,
+            "screenshot_accum_enabled": False,
+            "photo_accum_target": 0,
+            "screenshot_accum_target": 16,
         }
         self.time_ctrl = {
             "multiplier": 1.0,
@@ -623,6 +627,10 @@ class App(InputHandlerMixin):
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
                 "horizon_align": self.camera.get("horizon_align", True),
+                "photo_accum_enabled": self.camera.get("photo_accum_enabled", False),
+                "screenshot_accum_enabled": self.camera.get("screenshot_accum_enabled", False),
+                "photo_accum_target": self.camera.get("photo_accum_target", 0),
+                "screenshot_accum_target": self.camera.get("screenshot_accum_target", 16),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -4985,8 +4993,8 @@ class App(InputHandlerMixin):
             imgui.separator()
             imgui.text_colored("Accumulation Settings", 0.6, 0.9, 1.0)
             
-            p_enabled = self.camera.setdefault("photo_accum_enabled", True)
-            s_enabled = self.camera.setdefault("screenshot_accum_enabled", True)
+            p_enabled = self.camera.setdefault("photo_accum_enabled", False)
+            s_enabled = self.camera.setdefault("screenshot_accum_enabled", False)
             
             changed_p, new_p = imgui.checkbox("Pause Accumulation", p_enabled)
             if changed_p:
@@ -5013,8 +5021,8 @@ class App(InputHandlerMixin):
                     self.camera["screenshot_accum_target"] = new_ss
                     self.save_settings()
             
-            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", True)
-            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", True)
+            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)
+            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False)
             if is_pause_accum or is_ss_accum:
                 count = getattr(self, "photo_accum_count", 0)
                 imgui.text(f"Accumulated: {count} frames")
@@ -6953,7 +6961,11 @@ class App(InputHandlerMixin):
                                     changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
                                     changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
                                     changed_op, new_op = imgui.drag_float(f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 2.0, "%.4f")
-                                    changed_scat, new_scat = imgui.drag_float(f"Forward Scatter Mult##{i}", ring_item.get('scatter', 2.5), 0.01, 0.0, 100.0, "%.4f")
+                                    
+                                    changed_scat = False
+                                    if not is_tex_layer:
+                                        changed_scat, new_scat = imgui.drag_float(f"Phase Balance (Back <-> Fwd)##{i}", ring_item.get('scatter', 1.0), 0.005, 0.0, 1.0, "%.4f")
+                                    
                                     changed_asym, new_asym = imgui.drag_float(f"Forward Scatter Asym##{i}", ring_item.get('asymmetry', 0.7), 0.005, -0.999, 0.999, "%.4f")
                                     changed_bks, new_bks = imgui.drag_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.999, 0.999, "%.4f")
                                     
@@ -7424,8 +7436,8 @@ class App(InputHandlerMixin):
                             print(f"[System] Created new system '{sys_name}' with star '{star_name_c}'")
                 imgui.end()
     
-            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", True)
-            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", True)
+            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)
+            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False)
             
             if is_pause_accum or is_ss_accum:
                 cam_state_current = (
@@ -7513,7 +7525,7 @@ class App(InputHandlerMixin):
                 if getattr(self, "_accum_save_request", False):
                     save_now = True
                 elif getattr(self, "_screenshot_capturing", False):
-                    if self.camera.get("screenshot_accum_enabled", True):
+                    if self.camera.get("screenshot_accum_enabled", False):
                         if getattr(self, "photo_accum_count", 0) >= self.camera.get("screenshot_accum_target", 16):
                             save_now = True
                     else:

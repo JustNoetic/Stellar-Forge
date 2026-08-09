@@ -26,6 +26,8 @@ flat in float f_radius;
 flat in float f_final_radius;
 flat in float f_oblateness;
 flat in float f_bounding_radius;
+flat in vec3 f_my_atmo_tint;
+flat in float f_my_atmo_h;
 
 uniform vec3 u_refract_center;
 uniform float u_refract_radius;
@@ -141,7 +143,8 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
 // Inputs are per-caster quantities already resolved by the caller.
 vec3 casterShadowTerm(float alpha, float beta, float gamma,
                       float penumbra_outer, float penumbra_inner,
-                      float max_bend, vec3 atmo_tint) {
+                      float max_bend, vec3 atmo_tint,
+                      float atmo_h, float dist_to_caster) {
     float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
     float occ = clamp(max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma), 0.0, 1.0);
     // Correct geometric shadow curve: (1 - occ)^GAMMA (Space Engine gamma correction: 1 / 1.6)
@@ -156,35 +159,32 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
             // Normalized penetration depth in atmosphere (0 = top of atmosphere, 1 = surface level)
             float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
 
-            // Compute Rayleigh / Mie / absorption spectral transmittance combined with composition tint
-            vec3 deep_tint = atmo_tint * exp2(log2(max(atmo_tint, 1e-6)) * (atmo_depth * 2.0));
-            vec3 ext_exp = vec3(3.5, 10.0, 22.0) * (1.5 - deep_tint);
-            vec3 atmo_transmittance = vec3(
-                exp(-ext_exp.r * pow(atmo_depth, 1.5)),
-                exp(-ext_exp.g * pow(atmo_depth, 1.5)),
-                exp(-ext_exp.b * pow(atmo_depth, 1.5))
-            );
+            // atmo_depth is derived from the refraction angle, which is linearly proportional to atmospheric density.
+            // Therefore, atmo_depth IS the normalized atmospheric density along the refracted ray!
+            // Since optical depth scales linearly with density:
+            // tau = tau_grazing * atmo_depth
+            // atmo_transmittance = exp(-tau) = exp(log(atmo_tint) * atmo_depth) = pow(atmo_tint, atmo_depth)
+            vec3 atmo_transmittance = pow(max(atmo_tint, 1e-6), vec3(atmo_depth));
 
-            // Physical Spherical Lens Optics Dynamics (Space Engine Model)
-            // Focal ratio: f_r = D_caster / D_focal = max_bend / beta
-            float focal_ratio = max_bend / max(1e-6, beta);
-
-            // Inverse-square beam divergence beyond focal plane: (D_focal / D_caster)^2 = (1 / f_r)^2
-            float distance_divergence = min(1.0, 1.0 / max(1e-6, focal_ratio * focal_ratio));
-
-            // Spherical lens caustic amplification near focal plane (f_r ~ 1.0)
-            float lens_amplification = clamp(1.0 / (abs(1.0 - focal_ratio) + 0.3), 0.5, 3.0);
-
+            // Physical Atmospheric Ring Geometric Dilution (1/D falloff)
+            // The atmospheric lens is a ring, not a point lens, so light diverges in 1D, not 2D.
+            // Geometric intensity factor f = (2 * H_scale) / (alpha * D)
+            float h_scale_km = max(atmo_h / 12.0, 1e-3);
+            float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
+            float ring_intensity = (2.0 * h_scale_km) / max(alpha * dist_km, 1e-9);
+            
             // Smooth surface grazing fade to zero at solid body boundary (h = 0, atmo_depth = 1)
             float body_surface_fade = smoothstep(1.0, 0.8, atmo_depth);
-
-            // Physical Danjon Lunar Eclipse Scale with Visual Exposure Boost:
-            // Base physical value is ~0.00005, boosted to 0.015 for vibrant, clear visual presentation.
-            float atmo_base_intensity = 0.015;
-            float refraction_intensity = atmo_base_intensity * distance_divergence * lens_amplification * (1.0 - atmo_depth * 0.7) * body_surface_fade;
+            
+            // To make the eclipse vividly visible to human eyes (or standard HDR tonemappers)
+            // without simulating extreme dark-adaptation, we apply a small visual exposure boost.
+            // A boost of 2.0 perfectly matches the visual intensity of the old shader's Earth eclipses
+            // while preserving the correct 1/D distance falloff for other planets/moons!
+            float visual_boost = 1.0; // User requested pure realism!
+            float refraction_intensity = ring_intensity * visual_boost * (1.0 - atmo_depth * 0.7) * body_surface_fade;
 
             float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-            sh += deep_tint * atmo_transmittance * refraction_intensity * atmo_blend;
+            sh += atmo_transmittance * refraction_intensity * atmo_blend;
         }
     }
     return clamp(sh, vec3(0.0), vec3(1.0));
@@ -506,6 +506,28 @@ void main() {
             float NdotL = dot(N, L);
             float diffuse = clamp((NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
 
+            vec3 incoming_light_tint = vec3(1.0);
+            if (f_my_atmo_h > 0.0) {
+                float R_km = max(f_radius * u_au_to_km, 1e-6);
+                float H_atmo = f_my_atmo_h;
+                float H_scale = max(H_atmo / 12.0, 1e-3);
+                float mu = max(NdotL, 0.0);
+                
+                // Geometric relative air mass
+                float am = (sqrt(R_km*R_km*mu*mu + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*mu) / H_scale;
+                
+                // f_my_atmo_tint holds the transmittance for a FULL grazing ray (passing entirely through the atmosphere)
+                // We extract the effective grazing optical depth:
+                vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
+                
+                // Convert to vertical optical depth using the ratio of path lengths ( H_scale / sqrt(2*PI*R*H_scale) )
+                vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
+                
+                // Final transmittance to the ground
+                vec3 tau = tau_vertical * am;
+                incoming_light_tint = exp(-tau);
+            }
+
             // Blinn-Phong specular highlight
             vec3 H = normalize(L + V);
             float NdotH = max(dot(N, H), 0.0);
@@ -542,7 +564,8 @@ void main() {
                 float perp_sq = dot(cross_vec, cross_vec);
 
                 // Bounding cone early out using maximum equatorial radius
-                float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
+                float atmo_h_au = atmo_h / u_au_to_km;
+                float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h_au * 4.0 : 0.0);
                 float max_r_penumbra = max_effective_r + dist_to_caster * star_radius_over_dist;
                 if (perp_sq > max_r_penumbra * max_r_penumbra) continue;
 
@@ -562,7 +585,7 @@ void main() {
                 float local_star_radius_over_dist = directional_star_r / dist_to_star;
 
                 // Perfect Bounding Cone Early Out (Zero Artifacts)
-                float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
+                float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h_au * 4.0 : 0.0);
                 float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
                 if (perp_sq > r_penumbra * r_penumbra) continue;
 
@@ -572,7 +595,7 @@ void main() {
                 float gamma = sqrt(perp_sq) * inv_dist;
                 float penumbra_outer = alpha + beta;
                 float penumbra_inner = abs(beta - alpha);
-                shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j].xyz);
+                shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j].xyz, atmo_h, dist_to_caster);
             }
 
             // === Ring shadow on planet surface ===
@@ -663,8 +686,8 @@ void main() {
                 }
             }
 
-            total_diffuse_color += star_color * diffuse * shadow;
-            total_specular_color += star_color * specular * shadow;
+            total_diffuse_color += star_color * incoming_light_tint * diffuse * shadow;
+            total_specular_color += star_color * incoming_light_tint * specular * shadow;
 
             if (f_subpixel_factor > 0.0) {
                 float phase_cos = clamp(dot(V, L), -1.0, 1.0);
@@ -672,7 +695,7 @@ void main() {
                 float phase_angle = acos(phase_cos);
                 float phase_func = (phase_sin + (PI - phase_angle) * phase_cos) / PI;
                 float falloff = star_lum / max(dist_to_star * dist_to_star, 1e-8);
-                analytical_diffuse_color += star_color * falloff * phase_func * shadow;
+                analytical_diffuse_color += star_color * incoming_light_tint * falloff * phase_func * shadow;
             }
         }
 

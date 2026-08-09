@@ -61,16 +61,16 @@ float HenyeyGreensteinPhaseFunction(float eccentricity, float viewDirDotLight) {
 }
 
 vec2 GetRingPhaseFunctionStrengths(float alpha) {
-    float multipleScatteringLerp = clamp((alpha - 0.1) / 0.2, 0.0, 1.0);
-    return mix(vec2(2.0, 0.0), vec2(0.5, 10.0), multipleScatteringLerp);
+    float dust_to_chunks = clamp((alpha - 0.1) / 0.5, 0.0, 1.0);
+    return mix(vec2(0.95, 0.05), vec2(0.5, 0.5), dust_to_chunks);
 }
 
-vec2 GetRingPhaseFunctionsUnweighted(float dotLight) {
-    return vec2(HenyeyGreensteinPhaseFunction(0.85, dotLight), HenyeyGreensteinPhaseFunction(-0.2, dotLight));
+vec2 GetRingPhaseFunctionsUnweighted(float dotLight, float asym, float back_asym) {
+    return vec2(HenyeyGreensteinPhaseFunction(asym, dotLight), HenyeyGreensteinPhaseFunction(back_asym, dotLight));
 }
 
-float GetRingPhaseFunctions(float dotLight, float alpha) {
-    vec2 phaseFunctions = GetRingPhaseFunctionsUnweighted(dotLight) * GetRingPhaseFunctionStrengths(alpha);
+float GetRingPhaseFunctions(float dotLight, float alpha, float asym, float back_asym) {
+    vec2 phaseFunctions = GetRingPhaseFunctionsUnweighted(dotLight, asym, back_asym) * GetRingPhaseFunctionStrengths(alpha);
     return phaseFunctions.x + phaseFunctions.y;
 }
 
@@ -166,9 +166,24 @@ void main() {
         float viewDensity = tau_phys / cosViewRayVertical;
         float lightDensity = tau_phys / cosLightRayVertical;
 
+        float layer_asym = u_ring_planes[k].asymmetry;
+        float layer_backasym = u_ring_planes[k].backscatter;
+
         float scatteredLight_sunlit = viewDensity / (viewDensity + lightDensity) * (1.0 - exp(-viewDensity - lightDensity));
-        float pf_sunlit = GetRingPhaseFunctions(0.70, alpha_phys);
-        vec3 band_color_sunlit = ring_texel.rgb * (scatteredLight_sunlit * pf_sunlit);
+        float pf_sunlit = GetRingPhaseFunctions(0.70, alpha_phys, layer_asym, layer_backasym);
+        
+        // Hapke H-Functions for Multiple Scattering
+        float w0 = 0.92;
+        float gamma = sqrt(max(1e-4, 1.0 - w0));
+        float Hv = (1.0 + 2.0 * cosViewRayVertical) / (1.0 + 2.0 * cosViewRayVertical * gamma);
+        float H0 = (1.0 + 2.0 * cosLightRayVertical) / (1.0 + 2.0 * cosLightRayVertical * gamma);
+        float path_term = 1.0 - exp(-tau_phys * (1.0 / cosViewRayVertical + 1.0 / cosLightRayVertical));
+        float mu_ratio = cosLightRayVertical / max(1e-4, cosViewRayVertical + cosLightRayVertical);
+        
+        float dust_to_chunks = clamp((alpha_phys - 0.1) / 0.5, 0.0, 1.0);
+        float ms_sunlit = max(0.0, w0 * mu_ratio * (Hv * H0 - 1.0) * path_term * dust_to_chunks);
+
+        vec3 band_color_sunlit = ring_texel.rgb * (scatteredLight_sunlit * pf_sunlit + (plane_is_textured ? ms_sunlit : 0.0));
 
         float denominator = lightDensity - viewDensity;
         float scatteredLight_unlit = 0.0;
@@ -177,8 +192,8 @@ void main() {
         } else {
             scatteredLight_unlit = viewDensity * exp(-viewDensity);
         }
-        float pf_unlit = GetRingPhaseFunctions(-0.70, alpha_phys);
-        vec3 band_color_unlit = ring_texel.rgb * (scatteredLight_unlit * pf_unlit * 0.2 * layer_unlit);
+        float pf_unlit = GetRingPhaseFunctions(-0.70, alpha_phys, layer_asym, layer_backasym);
+        vec3 band_color_unlit = ring_texel.rgb * (scatteredLight_unlit * pf_unlit * layer_unlit);
 
         vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
 
@@ -207,5 +222,6 @@ void main() {
         total_ring_irradiance += band_color * kernel_val * dr * band_illum;
     }
 
-    out_color = vec4(total_ring_irradiance, 1.0);
+    // Multiply by PI to convert physically exact radiance to the Lambertian engine convention
+    out_color = vec4(total_ring_irradiance * 3.14159265358979, 1.0);
 }

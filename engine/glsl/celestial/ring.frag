@@ -148,16 +148,20 @@ float HenyeyGreensteinPhaseFunction(float eccentricity, float viewDirDotLight) {
 }
 
 vec2 GetRingPhaseFunctionStrengths(float alpha) {
-    float multipleScatteringLerp = clamp((alpha - 0.1) / 0.2, 0.0, 1.0);
-    return mix(vec2(2.0, 0.0), vec2(0.5, 10.0), multipleScatteringLerp);
+    // Optical depth affects particle size dominance. 
+    // Thin rings (dust) are highly forward-scattering.
+    // Thick rings (large chunks) are more isotropic / back-scattering.
+    float dust_to_chunks = clamp((alpha - 0.1) / 0.5, 0.0, 1.0);
+    // Weights must sum to 1.0 for physical energy conservation.
+    return mix(vec2(0.95, 0.05), vec2(0.5, 0.5), dust_to_chunks);
 }
 
-vec2 GetRingPhaseFunctionsUnweighted(float dotLight) {
-    return vec2(HenyeyGreensteinPhaseFunction(0.85, dotLight), HenyeyGreensteinPhaseFunction(-0.2, dotLight));
+vec2 GetRingPhaseFunctionsUnweighted(float dotLight, float asym, float back_asym) {
+    return vec2(HenyeyGreensteinPhaseFunction(asym, dotLight), HenyeyGreensteinPhaseFunction(back_asym, dotLight));
 }
 
-float GetRingPhaseFunctions(float dotLight, float alpha) {
-    vec2 phaseFunctions = GetRingPhaseFunctionsUnweighted(dotLight) * GetRingPhaseFunctionStrengths(alpha);
+float GetRingPhaseFunctions(float dotLight, float alpha, float asym, float back_asym) {
+    vec2 phaseFunctions = GetRingPhaseFunctionsUnweighted(dotLight, asym, back_asym) * GetRingPhaseFunctionStrengths(alpha);
     return phaseFunctions.x + phaseFunctions.y;
 }
 
@@ -166,7 +170,8 @@ float CornetteShanksPhaseFunction(float eccentricity, float viewDirDotLight) {
     float g2 = g * g;
     float mu = viewDirDotLight;
     float denom = pow(max(1e-6, 1.0 + g2 - 2.0 * g * mu), 1.5);
-    return (1.5 * (1.0 + mu * mu) * (1.0 - g2)) / ((2.0 + g2) * denom);
+    // Normalized to integrate to 1.0 over 4PI steradians
+    return (1.5 * (1.0 + mu * mu) * (1.0 - g2)) / ((2.0 + g2) * denom * 12.566370614);
 }
 
 float OppositionSurge(float cos_phase, float columnDensity) {
@@ -530,10 +535,19 @@ void main() {
         float ms_s = 0.0;
 
         if (is_textured_ring) {
-            float phase_func = GetRingPhaseFunctions(cos_theta, f_color.a);
-            float unlit_mult = onLitSide ? 1.0 : (0.2 * f_unlit_factor);
+            float phase_func = GetRingPhaseFunctions(cos_theta, f_color.a, f_asymmetry, f_backscatter);
+            float unlit_mult = onLitSide ? 1.0 : f_unlit_factor;
             single_scatter_s = scatteredLight * phase_func * unlit_mult;
-            ms_s = 0.0;
+            
+            // Multiple scattering transmits poorly through macroscopic chunks on the unlit side.
+            // Additionally, thin dust rings (low alpha) are highly forward-scattering and do not isotropize light effectively.
+            float dust_to_chunks = clamp((f_color.a - 0.1) / 0.5, 0.0, 1.0);
+            ms_s = onLitSide ? AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * dust_to_chunks : 0.0;
+
+            if (onLitSide) {
+                float cos_phase = -cos_theta;
+                single_scatter_s *= OppositionSurge(cos_phase, columnDensity);
+            }
         } else {
             // Double Cornette-Shanks phase function using the ring's own parameters
             float pf_forward = CornetteShanksPhaseFunction(f_asymmetry, cos_theta);
@@ -542,7 +556,9 @@ void main() {
             float balance = clamp(f_scatter, 0.0, 1.0);
             float phaseFunc = mix(pf_backward, pf_forward, balance);
             single_scatter_s = scatteredLight * phaseFunc;
-            ms_s = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide);
+            
+            // Isotropic multiple scattering only applies to backscattering chunks, not pure forward-scattering dust
+            ms_s = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * (1.0 - balance);
 
             // Opposition surge: brightening at low phase angles on single scattering (lit side only)
             if (onLitSide) {
@@ -557,6 +573,11 @@ void main() {
         if (u_hdr_enabled) {
             direct_illum_s *= star_lum / (dist_to_star * dist_to_star);
         }
+
+        // Multiply by PI to convert the physically exact radiance to the 
+        // engine's Lambertian surface BRDF convention (which drops the 1/PI).
+        direct_illum_s *= 3.14159265358979;
+
         vec3 shadow_s = vec3(1.0);
         float star_radius_over_dist = star_ang_radius;
 
@@ -703,8 +724,8 @@ void main() {
 
             float pf_p = 0.0;
             if (is_textured_ring) {
-                float pf_ref_p = GetRingPhaseFunctions(1.0, f_color.a);
-                float pf_curr_p = GetRingPhaseFunctions(cos_theta_p, f_color.a);
+                float pf_ref_p = GetRingPhaseFunctions(1.0, f_color.a, f_asymmetry, f_backscatter);
+                float pf_curr_p = GetRingPhaseFunctions(cos_theta_p, f_color.a, f_asymmetry, f_backscatter);
                 pf_p = pf_curr_p / max(1e-4, pf_ref_p);
             } else {
                 float pf_forward_p = CornetteShanksPhaseFunction(f_asymmetry, cos_theta_p);

@@ -5,17 +5,16 @@
     "jup347.bsp": false,
     "jup348.bsp": false,
     "jup349.bsp": false,
-    "jup365.bsp": true,
+    "jup365.bsp": false,
     "sat455.bsp": false,
     "sat456.bsp": false,
     "sat457.bsp": false,
     "sat459.bsp": false,
-    "sat441.bsp": true,
-    "ura111.bsp": true,
-    "ura116xl.bsp": false,
-    "nep095.bsp": true,
+    "sat441.bsp": false,
+    "ura111.bsp": false,
+    "nep095.bsp": false,
     "nep104.bsp": false,
     "nep105.bsp": false,
-    "plu060.bsp": true,
-    "mar099s.bsp": true
+    "plu060.bsp": false,
+    "mar099s.bsp": false
 }
