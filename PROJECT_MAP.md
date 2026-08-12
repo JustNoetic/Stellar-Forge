@@ -282,6 +282,7 @@ spectral classification.
       - Eclipse LUT + ring caster uniforms (~L3058–3196).
       - `render_atmosphere_pass(clip_mode)` (inner def ~L3379) — two-pass (behind/in front of rings).
       - Rings render (~L3571), Habitable Zones (~L3719), second atmosphere pass (~L3765).
+      - Dynamic Cloud Layer pass (~L4781) — rendered over the atmosphere to prevent Z-fighting and scattering washout.
       - ImGui UI: top bar (speed/exposure/graphics modal), system menu popup (~L3795–4030),
         mode switch (IAS15 / Keplerian / Ephemeris) radio (~L4219–4320),
         `_render_ephem_setup_modal()` (~L4097), `_trigger_ephem_switch()` (~L4146, spawns spice
@@ -445,6 +446,7 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change camera, UI, main render loop | `engine/app.py` | `class App`, `run()` |
 | Change eclipse LUT build | `engine/app.py` | `build_eclipse_lut` |
 | Change atmosphere LUT build | `engine/app.py` | `build_atmo_lut` |
+| Change cloud texture generation | `engine/app.py` | `_prepare_cloud_image` |
 | Change Body Inspector | `engine/app.py` | inspector block |
 | Change system-switch / ephemeris modal | `engine/app.py` | `_trigger_ephem_switch/exit`, `_render_ephem_setup_modal` |
 | Fetch real ephemerides offline | `scripts/fetch_horizons.py` | `main` |

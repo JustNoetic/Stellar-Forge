@@ -101,6 +101,7 @@ pip install numpy scipy moderngl glfw pyrr imgui numba spiceypy requests PyOpenG
 - **🛠️ Comprehensive Body Inspector**: In-depth GUI panel displaying real-time physical properties, osculating Keplerian orbital elements, atmospheric composition, effective thermal equilibrium, spectral type classifications, and dynamic property sliders.
 - **☀️ Stellar Classification & Evolution**: Computes effective temperatures, spectral classes (O, B, A, F, G, K, M, L, T, Y), luminosity classes (Hypergiants to Subdwarfs), and dynamic Habitable Zone (HZ) boundaries.
 - **🌤️ Atmospheric Raymarching**: Multi-pass sky raymarching powered by precomputed Look-Up Tables (LUTs) for transmittance, single scattering, and multi-scattering across customizable planetary gas compositions.
+- **☁️ Dynamic Cloud Layers**: Independent oblate geometry shells representing planetary cloud layers. Supports native PNG alpha channels or automatic grayscale-to-alpha mapping for JPG textures, layered dynamically above planetary surfaces and atmospheric scattering.
 - **🛰️ NASA JPL SPICE & Horizons Integration**: Real-time position playback using official NAIF SPICE kernels (`.bsp`, `.tpc`, `.tls`) with automatic kernel discovery & threaded downloading, plus REST querying of JPL Horizons state vectors. Ephemeris systems can be **exported to N-body system JSON** for further simulation.
 - **⚖️ System Comparison Mode**: Side-by-side rendering of two systems (e.g. IAS15 vs. Keplerian, or two presets) sharing the same camera, with independent time controls and a dedicated comparison inspector.
 - **⏯️ Timeline Recording & Scrubbing**: Record a system's full evolution into a position/velocity buffer and scrub or play it back frame-by-frame — useful for replaying close encounters and validating integration stability.
@@ -220,6 +221,12 @@ Utilizes a multi-step precomputation technique inspired by Bruneton et al. combi
 4. **Atmospheric Refraction & Lensing**: Calculates physical ray bending (`compute_refraction_angle`) derived from surface refractivity ($n_{\text{mix}} - 1$), scale height, and planetary oblateness. Applies refraction to celestial body meshes (`sphere.frag`), volumetric atmospheres (`atmo.frag`), orbits, and rings when viewed through a foreground planetary atmosphere.
 5. **Distance-Agnostic Focal Lensing**: Supports refraction at arbitrary distances (e.g. Earth's atmosphere refractive lensing and sun-hugging ring effects when viewed from lunar focal distances or when background moons set behind planetary limbs).
 6. **Refraction Bounding Mesh Expansion**: Dynamically expands proxy sphere vertex geometry (`atmo.vert`, `sphere.vert`) using `dist * tan(max_bend)` to prevent edge clipping during aggressive atmospheric refraction.
+
+### Dynamic Cloud Rendering
+Planetary clouds are rendered using an independent oblate geometry shell dynamically offset from the surface by the atmosphere's scale height. The engine features:
+- **Automatic Alpha Mapping**: Fully supports PNG transparency. For JPG and non-alpha textures, the engine automatically extracts the grayscale luminance to synthesize a correct alpha channel, mapping pure black to fully transparent and white to fully opaque.
+- **Physically-Correct Z-Ordering**: To ensure realistic volumetric depth, clouds are rendered after the atmosphere passes, allowing the volumetric atmospheric scattering to properly render behind the semi-transparent clouds without washing them out.
+- **Z-Fighting Mitigation**: Face culling is dynamically disabled and handled within the fragment shader (`sphere.frag`) based on the camera's position relative to the bounding sphere, completely eliminating cloud-to-surface Z-fighting.
 
 ### Planetary Rings, Planetshine & Ringshine
 - **Planetary Rings**: Rendered with dynamic optical depth, Phase functions (supporting forward/backward scattering asymmetry), and self-shadowing cast by the parent planet and companion bodies.

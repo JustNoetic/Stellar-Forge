@@ -499,6 +499,7 @@ class App(InputHandlerMixin):
             "msaa_samples": 4,
             "inspector_frame": 0,
             "shadow_caster_budget": 32,
+            "tex_stream_threshold_px": 500.0,
             "screenshot_res_idx": 1,
             "anisotropy": 16.0,
             "photo_accum_enabled": False,
@@ -625,6 +626,7 @@ class App(InputHandlerMixin):
                 "fov": self.camera.get("fov", 45.0),
                 "flight_speed": self.camera.get("flight_speed", 0.1),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
+                "tex_stream_threshold_px": self.camera.get("tex_stream_threshold_px", 500.0),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
                 "horizon_align": self.camera.get("horizon_align", True),
                 "photo_accum_enabled": self.camera.get("photo_accum_enabled", False),
@@ -868,8 +870,17 @@ class App(InputHandlerMixin):
         self.planet_textures = []
         self.planet_normal_textures = []
         self.planet_specular_textures = []
+        self.planet_cloud_textures = []
         self.texture_slices = {} # name_lower -> 1-based slice_idx
         self.texture_mean_colors = {} # name_lower -> np.ndarray([r,g,b]) in linear space
+
+        def _prepare_cloud_image(img):
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                img_rgba = img.convert('RGBA')
+            else:
+                img_l = img.convert('L')
+                img_rgba = Image.merge('RGBA', (img_l, img_l, img_l, img_l))
+            return img_rgba.resize((2048, 1024), Image.Resampling.LANCZOS)
 
         self.ring_textures_front = {}  # name_lower -> PIL.Image (4096, 1)
         self.ring_textures_back = {}   # name_lower -> PIL.Image (4096, 1)
@@ -877,197 +888,91 @@ class App(InputHandlerMixin):
         self.ring_gl_textures_back = {}  # name_lower -> ModernGL Texture
         self.ring_textures = self.ring_textures_front
         self.ring_gl_textures = self.ring_gl_textures_front
-
         textures_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'textures')
+
+        from engine.rendering.texture_streamer import TextureStreamer
+
+        self.texture_streamer = TextureStreamer(textures_dir, fallback_size=(1024, 512))
+        self.texture_slices = self.texture_streamer.name_to_idx
+        self.texture_mean_colors = self.texture_streamer.texture_mean_colors
+
+        # Ring texture loading
         if os.path.exists(textures_dir):
-            # Gather subdirectories + the root directory as candidates
-            target_dirs = []
             for root, dirs, files in os.walk(textures_dir):
                 for dir_name in dirs:
                     folder_path = os.path.join(root, dir_name)
-                    target_dirs.append((dir_name, folder_path))
-            
-            # Also add root textures_dir as a special candidate to support files stored directly in it
-            target_dirs.append(("", textures_dir))
-
-            for folder_name, path in target_dirs:
-                if path == textures_dir:
-                    # Root folder backward compatibility
-                    files = glob.glob(os.path.join(textures_dir, '*.png')) + glob.glob(os.path.join(textures_dir, '*.jpg'))
-                    base_names = set()
-                    for f in files:
-                        name = os.path.splitext(os.path.basename(f))[0]
-                        if name.endswith("_ring") or name.endswith("_rings") or name.endswith("_normal") or name.endswith("_specular") or name.endswith("_front") or name.endswith("_back"):
-                            continue
-                        base_names.add(name)
-                    
-                    for name in sorted(list(base_names)):
-                        name_lower = name.lower()
-                        if name_lower in self.texture_slices:
-                            continue # Already loaded from subdirectory
-                        try:
-                            # Diffuse
-                            d_path = os.path.join(textures_dir, name + ".png")
-                            if not os.path.exists(d_path): d_path = os.path.join(textures_dir, name + ".jpg")
-                            img = Image.open(d_path).convert('RGBA')
-                            img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
-                            self.planet_textures.append(img.tobytes())
-                            self.texture_mean_colors[name_lower] = compute_texture_spherical_mean(img)
-
-                            
-                            # Normal
-                            n_path = os.path.join(textures_dir, name + "_normal.png")
-                            if not os.path.exists(n_path): n_path = os.path.join(textures_dir, name + "_normal.jpg")
-                            if os.path.exists(n_path):
-                                img_n = Image.open(n_path).convert('RGBA')
-                                img_n = img_n.resize((2048, 1024), Image.Resampling.LANCZOS)
-                                self.planet_normal_textures.append(img_n.tobytes())
-                            else:
-                                self.planet_normal_textures.append(Image.new('RGBA', (2048, 1024), (128, 128, 255, 255)).tobytes())
-                                
-                            # Specular
-                            s_path = os.path.join(textures_dir, name + "_specular.png")
-                            if not os.path.exists(s_path): s_path = os.path.join(textures_dir, name + "_specular.jpg")
-                            if os.path.exists(s_path):
-                                img_s = Image.open(s_path).convert('L')
-                                img_s = img_s.resize((2048, 1024), Image.Resampling.LANCZOS)
-                                self.planet_specular_textures.append(img_s.tobytes())
-                            else:
-                                self.planet_specular_textures.append(Image.new('L', (2048, 1024), 0).tobytes())
-                                
-                            self.texture_slices[name_lower] = len(self.planet_textures)
-                        except Exception as e:
-                            print(f"Failed to load root planet textures for {name}: {e}")
-                            
-                    # Rings directly in root
-                    ring_files = glob.glob(os.path.join(textures_dir, '*_ring*.png')) + glob.glob(os.path.join(textures_dir, '*_rings*.png'))
-                    ring_base_names = set()
-                    for f in ring_files:
-                        bname = os.path.splitext(os.path.basename(f))[0]
-                        clean_name = bname.replace("_rings_front", "").replace("_ring_front", "").replace("_rings_back", "").replace("_ring_back", "").replace("_front", "").replace("_back", "").replace("_rings", "").replace("_ring", "")
-                        if clean_name:
-                            ring_base_names.add(clean_name)
-                            
-                    for name in sorted(list(ring_base_names)):
-                        name_lower = name.lower()
-                        if name_lower in self.ring_textures_front:
-                            continue # Already loaded from subdirectory
-                        
-                        f_front = None
-                        f_back = None
-                        f_single = None
-                        for ext in ['.png', '.jpg']:
-                            for pattern in [f"{name}_ring_front{ext}", f"{name}_rings_front{ext}", f"{name}_front{ext}"]:
-                                p = os.path.join(textures_dir, pattern)
-                                if os.path.exists(p): f_front = p; break
-                            for pattern in [f"{name}_ring_back{ext}", f"{name}_rings_back{ext}", f"{name}_back{ext}"]:
-                                p = os.path.join(textures_dir, pattern)
-                                if os.path.exists(p): f_back = p; break
-                            for pattern in [f"{name}_ring{ext}", f"{name}_rings{ext}"]:
-                                p = os.path.join(textures_dir, pattern)
-                                if os.path.exists(p): f_single = p; break
-                        
-                        try:
-                            if f_front:
-                                img_front = Image.open(f_front).convert('RGBA')
-                                img_back = Image.open(f_back).convert('RGBA') if f_back else img_front
-                                self.ring_gl_textures_front[name_lower] = img_front
-                                self.ring_gl_textures_back[name_lower] = img_back
-                                self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
-                                self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
-                            elif f_single:
-                                img = Image.open(f_single).convert('RGBA')
-                                self.ring_gl_textures_front[name_lower] = img
-                                self.ring_gl_textures_back[name_lower] = img
-                                img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
-                                self.ring_textures_front[name_lower] = img_ds
-                                self.ring_textures_back[name_lower] = img_ds
-                        except Exception as e:
-                            print(f"Failed to load root ring texture {name}: {e}")
-                else:
-                    # Subdirectory (e.g. Earth, Saturn)
-                    obj_name = folder_name
-                    name_lower = obj_name.lower()
-                    
-                    files = glob.glob(os.path.join(path, '*.png')) + glob.glob(os.path.join(path, '*.jpg'))
-                    
-                    d_path = None
-                    n_path = None
-                    s_path = None
-                    r_front_path = None
-                    r_back_path = None
-                    r_single_path = None
-                    
-                    # 1. Look for explicit matches first
-                    for f in files:
-                        fname = os.path.splitext(os.path.basename(f))[0]
-                        fname_lower = fname.lower()
-                        
-                        if fname_lower == name_lower:
-                            d_path = f
-                        elif fname_lower == name_lower + "_normal" or fname_lower == "normal" or fname_lower == "diffuse_normal":
-                            n_path = f
-                        elif fname_lower == name_lower + "_specular" or fname_lower == "specular" or fname_lower == "diffuse_specular":
-                            s_path = f
-                        elif fname_lower in [name_lower + "_ring_front", name_lower + "_rings_front", name_lower + "_front", "ring_front", "rings_front", "front"]:
+                    r_files = glob.glob(os.path.join(folder_path, '*.png')) + glob.glob(os.path.join(folder_path, '*.jpg'))
+                    name_lower = dir_name.lower()
+                    r_front_path, r_back_path, r_single_path = None, None, None
+                    for f in r_files:
+                        fname_lower = os.path.splitext(os.path.basename(f))[0].lower()
+                        if fname_lower in [name_lower + "_ring_front", name_lower + "_rings_front", name_lower + "_front", "ring_front", "rings_front", "front"]:
                             r_front_path = f
                         elif fname_lower in [name_lower + "_ring_back", name_lower + "_rings_back", name_lower + "_back", "ring_back", "rings_back", "back"]:
                             r_back_path = f
                         elif fname_lower in [name_lower + "_ring", name_lower + "_rings", "ring", "rings"]:
                             r_single_path = f
-
-                    # 2. Fallbacks if explicit matches not found
-                    if not d_path:
-                        for f in files:
-                            fname = os.path.splitext(os.path.basename(f))[0]
-                            fname_lower = fname.lower()
-                            if fname_lower in ["diffuse", "albedo", "color", "map"]:
-                                d_path = f
-                                break
-                    if not n_path:
-                        for f in files:
-                            fname = os.path.splitext(os.path.basename(f))[0]
-                            fname_lower = fname.lower()
-                            if fname_lower in ["bump", "n", "nm"]:
-                                n_path = f
-                                break
-                    if not s_path:
-                        for f in files:
-                            fname = os.path.splitext(os.path.basename(f))[0]
-                            fname_lower = fname.lower()
-                            if fname_lower in ["spec", "s", "specular_map"]:
-                                s_path = f
-                                break
-                    
-                    if d_path or n_path or s_path:
+                    if r_front_path:
                         try:
-                            if d_path:
-                                img = Image.open(d_path).convert('RGBA')
-                            else:
-                                img = Image.new('RGBA', (2048, 1024), (255, 255, 255, 255))
-                            img = img.resize((2048, 1024), Image.Resampling.LANCZOS)
-                            self.planet_textures.append(img.tobytes())
-                            if d_path:
-                                self.texture_mean_colors[name_lower] = compute_texture_spherical_mean(img)
-
-                            
-                            if n_path:
-                                img_n = Image.open(n_path).convert('RGBA')
-                                img_n = img_n.resize((2048, 1024), Image.Resampling.LANCZOS)
-                                self.planet_normal_textures.append(img_n.tobytes())
-                            else:
-                                self.planet_normal_textures.append(Image.new('RGBA', (2048, 1024), (128, 128, 255, 255)).tobytes())
-                                
-                            if s_path:
-                                img_s = Image.open(s_path).convert('L')
-                                img_s = img_s.resize((2048, 1024), Image.Resampling.LANCZOS)
-                                self.planet_specular_textures.append(img_s.tobytes())
-                            else:
-                                self.planet_specular_textures.append(Image.new('L', (2048, 1024), 0).tobytes())
-                                
-                            self.texture_slices[name_lower] = len(self.planet_textures)
+                            img_front = Image.open(r_front_path).convert('RGBA')
+                            img_back = Image.open(r_back_path).convert('RGBA') if r_back_path else img_front
+                            self.ring_gl_textures_front[name_lower] = img_front
+                            self.ring_gl_textures_back[name_lower] = img_back
+                            self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
+                            self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
                         except Exception as e:
-                            print(f"Failed to load planet textures in folder {path}: {e}")
+                            print(f"Failed to load front/back ring textures in folder {folder_path}: {e}")
+                    elif r_single_path:
+                        try:
+                            img = Image.open(r_single_path).convert('RGBA')
+                            self.ring_gl_textures_front[name_lower] = img
+                            self.ring_gl_textures_back[name_lower] = img
+                            img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
+                            self.ring_textures_front[name_lower] = img_ds
+                            self.ring_textures_back[name_lower] = img_ds
+                        except Exception as e:
+                            print(f"Failed to load ring texture in folder {folder_path}: {e}")
+
+            # Root ring textures
+            ring_files = glob.glob(os.path.join(textures_dir, '*_ring*.png')) + glob.glob(os.path.join(textures_dir, '*_rings*.png'))
+            ring_base_names = set()
+            for f in ring_files:
+                bname = os.path.splitext(os.path.basename(f))[0]
+                clean_name = bname.replace("_rings_front", "").replace("_ring_front", "").replace("_rings_back", "").replace("_ring_back", "").replace("_front", "").replace("_back", "").replace("_rings", "").replace("_ring", "")
+                if clean_name:
+                    ring_base_names.add(clean_name)
+            for name in sorted(list(ring_base_names)):
+                name_lower = name.lower()
+                if name_lower in self.ring_textures_front:
+                    continue
+                f_front, f_back, f_single = None, None, None
+                for ext in ['.png', '.jpg']:
+                    for pattern in [f"{name}_ring_front{ext}", f"{name}_rings_front{ext}", f"{name}_front{ext}"]:
+                        p = os.path.join(textures_dir, pattern)
+                        if os.path.exists(p): f_front = p; break
+                    for pattern in [f"{name}_ring_back{ext}", f"{name}_rings_back{ext}", f"{name}_back{ext}"]:
+                        p = os.path.join(textures_dir, pattern)
+                        if os.path.exists(p): f_back = p; break
+                    for pattern in [f"{name}_ring{ext}", f"{name}_rings{ext}"]:
+                        p = os.path.join(textures_dir, pattern)
+                        if os.path.exists(p): f_single = p; break
+                try:
+                    if f_front:
+                        img_front = Image.open(f_front).convert('RGBA')
+                        img_back = Image.open(f_back).convert('RGBA') if f_back else img_front
+                        self.ring_gl_textures_front[name_lower] = img_front
+                        self.ring_gl_textures_back[name_lower] = img_back
+                        self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
+                        self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
+                    elif f_single:
+                        img = Image.open(f_single).convert('RGBA')
+                        self.ring_gl_textures_front[name_lower] = img
+                        self.ring_gl_textures_back[name_lower] = img
+                        img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
+                        self.ring_textures_front[name_lower] = img_ds
+                        self.ring_textures_back[name_lower] = img_ds
+                except Exception as e:
+                    print(f"Failed to load root ring texture {name}: {e}")
                             
                     if r_front_path:
                         try:
@@ -1930,6 +1835,7 @@ class App(InputHandlerMixin):
         self.u_planet_textures_obj = None
         self.u_planet_normal_textures_obj = None
         self.u_planet_specular_textures_obj = None
+        self.u_planet_cloud_textures_obj = None
         
         # Anisotropic filtering is the key to eliminating spherical-mapping moire:
         # equirectangular UVs compress longitude toward the poles, so the isotropic
@@ -1944,43 +1850,42 @@ class App(InputHandlerMixin):
         # device max; values above the max are clamped by the driver anyway).
         aniso_value = max(1.0, min(max_aniso, 16.0))
 
-        if self.planet_textures:
-            tex_data = b''.join(self.planet_textures)
-            self.u_planet_textures_obj = ctx.texture_array(
-                (2048, 1024, len(self.planet_textures)), 4, tex_data, dtype='f1'
-            )
-            self.u_planet_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-            # Wrap along longitude (u wraps 0->1 around the sphere); clamp latitude.
-            self.u_planet_textures_obj.repeat_x = True
-            self.u_planet_textures_obj.build_mipmaps()
-            self.u_planet_textures_obj.anisotropy = aniso_value
-            self.u_planet_textures_obj.use(location=3) # Use texture unit 3
-            if 'u_planet_textures' in prog_spheres:
-                prog_spheres['u_planet_textures'].value = 3
-                
-            normal_tex_data = b''.join(self.planet_normal_textures)
-            self.u_planet_normal_textures_obj = ctx.texture_array(
-                (2048, 1024, len(self.planet_normal_textures)), 4, normal_tex_data, dtype='f1'
-            )
-            self.u_planet_normal_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-            self.u_planet_normal_textures_obj.repeat_x = True
-            self.u_planet_normal_textures_obj.build_mipmaps()
-            self.u_planet_normal_textures_obj.anisotropy = aniso_value
-            self.u_planet_normal_textures_obj.use(location=4) # Use texture unit 4
-            if 'u_planet_normal_textures' in prog_spheres:
-                prog_spheres['u_planet_normal_textures'].value = 4
-                
-            spec_tex_data = b''.join(self.planet_specular_textures)
-            self.u_planet_specular_textures_obj = ctx.texture_array(
-                (2048, 1024, len(self.planet_specular_textures)), 1, spec_tex_data, dtype='f1'
-            )
-            self.u_planet_specular_textures_obj.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-            self.u_planet_specular_textures_obj.repeat_x = True
-            self.u_planet_specular_textures_obj.build_mipmaps()
-            self.u_planet_specular_textures_obj.anisotropy = aniso_value
-            self.u_planet_specular_textures_obj.use(location=5) # Use texture unit 5
-            if 'u_planet_specular_textures' in prog_spheres:
-                prog_spheres['u_planet_specular_textures'].value = 5
+        # Dictionary holding resident ModernGL Texture objects:
+        # idx -> {'diffuse': tex, 'normal': tex, 'specular': tex, 'clouds': tex}
+        self.gpu_body_textures = {}
+        self.active_res_level = {} # idx -> 'low' or 'high'
+
+        # SSBO layout: struct BodyTextures { uvec2 diffuse; uvec2 normal; uvec2 specular; uvec2 clouds; };
+        # Each uvec2 is 8 bytes (two 32-bit uints). 4 uvec2s = 32 bytes per body texture slot.
+        MAX_TEXTURED_BODIES = max(64, len(self.texture_slices) + 16)
+        self.body_textures_ssbo_data = np.zeros((MAX_TEXTURED_BODIES, 4, 2), dtype=np.uint32)
+
+        def _upload_texture_obj(size, raw_bytes, components):
+            tex = ctx.texture(size, components, raw_bytes, dtype='f1')
+            tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+            tex.repeat_x = True
+            tex.build_mipmaps()
+            tex.anisotropy = aniso_value
+            return tex
+
+        # Initialize all fallback textures on the GPU and get their 64-bit bindless handles
+        for idx, entry in self.texture_streamer.fallback_data.items():
+            slot = idx - 1
+            tex_dict = {}
+            for map_name, (sz, raw_b, comp) in entry.items():
+                tex = _upload_texture_obj(sz, raw_b, comp)
+                tex_dict[map_name] = tex
+                handle_64 = int(tex.get_handle(resident=True))
+                # Split 64-bit uint into two 32-bit uints for GLSL uvec2
+                lo = handle_64 & 0xFFFFFFFF
+                hi = (handle_64 >> 32) & 0xFFFFFFFF
+                map_offset = {'diffuse': 0, 'normal': 1, 'specular': 2, 'clouds': 3}[map_name]
+                self.body_textures_ssbo_data[slot, map_offset] = [lo, hi]
+            self.gpu_body_textures[idx] = tex_dict
+            self.active_res_level[idx] = 'low'
+
+        self.body_textures_ssbo = ctx.buffer(self.body_textures_ssbo_data.tobytes())
+        self.body_textures_ssbo.bind_to_storage_buffer(binding=10)
 
         # Convert ring PIL images into ModernGL textures
         for name_lower, img in list(self.ring_gl_textures_front.items()):
@@ -3433,22 +3338,64 @@ class App(InputHandlerMixin):
                 all_instances[num_bodies:, 3:8] = self.visual_arr_cmp[:, 0:5]
                 all_instances[num_bodies:, 8] = self.is_star_arr_cmp
                 all_instances[num_bodies:, 9:12] = self.visual_arr_cmp[:, 5:8]
-                all_instances[num_bodies:, 12] = self.visual_arr_cmp[:, 8]
-                if self.visual_arr_cmp.shape[1] > 9:
-                    all_instances[num_bodies:, 13:16] = self.visual_arr_cmp[:, 9:12]
-                    all_instances[num_bodies:, 19] = self.visual_arr_cmp[:, 12]
-                    all_instances[num_bodies:, 23] = self.visual_arr_cmp[:, 13]
-                
-                # Texture slice index + spin angle for comparison bodies (independent clock).
                 all_instances[num_bodies:, 24] = self.tex_idx_arr_cmp[:self.num_bodies_cmp]
                 cmp_t_sec = float(cmp_sim_t) * 31557600.0
                 all_instances[num_bodies:, 25] = compute_body_rotation_angles_jit(
                     cmp_t_sec, self.rot_period_arr_cmp, self.w0_arr_cmp, self.tidally_locked_arr_cmp, self.parent_idx_arr_cmp, self.pos_snap_cmp, self.pole_n_arr_cmp, self.tangent_arr_cmp, self.bitangent_arr_cmp
                 )
-
-
+                
+            # --- Dynamic Texture Streaming: evaluate apparent pixel sizes & process completed uploads ---
+            stream_thresh_px = float(self.camera.get("tex_stream_threshold_px", 500.0))
+            cur_fov_factor = 1.0 / math.tan(math.radians(max(1.0, self.camera["fov"]) / 2.0))
             
-            # Precalculate planetshine bounce light direction & color on CPU using Numba
+            # Check apparent size for each body to trigger high-res streaming
+            for b_i in range(num_bodies):
+                t_slice = int(self.tex_idx_arr[b_i])
+                if t_slice <= 0:
+                    continue
+                b_name_lower = bodies_data[b_i].get('name', '').lower()
+                b_pos = pos_rel_all[b_i]
+                b_rad = body_radii[b_i]
+                cam_d = math.sqrt(b_pos[0]**2 + b_pos[1]**2 + b_pos[2]**2)
+                apparent_px = (b_rad / max(1e-12, cam_d)) * self.fb_height * cur_fov_factor
+                is_tracked = (self.camera.get("tracking_idx") == b_i and not self.camera.get("tracking_is_cmp", False))
+                
+                if (apparent_px >= stream_thresh_px or is_tracked) and self.active_res_level.get(t_slice) != 'high':
+                    self.texture_streamer.request_high_res(b_name_lower)
+
+            # Process any completed high-res decoded textures from background worker
+            decoded_results = self.texture_streamer.poll_results(max_items=2)
+            for res in decoded_results:
+                r_idx = res['idx']
+                r_slot = r_idx - 1
+                maps = res['maps']
+                if not maps:
+                    continue
+                
+                tex_dict = self.gpu_body_textures.get(r_idx, {})
+                for map_name, (sz, raw_b, comp) in maps.items():
+                    # Release previous fallback/old texture if needed
+                    if map_name in tex_dict and tex_dict[map_name] is not None:
+                        try:
+                            tex_dict[map_name].release()
+                        except Exception:
+                            pass
+                    
+                    new_tex = _upload_texture_obj(sz, raw_b, comp)
+                    tex_dict[map_name] = new_tex
+                    h_64 = int(new_tex.get_handle(resident=True))
+                    lo = h_64 & 0xFFFFFFFF
+                    hi = (h_64 >> 32) & 0xFFFFFFFF
+                    m_offset = {'diffuse': 0, 'normal': 1, 'specular': 2, 'clouds': 3}[map_name]
+                    self.body_textures_ssbo_data[r_slot, m_offset] = [lo, hi]
+
+                self.gpu_body_textures[r_idx] = tex_dict
+                self.active_res_level[r_idx] = 'high'
+                # Update the SSBO on GPU
+                self.body_textures_ssbo.write(self.body_textures_ssbo_data.tobytes())
+
+            # Bind the body textures SSBO to binding point 10 before rendering
+            self.body_textures_ssbo.bind_to_storage_buffer(binding=10)
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
             star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
             star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
@@ -4003,6 +3950,9 @@ class App(InputHandlerMixin):
                     if 'u_au_to_km' in prog:
                         prog['u_au_to_km'].value = au_to_km_val
 
+            if 'u_is_cloud_pass' in prog_spheres:
+                prog_spheres['u_is_cloud_pass'].value = False
+
             ctx.enable(moderngl.DEPTH_TEST)
             ctx.disable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
@@ -4203,6 +4153,7 @@ class App(InputHandlerMixin):
                 
                 if 'u_atmo_clip_mode' in cur_prog:
                     cur_prog['u_atmo_clip_mode'].value = clip_mode
+                self.atmo_ssbo.bind_to_storage_buffer(binding=8)
     
                 # Pre-build lookup tables outside the loop
                 atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
@@ -4720,6 +4671,25 @@ class App(InputHandlerMixin):
             execute_atmosphere_pass(2)
             _perf_gpu_end(_gq)
 
+            # --- Pass 2.5: Dynamic Cloud Layer Pass (Moved here to render over the atmosphere) ---
+            if 'u_is_cloud_pass' in prog_spheres and getattr(self, 'body_textures_ssbo', None) is not None:
+                _gq = _perf_gpu_begin(ctx, "gpu_clouds")
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.enable(moderngl.DEPTH_TEST)
+                ctx.disable(moderngl.CULL_FACE)
+                
+                prog_spheres['u_is_cloud_pass'].value = True
+                ctx.depth_mask = False
+                vis_hi_buffer.bind_to_storage_buffer(binding=3)
+                vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
+
+                vis_ultra_buffer.bind_to_storage_buffer(binding=3)
+                vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
+                prog_spheres['u_is_cloud_pass'].value = False
+                ctx.depth_mask = True
+                _perf_gpu_end(_gq)
+
             def compute_body_albedos(body_info, insp_idx, insp_is_cmp):
                 """Compute Geometric Albedo (A_g), Bond Albedo (A_b), Phase Integral (q), and Top-of-Atmosphere RGB reflectance."""
                 if insp_is_cmp and hasattr(self, 'visual_arr_cmp') and self.visual_arr_cmp is not None and len(self.visual_arr_cmp) > insp_idx:
@@ -5169,6 +5139,14 @@ class App(InputHandlerMixin):
                         imgui.unindent()
 
                     
+                    imgui.separator()
+                    # Dynamic Texture Streaming
+                    stream_thresh = float(self.camera.get("tex_stream_threshold_px", 500.0))
+                    changed_st, stream_thresh = imgui.slider_float("Min High-Res Size (px)", stream_thresh, 100.0, 2000.0, "%.0f px")
+                    if changed_st:
+                        self.camera["tex_stream_threshold_px"] = stream_thresh
+                        settings_changed = True
+
                     if settings_changed:
                         self.save_settings()
 

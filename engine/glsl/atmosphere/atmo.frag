@@ -968,6 +968,18 @@ void main() {
         float tanPhi = cosPhi / sqrt(max(1.0 - cosPhi * cosPhi, 1e-4));
         float solstice_factor = clamp(tanPhi * 1.8, 0.0, 1.0);
 
+        // Pre-compute SpaceEngine Solstice Winter Model once per ray (atmosphere thickness is negligible compared to radius)
+        vec3 mid_pos_sph = toSphericalSpace(mid_pos, u_pole_obl);
+        vec3 mid_dir_norm = normalize(mid_pos_sph);
+        float mid_sin_lat = abs(dot(mid_dir_norm, pole_dir_norm));
+        float lat_factor = smoothstep(0.1, 0.7, mid_sin_lat);
+        float frag_pole_dot = dot(mid_dir_norm, pole_dir_norm);
+        float is_winter = step(sun_pole_dot * frag_pole_dot, 0.0);
+        float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
+        float winter_solstice_effect = lat_factor * is_winter * solstice_factor * has_rings;
+        float polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
+        vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
+
         // Atmospheric refraction limit (max bending angle) for this body.
         // Derived from the surface refractivity (n_mix - 1) instead of a
         // hard-coded Earth-only 0.00029 constant, so Venus/Mars/Titan/gas
@@ -1014,21 +1026,6 @@ void main() {
         for (int i = 0; i < steps; i++) {
             float sample_len = length(current_pos_sph);
             float altitude = sample_len - u_planet_radius_km;
-
-            // SpaceEngine Solstice Winter Model: Blue polar atmospheric scattering appears ONLY on the winter pole during solstice
-            vec3 sample_dir_norm = current_pos_sph / max(sample_len, 1e-6);
-            float sin_lat = abs(dot(sample_dir_norm, pole_dir_norm));
-            float lat_factor = smoothstep(0.1, 0.7, sin_lat);
-
-            float frag_pole_dot = dot(sample_dir_norm, pole_dir_norm);
-
-            // Winter hemisphere condition: Sun and Sample point are on opposite sides of the equator
-            float is_winter = step(sun_pole_dot * frag_pole_dot, 0.0);
-
-            float winter_solstice_effect = lat_factor * is_winter * solstice_factor;
-
-            float polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
-            vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
 
             float h1 = h_prev;
             float rho_R1 = rho_R_prev;

@@ -42,6 +42,7 @@ class InputHandlerMixin:
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
+                "tex_stream_threshold_px": self.camera.get("tex_stream_threshold_px", 500.0),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
             }
             with open(settings_path, 'w') as f:

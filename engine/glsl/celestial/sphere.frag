@@ -1,4 +1,6 @@
 #version 460 core
+#extension GL_ARB_bindless_texture : require
+#extension GL_ARB_gpu_shader_int64 : enable
 #define MAX_CASTERS 64
 #define MAX_STARS 16
 #define MAX_RING_PLANES 16
@@ -36,9 +38,18 @@ uniform float u_refract_scale_height;
 uniform vec3 u_refract_pole;
 uniform float u_refract_oblateness;
 
-uniform sampler2DArray u_planet_textures;
-uniform sampler2DArray u_planet_normal_textures;
-uniform sampler2DArray u_planet_specular_textures;
+struct BodyTextures {
+    uvec2 diffuse;
+    uvec2 normal;
+    uvec2 specular;
+    uvec2 clouds;
+};
+
+layout(std430, binding = 10) readonly buffer BodyTextureBlock {
+    BodyTextures u_body_textures[];
+};
+
+uniform bool u_is_cloud_pass;
 
 layout(std140, binding = 1) uniform SceneData {
     mat4 projection;
@@ -209,6 +220,16 @@ float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
 void main() {
     if (f_clip_z <= 0.0) discard;
 
+    // To avoid double-rendering and Z-fighting when CULL_FACE is disabled:
+    // If the camera is outside the bounding sphere, we only want the front face.
+    // If the camera is inside the bounding sphere, we only want the back face.
+    float dist_to_center = length(f_center_pos - u_camera_pos);
+    if (dist_to_center > f_bounding_radius) {
+        if (!gl_FrontFacing) discard;
+    } else {
+        if (gl_FrontFacing) discard;
+    }
+
     // Body-local approach: separate small per-pixel mesh offset from large per-instance offset
     vec3 pole_n_pre = length(f_pole) > 1e-4 ? normalize(f_pole) : vec3(0.0, 1.0, 0.0);
     vec3 scaled_local = f_local_pos;
@@ -336,6 +357,7 @@ void main() {
     vec3 v_local_pos = hit_local_pos;
 
     if (f_is_star > 0.5) {
+        if (u_is_cloud_pass) discard;
         // Star is self-luminous, apply quadratic limb darkening
         vec3 V = normalize(-(cam_to_center + P_rel));
         vec3 N = normalize(v_normal);
@@ -393,6 +415,8 @@ void main() {
         vec3 N = normalize(v_normal);
         float spec_intensity = 0.0;
         vec3 local_f_color = f_color;
+        float cloud_frag_alpha = 1.0;
+        vec4 cloud_tex = vec4(0.0);
 
         if (f_tex_idx > 0.0) {
             vec3 p = normalize(v_local_pos);
@@ -426,29 +450,48 @@ void main() {
             if (dy.x > 0.5) dy.x -= 1.0;
             else if (dy.x < -0.5) dy.x += 1.0;
 
-            vec4 tex_color = textureGrad(u_planet_textures, vec3(uv, f_tex_idx - 1.0), dx, dy);
-            // Decode sRGB to Linear
-            local_f_color = pow(tex_color.rgb, vec3(2.2));
+            uint b_tex_slot = uint(f_tex_idx - 1.0);
+            BodyTextures bt = u_body_textures[b_tex_slot];
+            sampler2D s_clouds = sampler2D(bt.clouds);
+            cloud_tex = textureGrad(s_clouds, uv, dx, dy);
 
-            // Analytical TBN Mapping
-            vec3 map_normal = textureGrad(u_planet_normal_textures, vec3(uv, f_tex_idx - 1.0), dx, dy).rgb;
-            map_normal = map_normal * 2.0 - 1.0;
+            if (u_is_cloud_pass) {
+                cloud_frag_alpha = cloud_tex.a;
+                if (cloud_frag_alpha < 0.005) discard;
 
-            vec3 T_rot = normalize(vec3(-p_rot.z, 0.0, p_rot.x));
-            vec3 B_rot = normalize(cross(p_rot, T_rot));
+                local_f_color = max(cloud_tex.rgb, vec3(0.95));
+                spec_intensity = 0.0;
+                N = normalize(v_normal);
+            } else {
+                sampler2D s_diffuse = sampler2D(bt.diffuse);
+                vec4 tex_color = textureGrad(s_diffuse, uv, dx, dy);
+                // Decode sRGB to Linear
+                local_f_color = pow(tex_color.rgb, vec3(2.2));
 
-            float s_inv = sin(f_rotation_angle);
-            float c_inv = cos(f_rotation_angle);
-            vec3 T_local = vec3(T_rot.x * c_inv - T_rot.z * s_inv, T_rot.y, T_rot.x * s_inv + T_rot.z * c_inv);
-            vec3 B_local = vec3(B_rot.x * c_inv - B_rot.z * s_inv, B_rot.y, B_rot.x * s_inv + B_rot.z * c_inv);
+                // Analytical TBN Mapping
+                sampler2D s_normal = sampler2D(bt.normal);
+                vec3 map_normal = textureGrad(s_normal, uv, dx, dy).rgb;
+                map_normal = map_normal * 2.0 - 1.0;
 
-            vec3 T_world = T_local.x * tangent + T_local.y * f_pole + T_local.z * bitangent;
-            vec3 B_world = B_local.x * tangent + B_local.y * f_pole + B_local.z * bitangent;
+                vec3 T_rot = normalize(vec3(-p_rot.z, 0.0, p_rot.x));
+                vec3 B_rot = normalize(cross(p_rot, T_rot));
 
-            mat3 TBN = mat3(T_world, B_world, N);
-            N = normalize(TBN * map_normal);
+                float s_inv = sin(f_rotation_angle);
+                float c_inv = cos(f_rotation_angle);
+                vec3 T_local = vec3(T_rot.x * c_inv - T_rot.z * s_inv, T_rot.y, T_rot.x * s_inv + T_rot.z * c_inv);
+                vec3 B_local = vec3(B_rot.x * c_inv - B_rot.z * s_inv, B_rot.y, B_rot.x * s_inv + B_rot.z * c_inv);
 
-            spec_intensity = textureGrad(u_planet_specular_textures, vec3(uv, f_tex_idx - 1.0), dx, dy).r;
+                vec3 T_world = T_local.x * tangent + T_local.y * f_pole + T_local.z * bitangent;
+                vec3 B_world = B_local.x * tangent + B_local.y * f_pole + B_local.z * bitangent;
+
+                mat3 TBN = mat3(T_world, B_world, N);
+                N = normalize(TBN * map_normal);
+
+                sampler2D s_specular = sampler2D(bt.specular);
+                spec_intensity = textureGrad(s_specular, uv, dx, dy).r;
+            }
+        } else {
+            if (u_is_cloud_pass) discard;
         }
 
         vec3 total_diffuse_color = vec3(0.0);
@@ -503,6 +546,11 @@ void main() {
                 // Final transmittance to the ground
                 vec3 tau = tau_vertical * am;
                 incoming_light_tint = exp(-tau);
+            }
+
+            if (!u_is_cloud_pass && f_tex_idx > 0.0) {
+                // float shadow_factor = 1.0 - cloud_tex.a * 0.85;
+                // incoming_light_tint *= shadow_factor;
             }
 
             // Blinn-Phong specular highlight
@@ -817,6 +865,9 @@ void main() {
         float trans = 1.0;
         vec3 ap_rgb = vec3(0.0);
         float planet_alpha = mix(1.0, f_brightness_scale, f_subpixel_factor);
+        if (u_is_cloud_pass) {
+            planet_alpha *= cloud_frag_alpha;
+        }
         out_color = vec4(final_color * f_brightness_scale * trans + ap_rgb, planet_alpha);
     }
 }
