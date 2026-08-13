@@ -350,8 +350,8 @@ def main():
             warmup_start[0] = now
             last_swap[0] = now
             
-            # Hardcoded FOV of 20 degrees and look at Saturn's equator
-            app_instance.camera["fov"] = 20.0
+            # Hardcoded FOV of 45 degrees and look at Saturn's equator
+            app_instance.camera["fov"] = 45.0
             idx = app_instance.camera.get("tracking_idx")
             if idx is not None and hasattr(app_instance, '_bundle'):
                 bodies_data = app_instance._bundle['bodies_data']

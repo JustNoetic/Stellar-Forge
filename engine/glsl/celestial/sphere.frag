@@ -399,8 +399,15 @@ void main() {
 
         if (f_subpixel_factor > 0.0) {
             float dist_px = length(gl_FragCoord.xy - f_center_px);
-            float sigma = 0.5;
-            float kernel = (1.0 / (2.0 * PI * sigma * sigma)) * exp(-0.5 * (dist_px * dist_px) / (sigma * sigma));
+            
+            // Realistic optical point spread function (Airy disk envelope + scattering)
+            // Falls off as 1/r^3, simulating diffraction and glare better than a Gaussian.
+            // Integral of C / (1 + (r/a)^2)^1.5 is 2 * PI * a^2.
+            // For a = 0.25, C = 1.0 / (2 * PI * 0.0625) = 2.546479
+            float a = 0.25;
+            float r_over_a = dist_px / a;
+            float kernel = 2.546479 / pow(1.0 + r_over_a * r_over_a, 1.5);
+            
             float area_scale = PI * f_clamped_min_px * f_clamped_min_px;
             vec3 analytical_star = star_base_color * surface_luminance * (kernel * area_scale);
             final_star_color = mix(final_star_color, analytical_star, f_subpixel_factor);
@@ -457,6 +464,24 @@ void main() {
 
             if (u_is_cloud_pass) {
                 cloud_frag_alpha = cloud_tex.a;
+                
+                // Simulate atmosphere between camera and cloud by fading cloud alpha
+                // based on the view angle (more atmosphere = lower alpha, revealing the scattered sky behind it).
+                if (f_my_atmo_h > 0.0) {
+                    vec3 V = normalize(-(cam_to_center + P_rel));
+                    float NdotV = abs(dot(normalize(v_normal), V));
+                    float R_km = max(f_radius * u_au_to_km, 1e-6);
+                    float H_scale = max(f_my_atmo_h / 12.0, 1e-3);
+                    float am_view = (sqrt(R_km*R_km*NdotV*NdotV + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*NdotV) / H_scale;
+                    
+                    vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
+                    vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
+                    vec3 tau_view = tau_vertical * am_view;
+                    float view_transmittance = exp(-(tau_view.x + tau_view.y + tau_view.z) / 3.0);
+                    
+                    cloud_frag_alpha *= clamp(view_transmittance, 0.0, 1.0);
+                }
+
                 if (cloud_frag_alpha < 0.005) discard;
 
                 local_f_color = max(cloud_tex.rgb, vec3(0.95));
@@ -489,6 +514,10 @@ void main() {
 
                 sampler2D s_specular = sampler2D(bt.specular);
                 spec_intensity = textureGrad(s_specular, uv, dx, dy).r;
+
+                // Boost dark ocean albedo using specular map as a mask
+                vec3 ocean_base = vec3(0.003, 0.015, 0.06); // Deep blue linear albedo
+                local_f_color = mix(local_f_color, max(local_f_color, ocean_base), spec_intensity);
             }
         } else {
             if (u_is_cloud_pass) discard;
@@ -524,7 +553,14 @@ void main() {
 
             // Lambert cosine law with soft terminator
             float NdotL = dot(N, L);
-            float diffuse = clamp((NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+            float effective_NdotL = NdotL;
+            if (u_is_cloud_pass) {
+                float cloud_h_km = min(20.0, max(6.0, f_my_atmo_h * 0.12));
+                float R_km = max(f_radius * u_au_to_km, 1e-6);
+                float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
+                effective_NdotL += term_offset;
+            }
+            float diffuse = clamp((effective_NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
 
             vec3 incoming_light_tint = vec3(1.0);
             if (f_my_atmo_h > 0.0) {
@@ -850,8 +886,12 @@ void main() {
 
         if (f_subpixel_factor > 0.0) {
             float dist_px = length(gl_FragCoord.xy - f_center_px);
-            float sigma = 0.5;
-            float kernel = (1.0 / (2.0 * PI * sigma * sigma)) * exp(-0.5 * (dist_px * dist_px) / (sigma * sigma));
+            
+            // Realistic optical point spread function (Airy disk envelope + scattering)
+            float a = 0.25;
+            float r_over_a = dist_px / a;
+            float kernel = 2.546479 / pow(1.0 + r_over_a * r_over_a, 1.5);
+            
             float area_scale = PI * f_clamped_min_px * f_clamped_min_px;
             vec3 analytical_planet_color = local_f_color * analytical_diffuse_color * (kernel * area_scale);
             final_color = mix(final_color, analytical_planet_color, f_subpixel_factor);

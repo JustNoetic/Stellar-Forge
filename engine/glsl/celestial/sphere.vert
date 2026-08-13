@@ -138,7 +138,12 @@ void main() {
     if (apparent_px < clamped_min_px) {
         final_radius = (clamped_min_px * dist) / (screen_height * fov_factor);
         float ratio = apparent_px / clamped_min_px;
-        brightness_scale = ratio * ratio;
+        
+        // Physically correct area scaling is ratio^2.
+        // However, to compensate for the limited dynamic range of a monitor and 
+        // to ensure the peak brightness crosses the bloom threshold, we use a softer 
+        // exponent. This acts as a perceptual boost for point sources like Venus.
+        brightness_scale = pow(ratio, 1.25);
     }
     f_final_radius = final_radius;
     f_brightness_scale = brightness_scale;
