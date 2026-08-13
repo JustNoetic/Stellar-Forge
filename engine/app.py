@@ -247,11 +247,22 @@ def _camera_pivot_apply(cam, dx, dy, sensitivity):
     else:
         h_axis = up
 
-    R = _camera_rot_axis(h_axis, math.radians(-dx * sensitivity)) @ _camera_rot_axis(right, math.radians(-dy * sensitivity))
+    R_vert = _camera_rot_axis(right, math.radians(-dy * sensitivity))
+    fwd_test = R_vert @ fwd
+    fwd_test = fwd_test / max(np.linalg.norm(fwd_test), 1e-300)
+    
+    if cam.get("horizon_align", True) and cam.get("is_near_surface", False):
+        dot = np.dot(fwd_test, h_axis)
+        if abs(dot) > 0.999:
+            old_dot = np.dot(fwd, h_axis)
+            if abs(dot) > abs(old_dot):
+                R_vert = np.eye(3, dtype='f8')
+                
+    R = _camera_rot_axis(h_axis, math.radians(-dx * sensitivity)) @ R_vert
     fwd_new = R @ fwd
-    fwd_new = fwd_new / np.linalg.norm(fwd_new)
+    fwd_new = fwd_new / max(np.linalg.norm(fwd_new), 1e-300)
     up_new = R @ up
-    up_new = up_new / np.linalg.norm(up_new)
+    up_new = up_new / max(np.linalg.norm(up_new), 1e-300)
 
     yaw_new, pitch_new = _camera_yaw_pitch_from(fwd_new)
     cam["yaw"] = cam["yaw_actual"] = yaw_new
@@ -652,9 +663,9 @@ class App(InputHandlerMixin):
                 self.camera["fov"] *= (1.0 / (0.85 ** abs(yoffset)))
             self.camera["fov"] = max(0.001, min(120.0, self.camera["fov"]))
         else:
-            # Scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
+            # Scroll wheel changes flight velocity (Space Engine style, ~1.15x per notch).
             speed = self.camera.get("flight_speed", 0.1)
-            speed *= (2.0 ** yoffset)
+            speed *= (1.15 ** yoffset)
             self.camera["flight_speed"] = max(1e-12, min(5.0, speed))
     
     def mouse_button_callback(self, window, button, action, mods):
@@ -692,7 +703,7 @@ class App(InputHandlerMixin):
             # LMB+RMB: radial approach / recede toward the tracked body's surface.
             # Drag down (dy > 0) = move closer; drag up = pull back. Applied per-frame
             # as an exponential scale so the gesture feels uniform at any distance.
-            self.camera["approach_delta"] += dy * 0.0125
+            self.camera["approach_delta"] += dy * 0.002
         elif self.camera["left_dragging"]:
             # LMB: trackball pivot in place (free look), direct (no smoothing).
             # Rotates about the camera's own screen axes so the view always
@@ -3055,6 +3066,8 @@ class App(InputHandlerMixin):
                         rel = rel / r_s * r_floor
                     else:
                         rel = track_pole * r_floor
+                    # Cap flight speed to 100 m/s when hitting the ground
+                    cam["flight_speed"] = 100.0 / 149597870700.0
 
             cam["cam_pos_rel"] = rel
             cam["cam_pos_rel_prev"] = rel.copy()
