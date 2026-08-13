@@ -1824,7 +1824,7 @@ class App(InputHandlerMixin):
         orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
         atmo_quality = min(self.camera.get("atmo_quality", 1), 2)
         now_dt = datetime.datetime.now()
-        jump_date = [now_dt.year, now_dt.month, now_dt.day, now_dt.hour, now_dt.minute]
+        jump_date = [now_dt.year, now_dt.month, now_dt.day, now_dt.hour, now_dt.minute, now_dt.second]
         scrub_index = [0]
     
         last_orbit_pos_snap = None
@@ -2807,7 +2807,7 @@ class App(InputHandlerMixin):
     
             spice_valid_mask = np.ones(num_bodies, dtype=bool)
     
-            cur_y, cur_m, cur_d, cur_h, cur_mn = format_sim_time(display_t)
+            cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz = format_sim_time(display_t)
     
             if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
                 epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
@@ -2825,9 +2825,9 @@ class App(InputHandlerMixin):
             if not imgui.get_io().want_capture_keyboard:
                 d_roll = 0.0
                 if glfw.get_key(window, glfw.KEY_Q) == glfw.PRESS:
-                    d_roll += 60.0 * dt_render
-                if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
                     d_roll -= 60.0 * dt_render
+                if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
+                    d_roll += 60.0 * dt_render
                 if d_roll != 0.0:
                     fwd_v = -rel / max(np.linalg.norm(rel), 1e-300) if cam["cam_look"] == "aim" else _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
                     cur_up = _camera_get_up(cam, fwd_v)
@@ -3305,10 +3305,8 @@ class App(InputHandlerMixin):
                                 best_is_cmp = True
                                 
                 if best_idx != -1:
-                    self.camera["tracking_idx"] = best_idx
-                    self.camera["tracking_is_cmp"] = best_is_cmp
-                    # auto-aim at the newly selected body (legacy pick behavior)
-                    self.camera["cam_look"] = "aim"
+                    self.camera["inspected_idx"] = best_idx
+                    self.camera["inspected_is_cmp"] = best_is_cmp
 
     
             if not hasattr(self, '_all_instances_cache') or self._all_instances_cache.shape[0] != total_render_bodies:
@@ -3717,6 +3715,7 @@ class App(InputHandlerMixin):
                     scale_height_km = float(props.get('scale_height_km', 8.5))
                     caster_atmos_buf[i_c, 0:3] = trans
                     caster_atmos_buf[i_c, 3] = thick_km
+                    caster_colors_buf[i_c, 3] = scale_height_km
                     caster_max_bend_buf[i_c] = compute_max_bend(
                         body_radii[b_idx], scale_height_km,
                         float(props.get('refractivity', 0.00029)))
@@ -4784,7 +4783,7 @@ class App(InputHandlerMixin):
             imgui.separator()
             
             imgui.text("Current Date:")
-            imgui.text(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d} UTC")
+            imgui.text(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}")
             
             imgui.separator()
             imgui.text_colored("Camera", 0.6, 0.9, 1.0)
@@ -4881,6 +4880,8 @@ class App(InputHandlerMixin):
                     self.time_ctrl["sync_idx"] = scrub_index[0]
                     self.time_ctrl["paused"] = False
                     self.time_ctrl["timeline_playing"] = False
+                    with self.shared_state["lock"]:
+                        self.shared_state["timeline_active"] = False
                 imgui.same_line()
                 if imgui.button("Cancel"):
                     with self.shared_state["lock"]:
@@ -4894,28 +4895,34 @@ class App(InputHandlerMixin):
                 _, jump_date[1] = imgui.input_int("Month", jump_date[1])
                 _, jump_date[2] = imgui.input_int("Day", jump_date[2])
                 
-                imgui.text("Time (HH:MM)")
+                imgui.text("Time (HH:MM:SS)")
                 imgui.push_item_width(40)
                 _, jump_date[3] = imgui.input_int("##Hour", jump_date[3], step=0)
                 imgui.same_line()
                 imgui.text(":")
                 imgui.same_line()
                 _, jump_date[4] = imgui.input_int("##Minute", jump_date[4], step=0)
+                imgui.same_line()
+                imgui.text(":")
+                imgui.same_line()
+                _, jump_date[5] = imgui.input_int("##Second", jump_date[5], step=0)
                 imgui.pop_item_width()
                 
                 jump_date[1] = max(1, min(12, jump_date[1]))
                 jump_date[2] = max(1, min(31, jump_date[2]))
                 jump_date[3] = max(0, min(23, jump_date[3]))
                 jump_date[4] = max(0, min(59, jump_date[4]))
+                jump_date[5] = max(0, min(59, jump_date[5]))
                 
                 if ephemeris_mode_active or keplerian_mode_active:
                     if imgui.button("Jump to Date"):
-                        target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4])
+                        target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4], jump_date[5])
                         self.time_ctrl["sync_t"] = target_t
                 else:
                     if imgui.button("Render Timeline"):
-                        target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4])
+                        target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4], jump_date[5])
                         self.time_ctrl["target_t"] = target_t
+                        self.time_ctrl["cancel_render"] = False
                         self.time_ctrl["render_timeline"] = True
             
             imgui.separator()
@@ -6482,6 +6489,10 @@ class App(InputHandlerMixin):
                     
                     if is_tracking_body:
                         imgui.text_colored("Tracking Body", 0.3, 1.0, 0.3)
+                        if self.camera.get("cam_look", "aim") == "free":
+                            imgui.same_line()
+                            if imgui.button("Center on Screen"):
+                                self.camera["cam_look"] = "aim"
                     elif imgui.button("Track Body"):
                         # Preserve the camera's world position while re-basing it on the new body
                         if self.camera["tracking_idx"] is not None:
@@ -6514,11 +6525,26 @@ class App(InputHandlerMixin):
                             if rn > 1e-300 and rn < r_new + 1e-10:
                                 rel_new = rel_new / rn * (r_new + 1e-10)
                                 self.camera["cam_pos_rel"] = rel_new
+                                
+                    if not is_tracking_body:
+                        imgui.same_line()
+                    if imgui.button("Go To Body"):
+                        self.camera["tracking_idx"] = insp_idx
+                        self.camera["tracking_is_cmp"] = insp_is_cmp
+                        self.camera["tracking_mode"] = "body"
+                        self.camera["cam_look"] = "aim"
+                        r_new = float(cur_visual_arr[insp_idx, 3])
+                        dist = max(3.0 * r_new, 1e-5)
+                        self.camera["cam_pos_rel"] = np.array([0.0, 0.0, dist], dtype='f8')
                     
                     imgui.same_line()
                     
                     if is_tracking_bary:
                         imgui.text_colored("Tracking Barycenter", 0.3, 1.0, 0.3)
+                        if self.camera.get("cam_look", "aim") == "free":
+                            imgui.same_line()
+                            if imgui.button("Center on Screen"):
+                                self.camera["cam_look"] = "aim"
                     elif imgui.button("Track Barycenter"):
                         if self.camera["tracking_idx"] is not None:
                             old_track_is_cmp = self.camera.get("tracking_is_cmp", False)

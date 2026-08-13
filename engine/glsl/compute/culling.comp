@@ -58,7 +58,7 @@ void main() {
     bool visible = true;
     for (int p = 0; p < 6; p++) {
         float dist = dot(pos, u_frustum_planes[p].xyz) + u_frustum_planes[p].w;
-        if (dist < -r) {
+        if (dist < -r * 1.05) {
             visible = false;
             break;
         }

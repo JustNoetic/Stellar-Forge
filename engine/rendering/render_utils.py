@@ -125,6 +125,18 @@ def format_distance_au(dist_au, threshold_au=None, precision=5, show_unit=True):
         unit_str = " AU" if show_unit else ""
         return f"{dist_au:.{precision}f}{unit_str}"
 
+def _get_local_time(dt_utc):
+    try:
+        dt_loc = dt_utc.astimezone()
+        return dt_loc.year, dt_loc.month, dt_loc.day, dt_loc.hour, dt_loc.minute, dt_loc.second, dt_loc.tzname()
+    except (OSError, ValueError, OverflowError):
+        # astimezone() fails on some systems (e.g. 32-bit Windows) for years > 2038.
+        # Fallback to using a fixed local timezone offset from a safe date
+        tz_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+        dt_loc = dt_utc + tz_dt.utcoffset()
+        return dt_loc.year, dt_loc.month, dt_loc.day, dt_loc.hour, dt_loc.minute, dt_loc.second, tz_dt.tzname()
+
+
 def format_sim_time(t_years):
     # Try spiceypy first if ephemeris mode is active
     try:
@@ -136,7 +148,7 @@ def format_sim_time(t_years):
             et = et_epoch + t_years * 365.25 * 86400.0
             utc_str = spice.et2utc(et, 'C', 0)
             dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
-            return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute
+            return _get_local_time(dt_utc)
     except:
         pass
 
@@ -144,7 +156,7 @@ def format_sim_time(t_years):
     delta_seconds = t_years * 365.25 * 86400
     try:
         dt_utc = epoch + datetime.timedelta(seconds=delta_seconds)
-        return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute
+        return _get_local_time(dt_utc)
     except (OverflowError, OSError, ValueError):
         # Fallback to simple math for extreme years beyond 9999
         total_days = t_years * 365.25
@@ -174,13 +186,19 @@ def format_sim_time(t_years):
         if m > 12: m, d = 12, 31
         h = int(rem_hours)
         mn = int((rem_hours - h) * 60)
-        return y, m, d, h, mn
+        s = int((rem_hours - h - mn / 60.0) * 3600)
+        return y, m, d, h, mn, s, "UTC"
 
-def sim_time_from_date(y, m, d, h=0, mn=0):
+def sim_time_from_date(y, m, d, h=0, mn=0, s=0):
     if 1 <= y <= 9999:
         try:
             epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-            dt_utc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), 0, tzinfo=datetime.timezone.utc)
+            try:
+                dt_loc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s))
+                dt_utc = dt_loc.astimezone(datetime.timezone.utc)
+            except (OSError, ValueError, OverflowError):
+                tz_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+                dt_utc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s), tzinfo=datetime.timezone.utc) - tz_dt.utcoffset()
             delta = dt_utc - epoch
             return delta.total_seconds() / (365.25 * 86400)
         except ValueError:
@@ -195,7 +213,7 @@ def sim_time_from_date(y, m, d, h=0, mn=0):
         if i == 2 and y % 4 == 0 and (y % 100 != 0 or y % 400 == 0):
             days_ytd += 1
             
-    total_days = dy * 365.25 + days_ytd + (h - 12) / 24.0 + mn / 1440.0
+    total_days = dy * 365.25 + days_ytd + (h - 12) / 24.0 + mn / 1440.0 + s / 86400.0
     return total_days / 365.25
 
 @njit(cache=True)

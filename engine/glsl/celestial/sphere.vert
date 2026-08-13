@@ -60,6 +60,7 @@ flat out float f_oblateness;
 flat out float f_bounding_radius;
 flat out vec3 f_my_atmo_tint;
 flat out float f_my_atmo_h;
+flat out float f_my_scale_height;
 
 vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
     if (abs(angle) < 1e-7) return v;
@@ -90,18 +91,21 @@ void main() {
 
     vec3 my_atmo_tint = vec3(0.0);
     float my_atmo_h = 0.0;
+    float my_scale_height = 8.5;
     for (int j = 0; j < u_num_casters; j++) {
         if (distance(u_casters[j].xyz, in_offset) < 1e-4) {
             my_atmo_tint = u_caster_atmos[j].xyz;
             my_atmo_h = u_caster_atmos[j].w;
+            my_scale_height = u_caster_colors[j].w;
             break;
         }
     }
     f_my_atmo_tint = my_atmo_tint;
     f_my_atmo_h = my_atmo_h;
+    f_my_scale_height = my_scale_height;
 
     if (u_is_cloud_pass) {
-        float cloud_h_km = min(20.0, max(6.0, my_atmo_h * 0.12));
+        float cloud_h_km = f_my_scale_height * 1.5;
         float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
         in_radius += cloud_offset_au;
     }

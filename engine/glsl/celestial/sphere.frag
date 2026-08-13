@@ -30,6 +30,7 @@ flat in float f_oblateness;
 flat in float f_bounding_radius;
 flat in vec3 f_my_atmo_tint;
 flat in float f_my_atmo_h;
+flat in float f_my_scale_height;
 
 uniform vec3 u_refract_center;
 uniform float u_refract_radius;
@@ -337,12 +338,22 @@ void main() {
     
     if (h2 <= 0.0) discard;
     float t_hit_local = t_closest - h;  // front face (negative, going back toward camera)
+    bool is_inside = false;
+    vec3 true_cam_local = -cam_to_center;
+    vec3 true_cam_sph = true_cam_local + pole_n * (dot(true_cam_local, pole_n) * (f_scale - 1.0));
+    if (length(true_cam_sph) < f_final_radius) {
+        t_hit_local = t_closest + h;
+        is_inside = true;
+    }
 
     vec3 P_rel = O_local + ray_dir * t_hit_local;  // body-local hit position, precise
     vec3 hit_world_pos = P_rel + f_center_pos;  // for clip_pos + depth only
 
     vec3 P_scaled = P_rel + pole_n * (dot(P_rel, pole_n) * (f_scale * f_scale - 1.0));
     vec3 hit_normal = normalize(P_scaled);
+    if (is_inside && !u_is_cloud_pass) {
+        hit_normal = -hit_normal;
+    }
     vec3 hit_local_pos = P_rel / max(1e-6, f_radius);
 
     // Compute depth: we need the world-space t from camera for depth buffer
@@ -425,27 +436,34 @@ void main() {
         float cloud_frag_alpha = 1.0;
         vec4 cloud_tex = vec4(0.0);
 
+        vec3 tangent = vec3(0.0);
+        vec3 bitangent = vec3(0.0);
+        float rot_sin = 0.0;
+        float rot_cos = 1.0;
+        bool has_clouds = false;
+        sampler2D s_clouds;
+
         if (f_tex_idx > 0.0) {
-            vec3 p = normalize(v_local_pos);
             vec3 ref = vec3(0.0, 1.0, 0.0);
-            if (abs(dot(f_pole, ref)) > 0.999) {
+            if (abs(dot(pole_n, ref)) > 0.999) {
                 ref = vec3(1.0, 0.0, 0.0);
             }
-            vec3 tangent = normalize(cross(f_pole, ref));
-            vec3 bitangent = normalize(cross(f_pole, tangent));
+            tangent = normalize(cross(pole_n, ref));
+            bitangent = normalize(cross(pole_n, tangent));
 
-            vec3 p_local = vec3(dot(p, tangent), dot(p, f_pole), dot(p, bitangent));
+            rot_sin = sin(-f_rotation_angle);
+            rot_cos = cos(-f_rotation_angle);
 
-            float s = sin(-f_rotation_angle);
-            float c = cos(-f_rotation_angle);
+            vec3 p = normalize(v_local_pos);
+            vec3 p_local = vec3(dot(p, tangent), dot(p, pole_n), dot(p, bitangent));
             vec3 p_rot = vec3(
-                p_local.x * c - p_local.z * s,
+                p_local.x * rot_cos - p_local.z * rot_sin,
                 p_local.y,
-                p_local.x * s + p_local.z * c
+                p_local.x * rot_sin + p_local.z * rot_cos
             );
 
-            float u = 0.5 + atan(p_rot.z, p_rot.x) / (2.0 * 3.14159265);
-            float v = 0.5 - asin(clamp(p_rot.y, -1.0, 1.0)) / 3.14159265;
+            float u = 0.5 + atan(p_rot.z, p_rot.x) / (2.0 * PI);
+            float v = 0.5 - asin(clamp(p_rot.y, -1.0, 1.0)) / PI;
 
             vec2 uv = vec2(u, v);
             vec2 dx = dFdx(uv);
@@ -459,8 +477,11 @@ void main() {
 
             uint b_tex_slot = uint(f_tex_idx - 1.0);
             BodyTextures bt = u_body_textures[b_tex_slot];
-            sampler2D s_clouds = sampler2D(bt.clouds);
-            cloud_tex = textureGrad(s_clouds, uv, dx, dy);
+            if ((bt.clouds.x | bt.clouds.y) != 0u) {
+                has_clouds = true;
+                s_clouds = sampler2D(bt.clouds);
+                cloud_tex = textureGrad(s_clouds, uv, dx, dy);
+            }
 
             if (u_is_cloud_pass) {
                 cloud_frag_alpha = cloud_tex.a;
@@ -471,15 +492,14 @@ void main() {
                     vec3 V = normalize(-(cam_to_center + P_rel));
                     float NdotV = abs(dot(normalize(v_normal), V));
                     float R_km = max(f_radius * u_au_to_km, 1e-6);
-                    float H_scale = max(f_my_atmo_h / 12.0, 1e-3);
+                    float H_scale = max(f_my_scale_height, 1e-3);
                     float am_view = (sqrt(R_km*R_km*NdotV*NdotV + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*NdotV) / H_scale;
                     
                     vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
                     vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
                     vec3 tau_view = tau_vertical * am_view;
-                    float view_transmittance = exp(-(tau_view.x + tau_view.y + tau_view.z) / 3.0);
-                    
-                    cloud_frag_alpha *= clamp(view_transmittance, 0.0, 1.0);
+                    float fade = exp(-min(tau_view.r, min(tau_view.g, tau_view.b)));
+                    cloud_frag_alpha *= mix(0.1, 1.0, fade); // Limit fade to 10% so clouds don't disappear completely
                 }
 
                 if (cloud_frag_alpha < 0.005) discard;
@@ -555,7 +575,7 @@ void main() {
             float NdotL = dot(N, L);
             float effective_NdotL = NdotL;
             if (u_is_cloud_pass) {
-                float cloud_h_km = min(20.0, max(6.0, f_my_atmo_h * 0.12));
+                float cloud_h_km = f_my_scale_height * 1.5;
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
                 effective_NdotL += term_offset;
@@ -565,8 +585,7 @@ void main() {
             vec3 incoming_light_tint = vec3(1.0);
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
-                float H_atmo = f_my_atmo_h;
-                float H_scale = max(H_atmo / 12.0, 1e-3);
+                float H_scale = max(f_my_scale_height, 1e-3);
                 float mu = max(NdotL, 0.0);
                 
                 // Geometric relative air mass
@@ -579,14 +598,53 @@ void main() {
                 // Convert to vertical optical depth using the ratio of path lengths ( H_scale / sqrt(2*PI*R*H_scale) )
                 vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
                 
-                // Final transmittance to the ground
+                if (u_is_cloud_pass) {
+                    float cloud_h_km = f_my_scale_height * 1.5;
+                    tau_vertical *= exp(-cloud_h_km / H_scale);
+                }
+                
+                // Final transmittance to the ground (or cloud)
                 vec3 tau = tau_vertical * am;
                 incoming_light_tint = exp(-tau);
             }
 
-            if (!u_is_cloud_pass && f_tex_idx > 0.0) {
-                // float shadow_factor = 1.0 - cloud_tex.a * 0.85;
-                // incoming_light_tint *= shadow_factor;
+            // === Ray-Traced Cloud Shadows on Surface ===
+            if (!u_is_cloud_pass && f_tex_idx > 0.0 && has_clouds && f_my_scale_height > 0.0) {
+                float cloud_h_km = f_my_scale_height * 1.5;
+                float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
+                float eff_r = max(f_radius, f_final_radius);
+                float R_cloud = eff_r + cloud_offset_au;
+
+                vec3 O_sph_c = P_rel + pole_n * (dot(P_rel, pole_n) * (f_scale - 1.0));
+                vec3 D_sph_c = L + pole_n * (dot(L, pole_n) * (f_scale - 1.0));
+
+                float a_c = dot(D_sph_c, D_sph_c);
+                float b_c = dot(O_sph_c, D_sph_c);
+                float c_c = dot(O_sph_c, O_sph_c) - R_cloud * R_cloud;
+                float disc_c = b_c * b_c - a_c * c_c;
+
+                if (disc_c > 0.0) {
+                    float t_cloud = (-b_c + sqrt(disc_c)) / max(a_c, 1e-12);
+                    if (t_cloud > 0.0) {
+                        vec3 hit_cloud_sph = O_sph_c + t_cloud * D_sph_c;
+                        vec3 hit_cloud_local = hit_cloud_sph - pole_n * (dot(hit_cloud_sph, pole_n) * (1.0 - 1.0 / f_scale));
+                        vec3 p_c = normalize(hit_cloud_local);
+
+                        vec3 p_local_c = vec3(dot(p_c, tangent), dot(p_c, pole_n), dot(p_c, bitangent));
+                        vec3 p_rot_c = vec3(
+                            p_local_c.x * rot_cos - p_local_c.z * rot_sin,
+                            p_local_c.y,
+                            p_local_c.x * rot_sin + p_local_c.z * rot_cos
+                        );
+
+                        float u_c = 0.5 + atan(p_rot_c.z, p_rot_c.x) / (2.0 * PI);
+                        float v_c = 0.5 - asin(clamp(p_rot_c.y, -1.0, 1.0)) / PI;
+
+                        vec4 cloud_shadow_sample = textureLod(s_clouds, vec2(u_c, v_c), 0.0);
+                        float shadow_factor = 1.0 - cloud_shadow_sample.a * 0.85;
+                        incoming_light_tint *= shadow_factor;
+                    }
+                }
             }
 
             // Blinn-Phong specular highlight

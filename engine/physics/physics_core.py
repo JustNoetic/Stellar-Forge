@@ -1538,7 +1538,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         shared_state["timeline_rate"] = rate
                 valid_steps = step + 1
             
-            if valid_steps > 0:
+            if valid_steps > 0 and not time_ctrl.get("cancel_render", False):
                 local_pos = np.empty((num_bodies, 3), dtype=np.float64)
                 local_vel = np.empty((num_bodies, 3), dtype=np.float64)
                 _extract_render_state(sim_start_copy, num_bodies, local_pos, local_vel)
@@ -1558,6 +1558,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     shared_state["timeline_active"] = False
             
             time_ctrl["render_timeline"] = False
+            time_ctrl["cancel_render"] = False
             time_ctrl["cancel_render"] = False
             time_ctrl["paused"] = True
             continue
