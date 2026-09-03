@@ -53,6 +53,12 @@ layout(std430, binding = 8) buffer AtmoData {
     float u_ozone_width_km;
     float u_planet_clip_km;
     float u_max_adaptive_steps;
+    vec4  u_precomp_opt;         // x: inv_h_rayleigh, y: inv_h_mie, z: inv_ozone_width, w: max_bend
+    vec4  u_precomp_mie;         // x: c1, y: c2, z: c3, w: unused
+    vec4  u_star_color_irrad[4]; // rgb = star_color * irradiance * atmo_sun_intensity, w = sin_star
+    vec4  u_star_dir_sph_eff[4]; // xyz = sun_dir_sph_const, w = cos_sun_eff
+    vec4  u_star_pos_local[4];   // xyz = sun_pos_local_km, w = effective_star_rad
+    vec4  u_star_solstice[4];    // x = solstice_factor, y = sun_pole_dot, z = dist_star_au, w = star_radius_au
 };
 
 uniform float u_refract_max_bend;

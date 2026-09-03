@@ -1767,9 +1767,9 @@ class App(InputHandlerMixin):
         u_atmo_ring_coplanar_mask = prog_atmo.get('u_ring_coplanar_mask', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
 
-        self.atmo_ssbo = ctx.buffer(reserve=608)
+        self.atmo_ssbo = ctx.buffer(reserve=896)
         self.atmo_ssbo.bind_to_storage_buffer(binding=8)
-        self.atmo_staging = np.zeros(152, dtype=np.float32)
+        self.atmo_staging = np.zeros(224, dtype=np.float32)
         self.atmo_staging_int_view = self.atmo_staging.view(np.int32)
 
 
@@ -3918,7 +3918,14 @@ class App(InputHandlerMixin):
                     prog['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
                 if 'u_ringshine_band_count' in prog:
                     prog['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 10))
-                    
+
+            inv_proj_bytes = np.linalg.inv(projection).astype('f4').tobytes()
+            inv_view_bytes = np.linalg.inv(view).astype('f4').tobytes()
+            for prog in (prog_atmo, prog_atmo_lowres):
+                if 'u_inv_proj' in prog:
+                    prog['u_inv_proj'].write(inv_proj_bytes)
+                if 'u_inv_view' in prog:
+                    prog['u_inv_view'].write(inv_view_bytes)
             # --- Prepare and sort atmosphere bodies ---
             sorted_atmos = []
             if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
@@ -4282,6 +4289,37 @@ class App(InputHandlerMixin):
                             if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
                                 active_indices.append(child_bi)
                                 
+                    # CPU-side geometric eclipse culling: only keep casters that can geometrically cast an eclipse on this atmosphere
+                    if active_indices:
+                        pos_star = cmp_pos_rel[self.star_idx_cmp] if is_cmp else pos_rel_all[star_idx]
+                        to_star = pos_star - body_pos_rel
+                        dist_s_sq = float(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                        if dist_s_sq > 1e-12:
+                            dist_s = math.sqrt(dist_s_sq)
+                            L_star = to_star / dist_s
+                            star_rad = float(self.body_radii_cmp[self.star_idx_cmp] if is_cmp else body_radii[star_idx])
+                            star_tan = star_rad / max(dist_s, 1e-6)
+                            atmo_rad_au = float(atmo['atmo_radius_au'])
+
+                            filtered_active = []
+                            for idx_u in active_indices:
+                                is_c_cmp = (idx_u >= num_bodies)
+                                c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
+                                pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
+                                rad_c = float(self.body_radii_cmp[c_local_idx] if is_c_cmp else body_radii[c_local_idx])
+
+                                D = pos_c - body_pos_rel
+                                t_proj = float(D[0] * L_star[0] + D[1] * L_star[1] + D[2] * L_star[2])
+                                if t_proj <= 0.0:
+                                    continue # Caster is on the night side of planet
+
+                                d_sq = float(D[0]**2 + D[1]**2 + D[2]**2)
+                                perp_sq = max(0.0, d_sq - t_proj * t_proj)
+                                r_penumbra_max = rad_c * 1.5 + atmo_rad_au + t_proj * star_tan * 1.5
+                                if perp_sq <= r_penumbra_max * r_penumbra_max:
+                                    filtered_active.append(idx_u)
+                            active_indices = filtered_active
+
                     n_active = min(len(active_indices), 8)
                     active_indices = active_indices[:n_active]
                     
@@ -4386,6 +4424,86 @@ class App(InputHandlerMixin):
                         _lod_subdiv = 1
                     self.atmo_staging[150] = float(atmo['planet_radius_km']) * (1.0 - _icosphere_max_sag(_lod_subdiv))
 
+                    # Precomputed optical constants
+                    _inv_h_r = 1.0 / max(1e-3, float(props['scale_height_km']))
+                    _inv_h_m = 1.0 / max(1e-3, float(atmo.get('h_mie', 1.2)))
+                    _inv_oz = 1.0 / max(1e-3, float(props.get('ozone_width_km', 8.0)))
+                    _max_b = float(np.clip(2.0 * max(float(props.get('refractivity', 0.00029)), 0.0) * math.sqrt(math.pi * float(atmo['planet_radius_km']) / max(1e-6, float(props['scale_height_km']) * 2.0)), 0.001, 0.05))
+                    self.atmo_staging[152:156] = [_inv_h_r, _inv_h_m, _inv_oz, _max_b]
+
+                    # Precomputed Henyey-Greenstein Mie phase constants
+                    _g = float(np.clip(float(atmo.get('mie_g', 0.758)), 0.0, 0.88))
+                    _g2 = _g * _g
+                    _c1 = (3.0 / (8.0 * math.pi)) * ((1.0 - _g2) / (2.0 + _g2))
+                    _c2 = 1.0 + _g2
+                    _c3 = 2.0 * _g
+                    self.atmo_staging[156:160] = [_c1, _c2, _c3, 0.0]
+
+                    # Precomputed star parameters (up to 4 stars)
+                    self.atmo_staging[160:224] = 0.0
+                    _b_pole_raw = all_instances[body_idx_in_unified, 9:12]
+                    _b_pole_len = float(np.linalg.norm(_b_pole_raw))
+                    _p_pole_norm = _b_pole_raw / _b_pole_len if _b_pole_len > 1e-4 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                    _n_stars_to_precomp = min(len(stars_pos_radius), 4)
+                    for _s in range(_n_stars_to_precomp):
+                        _s_pos = np.array(stars_pos_radius[_s][0:3], dtype=np.float32)
+                        _s_rad = float(stars_pos_radius[_s][3])
+
+                        _f_to_s = _s_pos - body_pos_rel
+                        _d_star = float(np.linalg.norm(_f_to_s))
+                        _L_star = _f_to_s / _d_star if _d_star > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                        _pole_s = np.array(stars_poles_obl[_s][0:3], dtype=np.float32)
+                        _pole_s_len = float(np.linalg.norm(_pole_s))
+                        _pole_s_dir = _pole_s / _pole_s_len if _pole_s_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        _star_sin_lat = abs(float(np.dot(_L_star, _pole_s_dir)))
+
+                        _eq_col = np.array(stars_colors[_s][0:3], dtype=np.float32)
+                        _eq_lum = float(stars_colors[_s][3])
+                        _pol_col = np.array(stars_pole_colors[_s][0:3], dtype=np.float32)
+                        _pol_lum = float(stars_pole_colors[_s][3])
+
+                        _star_col = _eq_col * (1.0 - _star_sin_lat) + _pol_col * _star_sin_lat
+                        _star_lum = _eq_lum * (1.0 - _star_sin_lat) + _pol_lum * _star_sin_lat
+
+                        _sin_s = _s_rad / max(_d_star, _s_rad + 1e-6)
+                        _eff_s_rad = _sin_s + _max_b
+                        _cos_s_eff = math.sqrt(max(0.0, 1.0 - _eff_s_rad * _eff_s_rad))
+
+                        _irrad = _star_lum / max(_d_star * _d_star, 1e-8)
+                        _comb_int = _star_col * (_irrad * scaled_intensity * math.pi)
+
+                        _sun_pos_loc = _f_to_s * AU_TO_KM
+
+                        # toSphericalSpace of L
+                        _p_proj = float(np.dot(_L_star, _p_pole_norm))
+                        _p_perp = _L_star - _p_proj * _p_pole_norm
+                        _s_dir_sph = _p_perp * f_scale + _p_proj * _p_pole_norm
+                        _s_dir_sph_len = float(np.linalg.norm(_s_dir_sph))
+                        _s_dir_sph = _s_dir_sph / _s_dir_sph_len if _s_dir_sph_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                        _s_pole_dot = float(np.dot(_s_dir_sph, _p_pole_norm))
+                        _cosPhi = abs(_s_pole_dot)
+                        _tanPhi = _cosPhi / math.sqrt(max(1.0 - _cosPhi * _cosPhi, 1e-4))
+                        _solstice_f = float(np.clip(_tanPhi * 1.8, 0.0, 1.0))
+
+                        # Pack into staging buffer
+                        _b_idx = 160 + _s * 4
+                        self.atmo_staging[_b_idx : _b_idx + 3] = _comb_int
+                        self.atmo_staging[_b_idx + 3] = _sin_s
+
+                        _b_idx = 176 + _s * 4
+                        self.atmo_staging[_b_idx : _b_idx + 3] = _s_dir_sph
+                        self.atmo_staging[_b_idx + 3] = _cos_s_eff
+
+                        _b_idx = 192 + _s * 4
+                        self.atmo_staging[_b_idx : _b_idx + 3] = _sun_pos_loc
+                        self.atmo_staging[_b_idx + 3] = _eff_s_rad
+
+                        _b_idx = 208 + _s * 4
+                        self.atmo_staging[_b_idx : _b_idx + 4] = [_solstice_f, _s_pole_dot, _d_star, _s_rad]
+
                     # Single buffer upload per atmosphere body
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
                     
@@ -4398,8 +4516,11 @@ class App(InputHandlerMixin):
                 ctx.depth_func = '<'
                 ctx.disable(moderngl.BLEND)
 
-            def execute_atmosphere_pass(clip_mode):
+            def execute_atmosphere_pass(clip_mode, target_list=None):
                 if not self.camera.get("atmo_enabled", True):
+                    return
+                atmos_to_march = sorted_atmos if target_list is None else target_list
+                if not atmos_to_march:
                     return
                 atmo_res = 1.0 if getattr(self, "_screenshot_capturing", False) else float(self.camera.get("atmo_resolution", 1.0))
                 use_vrs = atmo_res < 0.999 and getattr(self, "atmo_lowres_fbo", None) is not None
@@ -4415,8 +4536,13 @@ class App(InputHandlerMixin):
                     ctx.viewport = (0, 0, self.atmo_lowres_fbo.width, self.atmo_lowres_fbo.height)
                     self.atmo_lowres_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
                     
+                    low_size = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                    if 'u_lowres_size' in prog_atmo_lowres:
+                        prog_atmo_lowres['u_lowres_size'].value = low_size
+                    if 'u_lowres_size' in prog_atmo:
+                        prog_atmo['u_lowres_size'].value = low_size
                     if 'u_screen_res' in prog_atmo_lowres:
-                        prog_atmo_lowres['u_screen_res'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                        prog_atmo_lowres['u_screen_res'].value = low_size
                     if self.depth_texture:
                         self.depth_texture.use(location=9)
                         
@@ -4470,7 +4596,7 @@ class App(InputHandlerMixin):
                     
                     pending_lowres_atmos.clear()
 
-                for sq_dist, atmo, is_cmp in sorted_atmos:
+                for sq_dist, atmo, is_cmp in atmos_to_march:
                     dist_to_body = math.sqrt(sq_dist)
                     apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
                     
@@ -4496,9 +4622,37 @@ class App(InputHandlerMixin):
                         
                 flush_lowres()
 
+            # Partition atmospheres into those requiring ring clipping vs ringless
+            def _body_needs_ring_clip(entry):
+                if n_ring_planes == 0:
+                    return False
+                _sq, _a, _is_c = entry
+                _bi = _a['body_idx']
+                if _is_c:
+                    if any(g.get('body_idx') == _bi for g in getattr(self, 'ring_render_groups_cmp', [])):
+                        return True
+                else:
+                    if _bi in self.body_ring_indices:
+                        return True
+                _b_pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                _a_rad = float(_a['atmo_radius_au'])
+                for _k in range(n_ring_planes):
+                    _c_ring = ring_centers_buf[_k, 0:3]
+                    _d_vec = _b_pos - _c_ring
+                    _d_sq = float(_d_vec[0]**2 + _d_vec[1]**2 + _d_vec[2]**2)
+                    _r_outer = float(ring_params_buf[_k, 1])
+                    _reach = _r_outer + _a_rad * 2.0
+                    if _d_sq < _reach * _reach:
+                        return True
+                return False
+
+            ringed_atmos = [a for a in sorted_atmos if _body_needs_ring_clip(a)]
+            ringless_atmos = [a for a in sorted_atmos if not _body_needs_ring_clip(a)]
+
             # --- Pass 1: Atmosphere behind rings ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
-            execute_atmosphere_pass(1)
+            if ringed_atmos:
+                execute_atmosphere_pass(1, ringed_atmos)
             _perf_gpu_end(_gq)
     
             # --- Render Rings ---
@@ -4725,9 +4879,12 @@ class App(InputHandlerMixin):
                 ctx.disable(moderngl.BLEND)
             _perf_gpu_end(_gq)
     
-            # --- Pass 2: Atmosphere in front of rings ---
+            # --- Pass 2: Atmosphere in front of rings & ringless bodies ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_front")
-            execute_atmosphere_pass(2)
+            if ringed_atmos:
+                execute_atmosphere_pass(2, ringed_atmos)
+            if ringless_atmos:
+                execute_atmosphere_pass(0, ringless_atmos)
             _perf_gpu_end(_gq)
 
             # --- Pass 2.5: Dynamic Cloud Layer Pass (Rendered over atmosphere for physical volumetric ordering) ---
