@@ -278,11 +278,11 @@ spectral classification.
       - `compute_planetshine_numba` → planetshine dirs/colors into instance buffer (~L2819).
       - GPU culling compute dispatch (`prog_culling_compute.run`) (~L2877).
       - Orbit polyline compute + draw (~L2880–3264).
-      - Sphere PBR draw (LOD: lo/hi/ultra via indirect draw cmds) (~L2997–3260).
-      - Eclipse LUT + ring caster uniforms (~L3058–3196).
-      - `render_atmosphere_pass(clip_mode)` (inner def ~L3379) — two-pass (behind/in front of rings).
-      - Rings render (~L3571), Habitable Zones (~L3719), second atmosphere pass (~L3765).
-      - Dynamic Cloud Layer pass (~L4781) — rendered over the atmosphere to prevent Z-fighting and scattering washout.
+      - Sphere PBR draw (LOD: lo/hi/ultra via indirect draw cmds).
+      - Orbit polyline compute + draw.
+      - `render_atmosphere_pass(clip_mode)` — two-pass with dual-source blending (behind/in front of rings).
+      - Rings render, Habitable Zones, second atmosphere pass.
+      - Dynamic Cloud Layer pass (~L4733) — rendered over the atmosphere via radiative transfer blending so the volumetric atmosphere renders behind semi-transparent clouds.
       - ImGui UI: top bar (speed/exposure/graphics modal), system menu popup (~L3795–4030),
         mode switch (IAS15 / Keplerian / Ephemeris) radio (~L4219–4320),
         `_render_ephem_setup_modal()` (~L4097), `_trigger_ephem_switch()` (~L4146, spawns spice

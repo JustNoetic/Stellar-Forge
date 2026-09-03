@@ -1866,7 +1866,7 @@ def load_system_from_data(bodies_data_raw):
             g_m_s2 = (6.67430e-11 * mass_kg) / ((planet_radius_km * 1000.0) ** 2) if planet_radius_km > 0 else 9.81
             props = compute_atmosphere_properties(surface_pressure, temperature, composition, g_m_s2)
             dyn_mie = compute_dynamic_mie_properties(surface_pressure, temperature, composition, g_m_s2)
-            atmo_height_km = props['atmo_height_km']
+            atmo_height_km = float(atmo.get('height', props['atmo_height_km']))
             atmo_radius_km = planet_radius_km + atmo_height_km
             atmo_radius_au = atmo_radius_km / AU_TO_KM
             atmo_bodies.append({
@@ -1874,6 +1874,7 @@ def load_system_from_data(bodies_data_raw):
                 'planet_radius_km': planet_radius_km,
                 'atmo_radius_km': atmo_radius_km,
                 'atmo_radius_au': atmo_radius_au,
+                'height': atmo_height_km,
                 'surface_radius_au': radius_au,
                 'surface_pressure': float(atmo.get('surface_pressure', 1.0)),
                 'temperature': float(atmo.get('temperature', 288.15)),

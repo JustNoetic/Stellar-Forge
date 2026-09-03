@@ -70,22 +70,21 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     return max(0.0, alpha);
 }
 
-vec3 apply_refraction(vec3 world_pos, vec3 cam_pos) {
-    if (u_refract_max_bend <= 1e-6) return world_pos;
+vec3 apply_refraction_eye(vec3 eye_pos, vec3 cam_pos) {
+    if (u_refract_max_bend <= 1e-6) return eye_pos;
     vec3 C_km = (cam_pos - u_refract_center) * u_au_to_km;
-    vec3 P_km = (world_pos - u_refract_center) * u_au_to_km;
-    vec3 true_vec = P_km - C_km;
+    vec3 true_vec = eye_pos * u_au_to_km;
     float d_km = length(true_vec);
-    if (d_km <= 1e-5) return world_pos;
+    if (d_km <= 1e-5) return eye_pos;
     vec3 V = true_vec / d_km;
     float alpha = compute_refraction_angle(C_km, V, d_km);
-    if (alpha <= 1e-7) return world_pos;
+    if (alpha <= 1e-7) return eye_pos;
     vec3 u_dir = C_km - V * dot(C_km, V);
     float u_len = length(u_dir);
-    if (u_len <= 1e-5) return world_pos;
+    if (u_len <= 1e-5) return eye_pos;
     u_dir /= u_len;
     vec3 V_app = V * cos(alpha) + u_dir * sin(alpha);
-    return cam_pos + V_app * (d_km / u_au_to_km);
+    return V_app * (d_km / u_au_to_km);
 }
 
 out vec4 f_color;
@@ -98,10 +97,10 @@ void main() {
     OrbitData od = orbits[gl_InstanceID + u_base_instance];
     vec3 color = vec3(od.d3.xyz);
 
+    dvec3 eye_pos_d = v.xyz - u_cam_pos_double.xyz;
+    vec3 eye_pos = vec3(eye_pos_d);
     vec3 cam_pos = vec3(u_cam_pos_double.xyz);
-    vec3 world_pos = vec3(v.xyz);
-    vec3 app_world_pos = apply_refraction(world_pos, cam_pos);
-    vec3 eye_pos = app_world_pos - cam_pos;
+    vec3 app_eye_pos = apply_refraction_eye(eye_pos, cam_pos);
 
     vec3 final_rgb = color * 0.4;
     float max_c = max(final_rgb.r, max(final_rgb.g, final_rgb.b));
@@ -112,6 +111,6 @@ void main() {
     }
 
     f_color = vec4(final_rgb, float(v.w));
-    gl_Position = projection * view_rot * vec4(eye_pos, 1.0);
+    gl_Position = projection * view_rot * vec4(app_eye_pos, 1.0);
     f_clip_z = gl_Position.w;
 }

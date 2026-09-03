@@ -890,7 +890,8 @@ class App(InputHandlerMixin):
                 img_rgba = img.convert('RGBA')
             else:
                 img_l = img.convert('L')
-                img_rgba = Image.merge('RGBA', (img_l, img_l, img_l, img_l))
+                white = Image.new('L', img_l.size, 255)
+                img_rgba = Image.merge('RGBA', (white, white, white, img_l))
             return img_rgba.resize((2048, 1024), Image.Resampling.LANCZOS)
 
         self.ring_textures_front = {}  # name_lower -> PIL.Image (4096, 1)
@@ -1951,7 +1952,8 @@ class App(InputHandlerMixin):
             radius_km = atmo['planet_radius_km']
             props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
             
-            atmo['atmo_radius_km'] = atmo['planet_radius_km'] + props['atmo_height_km']
+            atmo_h_km = float(atmo.get('height', props['atmo_height_km']))
+            atmo['atmo_radius_km'] = atmo['planet_radius_km'] + atmo_h_km
             atmo['atmo_radius_au'] = atmo['atmo_radius_km'] / 149597870.7
             
             beta_rayleigh = props['beta_rayleigh']
@@ -3523,15 +3525,26 @@ class App(InputHandlerMixin):
                             lod_levels[i] = 1.0
                     
                     t_idx = self.camera.get("tracking_idx")
+                    primary_idx = None
                     if not self.camera.get("tracking_is_cmp", False) and t_idx is not None and t_idx != star_idx and t_idx < num_bodies:
                         primary_idx = t_idx
                         if parent_snap[t_idx] >= 0 and parent_snap[parent_snap[t_idx]] == star_idx:
                             primary_idx = parent_snap[t_idx]
-                        
+                    elif num_bodies > 0:
+                        dists_to_cam = np.linalg.norm(pos_snap_render - cam_origin, axis=1)
+                        nearest_idx = int(np.argmin(dists_to_cam))
+                        if dists_to_cam[nearest_idx] < 0.2:
+                            primary_idx = nearest_idx
+                            if parent_snap[nearest_idx] >= 0 and parent_snap[parent_snap[nearest_idx]] == star_idx:
+                                primary_idx = parent_snap[nearest_idx]
+
+                    if primary_idx is not None:
                         lod_levels[primary_idx] = 0.0
+                        if t_idx is not None and t_idx < num_bodies:
+                            lod_levels[t_idx] = 0.0
                         for i in range(num_bodies):
                             if parent_snap[i] == primary_idx:
-                                lod_levels[i] = 1.0
+                                lod_levels[i] = 0.0
                                 
                     parent_snap_render = parent_snap.copy()
                     if ephemeris_mode_active:
@@ -3574,15 +3587,27 @@ class App(InputHandlerMixin):
                                 lod_levels_cmp[i] = 1.0
                                 
                         t_idx_cmp = self.camera.get("tracking_idx")
+                        primary_idx_cmp = None
                         if self.camera.get("tracking_is_cmp", False) and t_idx_cmp is not None and t_idx_cmp != self.star_idx_cmp and t_idx_cmp < self.num_bodies_cmp:
                             primary_idx_cmp = t_idx_cmp
                             if self.parent_snap_cmp[t_idx_cmp] >= 0 and self.parent_snap_cmp[self.parent_snap_cmp[t_idx_cmp]] == self.star_idx_cmp:
                                 primary_idx_cmp = self.parent_snap_cmp[t_idx_cmp]
-                                
+                        elif self.num_bodies_cmp > 0:
+                            cam_origin_cmp_pre = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                            dists_to_cam_cmp = np.linalg.norm(self.pos_snap_cmp - cam_origin_cmp_pre, axis=1)
+                            nearest_idx_cmp = int(np.argmin(dists_to_cam_cmp))
+                            if dists_to_cam_cmp[nearest_idx_cmp] < 0.2:
+                                primary_idx_cmp = nearest_idx_cmp
+                                if self.parent_snap_cmp[nearest_idx_cmp] >= 0 and self.parent_snap_cmp[self.parent_snap_cmp[nearest_idx_cmp]] == self.star_idx_cmp:
+                                    primary_idx_cmp = self.parent_snap_cmp[nearest_idx_cmp]
+
+                        if primary_idx_cmp is not None:
                             lod_levels_cmp[primary_idx_cmp] = 0.0
+                            if t_idx_cmp is not None and t_idx_cmp < self.num_bodies_cmp:
+                                lod_levels_cmp[t_idx_cmp] = 0.0
                             for i in range(self.num_bodies_cmp):
                                 if self.parent_snap_cmp[i] == primary_idx_cmp:
-                                    lod_levels_cmp[i] = 1.0
+                                    lod_levels_cmp[i] = 0.0
                         
                         cam_origin_cmp = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
                         offset_vec = np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -3719,6 +3744,20 @@ class App(InputHandlerMixin):
                 
             # Build atmosphere lookup dict once per frame to avoid expensive generator allocations inside the loop
             atmo_by_body = {a['body_idx']: a for a in atmo_bodies}
+            
+            # Calibrated Top-Of-Atmosphere appearance colors for planets & moons with atmospheres
+            ATMO_TOA_COLORS = {
+                'titan': (0.85, 0.55, 0.18),    # Dense orange-amber Tholin photochemical smog
+                'venus': (0.96, 0.93, 0.82),    # Thick yellowish-white sulfuric acid cloud tops
+                'earth': (0.35, 0.55, 0.90),    # Rayleigh blue + cloud tops + ocean reflection
+                'mars': (0.55, 0.35, 0.22),     # Airborne dust haze + rusty surface
+                'jupiter': (0.82, 0.74, 0.60),  # Ammonia cloud bands
+                'saturn': (0.84, 0.77, 0.58),   # Pale gold ammonia/methane haze
+                'uranus': (0.55, 0.84, 0.88),   # Pale cyan methane atmosphere
+                'neptune': (0.28, 0.55, 0.95),  # Deep azure methane atmosphere
+                'io': (0.95, 0.85, 0.30),       # Sulfur frost & volcanic haze
+            }
+            
             for i_c in range(n_casters_fixed):
                 b_idx = caster_indices[i_c]
                 atmo = atmo_by_body.get(b_idx)
@@ -3729,6 +3768,14 @@ class App(InputHandlerMixin):
                     caster_atmos_buf[i_c, 0:3] = trans
                     caster_atmos_buf[i_c, 3] = thick_km
                     caster_colors_buf[i_c, 3] = scale_height_km
+                    
+                    # Provide true Top-of-Atmosphere color for subpixel point light appearance
+                    b_name = bodies_data[b_idx].get('name', '').lower() if (bodies_data is not None and b_idx < len(bodies_data)) else ''
+                    if b_name in ATMO_TOA_COLORS:
+                        caster_colors_buf[i_c, 0:3] = ATMO_TOA_COLORS[b_name]
+                    elif b_name in self.texture_mean_colors:
+                        caster_colors_buf[i_c, 0:3] = self.texture_mean_colors[b_name]
+                    
                     caster_max_bend_buf[i_c] = compute_max_bend(
                         body_radii[b_idx], scale_height_km,
                         float(props.get('refractivity', 0.00029)))
@@ -3968,7 +4015,7 @@ class App(InputHandlerMixin):
             ctx.enable(moderngl.DEPTH_TEST)
             ctx.disable(moderngl.CULL_FACE)
             ctx.enable(moderngl.BLEND)
-            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+            ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
             # Pass 1: High/Ultra 3D meshes write opaque depth
             _gq = _perf_gpu_begin(ctx, "gpu_spheres")
@@ -4683,7 +4730,7 @@ class App(InputHandlerMixin):
             execute_atmosphere_pass(2)
             _perf_gpu_end(_gq)
 
-            # --- Pass 2.5: Dynamic Cloud Layer Pass (Moved here to render over the atmosphere) ---
+            # --- Pass 2.5: Dynamic Cloud Layer Pass (Rendered over atmosphere for physical volumetric ordering) ---
             if 'u_is_cloud_pass' in prog_spheres and getattr(self, 'body_textures_ssbo', None) is not None:
                 _gq = _perf_gpu_begin(ctx, "gpu_clouds")
                 ctx.enable(moderngl.BLEND)
@@ -4701,6 +4748,7 @@ class App(InputHandlerMixin):
                 prog_spheres['u_is_cloud_pass'].value = False
                 ctx.depth_mask = True
                 _perf_gpu_end(_gq)
+
 
             def compute_body_albedos(body_info, insp_idx, insp_is_cmp):
                 """Compute Geometric Albedo (A_g), Bond Albedo (A_b), Phase Integral (q), and Top-of-Atmosphere RGB reflectance."""
@@ -6815,9 +6863,10 @@ class App(InputHandlerMixin):
                                 
                                 # Re-evaluate atmosphere properties to get the actual scale height / height
                                 props, _, _ = get_cached_atmosphere_properties(atmo_item, mass_val)
-                                atmo_item['atmo_radius_km'] = R_km + props['atmo_height_km']
+                                atmo_h_km = float(atmo_item.get('height', props['atmo_height_km']))
+                                atmo_item['atmo_radius_km'] = R_km + atmo_h_km
                                 atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 149597870.7
-                                body_info['atmosphere']['height'] = props['atmo_height_km']
+                                body_info['atmosphere']['height'] = atmo_h_km
                                 
                                 current_height = atmo_item['atmo_radius_km'] - R_km
                                 imgui.text(f"Atmosphere Height: {current_height:,.1f} km")

@@ -15,6 +15,7 @@ in float f_brightness_scale;
 in float f_subpixel_factor;
 flat in vec2 f_center_px;
 flat in float f_clamped_min_px;
+flat in float f_apparent_px;
 flat in uvec2 f_caster_mask;
 flat in uint f_ring_mask;
 flat in vec3 f_planetshine_dir;
@@ -31,6 +32,7 @@ flat in float f_bounding_radius;
 flat in vec3 f_my_atmo_tint;
 flat in float f_my_atmo_h;
 flat in float f_my_scale_height;
+flat in vec3 f_my_atmo_color;
 
 uniform vec3 u_refract_center;
 uniform float u_refract_radius;
@@ -411,24 +413,30 @@ void main() {
         if (f_subpixel_factor > 0.0) {
             float dist_px = length(gl_FragCoord.xy - f_center_px);
             
-            // Realistic optical point spread function (Airy disk envelope + scattering)
-            // Falls off as 1/r^3, simulating diffraction and glare better than a Gaussian.
-            // Integral of C / (1 + (r/a)^2)^1.5 is 2 * PI * a^2.
-            // For a = 0.25, C = 1.0 / (2 * PI * 0.0625) = 2.546479
-            float a = 0.25;
+            // Optical point spread function (Airy/Lorentzian diffraction envelope)
+            // Core parameter a = 0.65 px provides anti-aliased subpixel coverage across pixel boundaries.
+            // Peak normalized to 1.0 at center (dist_px = 0) for exact C0 continuity at resolution boundary.
+            float a = 0.65;
             float r_over_a = dist_px / a;
-            float kernel = 2.546479 / pow(1.0 + r_over_a * r_over_a, 1.5);
+            float psf = 1.0 / pow(1.0 + r_over_a * r_over_a, 1.5);
             
-            float area_scale = PI * f_clamped_min_px * f_clamped_min_px;
-            vec3 analytical_star = star_base_color * surface_luminance * (kernel * area_scale);
+            // Smooth edge window to fade to zero at proxy boundary
+            float edge_window = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px);
+            psf *= edge_window;
+            
+            vec3 analytical_star = star_base_color * surface_luminance * (psf * f_brightness_scale);
             final_star_color = mix(final_star_color, analytical_star, f_subpixel_factor);
         }
 
         if (u_hdr_enabled) {
             final_star_color *= u_exposure;
         }
-        float star_alpha = mix(1.0, f_brightness_scale, f_subpixel_factor);
-        out_color = vec4(final_star_color * f_brightness_scale, star_alpha);
+        
+        float dist_px_star = length(gl_FragCoord.xy - f_center_px);
+        float edge_window_star = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px_star);
+        float silhouette_opacity_star = clamp((f_apparent_px * f_apparent_px) / (f_clamped_min_px * f_clamped_min_px), 0.0, 1.0) * edge_window_star;
+        float star_alpha = mix(1.0, silhouette_opacity_star, f_subpixel_factor);
+        out_color = vec4(final_star_color, star_alpha);
     } else {
         vec3 N = normalize(v_normal);
         float spec_intensity = 0.0;
@@ -485,26 +493,12 @@ void main() {
 
             if (u_is_cloud_pass) {
                 cloud_frag_alpha = cloud_tex.a;
-                
-                // Simulate atmosphere between camera and cloud by fading cloud alpha
-                // based on the view angle (more atmosphere = lower alpha, revealing the scattered sky behind it).
-                if (f_my_atmo_h > 0.0) {
-                    vec3 V = normalize(-(cam_to_center + P_rel));
-                    float NdotV = abs(dot(normalize(v_normal), V));
-                    float R_km = max(f_radius * u_au_to_km, 1e-6);
-                    float H_scale = max(f_my_scale_height, 1e-3);
-                    float am_view = (sqrt(R_km*R_km*NdotV*NdotV + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*NdotV) / H_scale;
-                    
-                    vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
-                    vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
-                    vec3 tau_view = tau_vertical * am_view;
-                    float fade = exp(-min(tau_view.r, min(tau_view.g, tau_view.b)));
-                    cloud_frag_alpha *= mix(0.1, 1.0, fade); // Limit fade to 10% so clouds don't disappear completely
-                }
-
                 if (cloud_frag_alpha < 0.005) discard;
 
-                local_f_color = max(cloud_tex.rgb, vec3(0.95));
+                // Cloud albedo: for grayscale cloud maps (where R=G=B=A), render as bright white scatterers;
+                // for colored textures, preserve their custom RGB albedo.
+                bool is_grayscale = abs(cloud_tex.r - cloud_tex.g) < 0.01 && abs(cloud_tex.g - cloud_tex.b) < 0.01;
+                local_f_color = is_grayscale ? vec3(0.95) : cloud_tex.rgb;
                 spec_intensity = 0.0;
                 N = normalize(v_normal);
             } else {
@@ -582,11 +576,18 @@ void main() {
             }
             float diffuse = clamp((effective_NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
 
+            // Forward Mie scattering (silver lining on clouds when backlit by the sun)
+            if (u_is_cloud_pass) {
+                float cos_view_sun = dot(V, L);
+                float silver_lining = pow(max(0.0, cos_view_sun), 5.0) * 0.75;
+                diffuse = diffuse * (1.0 + silver_lining);
+            }
+
             vec3 incoming_light_tint = vec3(1.0);
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
-                float mu = max(NdotL, 0.0);
+                float mu = u_is_cloud_pass ? max(effective_NdotL, 0.0) : max(NdotL, 0.0);
                 
                 // Geometric relative air mass
                 float am = (sqrt(R_km*R_km*mu*mu + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*mu) / H_scale;
@@ -814,7 +815,7 @@ void main() {
                 float phase_angle = acos(phase_cos);
                 float phase_func = (phase_sin + (PI - phase_angle) * phase_cos) / PI;
                 float falloff = star_lum / max(dist_to_star * dist_to_star, 1e-8);
-                analytical_diffuse_color += star_color * incoming_light_tint * falloff * phase_func * shadow;
+                analytical_diffuse_color += star_color * falloff * phase_func * shadow;
             }
         }
 
@@ -945,13 +946,20 @@ void main() {
         if (f_subpixel_factor > 0.0) {
             float dist_px = length(gl_FragCoord.xy - f_center_px);
             
-            // Realistic optical point spread function (Airy disk envelope + scattering)
-            float a = 0.25;
+            // Optical point spread function (Airy/Lorentzian diffraction envelope)
+            // Core parameter a = 0.65 px provides anti-aliased subpixel coverage across pixel boundaries.
+            // Peak normalized to 1.0 at center (dist_px = 0) for exact C0 continuity at resolution boundary.
+            float a = 0.65;
             float r_over_a = dist_px / a;
-            float kernel = 2.546479 / pow(1.0 + r_over_a * r_over_a, 1.5);
+            float psf = 1.0 / pow(1.0 + r_over_a * r_over_a, 1.5);
             
-            float area_scale = PI * f_clamped_min_px * f_clamped_min_px;
-            vec3 analytical_planet_color = local_f_color * analytical_diffuse_color * (kernel * area_scale);
+            // Smooth edge window to fade to zero at proxy boundary
+            float edge_window = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px);
+            psf *= edge_window;
+            
+            // For celestial bodies with atmospheres, use the true Top-Of-Atmosphere reflectance/color
+            vec3 planet_reflectance = (f_my_atmo_h > 0.0) ? f_my_atmo_color : local_f_color;
+            vec3 analytical_planet_color = planet_reflectance * analytical_diffuse_color * (psf * f_brightness_scale);
             final_color = mix(final_color, analytical_planet_color, f_subpixel_factor);
         }
 
@@ -959,13 +967,46 @@ void main() {
             final_color *= u_exposure;
         }
 
-        // Aerial perspective bypassed for cleaner rendering and matching ray marching
-        float trans = 1.0;
-        vec3 ap_rgb = vec3(0.0);
-        float planet_alpha = mix(1.0, f_brightness_scale, f_subpixel_factor);
+        float dist_px_planet = length(gl_FragCoord.xy - f_center_px);
+        float edge_window_planet = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px_planet);
+        float silhouette_opacity_planet = clamp((f_apparent_px * f_apparent_px) / (f_clamped_min_px * f_clamped_min_px), 0.0, 1.0) * edge_window_planet;
+        float planet_alpha = mix(1.0, silhouette_opacity_planet, f_subpixel_factor);
+
         if (u_is_cloud_pass) {
-            planet_alpha *= cloud_frag_alpha;
+            float T_view = 1.0;
+            if (f_my_atmo_h > 0.0) {
+                float R_km = max(f_radius * u_au_to_km, 1e-6);
+                float H_scale = max(f_my_scale_height, 1e-3);
+                float cloud_h_km = f_my_scale_height * 1.5;
+
+                float NdotV = max(dot(N, V), 0.0);
+                float am_view = (sqrt(R_km * R_km * NdotV * NdotV + 2.0 * R_km * H_scale + H_scale * H_scale) - R_km * NdotV) / H_scale;
+
+                // Distance from cloud to camera to scale optical depth when camera is inside atmosphere
+                float d_cam_km = length(cam_to_center + P_rel) * u_au_to_km;
+                float path_fraction = clamp(d_cam_km / max(am_view * H_scale, 1e-3), 0.0, 1.0);
+
+                vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
+                vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
+                vec3 tau_vert_cloud = tau_vertical * exp(-cloud_h_km / H_scale);
+                vec3 tau_view = tau_vert_cloud * am_view * path_fraction;
+
+                vec3 trans_rgb = exp(-tau_view);
+                // Photopic luminance weighting for view transmittance
+                T_view = dot(trans_rgb, vec3(0.2126, 0.7152, 0.0722));
+                
+                // Chromatic spectral extinction on cloud reflection
+                final_color *= trans_rgb / max(1e-4, T_view);
+            }
+
+            // Physical radiative transfer blending over the pre-rendered atmosphere:
+            // alpha_eff = cloud_alpha * T_view
+            // When viewed through thin atmosphere (nadir): T_view ~ 1 -> cloud is visible and reveals the pre-rendered atmosphere behind semi-transparent cloud.
+            // When viewed through thick atmosphere (limb): T_view -> 0 -> cloud reflection extinguishes and seamlessly reveals the dual-source blended atmosphere glow!
+            planet_alpha = cloud_frag_alpha * T_view;
+            if (planet_alpha < 0.002) discard;
         }
-        out_color = vec4(final_color * f_brightness_scale * trans + ap_rgb, planet_alpha);
+
+        out_color = vec4(final_color, planet_alpha);
     }
 }

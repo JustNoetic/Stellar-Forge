@@ -963,6 +963,7 @@ void main() {
 
         // --- HOISTED CONSTANTS ---
         vec3 pole_dir_norm = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
+        vec3 ring_normal_vec = (u_num_ring_planes > 0) ? u_ring_normal[0] : pole_dir_norm;
         float sun_pole_dot = dot(sun_dir_sph_const, pole_dir_norm);
         float cosPhi = abs(sun_pole_dot);
         float tanPhi = cosPhi / sqrt(max(1.0 - cosPhi * cosPhi, 1e-4));
@@ -1007,9 +1008,11 @@ void main() {
 
         vec3 total_rayleigh_ps = vec3(0.0);
         vec3 total_mie_ps = vec3(0.0);
+        vec3 total_ms_ps = vec3(0.0);
 
         vec3 total_rayleigh_rs = vec3(0.0);
         vec3 total_mie_rs = vec3(0.0);
+        vec3 total_ms_rs = vec3(0.0);
 
         float current_s = s_start + jitter * step_size;
         float t_lerp = jitter / float(steps);
@@ -1183,12 +1186,25 @@ void main() {
                 vec3 ps_attenuation = current_transmittance * transmittance_to_ps * vis_fraction_ps;
                 total_rayleigh_ps += rho_R * ps_attenuation * int_factor;
                 total_mie_ps      += rho_M * ps_attenuation * int_factor;
+
+                float ms_u_ps = 0.5 + 0.5 * sign(light_cos_theta_ps) * sqrt(abs(light_cos_theta_ps));
+                vec2 ms_uv_ps = vec2(ms_u_ps, v_norm);
+                vec3 psi_ps = textureLod(u_multi_scatter_lut, ms_uv_ps, 0.0).rgb;
+                total_ms_ps += (beta_R * rho_R + beta_M * rho_M) * psi_ps * ps_attenuation * int_factor;
             }
 
             if (u_ringshine_enabled) {
                 vec3 rs_attenuation = current_transmittance;
                 total_rayleigh_rs += rho_R * rs_attenuation * int_factor;
                 total_mie_rs      += rho_M * rs_attenuation * int_factor;
+
+                vec3 rs_pos_sph = normalize(current_pos_sph);
+                float rs_elev = dot(rs_pos_sph, ring_normal_vec);
+                float ring_cos_zenith = clamp(sqrt(max(0.0, 1.0 - rs_elev * rs_elev)), 0.0, 1.0);
+                float ms_u_rs = 0.5 + 0.5 * sqrt(ring_cos_zenith);
+                vec2 ms_uv_rs = vec2(ms_u_rs, v_norm);
+                vec3 psi_rs = textureLod(u_multi_scatter_lut, ms_uv_rs, 0.0).rgb;
+                total_ms_rs += (beta_R * rho_R + beta_M * rho_M) * psi_rs * rs_attenuation * int_factor;
             }
 
             current_transmittance *= step_transmittance;
@@ -1216,15 +1232,16 @@ void main() {
             total_ms
         );
 
-        if (u_planetshine_enabled && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
+        if (s == 0 && u_planetshine_enabled && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
             float cos_theta_ps = dot(ray_dir, body_planetshine_dir);
             float phase_R_ps = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_ps * cos_theta_ps);
             float phase_M_ps_scalar = (3.0 / (8.0 * PI)) * ((1.0 - g2_val) * (1.0 + cos_theta_ps * cos_theta_ps))
                                       / ((2.0 + g2_val) * pow(max(1e-4, 1.0 + g2_val - 2.0 * g_val * cos_theta_ps), 1.5));
             vec3 phase_M_ps = vec3(phase_M_ps_scalar);
-            scattered += body_planetshine_color * (
+            scattered += body_planetshine_color * atmo_sun_intensity * (
                 phase_R_ps * beta_R * total_rayleigh_ps +
-                phase_M_ps * beta_M * total_mie_ps
+                phase_M_ps * beta_M * total_mie_ps +
+                total_ms_ps
             );
         }
 
@@ -1233,7 +1250,7 @@ void main() {
             vec3 N = normalize(mid_pos);
             vec3 L_dir = L_mid;
 
-            vec3 ring_normal = u_ring_normal[0];
+            vec3 ring_normal = ring_normal_vec;
             float sun_elevation = dot(L_dir, ring_normal);
             float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
             float cos_sun_elev = sqrt(1.0 - sin_sun_elev * sin_sun_elev);
@@ -1280,9 +1297,11 @@ void main() {
             ringshine_irradiance *= (sin_sun_elev * face_multiplier * 0.318309886);
 
             float ambient_phase = 1.0 / (4.0 * PI);
+            float ambient_phase_M = ambient_phase * (1.0 / max(0.15, 1.0 - g_val));
             scattered += star_color * atmo_sun_intensity * irradiance * ringshine_irradiance * (
                 ambient_phase * beta_R * total_rayleigh_rs +
-                ambient_phase * beta_M * total_mie_rs
+                ambient_phase_M * beta_M * total_mie_rs +
+                total_ms_rs
             );
         }
 

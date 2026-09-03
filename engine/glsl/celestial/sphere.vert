@@ -45,6 +45,7 @@ out float f_brightness_scale;
 out float f_subpixel_factor;
 flat out vec2 f_center_px;
 flat out float f_clamped_min_px;
+flat out float f_apparent_px;
 flat out uvec2 f_caster_mask;
 flat out uint f_ring_mask;
 flat out vec3 f_planetshine_dir;
@@ -61,6 +62,7 @@ flat out float f_bounding_radius;
 flat out vec3 f_my_atmo_tint;
 flat out float f_my_atmo_h;
 flat out float f_my_scale_height;
+flat out vec3 f_my_atmo_color;
 
 vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
     if (abs(angle) < 1e-7) return v;
@@ -92,17 +94,20 @@ void main() {
     vec3 my_atmo_tint = vec3(0.0);
     float my_atmo_h = 0.0;
     float my_scale_height = 8.5;
+    vec3 my_atmo_color = in_color;
     for (int j = 0; j < u_num_casters; j++) {
         if (distance(u_casters[j].xyz, in_offset) < 1e-4) {
             my_atmo_tint = u_caster_atmos[j].xyz;
             my_atmo_h = u_caster_atmos[j].w;
             my_scale_height = u_caster_colors[j].w;
+            my_atmo_color = u_caster_colors[j].xyz;
             break;
         }
     }
     f_my_atmo_tint = my_atmo_tint;
     f_my_atmo_h = my_atmo_h;
     f_my_scale_height = my_scale_height;
+    f_my_atmo_color = my_atmo_color;
 
     if (u_is_cloud_pass) {
         float cloud_h_km = f_my_scale_height * 1.5;
@@ -136,22 +141,23 @@ void main() {
     float final_radius = in_radius;
     float brightness_scale = 1.0;
 
-    float clamped_min_px = max(in_min_size, 2.0);
+    float clamped_min_px = max(in_min_size, 2.5);
     f_clamped_min_px = clamped_min_px;
+    f_apparent_px = apparent_px;
 
     if (apparent_px < clamped_min_px) {
         final_radius = (clamped_min_px * dist) / (screen_height * fov_factor);
         float ratio = apparent_px / clamped_min_px;
         
-        // Physically correct area scaling is ratio^2.
-        // However, to compensate for the limited dynamic range of a monitor and 
-        // to ensure the peak brightness crosses the bloom threshold, we use a softer 
-        // exponent. This acts as a perceptual boost for point sources like Venus.
-        brightness_scale = pow(ratio, 1.25);
+        // Perceptual power-law scaling for subpixel point sources (Stevens' power law)
+        // Conserves apparent brightness across large distances on limited dynamic range displays.
+        // Guaranteed C0 continuity: ratio=1.0 yields brightness_scale=1.0 (zero jump at boundary).
+        brightness_scale = pow(ratio, 0.35);
     }
     f_final_radius = final_radius;
     f_brightness_scale = brightness_scale;
-    f_subpixel_factor = smoothstep(2.0, 1.0, apparent_px);
+    // Standard-compliant GLSL smoothstep with edge0 < edge1
+    f_subpixel_factor = 1.0 - smoothstep(1.0, clamped_min_px, apparent_px);
 
     vec3 pole_n = length(in_pole) > 1e-4 ? normalize(in_pole) : vec3(0.0, 1.0, 0.0);
     vec3 mesh_pos = rotate_about_axis(in_position, pole_n, f_rotation_angle);

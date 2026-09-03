@@ -180,8 +180,9 @@ void main() {
         float path_term = 1.0 - exp(-tau_phys * (1.0 / cosViewRayVertical + 1.0 / cosLightRayVertical));
         float mu_ratio = cosLightRayVertical / max(1e-4, cosViewRayVertical + cosLightRayVertical);
         
+        float inv_4pi = 1.0 / (4.0 * 3.14159265358979);
         float dust_to_chunks = clamp((alpha_phys - 0.1) / 0.5, 0.0, 1.0);
-        float ms_sunlit = max(0.0, w0 * mu_ratio * (Hv * H0 - 1.0) * path_term * dust_to_chunks);
+        float ms_sunlit = max(0.0, w0 * mu_ratio * (Hv * H0 - 1.0) * path_term * dust_to_chunks) * inv_4pi;
 
         vec3 band_color_sunlit = ring_texel.rgb * (scatteredLight_sunlit * pf_sunlit + (plane_is_textured ? ms_sunlit : 0.0));
 

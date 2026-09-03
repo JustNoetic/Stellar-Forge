@@ -224,8 +224,9 @@ Utilizes a multi-step precomputation technique inspired by Bruneton et al. combi
 
 ### Dynamic Cloud Rendering
 Planetary clouds are rendered using an independent oblate geometry shell dynamically offset from the surface by the atmosphere's scale height. The engine features:
-- **Automatic Alpha Mapping**: Fully supports PNG transparency. For JPG and non-alpha textures, the engine automatically extracts the grayscale luminance to synthesize a correct alpha channel, mapping pure black to fully transparent and white to fully opaque.
-- **Physically-Correct Z-Ordering**: To ensure realistic volumetric depth, clouds are rendered after the atmosphere passes, allowing the volumetric atmospheric scattering to properly render behind the semi-transparent clouds without washing them out.
+- **Automatic Alpha Mapping**: Fully supports PNG transparency. For JPG and non-alpha textures, the engine automatically extracts the grayscale luminance to synthesize a correct alpha channel, mapping pure black to fully transparent and white to fully opaque with pure white diffuse albedo.
+- **Physically Based Aerial Perspective**: Clouds are integrated with the surrounding atmosphere via view-dependent atmospheric extinction and spectral Rayleigh/Mie in-scattering. Direct cloud reflection dims at oblique angles while upper-atmosphere sky haze rises, naturally veiling clouds at the planetary limb without unphysical transparency fading.
+- **Twilight & Forward Scattering**: Incorporates altitude-dependent sunset delays with atmospheric reddening, forward Mie scattering ("silver lining") when backlit by the host star, and multi-scattered ambient skylight illumination on cloud shadow sides.
 - **Z-Fighting Mitigation**: Face culling is dynamically disabled and handled within the fragment shader (`sphere.frag`) based on the camera's position relative to the bounding sphere, completely eliminating cloud-to-surface Z-fighting.
 
 ### Planetary Rings, Planetshine & Ringshine

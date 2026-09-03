@@ -512,14 +512,16 @@
     "rotation_period": 10.556,
     "W0": 108.5911,
     "atmosphere": {
-      "surface_pressure": 1.0,
+      "surface_pressure": 0.4,
       "temperature": 134.0,
       "composition": {
         "H2": 0.963,
         "He": 0.0325,
         "CH4": 0.0045
       },
-      "height": 621.21
+      "height": 280.0,
+      "beta_mie": 3.5e-6,
+      "h_mie": 15.0
     },
     "ring_texture_inner": 1.144886,
     "ring_texture_outer": 2.266241,

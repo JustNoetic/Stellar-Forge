@@ -231,7 +231,7 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
     # the altitude at which the vertical optical depth drops below epsilon.
     # This scales correctly for both thin (Mars) and thick (Venus) atmospheres
     # without the previous log(pressure*1e6) heuristic.
-    _EPSILON_TAU = 1e-6
+    _EPSILON_TAU = 1e-4
     h_m = max(1.0, scale_height_m)
     # beta_rayleigh is the surface (1/m) coefficient per channel; column OD
     # at the surface is beta*H. Use the largest channel for a conservative cap.
@@ -366,9 +366,9 @@ def compute_dynamic_mie_properties(pressure_atm, temperature_k, composition, gra
         
     # 4. Gas Giant ammonia/methane upper haze regime (H2/He dominated)
     elif (x_h2 + x_he) > 0.70:
-        base_beta = 1.5e-5
-        h_mie = max(10.0, min(0.6 * H_km, 40.0))
-        mie_albedo = np.array([0.99, 0.97, 0.92], dtype=np.float32)
+        base_beta = 5.0e-6
+        h_mie = max(8.0, min(0.35 * H_km, 18.0))
+        mie_albedo = np.array([0.98, 0.95, 0.88], dtype=np.float32)
         mie_g = 0.80
         angstrom = 0.4
         

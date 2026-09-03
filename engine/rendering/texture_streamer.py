@@ -33,7 +33,8 @@ def _prepare_cloud_image(img, target_size=None):
         img_rgba = img.convert('RGBA')
     else:
         img_l = img.convert('L')
-        img_rgba = Image.merge('RGBA', (img_l, img_l, img_l, img_l))
+        white = Image.new('L', img_l.size, 255)
+        img_rgba = Image.merge('RGBA', (white, white, white, img_l))
     if target_size:
         return img_rgba.resize(target_size, Image.Resampling.LANCZOS)
     return img_rgba

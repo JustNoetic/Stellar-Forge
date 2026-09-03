@@ -208,11 +208,14 @@ float AnalyticMultipleScattering(float mu_v, float mu_0, float tau, bool onLitSi
     float path_term = 1.0 - exp(-tau * (1.0 / max(1e-4, mu_v) + 1.0 / max(1e-4, mu_0)));
     float mu_ratio = mu_0 / max(1e-4, mu_v + mu_0);
 
+    // Normalized by 1 / (4 * PI) to match single scattering phase function scale
+    float inv_4pi = 1.0 / (4.0 * 3.14159265358979);
+
     if (onLitSide) {
-        float ms_lit = w0 * mu_ratio * (Hv * H0 - 1.0) * path_term;
+        float ms_lit = w0 * mu_ratio * (Hv * H0 - 1.0) * path_term * inv_4pi;
         return max(0.0, ms_lit);
     } else {
-        float ms_unlit = w0 * mu_ratio * (Hv * H0) * exp(-gamma * tau) * path_term;
+        float ms_unlit = w0 * mu_ratio * (Hv * H0) * exp(-gamma * tau) * path_term * inv_4pi;
         return max(0.0, ms_unlit);
     }
 }
@@ -405,9 +408,7 @@ void main() {
             }
             vec3 r_color_front = tex_val_front.rgb;
             vec3 r_color_back  = tex_val_back.rgb;
-            float fwd_lum = pow(tex_val_back.a, 2.2);
-            float back_lum = max(1e-4, dot(r_color_front, vec3(0.2126, 0.7152, 0.0722)));
-            vec3 r_color_fwd = r_color_front * (fwd_lum / back_lum);
+            vec3 r_color_fwd   = r_color_front;
 
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
 
@@ -542,7 +543,7 @@ void main() {
             // Multiple scattering transmits poorly through macroscopic chunks on the unlit side.
             // Additionally, thin dust rings (low alpha) are highly forward-scattering and do not isotropize light effectively.
             float dust_to_chunks = clamp((f_color.a - 0.1) / 0.5, 0.0, 1.0);
-            ms_s = onLitSide ? AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * dust_to_chunks : 0.0;
+            ms_s = onLitSide ? (AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * dust_to_chunks) : 0.0;
 
             if (onLitSide) {
                 float cos_phase = -cos_theta;
