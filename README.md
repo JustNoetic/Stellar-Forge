@@ -43,12 +43,23 @@ pip install numpy scipy moderngl glfw pyrr imgui numba spiceypy requests PyOpenG
 
 ### 3. Keyboard & Mouse Controls
 
-#### 🖱️ Mouse Navigation
-* **Left Mouse Button (Drag)**: Pivot the camera in place (free look).
+#### 🖱️ Mouse Navigation & Movement Settings
+Stellar-Forge supports two switchable camera control modes, selectable via the **Controls** dropdown in the Control Panel or the **Graphics & Quality Settings** modal:
+
+##### 1. Simple Orbit Mode
+* **Left Mouse Button (Drag)**: Orbit the camera around the tracked celestial body or target pivot (keeps target centered).
+* **Scroll Wheel**: Smoothly zoom in / zoom out relative to the object surface (altitude-aware scaling).
+* **Right Mouse Button (Drag)**: Pivot the camera in place (free look) to inspect the surrounding sky/stars.
 * **Left Mouse Button (Click)**: Select / pick a celestial body in the viewport.
-* **Right Mouse Button (Drag)**: Orbit the camera around the tracked body (keeps distance).
+* **Left + Right Mouse Button (Drag)**: Alternative smooth radial approach / recede gesture.
+* **Shift + Scroll Wheel**: Adjust Field of View (FOV) ($1.0^\circ - 120.0^\circ$).
+
+##### 2. Free Flight Mode (Space Engine Style)
+* **Left Mouse Button (Drag)**: Pivot the camera in place (free look).
+* **Right Mouse Button (Drag)**: Orbit the camera around the tracked body.
+* **Scroll Wheel**: Change flight velocity (~1.15×–2× per notch, capped at 5 AU/s).
+* **Left Mouse Button (Click)**: Select / pick a celestial body in the viewport.
 * **Left + Right Mouse Button (Drag)**: Approach / recede from the tracked body's surface (drag down = move closer, up = pull back).
-* **Scroll Wheel**: Change flight velocity (~2× per notch, capped at 5 AU/s).
 * **Shift + Scroll Wheel**: Adjust Field of View (FOV) ($1.0^\circ - 120.0^\circ$).
 
 #### ⌨️ Keyboard Commands
@@ -58,6 +69,8 @@ pip install numpy scipy moderngl glfw pyrr imgui numba spiceypy requests PyOpenG
 * **Down / Left Arrow**: Halve the simulation speed (minimum $1.0\times$).
 * **R**: Reset simulation time multiplier to $1.0\times$.
 * **Q / E (hold)**: Roll / tilt the camera counter-clockwise / clockwise.
+* **H**: Toggle full UI visibility on/off for cinematic screenshots and views.
+* **F12**: Capture high-resolution screenshot (at selected preset: 4K, 8K, 16K).
 * **Minus (`-`) / Equal (`=`)**: Decrease / increase camera exposure.
 * **Shift + Minus (`-`) / Equal (`=`)**: Double-speed decrease / increase of camera exposure.
 * **Backslash (`\`) + Click "Export"**: Developer shortcut (only valid when active system is `Solar System`) that updates and dumps all bodies' cosmetics directly into the master `data/system.json`. (Standard **Click "Export"** without `\` saves a single body's cosmetic properties to a JSON file under `exports/`, while custom systems save changes directly).

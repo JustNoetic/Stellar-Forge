@@ -20,6 +20,7 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_poles_obl[MAX_CASTERS];
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
+    vec4 u_caster_ozone[MAX_CASTERS];
 };
 
 layout(std430, binding = 8) buffer AtmoData {
@@ -49,6 +50,7 @@ layout(std430, binding = 8) buffer AtmoData {
     float u_active_caster_R_minor[8];
     vec4  u_active_caster_atmos[8];
     float u_active_max_bend[8];
+    vec4  u_active_caster_ozone[8];
     float u_ozone_peak_km;
     float u_ozone_width_km;
     float u_planet_clip_km;

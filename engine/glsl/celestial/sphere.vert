@@ -29,6 +29,7 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_poles_obl[MAX_CASTERS];
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
+    vec4 u_caster_ozone[MAX_CASTERS];
 };
 uniform float screen_height;
 uniform float fov_factor;

@@ -62,12 +62,17 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     od_m = mie_coeffs * 1000.0 * math.sqrt(2.0 * math.pi * r_km_safe * h_m)
 
     z_o3_peak_km = max(1.0, float(props.get('ozone_peak_km', 25.0)))
-    ozone_slant_km = math.sqrt(2.0 * math.pi * r_km_safe * z_o3_peak_km)
+    ozone_w_km = max(0.1, float(props.get('ozone_width_km', 6.0)))
+    ozone_slant_km = math.sqrt(2.0 * math.pi * r_km_safe * ozone_w_km)
     beta_layered = np.nan_to_num(props['beta_abs_layered'], nan=0.0, posinf=0.0, neginf=0.0)
     beta_mixed = np.nan_to_num(props['beta_abs_mixed'], nan=0.0, posinf=0.0, neginf=0.0)
     
     od_o3 = beta_layered * 1000.0 * ozone_slant_km
     od_mixed = beta_mixed * 1000.0 * math.sqrt(2.0 * math.pi * r_km_safe * h_r)
+    
+    props['tau_R0'] = od_r.astype(np.float32)
+    props['tau_O3_peak'] = od_o3.astype(np.float32)
+    
     tau = od_r + od_m + od_o3 + od_mixed
     direct_trans = np.exp(-tau)
     forward_scatter = tau * np.exp(-tau * 0.8) * 0.3

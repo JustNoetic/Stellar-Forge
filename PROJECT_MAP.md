@@ -42,6 +42,14 @@ Stellar-Forge/
 │   │   ├── shader_loader.py    # GLSL shader loader with in-memory caching
 │   │   ├── shaders.py          # Shader re-exports & uniform bindings
 │   │   └── post_shaders.py     # Post-processing shader re-exports (Bloom, HDR)
+│   ├── ui/                     # Modular Dear ImGui Interface ('Orion UI')
+│   │   ├── __init__.py         # Master render_ui orchestrator
+│   │   ├── menu_bar.py         # Top Main Menu Bar (Systems, Physics, View, Render, Tools, Quick HUD)
+│   │   ├── time_hud.py         # Bottom Time Transport HUD & Timeline Scrubber
+│   │   ├── outliner.py         # Left System Outliner hierarchy panel with search filter
+│   │   ├── inspector.py        # Right Tabbed Body Inspector (Physical, Orbit, Atmo, Rings, Cosmetics)
+│   │   ├── modals.py           # Centralized dialogs (Graphics settings, Add Body, Create System, Ephemeris setup)
+│   │   └── viewport_hud.py     # Viewport floating HUD pill & toasts
 │   ├── ephemeris/              # Astronomical data & JPL Horizons/SPICE integration
 │   │   ├── system_manager.py   # System I/O, SystemSnapshot, derive_star_properties
 │   │   └── spice_manager.py    # SpiceManager: kernel download/load, SPICE state queries
@@ -254,9 +262,9 @@ spectral classification.
 - `__init__` (~L488) — camera dict (target, distance, fov, yaw/pitch/roll, exposure, hdr, tracking_idx,
   inspected_idx, add_mode, modals…), loads `graphics_settings.json` via `load_settings()`.
 - `load_settings()` (~L590), `save_settings()` (~L603).
-- **GLFW callbacks:** `scroll_callback` (~L634, zoom/FOV/tracking), `mouse_button_callback` (~L672,
-  pick + drag), `cursor_pos_callback` (~L695, orbit/pan), `char_callback` (~L738),
-  `key_callback` (~L741, speed/exposure/roll/pause), `resize_callback` (~L761).
+- **GLFW callbacks:** `scroll_callback` (~L634, zoom/speed/FOV by movement_mode), `mouse_button_callback` (~L672,
+  pick + drag), `cursor_pos_callback` (~L695, orbit/pivot by movement_mode: Free Flight vs Simple Orbit),
+  `char_callback` (~L738), `key_callback` (~L741, speed/exposure/roll/pause), `resize_callback` (~L761).
 - **`run()`** (~L774) — the whole application lifecycle. Major phases inside:
   1. Perf tracker setup (~L778).
   2. `SystemManager`, `SpiceManager`, load default system, build main + comparison bundles via
@@ -283,20 +291,28 @@ spectral classification.
       - `render_atmosphere_pass(clip_mode)` — two-pass with dual-source blending (behind/in front of rings).
       - Rings render, Habitable Zones, second atmosphere pass.
       - Dynamic Cloud Layer pass (~L4733) — rendered over the atmosphere via radiative transfer blending so the volumetric atmosphere renders behind semi-transparent clouds.
-      - ImGui UI: top bar (speed/exposure/graphics modal), system menu popup (~L3795–4030),
-        mode switch (IAS15 / Keplerian / Ephemeris) radio (~L4219–4320),
-        `_render_ephem_setup_modal()` (~L4097), `_trigger_ephem_switch()` (~L4146, spawns spice
-        download thread + `_on_spice_ready` ~L4157), `_trigger_ephem_exit()` (~L4184).
-        Body Inspector panel (~L4544–5832) — orbital/physical/thermal/atmosphere/stellar tabs,
-        cosmetics, ring editing (`rebuild_ring_render_group`), export.
-        Add-body mode (~L5832), Create System modal (~L5984).
-      - Accumulation resolve (~L6192), post-accum orbits/HZ (~L6243), bloom + composite (~L6330).
+      - Modular Dear ImGui UI ('Orion UI'): delegated to `engine.ui.render_ui(...)`:
+        - Top Menu Bar: Systems, Physics, View, Render, Tools, Quick Actions (screenshot & settings)
+        - System Outliner (Left Panel): hierarchy tree, quick search filter, body add/delete buttons
+        - Body Inspector (Right Panel): tabbed layout (Overview, Orbit, Atmosphere, Rings, Cosmetics)
+        - Time Transport HUD (Bottom Bar): playback transport, speed slider, UTC date/time, Jump in Time popup, timeline scrubber
+        - Centralized Modals: Graphics & Quality settings, Add Body, Create System, Ephemeris setup/download
+        - Viewport HUD: minimal floating camera info pill
+      - Accumulation resolve, post-accum orbits/HZ, bloom + composite.
   11. Teardown: stop physics thread, release GL objects, save settings, GLFW destroy.
 
-**Edit when:** UI, rendering pipeline, camera, input, modal dialogs, system switching,
-inspector, LUT building, instance buffer layout, post-processing.
+**Edit when:** rendering pipeline, camera, input, LUT building, instance buffer layout, post-processing.
 
-### 3.14 `scripts/`
+### 3.14 `engine/ui/` — Modular Dear ImGui Interface ('Orion UI')
+- `__init__.py`: Master `render_ui` orchestrator coordinating all UI passes when `app.ui_visible` is True.
+- `menu_bar.py`: `render_main_menu_bar` — Systems switch/create/delete, Physics modes (IAS15, Keplerian, SPICE), View (Free Flight, Simple Orbit, FOV, UI toggles), Render (MSAA, HDR, Atmosphere, Refraction, Planetshine, Ringshine), Tools (Ephemeris, Comparison, Distance Units, Accumulation), Quick HUD (physics badge, F12 Screenshot button, Settings cog).
+- `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, and Jump in Time popup / timeline playback & scrubbing.
+- `outliner.py`: `render_system_outliner` — Left-anchored hierarchy tree with real-time substring search filter, inline + / - CRUD buttons, and comparison system tree.
+- `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Overview (physical + stellar properties, photometric albedo readouts), Orbit (osculating Keplerian elements, precession rates, Roche limit check, interactive editor), Atmosphere, Rings, and Cosmetics.
+- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings, Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, and SPICE Downloader.
+- `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
+
+### 3.15 `scripts/`
 - `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
 - `accuracy_test.py` — `get_parent_center(body_name, parent_name)`, `main()`. Runs 1-yr forward integration vs JPL Horizons, prints RTN km error table.
 - `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
@@ -442,7 +458,7 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
 | Change planetshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
 | Change ring texture baking | `engine/rendering/texture_baker.py` | `bake_and_export_ring_textures` |
-| Change GLFW input callbacks & settings persistence | `engine/core/input_handler.py` | `InputHandlerMixin` |
+| Change GLFW input callbacks & settings persistence | `engine/core/input_handler.py`, `engine/app.py` | `InputHandlerMixin`, `App` callbacks & movement mode |
 | Change camera, UI, main render loop | `engine/app.py` | `class App`, `run()` |
 | Change eclipse LUT build | `engine/app.py` | `build_eclipse_lut` |
 | Change atmosphere LUT build | `engine/app.py` | `build_atmo_lut` |

@@ -71,6 +71,7 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_poles_obl[MAX_CASTERS];
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
+    vec4 u_caster_ozone[MAX_CASTERS];
 };
 
 // Ring shadow planes (sphere-only)
@@ -157,45 +158,69 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
 // Inputs are per-caster quantities already resolved by the caller.
 vec3 casterShadowTerm(float alpha, float beta, float gamma,
                       float penumbra_outer, float penumbra_inner,
-                      float max_bend, vec3 atmo_tint,
-                      float atmo_h, float dist_to_caster) {
+                      float max_bend, vec4 atmo_param, vec4 ozone_param,
+                      float scale_height_km, float dist_to_caster) {
     float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
     float occ = clamp(max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma), 0.0, 1.0);
     // Correct geometric shadow curve: (1 - occ)^GAMMA (Space Engine gamma correction: 1 / 1.6)
-    vec3 sh = vec3(pow(clamp(1.0 - occ, 0.0, 1.0), 1.0 / 1.6));
+    float geom_sh = pow(clamp(1.0 - occ, 0.0, 1.0), 1.0 / 1.6);
+    vec3 sh = vec3(geom_sh);
 
     if (max_bend > 1e-6 && gamma < penumbra_outer) {
-        // Required bend angle for light to reach inside the planet's geometric shadow
-        float req_bend = beta - gamma;
+        float H_scale = max(scale_height_km, 0.1);
+        float sigma_z = max(0.707 * H_scale, 0.1);
+        float z_peak = ozone_param.w;
+        float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
+
+        // Direct sunlight grazing the planetary limb in the inner penumbra passes
+        // through the stratosphere and ozone layer before reaching the vacuum.
+        if (gamma >= penumbra_inner) {
+            float z_direct_km = (gamma - penumbra_inner) * dist_km;
+            if (z_direct_km < 60.0) {
+                vec3 tau_R_d = atmo_param.xyz * exp(-z_direct_km / H_scale);
+                float z_diff_d = (z_direct_km - z_peak) / sigma_z;
+                vec3 tau_O3_d = ozone_param.xyz * exp(-0.5 * z_diff_d * z_diff_d);
+                vec3 T_direct = exp(-(tau_R_d + tau_O3_d));
+                vec3 pen_filter = clamp(T_direct + vec3(clamp((z_direct_km - 40.0) / 15.0, 0.0, 1.0)), 0.0, 1.0);
+                sh = geom_sh * pen_filter;
+            }
+        }
+
+        // For an extended light source (like the Sun), the transmitted light is dominated
+        // by the rays passing through the highest possible altitude (least required bend).
+        // We approximate the integral over the Sun's disk by evaluating the ray from the 
+        // upper limb (offset by ~80% of the Sun's radius).
+        float req_bend = beta - gamma - alpha * 0.8;
 
         // Rays requiring bend > max_bend hit the solid planet body (100% blocked)
         if (req_bend <= max_bend) {
             // Normalized penetration depth in atmosphere (0 = top of atmosphere, 1 = surface level)
             float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
 
-            // atmo_depth is derived from the refraction angle, which is linearly proportional to atmospheric density.
-            // Therefore, atmo_depth IS the normalized atmospheric density along the refracted ray!
-            // Since optical depth scales linearly with density:
-            // tau = tau_grazing * atmo_depth
-            // atmo_transmittance = exp(-tau) = exp(log(atmo_tint) * atmo_depth) = pow(atmo_tint, atmo_depth)
-            vec3 atmo_transmittance = pow(max(atmo_tint, 1e-6), vec3(atmo_depth));
+            // Grazing altitude z corresponding to this refraction bend angle:
+            // theta(z) = max_bend * exp(-z / H) -> atmo_depth = exp(-z / H)
+            float z_km = -H_scale * log(max(atmo_depth, 1e-5));
+
+            // 1. Rayleigh grazing optical depth at altitude z
+            vec3 tau_R = atmo_param.xyz * atmo_depth;
+
+            // 2. Stratospheric ozone layer absorption along grazing ray (Chappuis band)
+            float z_diff = (z_km - z_peak) / sigma_z;
+            vec3 tau_O3 = ozone_param.xyz * exp(-0.5 * z_diff * z_diff);
+
+            // Total optical depth and physical spectral transmittance
+            vec3 tau_total = tau_R + tau_O3;
+            vec3 atmo_transmittance = exp(-tau_total);
 
             // Physical Atmospheric Ring Geometric Dilution (1/D falloff)
             // The atmospheric lens is a ring, not a point lens, so light diverges in 1D, not 2D.
             // Geometric intensity factor f = (2 * H_scale) / (alpha * D)
-            float h_scale_km = max(atmo_h / 12.0, 1e-3);
-            float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
-            float ring_intensity = (2.0 * h_scale_km) / max(alpha * dist_km, 1e-9);
+            float ring_intensity = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
             
             // Smooth surface grazing fade to zero at solid body boundary (h = 0, atmo_depth = 1)
-            float body_surface_fade = smoothstep(1.0, 0.8, atmo_depth);
+            float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
             
-            // To make the eclipse vividly visible to human eyes (or standard HDR tonemappers)
-            // without simulating extreme dark-adaptation, we apply a small visual exposure boost.
-            // A boost of 2.0 perfectly matches the visual intensity of the old shader's Earth eclipses
-            // while preserving the correct 1/D distance falloff for other planets/moons!
-            float visual_boost = 1.0; // User requested pure realism!
-            float refraction_intensity = ring_intensity * visual_boost * (1.0 - atmo_depth * 0.7) * body_surface_fade;
+            float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
 
             float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
             sh += atmo_transmittance * refraction_intensity * atmo_blend;
@@ -715,7 +740,7 @@ void main() {
                 float gamma = sqrt(perp_sq) * inv_dist;
                 float penumbra_outer = alpha + beta;
                 float penumbra_inner = abs(beta - alpha);
-                shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j].xyz, atmo_h, dist_to_caster);
+                shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j], u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster);
             }
 
             // === Ring shadow on planet surface ===
@@ -986,7 +1011,7 @@ void main() {
                 float d_cam_km = length(cam_to_center + P_rel) * u_au_to_km;
                 float path_fraction = clamp(d_cam_km / max(am_view * H_scale, 1e-3), 0.0, 1.0);
 
-                vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
+                vec3 tau_grazing = f_my_atmo_tint;
                 vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
                 vec3 tau_vert_cloud = tau_vertical * exp(-cloud_h_km / H_scale);
                 vec3 tau_view = tau_vert_cloud * am_view * path_fraction;

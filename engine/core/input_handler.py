@@ -44,6 +44,7 @@ class InputHandlerMixin:
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
                 "tex_stream_threshold_px": self.camera.get("tex_stream_threshold_px", 500.0),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
+                "movement_mode": self.camera.get("movement_mode", 0),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -63,10 +64,15 @@ class InputHandlerMixin:
                 self.camera["fov"] *= (1.0 / (0.85 ** abs(yoffset)))
             self.camera["fov"] = max(0.001, min(120.0, self.camera["fov"]))
         else:
-            # Scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
-            speed = self.camera.get("flight_speed", 0.1)
-            speed *= (2.0 ** yoffset)
-            self.camera["flight_speed"] = max(1e-12, min(5.0, speed))
+            movement_mode = self.camera.get("movement_mode", 0)
+            if movement_mode == 1:
+                # Simple Orbit mode: scroll wheel zooms camera in / out relative to tracked object
+                self.camera["approach_delta"] += yoffset * 0.15
+            else:
+                # Free Flight mode: scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
+                speed = self.camera.get("flight_speed", 0.1)
+                speed *= (2.0 ** yoffset)
+                self.camera["flight_speed"] = max(1e-12, min(5.0, speed))
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)
@@ -98,19 +104,30 @@ class InputHandlerMixin:
         dy = ypos - self.camera["last_y"]
         
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
+        movement_mode = self.camera.get("movement_mode", 0)
         
         if self.camera["left_dragging"] and self.camera["right_dragging"]:
             # LMB+RMB: radial approach / recede toward the tracked body's surface.
             self.camera["approach_delta"] += dy * 0.0125
         elif self.camera["left_dragging"]:
-            # LMB: trackball pivot in place (free look), direct (no smoothing).
             sensitivity = 0.3 * fov_ratio
-            _camera_pivot_apply(self.camera, dx, dy, sensitivity)
-            self.camera["cam_look"] = "free"
+            if movement_mode == 1:
+                # Simple Orbit mode: LMB drag orbits the object
+                self.camera["cam_look"] = "aim"
+                _camera_orbit_apply(self.camera, dx, dy, sensitivity)
+            else:
+                # Free Flight mode: LMB drag trackball pivot in place (free look)
+                _camera_pivot_apply(self.camera, dx, dy, sensitivity)
+                self.camera["cam_look"] = "free"
         elif self.camera["right_dragging"]:
-            # RMB: trackball orbit around the pivot, direct (no smoothing).
             sensitivity = 0.3 * fov_ratio
-            _camera_orbit_apply(self.camera, dx, dy, sensitivity)
+            if movement_mode == 1:
+                # Simple Orbit mode: RMB drag pivots in place (free look)
+                _camera_pivot_apply(self.camera, dx, dy, sensitivity)
+                self.camera["cam_look"] = "free"
+            else:
+                # Free Flight mode: RMB drag trackball orbit around the pivot
+                _camera_orbit_apply(self.camera, dx, dy, sensitivity)
     
         self.camera["last_x"], self.camera["last_y"] = xpos, ypos
     
@@ -142,6 +159,8 @@ class InputHandlerMixin:
             elif key == glfw.KEY_EQUAL:
                 multiplier = 2.0 if (mods & glfw.MOD_SHIFT) else 1.1
                 self.camera["exposure"] *= multiplier
+            elif key == glfw.KEY_H and action == glfw.PRESS:
+                self.ui_visible = not getattr(self, "ui_visible", True)
             elif key == glfw.KEY_F12 and action == glfw.PRESS:
                 if not self._screenshot_capturing and not self._screenshot_saving:
                     _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]

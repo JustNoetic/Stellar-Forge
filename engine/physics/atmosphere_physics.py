@@ -28,18 +28,17 @@ GAS_PROPERTIES = {
     "CH4": (1.000444, 1.000, 0.01604, np.array([2.0e-30, 1.2e-30, 6.0e-31])),
     "H2":  (1.000132, 1.020, 0.002016, np.array([0.0, 0.0, 0.0])),
     "He":  (1.000036, 1.000, 0.004002, np.array([0.0, 0.0, 0.0])),
-    "O3":  (1.000520, 1.030, 0.04800, np.array([1.036e-25, 3.0e-25, 0.1356e-25])),
+    "O3":  (1.000520, 1.030, 0.04800, np.array([6.0e-25, 5.0e-25, 0.15e-25])),
     "SO2": (1.000686, 1.075, 0.06406, np.array([0.1e-28, 0.5e-28, 3.0e-28])),
     "Tholin": (1.000600, 1.000, 0.08000, np.array([0.2e-29, 1.2e-29, 3.0e-29])),
 }
 
 _atmo_cache = {}
 
-# O2 UV photolysis cross-section (Schumann-Runge / Herzberg continuum,
-# ~200-240 nm). Order-of-magnitude value used to locate the Chapman ozone
-# peak altitude; the exact band-averaged value varies but ~1e-23 m^2 is the
-# commonly adopted figure for the Hartley/Hertzberg region.
-_SIGMA_O2_UV = 1.0e-23  # m^2
+# O2 UV photolysis cross-section in the Herzberg continuum (~200-242 nm).
+# This solar UV-C penetrates into the stratosphere to photolyze O2 and form
+# the Chapman ozone layer peaking at ~20-25 km for Earth.
+_SIGMA_O2_UV = 3.5e-28  # m^2
 
 
 def _chapman_ozone_profile(x_o2, pressure_pa, temperature_k, scale_height_m):
@@ -205,21 +204,28 @@ def compute_atmosphere_properties(pressure_atm, temperature_k, composition, grav
         
         # Absorption coefficient: cross section * number density of this specific gas
         gas_number_density = number_density * fraction
-        if gas == "O3":
-            # Ozone is concentrated in a stratospheric Chapman layer rather
-            # than being well-mixed. The peak density enhancement over the
-            # well-mixed surface value is derived from the O2 fraction, P, T
-            # and scale height via the Chapman production function (Earth's
-            # canonical value is ~246x; this generalises it to any body).
-            o3_enhancement = _chapman_ozone_enhancement(
-                x_o2, pressure_pa, temperature_k, scale_height_m)
-            beta_abs_layered += abs_cross * (gas_number_density * o3_enhancement)
-        else:
+        if gas != "O3":
             beta_abs_mixed += abs_cross * gas_number_density
-            
+
+    # Ozone stratospheric Chapman layer:
+    # In any atmosphere containing O2, UV-C photolysis naturally generates an ozone layer
+    # in photochemical equilibrium (Chapman mechanism). Earth's peak stratospheric density
+    # is ~ 5.0e18 m^-3 (~8 ppm at 25 km). Density scales with sqrt(x_O2 * P).
+    o3_cross = GAS_PROPERTIES["O3"][3]
+    n_o3_peak = 0.0
+    if x_o2 > 0.001 and pressure_atm > 0.0:
+        n_o3_peak = 5.0e18 * math.sqrt((x_o2 / 0.21) * min(5.0, pressure_atm))
+    if "O3" in normalized_composition:
+        # If explicit O3 fraction is provided (e.g. from composition slider or preset),
+        # allow it to set/enhance the peak density (200x typical stratospheric enhancement over surface trace).
+        n_o3_explicit = number_density * normalized_composition["O3"] * 200.0
+        n_o3_peak = max(n_o3_peak, n_o3_explicit)
+
+    beta_abs_layered = o3_cross * n_o3_peak
+
     # Beta Rayleigh = mixture cross section * actual number density
     beta_rayleigh = sigma_rayleigh_mix * number_density
-    
+
     # Ensure no NaN or Inf in output arrays
     beta_rayleigh = np.nan_to_num(beta_rayleigh, nan=0.0, posinf=0.0, neginf=0.0)
     beta_abs_mixed = np.nan_to_num(beta_abs_mixed, nan=0.0, posinf=0.0, neginf=0.0)
