@@ -1,15 +1,30 @@
 import math
+import os
+import json
 import numpy as np
 import imgui
+import glfw
 from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
-from engine.physics.atmosphere_physics import compute_mie_coefficients
+from engine.physics.atmosphere_physics import compute_mie_coefficients, GAS_PROPERTIES
 from engine.rendering.render_utils import (
     compute_surface_albedo,
     format_distance_au,
-    rebuild_ring_render_group
+    rebuild_ring_render_group,
+    generate_ring_shadow_grad
 )
 from engine.rendering.planetshine import get_cached_atmosphere_properties
+from engine.rendering.texture_baker import bake_and_export_ring_textures
 from engine.ephemeris.system_manager import SystemManager
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        return super().default(obj)
 
 def _ellipsoid_surface_radius(r_eq, f, pole, u):
     """Compute local radius on an oblate spheroid in direction unit vector u."""
@@ -389,58 +404,498 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
             imgui.end_tab_item()
 
         # ── Tab 3: Atmosphere ──
-        if (has_atmo or app.camera["edit_mode"]) and imgui.begin_tab_item("Atmosphere")[0]:
-            atmo_item = body_info.get('atmosphere')
-            if atmo_item:
-                p_bar = atmo_item.get('pressure_bar', atmo_item.get('pressure_atm', 1.0))
-                imgui.text(f"Surface Pressure: {p_bar:.3f} bar")
-                imgui.text(f"Rayleigh Scale Height: {atmo_item.get('scale_height_km', 8.5):.1f} km")
+        if not inspect_bary and imgui.begin_tab_item("Atmosphere")[0]:
+            cur_atmo_bodies = app.atmo_bodies_cmp if insp_is_cmp else atmo_bodies
+            atmo_item = next((a for a in cur_atmo_bodies if a['body_idx'] == insp_idx), None)
+            mass_val = cur_mass_snap[insp_idx] if len(cur_mass_snap) > insp_idx else 3.0e-6
+            R_km = atmo_item.get('planet_radius_km', body_r_km) if atmo_item else body_r_km
 
+            if atmo_item:
+                # Compute T_eq for the planet
+                star_idx_local = -1
+                for k, b in enumerate(cur_bodies_data):
+                    if b.get('type') == 'Star':
+                        star_idx_local = k
+                        break
+                if star_idx_local != -1:
+                    star_body = cur_bodies_data[star_idx_local]
+                    star_lum = star_body.get('star_props', {}).get('lum', 1.0)
+                    star_pos = cur_pos_snap_render[star_idx_local]
+                    planet_pos = cur_pos_snap_render[insp_idx]
+                    to_planet = planet_pos - star_pos
+                    dist_to_star_au = np.linalg.norm(to_planet)
+                    if dist_to_star_au > 1e-12:
+                        L_dir = to_planet / dist_to_star_au
+                    else:
+                        L_dir = np.array([0.0, 1.0, 0.0])
+
+                    star_pole = app.visual_arr_cmp[star_idx_local, 5:8] if insp_is_cmp else visual_arr[star_idx_local, 5:8]
+                    sin_lat = abs(np.dot(L_dir, star_pole))
+
+                    star_sp = star_body.get('star_props', {})
+                    if star_sp.get('rot_frac', 0.0) > 0.0:
+                        lum_eq = star_sp.get('lum_eq', star_lum)
+                        lum_pole = star_sp.get('lum_pole', star_lum)
+                        star_lum_dir = lum_eq * (1.0 - sin_lat) + lum_pole * sin_lat
+                    else:
+                        star_lum_dir = star_lum
+                else:
+                    star_lum_dir = 1.0
+
+                eff_a = 1.0
+                curr = insp_idx
+                while curr >= 0:
+                    p_id = cur_parent_snap[curr]
+                    if p_id == -1:
+                        break
+                    p_body = cur_bodies_data[p_id]
+                    if p_body.get('type') == 'Star':
+                        eff_a = cur_bodies_data[curr].get('a', 1.0)
+                        break
+                    curr = p_id
+
+                _, A_b, q_val, _ = compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo_bodies, cur_mass_snap)
+                albedo = A_b
+
+                eff_a_safe = max(1e-4, eff_a) if not (math.isnan(eff_a) or math.isinf(eff_a)) else 1.0
+                star_lum_safe = max(0.0, star_lum_dir) if not (math.isnan(star_lum_dir) or math.isinf(star_lum_dir)) else 1.0
+                albedo_safe = min(0.9999, max(0.0, float(albedo))) if not (math.isnan(albedo) or math.isinf(albedo)) else 0.3
+                t_eq_atmo = 278.5 * ((star_lum_safe / (eff_a_safe**2))**0.25) * ((1.0 - albedo_safe)**0.25)
+                v_c_atmo = app.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
+                _, A_surf_atmo, surf_src_atmo = compute_surface_albedo(body_info, getattr(app, 'texture_mean_colors', None), v_c_atmo)
+                src_label_atmo = "texture map" if surf_src_atmo == 'texture' else ("albedo scale" if surf_src_atmo == 'albedo_scale' else "base color")
+                imgui.text(f"Surface Albedo: {A_surf_atmo:.3f} ({src_label_atmo})")
+                imgui.text(f"Bond Albedo (A_b): {albedo:.3f} (q = {q_val:.2f})")
+
+                # Calculate temperature dynamically from greenhouse effect
                 comp = atmo_item.get('composition', {})
-                if comp:
-                    imgui.separator()
-                    imgui.text_colored("Gas Composition:", 0.6, 0.9, 1.0)
-                    for gas, frac in comp.items():
-                        imgui.text(f"  {gas}: {frac * 100.0:.1f}%")
+                potencies = {'CO2': 1.0, 'H2O': 1.5, 'CH4': 25.0, 'SO2': 5.0, 'Tholin': -15.0}
+                f_gh = sum(comp.get(gas, 0.0) * factor for gas, factor in potencies.items())
+                f_gh = max(0.0, f_gh)
+
+                press = max(0.0, float(atmo_item.get('surface_pressure', 1.0)))
+                tau = (press ** 0.63) * (0.84 + 2.51 * f_gh)
+                t_calc = t_eq_atmo * ((1.0 + 0.75 * tau) ** 0.25)
+                if math.isnan(t_calc) or math.isinf(t_calc) or t_calc <= 0.0:
+                    t_calc = 288.15
+                if abs(atmo_item.get('temperature', 0.0) - t_calc) > 1e-4:
+                    atmo_item['temperature'] = t_calc
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+
+                if 'atmosphere' not in body_info:
+                    body_info['atmosphere'] = {}
+                body_info['atmosphere']['temperature'] = atmo_item['temperature']
+                body_info['atmosphere']['surface_pressure'] = atmo_item['surface_pressure']
+                body_info['atmosphere']['composition'] = atmo_item['composition']
+
+                props, _, _ = get_cached_atmosphere_properties(atmo_item, mass_val)
+                atmo_h_km = float(atmo_item.get('height', props['atmo_height_km']))
+                atmo_item['atmo_radius_km'] = R_km + atmo_h_km
+                atmo_item['atmo_radius_au'] = atmo_item['atmo_radius_km'] / 149597870.7
+                body_info['atmosphere']['height'] = atmo_h_km
+
+                current_height = atmo_item['atmo_radius_km'] - R_km
+                imgui.text(f"Atmosphere Height: {current_height:,.1f} km")
+
+                changed_p, new_p = imgui.drag_float("Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
+                if changed_p:
+                    atmo_item['surface_pressure'] = new_p
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+
+                imgui.text("Temperature: {:.1f} K ({:+.1f} °C) [Calculated]".format(atmo_item['temperature'], atmo_item['temperature'] - 273.15))
+
+                comp = atmo_item.get('composition', {"N2": 0.78, "O2": 0.21})
+                if imgui.tree_node("Composition"):
+                    comp_keys = list(comp.keys())
+                    gas_changed = False
+                    for gas in comp_keys:
+                        changed, new_pct = imgui.slider_float(f"{gas}##slider", comp[gas] * 100.0, 0.0, 100.0, "%.1f%%")
+                        if changed:
+                            comp[gas] = new_pct / 100.0
+                            gas_changed = True
+
+                        imgui.same_line()
+                        if imgui.button(f"X##{gas}"):
+                            del comp[gas]
+                            gas_changed = True
+
+                    total_pct = sum(comp.values()) * 100.0
+                    imgui.text_disabled(f"Total: {total_pct:.1f}%  (auto-normalized)")
+
+                    available_gases = [g for g in GAS_PROPERTIES.keys() if g not in comp]
+                    if available_gases:
+                        if 'selected_gas' not in atmo_item:
+                            atmo_item['selected_gas'] = 0
+
+                        atmo_item['selected_gas'] = min(atmo_item['selected_gas'], len(available_gases) - 1)
+                        changed, new_idx = imgui.combo("##AddGasCombo", atmo_item['selected_gas'], available_gases)
+                        if changed:
+                            atmo_item['selected_gas'] = new_idx
+
+                        imgui.same_line()
+                        if imgui.button("Add Gas"):
+                            comp[available_gases[atmo_item['selected_gas']]] = 0.10
+                            gas_changed = True
+
+                    if gas_changed:
+                        atmo_item['composition'] = comp
+                        atmo_item['_dirty'] = True
+                        if 'lut_tex' in atmo_item:
+                            atmo_item['lut_tex'].release()
+                            del atmo_item['lut_tex']
+                    imgui.tree_pop()
+
+                changed_m, b_mie = imgui.drag_float("Aerosol Beta (x10^-6)", atmo_item.get('beta_mie', 2.0e-6)*1e6, 0.1)
+                if changed_m:
+                    atmo_item['beta_mie'] = b_mie * 1e-6
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+                changed_hm, new_hm = imgui.drag_float("Aerosol Scale (km)", atmo_item.get('h_mie', 1.2), 0.1, 0.1, 1000.0)
+                if changed_hm:
+                    atmo_item['h_mie'] = new_hm
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+                changed_mg, new_mg = imgui.slider_float("Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
+                if changed_mg:
+                    atmo_item['mie_g'] = new_mg
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+
+                cur_alb = atmo_item.get('mie_albedo', None)
+                cur_alb_val = 1.0 if cur_alb is None else float(np.mean(cur_alb))
+                changed_alb, new_alb = imgui.slider_float("Aerosol Albedo (w0)", cur_alb_val, 0.0, 1.0)
+                if changed_alb:
+                    atmo_item['mie_albedo'] = np.array([new_alb, new_alb, new_alb], dtype=np.float32)
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+
+                is_manual = ('mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None)
+                changed_mode, use_manual = imgui.checkbox("Manual Angstrom Exponent", is_manual)
+                if changed_mode:
+                    atmo_item['mie_angstrom'] = 1.2 if use_manual else None
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+
+                if 'mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None:
+                    changed_ang, new_ang = imgui.slider_float("Aerosol Angstrom", atmo_item['mie_angstrom'], 0.0, 5.0)
+                    if changed_ang:
+                        atmo_item['mie_angstrom'] = new_ang
+                        atmo_item['_dirty'] = True
+                        if 'lut_tex' in atmo_item:
+                            atmo_item['lut_tex'].release()
+                            del atmo_item['lut_tex']
+                else:
+                    auto_val = 1.2 * math.exp(-atmo_item.get('beta_mie', 2.0e-6) / 5.0e-6)
+                    imgui.text(f"  Auto Angstrom Exponent: {auto_val:.3f} (based on Beta)")
+
+                _, atmo_item['intensity'] = imgui.drag_float("Intensity", atmo_item.get('intensity', 1.0), 0.5, 0.0, 1000.0)
+
+                imgui.separator()
+                if imgui.button("Remove Atmosphere", width=-1):
+                    cur_atmo_bodies.remove(atmo_item)
+                    if 'atmosphere' in body_info:
+                        del body_info['atmosphere']
             else:
                 imgui.text_colored("No Atmosphere Present", 0.6, 0.6, 0.6)
+                if imgui.button("Add Atmosphere", width=-1):
+                    new_atmo = {
+                        'body_idx': insp_idx,
+                        'planet_radius_km': body_r_km,
+                        'surface_radius_au': body_r_km / 149597870.7,
+                        'atmo_radius_km': body_r_km * 1.025,
+                        'atmo_radius_au': (body_r_km * 1.025) / 149597870.7,
+                        'surface_pressure': 1.0,
+                        'temperature': 288.15,
+                        'composition': {"N2": 0.78, "O2": 0.21},
+                        'beta_mie': 2.0e-6,
+                        'h_mie': 1.2,
+                        'mie_g': 0.758,
+                        'mie_albedo': np.array([1.0, 1.0, 1.0], dtype=np.float32),
+                        'intensity': 1.0
+                    }
+                    cur_atmo_bodies.append(new_atmo)
+                    body_info['atmosphere'] = {
+                        'surface_pressure': 1.0,
+                        'temperature': 288.15,
+                        'composition': {"N2": 0.78, "O2": 0.21}
+                    }
             imgui.end_tab_item()
 
         # ── Tab 4: Rings ──
-        if (has_rings or app.camera["edit_mode"]) and imgui.begin_tab_item("Rings")[0]:
-            rings_list = body_info.get('rings', [])
-            if rings_list:
-                for ri, r in enumerate(rings_list):
-                    imgui.text_colored(f"Ring #{ri+1}:", 0.6, 0.9, 1.0)
-                    r_in_km = r.get('inner_r', 1.5) * body_r_km
-                    r_out_km = r.get('outer_r', 2.5) * body_r_km
-                    imgui.text(f"  Inner: {r.get('inner_r', 1.5):.2f} R ({r_in_km:,.0f} km)")
-                    imgui.text(f"  Outer: {r.get('outer_r', 2.5):.2f} R ({r_out_km:,.0f} km)")
-                    imgui.text(f"  Opacity: {r.get('opacity', 0.8):.2f}")
-            else:
-                imgui.text_colored("No Planetary Rings", 0.6, 0.6, 0.6)
+        if not inspect_bary and imgui.begin_tab_item("Rings")[0]:
+            rings = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
+
+            for i, ring_item in enumerate(rings):
+                is_tex_layer = ring_item.get('is_textured', False)
+                node_title = f"Textured Ring Layer {i}" if is_tex_layer else f"Ring Layer {i}"
+                if imgui.tree_node(node_title):
+                    changed_in, new_in = imgui.drag_float(f"Inner Radius (km)##{i}", ring_item['inner_r'] * 149597870.7, 10.0, body_r_km, ring_item['outer_r'] * 149597870.7 - 10)
+                    changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
+                    changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
+                    changed_op, new_op = imgui.drag_float(f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 2.0, "%.4f")
+
+                    changed_scat = False
+                    if not is_tex_layer:
+                        changed_scat, new_scat = imgui.drag_float(f"Phase Balance (Back <-> Fwd)##{i}", ring_item.get('scatter', 1.0), 0.005, 0.0, 1.0, "%.4f")
+
+                    changed_asym, new_asym = imgui.drag_float(f"Forward Scatter Asym##{i}", ring_item.get('asymmetry', 0.7), 0.005, -0.999, 0.999, "%.4f")
+                    changed_bks, new_bks = imgui.drag_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.999, 0.999, "%.4f")
+
+                    changed_unlit = False
+                    changed_sat = False
+                    changed_hue = False
+                    changed_bri = False
+                    changed_boost = False
+
+                    if is_tex_layer:
+                        if imgui.tree_node(f"Texture Editor##{i}"):
+                            changed_unlit, new_unlit = imgui.drag_float(f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
+                            changed_sat, new_sat = imgui.drag_float(f"Saturation##{i}", ring_item.get('saturation', 1.0), 0.01, 0.0, 3.0, "%.2f")
+                            changed_hue, new_hue = imgui.drag_float(f"Hue Shift##{i}", ring_item.get('hue_shift', 0.0), 0.005, -1.0, 1.0, "%.3f")
+                            changed_bri, new_bri = imgui.drag_float(f"Brightness##{i}", ring_item.get('brightness', 1.0), 0.01, 0.0, 3.0, "%.2f")
+                            changed_boost, new_boost = imgui.drag_float(f"Alpha Boost##{i}", ring_item.get('alpha_boost', 1.0), 0.01, 0.1, 5.0, "%.2f")
+                            if imgui.button(f"Reset Edits##{i}"):
+                                ring_item['unlit_factor'] = 1.0
+                                ring_item['saturation'] = 1.0
+                                ring_item['hue_shift'] = 0.0
+                                ring_item['brightness'] = 1.0
+                                ring_item['alpha_boost'] = 1.0
+                                changed_unlit = True
+                            imgui.same_line()
+                            if imgui.button(f"Bake & Save Textures##{i}"):
+                                b_name = cur_bodies_data[insp_idx]['name']
+                                bake_and_export_ring_textures(app, b_name, ring_item, ring_precomputed, ring_render_groups, ring_gradient_tex)
+                            imgui.tree_pop()
+
+                    grad_changed = False
+                    grad_sort_needed = False
+                    if imgui.tree_node(f"Alpha Gradient##{i}"):
+                        grad = ring_item['gradient']
+                        if imgui.button(f"Add Stop##{i}"):
+                            grad.append({'p': 1.0, 'a': 1.0})
+                            grad_sort_needed = True
+
+                        stops_to_remove = []
+                        for j, stop in enumerate(grad):
+                            imgui.push_item_width(100)
+                            changed_p, n_p = imgui.drag_float(f"Pos##{i}_{id(stop)}", stop['p'], 0.005, 0.0, 1.0, "%.4f")
+                            if imgui.is_item_deactivated_after_edit():
+                                grad_sort_needed = True
+                            imgui.same_line()
+                            changed_a, n_a = imgui.drag_float(f"Alpha##{i}_{id(stop)}", stop['a'], 0.005, 0.0, 1.0, "%.4f")
+                            imgui.same_line()
+                            if imgui.button(f"X##{i}_{id(stop)}"):
+                                stops_to_remove.append(j)
+                                grad_sort_needed = True
+                            imgui.pop_item_width()
+
+                            if changed_p or changed_a:
+                                stop['p'] = n_p
+                                stop['a'] = n_a
+                                grad_changed = True
+
+                        for j in reversed(stops_to_remove):
+                            grad.pop(j)
+                            grad_changed = True
+
+                        if grad_sort_needed:
+                            grad.sort(key=lambda x: x['p'])
+                            grad_changed = True
+
+                        imgui.tree_pop()
+
+                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or changed_unlit or changed_sat or changed_hue or changed_bri or changed_boost or grad_changed:
+                        if changed_in: ring_item['inner_r'] = new_in / 149597870.7
+                        if changed_out: ring_item['outer_r'] = new_out / 149597870.7
+                        if changed_col: ring_item['raw_color'] = new_col
+                        if changed_op: ring_item['opacity'] = new_op
+                        if changed_scat: ring_item['scatter'] = new_scat
+                        if changed_asym: ring_item['asymmetry'] = new_asym
+                        if changed_bks: ring_item['backscatter'] = new_bks
+                        if changed_unlit: ring_item['unlit_factor'] = new_unlit
+                        if changed_sat: ring_item['saturation'] = new_sat
+                        if changed_hue: ring_item['hue_shift'] = new_hue
+                        if changed_bri: ring_item['brightness'] = new_bri
+                        if changed_boost: ring_item['alpha_boost'] = new_boost
+
+                        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=ring_item.get('tex_sampled'))
+                        ring_item['shadow_grad'] = shadow_grad
+                        app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+
+                    if imgui.button(f"Remove Layer##{i}"):
+                        ring_precomputed[:] = [r for r in ring_precomputed if r is not ring_item]
+                        app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+
+                    imgui.tree_pop()
+
+            if imgui.button("Add Ring Layer", width=-1):
+                if len(rings) < 16:
+                    r_in = body_r_km * 1.2 / 149597870.7
+                    if rings:
+                        r_in = rings[-1]['outer_r'] + (100 / 149597870.7)
+                    r_out = r_in + (body_r_km * 0.5 / 149597870.7)
+                    pole_render = cur_visual_arr[insp_idx, 5:8]
+                    color = cur_visual_arr[insp_idx, 0:3]
+                    grad = [{'p': 0.0, 'a': 0.0}, {'p': 0.5, 'a': 1.0}, {'p': 1.0, 'a': 0.0}]
+                    pole_n = pole_render / np.linalg.norm(pole_render)
+                    shadow_grad = generate_ring_shadow_grad(grad)
+                    ring_precomputed.append({
+                        'body_idx': insp_idx,
+                        'pole': pole_n.astype('f4'),
+                        'inner_r': r_in, 'outer_r': r_out, 'opacity': 0.8,
+                        'scatter': 2.5, 'asymmetry': 0.8, 'backscatter': -0.3, 'shadow_grad': shadow_grad,
+                        'raw_color': color, 'gradient': grad,
+                        'row_idx': len(ring_precomputed)
+                    })
+                    app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
             imgui.end_tab_item()
 
         # ── Tab 5: Cosmetics ──
-        if imgui.begin_tab_item("Cosmetics")[0]:
-            imgui.text_colored("Cosmetics & Export", 1.0, 0.85, 0.4)
+        if not inspect_bary and imgui.begin_tab_item("Cosmetics")[0]:
+            imgui.text_colored("Cosmetics & Surface Color", 1.0, 0.85, 0.4)
             imgui.separator()
 
+            # Convert linear albedo to sRGB for the color picker
+            if insp_is_cmp:
+                srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in app.visual_arr_cmp[insp_idx, 0:3]]
+            else:
+                srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in visual_arr[insp_idx, 0:3]]
+            changed_c, new_c = imgui.color_edit3("Base Color (sRGB)", *srgb_c)
+            if changed_c:
+                linear_c = [pow(c, 2.2) if c > 0 else 0.0 for c in new_c]
+                if insp_is_cmp:
+                    app.visual_arr_cmp[insp_idx, 0:3] = linear_c
+                    app.visual_data_cmp[insp_idx][0:3] = linear_c
+                    atmo_item = next((a for a in app.atmo_bodies_cmp if a['body_idx'] == insp_idx), None)
+                else:
+                    visual_arr[insp_idx, 0:3] = linear_c
+                    if hasattr(app, "visual_data") and len(app.visual_data) > insp_idx:
+                        app.visual_data[insp_idx][0:3] = linear_c
+                    atmo_item = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+
+                if atmo_item:
+                    atmo_item['_dirty'] = True
+                    if 'lut_tex' in atmo_item:
+                        atmo_item['lut_tex'].release()
+                        del atmo_item['lut_tex']
+
+            v_c_cosmetic = app.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
+            _, A_surf_c, surf_src_c = compute_surface_albedo(body_info, getattr(app, 'texture_mean_colors', None), v_c_cosmetic)
+            src_lbl = "texture map" if surf_src_c == 'texture' else ("albedo scale" if surf_src_c == 'albedo_scale' else "base color")
+            imgui.text(f"Surface Albedo: {A_surf_c:.3f} ({src_lbl})")
+
+            imgui.separator()
             if not insp_is_cmp:
                 if imgui.button("Export Body Cosmetics", width=-1):
-                    # Export cosmetic properties for this body
-                    import json, os
-                    os.makedirs("exports", exist_ok=True)
-                    fname = f"exports/{body_name}_cosmetics.json"
-                    export_dict = {
-                        "name": body_name,
-                        "color": list(cur_visual_arr[insp_idx, 0:3]),
-                        "rings": body_info.get("rings", []),
-                        "atmosphere": body_info.get("atmosphere", {})
-                    }
-                    with open(fname, 'w') as f:
-                        json.dump(export_dict, f, indent=4)
-                    print(f"[Cosmetics] Exported {body_name} cosmetics to {fname}")
+                    is_hidden_combo = (hasattr(app, 'window') and glfw.get_key(app.window, glfw.KEY_BACKSLASH) == glfw.PRESS)
+                    def fmt(val, dec=5): return round(float(val), dec)
+
+                    if is_hidden_combo:
+                        if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                            system_file = "data/system.json"
+                        else:
+                            system_file = app.sys_mgr._system_json_path(active_system_name)
+                        try:
+                            with open(system_file, "r") as f:
+                                sys_data = json.load(f)
+
+                            for s_body in sys_data:
+                                name = s_body.get("name")
+                                b_idx = None
+                                for i_b, b in enumerate(bodies_data):
+                                    if b.get("name") == name:
+                                        b_idx = i_b
+                                        break
+
+                                if b_idx is not None:
+                                    c = visual_arr[b_idx, 0:3]
+                                    s_body["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+
+                                    atmo_it = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
+                                    if atmo_it:
+                                        s_body["atmosphere"] = {
+                                            "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
+                                            "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
+                                            "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
+                                            "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
+                                        }
+
+                                    ring_segs = [r for r in ring_precomputed if r['body_idx'] == b_idx]
+                                    if ring_segs:
+                                        s_body["rings"] = []
+                                        body_r_au = (bodies_data[b_idx].get('r', 0.0) * 696340.0) / 1.495978707e8
+                                        for r in ring_segs:
+                                            rc = r.get('raw_color', [1.0, 1.0, 1.0])
+                                            hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
+                                            s_body["rings"].append({
+                                                "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
+                                                "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
+                                                "color": hex_col,
+                                                "opacity": fmt(r['opacity']),
+                                                "scatter": fmt(r['scatter']),
+                                                "asymmetry": fmt(r['asymmetry']),
+                                                "backscatter": fmt(r['backscatter']),
+                                                "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
+                                            })
+
+                            with open(system_file, "w") as f:
+                                json.dump(sys_data, f, indent=2, cls=NumpyEncoder)
+                            print(f"[Cosmetics] Secret Combo: Exported entire system cosmetics directly to {system_file}!")
+                        except Exception as e:
+                            print(f"Error updating system.json: {e}")
+                    else:
+                        exp = {}
+                        c = visual_arr[insp_idx, 0:3]
+                        exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+
+                        atmo_it = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                        if atmo_it:
+                            exp["atmosphere"] = {
+                                "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
+                                "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
+                                "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
+                                "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
+                            }
+
+                        ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
+                        if ring_segs:
+                            exp["rings"] = []
+                            body_r_au = (body_info.get('r', 0.0) * 696340.0) / 1.495978707e8
+                            for r in ring_segs:
+                                rc = r.get('raw_color', [1.0, 1.0, 1.0])
+                                hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
+                                exp["rings"].append({
+                                    "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
+                                    "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
+                                    "color": hex_col,
+                                    "opacity": fmt(r['opacity']),
+                                    "scatter": fmt(r['scatter']),
+                                    "asymmetry": fmt(r['asymmetry']),
+                                    "backscatter": fmt(r['backscatter']),
+                                    "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
+                                })
+
+                        os.makedirs("exports", exist_ok=True)
+                        filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
+                        with open(filename, 'w') as f:
+                            json.dump(exp, f, indent=4, cls=NumpyEncoder)
+                        print(f"[Cosmetics] Exported cosmetics to {filename}")
             imgui.end_tab_item()
 
         imgui.end_tab_bar()
