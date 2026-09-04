@@ -1974,7 +1974,7 @@ class App(InputHandlerMixin):
             lut_tex = ctx.texture((256, 256), 4, dtype='f4')
             fbo = ctx.framebuffer(color_attachments=[lut_tex])
             
-            multi_scatter_tex = ctx.texture((32, 32), 4, dtype='f4')
+            multi_scatter_tex = ctx.texture((64, 64), 4, dtype='f4')
             ms_fbo = ctx.framebuffer(color_attachments=[multi_scatter_tex])
             
             mass_kg = mass_sm * 1.98847e30
@@ -3796,7 +3796,7 @@ class App(InputHandlerMixin):
                     props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
                     thick_km = float(atmo.get('atmo_radius_km', 0.0) - atmo.get('planet_radius_km', 0.0))
                     scale_height_km = float(props.get('scale_height_km', 8.5))
-                    caster_atmos_buf[i_c, 0:3] = trans
+                    caster_atmos_buf[i_c, 0:3] = props.get('tau_vertical', trans)
                     caster_atmos_buf[i_c, 3] = thick_km
                     caster_colors_buf[i_c, 3] = scale_height_km
                     

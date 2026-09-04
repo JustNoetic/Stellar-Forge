@@ -73,6 +73,11 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     props['tau_R0'] = od_r.astype(np.float32)
     props['tau_O3_peak'] = od_o3.astype(np.float32)
     
+    tau_vert_r = beta_r * 1000.0 * h_r
+    tau_vert_m = mie_coeffs * 1000.0 * h_m
+    tau_vert_mixed = beta_mixed * 1000.0 * h_r
+    props['tau_vertical'] = (tau_vert_r + tau_vert_m + tau_vert_mixed).astype(np.float32)
+    
     tau = od_r + od_m + od_o3 + od_mixed
     direct_trans = np.exp(-tau)
     forward_scatter = tau * np.exp(-tau * 0.8) * 0.3

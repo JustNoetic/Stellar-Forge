@@ -107,9 +107,12 @@ void main() {
     // Direction-invariant: computed once per pixel instead of inside the loop.
     vec3 effective_ground_albedo = max(u_ground_albedo, w0_M * clamp((beta_M * u_h_mie - vec3(0.5)) / 2.0, vec3(0.0), vec3(1.0)));
 
-    const int ray_samples = 20;
+    const int ray_samples = 32;
     vec3 lum_total = vec3(0.0);
     vec3 fms_total = vec3(0.0);
+
+    vec3 tau_total = beta_R * u_h_rayleigh + beta_M_ext * u_h_mie;
+    float sun_mu = max(0.0, cos_sun_zenith);
 
     // Single flat loop over precomputed directions: 36 iterations instead of
     // 8x8 = 64, and no acos/sin/cos evaluated at runtime.
@@ -122,16 +125,22 @@ void main() {
         bool hits_ground = (t_planet.x > 0.0 && t_planet.x < t_atmo.y);
         float ray_len = hits_ground ? t_planet.x : t_atmo.y;
 
-        float step_size = ray_len / float(ray_samples);
-
         vec3 lum = vec3(0.0);
         vec3 fms = vec3(0.0);
-
-        float current_s = 0.5 * step_size;
         vec3 transmittance_accum = vec3(1.0);
 
         for (int s = 0; s < ray_samples; s++) {
-            vec3 p = origin + ray_dir * current_s;
+            float u0 = float(s) / float(ray_samples);
+            float u1 = float(s + 1) / float(ray_samples);
+            float um = (float(s) + 0.5) / float(ray_samples);
+
+            // Graded step spacing along sample ray: smaller steps near origin
+            float s0 = ray_len * (u0 * u0);
+            float s1 = ray_len * (u1 * u1);
+            float sm = ray_len * (um * um);
+            float step_size = max(1e-4, s1 - s0);
+
+            vec3 p = origin + ray_dir * sm;
             float p_len = length(p);
             float h_sample = max(0.0, p_len - u_planet_radius_km);
 
@@ -157,7 +166,6 @@ void main() {
             fms += transmittance_accum * FMS_Sint;
 
             transmittance_accum *= sample_transmittance;
-            current_s += step_size;
         }
 
         if (hits_ground) {
@@ -181,6 +189,20 @@ void main() {
     vec3 L2nd = lum_total / n_samples;
     vec3 fms_avg = fms_total / n_samples;
 
-    vec3 psi = L2nd / max(vec3(1.0) - fms_avg, 1e-6);
+    vec3 psi_direct = L2nd / max(vec3(1.0) - fms_avg, 1e-6);
+
+    // Column diffusion lower bound for optically thick conservative scattering
+    float rho_R_h = exp(-h / max(1e-4, u_h_rayleigh));
+    float rho_M_h = exp(-h / max(1e-4, u_h_mie));
+    vec3 tau_h = beta_R * u_h_rayleigh * rho_R_h + beta_M_ext * u_h_mie * rho_M_h;
+    vec3 tau_below = max(vec3(0.0), tau_total - tau_h);
+    vec3 diff_factor = (vec3(1.0) + 0.75 * (1.0 - u_mie_g) * tau_below + 2.0 * effective_ground_albedo) /
+                       max(vec3(1e-4), vec3(1.0) + 0.75 * (1.0 - u_mie_g) * tau_total + 2.0 * effective_ground_albedo);
+    vec3 scat_h = beta_R * rho_R_h + beta_M * rho_M_h;
+    vec3 ext_h = scat_h + beta_M_abs * rho_M_h + beta_A_mixed * rho_R_h;
+    vec3 omega_h = scat_h / max(ext_h, 1e-6);
+    vec3 psi_diffuse = diff_factor * (sun_mu * phase) * omega_h;
+
+    vec3 psi = max(psi_direct, psi_diffuse);
     out_color = vec4(psi, 1.0);
 }

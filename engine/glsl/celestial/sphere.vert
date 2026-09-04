@@ -111,7 +111,7 @@ void main() {
     f_my_atmo_color = my_atmo_color;
 
     if (u_is_cloud_pass) {
-        float cloud_h_km = f_my_scale_height * 1.5;
+        float cloud_h_km = f_my_scale_height * 0.35;
         float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
         in_radius += cloud_offset_au;
     }

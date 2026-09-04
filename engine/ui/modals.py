@@ -14,8 +14,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
     # ── 1. Graphics & Quality Settings Modal ──
     if app.camera.get("show_settings_modal", False):
-        imgui.set_next_window_size(360, 420, imgui.FIRST_USE_EVER)
-        imgui.set_next_window_position(app.fb_width // 2 - 180, app.fb_height // 2 - 210, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_size(380, 520, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_position(app.fb_width // 2 - 190, app.fb_height // 2 - 260, imgui.FIRST_USE_EVER)
         expanded, app.camera["show_settings_modal"] = imgui.begin("Graphics & Quality Settings", True)
         if expanded:
             settings_changed = False
@@ -34,6 +34,13 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     app.camera["atmo_resolution"] = atmo_res
                     settings_changed = True
 
+                if atmo_res < 0.999:
+                    vrs_threshold = float(app.camera.get("atmo_vrs_threshold_px", 100.0))
+                    changed_vrs, vrs_threshold = imgui.slider_float("VRS Low-Res Threshold (px)", vrs_threshold, 10.0, 1000.0, "%.1f")
+                    if changed_vrs:
+                        app.camera["atmo_vrs_threshold_px"] = vrs_threshold
+                        settings_changed = True
+
                 max_steps = app.camera.get("atmo_steps_max", 32)
                 changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
                 if changed_steps:
@@ -46,6 +53,19 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     app.camera["atmo_adaptive_steps"] = adaptive_steps
                     settings_changed = True
 
+                if adaptive_steps:
+                    max_adapt_steps = app.camera.get("atmo_adaptive_steps_max", 128)
+                    changed_max_adapt, max_adapt_steps = imgui.slider_int("Max Adaptive Steps", max_adapt_steps, 8, 256)
+                    if changed_max_adapt:
+                        app.camera["atmo_adaptive_steps_max"] = max_adapt_steps
+                        settings_changed = True
+
+                stochastic_steps = app.camera.get("atmo_stochastic", True)
+                changed_stoch, stochastic_steps = imgui.checkbox("Stochastic Raymarching", stochastic_steps)
+                if changed_stoch:
+                    app.camera["atmo_stochastic"] = stochastic_steps
+                    settings_changed = True
+
             # Shadow Caster Budget
             caster_budget = app.camera.get("shadow_caster_budget", 32)
             changed_budget, caster_budget = imgui.slider_int("Shadow Caster Budget", caster_budget, 4, 64)
@@ -54,15 +74,6 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 settings_changed = True
 
             imgui.separator()
-
-            # Movement Mode
-            cur_mm = app.camera.get("movement_mode", 0)
-            changed_mm, new_mm = imgui.combo("Movement Mode", cur_mm, ["Free Flight", "Simple Orbit"])
-            if changed_mm:
-                app.camera["movement_mode"] = new_mm
-                if new_mm == 1:
-                    app.camera["cam_look"] = "aim"
-                settings_changed = True
 
             # Exposure & HDR
             changed_hdr, app.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", app.camera.get("hdr_enabled", True))
@@ -88,13 +99,33 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 app.camera["msaa_samples"] = msaa_options[new_msaa_idx]
                 settings_changed = True
 
-            # Orbits
+            # Orbits & Fade
             changed_so, app.camera["show_orbits"] = imgui.checkbox("Show Orbits", app.camera.get("show_orbits", True))
             if changed_so: settings_changed = True
+
+            if app.camera.get("show_orbits", True):
+                orbit_fade_dir_idx = app.camera.get("orbit_fade_dir_idx", 0)
+                changed_ofd, orbit_fade_dir_idx = imgui.combo("Orbit Fade", orbit_fade_dir_idx, ["Bright Behind", "Bright Ahead"])
+                if changed_ofd:
+                    app.camera["orbit_fade_dir_idx"] = orbit_fade_dir_idx
+                    settings_changed = True
+
+                orbit_min_alpha = app.camera.get("orbit_min_alpha", 0.1)
+                changed_oma, orbit_min_alpha = imgui.slider_float("Min Orbit Alpha", orbit_min_alpha, 0.0, 1.0, "%.2f")
+                if changed_oma:
+                    app.camera["orbit_min_alpha"] = orbit_min_alpha
+                    settings_changed = True
 
             # Habitable Zones
             changed_hz, app.camera["show_habitable_zone"] = imgui.checkbox("Show Habitable Zones", app.camera.get("show_habitable_zone", False))
             if changed_hz: settings_changed = True
+
+            # Atmosphere & Refraction
+            changed_atmo, app.camera["atmo_enabled"] = imgui.checkbox("Enable Atmosphere Rendering", app.camera.get("atmo_enabled", True))
+            if changed_atmo: settings_changed = True
+
+            changed_refr, app.camera["refraction_enabled"] = imgui.checkbox("Enable Atmospheric Refraction", app.camera.get("refraction_enabled", True))
+            if changed_refr: settings_changed = True
 
             # Planetshine & Ringshine
             changed_ps, app.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", app.camera.get("planetshine_enabled", True))
@@ -102,6 +133,22 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
             changed_rs, app.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", app.camera.get("ringshine_enabled", True))
             if changed_rs: settings_changed = True
+
+            if app.camera.get("ringshine_enabled", True):
+                imgui.indent()
+                ringshine_bands = int(app.camera.get("ringshine_band_count", 256))
+                changed_rsb, ringshine_bands = imgui.slider_int("Ringshine Bands", ringshine_bands, 4, 1024)
+                if changed_rsb:
+                    app.camera["ringshine_band_count"] = ringshine_bands
+                    settings_changed = True
+                imgui.unindent()
+
+            # Dynamic Texture Streaming
+            stream_thresh = float(app.camera.get("tex_stream_threshold_px", 500.0))
+            changed_st, stream_thresh = imgui.slider_float("Min High-Res Size (px)", stream_thresh, 100.0, 2000.0, "%.0f px")
+            if changed_st:
+                app.camera["tex_stream_threshold_px"] = stream_thresh
+                settings_changed = True
 
             if settings_changed:
                 app.save_settings()

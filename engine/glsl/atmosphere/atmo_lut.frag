@@ -55,7 +55,7 @@ void main() {
     vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
-    const int num_samples = 40;
+    const int num_samples = 64;
     float step_size = ray_len / float(num_samples);
 
     float od_rayleigh = 0.0;

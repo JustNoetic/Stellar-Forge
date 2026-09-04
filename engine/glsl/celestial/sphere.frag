@@ -174,10 +174,14 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
 
         // Direct sunlight grazing the planetary limb in the inner penumbra passes
         // through the stratosphere and ozone layer before reaching the vacuum.
+        float caster_r_km = max(beta * dist_km, 100.0);
+        float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
+        vec3 tau_grazing_0 = atmo_param.xyz * grazing_factor;
+
         if (gamma >= penumbra_inner) {
             float z_direct_km = (gamma - penumbra_inner) * dist_km;
             if (z_direct_km < 60.0) {
-                vec3 tau_R_d = atmo_param.xyz * exp(-z_direct_km / H_scale);
+                vec3 tau_R_d = tau_grazing_0 * exp(-z_direct_km / H_scale);
                 float z_diff_d = (z_direct_km - z_peak) / sigma_z;
                 vec3 tau_O3_d = ozone_param.xyz * exp(-0.5 * z_diff_d * z_diff_d);
                 vec3 T_direct = exp(-(tau_R_d + tau_O3_d));
@@ -202,7 +206,7 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
             float z_km = -H_scale * log(max(atmo_depth, 1e-5));
 
             // 1. Rayleigh grazing optical depth at altitude z
-            vec3 tau_R = atmo_param.xyz * atmo_depth;
+            vec3 tau_R = tau_grazing_0 * atmo_depth;
 
             // 2. Stratospheric ozone layer absorption along grazing ray (Chappuis band)
             float z_diff = (z_km - z_peak) / sigma_z;
@@ -594,7 +598,7 @@ void main() {
             float NdotL = dot(N, L);
             float effective_NdotL = NdotL;
             if (u_is_cloud_pass) {
-                float cloud_h_km = f_my_scale_height * 1.5;
+                float cloud_h_km = f_my_scale_height * 0.35;
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
                 effective_NdotL += term_offset;
@@ -609,6 +613,7 @@ void main() {
             }
 
             vec3 incoming_light_tint = vec3(1.0);
+            vec3 direct_light_tint = vec3(1.0);
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
@@ -617,26 +622,29 @@ void main() {
                 // Geometric relative air mass
                 float am = (sqrt(R_km*R_km*mu*mu + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*mu) / H_scale;
                 
-                // f_my_atmo_tint holds the transmittance for a FULL grazing ray (passing entirely through the atmosphere)
-                // We extract the effective grazing optical depth:
-                vec3 tau_grazing = -log(max(f_my_atmo_tint, 1e-6));
-                
-                // Convert to vertical optical depth using the ratio of path lengths ( H_scale / sqrt(2*PI*R*H_scale) )
-                vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
+                // f_my_atmo_tint holds the column vertical optical depth
+                vec3 tau_vertical = max(f_my_atmo_tint, vec3(0.0));
                 
                 if (u_is_cloud_pass) {
-                    float cloud_h_km = f_my_scale_height * 1.5;
+                    float cloud_h_km = f_my_scale_height * 0.35;
                     tau_vertical *= exp(-cloud_h_km / H_scale);
                 }
                 
-                // Final transmittance to the ground (or cloud)
-                vec3 tau = tau_vertical * am;
-                incoming_light_tint = exp(-tau);
+                // Direct sunlight extinction
+                vec3 tau_direct = tau_vertical * am;
+                direct_light_tint = exp(-tau_direct);
+
+                // Downward diffuse daylight (Eddington approximation for conservative / semi-conservative scattering)
+                const float g_eff = 0.8;
+                vec3 tau_diff = (1.0 - g_eff) * tau_vertical;
+                vec3 diffuse_light_tint = (vec3(1.0) - exp(-tau_vertical)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff));
+
+                incoming_light_tint = direct_light_tint + diffuse_light_tint;
             }
 
             // === Ray-Traced Cloud Shadows on Surface ===
             if (!u_is_cloud_pass && f_tex_idx > 0.0 && has_clouds && f_my_scale_height > 0.0) {
-                float cloud_h_km = f_my_scale_height * 1.5;
+                float cloud_h_km = f_my_scale_height * 0.35;
                 float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
                 float eff_r = max(f_radius, f_final_radius);
                 float R_cloud = eff_r + cloud_offset_au;
@@ -832,7 +840,7 @@ void main() {
             }
 
             total_diffuse_color += star_color * incoming_light_tint * diffuse * shadow;
-            total_specular_color += star_color * incoming_light_tint * specular * shadow;
+            total_specular_color += star_color * direct_light_tint * specular * shadow;
 
             if (f_subpixel_factor > 0.0) {
                 float phase_cos = clamp(dot(V, L), -1.0, 1.0);
@@ -998,11 +1006,10 @@ void main() {
         float planet_alpha = mix(1.0, silhouette_opacity_planet, f_subpixel_factor);
 
         if (u_is_cloud_pass) {
-            float T_view = 1.0;
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
-                float cloud_h_km = f_my_scale_height * 1.5;
+                float cloud_h_km = f_my_scale_height * 0.35;
 
                 float NdotV = max(dot(N, V), 0.0);
                 float am_view = (sqrt(R_km * R_km * NdotV * NdotV + 2.0 * R_km * H_scale + H_scale * H_scale) - R_km * NdotV) / H_scale;
@@ -1011,25 +1018,60 @@ void main() {
                 float d_cam_km = length(cam_to_center + P_rel) * u_au_to_km;
                 float path_fraction = clamp(d_cam_km / max(am_view * H_scale, 1e-3), 0.0, 1.0);
 
-                vec3 tau_grazing = f_my_atmo_tint;
-                vec3 tau_vertical = tau_grazing * sqrt(H_scale / (2.0 * PI * R_km));
+                // f_my_atmo_tint holds the column vertical optical depth
+                vec3 tau_vertical = max(f_my_atmo_tint, vec3(0.0));
+                vec3 tau_grazing = tau_vertical * sqrt((2.0 * PI * R_km) / H_scale);
                 vec3 tau_vert_cloud = tau_vertical * exp(-cloud_h_km / H_scale);
                 vec3 tau_view = tau_vert_cloud * am_view * path_fraction;
 
                 vec3 trans_rgb = exp(-tau_view);
-                // Photopic luminance weighting for view transmittance
-                T_view = dot(trans_rgb, vec3(0.2126, 0.7152, 0.0722));
-                
-                // Chromatic spectral extinction on cloud reflection
-                final_color *= trans_rgb / max(1e-4, T_view);
+
+                // Normalized Rayleigh scattering tint of the atmosphere
+                vec3 sky_color_tint = tau_grazing / max(1e-5, max(tau_grazing.r, max(tau_grazing.g, tau_grazing.b)));
+
+                // Compute upper atmosphere in-scattering along the view ray in front of the clouds
+                vec3 total_inscatter = vec3(0.0);
+                float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
+
+                for (int s = 0; s < u_num_stars; s++) {
+                    vec3 star_pos = u_stars_pos_radius[s].xyz;
+                    vec3 frag_to_star = (star_pos - f_center_pos) - P_rel;
+                    float dist_to_star = length(frag_to_star);
+                    if (dist_to_star < 1e-5) continue;
+                    vec3 L_s = frag_to_star / dist_to_star;
+
+                    // Strictly zero on the nightside (sun below local horizon)
+                    float sun_cos = dot(N, L_s);
+                    float sun_factor = smoothstep(-term_offset, 0.15, sun_cos);
+                    if (sun_factor <= 0.0) continue;
+
+                    vec3 eq_color = u_stars_colors[s].rgb;
+                    vec3 pole_color = u_stars_pole_colors[s].rgb;
+                    vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
+                    float star_sin_lat = abs(dot(L_s, pole_dir));
+                    vec3 star_color = mix(eq_color, pole_color, star_sin_lat);
+
+                    float cos_view_star = dot(V, L_s);
+                    float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_view_star * cos_view_star);
+                    float g_mie = 0.76;
+                    float g2 = g_mie * g_mie;
+                    float phase_M = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_view_star * cos_view_star))
+                                  / ((2.0 + g2) * pow(max(1e-4, 1.0 + g2 - 2.0 * g_mie * cos_view_star), 1.5));
+
+                    vec3 star_inscatter = star_color * (phase_R * 2.5 * sky_color_tint + phase_M * 0.4 * vec3(1.0)) * sun_factor;
+                    total_inscatter += star_inscatter;
+                }
+
+                vec3 ap_rgb = (vec3(1.0) - trans_rgb) * total_inscatter;
+                if (u_hdr_enabled) {
+                    ap_rgb *= u_exposure;
+                }
+
+                // Cloud reflected light is attenuated by upper atmosphere, plus upper atmosphere in-scattering is added
+                final_color = final_color * trans_rgb + ap_rgb;
             }
 
-            // Physical radiative transfer blending over the pre-rendered atmosphere:
-            // alpha_eff = cloud_alpha * T_view
-            // When viewed through thin atmosphere (nadir): T_view ~ 1 -> cloud is visible and reveals the pre-rendered atmosphere behind semi-transparent cloud.
-            // When viewed through thick atmosphere (limb): T_view -> 0 -> cloud reflection extinguishes and seamlessly reveals the dual-source blended atmosphere glow!
-            planet_alpha = cloud_frag_alpha * T_view;
-            if (planet_alpha < 0.002) discard;
+            planet_alpha = cloud_frag_alpha;
         }
 
         out_color = vec4(final_color, planet_alpha);

@@ -139,6 +139,7 @@ uniform int u_num_ring_planes;
 uniform sampler2D u_ring_gradients;
 
 out vec4 out_color;
+const float PI = 3.14159265358979323846;
 
 uniform bool u_is_textured;
 uniform sampler2D u_ring_texture_front;
@@ -266,10 +267,14 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
 
         // Direct sunlight grazing the planetary limb in the inner penumbra passes
         // through the stratosphere and ozone layer before reaching the vacuum.
+        float caster_r_km = max(beta * dist_km, 100.0);
+        float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
+        vec3 tau_grazing_0 = atmo_param.xyz * grazing_factor;
+
         if (gamma >= penumbra_inner) {
             float z_direct_km = (gamma - penumbra_inner) * dist_km;
             if (z_direct_km < 60.0) {
-                vec3 tau_R_d = atmo_param.xyz * exp(-z_direct_km / H_scale);
+                vec3 tau_R_d = tau_grazing_0 * exp(-z_direct_km / H_scale);
                 float z_diff_d = (z_direct_km - z_peak) / sigma_z;
                 vec3 tau_O3_d = ozone_param.xyz * exp(-0.5 * z_diff_d * z_diff_d);
                 vec3 T_direct = exp(-(tau_R_d + tau_O3_d));
@@ -294,7 +299,7 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
             float z_km = -H_scale * log(max(atmo_depth, 1e-5));
 
             // 1. Rayleigh grazing optical depth at altitude z
-            vec3 tau_R = atmo_param.xyz * atmo_depth;
+            vec3 tau_R = tau_grazing_0 * atmo_depth;
 
             // 2. Stratospheric ozone layer absorption along grazing ray (Chappuis band)
             float z_diff = (z_km - z_peak) / sigma_z;

@@ -186,41 +186,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     "locked_lum": sp.get("locked_lum", False)
                 }
 
-    # Tracking Action Button
-    is_tracking_curr = (app.camera["tracking_idx"] == insp_idx and app.camera.get("tracking_is_cmp", False) == insp_is_cmp and not app.camera.get("tracking_bary", False))
-    track_btn_label = "Tracking Body" if is_tracking_curr else "Track Body"
-    if is_tracking_curr:
-        imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
-    if imgui.button(track_btn_label):
-        if is_tracking_curr:
-            app.camera["tracking_idx"] = None
-        else:
-            app.camera["tracking_idx"] = insp_idx
-            app.camera["tracking_is_cmp"] = insp_is_cmp
-            app.camera["tracking_bary"] = False
-            app.camera["cam_look"] = "aim"
-    if is_tracking_curr:
-        imgui.pop_style_color()
-
-    imgui.same_line(spacing=8)
-    is_tracking_bary = (app.camera["tracking_idx"] == insp_idx and app.camera.get("tracking_is_cmp", False) == insp_is_cmp and app.camera.get("tracking_bary", False))
-    bary_btn_label = "Tracking Barycenter" if is_tracking_bary else "Track Barycenter"
-    if is_tracking_bary:
-        imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
-    if imgui.button(bary_btn_label):
-        if is_tracking_bary:
-            app.camera["tracking_idx"] = None
-            app.camera["tracking_bary"] = False
-        else:
-            app.camera["tracking_idx"] = insp_idx
-            app.camera["tracking_is_cmp"] = insp_is_cmp
-            app.camera["tracking_bary"] = True
-            app.camera["cam_look"] = "aim"
-    if is_tracking_bary:
-        imgui.pop_style_color()
-
-    # Altitude & Distance Readout
-    thresh_au = app.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
+    # Target position and radius calculation
     target_pos = cur_subsys_pos_buf[insp_idx].copy() if inspect_bary else cur_pos_snap_render[insp_idx].copy()
     if insp_is_cmp:
         target_pos += np.array([app.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -229,6 +195,80 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     body_r_km = body_info.get('r', 0.0) * 696340.0
     body_mass = cur_mass_snap[insp_idx]
 
+    # Target approach distance
+    if inspect_bary:
+        oe_a_val = float(body_info.get('a', 1.0))
+        target_d = max(oe_a_val * 2.5, 0.01)
+    else:
+        r_au = (body_r_km / 149597870.7)
+        target_d = max(r_au * 3.5, 1e-6) if r_au > 0 else 0.01
+
+    # ── Action Buttons: Track, Center, Go To, Barycenter ──
+    is_tracked = (app.camera["tracking_idx"] == insp_idx and
+                  app.camera.get("tracking_is_cmp", False) == insp_is_cmp and
+                  app.camera.get("tracking_bary", False) == inspect_bary)
+
+    # 1. Track Button
+    track_btn_label = "Tracking" if is_tracked else "Track"
+    if is_tracked:
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
+    if imgui.button(f"{track_btn_label}##track_btn"):
+        if is_tracked:
+            app.camera["tracking_idx"] = None
+            app.camera["cam_look"] = "free"
+        else:
+            app.camera["tracking_idx"] = insp_idx
+            app.camera["tracking_is_cmp"] = insp_is_cmp
+            app.camera["tracking_bary"] = inspect_bary
+            app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
+            app.camera["cam_pos_rel"] = (cam_world_pos_f8 - target_pos).copy()
+            app.camera["cam_look"] = "aim"
+            app.camera["approach_delta"] = 0.0
+    if is_tracked:
+        imgui.pop_style_color()
+
+    # 2. Center Object Button
+    imgui.same_line(spacing=6)
+    if imgui.button("Center##center_btn"):
+        app.camera["tracking_idx"] = insp_idx
+        app.camera["tracking_is_cmp"] = insp_is_cmp
+        app.camera["tracking_bary"] = inspect_bary
+        app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
+        app.camera["cam_pos_rel"] = (cam_world_pos_f8 - target_pos).copy()
+        app.camera["cam_look"] = "aim"
+        app.camera["approach_delta"] = 0.0
+
+    # 3. Go To Planet / Object Button
+    imgui.same_line(spacing=6)
+    if imgui.button("Go To##goto_btn"):
+        app.camera["tracking_idx"] = insp_idx
+        app.camera["tracking_is_cmp"] = insp_is_cmp
+        app.camera["tracking_bary"] = inspect_bary
+        app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
+        app.camera["cam_look"] = "aim"
+
+        delta = cam_world_pos_f8 - target_pos
+        d = np.linalg.norm(delta)
+        if d > 1e-12:
+            app.camera["cam_pos_rel"] = (delta / d) * target_d
+        else:
+            app.camera["cam_pos_rel"] = np.array([0.0, 0.0, target_d], dtype='f8')
+        app.camera["approach_delta"] = 0.0
+
+        if app.camera.get("movement_mode", 0) == 0:
+            app.camera["flight_speed"] = max(target_d * 0.05, 1e-10)
+
+    # 4. Barycenter / Body Mode Toggle
+    imgui.same_line(spacing=6)
+    bary_btn_label = "Barycenter" if not inspect_bary else "Body"
+    if imgui.button(f"{bary_btn_label}##toggle_bary_btn"):
+        app.camera["inspect_bary"] = not inspect_bary
+        if app.camera["tracking_idx"] == insp_idx and app.camera.get("tracking_is_cmp", False) == insp_is_cmp:
+            app.camera["tracking_bary"] = app.camera["inspect_bary"]
+            app.camera["tracking_mode"] = "bary" if app.camera["inspect_bary"] else "body"
+
+    # Altitude & Distance Readout
+    thresh_au = app.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
     if dist_to_center_km > 1.49597e7:
         imgui.text(f"Distance: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
     else:

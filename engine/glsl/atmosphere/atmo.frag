@@ -424,6 +424,22 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
     return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
+float map_t_to_s(float t, float s_start, float s_end, float s_min, float p) {
+    float L = s_end - s_start;
+    if (L < 1e-4) return s_start;
+    if (abs(p - 1.0) < 0.01) return s_start + t * L;
+    float t_min = clamp((s_min - s_start) / L, 0.0, 1.0);
+    if (t <= t_min) {
+        if (t_min < 1e-5) return s_min;
+        float u = t / t_min;
+        return s_min - (s_min - s_start) * pow(1.0 - u, p);
+    } else {
+        if (t_min > 0.99999) return s_min;
+        float u = (t - t_min) / (1.0 - t_min);
+        return s_min + (s_end - s_min) * pow(u, p);
+    }
+}
+
 void main() {
     if (f_clip_z < 0.0) discard;
     
@@ -633,8 +649,10 @@ void main() {
     float s_start = max(0.0, s_atmo.x);
     float s_end = s_atmo.y;
 
+    bool hits_surface = false;
     if (s_planet.x > 0.0 && s_planet.x < s_end) {
         s_end = s_planet.x;
+        hits_surface = true;
     }
 
     vec3 frag_local = cam_local;
@@ -727,28 +745,57 @@ void main() {
     vec3 beta_A_mixed = u_beta_abs_mixed * 1000.0;
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
-    int steps = u_num_samples;
-    if (u_atmo_adaptive_steps) {
-        float ray_len = s_end - s_start;
-        float atmo_thickness = max(1e-3, u_atmo_radius_km - u_planet_radius_km);
-
-        float s_closest = clamp(-dot(cam_local_sph, ray_dir_sph), s_start, s_end);
-        float min_altitude = length(cam_local_sph + s_closest * ray_dir_sph) - u_planet_radius_km;
-        float alt_factor = mix(0.25, 1.0, clamp(exp(-max(0.0, min_altitude) / max(1e-3, u_h_rayleigh * 2.0)), 0.0, 1.0));
-
-        float length_boost = clamp(sqrt(ray_len / atmo_thickness), 1.0, 4.0);
-        float max_adaptive = max(float(u_num_samples), u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
-        steps = int(clamp(float(u_num_samples) * alt_factor * length_boost, 4.0, max_adaptive));
-    }
-    float step_size = (s_end - s_start) / float(steps);
-    vec3 scattered = vec3(0.0);
-    vec3 final_transmittance = vec3(1.0);
+    float ray_len = s_end - s_start;
+    float s_closest = clamp(-dot(cam_local_sph, ray_dir_sph), s_start, s_end);
+    float min_altitude = max(0.0, length(cam_local_sph + s_closest * ray_dir_sph) - u_planet_radius_km);
 
     vec3 pole_dir_norm = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
     float max_bend = u_precomp_opt.w;
     float inv_h_rayleigh = u_precomp_opt.x;
     float inv_h_mie = u_precomp_opt.y;
     float inv_ozone_width = u_precomp_opt.z;
+
+    // Optical depth awareness: compute peak extinction along this ray to set non-linear grading
+    float peak_rho_R = exp(-min_altitude * inv_h_rayleigh);
+    float peak_rho_M = exp(-min_altitude * inv_h_mie);
+    float peak_ext = dot(beta_R, vec3(0.333333)) * peak_rho_R + dot(beta_M_ext, vec3(0.333333)) * peak_rho_M;
+    float tau_ray_approx = peak_ext * min(ray_len, 2.0 * sqrt(max(0.0, 2.0 * u_planet_radius_km * u_h_rayleigh + u_h_rayleigh * u_h_rayleigh)));
+
+    // Spherical limb geometry already concentrates path length quadratically near closest approach (h ~ h_min + s^2 / 2R).
+    // Applying power grading (p > 1) on limb rays distorts altitude as u^(2p) (e.g. u^5 for p=2.5), which over-concentrates
+    // steps in the core and stretches outer steps to >1,000 km, ruining numerical convergence and color stability.
+    // Therefore, limb rays use linear distance spacing (p = 1.0).
+    // Only surface-intersecting rays or ground-observer rays (where altitude varies linearly along the ray) benefit from
+    // exponential grading towards the planetary surface.
+    bool cam_on_ground = (length(cam_local_sph) < u_planet_radius_km + max(1.0, u_h_rayleigh * 0.5));
+    bool is_surface_ray = hits_surface || cam_on_ground;
+
+    float grade_p = 1.0;
+    if (is_surface_ray && tau_ray_approx > 1.0) {
+        grade_p = clamp(1.0 + 0.5 * log(tau_ray_approx), 1.0, 2.0);
+    }
+
+    float jitter = 0.5;
+    if (u_stochastic_noise) {
+        vec2 frame_offset = vec2(u_frame_counter * 5.588238, u_frame_counter * 13.91849);
+        jitter = get_ign(gl_FragCoord.xy + frame_offset);
+    }
+
+    int steps = u_num_samples;
+    if (u_atmo_adaptive_steps) {
+        float max_adaptive = max(float(u_num_samples), u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
+        float max_limb_len = 2.0 * sqrt(max(0.0, u_atmo_radius_km * u_atmo_radius_km - u_planet_radius_km * u_planet_radius_km));
+        float alt_factor = clamp(exp(-min_altitude / max(1e-3, u_h_rayleigh * 3.0)), 0.0, 1.0);
+        float length_factor = clamp(ray_len / max(1e-3, max_limb_len), 0.0, 1.0);
+        float importance = alt_factor * length_factor;
+        float continuous_steps = mix(float(u_num_samples), max_adaptive, importance);
+        // Stochastic dithering across fractional step count boundaries:
+        // Converts sharp concentric integer step rings into imperceptible smooth transitions
+        float step_dither = u_stochastic_noise ? (jitter - 0.5) : 0.0;
+        steps = int(clamp(continuous_steps + step_dither + 0.5, float(u_num_samples), max_adaptive));
+    }
+    vec3 scattered = vec3(0.0);
+    vec3 final_transmittance = vec3(1.0);
 
     for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
@@ -996,15 +1043,6 @@ void main() {
         float polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
         vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
 
-        vec3 cached_psi = vec3(0.0);
-
-        float jitter = 0.5;
-        if (u_stochastic_noise) {
-            vec2 frame_offset = vec2(u_frame_counter * 5.588238, u_frame_counter * 13.91849);
-            jitter = get_ign(gl_FragCoord.xy + frame_offset);
-        }
-        vec3 step_dir_sph = ray_dir_sph * step_size;
-        vec3 current_pos_sph = cam_local_sph + (s_start + jitter * step_size) * ray_dir_sph;
 
         vec3 total_rayleigh = vec3(0.0);
         vec3 total_mie = vec3(0.0);
@@ -1019,20 +1057,26 @@ void main() {
         vec3 total_mie_rs = vec3(0.0);
         vec3 total_ms_rs = vec3(0.0);
 
-        float current_s = s_start + jitter * step_size;
-        float t_lerp = jitter / float(steps);
-        float t_step = 1.0 / float(steps);
-
         float inv_atmo_thickness = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);
 
         for (int i = 0; i < steps; i++) {
+            float t0 = float(i) / float(steps);
+            float t1 = float(i + 1) / float(steps);
+            float tj = (float(i) + jitter) / float(steps);
+
+            float s0 = map_t_to_s(t0, s_start, s_end, s_closest, grade_p);
+            float s1 = map_t_to_s(t1, s_start, s_end, s_closest, grade_p);
+            float current_s = map_t_to_s(tj, s_start, s_end, s_closest, grade_p);
+            float step_size = max(1e-4, s1 - s0);
+
+            vec3 current_pos_sph = cam_local_sph + current_s * ray_dir_sph;
             float sample_len = length(current_pos_sph);
             float altitude = max(0.0, sample_len - u_planet_radius_km);
 
             float rho_R = exp(-altitude * inv_h_rayleigh);
             float rho_M = exp(-altitude * inv_h_mie) * polar_haze_factor;
             float t_ozone = (altitude - u_ozone_peak_km) * inv_ozone_width;
-            float rho_O = exp(-t_ozone * t_ozone);
+            float rho_O = exp(-(t_ozone * t_ozone));
 
             // Extinction uses physical beta_R to prevent artificial limb color fringing
             vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
@@ -1155,15 +1199,11 @@ void main() {
             total_rayleigh += (rho_R * polar_rayleigh_inscatter_boost) * sample_attenuation * int_factor;
             total_mie      += rho_M * sample_attenuation * int_factor;
 
-            vec3 psi = cached_psi;
-            if ((i & 1) == 0 || i == steps - 1) {
-                float sun_cos_zenith = light_cos_theta;
-                float ms_u = 0.5 + 0.5 * sign(sun_cos_zenith) * sqrt(abs(sun_cos_zenith));
-                float ms_v = v_norm;
-                vec2 ms_uv = vec2(ms_u, ms_v);
-                cached_psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
-                psi = cached_psi;
-            }
+            float sun_cos_zenith = light_cos_theta;
+            float ms_u = 0.5 + 0.5 * sign(sun_cos_zenith) * sqrt(abs(sun_cos_zenith));
+            float ms_v = v_norm;
+            vec2 ms_uv = vec2(ms_u, ms_v);
+            vec3 psi = textureLod(u_multi_scatter_lut, ms_uv, 0.0).rgb;
 
             vec3 ms_shadow = sample_shadow;
             total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * ms_shadow * int_factor;
@@ -1200,10 +1240,6 @@ void main() {
             if (all(lessThan(current_transmittance, vec3(0.002)))) {
                 break;
             }
-
-            current_pos_sph += step_dir_sph;
-            current_s += step_size;
-            t_lerp += t_step;
         }
 
         float cos_theta = dot(ray_dir, L_mid);
