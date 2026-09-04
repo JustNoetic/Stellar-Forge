@@ -33,6 +33,7 @@ uniform vec3 u_host_planet_color;
 uniform vec4 u_host_planet_atmo;
 uniform vec4 u_host_planet_ozone;
 uniform float u_host_planet_refractivity;  // surface (n_mix - 1) for eclipse refraction
+uniform float u_host_planet_max_bend;      // precomputed host planet max bend
 uniform vec3 u_camera_pos;
 uniform vec4 u_host_planet_pole_obl;
 uniform float u_host_planet_R_minor;
@@ -71,7 +72,7 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
     
     float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
-    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
+    float delta_rmin = min(0.15, u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height)));
     float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
     
     if (d < 0.1 * sigma) {
@@ -707,9 +708,11 @@ void main() {
                         float gamma = sqrt(perp_sq) * inv_dist;
                         float penumbra_outer = alpha + beta;
                         float penumbra_inner = abs(beta - alpha);
-                        float max_bend = host_atmo_h > 0.0
-                            ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.05)
-                            : 0.0;
+                        float max_bend = u_host_planet_max_bend > 0.0
+                            ? u_host_planet_max_bend
+                            : (host_atmo_h > 0.0
+                                ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.10)
+                                : 0.0);
                         shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, max_bend, u_host_planet_atmo, u_host_planet_ozone, u_host_planet_atmo.w, dist_to_host);
                     }
                 }

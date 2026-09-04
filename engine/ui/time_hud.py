@@ -105,45 +105,51 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
         return
 
     # Standard Transport Controls
-    # Play / Pause
+    # 1. Play / Pause
     is_paused = app.time_ctrl["paused"]
     btn_play_pause = " Play " if is_paused else " Pause "
-    if imgui.button(btn_play_pause):
+    if imgui.button(btn_play_pause, width=54):
         app.time_ctrl["paused"] = not is_paused
 
-    # Direction (Forward / Backward)
-    imgui.same_line(spacing=8)
+    # 2. Direction (Forward / Backward)
+    imgui.same_line(spacing=6)
     td = app.time_ctrl["time_direction"]
-    if td >= 0:
-        if imgui.button(" Forward "):
-            app.time_ctrl["time_direction"] = -1
-    else:
-        if imgui.button(" Reverse "):
-            app.time_ctrl["time_direction"] = 1
+    dir_label = " Forward " if td >= 0 else " Reverse "
+    if imgui.button(dir_label, width=68):
+        app.time_ctrl["time_direction"] = -td
 
-    # Speed readout & Slider
-    imgui.same_line(spacing=10)
-    effective_mult = app.time_ctrl["multiplier"] * td
-    imgui.text(format_time_speed(effective_mult))
+    # 3. 1x Reset Speed
+    imgui.same_line(spacing=6)
+    if imgui.button("1x", width=28):
+        app.time_ctrl["multiplier"] = 1.0
 
+    # 4. Speed Slider (Fixed position, placed BEFORE speed text so text length never moves the slider)
     imgui.same_line(spacing=8)
-    imgui.push_item_width(130)
+    imgui.push_item_width(140)
     val_log = math.log10(max(1.0, abs(app.time_ctrl["multiplier"])))
     changed_speed, new_log = imgui.slider_float("##speed_slider", val_log, 0.0, 12.0, "")
     if changed_speed:
         app.time_ctrl["multiplier"] = 10 ** new_log
     imgui.pop_item_width()
 
-    imgui.same_line(spacing=6)
-    if imgui.button("1x"):
-        app.time_ctrl["multiplier"] = 1.0
+    # 5. Speed readout (Text placed AFTER slider)
+    imgui.same_line(spacing=8)
+    effective_mult = app.time_ctrl["multiplier"] * td
+    imgui.text(format_time_speed(effective_mult))
 
-    # Date / Time Display
-    imgui.same_line(spacing=15)
+    # 6. Date / Time Display + Jump Button (Anchored to right side)
+    right_section_w = 265
+    right_x = bar_w - right_section_w - 12
+    if right_x > imgui.get_cursor_pos_x():
+        imgui.same_line()
+        imgui.set_cursor_pos_x(right_x)
+    else:
+        imgui.same_line(spacing=15)
+
     imgui.text_colored(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}", 0.85, 0.9, 1.0)
 
     # Jump to date button
-    imgui.same_line(spacing=10)
+    imgui.same_line(spacing=8)
     if imgui.button("Jump..."):
         jump_date[0] = cur_y
         jump_date[1] = cur_m

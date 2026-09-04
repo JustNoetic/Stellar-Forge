@@ -5,14 +5,45 @@ from engine.core.constants import SOLAR_RADIUS_KM
 from engine.core.math_utils import pole_to_ecliptic
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, compute_mie_coefficients
 
-def compute_max_bend(caster_r_au, atmo_h_km, refractivity=0.00029):
-    """Maximum atmospheric refraction angle (radians) for a spherical shell."""
+def compute_max_bend(caster_r_au, atmo_h_km, refractivity=0.00029, beta_ext=None):
+    """Maximum atmospheric refraction angle (radians) for a spherical shell,
+    accounting for transmission optical depth through the planetary limb.
+    
+    Rays traversing the limb cannot emerge from altitudes where optical depth is
+    opaque (tau > tau_cutoff). For thin atmospheres (Earth, Titan, Mars) this
+    reaches the surface, giving the true uncapped surface refraction. For hyper-dense
+    atmospheres (Venus), this evaluates at the transmission mesosphere (~60-70 km).
+    """
     if atmo_h_km <= 0.0 or caster_r_au <= 0.0:
         return 0.0
     caster_r_km = caster_r_au * 149597870.7
     val = (3.141592653589793 * caster_r_km) / max(1e-6, atmo_h_km * 2.0)
-    max_bend = 2.0 * max(refractivity, 0.0) * math.sqrt(val)
-    return max(0.001, min(0.05, max_bend))
+    surface_bend = 2.0 * max(refractivity, 0.0) * math.sqrt(val)
+    
+    # Transmission limit: twilight/limb grazing optical depth threshold (evaluated at the
+    # penetrating red wavelength where Rayleigh scattering is minimal and twilight transmission peaks)
+    tau_cutoff = 35.0
+    if beta_ext is not None:
+        try:
+            beta_val = float(np.min(beta_ext)) if hasattr(beta_ext, '__iter__') else float(beta_ext)
+        except Exception:
+            beta_val = (max(refractivity, 0.0) / 0.00029) * 5.4e-6
+    else:
+        # Physical Gladstone-Dale scaling for red wavelength Rayleigh scattering
+        beta_val = (max(refractivity, 0.0) / 0.00029) * 5.4e-6
+        
+    path_len_m = math.sqrt(2.0 * math.pi * caster_r_km * 1000.0 * atmo_h_km * 1000.0)
+    tau_slant_0 = max(0.0, beta_val * path_len_m)
+    
+    if tau_slant_0 > tau_cutoff:
+        trans_factor = tau_cutoff / tau_slant_0
+        max_bend = surface_bend * trans_factor
+    else:
+        max_bend = surface_bend
+        
+    # Numerical safety envelope: clamp between 0.001 rad (~0.05 deg) and 0.10 rad (~5.7 deg)
+    return max(0.001, min(0.10, max_bend))
+
 
 @njit(cache=True)
 def compute_ring_coplanar_masks(n_ring_planes, centers, normals):

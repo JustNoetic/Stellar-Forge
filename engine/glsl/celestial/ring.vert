@@ -52,7 +52,7 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
     
     float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
-    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
+    float delta_rmin = min(0.15, u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height)));
     float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
     
     if (d < 0.1 * sigma) {

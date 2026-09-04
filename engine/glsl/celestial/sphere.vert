@@ -138,27 +138,22 @@ void main() {
     f_center_px = (center_ndc * 0.5 + 0.5) * vec2(screen_width, screen_height);
 
     float dist = length((view * vec4(in_offset, 1.0)).xyz);
-    float apparent_px = (in_radius / dist) * screen_height * fov_factor;
+    float apparent_px = (in_radius / max(1e-9, dist)) * screen_height * fov_factor;
     float final_radius = in_radius;
     float brightness_scale = 1.0;
 
-    float clamped_min_px = max(in_min_size, 2.5);
-    f_clamped_min_px = clamped_min_px;
-    f_apparent_px = apparent_px;
-
-    if (apparent_px < clamped_min_px) {
-        final_radius = (clamped_min_px * dist) / (screen_height * fov_factor);
-        float ratio = apparent_px / clamped_min_px;
-        
-        // Perceptual power-law scaling for subpixel point sources (Stevens' power law)
-        // Conserves apparent brightness across large distances on limited dynamic range displays.
-        // Guaranteed C0 continuity: ratio=1.0 yields brightness_scale=1.0 (zero jump at boundary).
-        brightness_scale = pow(ratio, 0.35);
+    f_clamped_min_px = 3.0;
+    if (apparent_px > 1e-6 && apparent_px < f_clamped_min_px) {
+        final_radius = in_radius * (f_clamped_min_px / apparent_px);
     }
+
+    f_apparent_px = apparent_px;
     f_final_radius = final_radius;
     f_brightness_scale = brightness_scale;
-    // Standard-compliant GLSL smoothstep with edge0 < edge1
-    f_subpixel_factor = 1.0 - smoothstep(1.0, clamped_min_px, apparent_px);
+
+    // Transition weight for hand-off with point-light quad:
+    // f_subpixel_factor = 1.0 at <= 2.0 px (100% point light), 0.0 at >= 3.0 px (100% 3D mesh)
+    f_subpixel_factor = 1.0 - smoothstep(2.0, 3.0, apparent_px);
 
     vec3 pole_n = length(in_pole) > 1e-4 ? normalize(in_pole) : vec3(0.0, 1.0, 0.0);
     vec3 mesh_pos = rotate_about_axis(in_position, pole_n, f_rotation_angle);
@@ -174,8 +169,20 @@ void main() {
         adj_normal = normalize(mesh_norm + pole_n * (dot(mesh_norm, pole_n) * f_inv));
     }
 
-    // Expand bounding mesh radius to cover the refracted/ray-traced shape
-    float atmo_expand = (u_refract_max_bend > 0.0) ? (dist * tan(u_refract_max_bend) * 1.5 + final_radius * 0.08) : (final_radius * 0.01);
+    // Expand bounding mesh radius to cover the refracted/ray-traced shape.
+    // Base expansion: local body expands by 8% (when refraction is enabled) to cover
+    // the elevated refracted horizon, or 1% (when disabled) for base raymarching.
+    float base_expand = (u_refract_max_bend > 0.0) ? (final_radius * 0.08) : (final_radius * 0.01);
+
+    // Background body deflection: distant bodies (dist > 2.0 * final_radius) seen through
+    // a foreground atmosphere can appear shifted across the sky by up to tan(max_bend).
+    float bg_expand = 0.0;
+    if (u_refract_max_bend > 0.0 && dist > final_radius * 2.0) {
+        float max_bg_expand = max(0.0, dist * 0.40 - final_radius);
+        bg_expand = min(dist * tan(u_refract_max_bend) * 1.5, max_bg_expand);
+    }
+
+    float atmo_expand = base_expand + bg_expand;
     float bounding_radius = final_radius + atmo_expand;
     f_bounding_radius = bounding_radius;
 

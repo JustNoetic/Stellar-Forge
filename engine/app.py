@@ -1290,6 +1290,7 @@ class App(InputHandlerMixin):
     
     
         prog_spheres = ctx.program(vertex_shader=sphere_vertex_shader, fragment_shader=sphere_fragment_shader)
+        prog_point_celestial = ctx.program(vertex_shader=point_celestial_vertex_shader, fragment_shader=point_celestial_fragment_shader)
         prog_culling_compute = ctx.compute_shader(culling_compute_shader)
     
         prog_gpu_orbits = ctx.program(vertex_shader=orbit_vertex_shader, fragment_shader=orbit_fragment_shader)
@@ -1677,17 +1678,33 @@ class App(InputHandlerMixin):
         ibo_hi = ctx.buffer(mesh_hi_idx.tobytes())
         vbo_ultra = ctx.buffer(mesh_ultra_verts.tobytes())
         ibo_ultra = ctx.buffer(mesh_ultra_idx.tobytes())
+
+        quad_verts = np.array([
+            -1.0, -1.0,
+             1.0, -1.0,
+             1.0,  1.0,
+            -1.0,  1.0,
+        ], dtype=np.float32)
+        quad_idx = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint32)
+        vbo_quad = ctx.buffer(quad_verts.tobytes())
+        ibo_quad = ctx.buffer(quad_idx.tobytes())
     
         # Instead of vbo_instances, use SSBOs for GPU culling
         all_instances_buffer = ctx.buffer(reserve=MAX_BODIES * 112) # 28 floats * 4 bytes
+        vis_point_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_lo_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_hi_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         vis_ultra_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
-        draw_cmds_buffer = ctx.buffer(reserve=3 * 20) # 3 structs of 5 uints
+        draw_cmds_buffer = ctx.buffer(reserve=4 * 20) # 4 structs of 5 uints (point, lo, hi, ultra)
         focused_mask_buffer = ctx.buffer(reserve=MAX_BODIES * 4)
         
         # We still need the base geometry vao, but we won't bind instances here
         # The vertex shader uses SSBO bindings directly based on gl_InstanceID
+        vao_point = ctx.vertex_array(
+            prog_point_celestial,
+            [(vbo_quad, '2f', 'in_position')],
+            index_buffer=ibo_quad
+        )
         vao_lo = ctx.vertex_array(
             prog_spheres,
             [(vbo_lo, '3f 3f', 'in_position', 'in_normal')],
@@ -1775,6 +1792,7 @@ class App(InputHandlerMixin):
         u_ring_host_color = prog_rings.get('u_host_planet_color', None)
         u_ring_host_atmo = prog_rings.get('u_host_planet_atmo', None)
         u_ring_host_refractivity = prog_rings.get('u_host_planet_refractivity', None)
+        u_ring_host_max_bend = prog_rings.get('u_host_planet_max_bend', None)
         u_ring_camera_pos = prog_rings['u_camera_pos']
         u_ring_body_offset = prog_rings['u_body_offset']
         u_ring_clip_mode = prog_rings['u_clip_mode']
@@ -2712,6 +2730,13 @@ class App(InputHandlerMixin):
             dt_render = min(now - last_render_time, 0.1)
             last_render_time = now
             
+            # Synchronize camera and rendering display parameters per frame
+            show_orbits = self.camera.get("show_orbits", True)
+            orbit_fade_dir_idx = self.camera.get("orbit_fade_dir_idx", 0)
+            orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
+            orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
+            atmo_quality = min(self.camera.get("atmo_quality", 2), 2)
+            
             glfw.poll_events()
             
             self.impl.process_inputs()
@@ -3475,6 +3500,7 @@ class App(InputHandlerMixin):
             all_instances_buffer.write(all_instances[:total_render_bodies].tobytes())
             
             cmds_data = np.array([
+                len(quad_idx), 0, 0, 0, 0,
                 len(mesh_lo_idx), 0, 0, 0, 0,
                 len(mesh_hi_idx), 0, 0, 0, 0,
                 len(mesh_ultra_idx), 0, 0, 0, 0,
@@ -3512,20 +3538,23 @@ class App(InputHandlerMixin):
             if 'u_camera_pos' in prog_culling_compute:
                 prog_culling_compute['u_camera_pos'].value = tuple(cam_pos)
             if 'u_screen_height' in prog_culling_compute:
-                prog_culling_compute['u_screen_height'].value = float(self.window_height)
+                prog_culling_compute['u_screen_height'].value = float(self.fb_height)
             if 'u_fov_factor' in prog_culling_compute:
                 prog_culling_compute['u_fov_factor'].value = float(1.0 / math.tan(math.radians(self.camera["fov"] / 2.0)))
             if 'u_lod_thresh_ultra' in prog_culling_compute:
                 prog_culling_compute['u_lod_thresh_ultra'].value = 300.0
             if 'u_lod_thresh_hi' in prog_culling_compute:
                 prog_culling_compute['u_lod_thresh_hi'].value = 40.0
+            if 'u_exposure' in prog_culling_compute:
+                prog_culling_compute['u_exposure'].value = float(self.camera.get("exposure", 1.0))
             
             all_instances_buffer.bind_to_storage_buffer(binding=2)
-            vis_lo_buffer.bind_to_storage_buffer(binding=3)
-            vis_hi_buffer.bind_to_storage_buffer(binding=4)
-            vis_ultra_buffer.bind_to_storage_buffer(binding=5)
-            draw_cmds_buffer.bind_to_storage_buffer(binding=6)
-            focused_mask_buffer.bind_to_storage_buffer(binding=7)
+            vis_point_buffer.bind_to_storage_buffer(binding=3)
+            vis_lo_buffer.bind_to_storage_buffer(binding=4)
+            vis_hi_buffer.bind_to_storage_buffer(binding=5)
+            vis_ultra_buffer.bind_to_storage_buffer(binding=6)
+            draw_cmds_buffer.bind_to_storage_buffer(binding=7)
+            focused_mask_buffer.bind_to_storage_buffer(binding=8)
             
             _gq = _perf_gpu_begin(ctx, "gpu_culling")
             prog_culling_compute.run((total_render_bodies + 255) // 256, 1, 1)
@@ -3816,7 +3845,8 @@ class App(InputHandlerMixin):
                     
                     caster_max_bend_buf[i_c] = compute_max_bend(
                         body_radii[b_idx], scale_height_km,
-                        float(props.get('refractivity', 0.00029)))
+                        float(props.get('refractivity', 0.00029)),
+                        beta_ext=props.get('beta_rayleigh'))
                 else:
                     caster_atmos_buf[i_c] = 0.0
                     caster_ozone_buf[i_c] = 0.0
@@ -3870,6 +3900,12 @@ class App(InputHandlerMixin):
             uniform_num_ring_planes.value = n_ring_planes
             if 'u_camera_pos' in prog_spheres:
                 prog_spheres['u_camera_pos'].value = tuple(cam_pos)
+            if 'u_camera_pos' in prog_point_celestial:
+                prog_point_celestial['u_camera_pos'].value = tuple(cam_pos)
+            if 'screen_height' in prog_point_celestial:
+                prog_point_celestial['screen_height'].value = float(self.fb_height)
+            if 'fov_factor' in prog_point_celestial:
+                prog_point_celestial['fov_factor'].value = float(fov_factor)
             if uniform_caster_max_bend is not None:
                 uniform_caster_max_bend.write(caster_max_bend_buf)
             if u_ring_caster_max_bend is not None:
@@ -3948,7 +3984,7 @@ class App(InputHandlerMixin):
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -4028,7 +4064,9 @@ class App(InputHandlerMixin):
                 refractivity = float(props_c.get('refractivity', 0.00029))
                 planet_radius_au = closest_atmo['planet_radius_km'] / au_to_km_val
                 if self.camera.get("refraction_enabled", True):
-                    refract_max_bend = compute_max_bend(planet_radius_au, refract_scale_height, refractivity)
+                    refract_max_bend = compute_max_bend(
+                        planet_radius_au, refract_scale_height, refractivity,
+                        beta_ext=props_c.get('beta_rayleigh'))
                     if cam_dist_au > 0.95:
                         fade = max(0.0, 1.0 - (cam_dist_au - 0.95) / 0.05)
                         refract_max_bend *= fade
@@ -4065,19 +4103,23 @@ class App(InputHandlerMixin):
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
 
-            # Pass 1: High/Ultra 3D meshes write opaque depth
+            # Pass 1: High/Ultra & Low resolved 3D meshes write opaque depth
             _gq = _perf_gpu_begin(ctx, "gpu_spheres")
             ctx.depth_mask = True
             vis_hi_buffer.bind_to_storage_buffer(binding=3)
-            vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
+            vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
             
             vis_ultra_buffer.bind_to_storage_buffer(binding=3)
-            vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
+            vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=3)
 
-            # Pass 2: Low LOD / subpixel bodies test depth but do not write depth to allow smooth transit blending
-            ctx.depth_mask = False
             vis_lo_buffer.bind_to_storage_buffer(binding=3)
-            vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
+            vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
+
+            # Pass 2: Dedicated Subpixel / Point Light Pass (apparent_px < 2.5)
+            # Tests depth against scene, blends light, does not write depth
+            ctx.depth_mask = False
+            vis_point_buffer.bind_to_storage_buffer(binding=3)
+            vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
             _perf_gpu_end(_gq)
 
             ctx.disable(moderngl.BLEND)
@@ -4413,7 +4455,8 @@ class App(InputHandlerMixin):
                             active_atmos_buf[i_ac, 3] = thick_km
                             active_max_bend_buf[i_ac] = compute_max_bend(
                                 rad_c, scale_height_km,
-                                float(props_c.get('refractivity', 0.00029)))
+                                float(props_c.get('refractivity', 0.00029)),
+                                beta_ext=props_c.get('beta_rayleigh'))
                             r_c_km = float(atmo_info.get('planet_radius_km', rad_c * 149597870.7))
                             path_len_m_c = math.sqrt(2.0 * math.pi * r_c_km * 1000.0 * scale_height_km * 1000.0)
                             tau_o3_c = props_c.get('beta_abs_layered', np.zeros(3)) * path_len_m_c
@@ -4477,7 +4520,11 @@ class App(InputHandlerMixin):
                     _inv_h_r = 1.0 / max(1e-3, float(props['scale_height_km']))
                     _inv_h_m = 1.0 / max(1e-3, float(atmo.get('h_mie', 1.2)))
                     _inv_oz = 1.0 / max(1e-3, float(props.get('ozone_width_km', 8.0)))
-                    _max_b = float(np.clip(2.0 * max(float(props.get('refractivity', 0.00029)), 0.0) * math.sqrt(math.pi * float(atmo['planet_radius_km']) / max(1e-6, float(props['scale_height_km']) * 2.0)), 0.001, 0.05))
+                    _max_b = compute_max_bend(
+                        float(atmo['planet_radius_km']) / AU_TO_KM,
+                        float(props['scale_height_km']),
+                        float(props.get('refractivity', 0.00029)),
+                        beta_ext=props.get('beta_rayleigh'))
                     self.atmo_staging[184:188] = [_inv_h_r, _inv_h_m, _inv_oz, _max_b]
 
                     # Precomputed Henyey-Greenstein Mie phase constants
@@ -4759,10 +4806,14 @@ class App(InputHandlerMixin):
                                 u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
                                 if u_ring_host_refractivity is not None:
                                     u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = compute_max_bend(body_radii[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                                 if u_ring_host_refractivity is not None:
                                     u_ring_host_refractivity.value = 0.0
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = 0.0
                         k = self.body_ring_indices.get(bi)
                         if k is not None:
                             u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
@@ -4842,10 +4893,14 @@ class App(InputHandlerMixin):
                                 u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
                                 if u_ring_host_refractivity is not None:
                                     u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = compute_max_bend(self.body_radii_cmp[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
                             else:
                                 u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
                                 if u_ring_host_refractivity is not None:
                                     u_ring_host_refractivity.value = 0.0
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = 0.0
                         u_ring_caster_mask_lo_uni.value = 0
                         u_ring_caster_mask_hi_uni.value = 0
                         body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
@@ -4947,10 +5002,10 @@ class App(InputHandlerMixin):
                 prog_spheres['u_is_cloud_pass'].value = True
                 ctx.depth_mask = False
                 vis_hi_buffer.bind_to_storage_buffer(binding=3)
-                vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
+                vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
 
                 vis_ultra_buffer.bind_to_storage_buffer(binding=3)
-                vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
+                vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=3)
                 prog_spheres['u_is_cloud_pass'].value = False
                 ctx.depth_mask = True
                 _perf_gpu_end(_gq)

@@ -178,7 +178,7 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
 
     float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height);
-    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
+    float delta_rmin = min(0.15, u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height)));
     float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
 
     if (d < 0.1 * sigma) {
@@ -580,7 +580,7 @@ void main() {
             float h = r_cam - local_refract_radius;
             if (h < u_refract_scale_height * 15.0) {
                 float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
-                float max_terr_alpha = 0.5 * u_refract_max_bend * density;
+                float max_terr_alpha = min(0.05, 0.5 * u_refract_max_bend * density);
 
                 if (max_terr_alpha > 1e-7) {
                     float mu = dot(view_ray, local_up);
@@ -765,10 +765,9 @@ void main() {
     // Applying power grading (p > 1) on limb rays distorts altitude as u^(2p) (e.g. u^5 for p=2.5), which over-concentrates
     // steps in the core and stretches outer steps to >1,000 km, ruining numerical convergence and color stability.
     // Therefore, limb rays use linear distance spacing (p = 1.0).
-    // Only surface-intersecting rays or ground-observer rays (where altitude varies linearly along the ray) benefit from
+    // Only surface-intersecting rays (where altitude varies towards the planetary surface) benefit from
     // exponential grading towards the planetary surface.
-    bool cam_on_ground = (length(cam_local_sph) < u_planet_radius_km + max(1.0, u_h_rayleigh * 0.5));
-    bool is_surface_ray = hits_surface || cam_on_ground;
+    bool is_surface_ray = hits_surface;
 
     float grade_p = 1.0;
     if (is_surface_ray && tau_ray_approx > 1.0) {
@@ -1237,7 +1236,8 @@ void main() {
             }
 
             current_transmittance *= step_transmittance;
-            if (all(lessThan(current_transmittance, vec3(0.002)))) {
+            if (all(lessThan(current_transmittance, vec3(1e-6)))) {
+                current_transmittance = vec3(0.0);
                 break;
             }
         }

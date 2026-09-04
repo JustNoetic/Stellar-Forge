@@ -72,7 +72,15 @@ out float f_clip_z;
 
 void main() {
     float dist = length(u_body_offset - u_camera_pos);
-    float atmo_expand = (u_refract_max_bend > 0.0) ? (dist * tan(u_refract_max_bend) * 1.5 + u_atmo_radius_au * 0.08) : (u_atmo_radius_au * 0.03);
+    float base_expand = (u_refract_max_bend > 0.0) ? (u_atmo_radius_au * 0.08) : (u_atmo_radius_au * 0.03);
+
+    float bg_expand = 0.0;
+    if (u_refract_max_bend > 0.0 && dist > u_atmo_radius_au * 2.0) {
+        float max_bg_expand = max(0.0, dist * 0.40 - u_atmo_radius_au);
+        bg_expand = min(dist * tan(u_refract_max_bend) * 1.5, max_bg_expand);
+    }
+
+    float atmo_expand = base_expand + bg_expand;
     float bounding_radius = u_atmo_radius_au + atmo_expand;
     float scale_factor = bounding_radius / max(1e-6, u_atmo_radius_au);
 

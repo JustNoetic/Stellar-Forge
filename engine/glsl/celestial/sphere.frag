@@ -117,7 +117,7 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
     if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
     
     float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height); 
-    float delta_rmin = u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height));
+    float delta_rmin = min(0.15, u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height)));
     float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
     
     if (d < 0.1 * sigma) {
@@ -318,7 +318,7 @@ void main() {
             float h = r_cam - local_refract_radius;
             if (h < u_refract_scale_height * 15.0) {
                 float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
-                float max_terr_alpha = 0.5 * u_refract_max_bend * density;
+                float max_terr_alpha = min(0.05, 0.5 * u_refract_max_bend * density);
                 
                 if (max_terr_alpha > 1e-7) {
                     float mu = dot(view_ray, local_up);
@@ -438,33 +438,13 @@ void main() {
 
         float surface_luminance = u_hdr_enabled ? (star_lum / (star_r * star_r)) : 1.0;
         vec3 final_star_color = star_base_color * color_shift * ld * surface_luminance;
-
-        if (f_subpixel_factor > 0.0) {
-            float dist_px = length(gl_FragCoord.xy - f_center_px);
-            
-            // Optical point spread function (Airy/Lorentzian diffraction envelope)
-            // Core parameter a = 0.65 px provides anti-aliased subpixel coverage across pixel boundaries.
-            // Peak normalized to 1.0 at center (dist_px = 0) for exact C0 continuity at resolution boundary.
-            float a = 0.65;
-            float r_over_a = dist_px / a;
-            float psf = 1.0 / pow(1.0 + r_over_a * r_over_a, 1.5);
-            
-            // Smooth edge window to fade to zero at proxy boundary
-            float edge_window = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px);
-            psf *= edge_window;
-            
-            vec3 analytical_star = star_base_color * surface_luminance * (psf * f_brightness_scale);
-            final_star_color = mix(final_star_color, analytical_star, f_subpixel_factor);
-        }
-
         if (u_hdr_enabled) {
             final_star_color *= u_exposure;
         }
         
-        float dist_px_star = length(gl_FragCoord.xy - f_center_px);
-        float edge_window_star = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px_star);
-        float silhouette_opacity_star = clamp((f_apparent_px * f_apparent_px) / (f_clamped_min_px * f_clamped_min_px), 0.0, 1.0) * edge_window_star;
-        float star_alpha = mix(1.0, silhouette_opacity_star, f_subpixel_factor);
+        float mesh_weight_star = 1.0 - f_subpixel_factor;
+        final_star_color *= mesh_weight_star;
+        float star_alpha = mesh_weight_star;
         out_color = vec4(final_star_color, star_alpha);
     } else {
         vec3 N = normalize(v_normal);
@@ -568,7 +548,6 @@ void main() {
 
         vec3 total_diffuse_color = vec3(0.0);
         vec3 total_specular_color = vec3(0.0);
-        vec3 analytical_diffuse_color = vec3(0.0);
         vec3 V = normalize(-(cam_to_center + P_rel));
 
         for (int s = 0; s < u_num_stars; s++) {
@@ -841,15 +820,6 @@ void main() {
 
             total_diffuse_color += star_color * incoming_light_tint * diffuse * shadow;
             total_specular_color += star_color * direct_light_tint * specular * shadow;
-
-            if (f_subpixel_factor > 0.0) {
-                float phase_cos = clamp(dot(V, L), -1.0, 1.0);
-                float phase_sin = sqrt(max(0.0, 1.0 - phase_cos * phase_cos));
-                float phase_angle = acos(phase_cos);
-                float phase_func = (phase_sin + (PI - phase_angle) * phase_cos) / PI;
-                float falloff = star_lum / max(dist_to_star * dist_to_star, 1e-8);
-                analytical_diffuse_color += star_color * falloff * phase_func * shadow;
-            }
         }
 
         // === Moonshine / Planetshine ===
@@ -976,34 +946,14 @@ void main() {
             final_color += local_f_color * ring_shine;
         }
 
-        if (f_subpixel_factor > 0.0) {
-            float dist_px = length(gl_FragCoord.xy - f_center_px);
-            
-            // Optical point spread function (Airy/Lorentzian diffraction envelope)
-            // Core parameter a = 0.65 px provides anti-aliased subpixel coverage across pixel boundaries.
-            // Peak normalized to 1.0 at center (dist_px = 0) for exact C0 continuity at resolution boundary.
-            float a = 0.65;
-            float r_over_a = dist_px / a;
-            float psf = 1.0 / pow(1.0 + r_over_a * r_over_a, 1.5);
-            
-            // Smooth edge window to fade to zero at proxy boundary
-            float edge_window = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px);
-            psf *= edge_window;
-            
-            // For celestial bodies with atmospheres, use the true Top-Of-Atmosphere reflectance/color
-            vec3 planet_reflectance = (f_my_atmo_h > 0.0) ? f_my_atmo_color : local_f_color;
-            vec3 analytical_planet_color = planet_reflectance * analytical_diffuse_color * (psf * f_brightness_scale);
-            final_color = mix(final_color, analytical_planet_color, f_subpixel_factor);
-        }
-
         if (u_hdr_enabled) {
             final_color *= u_exposure;
         }
 
-        float dist_px_planet = length(gl_FragCoord.xy - f_center_px);
-        float edge_window_planet = smoothstep(f_clamped_min_px, f_clamped_min_px * 0.5, dist_px_planet);
-        float silhouette_opacity_planet = clamp((f_apparent_px * f_apparent_px) / (f_clamped_min_px * f_clamped_min_px), 0.0, 1.0) * edge_window_planet;
-        float planet_alpha = mix(1.0, silhouette_opacity_planet, f_subpixel_factor);
+        // Mesh transition weight for seamless hand-off with point-light quad (apparent_px in [1.5, 2.5])
+        float mesh_weight_planet = 1.0 - f_subpixel_factor;
+        final_color *= mesh_weight_planet;
+        float planet_alpha = mesh_weight_planet;
 
         if (u_is_cloud_pass) {
             if (f_my_atmo_h > 0.0) {

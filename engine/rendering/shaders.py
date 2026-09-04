@@ -5,6 +5,9 @@ culling_compute_shader = load_shader("compute/culling.comp")
 sphere_vertex_shader = load_shader("celestial/sphere.vert")
 sphere_fragment_shader = load_shader("celestial/sphere.frag")
 
+point_celestial_vertex_shader = load_shader("celestial/point_celestial.vert")
+point_celestial_fragment_shader = load_shader("celestial/point_celestial.frag")
+
 
 
 orbit_compute_shader = load_shader("compute/orbit.comp")

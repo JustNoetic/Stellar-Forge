@@ -5,9 +5,10 @@ layout(std430, binding = 2) buffer AllInstances {
     vec4 instances[];
 };
 
-layout(std430, binding = 3) buffer VisLo { uint vis_lo[]; };
-layout(std430, binding = 4) buffer VisHi { uint vis_hi[]; };
-layout(std430, binding = 5) buffer VisUltra { uint vis_ultra[]; };
+layout(std430, binding = 3) buffer VisPoint { uint vis_point[]; };
+layout(std430, binding = 4) buffer VisLo { uint vis_lo[]; };
+layout(std430, binding = 5) buffer VisHi { uint vis_hi[]; };
+layout(std430, binding = 6) buffer VisUltra { uint vis_ultra[]; };
 
 struct DrawCmd {
     uint count;
@@ -17,11 +18,11 @@ struct DrawCmd {
     uint baseInstance;
 };
 
-layout(std430, binding = 6) buffer DrawCmds {
-    DrawCmd cmds[3]; // lo=0, hi=1, ultra=2
+layout(std430, binding = 7) buffer DrawCmds {
+    DrawCmd cmds[4]; // point=0, lo=1, hi=2, ultra=3
 };
 
-layout(std430, binding = 7) buffer FocusMask {
+layout(std430, binding = 8) buffer FocusMask {
     uint focused_mask[];
 };
 
@@ -42,6 +43,7 @@ uniform float u_screen_height;
 uniform float u_fov_factor;
 uniform float u_lod_thresh_ultra;
 uniform float u_lod_thresh_hi;
+uniform float u_exposure;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -134,18 +136,65 @@ void main() {
         float cam_dist = length(pos - u_camera_pos);
         float apparent_px = (cam_dist > 1e-6) ? ((r / cam_dist) * u_screen_height * u_fov_factor) : 10000.0;
 
-        bool is_ultra = (int(idx) == u_tracking_idx) || (apparent_px >= u_lod_thresh_ultra);
-        bool is_hi = (apparent_px >= u_lod_thresh_hi) || (f2.x > 0.5);
+        bool is_star = (f2.x > 0.5);
+        bool is_tracked = (int(idx) == u_tracking_idx);
 
-        if (is_ultra) {
-            uint slot = atomicAdd(cmds[2].instanceCount, 1u);
-            vis_ultra[slot] = idx;
-        } else if (is_hi) {
-            uint slot = atomicAdd(cmds[1].instanceCount, 1u);
-            vis_hi[slot] = idx;
+        // --- Exposure-Dependent Photometric Flux Evaluation for Culling ---
+        float exp_val = max(1e-6, u_exposure);
+        float apparent_flux = 0.0;
+
+        if (is_star) {
+            float star_lum = max(instances[idx * 7 + 4].w, 1e-4);
+            float star_r = max(r, 1e-6);
+            float surf_lum = star_lum / (star_r * star_r);
+            apparent_flux = apparent_px * apparent_px * surf_lum;
         } else {
-            uint slot = atomicAdd(cmds[0].instanceCount, 1u);
-            vis_lo[slot] = idx;
+            vec3 star_p = instances[u_star_idx * 7 + 0].xyz;
+            float d_star = length(star_p - pos);
+            float star_lum = max(instances[u_star_idx * 7 + 4].w, 1.0);
+            float star_flux = star_lum / max(d_star * d_star, 1e-4);
+
+            vec3 L = (d_star > 1e-6) ? ((star_p - pos) / d_star) : vec3(0.0, 1.0, 0.0);
+            vec3 V = (cam_dist > 1e-6) ? ((u_camera_pos - pos) / cam_dist) : vec3(0.0, 0.0, 1.0);
+            float cos_alpha = clamp(dot(V, L), -1.0, 1.0);
+            float alpha = acos(cos_alpha);
+            float phase_func = max(0.0, (sin(alpha) + (3.14159265 - alpha) * cos_alpha) / 3.14159265);
+
+            vec3 body_col = vec3(f0.w, f1.x, f1.y);
+            float alb = clamp(dot(body_col, vec3(0.2126, 0.7152, 0.0722)), 0.04, 1.0);
+            apparent_flux = apparent_px * apparent_px * star_flux * alb * phase_func;
+        }
+
+        // Peak pixel signal on sensor
+        float peak_signal = apparent_flux * exp_val;
+        float limiting_threshold = 1.0e-5;
+
+        // Dynamic culling for unresolved distant objects based on limiting magnitude
+        if (!is_tracked && apparent_px < 2.0 && peak_signal < limiting_threshold) {
+            visible = false;
+        }
+
+        if (visible) {
+            bool is_ultra = is_tracked || (apparent_px >= u_lod_thresh_ultra);
+            bool is_hi = !is_ultra && ((apparent_px >= u_lod_thresh_hi) || (is_star && apparent_px >= 2.0));
+            bool is_lo = !is_ultra && !is_hi && (apparent_px >= 2.0);
+            bool is_point = (apparent_px < 3.0);
+
+            if (is_ultra) {
+                uint slot = atomicAdd(cmds[3].instanceCount, 1u);
+                vis_ultra[slot] = idx;
+            } else if (is_hi) {
+                uint slot = atomicAdd(cmds[2].instanceCount, 1u);
+                vis_hi[slot] = idx;
+            } else if (is_lo) {
+                uint slot = atomicAdd(cmds[1].instanceCount, 1u);
+                vis_lo[slot] = idx;
+            }
+
+            if (is_point) {
+                uint slot = atomicAdd(cmds[0].instanceCount, 1u);
+                vis_point[slot] = idx;
+            }
         }
     }
 }
