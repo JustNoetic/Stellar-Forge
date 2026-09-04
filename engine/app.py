@@ -4991,12 +4991,13 @@ class App(InputHandlerMixin):
                 execute_atmosphere_pass(0, ringless_atmos)
             _perf_gpu_end(_gq)
 
-            # --- Pass 2.5: Dynamic Cloud Layer Pass (Rendered over atmosphere for physical volumetric ordering) ---
+            # --- Pass 2.5: Dynamic Cloud Layer Pass (Rendered over atmosphere with physical view-transmittance fading) ---
             if 'u_is_cloud_pass' in prog_spheres and getattr(self, 'body_textures_ssbo', None) is not None:
                 _gq = _perf_gpu_begin(ctx, "gpu_clouds")
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
                 ctx.enable(moderngl.DEPTH_TEST)
+                ctx.depth_func = '<='
                 ctx.disable(moderngl.CULL_FACE)
                 
                 prog_spheres['u_is_cloud_pass'].value = True
@@ -5008,7 +5009,9 @@ class App(InputHandlerMixin):
                 vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=3)
                 prog_spheres['u_is_cloud_pass'].value = False
                 ctx.depth_mask = True
+                ctx.depth_func = '<'
                 _perf_gpu_end(_gq)
+
 
 
             # ── Stellar-Forge UI Layer ('Orion UI') ──

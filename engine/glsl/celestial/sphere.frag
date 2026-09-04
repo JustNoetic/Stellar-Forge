@@ -956,72 +956,34 @@ void main() {
         float planet_alpha = mesh_weight_planet;
 
         if (u_is_cloud_pass) {
+            float trans_view = 1.0;
+            float horizon_fade = 1.0;
+
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
                 float cloud_h_km = f_my_scale_height * 0.35;
 
-                float NdotV = max(dot(N, V), 0.0);
+                vec3 view_norm = is_inside ? -N : N;
+                float NdotV = max(dot(view_norm, V), 0.0);
                 float am_view = (sqrt(R_km * R_km * NdotV * NdotV + 2.0 * R_km * H_scale + H_scale * H_scale) - R_km * NdotV) / H_scale;
 
-                // Distance from cloud to camera to scale optical depth when camera is inside atmosphere
                 float d_cam_km = length(cam_to_center + P_rel) * u_au_to_km;
                 float path_fraction = clamp(d_cam_km / max(am_view * H_scale, 1e-3), 0.0, 1.0);
 
-                // f_my_atmo_tint holds the column vertical optical depth
                 vec3 tau_vertical = max(f_my_atmo_tint, vec3(0.0));
-                vec3 tau_grazing = tau_vertical * sqrt((2.0 * PI * R_km) / H_scale);
                 vec3 tau_vert_cloud = tau_vertical * exp(-cloud_h_km / H_scale);
                 vec3 tau_view = tau_vert_cloud * am_view * path_fraction;
 
-                vec3 trans_rgb = exp(-tau_view);
+                // Photopic optical depth along view ray for natural perceptual fading
+                float tau_eff = dot(tau_view, vec3(0.2126, 0.7152, 0.0722));
+                trans_view = exp(-tau_eff);
 
-                // Normalized Rayleigh scattering tint of the atmosphere
-                vec3 sky_color_tint = tau_grazing / max(1e-5, max(tau_grazing.r, max(tau_grazing.g, tau_grazing.b)));
-
-                // Compute upper atmosphere in-scattering along the view ray in front of the clouds
-                vec3 total_inscatter = vec3(0.0);
-                float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
-
-                for (int s = 0; s < u_num_stars; s++) {
-                    vec3 star_pos = u_stars_pos_radius[s].xyz;
-                    vec3 frag_to_star = (star_pos - f_center_pos) - P_rel;
-                    float dist_to_star = length(frag_to_star);
-                    if (dist_to_star < 1e-5) continue;
-                    vec3 L_s = frag_to_star / dist_to_star;
-
-                    // Strictly zero on the nightside (sun below local horizon)
-                    float sun_cos = dot(N, L_s);
-                    float sun_factor = smoothstep(-term_offset, 0.15, sun_cos);
-                    if (sun_factor <= 0.0) continue;
-
-                    vec3 eq_color = u_stars_colors[s].rgb;
-                    vec3 pole_color = u_stars_pole_colors[s].rgb;
-                    vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
-                    float star_sin_lat = abs(dot(L_s, pole_dir));
-                    vec3 star_color = mix(eq_color, pole_color, star_sin_lat);
-
-                    float cos_view_star = dot(V, L_s);
-                    float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_view_star * cos_view_star);
-                    float g_mie = 0.76;
-                    float g2 = g_mie * g_mie;
-                    float phase_M = (3.0 / (8.0 * PI)) * ((1.0 - g2) * (1.0 + cos_view_star * cos_view_star))
-                                  / ((2.0 + g2) * pow(max(1e-4, 1.0 + g2 - 2.0 * g_mie * cos_view_star), 1.5));
-
-                    vec3 star_inscatter = star_color * (phase_R * 2.5 * sky_color_tint + phase_M * 0.4 * vec3(1.0)) * sun_factor;
-                    total_inscatter += star_inscatter;
-                }
-
-                vec3 ap_rgb = (vec3(1.0) - trans_rgb) * total_inscatter;
-                if (u_hdr_enabled) {
-                    ap_rgb *= u_exposure;
-                }
-
-                // Cloud reflected light is attenuated by upper atmosphere, plus upper atmosphere in-scattering is added
-                final_color = final_color * trans_rgb + ap_rgb;
+                // Smooth horizon falloff to prevent grazing edge aliasing
+                horizon_fade = smoothstep(0.0, 0.05, NdotV);
             }
 
-            planet_alpha = cloud_frag_alpha;
+            planet_alpha = cloud_frag_alpha * trans_view * horizon_fade * mesh_weight_planet;
         }
 
         out_color = vec4(final_color, planet_alpha);

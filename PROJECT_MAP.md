@@ -290,7 +290,7 @@ spectral classification.
       - Orbit polyline compute + draw.
       - `render_atmosphere_pass(clip_mode)` — two-pass with dual-source blending (behind/in front of rings).
       - Rings render, Habitable Zones, second atmosphere pass.
-      - Dynamic Cloud Layer pass (~L4733) — rendered over the atmosphere via radiative transfer blending so the volumetric atmosphere renders behind semi-transparent clouds.
+      - Dynamic Cloud Layer pass (~L4994) — rendered over the atmosphere with physical view-transmittance fading so the volumetric atmosphere is preserved behind semi-transparent clouds while distant clouds naturally dissolve into horizon haze.
       - Modular Dear ImGui UI ('Orion UI'): delegated to `engine.ui.render_ui(...)`:
         - Top Menu Bar: Systems, Physics, View, Render, Tools, Quick Actions (screenshot & settings)
         - System Outliner (Left Panel): hierarchy tree, quick search filter, body add/delete buttons
