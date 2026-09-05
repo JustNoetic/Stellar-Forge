@@ -358,7 +358,6 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             float sin_theta = dot(dir_radial, T);
             R_eff = r_star_proj * sqrt( pow(cos_theta / max(1e-6, abs(denom)), 2.0) + pow(sin_theta, 2.0) );
         }
-        R_eff = max(R_eff, fwidth(d) * 0.75);
 
         float plane_occlusion = 0.0;
 
@@ -669,8 +668,14 @@ void main() {
                 if (s_ring + ray_shift_au * u_au_to_km > 0.0) {
                     float ring_opacity = u_ring_params[k].z;
                     if (ring_opacity > 1e-6) {
-                        if (s_ring < closest_s_ring) {
-                            closest_s_ring = s_ring;
+                        vec3 hit_pt = ring_cam_local + s_ring * ring_ray_dir;
+                        float hit_r = length(hit_pt - ring_center_local);
+                        float inner_r_km = u_ring_params[k].x * u_au_to_km;
+                        float outer_r_km = u_ring_params[k].y * u_au_to_km;
+                        if (hit_r >= inner_r_km && hit_r <= outer_r_km) {
+                            if (s_ring < closest_s_ring) {
+                                closest_s_ring = s_ring;
+                            }
                         }
                     }
                 }

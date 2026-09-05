@@ -1247,6 +1247,14 @@ class App(InputHandlerMixin):
         glfw.swap_interval(0)
         ctx = moderngl.create_context()
         self.ctx = ctx
+        if not hasattr(type(ctx), 'depth_mask'):
+            def _get_depth_mask(c):
+                return bool(gl.glGetBoolean(gl.GL_DEPTH_WRITEMASK))
+            def _set_depth_mask(c, enabled):
+                gl.glDepthMask(gl.GL_TRUE if enabled else gl.GL_FALSE)
+                if c.fbo is not None:
+                    c.fbo.depth_mask = bool(enabled)
+            type(ctx).depth_mask = property(_get_depth_mask, _set_depth_mask)
         ctx.enable(moderngl.DEPTH_TEST) 
     
         
@@ -4932,6 +4940,7 @@ class App(InputHandlerMixin):
                             prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
                             prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
                         group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+                ctx.depth_mask = True
             _perf_gpu_end(_gq)
             
             # Render Habitable Zone Visualizer

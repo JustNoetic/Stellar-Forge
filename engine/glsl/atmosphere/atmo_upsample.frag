@@ -70,25 +70,31 @@ void main() {
     float dw01 = exp(-abs(d01 - high_depth) / depth_tol);
     float dw11 = exp(-abs(d11 - high_depth) / depth_tol);
 
-    float w00 = (1.0 - f.x) * (1.0 - f.y) * dw00;
-    float w10 = f.x * (1.0 - f.y) * dw10;
-    float w01 = (1.0 - f.x) * f.y * dw01;
-    float w11 = f.x * f.y * dw11;
+    float w00 = (1.0 - f.x) * (1.0 - f.y) * dw00 * step(0.001, t00.a);
+    float w10 = f.x * (1.0 - f.y) * dw10 * step(0.001, t10.a);
+    float w01 = (1.0 - f.x) * f.y * dw01 * step(0.001, t01.a);
+    float w11 = f.x * f.y * dw11 * step(0.001, t11.a);
 
     float sum_w = w00 + w10 + w01 + w11;
 
     if (sum_w < 1e-4) {
         // Nearest depth fallback to prevent halos when crossing sharp depth discontinuities
-        float m00 = abs(d00 - high_depth);
-        float m10 = abs(d10 - high_depth);
-        float m01 = abs(d01 - high_depth);
-        float m11 = abs(d11 - high_depth);
+        float m00 = (t00.a > 0.001) ? abs(d00 - high_depth) : 1e15;
+        float m10 = (t10.a > 0.001) ? abs(d10 - high_depth) : 1e15;
+        float m01 = (t01.a > 0.001) ? abs(d01 - high_depth) : 1e15;
+        float m11 = (t11.a > 0.001) ? abs(d11 - high_depth) : 1e15;
         float min_m = min(min(m00, m10), min(m01, m11));
-        w00 = (m00 == min_m) ? 1.0 : 0.0;
-        w10 = (m10 == min_m) ? 1.0 : 0.0;
-        w01 = (m01 == min_m) ? 1.0 : 0.0;
-        w11 = (m11 == min_m) ? 1.0 : 0.0;
-        sum_w = w00 + w10 + w01 + w11;
+        if (min_m < 1e14) {
+            w00 = (m00 == min_m) ? 1.0 : 0.0;
+            w10 = (m10 == min_m) ? 1.0 : 0.0;
+            w01 = (m01 == min_m) ? 1.0 : 0.0;
+            w11 = (m11 == min_m) ? 1.0 : 0.0;
+            sum_w = w00 + w10 + w01 + w11;
+        } else {
+            out_scattered = vec4(0.0);
+            out_transmittance = vec4(1.0);
+            return;
+        }
     }
 
     w00 /= sum_w;

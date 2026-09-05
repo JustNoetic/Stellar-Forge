@@ -480,8 +480,7 @@ void main() {
     }
 
     if (total_tau <= 1e-6) {
-        out_color = vec4(0.0);
-        return;
+        discard;
     }
 
     vec3 V = -ray_dir;
