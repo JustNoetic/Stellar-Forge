@@ -10,7 +10,7 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     scrub_index = getattr(app, "scrub_index", [0])
     jump_date = getattr(app, "jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
 
-    bar_w = min(940, app.fb_width - 40)
+    bar_w = min(960, app.fb_width - 40)
     bar_h = 58 if is_scrubbing or (tl_active and tl_prog < 1.0) else 44
     bar_x = (app.fb_width - bar_w) / 2
     bar_y = app.fb_height - bar_h - 10
@@ -136,25 +136,51 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     imgui.same_line(spacing=8)
     effective_mult = app.time_ctrl["multiplier"] * td
     imgui.text(format_time_speed(effective_mult))
+    imgui.same_line()
+    left_end_x = imgui.get_cursor_pos_x()
 
-    # 6. Date / Time Display + Jump Button (Anchored to right side)
+    # 6. Date / Time Display + Jump Button (Aligned to right edge of the window)
     btn_label = "Jump to Date..." if (ephemeris_mode_active or keplerian_mode_active) else "Render Timeline..."
-    right_section_w = 330
-    right_x = bar_w - right_section_w - 12
-    if right_x > imgui.get_cursor_pos_x():
-        imgui.same_line()
-        imgui.set_cursor_pos_x(right_x)
-    else:
-        imgui.same_line(spacing=15)
+    date_str = f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}"
 
-    imgui.text_colored(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}", 0.85, 0.9, 1.0)
+    style = imgui.get_style()
+    btn_spacing = 8.0
+    text_w = imgui.calc_text_size(date_str)[0]
+    btn_w = imgui.calc_text_size(btn_label)[0] + style.frame_padding.x * 2.0
+    total_right_w = text_w + btn_spacing + btn_w
+    target_x = bar_w - style.window_padding.x - total_right_w
+
+    # If space is too tight for the full timezone string, shorten long timezone name
+    if target_x <= left_end_x + 10 and len(cur_tz) > 6:
+        short_tz = "".join(c for c in cur_tz if c.isupper())
+        if not short_tz:
+            short_tz = cur_tz[:4]
+        date_str = f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {short_tz}"
+        text_w = imgui.calc_text_size(date_str)[0]
+        total_right_w = text_w + btn_spacing + btn_w
+        target_x = bar_w - style.window_padding.x - total_right_w
+
+    if target_x > left_end_x + 10:
+        imgui.set_cursor_pos_x(target_x)
+    else:
+        imgui.set_cursor_pos_x(left_end_x + 12)
+
+    imgui.text_colored(date_str, 0.85, 0.9, 1.0)
 
     # Button to open Jump in Time & Render Timeline modal
-    imgui.same_line(spacing=8)
+    imgui.same_line(spacing=btn_spacing)
     if imgui.button(btn_label):
         app.camera["show_jump_modal"] = True
-        jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
-        jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
-        jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+        use_utc = app.camera.get("jump_use_utc", True)
+        if use_utc:
+            from engine.rendering.render_utils import format_sim_time_utc
+            uy, um, ud, uh, umn, us, _ = format_sim_time_utc(display_t)
+            jd = app.camera.setdefault("jump_date", [uy, um, ud, uh, umn, us])
+            jd[0], jd[1], jd[2] = uy, um, ud
+            jd[3], jd[4], jd[5] = uh, umn, us
+        else:
+            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+            jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
+            jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
 
     imgui.end()

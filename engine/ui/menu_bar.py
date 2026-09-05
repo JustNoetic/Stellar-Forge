@@ -86,9 +86,17 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         jump_label = "Render Timeline to Date..." if cur_mode == 0 else "Jump to Date..."
         if imgui.menu_item(jump_label)[0]:
             app.camera["show_jump_modal"] = True
-            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
-            jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
-            jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+            use_utc = app.camera.get("jump_use_utc", True)
+            if use_utc:
+                from engine.rendering.render_utils import format_sim_time_utc
+                uy, um, ud, uh, umn, us, _ = format_sim_time_utc(display_t)
+                jd = app.camera.setdefault("jump_date", [uy, um, ud, uh, umn, us])
+                jd[0], jd[1], jd[2] = uy, um, ud
+                jd[3], jd[4], jd[5] = uh, umn, us
+            else:
+                jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+                jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
+                jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
 
         if keplerian_mode_active:
             if imgui.menu_item("Export & Switch to N-Body Mode")[0]:
@@ -201,9 +209,17 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
     if imgui.begin_menu("Tools"):
         if imgui.menu_item("Jump to Date / Render Timeline...")[0]:
             app.camera["show_jump_modal"] = True
-            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
-            jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
-            jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+            use_utc = app.camera.get("jump_use_utc", True)
+            if use_utc:
+                from engine.rendering.render_utils import format_sim_time_utc
+                uy, um, ud, uh, umn, us, _ = format_sim_time_utc(display_t)
+                jd = app.camera.setdefault("jump_date", [uy, um, ud, uh, umn, us])
+                jd[0], jd[1], jd[2] = uy, um, ud
+                jd[3], jd[4], jd[5] = uh, umn, us
+            else:
+                jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+                jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
+                jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
 
         if imgui.menu_item("SPICE Ephemeris Kernel Settings...")[0]:
             app._show_ephem_setup_modal = True

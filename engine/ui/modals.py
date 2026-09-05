@@ -4,7 +4,7 @@ import os
 import imgui
 from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
 from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic
-from engine.rendering.render_utils import compute_surface_albedo, format_distance_au, sim_time_from_date
+from engine.rendering.render_utils import compute_surface_albedo, format_distance_au, sim_time_from_date, format_sim_time_utc
 from engine.ephemeris.system_manager import SystemManager
 
 def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, num_bodies, mass_snap, pos_snap_render, vel_snap_render, visual_arr, cur_y, cur_m, cur_d, display_t, switch_triggers, cur_h=0, cur_mn=0, cur_s=0, cur_tz="UTC"):
@@ -412,8 +412,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
     # ── 6. Jump to Date / Render Timeline Modal ──
     if app.camera.get("show_jump_modal", False):
-        imgui.set_next_window_size(390, 440, imgui.FIRST_USE_EVER)
-        imgui.set_next_window_position(app.fb_width // 2 - 195, app.fb_height // 2 - 220, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_size(410, 480, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_position(app.fb_width // 2 - 205, app.fb_height // 2 - 240, imgui.FIRST_USE_EVER)
         expanded, app.camera["show_jump_modal"] = imgui.begin("Jump to Date / Render Timeline###jump_modal", True)
         if expanded:
             ephem_active = app.shared_state.get("ephemeris_mode", False)
@@ -427,10 +427,27 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             else:
                 imgui.text_colored("Mode: N-Body Simulation (IAS15)", 0.4, 0.8, 1.0)
 
-            imgui.text_colored(f"Current UTC: {cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}", 0.7, 0.85, 1.0)
+            utc_y, utc_m, utc_d, utc_h, utc_mn, utc_s, _ = format_sim_time_utc(display_t)
+            imgui.text_colored(f"Sim Time (UTC):   {utc_y:04d}-{utc_m:02d}-{utc_d:02d} {utc_h:02d}:{utc_mn:02d}:{utc_s:02d} UTC", 0.6, 0.9, 1.0)
+            imgui.text_colored(f"Sim Time (Local): {cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} ({cur_tz})", 0.7, 0.85, 1.0)
             imgui.separator()
 
-            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+            # Timezone input selection (UTC vs Local)
+            use_utc = app.camera.setdefault("jump_use_utc", True)
+            imgui.text("Input Time Standard:")
+            imgui.same_line()
+            r_utc = imgui.radio_button("UTC", use_utc)
+            if r_utc:
+                app.camera["jump_use_utc"] = True
+            imgui.same_line()
+            r_loc = imgui.radio_button(f"Local ({cur_tz})", not use_utc)
+            if r_loc:
+                app.camera["jump_use_utc"] = False
+            use_utc = app.camera["jump_use_utc"]
+
+            imgui.separator()
+            init_vals = [utc_y, utc_m, utc_d, utc_h, utc_mn, utc_s] if use_utc else [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s]
+            jd = app.camera.setdefault("jump_date", init_vals)
 
             imgui.text("Target Date:")
             imgui.push_item_width(90)
@@ -441,7 +458,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             _, jd[2] = imgui.input_int("Day", jd[2])
             imgui.pop_item_width()
 
-            imgui.text("Target Time (UTC):")
+            time_label = "Target Time (UTC):" if use_utc else f"Target Time (Local - {cur_tz}):"
+            imgui.text(time_label)
             imgui.push_item_width(50)
             _, jd[3] = imgui.input_int("##Hour", jd[3], step=0)
             imgui.same_line(); imgui.text(":")
@@ -463,7 +481,10 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             imgui.separator()
             imgui.text_colored("Quick Presets:", 0.6, 0.9, 1.0)
             if imgui.button("Today / Now"):
-                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                if use_utc:
+                    now_dt = datetime.datetime.now(datetime.timezone.utc)
+                else:
+                    now_dt = datetime.datetime.now()
                 jd[0], jd[1], jd[2] = now_dt.year, now_dt.month, now_dt.day
                 jd[3], jd[4], jd[5] = now_dt.hour, now_dt.minute, now_dt.second
 
@@ -485,14 +506,14 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 imgui.text_wrapped("Directly synchronizes the celestial positions to the specified target epoch.")
                 imgui.spacing()
                 if imgui.button("🚀 Jump to Date", width=-1):
-                    target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5])
+                    target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5], is_utc=use_utc)
                     app.time_ctrl["sync_t"] = target_t
                     app.camera["show_jump_modal"] = False
             else:
                 imgui.text_wrapped("Integrates an accurate 1,000-step N-body trajectory from the current time to the target date, opening an interactive timeline scrubber.")
                 imgui.spacing()
                 if imgui.button("⏳ Render Timeline to Date", width=-1):
-                    target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5])
+                    target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5], is_utc=use_utc)
                     app.time_ctrl["target_t"] = target_t
                     app.time_ctrl["cancel_render"] = False
                     app.time_ctrl["render_timeline"] = True

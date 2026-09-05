@@ -36,6 +36,10 @@ uniform float fov_factor;
 uniform float u_refract_max_bend;
 uniform bool u_is_cloud_pass;
 uniform float u_au_to_km;
+// Per-caster Mie vertical optical depth (xyz) + Mie scale height in km (w).
+// Separate from the UBO so Rayleigh/mixed (H_R) and Mie (H_Mie) can be
+// attenuated independently above the cloud deck.
+uniform vec4 u_caster_mie[MAX_CASTERS];
 
 out vec3 f_color;
 out vec3 f_world_pos;
@@ -64,6 +68,8 @@ flat out vec3 f_my_atmo_tint;
 flat out float f_my_atmo_h;
 flat out float f_my_scale_height;
 flat out vec3 f_my_atmo_color;
+flat out vec3 f_my_mie_tau;
+flat out float f_my_mie_h;
 
 vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
     if (abs(angle) < 1e-7) return v;
@@ -96,12 +102,16 @@ void main() {
     float my_atmo_h = 0.0;
     float my_scale_height = 8.5;
     vec3 my_atmo_color = in_color;
+    vec3 my_mie_tau = vec3(0.0);
+    float my_mie_h = 1.2;
     for (int j = 0; j < u_num_casters; j++) {
         if (distance(u_casters[j].xyz, in_offset) < 1e-4) {
             my_atmo_tint = u_caster_atmos[j].xyz;
             my_atmo_h = u_caster_atmos[j].w;
             my_scale_height = u_caster_colors[j].w;
             my_atmo_color = u_caster_colors[j].xyz;
+            my_mie_tau = u_caster_mie[j].xyz;
+            my_mie_h = max(u_caster_mie[j].w, 0.2);
             break;
         }
     }
@@ -109,9 +119,13 @@ void main() {
     f_my_atmo_h = my_atmo_h;
     f_my_scale_height = my_scale_height;
     f_my_atmo_color = my_atmo_color;
+    f_my_mie_tau = my_mie_tau;
+    f_my_mie_h = my_mie_h;
 
     if (u_is_cloud_pass) {
-        float cloud_h_km = f_my_scale_height * 0.35;
+        // Mean optically-thick cloud deck near ~500 hPa (p/p0 ~ 0.45):
+        // z = H * ln(1/0.45) ~= 0.8H (~6.5 km for Earth), not a low 0.35H haze.
+        float cloud_h_km = f_my_scale_height * 0.8;
         float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
         in_radius += cloud_offset_au;
     }

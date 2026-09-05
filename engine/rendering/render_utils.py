@@ -189,22 +189,73 @@ def format_sim_time(t_years):
         s = int((rem_hours - h - mn / 60.0) * 3600)
         return y, m, d, h, mn, s, "UTC"
 
-def sim_time_from_date(y, m, d, h=0, mn=0, s=0):
+def format_sim_time_utc(t_years):
+    # Try spiceypy first if ephemeris mode is active
+    try:
+        from app import _mgr
+        if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
+            import spiceypy as spice
+            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+            et_epoch = _mgr.datetime_to_et(epoch_dt)
+            et = et_epoch + t_years * 365.25 * 86400.0
+            utc_str = spice.et2utc(et, 'C', 0)
+            dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+            return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second, "UTC"
+    except:
+        pass
+
+    epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    delta_seconds = t_years * 365.25 * 86400
+    try:
+        dt_utc = epoch + datetime.timedelta(seconds=delta_seconds)
+        return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second, "UTC"
+    except (OverflowError, OSError, ValueError):
+        # Fallback to simple math for extreme years beyond 9999
+        total_days = t_years * 365.25
+        y = 2026 + int(total_days // 365.25)
+        rem_days = total_days % 365.25
+        rem_days += 0.5
+        if rem_days >= 365.25:
+            y += 1
+            rem_days -= 365.25
+        m = 1
+        days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        is_leap = (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0))
+        if is_leap: days_in_month[2] = 29
+        d = int(rem_days) + 1
+        rem_hours = (rem_days - int(rem_days)) * 24
+        for i in range(1, 13):
+            if d > days_in_month[i]:
+                d -= days_in_month[i]
+                m += 1
+            else:
+                break
+        if m > 12: m, d = 12, 31
+        h = int(rem_hours)
+        mn = int((rem_hours - h) * 60)
+        s = int((rem_hours - h - mn / 60.0) * 3600)
+        return y, m, d, h, mn, s, "UTC"
+
+
+def sim_time_from_date(y, m, d, h=0, mn=0, s=0, is_utc=True):
     if 1 <= y <= 9999:
         try:
             epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-            try:
-                dt_loc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s))
-                dt_utc = dt_loc.astimezone(datetime.timezone.utc)
-            except (OSError, ValueError, OverflowError):
-                tz_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
-                dt_utc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s), tzinfo=datetime.timezone.utc) - tz_dt.utcoffset()
-            delta = dt_utc - epoch
+            if is_utc:
+                dt = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s), tzinfo=datetime.timezone.utc)
+            else:
+                try:
+                    dt_loc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s))
+                    dt = dt_loc.astimezone(datetime.timezone.utc)
+                except (OSError, ValueError, OverflowError):
+                    tz_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc).astimezone()
+                    dt = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s), tzinfo=datetime.timezone.utc) - tz_dt.utcoffset()
+            delta = dt - epoch
             return delta.total_seconds() / (365.25 * 86400)
         except ValueError:
             pass
-            
-    # For extreme years, use a simplified Julian year progression
+
+    # For extreme years, use a simplified Julian year progression (UTC)
     dy = y - 2026
     days_in_month = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     days_ytd = d - 1
@@ -212,7 +263,7 @@ def sim_time_from_date(y, m, d, h=0, mn=0, s=0):
         days_ytd += days_in_month[i]
         if i == 2 and y % 4 == 0 and (y % 100 != 0 or y % 400 == 0):
             days_ytd += 1
-            
+
     total_days = dy * 365.25 + days_ytd + (h - 12) / 24.0 + mn / 1440.0 + s / 86400.0
     return total_days / 365.25
 

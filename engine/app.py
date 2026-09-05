@@ -1789,6 +1789,7 @@ class App(InputHandlerMixin):
         uniform_ring_5colors = prog_spheres.get('u_ring_5colors', None)
         uniform_ring_coplanar_mask = prog_spheres.get('u_ring_coplanar_mask', None)
         uniform_caster_max_bend = prog_spheres.get('u_caster_max_bend', None)
+        uniform_caster_mie = prog_spheres.get('u_caster_mie', None)
         uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
         if 'u_ring_gradients' in prog_spheres:
             prog_spheres['u_ring_gradients'].value = 0
@@ -1874,6 +1875,9 @@ class App(InputHandlerMixin):
         caster_atmos_buf = np.zeros((64, 4), dtype='f4')
         caster_ozone_buf = np.zeros((64, 4), dtype='f4')
         caster_max_bend_buf = np.zeros(64, dtype='f4')
+        # Per-caster Mie vertical optical depth (xyz) + Mie scale height km (w)
+        # for physically-based per-species cloud-altitude attenuation.
+        caster_mie_buf = np.zeros((64, 4), dtype='f4')
         ring_centers_buf = np.zeros((16, 3), dtype='f4')
         ring_normals_buf = np.zeros((16, 3), dtype='f4')
         ring_params_buf = np.zeros((16, 4), dtype='f4')
@@ -2201,6 +2205,7 @@ class App(InputHandlerMixin):
                 caster_atmos_buf = np.zeros((64, 4), dtype='f4')
                 caster_ozone_buf = np.zeros((64, 4), dtype='f4')
                 caster_max_bend_buf = np.zeros(64, dtype='f4')
+                caster_mie_buf = np.zeros((64, 4), dtype='f4')
                 ring_centers_buf = np.zeros((16, 3), dtype='f4')
                 ring_normals_buf = np.zeros((16, 3), dtype='f4')
                 ring_params_buf = np.zeros((16, 4), dtype='f4')
@@ -3880,6 +3885,19 @@ class App(InputHandlerMixin):
                     caster_atmos_buf[i_c, 0:3] = props.get('tau_vertical', trans)
                     caster_atmos_buf[i_c, 3] = thick_km
                     caster_colors_buf[i_c, 3] = scale_height_km
+                    # Split Mie component for per-species cloud-altitude attenuation.
+                    # Falls back to total-minus-Rm if cached props predate the split.
+                    _tau_m = props.get('tau_vert_mie', None)
+                    if _tau_m is None:
+                        _tau_rm = props.get('tau_vert_rm', None)
+                        _tau_tot = props.get('tau_vertical', trans)
+                        try:
+                            _tau_m = (np.asarray(_tau_tot, dtype=np.float32)
+                                      - np.asarray(_tau_rm, dtype=np.float32)) if _tau_rm is not None else np.zeros(3, dtype=np.float32)
+                        except Exception:
+                            _tau_m = np.zeros(3, dtype=np.float32)
+                    caster_mie_buf[i_c, 0:3] = _tau_m
+                    caster_mie_buf[i_c, 3] = float(props.get('h_mie_km', float(atmo.get('h_mie', 1.2))))
                     
                     b_rad_km = float(bodies_data[b_idx].get('req_km', body_radii[b_idx] * 149597870.7)) if bodies_data is not None and b_idx < len(bodies_data) else 6371.0
                     path_len_m = math.sqrt(2.0 * math.pi * b_rad_km * 1000.0 * scale_height_km * 1000.0)
@@ -3903,10 +3921,12 @@ class App(InputHandlerMixin):
                     caster_atmos_buf[i_c] = 0.0
                     caster_ozone_buf[i_c] = 0.0
                     caster_max_bend_buf[i_c] = 0.0
+                    caster_mie_buf[i_c] = 0.0
             if n_casters_fixed < 64:
                 caster_atmos_buf[n_casters_fixed:] = 0
                 caster_ozone_buf[n_casters_fixed:] = 0
                 caster_max_bend_buf[n_casters_fixed:] = 0
+                caster_mie_buf[n_casters_fixed:] = 0
     
             ubo_staging[0:16] = projection.ravel()
             ubo_staging[16:32] = view.ravel()
@@ -3960,6 +3980,11 @@ class App(InputHandlerMixin):
                 prog_point_celestial['fov_factor'].value = float(fov_factor)
             if uniform_caster_max_bend is not None:
                 uniform_caster_max_bend.write(caster_max_bend_buf)
+            if uniform_caster_mie is not None:
+                try:
+                    uniform_caster_mie.write(caster_mie_buf)
+                except Exception:
+                    pass
             if u_ring_caster_max_bend is not None:
                 u_ring_caster_max_bend.write(caster_max_bend_buf)
             if n_ring_planes > 0:

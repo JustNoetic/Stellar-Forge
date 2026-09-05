@@ -33,6 +33,8 @@ flat in vec3 f_my_atmo_tint;
 flat in float f_my_atmo_h;
 flat in float f_my_scale_height;
 flat in vec3 f_my_atmo_color;
+flat in vec3 f_my_mie_tau;
+flat in float f_my_mie_h;
 
 uniform vec3 u_refract_center;
 uniform float u_refract_radius;
@@ -577,19 +579,14 @@ void main() {
             float NdotL = dot(N, L);
             float effective_NdotL = NdotL;
             if (u_is_cloud_pass) {
-                float cloud_h_km = f_my_scale_height * 0.35;
+                // Mean cloud deck ~0.8H (~500 hPa); higher than the old 0.35H haze
+                // so the terminator delay sqrt(2*z/R) matches high clouds staying lit.
+                float cloud_h_km = f_my_scale_height * 0.8;
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
                 effective_NdotL += term_offset;
             }
             float diffuse = clamp((effective_NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
-
-            // Forward Mie scattering (silver lining on clouds when backlit by the sun)
-            if (u_is_cloud_pass) {
-                float cos_view_sun = dot(V, L);
-                float silver_lining = pow(max(0.0, cos_view_sun), 5.0) * 0.75;
-                diffuse = diffuse * (1.0 + silver_lining);
-            }
 
             vec3 incoming_light_tint = vec3(1.0);
             vec3 direct_light_tint = vec3(1.0);
@@ -597,33 +594,44 @@ void main() {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
                 float mu = u_is_cloud_pass ? max(effective_NdotL, 0.0) : max(NdotL, 0.0);
-                
+
                 // Geometric relative air mass
                 float am = (sqrt(R_km*R_km*mu*mu + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*mu) / H_scale;
-                
-                // f_my_atmo_tint holds the column vertical optical depth
-                vec3 tau_vertical = max(f_my_atmo_tint, vec3(0.0));
-                
+
+                // Split total column OD into Rayleigh+mixed (H_R) and Mie (H_Mie).
+                // f_my_atmo_tint = total; f_my_mie_tau = Mie part (new uniform).
+                vec3 tau_mie_vert = max(f_my_mie_tau, vec3(0.0));
+                vec3 tau_rm_vert = max(max(f_my_atmo_tint, vec3(0.0)) - tau_mie_vert, vec3(0.0));
+
                 if (u_is_cloud_pass) {
-                    float cloud_h_km = f_my_scale_height * 0.35;
-                    tau_vertical *= exp(-cloud_h_km / H_scale);
+                    float cloud_h_km = f_my_scale_height * 0.8;
+                    float H_mie = max(f_my_mie_h, 0.5);
+                    tau_rm_vert *= exp(-cloud_h_km / H_scale);
+                    // Mie haze is concentrated near the surface: at cloud altitude
+                    // most of it is already below, so attenuate by its own scale height.
+                    tau_mie_vert *= exp(-cloud_h_km / H_mie);
                 }
-                
+                vec3 tau_vertical = tau_rm_vert + tau_mie_vert;
+
                 // Direct sunlight extinction
                 vec3 tau_direct = tau_vertical * am;
                 direct_light_tint = exp(-tau_direct);
 
-                // Downward diffuse daylight (Eddington approximation for conservative / semi-conservative scattering)
-                const float g_eff = 0.8;
-                vec3 tau_diff = (1.0 - g_eff) * tau_vertical;
-                vec3 diffuse_light_tint = (vec3(1.0) - exp(-tau_vertical)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff));
+                // Downward diffuse daylight: two-term Eddington, Rayleigh g=0 and
+                // Mie g=0.8, so blue sky-shine and white haze keep correct hues.
+                vec3 tau_diff_rm = tau_rm_vert; // (1-0)*tau
+                vec3 tau_diff_m = 0.2 * tau_mie_vert; // (1-0.8)*tau
+                vec3 diffuse_rm = (vec3(1.0) - exp(-tau_rm_vert)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff_rm));
+                vec3 diffuse_m = (vec3(1.0) - exp(-tau_mie_vert)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff_m));
+                vec3 diffuse_light_tint = diffuse_rm + diffuse_m;
 
                 incoming_light_tint = direct_light_tint + diffuse_light_tint;
             }
 
             // === Ray-Traced Cloud Shadows on Surface ===
+            // Must use the same mean deck height as the cloud shell (0.8H).
             if (!u_is_cloud_pass && f_tex_idx > 0.0 && has_clouds && f_my_scale_height > 0.0) {
-                float cloud_h_km = f_my_scale_height * 0.35;
+                float cloud_h_km = f_my_scale_height * 0.8;
                 float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
                 float eff_r = max(f_radius, f_final_radius);
                 float R_cloud = eff_r + cloud_offset_au;
@@ -962,7 +970,9 @@ void main() {
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
-                float cloud_h_km = f_my_scale_height * 0.35;
+                // Same mean deck + per-species split as sun path for consistency.
+                float cloud_h_km = f_my_scale_height * 0.8;
+                float H_mie = max(f_my_mie_h, 0.5);
 
                 vec3 view_norm = is_inside ? -N : N;
                 float NdotV = max(dot(view_norm, V), 0.0);
@@ -971,8 +981,10 @@ void main() {
                 float d_cam_km = length(cam_to_center + P_rel) * u_au_to_km;
                 float path_fraction = clamp(d_cam_km / max(am_view * H_scale, 1e-3), 0.0, 1.0);
 
-                vec3 tau_vertical = max(f_my_atmo_tint, vec3(0.0));
-                vec3 tau_vert_cloud = tau_vertical * exp(-cloud_h_km / H_scale);
+                vec3 tau_mie_vert = max(f_my_mie_tau, vec3(0.0));
+                vec3 tau_rm_vert = max(max(f_my_atmo_tint, vec3(0.0)) - tau_mie_vert, vec3(0.0));
+                vec3 tau_vert_cloud = tau_rm_vert * exp(-cloud_h_km / H_scale)
+                                    + tau_mie_vert * exp(-cloud_h_km / H_mie);
                 vec3 tau_view = tau_vert_cloud * am_view * path_fraction;
 
                 // Photopic optical depth along view ray for natural perceptual fading

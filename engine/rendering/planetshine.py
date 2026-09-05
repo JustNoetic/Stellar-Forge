@@ -108,6 +108,11 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     tau_vert_m = mie_coeffs * 1000.0 * h_m
     tau_vert_mixed = beta_mixed * 1000.0 * h_r
     props['tau_vertical'] = (tau_vert_r + tau_vert_m + tau_vert_mixed).astype(np.float32)
+    # Split components so the sphere shader can apply per-species altitude
+    # attenuation above the cloud deck: Rayleigh/mixed follow H_R, Mie follows H_Mie.
+    props['tau_vert_rm'] = (tau_vert_r + tau_vert_mixed).astype(np.float32)
+    props['tau_vert_mie'] = tau_vert_m.astype(np.float32)
+    props['h_mie_km'] = float(h_m)
     
     tau = od_r + od_m + od_o3 + od_mixed
     direct_trans = np.exp(-tau)
