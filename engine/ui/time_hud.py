@@ -138,7 +138,8 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     imgui.text(format_time_speed(effective_mult))
 
     # 6. Date / Time Display + Jump Button (Anchored to right side)
-    right_section_w = 265
+    btn_label = "Jump to Date..." if (ephemeris_mode_active or keplerian_mode_active) else "Render Timeline..."
+    right_section_w = 330
     right_x = bar_w - right_section_w - 12
     if right_x > imgui.get_cursor_pos_x():
         imgui.same_line()
@@ -148,58 +149,12 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
 
     imgui.text_colored(f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}", 0.85, 0.9, 1.0)
 
-    # Jump to date button
+    # Button to open Jump in Time & Render Timeline modal
     imgui.same_line(spacing=8)
-    if imgui.button("Jump..."):
-        jump_date[0] = cur_y
-        jump_date[1] = cur_m
-        jump_date[2] = cur_d
-        jump_date[3] = cur_h
-        jump_date[4] = cur_mn
-        jump_date[5] = cur_s
-        imgui.open_popup("JumpInTimePopup")
-
-    # Compact Jump in Time Popup
-    if imgui.begin_popup("JumpInTimePopup"):
-        imgui.text_colored("Jump in Time", 0.6, 0.9, 1.0)
-        imgui.separator()
-        imgui.push_item_width(80)
-        _, jump_date[0] = imgui.input_int("Year", jump_date[0])
-        _, jump_date[1] = imgui.input_int("Month", jump_date[1])
-        _, jump_date[2] = imgui.input_int("Day", jump_date[2])
-        imgui.pop_item_width()
-
-        imgui.text("Time (HH:MM:SS):")
-        imgui.push_item_width(38)
-        _, jump_date[3] = imgui.input_int("##Hour", jump_date[3], step=0)
-        imgui.same_line(); imgui.text(":")
-        imgui.same_line()
-        _, jump_date[4] = imgui.input_int("##Min", jump_date[4], step=0)
-        imgui.same_line(); imgui.text(":")
-        imgui.same_line()
-        _, jump_date[5] = imgui.input_int("##Sec", jump_date[5], step=0)
-        imgui.pop_item_width()
-
-        jump_date[1] = max(1, min(12, jump_date[1]))
-        jump_date[2] = max(1, min(31, jump_date[2]))
-        jump_date[3] = max(0, min(23, jump_date[3]))
-        jump_date[4] = max(0, min(59, jump_date[4]))
-        jump_date[5] = max(0, min(59, jump_date[5]))
-
-        imgui.separator()
-        if ephemeris_mode_active or keplerian_mode_active:
-            if imgui.button("Jump to Date", width=-1):
-                target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4], jump_date[5])
-                app.time_ctrl["sync_t"] = target_t
-                imgui.close_current_popup()
-        else:
-            if imgui.button("Render Timeline to Date", width=-1):
-                target_t = sim_time_from_date(jump_date[0], jump_date[1], jump_date[2], jump_date[3], jump_date[4], jump_date[5])
-                app.time_ctrl["target_t"] = target_t
-                app.time_ctrl["cancel_render"] = False
-                app.time_ctrl["render_timeline"] = True
-                imgui.close_current_popup()
-
-        imgui.end_popup()
+    if imgui.button(btn_label):
+        app.camera["show_jump_modal"] = True
+        jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+        jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
+        jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
 
     imgui.end()

@@ -2,7 +2,7 @@ import imgui
 import math
 from engine.ephemeris.system_manager import SystemManager
 
-def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, cur_y, cur_m, cur_d, display_t, switch_triggers):
+def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, cur_y, cur_m, cur_d, display_t, switch_triggers, cur_h=0, cur_mn=0, cur_s=0, cur_tz="UTC"):
     """Render the top main menu bar for Stellar-Forge."""
     trigger_system_switch = switch_triggers["switch_system"]
     trigger_ephem_switch = switch_triggers["ephem_switch"]
@@ -83,6 +83,13 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                     trigger_ephem_switch()
 
         imgui.separator()
+        jump_label = "Render Timeline to Date..." if cur_mode == 0 else "Jump to Date..."
+        if imgui.menu_item(jump_label)[0]:
+            app.camera["show_jump_modal"] = True
+            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+            jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
+            jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+
         if keplerian_mode_active:
             if imgui.menu_item("Export & Switch to N-Body Mode")[0]:
                 app.shared_state["ephemeris_mode"] = False
@@ -192,6 +199,12 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
 
     # ── Tools Menu ──
     if imgui.begin_menu("Tools"):
+        if imgui.menu_item("Jump to Date / Render Timeline...")[0]:
+            app.camera["show_jump_modal"] = True
+            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+            jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
+            jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+
         if imgui.menu_item("SPICE Ephemeris Kernel Settings...")[0]:
             app._show_ephem_setup_modal = True
 

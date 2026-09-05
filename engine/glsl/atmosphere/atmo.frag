@@ -118,6 +118,15 @@ uniform vec2 u_lowres_size;
 uniform mat4 u_inv_proj;
 uniform mat4 u_inv_view;
 
+uniform bool u_temporal_accum;
+uniform bool u_history_valid;
+uniform float u_temporal_alpha;
+uniform float u_prev_exposure;
+uniform mat4 u_prev_view_proj;
+uniform vec3 u_prev_body_offset;
+uniform sampler2D u_history_scatter;
+uniform sampler2D u_history_trans;
+
 layout(location = 0, index = 0) out vec4 out_scattered;
 layout(location = 0, index = 1) out vec4 out_transmittance;
 
@@ -791,22 +800,46 @@ void main() {
 
     float jitter = 0.5;
     if (u_stochastic_noise) {
-        vec2 frame_offset = vec2(u_frame_counter * 5.588238, u_frame_counter * 13.91849);
-        jitter = get_ign(gl_FragCoord.xy + frame_offset);
+        float base_ign = get_ign(gl_FragCoord.xy);
+        // Golden ratio Weyl sequence provides uniform 1D stratification across consecutive frames:
+        jitter = fract(base_ign + float(int(u_frame_counter) % 16) * 0.6180339887);
     }
 
     int steps = u_num_samples;
     if (u_atmo_adaptive_steps) {
-        float max_adaptive = max(float(u_num_samples), u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
-        float max_limb_len = 2.0 * sqrt(max(0.0, u_atmo_radius_km * u_atmo_radius_km - u_planet_radius_km * u_planet_radius_km));
+        float base_steps = float(u_num_samples);
+        float max_adaptive = max(base_steps, u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
+        float min_steps = clamp(base_steps * 0.15, 3.0, 8.0);
+
+        // Reference distance where ray transitions from "short ray" to "full baseline atmospheric ray"
+        // Scale height H (~8 km for Earth); 3*H covers ~95% of atmospheric density profile vertically.
+        float d_base = max(u_h_rayleigh * 3.0, 25.0);
+
+        // Density / optical thickness factor: 1.0 at sea level/dense atmosphere, decaying towards 0 at vacuum
         float alt_factor = clamp(exp(-min_altitude / max(1e-3, u_h_rayleigh * 3.0)), 0.0, 1.0);
-        float length_factor = clamp(ray_len / max(1e-3, max_limb_len), 0.0, 1.0);
-        float importance = alt_factor * length_factor;
-        float continuous_steps = mix(float(u_num_samples), max_adaptive, importance);
-        // Stochastic dithering across fractional step count boundaries:
-        // Converts sharp concentric integer step rings into imperceptible smooth transitions
-        float step_dither = u_stochastic_noise ? (jitter - 0.5) : 0.0;
-        steps = int(clamp(continuous_steps + step_dither + 0.5, float(u_num_samples), max_adaptive));
+
+        float continuous_steps;
+        if (ray_len <= d_base) {
+            // Short ray to ground / near surface: steps scale down proportionally to distance traveled
+            float t_short = clamp(ray_len / d_base, 0.0, 1.0);
+            continuous_steps = mix(min_steps, base_steps, t_short);
+        } else {
+            // Long ray through thick atmosphere into infinity / horizon: scales up using extra steps
+            float d_max = 2.0 * sqrt(max(0.0, u_atmo_radius_km * u_atmo_radius_km - u_planet_radius_km * u_planet_radius_km));
+            float t_long = clamp((ray_len - d_base) / max(1e-3, d_max - d_base), 0.0, 1.0);
+
+            // Sub-linear response (sqrt) ensures upward rays to infinity (zenith ~100 km) receive meaningful extra steps,
+            // while horizon/limb chords (~1000-2000 km) scale up to max_adaptive.
+            float length_boost = sqrt(t_long);
+            float extra_importance = length_boost * alt_factor;
+
+            continuous_steps = mix(base_steps, max_adaptive, extra_importance);
+        }
+
+        // Softened stochastic dithering across fractional step count boundaries:
+        // Converts sharp integer step rings into imperceptible smooth transitions without high-frequency flicker
+        float step_dither = u_stochastic_noise ? (jitter - 0.5) * 0.5 : 0.0;
+        steps = int(clamp(continuous_steps + step_dither + 0.5, min_steps, max_adaptive));
     }
     vec3 scattered = vec3(0.0);
     vec3 final_transmittance = vec3(1.0);
@@ -1352,6 +1385,52 @@ void main() {
 
     if (u_hdr_enabled) {
         scattered *= u_exposure;
+    }
+
+    if (u_temporal_accum && u_history_valid) {
+        float d_repr_km;
+        if (hits_surface) {
+            d_repr_km = max(s_end, 0.001);
+        } else {
+            float cam_r = length(cam_local_sph);
+            float cos_zenith = dot(cam_local_sph, ray_dir_sph) / max(cam_r, 1e-3);
+            float sin_elev = max(0.05, cos_zenith);
+            float eff_h = u_h_rayleigh / sin_elev;
+            float chord = max(0.0, s_end - s_start);
+            float offset = clamp(max(s_closest - s_start, eff_h), chord * 0.05, chord * 0.75);
+            d_repr_km = s_start + offset;
+        }
+        float d_repr_au = d_repr_km / u_au_to_km;
+
+        vec3 p_repr_world = u_camera_pos + d_repr_au * ray_dir;
+        vec3 p_body_local = p_repr_world - u_body_offset;
+        vec3 p_prev_world = p_body_local + u_prev_body_offset;
+
+        vec4 clip_prev = u_prev_view_proj * vec4(p_prev_world, 1.0);
+        if (clip_prev.w > 1e-13) {
+            vec2 uv_prev = (clip_prev.xy / clip_prev.w) * 0.5 + 0.5;
+            if (uv_prev.x >= 0.0 && uv_prev.x <= 1.0 && uv_prev.y >= 0.0 && uv_prev.y <= 1.0) {
+                vec4 hist_s = texture(u_history_scatter, uv_prev);
+                vec4 hist_t = texture(u_history_trans, uv_prev);
+
+                if (hist_t.a > 0.001) {
+                    float exp_ratio = (u_prev_exposure > 1e-6) ? (u_exposure / u_prev_exposure) : 1.0;
+                    vec3 hist_s_curr = hist_s.rgb * exp_ratio;
+
+                    // Range clamping against current frame raymarch result to prevent ghosting
+                    vec3 s_min = max(vec3(0.0), scattered * 0.35 - 0.02);
+                    vec3 s_max = scattered * 2.5 + 0.05;
+                    vec3 clamped_hist_s = clamp(hist_s_curr, s_min, s_max);
+
+                    vec3 t_min = max(vec3(0.0), transmittance * 0.6 - 0.02);
+                    vec3 t_max = min(vec3(1.0), transmittance * 1.4 + 0.02);
+                    vec3 clamped_hist_t = clamp(hist_t.rgb, t_min, t_max);
+
+                    scattered = mix(clamped_hist_s, scattered, u_temporal_alpha);
+                    transmittance = mix(clamped_hist_t, transmittance, u_temporal_alpha);
+                }
+            }
+        }
     }
 
     out_scattered = vec4(scattered, 1.0);

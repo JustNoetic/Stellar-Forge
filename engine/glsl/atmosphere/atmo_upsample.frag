@@ -115,6 +115,32 @@ void main() {
     if (t01.a < 0.001) t01 = vec4(1.0);
     if (t11.a < 0.001) t11 = vec4(1.0);
 
-    out_scattered = s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11;
+    vec4 base_scatter = s00 * w00 + s10 * w10 + s01 * w01 + s11 * w11;
+
+    // Cross-bilateral low-res spatial filter (Solution B):
+    // Cleans residual dither checkerboard while strictly preserving silhouettes
+    vec4 filt_scatter = base_scatter * 0.4;
+    float filt_w = 0.4;
+
+    vec2 step_uv = 1.0 / u_lowres_size;
+    vec2 cross_offsets[4] = vec2[](
+        vec2(-step_uv.x, 0.0), vec2(step_uv.x, 0.0),
+        vec2(0.0, -step_uv.y), vec2(0.0, step_uv.y)
+    );
+
+    for (int k = 0; k < 4; k++) {
+        vec2 tap_uv = v_texcoord + cross_offsets[k];
+        vec4 tap_trans = texture(u_lowres_trans, tap_uv);
+        if (tap_trans.a > 0.001) {
+            float tap_depth = linearize_depth(texture(u_highres_depth, tap_uv).r);
+            float d_diff = abs(tap_depth - high_depth);
+            float dw = exp(-d_diff / depth_tol);
+            float w = 0.15 * dw;
+            filt_scatter += texture(u_lowres_scatter, tap_uv) * w;
+            filt_w += w;
+        }
+    }
+
+    out_scattered = (filt_w > 1e-4) ? (filt_scatter / filt_w) : base_scatter;
     out_transmittance = t00 * w00 + t10 * w10 + t01 * w01 + t11 * w11;
 }

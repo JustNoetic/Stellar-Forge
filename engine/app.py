@@ -494,6 +494,8 @@ class App(InputHandlerMixin):
             "atmo_resolution": 1.0,
             "atmo_vrs_threshold_px": 100.0,
             "atmo_stochastic": True,
+            "atmo_temporal_accum": True,
+            "atmo_temporal_blend": 0.90,
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
             "atmo_adaptive_steps_max": 128,
@@ -549,9 +551,17 @@ class App(InputHandlerMixin):
         self.prog_atmo_lowres = None
         self.prog_atmo_upsample = None
         self.quad_vao_atmo_upsample = None
-        self.atmo_lowres_fbo = None
-        self.atmo_lowres_scatter_tex = None
-        self.atmo_lowres_trans_tex = None
+        self.atmo_history_valid = {0: False, 1: False, 2: False}
+        self.atmo_ping_pong_idx = {0: 0, 1: 0, 2: 0}
+        self.atmo_lowres_fbo = {0: [None, None], 1: [None, None], 2: [None, None]}
+        self.atmo_lowres_scatter_tex = {0: [None, None], 1: [None, None], 2: [None, None]}
+        self.atmo_lowres_trans_tex = {0: [None, None], 1: [None, None], 2: [None, None]}
+        self.prev_atmo_view_proj = None
+        self.prev_atmo_cam_pos = None
+        self.prev_atmo_exposure = 1.0
+        self.prev_atmo_body_offsets = {}
+        self.prev_atmo_body_offsets_cmp = {}
+        self.last_atmo_temporal_accum = None
         
         self.depth_texture = None
         self.prev_cam_origin = None
@@ -631,6 +641,8 @@ class App(InputHandlerMixin):
                 "atmo_resolution": self.camera.get("atmo_resolution", 1.0),
                 "atmo_vrs_threshold_px": self.camera.get("atmo_vrs_threshold_px", 100.0),
                 "atmo_stochastic": self.camera.get("atmo_stochastic", True),
+                "atmo_temporal_accum": self.camera.get("atmo_temporal_accum", True),
+                "atmo_temporal_blend": self.camera.get("atmo_temporal_blend", 0.90),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
                 "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
@@ -1340,6 +1352,10 @@ class App(InputHandlerMixin):
                 p['u_multi_scatter_lut'].value = 3
             if 'u_ring_gradients' in p:
                 p['u_ring_gradients'].value = 0
+            if 'u_history_scatter' in p:
+                p['u_history_scatter'].value = 10
+            if 'u_history_trans' in p:
+                p['u_history_trans'].value = 11
         
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -2771,10 +2787,15 @@ class App(InputHandlerMixin):
             else:
                 msaa_samples = self.camera.get("msaa_samples", 4)
                 atmo_res = float(self.camera.get("atmo_resolution", 1.0))
-            if self.last_fb_size != (self.fb_width, self.fb_height) or self.last_msaa_samples != msaa_samples or self.last_atmo_res != atmo_res:
+            temporal_accum = self.camera.get("atmo_temporal_accum", True)
+            if (self.last_fb_size != (self.fb_width, self.fb_height) or 
+                self.last_msaa_samples != msaa_samples or 
+                self.last_atmo_res != atmo_res or 
+                getattr(self, "last_atmo_temporal_accum", None) != temporal_accum):
                 self.last_fb_size = (self.fb_width, self.fb_height)
                 self.last_msaa_samples = msaa_samples
                 self.last_atmo_res = atmo_res
+                self.last_atmo_temporal_accum = temporal_accum
                 
                 # Release old
                 if self.hdr_resolve_fbo: self.hdr_resolve_fbo.release(); self.hdr_resolve_fbo = None
@@ -2783,9 +2804,17 @@ class App(InputHandlerMixin):
                 if self.orbit_resolve_fbo: self.orbit_resolve_fbo.release(); self.orbit_resolve_fbo = None
                 if self.orbit_resolved_tex: self.orbit_resolved_tex.release(); self.orbit_resolved_tex = None
                 if self.depth_texture: self.depth_texture.release(); self.depth_texture = None
-                if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
-                if self.atmo_lowres_scatter_tex: self.atmo_lowres_scatter_tex.release(); self.atmo_lowres_scatter_tex = None
-                if self.atmo_lowres_trans_tex: self.atmo_lowres_trans_tex.release(); self.atmo_lowres_trans_tex = None
+                if hasattr(self, "atmo_lowres_fbo") and isinstance(self.atmo_lowres_fbo, dict):
+                    for mode in (0, 1, 2):
+                        for idx in (0, 1):
+                            if self.atmo_lowres_fbo[mode][idx]: self.atmo_lowres_fbo[mode][idx].release(); self.atmo_lowres_fbo[mode][idx] = None
+                            if self.atmo_lowres_scatter_tex[mode][idx]: self.atmo_lowres_scatter_tex[mode][idx].release(); self.atmo_lowres_scatter_tex[mode][idx] = None
+                            if self.atmo_lowres_trans_tex[mode][idx]: self.atmo_lowres_trans_tex[mode][idx].release(); self.atmo_lowres_trans_tex[mode][idx] = None
+                        self.atmo_history_valid[mode] = False
+                elif getattr(self, "atmo_lowres_fbo", None):
+                    if self.atmo_lowres_fbo: self.atmo_lowres_fbo.release(); self.atmo_lowres_fbo = None
+                    if self.atmo_lowres_scatter_tex: self.atmo_lowres_scatter_tex.release(); self.atmo_lowres_scatter_tex = None
+                    if self.atmo_lowres_trans_tex: self.atmo_lowres_trans_tex.release(); self.atmo_lowres_trans_tex = None
                 if getattr(self, "accum_fbo_a", None): self.accum_fbo_a.release(); self.accum_fbo_a = None
                 if getattr(self, "accum_tex_a", None): self.accum_tex_a.release(); self.accum_tex_a = None
                 if getattr(self, "accum_fbo_b", None): self.accum_fbo_b.release(); self.accum_fbo_b = None
@@ -2818,24 +2847,33 @@ class App(InputHandlerMixin):
                 self.photo_accum_count = 0
                 self.photo_accum_last_cam = None
                 
-                if atmo_res < 0.999:
+                if atmo_res < 0.999 or temporal_accum:
                     low_w = max(1, int(self.fb_width * atmo_res))
                     low_h = max(1, int(self.fb_height * atmo_res))
-                    self.atmo_lowres_scatter_tex = ctx.texture((low_w, low_h), 4, dtype='f4')
-                    self.atmo_lowres_scatter_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    self.atmo_lowres_scatter_tex.repeat_x = False
-                    self.atmo_lowres_scatter_tex.repeat_y = False
-                    
-                    self.atmo_lowres_trans_tex = ctx.texture((low_w, low_h), 4, dtype='f4')
-                    self.atmo_lowres_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    self.atmo_lowres_trans_tex.repeat_x = False
-                    self.atmo_lowres_trans_tex.repeat_y = False
-                    
-                    self.atmo_lowres_fbo = ctx.framebuffer(color_attachments=[self.atmo_lowres_scatter_tex, self.atmo_lowres_trans_tex])
+                    for mode in (0, 1, 2):
+                        for idx in (0, 1):
+                            s_tex = ctx.texture((low_w, low_h), 4, dtype='f4')
+                            s_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                            s_tex.repeat_x = False
+                            s_tex.repeat_y = False
+                            self.atmo_lowres_scatter_tex[mode][idx] = s_tex
+                            
+                            t_tex = ctx.texture((low_w, low_h), 4, dtype='f4')
+                            t_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                            t_tex.repeat_x = False
+                            t_tex.repeat_y = False
+                            self.atmo_lowres_trans_tex[mode][idx] = t_tex
+                            
+                            self.atmo_lowres_fbo[mode][idx] = ctx.framebuffer(color_attachments=[s_tex, t_tex])
+                        self.atmo_history_valid[mode] = False
+                        self.atmo_ping_pong_idx[mode] = 0
                 else:
-                    self.atmo_lowres_fbo = None
-                    self.atmo_lowres_scatter_tex = None
-                    self.atmo_lowres_trans_tex = None
+                    self.atmo_lowres_fbo = {0: [None, None], 1: [None, None], 2: [None, None]}
+                    self.atmo_lowres_scatter_tex = {0: [None, None], 1: [None, None], 2: [None, None]}
+                    self.atmo_lowres_trans_tex = {0: [None, None], 1: [None, None], 2: [None, None]}
+                    for mode in (0, 1, 2):
+                        self.atmo_history_valid[mode] = False
+                        self.atmo_ping_pong_idx[mode] = 0
                 
                 if msaa_samples > 0:
                     orbit_msaa_color = ctx.renderbuffer((self.fb_width, self.fb_height), components=4, samples=msaa_samples, dtype='f4')
@@ -2937,6 +2975,12 @@ class App(InputHandlerMixin):
             if self.comparison_enabled:
                 compute_barycenters(self.pos_snap_cmp, self.vel_snap_cmp, self.mass_snap_cmp, self.parent_snap_cmp,
                                     self.subsys_pos_buf_cmp, self.subsys_vel_buf_cmp, self.subsys_mass_buf_cmp)
+
+            # Invalidate atmosphere temporal history on tracking target change to prevent ghosting
+            if cam["tracking_idx"] != getattr(self, "_last_atmo_tracking_idx", None):
+                self._last_atmo_tracking_idx = cam["tracking_idx"]
+                for m in (0, 1, 2):
+                    self.atmo_history_valid[m] = False
 
             # Resolve the camera pivot (tracked body / barycenter, or free target)
             if cam["tracking_idx"] is not None:
@@ -4298,6 +4342,19 @@ class App(InputHandlerMixin):
                 if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
                 if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
                 if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
+                
+                is_temporal = self.camera.get("atmo_temporal_accum", True) and getattr(self, "prev_atmo_view_proj", None) is not None
+                hist_valid = is_temporal and self.atmo_history_valid.get(clip_mode, False)
+                temporal_alpha = 1.0 - float(self.camera.get("atmo_temporal_blend", 0.90))
+
+                if 'u_temporal_accum' in cur_prog: cur_prog['u_temporal_accum'].value = is_temporal
+                if 'u_history_valid' in cur_prog: cur_prog['u_history_valid'].value = hist_valid
+                if 'u_temporal_alpha' in cur_prog: cur_prog['u_temporal_alpha'].value = temporal_alpha
+                if 'u_prev_exposure' in cur_prog: cur_prog['u_prev_exposure'].value = float(getattr(self, "prev_atmo_exposure", self.camera.get("exposure", 1.0)))
+                if 'u_exposure' in cur_prog: cur_prog['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+                if 'u_prev_view_proj' in cur_prog and getattr(self, "prev_atmo_view_proj", None) is not None:
+                    cur_prog['u_prev_view_proj'].write(self.prev_atmo_view_proj)
+
                 AU_TO_KM = 149597870.7
             
                 if 'u_num_ring_planes' in cur_prog: cur_prog['u_num_ring_planes'].value = n_ring_planes
@@ -4329,9 +4386,13 @@ class App(InputHandlerMixin):
                     if is_cmp:
                         body_pos_rel = cmp_pos_rel[bi].astype('f4')
                         body_idx_in_unified = num_bodies + bi
+                        prev_offset = self.prev_atmo_body_offsets_cmp.get(bi, body_pos_rel)
                     else:
                         body_pos_rel = pos_rel_all[bi]
                         body_idx_in_unified = bi
+                        prev_offset = self.prev_atmo_body_offsets.get(bi, body_pos_rel)
+                    if 'u_prev_body_offset' in cur_prog:
+                        cur_prog['u_prev_body_offset'].write(prev_offset.astype('f4'))
     
                     dist_to_body = math.sqrt(sq_dist)
                     apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
@@ -4627,7 +4688,12 @@ class App(InputHandlerMixin):
                 if not atmos_to_march:
                     return
                 atmo_res = 1.0 if getattr(self, "_screenshot_capturing", False) else float(self.camera.get("atmo_resolution", 1.0))
-                use_vrs = atmo_res < 0.999 and getattr(self, "atmo_lowres_fbo", None) is not None
+                temporal_accum = self.camera.get("atmo_temporal_accum", True)
+                has_atmo_fbos = (
+                    isinstance(self.atmo_lowres_fbo, dict) and 
+                    self.atmo_lowres_fbo.get(clip_mode, [None])[0] is not None
+                )
+                use_vrs = (atmo_res < 0.999 or temporal_accum) and has_atmo_fbos
                 
                 pending_lowres_atmos = []
                 
@@ -4635,12 +4701,16 @@ class App(InputHandlerMixin):
                     if not pending_lowres_atmos:
                         return
                         
-                    # 1. Low-Res Pass (Inner Region)
-                    self.atmo_lowres_fbo.use()
-                    ctx.viewport = (0, 0, self.atmo_lowres_fbo.width, self.atmo_lowres_fbo.height)
-                    self.atmo_lowres_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
+                    curr_idx = self.atmo_ping_pong_idx.get(clip_mode, 0)
+                    prev_idx = 1 - curr_idx
+                    target_fbo = self.atmo_lowres_fbo[clip_mode][curr_idx]
+                        
+                    # 1. Low-Res / Atmosphere Buffer Pass (Inner Region)
+                    target_fbo.use()
+                    ctx.viewport = (0, 0, target_fbo.width, target_fbo.height)
+                    target_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
                     
-                    low_size = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                    low_size = (float(target_fbo.width), float(target_fbo.height))
                     if 'u_lowres_size' in prog_atmo_lowres:
                         prog_atmo_lowres['u_lowres_size'].value = low_size
                     if 'u_lowres_size' in prog_atmo:
@@ -4649,6 +4719,12 @@ class App(InputHandlerMixin):
                         prog_atmo_lowres['u_screen_res'].value = low_size
                     if self.depth_texture:
                         self.depth_texture.use(location=9)
+                    
+                    # Bind previous history textures for temporal reprojection
+                    if self.atmo_lowres_scatter_tex[clip_mode][prev_idx]:
+                        self.atmo_lowres_scatter_tex[clip_mode][prev_idx].use(location=10)
+                    if self.atmo_lowres_trans_tex[clip_mode][prev_idx]:
+                        self.atmo_lowres_trans_tex[clip_mode][prev_idx].use(location=11)
                         
                     render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=True)
                     
@@ -4660,8 +4736,8 @@ class App(InputHandlerMixin):
                     ctx.disable(moderngl.DEPTH_TEST)
                     ctx.depth_mask = False
                     
-                    self.atmo_lowres_scatter_tex.use(location=0)
-                    self.atmo_lowres_trans_tex.use(location=1)
+                    self.atmo_lowres_scatter_tex[clip_mode][curr_idx].use(location=0)
+                    self.atmo_lowres_trans_tex[clip_mode][curr_idx].use(location=1)
                     if self.depth_texture:
                         self.depth_texture.use(location=9)
                         
@@ -4670,33 +4746,37 @@ class App(InputHandlerMixin):
                     if 'u_far' in self.prog_atmo_upsample:
                         self.prog_atmo_upsample['u_far'].value = far
                     if 'u_lowres_size' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_lowres_size'].value = (float(self.atmo_lowres_fbo.width), float(self.atmo_lowres_fbo.height))
+                        self.prog_atmo_upsample['u_lowres_size'].value = (float(target_fbo.width), float(target_fbo.height))
                     if 'u_vrs_enabled' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_vrs_enabled'].value = True
+                        self.prog_atmo_upsample['u_vrs_enabled'].value = (atmo_res < 0.999)
                         
                     self.quad_vao_atmo_upsample.render(moderngl.TRIANGLE_STRIP)
                     
                     if 'u_vrs_enabled' in self.prog_atmo_upsample:
                         self.prog_atmo_upsample['u_vrs_enabled'].value = False
                         
-                    # 3. High-Res Pass (Edge Region)
-                    # Stay bound to hdr_resolve_fbo
-                    self.atmo_lowres_trans_tex.use(location=2)
-                    if 'u_lowres_trans' in prog_atmo:
-                        prog_atmo['u_lowres_trans'].value = 2
-                    if 'u_vrs_highres_pass' in prog_atmo:
-                        prog_atmo['u_vrs_highres_pass'].value = True
-                    if 'u_screen_res' in prog_atmo:
-                        prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                    # 3. High-Res Pass (Edge Region only when VRS downsampling is active)
+                    if atmo_res < 0.999:
+                        self.atmo_lowres_trans_tex[clip_mode][curr_idx].use(location=2)
+                        if 'u_lowres_trans' in prog_atmo:
+                            prog_atmo['u_lowres_trans'].value = 2
+                        if 'u_vrs_highres_pass' in prog_atmo:
+                            prog_atmo['u_vrs_highres_pass'].value = True
+                        if 'u_screen_res' in prog_atmo:
+                            prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                            
+                        render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=False)
                         
-                    render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=False)
-                    
-                    if 'u_vrs_highres_pass' in prog_atmo:
-                        prog_atmo['u_vrs_highres_pass'].value = False
+                        if 'u_vrs_highres_pass' in prog_atmo:
+                            prog_atmo['u_vrs_highres_pass'].value = False
                         
                     ctx.depth_mask = True
                     ctx.enable(moderngl.DEPTH_TEST)
                     ctx.disable(moderngl.BLEND)
+                    
+                    # Advance ping-pong index and mark history valid for this clip mode
+                    self.atmo_ping_pong_idx[clip_mode] = 1 - self.atmo_ping_pong_idx[clip_mode]
+                    self.atmo_history_valid[clip_mode] = True
                     
                     pending_lowres_atmos.clear()
 
@@ -4704,7 +4784,7 @@ class App(InputHandlerMixin):
                     dist_to_body = math.sqrt(sq_dist)
                     apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
                     
-                    vrs_threshold = float(self.camera.get("atmo_vrs_threshold_px", 100.0))
+                    vrs_threshold = float(self.camera.get("atmo_vrs_threshold_px", 100.0)) if atmo_res < 0.999 else 0.0
                     is_this_lowres = use_vrs and apparent_px >= vrs_threshold
                     
                     if is_this_lowres:
@@ -4999,6 +5079,14 @@ class App(InputHandlerMixin):
             if ringless_atmos:
                 execute_atmosphere_pass(0, ringless_atmos)
             _perf_gpu_end(_gq)
+
+            # Update temporal reprojection history state for next frame
+            self.prev_atmo_view_proj = np.copy(vp_matrix.astype('f4'))
+            self.prev_atmo_cam_pos = np.copy(cam_pos)
+            self.prev_atmo_exposure = float(self.camera.get("exposure", 1.0))
+            self.prev_atmo_body_offsets = {a['body_idx']: np.copy(pos_rel_all[a['body_idx']]) for a in atmo_bodies}
+            if self.comparison_enabled:
+                self.prev_atmo_body_offsets_cmp = {a['body_idx']: np.copy(cmp_pos_rel[a['body_idx']]) for a in self.atmo_bodies_cmp}
 
             # --- Pass 2.5: Dynamic Cloud Layer Pass (Rendered over atmosphere with physical view-transmittance fading) ---
             if 'u_is_cloud_pass' in prog_spheres and getattr(self, 'body_textures_ssbo', None) is not None:

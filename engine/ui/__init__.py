@@ -64,7 +64,11 @@ def render_ui(
         star_idx,
         cur_y, cur_m, cur_d,
         display_t,
-        switch_triggers
+        switch_triggers,
+        cur_h=cur_h,
+        cur_mn=cur_mn,
+        cur_s=cur_s,
+        cur_tz=cur_tz
     )
 
     # 2. System Outliner (Left Panel)
@@ -134,5 +138,9 @@ def render_ui(
         visual_arr,
         cur_y, cur_m, cur_d,
         display_t,
-        switch_triggers
+        switch_triggers,
+        cur_h=cur_h,
+        cur_mn=cur_mn,
+        cur_s=cur_s,
+        cur_tz=cur_tz
     )

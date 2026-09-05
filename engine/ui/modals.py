@@ -4,10 +4,10 @@ import os
 import imgui
 from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
 from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic
-from engine.rendering.render_utils import compute_surface_albedo, format_distance_au
+from engine.rendering.render_utils import compute_surface_albedo, format_distance_au, sim_time_from_date
 from engine.ephemeris.system_manager import SystemManager
 
-def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, num_bodies, mass_snap, pos_snap_render, vel_snap_render, visual_arr, cur_y, cur_m, cur_d, display_t, switch_triggers):
+def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, num_bodies, mass_snap, pos_snap_render, vel_snap_render, visual_arr, cur_y, cur_m, cur_d, display_t, switch_triggers, cur_h=0, cur_mn=0, cur_s=0, cur_tz="UTC"):
     """Render all popup dialogs and modal windows."""
     load_system_from_data = switch_triggers["load_system"]
     trigger_ephem_switch = switch_triggers["ephem_switch"]
@@ -65,6 +65,19 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 if changed_stoch:
                     app.camera["atmo_stochastic"] = stochastic_steps
                     settings_changed = True
+
+                temporal_accum = app.camera.get("atmo_temporal_accum", True)
+                changed_ta, temporal_accum = imgui.checkbox("Temporal Integration (TAA)", temporal_accum)
+                if changed_ta:
+                    app.camera["atmo_temporal_accum"] = temporal_accum
+                    settings_changed = True
+
+                if temporal_accum:
+                    temporal_blend = float(app.camera.get("atmo_temporal_blend", 0.90))
+                    changed_tb, temporal_blend = imgui.slider_float("Temporal History Weight", temporal_blend, 0.50, 0.98, "%.2f")
+                    if changed_tb:
+                        app.camera["atmo_temporal_blend"] = temporal_blend
+                        settings_changed = True
 
             # Shadow Caster Budget
             caster_budget = app.camera.get("shadow_caster_budget", 32)
@@ -396,3 +409,96 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             app._show_ephem_download_modal = False
             imgui.close_current_popup()
         imgui.end_popup()
+
+    # ── 6. Jump to Date / Render Timeline Modal ──
+    if app.camera.get("show_jump_modal", False):
+        imgui.set_next_window_size(390, 440, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_position(app.fb_width // 2 - 195, app.fb_height // 2 - 220, imgui.FIRST_USE_EVER)
+        expanded, app.camera["show_jump_modal"] = imgui.begin("Jump to Date / Render Timeline###jump_modal", True)
+        if expanded:
+            ephem_active = app.shared_state.get("ephemeris_mode", False)
+            kepler_active = app.shared_state.get("keplerian_mode", False)
+
+            # Mode Header
+            if ephem_active:
+                imgui.text_colored("Mode: NASA SPICE Ephemeris Playback", 0.4, 0.8, 1.0)
+            elif kepler_active:
+                imgui.text_colored("Mode: Analytical Keplerian Orbiting", 0.4, 0.8, 1.0)
+            else:
+                imgui.text_colored("Mode: N-Body Simulation (IAS15)", 0.4, 0.8, 1.0)
+
+            imgui.text_colored(f"Current UTC: {cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}", 0.7, 0.85, 1.0)
+            imgui.separator()
+
+            jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
+
+            imgui.text("Target Date:")
+            imgui.push_item_width(90)
+            _, jd[0] = imgui.input_int("Year", jd[0])
+            imgui.same_line()
+            _, jd[1] = imgui.input_int("Month", jd[1])
+            imgui.same_line()
+            _, jd[2] = imgui.input_int("Day", jd[2])
+            imgui.pop_item_width()
+
+            imgui.text("Target Time (UTC):")
+            imgui.push_item_width(50)
+            _, jd[3] = imgui.input_int("##Hour", jd[3], step=0)
+            imgui.same_line(); imgui.text(":")
+            imgui.same_line()
+            _, jd[4] = imgui.input_int("##Min", jd[4], step=0)
+            imgui.same_line(); imgui.text(":")
+            imgui.same_line()
+            _, jd[5] = imgui.input_int("##Sec", jd[5], step=0)
+            imgui.pop_item_width()
+
+            # Date clamping
+            jd[1] = max(1, min(12, jd[1]))
+            jd[2] = max(1, min(31, jd[2]))
+            jd[3] = max(0, min(23, jd[3]))
+            jd[4] = max(0, min(59, jd[4]))
+            jd[5] = max(0, min(59, jd[5]))
+
+            # Quick Presets
+            imgui.separator()
+            imgui.text_colored("Quick Presets:", 0.6, 0.9, 1.0)
+            if imgui.button("Today / Now"):
+                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                jd[0], jd[1], jd[2] = now_dt.year, now_dt.month, now_dt.day
+                jd[3], jd[4], jd[5] = now_dt.hour, now_dt.minute, now_dt.second
+
+            imgui.same_line()
+            if imgui.button("J2000"):
+                jd[0], jd[1], jd[2], jd[3], jd[4], jd[5] = 2000, 1, 1, 12, 0, 0
+
+            imgui.same_line()
+            if imgui.button("+1 Year"):
+                jd[0] += 1
+
+            imgui.same_line()
+            if imgui.button("-1 Year"):
+                jd[0] -= 1
+
+            imgui.separator()
+            # Action button
+            if ephem_active or kepler_active:
+                imgui.text_wrapped("Directly synchronizes the celestial positions to the specified target epoch.")
+                imgui.spacing()
+                if imgui.button("🚀 Jump to Date", width=-1):
+                    target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5])
+                    app.time_ctrl["sync_t"] = target_t
+                    app.camera["show_jump_modal"] = False
+            else:
+                imgui.text_wrapped("Integrates an accurate 1,000-step N-body trajectory from the current time to the target date, opening an interactive timeline scrubber.")
+                imgui.spacing()
+                if imgui.button("⏳ Render Timeline to Date", width=-1):
+                    target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5])
+                    app.time_ctrl["target_t"] = target_t
+                    app.time_ctrl["cancel_render"] = False
+                    app.time_ctrl["render_timeline"] = True
+                    app.camera["show_jump_modal"] = False
+
+            imgui.spacing()
+            if imgui.button("Close", width=-1):
+                app.camera["show_jump_modal"] = False
+        imgui.end()
