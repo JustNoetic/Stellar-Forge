@@ -1,0 +1,68 @@
+layout (local_size_x = 256, local_size_y = 1) in;
+
+#ifdef ROW
+// Kernel Row Pass: Sample, center DC, pad, and row FFT -> transposed into tmpFFT
+uniform sampler2D u_kernel_tex;
+uniform float u_kernel_scale;
+layout (rgba32f, binding = 0) uniform writeonly image2D tmpFFT;
+
+vec4 sampleCenterKernel(uint x, uint y) {
+  int sx = int(x);
+  int sy = int(y);
+  if (sx >= int(FFT_SIZE / 2)) sx -= int(FFT_SIZE);
+  if (sy >= int(FFT_SIZE / 2)) sy -= int(FFT_SIZE);
+
+  float scale = clamp(u_kernel_scale, 0.02, 1.0);
+  float halfK = float(KERNEL_SIZE / 2) * scale;
+  float r = max(abs(float(sx)), abs(float(sy)));
+  if (r >= halfK) {
+    return vec4(0.0);
+  }
+
+  vec2 uv = 0.5 + vec2(sx, sy) / (float(KERNEL_SIZE) * scale);
+  vec3 col = textureLod(u_kernel_tex, uv, 0.0).rgb;
+
+  // Smooth edge windowing over 4 pixels prevents Gibbs ringing and step discontinuities
+  float edge_fade = smoothstep(halfK, max(halfK - 4.0, 0.0), r);
+  return vec4(col * edge_fade, 0.0);
+}
+
+void main() {
+  uint y = gl_GlobalInvocationID.y;
+  uint x = gl_GlobalInvocationID.x;
+
+  vec4 t0 = sampleCenterKernel(x, y);
+  vec4 t1 = sampleCenterKernel(x + N_4_1, y);
+  vec4 t2 = sampleCenterKernel(x + N_4_2, y);
+  vec4 t3 = sampleCenterKernel(x + N_4_3, y);
+
+  rgba1DFFT(x, t0, t1, t2, t3);
+
+  imageStore(tmpFFT, ivec2(y, x),         t0);
+  imageStore(tmpFFT, ivec2(y, x + N_4_1), t1);
+  imageStore(tmpFFT, ivec2(y, x + N_4_2), t2);
+  imageStore(tmpFFT, ivec2(y, x + N_4_3), t3);
+}
+
+#else
+// Kernel Column Pass: Col FFT on tmpFFT -> transposed into kerFFT (normalized)
+layout (rgba32f, binding = 0) uniform readonly image2D tmpFFT;
+layout (rgba32f, binding = 1) uniform writeonly image2D kerFFT;
+
+void main() {
+  uint y = gl_GlobalInvocationID.y;
+  uint x = gl_GlobalInvocationID.x;
+
+  vec4 t0 = imageLoad(tmpFFT, ivec2(x, y));
+  vec4 t1 = imageLoad(tmpFFT, ivec2(x + N_4_1, y));
+  vec4 t2 = imageLoad(tmpFFT, ivec2(x + N_4_2, y));
+  vec4 t3 = imageLoad(tmpFFT, ivec2(x + N_4_3, y));
+
+  rgba1DFFT(x, t0, t1, t2, t3);
+
+  imageStore(kerFFT, ivec2(y, x),         t0 * NORM);
+  imageStore(kerFFT, ivec2(y, x + N_4_1), t1 * NORM);
+  imageStore(kerFFT, ivec2(y, x + N_4_2), t2 * NORM);
+  imageStore(kerFFT, ivec2(y, x + N_4_3), t3 * NORM);
+}
+#endif

@@ -4,6 +4,9 @@ out vec4 out_color;
 uniform sampler2D u_main_texture;
 uniform sampler2D u_bloom_texture;
 uniform float u_bloom_intensity;
+uniform sampler2D u_conv_bloom_texture;
+uniform float u_conv_bloom_intensity;
+uniform vec2 u_conv_bloom_scale;
 
 // ACES Tone Mapping
 vec3 ACESFilm(vec3 x) {
@@ -18,8 +21,12 @@ vec3 ACESFilm(vec3 x) {
 void main() {
     vec3 hdr_color = texture(u_main_texture, v_texcoord).rgb;
     vec3 bloom_color = texture(u_bloom_texture, v_texcoord).rgb;
+    vec3 conv_color = vec3(0.0);
+    if (u_conv_bloom_intensity > 0.0) {
+        conv_color = texture(u_conv_bloom_texture, v_texcoord * u_conv_bloom_scale).rgb;
+    }
     
-    vec3 final_color = hdr_color + bloom_color * u_bloom_intensity;
+    vec3 final_color = hdr_color + bloom_color * u_bloom_intensity + conv_color * u_conv_bloom_intensity;
     
     // Measure luminance before tone mapping to detect extreme glare
     float pre_luma = dot(final_color, vec3(0.2126, 0.7152, 0.0722));

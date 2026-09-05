@@ -1,0 +1,125 @@
+layout (local_size_x = 256, local_size_y = 1) in;
+
+#ifdef ROW
+// Scene Row Pass: Downsample, soft-knee threshold, aspect padding, and row FFT
+uniform sampler2D u_scene_tex;
+uniform float u_aspect_ratio;
+uniform float u_threshold;
+uniform float u_knee;
+layout (rgba32f, binding = 0) uniform writeonly image2D tmpFFT;
+
+vec3 softKnee(vec3 color) {
+  float l = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+  if (l <= 1e-6) return vec3(0.0);
+
+  float knee = max(u_knee, 0.001);
+  float rq = clamp(l - u_threshold + knee, 0.0, 2.0 * knee);
+  float soft = (rq * rq) / (4.0 * knee + 1e-5);
+  float base_contrib = max(soft, l - u_threshold);
+
+  // Asymptotic continuous physical rolloff tail:
+  // Decays as l^2 / (4 * threshold) below knee, providing smooth C1 continuity
+  // without abrupt hard-cutoff cliffs for distant celestial emitters.
+  float tail = (l * l) / (4.0 * max(u_threshold, 0.1));
+  float factor = max(base_contrib, tail * 0.25) / l;
+  color *= factor;
+
+  // Cap maximum luminance input to FFT (32.0) to prevent single-precision mantissa blowout and Fourier ringing
+  const float maxLuminance = 32.0;
+  float out_l = l * factor;
+  if (out_l > maxLuminance) {
+    color *= maxLuminance / out_l;
+  }
+  return color;
+}
+
+vec4 sampleThresholdedScene(uint x, uint y) {
+  float maxDim = float(FFT_SIZE - KERNEL_SIZE);
+  vec2 size = u_aspect_ratio >= 1.0 ? vec2(maxDim, maxDim / u_aspect_ratio) : vec2(maxDim * u_aspect_ratio, maxDim);
+  if (any(greaterThanEqual(vec2(x, y), size))) {
+    return vec4(0.0);
+  }
+
+  // Smooth edge windowing (Tukey window over 16 pixels) prevents rectangular frame discontinuities and Gibbs ringing
+  float edgeDistX = min(float(x), size.x - 1.0 - float(x));
+  float edgeDistY = min(float(y), size.y - 1.0 - float(y));
+  float fade = smoothstep(0.0, 16.0, edgeDistX) * smoothstep(0.0, 16.0, edgeDistY);
+
+  // Area-integrating Karis 13-tap downsampling footprint matching the screen-to-FFT stride
+  ivec2 sceneSize = textureSize(u_scene_tex, 0);
+  vec2 texel = 1.0 / vec2(sceneSize);
+  vec2 stride = (vec2(sceneSize) / size);
+  vec2 d1 = stride * 0.25 * texel;
+  vec2 d2 = stride * 0.50 * texel;
+
+  vec2 uv = (vec2(x, y) + 0.5) / size;
+
+  // Center tap
+  vec3 e = softKnee(textureLod(u_scene_tex, uv, 0.0).rgb);
+
+  // 4 inner diagonal bilinear taps
+  vec3 j = softKnee(textureLod(u_scene_tex, uv + vec2(-d1.x, -d1.y), 0.0).rgb);
+  vec3 k = softKnee(textureLod(u_scene_tex, uv + vec2( d1.x, -d1.y), 0.0).rgb);
+  vec3 l = softKnee(textureLod(u_scene_tex, uv + vec2(-d1.x,  d1.y), 0.0).rgb);
+  vec3 m = softKnee(textureLod(u_scene_tex, uv + vec2( d1.x,  d1.y), 0.0).rgb);
+
+  // 4 outer corner bilinear taps
+  vec3 a = softKnee(textureLod(u_scene_tex, uv + vec2(-d2.x, -d2.y), 0.0).rgb);
+  vec3 c = softKnee(textureLod(u_scene_tex, uv + vec2( d2.x, -d2.y), 0.0).rgb);
+  vec3 g = softKnee(textureLod(u_scene_tex, uv + vec2(-d2.x,  d2.y), 0.0).rgb);
+  vec3 i = softKnee(textureLod(u_scene_tex, uv + vec2( d2.x,  d2.y), 0.0).rgb);
+
+  // 4 outer axial bilinear taps
+  vec3 b = softKnee(textureLod(u_scene_tex, uv + vec2(  0.0, -d2.y), 0.0).rgb);
+  vec3 d = softKnee(textureLod(u_scene_tex, uv + vec2(-d2.x,   0.0), 0.0).rgb);
+  vec3 f = softKnee(textureLod(u_scene_tex, uv + vec2( d2.x,   0.0), 0.0).rgb);
+  vec3 h = softKnee(textureLod(u_scene_tex, uv + vec2(  0.0,  d2.y), 0.0).rgb);
+
+  // Karis 13-tap weighted average (weights sum to 1.0)
+  vec3 color = e * 0.125;
+  color += (a + c + g + i) * 0.03125;
+  color += (b + d + f + h) * 0.0625;
+  color += (j + k + l + m) * 0.125;
+
+  return vec4(color * fade, 0.0);
+}
+
+void main() {
+  uint y = gl_GlobalInvocationID.y;
+  uint x = gl_GlobalInvocationID.x;
+
+  vec4 t0 = sampleThresholdedScene(x, y);
+  vec4 t1 = sampleThresholdedScene(x + N_4_1, y);
+  vec4 t2 = sampleThresholdedScene(x + N_4_2, y);
+  vec4 t3 = sampleThresholdedScene(x + N_4_3, y);
+
+  rgba1DFFT(x, t0, t1, t2, t3);
+
+  imageStore(tmpFFT, ivec2(y, x),         t0);
+  imageStore(tmpFFT, ivec2(y, x + N_4_1), t1);
+  imageStore(tmpFFT, ivec2(y, x + N_4_2), t2);
+  imageStore(tmpFFT, ivec2(y, x + N_4_3), t3);
+}
+
+#else
+// Scene Column Pass: Col FFT on tmpFFT -> transposed into imgFFT (normalized)
+layout (rgba32f, binding = 0) uniform readonly image2D tmpFFT;
+layout (rgba32f, binding = 2) uniform writeonly image2D imgFFT;
+
+void main() {
+  uint y = gl_GlobalInvocationID.y;
+  uint x = gl_GlobalInvocationID.x;
+
+  vec4 t0 = imageLoad(tmpFFT, ivec2(x, y));
+  vec4 t1 = imageLoad(tmpFFT, ivec2(x + N_4_1, y));
+  vec4 t2 = imageLoad(tmpFFT, ivec2(x + N_4_2, y));
+  vec4 t3 = imageLoad(tmpFFT, ivec2(x + N_4_3, y));
+
+  rgba1DFFT(x, t0, t1, t2, t3);
+
+  imageStore(imgFFT, ivec2(y, x),         t0 * NORM);
+  imageStore(imgFFT, ivec2(y, x + N_4_1), t1 * NORM);
+  imageStore(imgFFT, ivec2(y, x + N_4_2), t2 * NORM);
+  imageStore(imgFFT, ivec2(y, x + N_4_3), t3 * NORM);
+}
+#endif

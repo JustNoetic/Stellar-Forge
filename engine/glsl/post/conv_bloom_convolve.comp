@@ -1,0 +1,81 @@
+layout (local_size_x = 256, local_size_y = 1) in;
+
+#ifdef ROW
+// Convolve Row Pass: Complex multiply in frequency domain + row IFFT -> transposed into tmpFFT
+layout (rgba32f, binding = 1) uniform readonly image2D kerFFT;
+layout (rgba32f, binding = 2) uniform readonly image2D imgFFT;
+layout (rgba32f, binding = 0) uniform writeonly image2D tmpFFT;
+
+vec4 freqConvolve(ivec2 coord) {
+  if (coord.x >= FFT_SIZE || coord.y >= FFT_SIZE) return vec4(0.0);
+
+  ivec2 symCoord = (ivec2(FFT_SIZE) - coord) & ivec2(FFT_SIZE - 1);
+
+  vec4 h_img    = imageLoad(imgFFT, coord);
+  vec4 h_imgSym = imageLoad(imgFFT, symCoord);
+  vec4 h_ker    = imageLoad(kerFFT, coord);
+  vec4 h_kerSym = imageLoad(kerFFT, symCoord);
+  
+  vec2 F_R = vec2(h_img.x + h_imgSym.x, h_img.y - h_imgSym.y);
+  vec2 K_R = vec2(h_ker.x + h_kerSym.x, h_ker.y - h_kerSym.y);
+  vec2 Out_R = cmul(F_R, K_R);
+
+  vec2 F_G = vec2(h_img.y + h_imgSym.y, h_imgSym.x - h_img.x);
+  vec2 K_G = vec2(h_ker.y + h_kerSym.y, h_kerSym.x - h_ker.x);
+  vec2 Out_G = cmul(F_G, K_G);
+
+  vec2 F_B = vec2(h_img.z + h_imgSym.z, h_img.w - h_imgSym.w);
+  vec2 K_B = vec2(h_ker.z + h_kerSym.z, h_ker.w - h_kerSym.w);
+  vec2 Out_B = cmul(F_B, K_B);
+
+  vec2 F_A = vec2(h_img.w + h_imgSym.w, h_imgSym.z - h_img.z);
+  vec2 K_A = vec2(h_ker.w + h_kerSym.w, h_kerSym.z - h_ker.z);
+  vec2 Out_A = cmul(F_A, K_A);
+
+  return 0.25 * vec4(
+    Out_R.x - Out_G.y,
+    Out_R.y + Out_G.x,
+    Out_B.x - Out_A.y,
+    Out_B.y + Out_A.x
+  );
+}
+
+void main() {
+  uint y = gl_GlobalInvocationID.y;
+  uint x = gl_GlobalInvocationID.x;
+
+  vec4 t0 = freqConvolve(ivec2(x, y));
+  vec4 t1 = freqConvolve(ivec2(x + N_4_1, y));
+  vec4 t2 = freqConvolve(ivec2(x + N_4_2, y));
+  vec4 t3 = freqConvolve(ivec2(x + N_4_3, y));
+
+  rgba1DFFT(x, t0, t1, t2, t3);
+
+  imageStore(tmpFFT, ivec2(y, x),         t0);
+  imageStore(tmpFFT, ivec2(y, x + N_4_1), t1);
+  imageStore(tmpFFT, ivec2(y, x + N_4_2), t2);
+  imageStore(tmpFFT, ivec2(y, x + N_4_3), t3);
+}
+
+#else
+// Convolve Column Pass: Col IFFT on tmpFFT -> transposed into imgFFT (normalized)
+layout (rgba32f, binding = 0) uniform readonly image2D tmpFFT;
+layout (rgba32f, binding = 2) uniform writeonly image2D imgFFT;
+
+void main() {
+  uint y = gl_GlobalInvocationID.y;
+  uint x = gl_GlobalInvocationID.x;
+
+  vec4 t0 = imageLoad(tmpFFT, ivec2(x, y));
+  vec4 t1 = imageLoad(tmpFFT, ivec2(x + N_4_1, y));
+  vec4 t2 = imageLoad(tmpFFT, ivec2(x + N_4_2, y));
+  vec4 t3 = imageLoad(tmpFFT, ivec2(x + N_4_3, y));
+
+  rgba1DFFT(x, t0, t1, t2, t3);
+
+  imageStore(imgFFT, ivec2(y, x),         t0 * NORM);
+  imageStore(imgFFT, ivec2(y, x + N_4_1), t1 * NORM);
+  imageStore(imgFFT, ivec2(y, x + N_4_2), t2 * NORM);
+  imageStore(imgFFT, ivec2(y, x + N_4_3), t3 * NORM);
+}
+#endif

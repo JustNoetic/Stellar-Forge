@@ -184,8 +184,51 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
             c_exp, app.camera["exposure"] = imgui.slider_float("Exposure", app.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
             if c_exp: settings_changed = True
 
-        c_bi, app.camera["bloom_intensity"] = imgui.slider_float("Bloom Intensity", app.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
-        if c_bi: settings_changed = True
+        bloom_modes = ["Gaussian Blur", "Diffraction Spikes", "Hybrid (Spikes + Haze)"]
+        curr_bm = app.camera.get("bloom_mode", 2)
+        curr_bm_idx = curr_bm if 0 <= curr_bm < len(bloom_modes) else 2
+        c_bm, new_bm = imgui.combo("Bloom Mode", curr_bm_idx, bloom_modes)
+        if c_bm:
+            app.camera["bloom_mode"] = new_bm
+            settings_changed = True
+
+        if app.camera.get("bloom_mode", 2) in (1, 2):
+            spike_counts = [4, 6, 8]
+            spike_labels = ["4 Spikes (Cross)", "6 Spikes (JWST / Newtonian)", "8 Spikes (Octagram)"]
+            curr_sc = app.camera.get("spike_count", 6)
+            sc_idx = spike_counts.index(curr_sc) if curr_sc in spike_counts else 1
+            c_sc, new_sc_idx = imgui.combo("Spike Pattern", sc_idx, spike_labels)
+            if c_sc:
+                app.camera["spike_count"] = spike_counts[new_sc_idx]
+                settings_changed = True
+
+            c_cbi, app.camera["conv_bloom_intensity"] = imgui.slider_float("Spikes Intensity", app.camera.get("conv_bloom_intensity", 0.5), 0.0, 5.0, "%.2f")
+            if c_cbi: settings_changed = True
+            c_sl, app.camera["spike_length"] = imgui.slider_float("Spikes Length", app.camera.get("spike_length", 1.0), 0.2, 3.0, "%.2f")
+            if c_sl: settings_changed = True
+            c_sa, app.camera["spike_angle"] = imgui.slider_float("Spikes Angle", app.camera.get("spike_angle", 0.0), 0.0, 180.0, "%.1f deg")
+            if c_sa: settings_changed = True
+            c_srl, app.camera["spike_roll_lock"] = imgui.checkbox("Lock Spikes to Camera Roll", app.camera.get("spike_roll_lock", True))
+            if c_srl: settings_changed = True
+            c_sd, app.camera["spike_dispersion"] = imgui.slider_float("Dispersion (Rainbow)", app.camera.get("spike_dispersion", 0.015), 0.0, 0.05, "%.3f")
+            if c_sd: settings_changed = True
+            spike_res_opts = [0, 1]
+            spike_res_labels = ["Quarter Res (Fast - 0.1ms)", "Half Res (Ultra)"]
+            curr_sq = app.camera.get("spike_quality", 0)
+            sq_idx = curr_sq if 0 <= curr_sq < len(spike_res_opts) else 0
+            c_sq, new_sq_idx = imgui.combo("Spikes Resolution", sq_idx, spike_res_labels)
+            if c_sq:
+                app.camera["spike_quality"] = spike_res_opts[new_sq_idx]
+                app.last_fb_size = (0, 0)
+                settings_changed = True
+
+            c_cds, app.camera["conv_bloom_dynamic_scale"] = imgui.checkbox("Dynamic Spikes Shrink", app.camera.get("conv_bloom_dynamic_scale", True))
+            if c_cds: settings_changed = True
+        if app.camera.get("bloom_mode", 2) in (0, 2):
+            c_bi, app.camera["bloom_intensity"] = imgui.slider_float("Haze Intensity", app.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
+            if c_bi: settings_changed = True
+            c_bt, app.camera["bloom_threshold"] = imgui.slider_float("Bloom Threshold", app.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
+            if c_bt: settings_changed = True
 
         msaa_opts = [0, 2, 4, 8]
         msaa_labels = ["Off", "2x", "4x", "8x"]

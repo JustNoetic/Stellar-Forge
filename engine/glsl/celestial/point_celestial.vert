@@ -37,6 +37,8 @@ uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform vec3 u_camera_pos;
 
+#include "common/refraction.glsl"
+
 out vec3 f_color;
 out float f_is_star;
 out float f_clip_z;
@@ -65,7 +67,9 @@ void main() {
     float aspect = projection[1][1] / max(1e-6, projection[0][0]);
     float screen_width = screen_height * aspect;
 
-    vec4 center_clip = projection * view * vec4(in_offset, 1.0);
+    vec3 app_world_pos = apply_refraction(in_offset, u_camera_pos);
+
+    vec4 center_clip = projection * view * vec4(app_world_pos, 1.0);
     if (center_clip.w <= 1e-6) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         return;
@@ -75,7 +79,7 @@ void main() {
     vec2 center_px = (center_ndc * 0.5 + 0.5) * vec2(screen_width, screen_height);
     f_center_px = center_px;
 
-    float dist = length((view * vec4(in_offset, 1.0)).xyz);
+    float dist = length((view * vec4(app_world_pos, 1.0)).xyz);
     float apparent_px = (in_radius / max(1e-9, dist)) * screen_height * fov_factor;
     f_apparent_px = apparent_px;
 

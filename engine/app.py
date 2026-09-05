@@ -508,8 +508,17 @@ class App(InputHandlerMixin):
             "planetshine_enabled": True,
             "ringshine_enabled": True,
             "ringshine_band_count": 10,
+            "bloom_mode": 2,
+            "conv_bloom_intensity": 0.5,
+            "conv_bloom_threshold": 1.5,
             "bloom_intensity": 0.05,
             "bloom_threshold": 1.0,
+            "spike_count": 6,
+            "spike_length": 1.0,
+            "spike_angle": 0.0,
+            "spike_roll_lock": True,
+            "spike_dispersion": 0.015,
+            "spike_quality": 0,
             "msaa_samples": 4,
             "inspector_frame": 0,
             "shadow_caster_budget": 32,
@@ -536,9 +545,27 @@ class App(InputHandlerMixin):
         self.hdr_resolve_tex = None
         self.bloom_fbos = []
         self.bloom_texs = []
+        self.streak_fbo = None
+        self.streak_tex = None
+        self.prog_star_streak = None
+        self.quad_vao_streak = None
         self.last_fb_size = (0, 0)
         self.last_msaa_samples = -1
         self.last_atmo_res = -1.0
+        
+        # FFT Convolution Bloom resources
+        self.conv_ker_tex = None
+        self.conv_tmp_tex = None
+        self.conv_ker_fft_tex = None
+        self.conv_img_fft_tex = None
+        self.prog_conv_krow = None
+        self.prog_conv_kcol = None
+        self.prog_conv_srow = None
+        self.prog_conv_scol = None
+        self.prog_conv_crow = None
+        self.prog_conv_ccol = None
+        self.conv_fft_size = 1024
+        self.conv_kernel_size = 384
         
         # Orbit-line MSAA resources (only orbit lines are multisampled)
         self.orbit_msaa_fbo = None
@@ -648,8 +675,17 @@ class App(InputHandlerMixin):
                 "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
+                "bloom_mode": self.camera.get("bloom_mode", 2),
+                "conv_bloom_intensity": self.camera.get("conv_bloom_intensity", 0.5),
+                "conv_bloom_threshold": self.camera.get("conv_bloom_threshold", 1.5),
                 "bloom_intensity": self.camera.get("bloom_intensity", 0.05),
                 "bloom_threshold": self.camera.get("bloom_threshold", 1.0),
+                "spike_count": self.camera.get("spike_count", 6),
+                "spike_length": self.camera.get("spike_length", 1.0),
+                "spike_angle": self.camera.get("spike_angle", 0.0),
+                "spike_roll_lock": self.camera.get("spike_roll_lock", True),
+                "spike_dispersion": self.camera.get("spike_dispersion", 0.015),
+                "spike_quality": self.camera.get("spike_quality", 0),
                 "msaa_samples": self.camera.get("msaa_samples", 4),
                 "show_orbits": self.camera.get("show_orbits", True),
                 "orbit_fade_dir_idx": self.camera.get("orbit_fade_dir_idx", 0),
@@ -1263,9 +1299,15 @@ class App(InputHandlerMixin):
             def _get_depth_mask(c):
                 return bool(gl.glGetBoolean(gl.GL_DEPTH_WRITEMASK))
             def _set_depth_mask(c, enabled):
-                gl.glDepthMask(gl.GL_TRUE if enabled else gl.GL_FALSE)
+                try:
+                    gl.glDepthMask(gl.GL_TRUE if enabled else gl.GL_FALSE)
+                except Exception:
+                    pass
                 if c.fbo is not None:
-                    c.fbo.depth_mask = bool(enabled)
+                    try:
+                        c.fbo.depth_mask = bool(enabled)
+                    except Exception:
+                        pass
             type(ctx).depth_mask = property(_get_depth_mask, _set_depth_mask)
         ctx.enable(moderngl.DEPTH_TEST) 
     
@@ -1360,6 +1402,21 @@ class App(InputHandlerMixin):
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
         self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
+        if 'u_main_texture' in self.prog_composite:
+            self.prog_composite['u_main_texture'].value = 0
+        if 'u_bloom_texture' in self.prog_composite:
+            self.prog_composite['u_bloom_texture'].value = 1
+        if 'u_conv_bloom_texture' in self.prog_composite:
+            self.prog_composite['u_conv_bloom_texture'].value = 2
+        self.prog_star_streak = ctx.program(vertex_shader=star_streak_shader_vs, fragment_shader=star_streak_shader_fs)
+        if 'u_bright_texture' in self.prog_star_streak:
+            self.prog_star_streak['u_bright_texture'].value = 0
+        if 'u_bloom_mip1' in self.prog_star_streak:
+            self.prog_star_streak['u_bloom_mip1'].value = 1
+        if 'u_bloom_mip2' in self.prog_star_streak:
+            self.prog_star_streak['u_bloom_mip2'].value = 2
+        if 'u_bloom_mip3' in self.prog_star_streak:
+            self.prog_star_streak['u_bloom_mip3'].value = 3
         self.prog_accum = ctx.program(vertex_shader=accum_shader_vs, fragment_shader=accum_shader_fs)
         self.prog_atmo_composite = ctx.program(vertex_shader=atmo_composite_shader_vs, fragment_shader=atmo_composite_shader_fs)
         self.prog_atmo_upsample = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=atmo_upsample_fragment_shader)
@@ -1369,6 +1426,71 @@ class App(InputHandlerMixin):
             self.prog_atmo_upsample['u_lowres_trans'].value = 1
         if 'u_highres_depth' in self.prog_atmo_upsample:
             self.prog_atmo_upsample['u_highres_depth'].value = 9
+
+        # Compile FFT Convolution Bloom Compute Shaders
+        try:
+            self.prog_conv_krow = ctx.compute_shader(conv_bloom_krow_shader)
+            self.prog_conv_kcol = ctx.compute_shader(conv_bloom_kcol_shader)
+            self.prog_conv_srow = ctx.compute_shader(conv_bloom_srow_shader)
+            self.prog_conv_scol = ctx.compute_shader(conv_bloom_scol_shader)
+            self.prog_conv_crow = ctx.compute_shader(conv_bloom_crow_shader)
+            self.prog_conv_ccol = ctx.compute_shader(conv_bloom_ccol_shader)
+
+            self.conv_tmp_tex = ctx.texture((self.conv_fft_size, self.conv_fft_size), 4, dtype='f4')
+            self.conv_tmp_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.conv_tmp_tex.repeat_x = False
+            self.conv_tmp_tex.repeat_y = False
+
+            self.conv_ker_fft_tex = ctx.texture((self.conv_fft_size, self.conv_fft_size), 4, dtype='f4')
+            self.conv_ker_fft_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.conv_ker_fft_tex.repeat_x = False
+            self.conv_ker_fft_tex.repeat_y = False
+
+            self.conv_img_fft_tex = ctx.texture((self.conv_fft_size, self.conv_fft_size), 4, dtype='f4')
+            self.conv_img_fft_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.conv_img_fft_tex.repeat_x = False
+            self.conv_img_fft_tex.repeat_y = False
+
+            self.conv_tmp_tex.bind_to_image(0, read=True, write=True)
+            self.conv_ker_fft_tex.bind_to_image(1, read=True, write=True)
+            self.conv_img_fft_tex.bind_to_image(2, read=True, write=True)
+
+            # Load Aperture Kernel Texture
+            ker_candidates = [
+                os.path.join("textures", "bloom", "kernel_8point.bin"),
+                os.path.join("textures", "bloom", "kernelTex.bin"),
+            ]
+            ker_path = None
+            for kp in ker_candidates:
+                if os.path.exists(kp):
+                    ker_path = kp
+                    break
+
+            if ker_path:
+                with open(ker_path, "rb") as f:
+                    ker_data = f.read()
+                self.conv_ker_tex = ctx.texture((1024, 1024), 4, data=ker_data, dtype='f4')
+                self.conv_ker_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.conv_ker_tex.repeat_x = False
+                self.conv_ker_tex.repeat_y = False
+
+                # Execute One-Time Kernel FFT Setup Pass
+                self.conv_current_kernel_scale = 1.0
+                self.conv_ker_tex.use(location=0)
+                if 'u_kernel_tex' in self.prog_conv_krow:
+                    self.prog_conv_krow['u_kernel_tex'].value = 0
+                if 'u_kernel_scale' in self.prog_conv_krow:
+                    self.prog_conv_krow['u_kernel_scale'].value = 1.0
+                self.prog_conv_krow.run(1, self.conv_fft_size, 1)
+                ctx.memory_barrier()
+                self.prog_conv_kcol.run(1, self.conv_fft_size, 1)
+                ctx.memory_barrier()
+                print("FFT Convolution Bloom: Kernel precomputed successfully.")
+            else:
+                print("Warning: Convolution bloom kernel texture not found.")
+        except Exception as e:
+            print(f"Warning: Failed to initialize FFT Convolution Bloom: {e}")
+            self.conv_ker_tex = None
         
         quad_vertices = np.array([
             -1.0, -1.0,
@@ -1383,6 +1505,7 @@ class App(InputHandlerMixin):
         self.quad_vao_accum = ctx.vertex_array(self.prog_accum, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_comp = ctx.vertex_array(self.prog_atmo_composite, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_upsample = ctx.vertex_array(self.prog_atmo_upsample, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_streak = ctx.vertex_array(self.prog_star_streak, [(quad_vbo, '2f', 'in_position')])
         
         # Compile Habitable Zone Shader
         self.prog_hz = ctx.program(vertex_shader=hz_vertex_shader, fragment_shader=hz_fragment_shader)
@@ -2829,6 +2952,8 @@ class App(InputHandlerMixin):
                 for tex in self.bloom_texs: tex.release()
                 self.bloom_fbos = []
                 self.bloom_texs = []
+                if self.streak_fbo: self.streak_fbo.release(); self.streak_fbo = None
+                if self.streak_tex: self.streak_tex.release(); self.streak_tex = None
                 
                 # Rebuild
                 self.hdr_resolve_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
@@ -2907,6 +3032,15 @@ class App(InputHandlerMixin):
                     self.bloom_fbos.append(ctx.framebuffer(color_attachments=[btex]))
                     bw //= 2
                     bh //= 2
+
+                # Anisotropic Star Streak FBO (Quarter resolution for ultra-fast 0.1ms rendering, Half for ultra)
+                streak_scale = 4 if self.camera.get("spike_quality", 0) == 0 else 2
+                sbw, sbh = max(1, self.fb_width // streak_scale), max(1, self.fb_height // streak_scale)
+                self.streak_tex = ctx.texture((sbw, sbh), 3, dtype='f4')
+                self.streak_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.streak_tex.repeat_x = False
+                self.streak_tex.repeat_y = False
+                self.streak_fbo = ctx.framebuffer(color_attachments=[self.streak_tex])
 
             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
             self.hdr_resolve_fbo.use()
@@ -4155,7 +4289,7 @@ class App(InputHandlerMixin):
                 refract_pole = (float(pole_ref[0]), float(pole_ref[1]), float(pole_ref[2]))
                 refract_oblateness = float(b_info.get('oblateness', 0.0))
 
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, getattr(self, 'prog_hz', None)):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, getattr(self, 'prog_hz', None)):
                 if prog is not None:
                     if 'u_refract_center' in prog:
                         prog['u_refract_center'].value = refract_center
@@ -5362,13 +5496,18 @@ class App(InputHandlerMixin):
                 resolved_tex = self.hdr_resolve_tex
 
             # --- Post Processing ---
-            # Bloom Downsample
+            bloom_mode = self.camera.get("bloom_mode", 2)  # 0: Gaussian, 1: Spikes, 2: Hybrid
+            conv_bloom_enabled = (bloom_mode in (1, 2))
+            gaussian_bloom_enabled = (bloom_mode in (0, 2))
+
+            # Bloom Downsample & Upsample
             _gq = _perf_gpu_begin(ctx, "gpu_bloom")
             ctx.disable(moderngl.DEPTH_TEST)
             ctx.disable(moderngl.BLEND)
             
-            # Pass 1: Extract and Downsample to bloom_fbos[0]
-            if len(self.bloom_fbos) == 5:
+            any_bloom_enabled = (gaussian_bloom_enabled or conv_bloom_enabled) and len(self.bloom_fbos) == 5
+            if any_bloom_enabled:
+                # Pass 1: Extract and Downsample to bloom_fbos[0]
                 self.bloom_fbos[0].use()
                 ctx.viewport = (0, 0, self.bloom_texs[0].width, self.bloom_texs[0].height)
                 resolved_tex.use(location=0)
@@ -5377,7 +5516,7 @@ class App(InputHandlerMixin):
                 self.prog_bloom_down['u_threshold'].value = self.camera.get("bloom_threshold", 1.0)
                 self.quad_vao_down.render(moderngl.TRIANGLE_STRIP)
                 
-                # Pass 2..5: Downsample
+                # Pass 2..5: Downsample (produces pre-filtered MIPs used by both Gaussian upsample and Star Streak)
                 self.prog_bloom_down['u_threshold'].value = 0.0 # only threshold on first pass
                 for i in range(1, 5):
                     self.bloom_fbos[i].use()
@@ -5386,99 +5525,168 @@ class App(InputHandlerMixin):
                     self.prog_bloom_down['u_texel_size'].value = (1.0 / self.bloom_texs[i-1].width, 1.0 / self.bloom_texs[i-1].height)
                     self.quad_vao_down.render(moderngl.TRIANGLE_STRIP)
                     
-                # Pass 6..9: Upsample with Additive Blending
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = moderngl.ONE, moderngl.ONE
-                self.prog_bloom_up['u_texture'].value = 0
-                self.prog_bloom_up['u_radius'].value = 1.0
-                
-                for i in range(3, -1, -1):
-                    self.bloom_fbos[i].use()
-                    ctx.viewport = (0, 0, self.bloom_texs[i].width, self.bloom_texs[i].height)
-                    self.bloom_texs[i+1].use(location=0)
-                    self.prog_bloom_up['u_texel_size'].value = (1.0 / self.bloom_texs[i+1].width, 1.0 / self.bloom_texs[i+1].height)
-                    self.quad_vao_up.render(moderngl.TRIANGLE_STRIP)
+                # Pass 6..9: Upsample with Additive Blending (Gaussian Haze only)
+                if gaussian_bloom_enabled:
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = moderngl.ONE, moderngl.ONE
+                    self.prog_bloom_up['u_texture'].value = 0
+                    self.prog_bloom_up['u_radius'].value = 1.0
                     
-                _perf_gpu_end(_gq)
-                # Final Composite
-                ctx.disable(moderngl.BLEND)
-                
-                # Screenshot: capture composited result to a temporary high-res FBO
-                save_now = False
-                if getattr(self, "_accum_save_request", False):
-                    save_now = True
-                elif getattr(self, "_screenshot_capturing", False):
-                    if self.camera.get("screenshot_accum_enabled", False):
-                        if getattr(self, "photo_accum_count", 0) >= self.camera.get("screenshot_accum_target", 16):
-                            save_now = True
-                    else:
-                        save_now = True
+                    for i in range(3, -1, -1):
+                        self.bloom_fbos[i].use()
+                        ctx.viewport = (0, 0, self.bloom_texs[i].width, self.bloom_texs[i].height)
+                        self.bloom_texs[i+1].use(location=0)
+                        self.prog_bloom_up['u_texel_size'].value = (1.0 / self.bloom_texs[i+1].width, 1.0 / self.bloom_texs[i+1].height)
+                        self.quad_vao_up.render(moderngl.TRIANGLE_STRIP)
+                    ctx.disable(moderngl.BLEND)
+            _perf_gpu_end(_gq)
 
-                if save_now:
-                    ss_w, ss_h = self.fb_width, self.fb_height
-                    ss_tex = ctx.texture((ss_w, ss_h), 4)  # 8-bit RGBA for final sRGB output
-                    ss_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                    ss_fbo = ctx.framebuffer(color_attachments=[ss_tex])
-                    ss_fbo.use()
-                    ctx.viewport = (0, 0, ss_w, ss_h)
-                    resolved_tex.use(location=0)
-                    self.bloom_texs[0].use(location=1)
-                    self.prog_composite['u_main_texture'].value = 0
-                    self.prog_composite['u_bloom_texture'].value = 1
-                    self.prog_composite['u_bloom_intensity'].value = self.camera.get("bloom_intensity", 0.05)
-                    self.quad_vao_comp.render(moderngl.TRIANGLE_STRIP)
-                    
-                    # Read composited pixels
-                    raw_pixels = ss_fbo.read(components=3)
-                    ss_fbo.release()
-                    ss_tex.release()
-                    
-                    # Restore original resolution
-                    if self._screenshot_orig_fb:
-                        self.fb_width, self.fb_height = self._screenshot_orig_fb
-                        self.last_fb_size = (0, 0)       # Force FBO rebuild next frame
-                        self.last_msaa_samples = -1
-                    self._screenshot_capturing = False
-                    self._screenshot_orig_fb = None
-                    self._accum_save_request = False
-                    
-                    # Save PNG in a background thread
-                    _ss_cap_w, _ss_cap_h = ss_w, ss_h
-                    _ss_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    _ss_filename = f"screenshots/StellarForge_{_ss_cap_w}x{_ss_cap_h}_{_ss_timestamp}.png"
-                    self._screenshot_saving = True
-                    self._screenshot_toast = (f"Saving {_ss_cap_w}\u00d7{_ss_cap_h}...", time.time())
-                    _ss_self_ref = self
-                    def _save_screenshot_bg(_raw, _w, _h, _fname, _self):
-                        try:
-                            from PIL import Image
-                            import os
-                            os.makedirs("screenshots", exist_ok=True)
-                            img = Image.frombytes('RGB', (_w, _h), _raw)
-                            img = img.transpose(Image.FLIP_TOP_BOTTOM)
-                            img.save(_fname, 'PNG', optimize=False)
-                            _self._screenshot_toast = (f"Saved: {_fname}", time.time())
-                        except Exception as e:
-                            _self._screenshot_toast = (f"Screenshot failed: {e}", time.time())
-                        finally:
-                            _self._screenshot_saving = False
-                    threading.Thread(
-                        target=_save_screenshot_bg,
-                        args=(raw_pixels, _ss_cap_w, _ss_cap_h, _ss_filename, _ss_self_ref),
-                        daemon=True
-                    ).start()
-                
-                # Normal composite to screen for display
-                _gq = _perf_gpu_begin(ctx, "gpu_composite")
-                ctx.screen.use()
-                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+            # Anisotropic Directional Streak Bloom (Pixel-Perfect Star Diffraction Spikes)
+            conv_scale = (1.0, 1.0)
+            if conv_bloom_enabled and getattr(self, "streak_fbo", None) is not None and len(self.bloom_texs) >= 4:
+                _gq_conv = _perf_gpu_begin(ctx, "gpu_conv_bloom")
+                self.streak_fbo.use()
+                ctx.viewport = (0, 0, self.streak_tex.width, self.streak_tex.height)
+
+                # Base rotation angle (optionally locked to camera roll)
+                base_angle = math.radians(self.camera.get("spike_angle", 0.0))
+                if self.camera.get("spike_roll_lock", True):
+                    base_angle += math.radians(self.camera.get("roll", 0.0))
+
+                # Dynamic Aperture Kernel Scaling: physically shrink spikes as camera moves away
+                length_scale = self.camera.get("spike_length", 1.0)
+                if self.camera.get("conv_bloom_dynamic_scale", True) and star_idx is not None and star_idx < len(pos_rel_all):
+                    dist_star = float(np.linalg.norm(pos_rel_all[star_idx] - cam_pos))
+                    r_star = float(body_radii[star_idx])
+                    cur_fov_factor = 1.0 / math.tan(math.radians(max(1.0, float(self.camera.get("fov", 60.0))) / 2.0))
+                    apparent_px = (r_star * 2.0 / max(dist_star, 1e-9)) * float(self.fb_height) * cur_fov_factor
+                    ref_px = 15.0
+                    dyn_scale = max(0.1, min(1.0, math.pow(apparent_px / ref_px, 0.6)))
+                    length_scale *= dyn_scale
+
+                self.bloom_texs[0].use(location=0)
+                self.bloom_texs[1].use(location=1)
+                self.bloom_texs[2].use(location=2)
+                self.bloom_texs[3].use(location=3)
+
+                if 'u_bright_texture' in self.prog_star_streak: self.prog_star_streak['u_bright_texture'].value = 0
+                if 'u_bloom_mip1' in self.prog_star_streak: self.prog_star_streak['u_bloom_mip1'].value = 1
+                if 'u_bloom_mip2' in self.prog_star_streak: self.prog_star_streak['u_bloom_mip2'].value = 2
+                if 'u_bloom_mip3' in self.prog_star_streak: self.prog_star_streak['u_bloom_mip3'].value = 3
+
+                self.prog_star_streak['u_texel_size'].value = (1.0 / self.streak_tex.width, 1.0 / self.streak_tex.height)
+                self.prog_star_streak['u_spike_count'].value = int(self.camera.get("spike_count", 6))
+                self.prog_star_streak['u_spike_angle'].value = float(base_angle)
+                self.prog_star_streak['u_spike_length'].value = float(length_scale)
+                self.prog_star_streak['u_dispersion'].value = float(self.camera.get("spike_dispersion", 0.015))
+                self.prog_star_streak['u_intensity'].value = 1.0
+
+                self.quad_vao_streak.render(moderngl.TRIANGLE_STRIP)
+                _perf_gpu_end(_gq_conv)
+
+            # Intensity scalars for composite
+            bloom_intensity_val = self.camera.get("bloom_intensity", 0.05) if gaussian_bloom_enabled else 0.0
+            conv_intensity_val = self.camera.get("conv_bloom_intensity", 0.5) if conv_bloom_enabled else 0.0
+
+            # Final Composite
+            ctx.disable(moderngl.BLEND)
+            
+            # Screenshot: capture composited result to a temporary high-res FBO
+            save_now = False
+            if getattr(self, "_accum_save_request", False):
+                save_now = True
+            elif getattr(self, "_screenshot_capturing", False):
+                if self.camera.get("screenshot_accum_enabled", False):
+                    if getattr(self, "photo_accum_count", 0) >= self.camera.get("screenshot_accum_target", 16):
+                        save_now = True
+                else:
+                    save_now = True
+
+            if save_now:
+                ss_w, ss_h = self.fb_width, self.fb_height
+                ss_tex = ctx.texture((ss_w, ss_h), 4)  # 8-bit RGBA for final sRGB output
+                ss_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                ss_fbo = ctx.framebuffer(color_attachments=[ss_tex])
+                ss_fbo.use()
+                ctx.viewport = (0, 0, ss_w, ss_h)
                 resolved_tex.use(location=0)
                 self.bloom_texs[0].use(location=1)
+                if getattr(self, "streak_tex", None) is not None:
+                    self.streak_tex.use(location=2)
+                elif self.conv_img_fft_tex:
+                    self.conv_img_fft_tex.use(location=2)
                 self.prog_composite['u_main_texture'].value = 0
                 self.prog_composite['u_bloom_texture'].value = 1
-                self.prog_composite['u_bloom_intensity'].value = self.camera.get("bloom_intensity", 0.05)
+                if 'u_conv_bloom_texture' in self.prog_composite:
+                    self.prog_composite['u_conv_bloom_texture'].value = 2
+                self.prog_composite['u_bloom_intensity'].value = bloom_intensity_val
+                if 'u_conv_bloom_intensity' in self.prog_composite:
+                    self.prog_composite['u_conv_bloom_intensity'].value = conv_intensity_val
+                if 'u_conv_bloom_scale' in self.prog_composite:
+                    self.prog_composite['u_conv_bloom_scale'].value = conv_scale
                 self.quad_vao_comp.render(moderngl.TRIANGLE_STRIP)
-                _perf_gpu_end(_gq)
+                
+                # Read composited pixels
+                raw_pixels = ss_fbo.read(components=3)
+                ss_fbo.release()
+                ss_tex.release()
+                
+                # Restore original resolution
+                if self._screenshot_orig_fb:
+                    self.fb_width, self.fb_height = self._screenshot_orig_fb
+                    self.last_fb_size = (0, 0)       # Force FBO rebuild next frame
+                    self.last_msaa_samples = -1
+                self._screenshot_capturing = False
+                self._screenshot_orig_fb = None
+                self._accum_save_request = False
+                
+                # Save PNG in a background thread
+                _ss_cap_w, _ss_cap_h = ss_w, ss_h
+                _ss_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                _ss_filename = f"screenshots/StellarForge_{_ss_cap_w}x{_ss_cap_h}_{_ss_timestamp}.png"
+                self._screenshot_saving = True
+                self._screenshot_toast = (f"Saving {_ss_cap_w}\u00d7{_ss_cap_h}...", time.time())
+                _ss_self_ref = self
+                def _save_screenshot_bg(_raw, _w, _h, _fname, _self):
+                    try:
+                        from PIL import Image
+                        import os
+                        os.makedirs("screenshots", exist_ok=True)
+                        img = Image.frombytes('RGB', (_w, _h), _raw)
+                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                        img.save(_fname, 'PNG', optimize=False)
+                        _self._screenshot_toast = (f"Saved: {_fname}", time.time())
+                    except Exception as e:
+                        _self._screenshot_toast = (f"Screenshot failed: {e}", time.time())
+                    finally:
+                        _self._screenshot_saving = False
+                threading.Thread(
+                    target=_save_screenshot_bg,
+                    args=(raw_pixels, _ss_cap_w, _ss_cap_h, _ss_filename, _ss_self_ref),
+                    daemon=True
+                ).start()
+            
+            # Normal composite to screen for display
+            _gq = _perf_gpu_begin(ctx, "gpu_composite")
+            ctx.screen.use()
+            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+            resolved_tex.use(location=0)
+            self.bloom_texs[0].use(location=1)
+            if getattr(self, "streak_tex", None) is not None:
+                self.streak_tex.use(location=2)
+            elif self.conv_img_fft_tex:
+                self.conv_img_fft_tex.use(location=2)
+            self.prog_composite['u_main_texture'].value = 0
+            self.prog_composite['u_bloom_texture'].value = 1
+            if 'u_conv_bloom_texture' in self.prog_composite:
+                self.prog_composite['u_conv_bloom_texture'].value = 2
+            self.prog_composite['u_bloom_intensity'].value = bloom_intensity_val
+            if 'u_conv_bloom_intensity' in self.prog_composite:
+                self.prog_composite['u_conv_bloom_intensity'].value = conv_intensity_val
+            if 'u_conv_bloom_scale' in self.prog_composite:
+                self.prog_composite['u_conv_bloom_scale'].value = conv_scale
+            self.quad_vao_comp.render(moderngl.TRIANGLE_STRIP)
+            _perf_gpu_end(_gq)
 
             # Re-enable standard settings for ImGui
             ctx.screen.use()
@@ -5521,6 +5729,10 @@ class App(InputHandlerMixin):
         physics_thread.join(timeout=1.0)
         physics_thread_cmp.join(timeout=1.0)
         self.save_settings()
+        if getattr(self, 'conv_tmp_tex', None): self.conv_tmp_tex.release()
+        if getattr(self, 'conv_ker_fft_tex', None): self.conv_ker_fft_tex.release()
+        if getattr(self, 'conv_img_fft_tex', None): self.conv_img_fft_tex.release()
+        if getattr(self, 'conv_ker_tex', None): self.conv_ker_tex.release()
         self.impl.shutdown()
         glfw.terminate()
     

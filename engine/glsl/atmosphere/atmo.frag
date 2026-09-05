@@ -40,13 +40,6 @@ uint u_ring_mask;
 
 uniform vec3 u_camera_pos;
 
-uniform vec3 u_refract_center;
-uniform float u_refract_radius;
-uniform float u_refract_max_bend;
-uniform float u_refract_scale_height;
-uniform vec3 u_refract_pole;
-uniform float u_refract_oblateness;
-
 layout(std430, binding = 8) buffer AtmoData {
     vec3  u_body_offset;
     float u_atmo_radius_au;
@@ -168,45 +161,8 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
     return perp_len / denom;
 }
 
-float compute_refraction_angle(vec3 C, vec3 V, float d) {
-    if (u_refract_max_bend <= 1e-6) return 0.0;
-    float s_min = -dot(C, V);
-    vec3 P_min = C + s_min * V;
-    float r_min = length(P_min);
-
-    float local_refract_radius = u_refract_radius;
-    if (u_refract_oblateness > 0.001 && u_refract_oblateness < 0.99) {
-        vec3 P_dir = r_min > 1e-6 ? (P_min / r_min) : vec3(0.0, 1.0, 0.0);
-        vec3 pole_dir = length(u_refract_pole) > 1e-4 ? normalize(u_refract_pole) : vec3(0.0, 1.0, 0.0);
-        float cos_t = abs(dot(P_dir, pole_dir));
-        float k = 1.0 / (1.0 - u_refract_oblateness);
-        float denom = sqrt(max(1e-6, 1.0 + (k * k - 1.0) * cos_t * cos_t));
-        local_refract_radius = u_refract_radius / denom;
-    }
-
-    if (r_min > local_refract_radius + u_refract_scale_height * 15.0) return 0.0;
-
-    float r_min_clamped = max(r_min, local_refract_radius - u_refract_scale_height);
-    float delta_rmin = min(0.15, u_refract_max_bend * exp(-(r_min_clamped - local_refract_radius) / max(1e-4, u_refract_scale_height)));
-    float sigma = sqrt(max(1e-4, r_min_clamped * u_refract_scale_height));
-
-    if (d < 0.1 * sigma) {
-        float kappa_0 = (delta_rmin / (sigma * 2.506628)) * exp(-(s_min * s_min) / (2.0 * sigma * sigma));
-        return 0.5 * kappa_0 * d;
-    }
-
-    float sqrt2_sig = 1.4142135 * sigma;
-    float x_d = (d - s_min) / sqrt2_sig;
-    float x_0 = s_min / sqrt2_sig;
-
-    float E_d = sign(x_d) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_d * x_d)));
-    float E_0 = sign(x_0) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_0 * x_0)));
-    float G_d = exp(-clamp(x_d * x_d, 0.0, 50.0));
-    float G_0 = exp(-clamp(x_0 * x_0, 0.0, 50.0));
-
-    float alpha = delta_rmin * ( 0.5 * (E_d + E_0) * (1.0 - s_min / d) + (sigma / (d * 2.506628)) * (G_d - G_0) );
-    return max(0.0, alpha);
-}
+#define ATMO_DATA_HAS_AU_TO_KM 1
+#include "common/refraction.glsl"
 
 // Shared analytical eclipse penumbra + physical atmospheric lens optics & Danjon refraction tinting.
 // Inputs are per-caster quantities already resolved by the caller.

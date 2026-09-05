@@ -96,11 +96,54 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 changed_exp, app.camera["exposure"] = imgui.slider_float("Exposure", app.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
                 if changed_exp: settings_changed = True
 
-            # Bloom
-            changed_bi, app.camera["bloom_intensity"] = imgui.slider_float("Bloom Intensity", app.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
-            if changed_bi: settings_changed = True
-            changed_bt, app.camera["bloom_threshold"] = imgui.slider_float("Bloom Threshold", app.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
-            if changed_bt: settings_changed = True
+            # Bloom & Diffraction Spikes
+            bloom_modes = ["Gaussian Blur", "Diffraction Spikes", "Hybrid (Spikes + Haze)"]
+            current_bm = app.camera.get("bloom_mode", 2)
+            current_bm_idx = current_bm if 0 <= current_bm < len(bloom_modes) else 2
+            changed_bm, new_bm = imgui.combo("Bloom Mode", current_bm_idx, bloom_modes)
+            if changed_bm:
+                app.camera["bloom_mode"] = new_bm
+                settings_changed = True
+
+            if app.camera.get("bloom_mode", 2) in (1, 2):
+                spike_counts = [4, 6, 8]
+                spike_labels = ["4 Spikes (Cross)", "6 Spikes (JWST / Newtonian)", "8 Spikes (Octagram)"]
+                curr_sc = app.camera.get("spike_count", 6)
+                sc_idx = spike_counts.index(curr_sc) if curr_sc in spike_counts else 1
+                changed_sc, new_sc_idx = imgui.combo("Spike Pattern", sc_idx, spike_labels)
+                if changed_sc:
+                    app.camera["spike_count"] = spike_counts[new_sc_idx]
+                    settings_changed = True
+
+                changed_cbi, app.camera["conv_bloom_intensity"] = imgui.slider_float("Diffraction Spikes Intensity", app.camera.get("conv_bloom_intensity", 0.5), 0.0, 5.0, "%.2f")
+                if changed_cbi: settings_changed = True
+                changed_sl, app.camera["spike_length"] = imgui.slider_float("Diffraction Spikes Length", app.camera.get("spike_length", 1.0), 0.2, 3.0, "%.2f")
+                if changed_sl: settings_changed = True
+                changed_sa, app.camera["spike_angle"] = imgui.slider_float("Diffraction Spikes Angle", app.camera.get("spike_angle", 0.0), 0.0, 180.0, "%.1f deg")
+                if changed_sa: settings_changed = True
+                changed_srl, app.camera["spike_roll_lock"] = imgui.checkbox("Lock Spikes to Camera Roll", app.camera.get("spike_roll_lock", True))
+                if changed_srl: settings_changed = True
+                changed_sd, app.camera["spike_dispersion"] = imgui.slider_float("Dispersion (Rainbow)", app.camera.get("spike_dispersion", 0.015), 0.0, 0.05, "%.3f")
+                if changed_sd: settings_changed = True
+
+                spike_res_opts = [0, 1]
+                spike_res_labels = ["Quarter Res (Fast - 0.1ms)", "Half Res (Ultra)"]
+                curr_sq = app.camera.get("spike_quality", 0)
+                sq_idx = curr_sq if 0 <= curr_sq < len(spike_res_opts) else 0
+                changed_sq, new_sq_idx = imgui.combo("Spikes Resolution", sq_idx, spike_res_labels)
+                if changed_sq:
+                    app.camera["spike_quality"] = spike_res_opts[new_sq_idx]
+                    app.last_fb_size = (0, 0)
+                    settings_changed = True
+
+                changed_cds, app.camera["conv_bloom_dynamic_scale"] = imgui.checkbox("Dynamic Spike Distance Shrinking", app.camera.get("conv_bloom_dynamic_scale", True))
+                if changed_cds: settings_changed = True
+
+            if app.camera.get("bloom_mode", 2) in (0, 2):
+                changed_bi, app.camera["bloom_intensity"] = imgui.slider_float("Gaussian Haze Intensity", app.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
+                if changed_bi: settings_changed = True
+                changed_bt, app.camera["bloom_threshold"] = imgui.slider_float("Gaussian Haze Threshold", app.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
+                if changed_bt: settings_changed = True
 
             # MSAA
             msaa_options = [0, 2, 4, 8]

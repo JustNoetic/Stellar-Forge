@@ -196,7 +196,7 @@ class PerfTracker:
                     ("Atmosphere Rendering", ["gpu_atmo_behind", "gpu_atmo_front"]),
                     ("Celestial Bodies & Geo", ["gpu_spheres", "gpu_orbits", "gpu_hz"]),
                     ("Rings & Shadows", ["gpu_rings", "gpu_ringshine_map"]),
-                    ("Post-Processing", ["gpu_bloom", "gpu_composite", "gpu_taa"]),
+                    ("Post-Processing", ["gpu_bloom", "gpu_conv_bloom", "gpu_composite", "gpu_taa"]),
                     ("Overhead & UI", ["gpu_culling", "gpu_imgui"])
                 ]
                 
