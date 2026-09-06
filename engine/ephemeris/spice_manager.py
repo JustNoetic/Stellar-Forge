@@ -31,13 +31,15 @@ class SpiceManager:
         "nep104.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep104.bsp",
         "nep105.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep105.bsp",
         "plu060.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/plu060.bsp",
-        "mar099s.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp"
+        "mar099s.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp",
+        "artemis2.bsp": "HORIZONS_API"
     }
     
     KERNEL_DESCRIPTIONS = {
         "naif0012.tls": "Leapseconds (Required)",
         "pck00010.tpc": "Planetary Constants (Required)",
         "de440s.bsp": "Planetary Ephemeris (Required)",
+        "artemis2.bsp": "Artemis II Lunar Flyby (Orion) [144KB]",
         "jup347.bsp": "Irregular Jupiter Moons (879MB)",
         "jup348.bsp": "Irregular Jupiter Moons (57MB)",
         "jup349.bsp": "Irregular Jupiter Moons (93MB)",
@@ -66,6 +68,17 @@ class SpiceManager:
         299: {"name": "Venus", "type": "Planet", "color": "#e0c8a0", "radius_km": 6051.8, "mass_kg": 4.8675e24},
         399: {"name": "Earth", "type": "Planet", "color": "#3b5d9c", "radius_km": 6371.0, "mass_kg": 5.972e24},
         301: {"name": "Moon", "type": "Moon", "color": "#d0d0d0", "radius_km": 1737.4, "mass_kg": 7.342e22},
+        -1024: {
+            "name": "Artemis II (Orion)",
+            "type": "Spacecraft",
+            "color": "#00ffff",
+            "radius_km": 0.010,
+            "mass_kg": 26000.0,
+            "parentId": "Earth",
+            "is_spacecraft": True,
+            "mission_start_utc": "2026-04-02 02:00:00",
+            "mission_end_utc": "2026-04-10 23:50:00"
+        },
         499: {"name": "Mars", "type": "Planet", "color": "#c1440e", "radius_km": 3389.5, "mass_kg": 6.4171e23},
         401: {"name": "Phobos", "type": "Moon", "color": "#a0a0a0", "radius_km": 11.26, "mass_kg": 1.0659e16},
         402: {"name": "Deimos", "type": "Moon", "color": "#a0a0a0", "radius_km": 6.2, "mass_kg": 1.4762e15},
@@ -231,6 +244,30 @@ class SpiceManager:
                 self.current_download_file = filename
                 self.download_status = f"Downloading {filename} ({i+1}/{total_files})..."
                 
+                if filename == "artemis2.bsp":
+                    self.current_download_file = filename
+                    self.download_status = f"Generating {filename} from JPL Horizons ({i+1}/{total_files})..."
+                    try:
+                        from scripts.fetch_artemis2_kernel import generate_artemis2_spk
+                        def _artemis_hook(frac, msg):
+                            if self.cancel_requested:
+                                raise InterruptedError("Download cancelled by user.")
+                            self.download_progress = (i + frac) / total_files
+                            self.download_status = f"Artemis II: {msg}"
+                        ok, msg, _ = generate_artemis2_spk(output_dir=self.KERNEL_DIR, progress_callback=_artemis_hook)
+                        if not ok:
+                            raise RuntimeError(msg)
+                    except Exception as e:
+                        if self.cancel_requested:
+                            self.download_status = "Download cancelled."
+                        else:
+                            print(f"[SPICE] Failed to generate {filename}: {e}")
+                            self.download_status = f"Error generating {filename}"
+                            self.download_error = str(e)
+                        self.is_downloading = False
+                        return
+                    continue
+
                 start_time = time.time()
                 last_sample_time = [start_time]
                 last_sample_bytes = [0]
@@ -354,19 +391,23 @@ class SpiceManager:
                     try:
                         name = spice.bodc2n(spid)
                     except:
-                        prefix = str(spid)[0]
-                        if prefix == '5': name = f"Jovian Moon ({spid})"
-                        elif prefix == '6': name = f"Saturnian Moon ({spid})"
-                        elif prefix == '7': name = f"Uranian Moon ({spid})"
-                        elif prefix == '8': name = f"Neptunian Moon ({spid})"
-                        else: name = f"Asteroid ({spid})"
+                        if spid < 0:
+                            name = f"Spacecraft ({spid})"
+                        else:
+                            prefix = str(spid)[0]
+                            if prefix == '5': name = f"Jovian Moon ({spid})"
+                            elif prefix == '6': name = f"Saturnian Moon ({spid})"
+                            elif prefix == '7': name = f"Uranian Moon ({spid})"
+                            elif prefix == '8': name = f"Neptunian Moon ({spid})"
+                            else: name = f"Asteroid ({spid})"
                         
                     self.SPICE_BODIES[spid] = {
                         "name": name,
-                        "type": "Moon",
-                        "color": "#a0a0a0",
-                        "radius_km": 10.0,
-                        "mass_kg": 1e15
+                        "type": "Spacecraft" if spid < 0 else "Moon",
+                        "color": "#00ffff" if spid < 0 else "#a0a0a0",
+                        "radius_km": 0.010 if spid < 0 else 10.0,
+                        "mass_kg": 26000.0 if spid < 0 else 1e15,
+                        "is_spacecraft": (spid < 0)
                     }
             except Exception as e:
                 print(f"Error discovering bodies in {k_name}: {e}")
@@ -436,6 +477,15 @@ class SpiceManager:
             if not state:
                 state = self.get_body_state(body_id, et)
                 
+            # If body is a spacecraft with a finite mission window and et is outside that window,
+            # query its state at mission start so build_ephemeris_system has an initial state.
+            if not state and body_info.get("is_spacecraft") and "mission_start_utc" in body_info:
+                try:
+                    start_et = spice.str2et(body_info["mission_start_utc"]) + 600.0
+                    state = self.get_body_state(body_id, start_et)
+                except Exception:
+                    pass
+
             if state:
                 states[actual_id] = {
                     "info": body_info,
@@ -653,6 +703,13 @@ class SpiceManager:
                     if planet_id in states:
                         parent_id = planet_id
                         parent_name = states[planet_id]["info"]["name"]
+                elif data["info"].get("parentId"):
+                    p_name = data["info"]["parentId"]
+                    parent_name = p_name
+                    for sp_id, pdata in states.items():
+                        if pdata["info"]["name"].upper() == p_name.upper():
+                            parent_id = sp_id
+                            break
                 
                 parent_state = states.get(parent_id)
                 if parent_state and body_id != 10:
@@ -663,7 +720,7 @@ class SpiceManager:
                     vel_rel = data["state"]["vel"]
                     
                 m_sun, r_sun = self._get_body_properties(body_id, data["info"]["mass_kg"], data["info"]["radius_km"])
-                bodies_data.append({
+                body_dict = {
                     "name": data["info"]["name"],
                     "type": data["info"]["type"],
                     "m": m_sun,
@@ -674,7 +731,10 @@ class SpiceManager:
                         "x": pos_rel[0], "y": pos_rel[1], "z": pos_rel[2],
                         "vx": vel_rel[0], "vy": vel_rel[1], "vz": vel_rel[2]
                     }
-                })
+                }
+                if data["info"].get("is_spacecraft"):
+                    body_dict["is_spacecraft"] = True
+                bodies_data.append(body_dict)
             return bodies_data
 
         # Fallback: Build entirely from SPICE states if no template provided
@@ -709,6 +769,13 @@ class SpiceManager:
                 if planet_id in states:
                     parent_id = planet_id
                     parent_name = states[planet_id]["info"]["name"]
+            elif data["info"].get("parentId"):
+                p_name = data["info"]["parentId"]
+                parent_name = p_name
+                for sp_id, pdata in states.items():
+                    if pdata["info"]["name"].upper() == p_name.upper():
+                        parent_id = sp_id
+                        break
             
             parent_state = states.get(parent_id)
             if parent_state and body_id != 10:
@@ -719,7 +786,7 @@ class SpiceManager:
                 vel_rel = data["state"]["vel"]
                 
             m_sun, r_sun = self._get_body_properties(body_id, data["info"]["mass_kg"], data["info"]["radius_km"])
-            bodies_data.append({
+            body_dict = {
                 "name": data["info"]["name"],
                 "type": data["info"]["type"],
                 "m": m_sun,
@@ -730,6 +797,37 @@ class SpiceManager:
                     "x": pos_rel[0], "y": pos_rel[1], "z": pos_rel[2],
                     "vx": vel_rel[0], "vy": vel_rel[1], "vz": vel_rel[2]
                 }
-            })
+            }
+            if data["info"].get("is_spacecraft"):
+                body_dict["is_spacecraft"] = True
+            bodies_data.append(body_dict)
             
         return bodies_data
+
+    def get_trajectory_polyline(self, body_id=-1024, observer_id=399, num_samples=1000):
+        """
+        Samples the 3D trajectory of a body relative to an observer (e.g. Earth 399)
+        across its mission duration. Returns an (N, 3) float32 numpy array in engine render frame:
+        X = x * KM_TO_AU, Y = z * KM_TO_AU, Z = -y * KM_TO_AU.
+        """
+        if not self.kernels_loaded:
+            return None
+        info = self.SPICE_BODIES.get(body_id)
+        if not info or "mission_start_utc" not in info:
+            return None
+        try:
+            et_start = spice.str2et(info["mission_start_utc"])
+            et_end = spice.str2et(info["mission_end_utc"])
+            et_samples = np.linspace(et_start, et_end, num_samples)
+            points = np.empty((num_samples, 3), dtype=np.float32)
+            km_to_au = float(self.KM_TO_AU)
+            for i, et in enumerate(et_samples):
+                st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', observer_id)
+                # Engine render frame swap: X=x, Y=z, Z=-y
+                points[i, 0] = float(st[0] * km_to_au)
+                points[i, 1] = float(st[2] * km_to_au)
+                points[i, 2] = float(-st[1] * km_to_au)
+            return points
+        except Exception as e:
+            print(f"[SPICE] Failed to sample trajectory polyline for {body_id}: {e}")
+            return None

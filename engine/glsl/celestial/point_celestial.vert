@@ -140,7 +140,9 @@ void main() {
         // Geometric albedo: use true Top-Of-Atmosphere (TOA) color if body has an atmosphere
         vec3 albedo = in_color;
         for (int j = 0; j < u_num_casters; j++) {
-            if (distance(u_casters[j].xyz, in_offset) < 1e-4) {
+            // Positions are bit-identical copies from the same CPU buffer, so a
+            // tight epsilon suffices (1e-4 AU would misclassify close-in moons).
+            if (distance(u_casters[j].xyz, in_offset) < 1e-7) {
                 if (u_caster_atmos[j].w > 0.0) {
                     albedo = u_caster_colors[j].xyz;
                 }

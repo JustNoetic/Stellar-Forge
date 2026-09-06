@@ -471,7 +471,7 @@ void main() {
     vec3 view_ray = normalize((u_inv_view * eye_ray).xyz);
 
     vec3 ray_dir = view_ray;
-    bool is_refract_host = length(u_body_offset - u_refract_center) < 1e-4;
+    bool is_refract_host = length(u_body_offset - u_refract_center) < 1e-7;
 
 
     vec3 ring_ray_dir = view_ray;
@@ -493,7 +493,10 @@ void main() {
             }
         }
 
-        float alpha = compute_refraction_angle(C_km, view_ray, d_km);
+        // Total (un-parallaxed) bend: the anchored rotation below applies the
+        // (1 - s_min/d) parallax geometrically; using the parallaxed alpha here
+        // would double-count it.
+        float alpha = compute_refraction_total(C_km, view_ray, d_km);
         if (alpha > 1e-7) {
             vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
             float u_len = length(u_dir);

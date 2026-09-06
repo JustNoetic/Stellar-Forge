@@ -33,8 +33,10 @@ flat in vec3 f_my_atmo_tint;
 flat in float f_my_atmo_h;
 flat in float f_my_scale_height;
 flat in vec3 f_my_atmo_color;
-flat in vec3 f_my_mie_tau;
-flat in float f_my_mie_h;
+    flat in vec3 f_my_mie_tau;
+    flat in float f_my_mie_h;
+    flat in vec3 f_my_o3_tau;
+    flat in vec2 f_my_o3_layer;
 
 struct BodyTextures {
     uvec2 diffuse;
@@ -67,6 +69,9 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
     vec4 u_caster_ozone[MAX_CASTERS];
+    // Vertical Chapman-ozone column (rgb) + layer Gaussian width km (w).
+    // Appended tail member: older SceneData declarations remain offset-valid.
+    vec4 u_caster_ozone_vert[MAX_CASTERS];
 };
 
 // Ring shadow planes (sphere-only)
@@ -230,14 +235,17 @@ void main() {
     vec3 view_ray = normalize(f_local_bounding + cam_to_center);
     vec3 ray_dir = view_ray;
     vec3 ray_origin = u_camera_pos;
-    bool is_refract_host = length(f_center_pos - u_refract_center) < 1e-4;
+    bool is_refract_host = length(f_center_pos - u_refract_center) < 1e-7;
 
     float s_min_au = 0.0;
     if (u_refract_max_bend > 1e-6) {
         if (!is_refract_host) {
             vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
             float d_km = length(cam_to_center * u_au_to_km);
-            float alpha = compute_refraction_angle(C_km, view_ray, d_km);
+            // Total (un-parallaxed) bend: the anchored rotation below applies
+            // the (1 - s_min/d) parallax geometrically; using the parallaxed
+            // alpha here would double-count it.
+            float alpha = compute_refraction_total(C_km, view_ray, d_km);
             if (alpha > 1e-7) {
                 vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
                 float u_len = length(u_dir);
@@ -544,6 +552,7 @@ void main() {
 
             vec3 incoming_light_tint = vec3(1.0);
             vec3 direct_light_tint = vec3(1.0);
+            vec3 diffuse_light_tint = vec3(0.0);
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
@@ -569,15 +578,34 @@ void main() {
 
                 // Direct sunlight extinction
                 vec3 tau_direct = tau_vertical * am;
+
+                // Stratospheric ozone (Chappuis band) absorbs the orange/red
+                // direct beam heavily at high air mass — this is what keeps the
+                // real terminator only faintly warm instead of saturated red.
+                // The layer sits above cloud decks, so the full vertical column
+                // applies in both passes; its Chapman air mass uses the layer's
+                // own altitude and Gaussian width.
+                if (dot(f_my_o3_tau, f_my_o3_tau) > 0.0) {
+                    float o3_w = f_my_o3_layer.y;
+                    float R_o3 = R_km + max(f_my_o3_layer.x, 0.0);
+                    float am_o3 = (sqrt(R_o3*R_o3*mu*mu + 2.0*R_o3*o3_w + o3_w*o3_w) - R_o3*mu) / o3_w;
+                    tau_direct += f_my_o3_tau * am_o3;
+                }
+
                 direct_light_tint = exp(-tau_direct);
 
                 // Downward diffuse daylight: two-term Eddington, Rayleigh g=0 and
                 // Mie g=0.8, so blue sky-shine and white haze keep correct hues.
+                // The scattered-out fraction must use the SLANT optical depth
+                // (tau_v * am): it saturates toward 1 at low sun instead of
+                // decaying ~ mu, which left the ground far too dark at dusk.
+                vec3 tau_slant_rm = tau_rm_vert * am;
+                vec3 tau_slant_m = tau_mie_vert * am;
                 vec3 tau_diff_rm = tau_rm_vert; // (1-0)*tau
                 vec3 tau_diff_m = 0.2 * tau_mie_vert; // (1-0.8)*tau
-                vec3 diffuse_rm = (vec3(1.0) - exp(-tau_rm_vert)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff_rm));
-                vec3 diffuse_m = (vec3(1.0) - exp(-tau_mie_vert)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff_m));
-                vec3 diffuse_light_tint = diffuse_rm + diffuse_m;
+                vec3 diffuse_rm = (vec3(1.0) - exp(-tau_slant_rm)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff_rm));
+                vec3 diffuse_m = (vec3(1.0) - exp(-tau_slant_m)) * (max(0.0, mu) / (vec3(1.0) + 0.75 * tau_diff_m));
+                diffuse_light_tint = diffuse_rm + diffuse_m;
 
                 incoming_light_tint = direct_light_tint + diffuse_light_tint;
             }
@@ -616,8 +644,12 @@ void main() {
                         float v_c = 0.5 - asin(clamp(p_rot_c.y, -1.0, 1.0)) / PI;
 
                         vec4 cloud_shadow_sample = textureLod(s_clouds, vec2(u_c, v_c), 0.0);
-                        float shadow_factor = 1.0 - cloud_shadow_sample.a * 0.85;
-                        incoming_light_tint *= shadow_factor;
+                        float shadow_alpha = cloud_shadow_sample.a;
+                        // Direct beam is nearly fully blocked by the cloud, but
+                        // diffuse skylight arrives from the whole sky dome and
+                        // must only be mildly reduced inside the shadow.
+                        incoming_light_tint = direct_light_tint * (1.0 - shadow_alpha * 0.85)
+                                            + diffuse_light_tint * (1.0 - shadow_alpha * 0.25);
                     }
                 }
             }
@@ -808,7 +840,8 @@ void main() {
 
             int host_caster_idx = -1;
             for (int j = 0; j < u_num_casters; j++) {
-                if (distance(u_casters[j].xyz, ring_center) < 1e-4) {
+                // Positions are bit-identical copies from the same CPU buffer
+                if (distance(u_casters[j].xyz, ring_center) < 1e-7) {
                     host_caster_idx = j;
                     break;
                 }

@@ -222,6 +222,8 @@ spectral classification.
   - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`).
   - `ring_*` (`glsl/celestial/ring.*`), `hz_*` (`glsl/celestial/hz.*`).
   - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*` — Volumetric raymarching atmosphere shaders (with primary ray refraction & vertex bounding expansion).
+  - `point_celestial.*` (`glsl/celestial/`) — Subpixel point-light quad pass (apparent_px < 3.0); refracts the body's apparent position via `apply_refraction` (parallax-weighted with Newton-Raphson inverse apparent solver `solve_refraction_apparent` and solid-body occlusion guard), cross-fades against the mesh over apparent_px ∈ [2.0, 3.0].
+  - `common/refraction.glsl` — Shared refraction math: `compute_refraction_angle` (parallax-weighted apparent displacement) vs `compute_refraction_total` (un-parallaxed total ray turn); `solve_refraction_apparent` inverts the deflection for point lights/orbits via damped Newton-Raphson to ensure smooth, monotonic setting without orbit-lever inversion jumps; `refract_chord_blocked` tests apparent-ray periapsis to occlude bodies behind the solid planet.
 
 **Edit when:** editing GLSL shader logic inside `engine/glsl/` or uniform bindings in `shaders.py`.
 

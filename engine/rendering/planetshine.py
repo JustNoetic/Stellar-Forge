@@ -18,6 +18,9 @@ def compute_max_bend(caster_r_au, atmo_h_km, refractivity=0.00029, beta_ext=None
         return 0.0
     caster_r_km = caster_r_au * 149597870.7
     val = (3.141592653589793 * caster_r_km) / max(1e-6, atmo_h_km * 2.0)
+    # Full space-to-space grazing ray bending: 2*(n-1)*sqrt(pi*R/(2H)).
+    # Note: For observers on the ground, the ray only traverses half the atmosphere;
+    # refraction.glsl dynamically accounts for observer altitude via the 0.5 * (E_d + E_0) factor.
     surface_bend = 2.0 * max(refractivity, 0.0) * math.sqrt(val)
     
     # Transmission limit: twilight/limb grazing optical depth threshold (evaluated at the
@@ -103,6 +106,11 @@ def get_cached_atmosphere_properties(atmo, mass_sm):
     
     props['tau_R0'] = od_r.astype(np.float32)
     props['tau_O3_peak'] = od_o3.astype(np.float32)
+    # Vertical column of the Chapman ozone layer (surface-beam geometry for the
+    # terminator direct-light extinction). Distinct from the limb slant od_o3
+    # above, which is used for eclipse shadows / top-of-atmosphere color.
+    props['tau_o3_vert'] = (beta_layered * 1000.0 * (ozone_w_km * math.sqrt(2.0 * math.pi))).astype(np.float32)
+    props['o3_width_km'] = float(ozone_w_km)
     
     tau_vert_r = beta_r * 1000.0 * h_r
     tau_vert_m = mie_coeffs * 1000.0 * h_m

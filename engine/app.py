@@ -1886,7 +1886,7 @@ class App(InputHandlerMixin):
         orbit_ssbo_out.bind_to_storage_buffer(binding=1)
         vao_gpu_orbits = ctx.vertex_array(prog_gpu_orbits, [])
     
-        UBO_SIZE = 6304
+        UBO_SIZE = 7328
         scene_ubo = ctx.buffer(reserve=UBO_SIZE)
         scene_ubo.bind_to_uniform_block(1)
         ubo_staging = np.zeros(UBO_SIZE // 4, dtype=np.float32)
@@ -1997,6 +1997,9 @@ class App(InputHandlerMixin):
         caster_colors_buf = np.zeros((64, 4), dtype='f4')
         caster_atmos_buf = np.zeros((64, 4), dtype='f4')
         caster_ozone_buf = np.zeros((64, 4), dtype='f4')
+        # Vertical Chapman-ozone column (rgb) + layer Gaussian width km (w)
+        # for the terminator direct-light extinction in sphere.frag.
+        caster_ozone_vert_buf = np.zeros((64, 4), dtype='f4')
         caster_max_bend_buf = np.zeros(64, dtype='f4')
         # Per-caster Mie vertical optical depth (xyz) + Mie scale height km (w)
         # for physically-based per-species cloud-altitude attenuation.
@@ -2269,10 +2272,13 @@ class App(InputHandlerMixin):
                     self.shared_state["ephemeris_mode"] = True
                     keplerian_mode_active = False
                     self.shared_state["keplerian_mode"] = False
+                    self._artemis_polyline_loaded = False
                 elif is_ephem_exit:
                     ephemeris_mode_active = False
                     active_system_name = switch_req_name
                     self.shared_state["ephemeris_mode"] = False
+                    self._artemis_polyline_loaded = False
+                    self._artemis_polyline_len = 0
                     if to_keplerian:
                         keplerian_mode_active = True
                         self.shared_state["keplerian_mode"] = True
@@ -2327,6 +2333,7 @@ class App(InputHandlerMixin):
                 caster_colors_buf = np.zeros((64, 4), dtype='f4')
                 caster_atmos_buf = np.zeros((64, 4), dtype='f4')
                 caster_ozone_buf = np.zeros((64, 4), dtype='f4')
+                caster_ozone_vert_buf = np.zeros((64, 4), dtype='f4')
                 caster_max_bend_buf = np.zeros(64, dtype='f4')
                 caster_mie_buf = np.zeros((64, 4), dtype='f4')
                 ring_centers_buf = np.zeros((16, 3), dtype='f4')
@@ -3800,6 +3807,9 @@ class App(InputHandlerMixin):
                     parent_snap_render = parent_snap.copy()
                     if ephemeris_mode_active:
                         parent_snap_render[~spice_valid_mask] = -1
+                        for bi in range(num_bodies):
+                            if bodies_data[bi].get("is_spacecraft", False) or bodies_data[bi].get("type") == "Spacecraft":
+                                parent_snap_render[bi] = -1
 
                     n_orbits = compute_all_orbits_batch(
                         pos_snap_render, vel_snap_render, mass_snap, parent_snap_render,
@@ -3807,6 +3817,16 @@ class App(InputHandlerMixin):
                         visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels,
                         np.zeros(3, dtype='f8'))
                     last_orbit_pos_snap = pos_snap_render.copy()
+
+                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded and not getattr(self, "_artemis_polyline_loaded", False):
+                        if -1024 in getattr(self, "_ephem_mapping", []):
+                            pts = sys_mgr_spice.get_trajectory_polyline(-1024, observer_id=399, num_samples=1000)
+                            if pts is not None:
+                                if vbo_ephem_orbits.size < pts.nbytes:
+                                    vbo_ephem_orbits.orphan(pts.nbytes)
+                                vbo_ephem_orbits.write(pts.tobytes())
+                                self._artemis_polyline_len = len(pts)
+                                self._artemis_polyline_loaded = True
                     
                     if n_orbits > 0:
                         valid_orbits = orbit_data_buf[:n_orbits]
@@ -4039,6 +4059,10 @@ class App(InputHandlerMixin):
                     z_peak_km = float(props.get('ozone_peak_km', 25.0))
                     caster_ozone_buf[i_c, 0:3] = tau_o3_peak
                     caster_ozone_buf[i_c, 3] = z_peak_km
+                    # Vertical ozone column for the surface direct-beam
+                    # extinction (Chappuis band); w carries the layer width.
+                    caster_ozone_vert_buf[i_c, 0:3] = props.get('tau_o3_vert', np.zeros(3, dtype=np.float32))
+                    caster_ozone_vert_buf[i_c, 3] = float(props.get('o3_width_km', 6.0))
 
                     # Provide true Top-of-Atmosphere color for subpixel point light appearance
                     b_name = bodies_data[b_idx].get('name', '').lower() if (bodies_data is not None and b_idx < len(bodies_data)) else ''
@@ -4054,11 +4078,13 @@ class App(InputHandlerMixin):
                 else:
                     caster_atmos_buf[i_c] = 0.0
                     caster_ozone_buf[i_c] = 0.0
+                    caster_ozone_vert_buf[i_c] = 0.0
                     caster_max_bend_buf[i_c] = 0.0
                     caster_mie_buf[i_c] = 0.0
             if n_casters_fixed < 64:
                 caster_atmos_buf[n_casters_fixed:] = 0
                 caster_ozone_buf[n_casters_fixed:] = 0
+                caster_ozone_vert_buf[n_casters_fixed:] = 0
                 caster_max_bend_buf[n_casters_fixed:] = 0
                 caster_mie_buf[n_casters_fixed:] = 0
     
@@ -4097,6 +4123,7 @@ class App(InputHandlerMixin):
             ubo_staging[808:1064] = caster_colors_buf.ravel()
             ubo_staging[1064:1320] = caster_atmos_buf.ravel()
             ubo_staging[1320:1576] = caster_ozone_buf.ravel()
+            ubo_staging[1576:1832] = caster_ozone_vert_buf.ravel()
             
             scene_ubo.write(ubo_staging.tobytes())
             
@@ -4289,7 +4316,7 @@ class App(InputHandlerMixin):
                 refract_pole = (float(pole_ref[0]), float(pole_ref[1]), float(pole_ref[2]))
                 refract_oblateness = float(b_info.get('oblateness', 0.0))
 
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, getattr(self, 'prog_hz', None)):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_culling_compute, getattr(self, 'prog_hz', None)):
                 if prog is not None:
                     if 'u_refract_center' in prog:
                         prog['u_refract_center'].value = refract_center
@@ -4401,6 +4428,30 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
+                if ephemeris_mode_active and getattr(self, "_artemis_polyline_len", 0) > 0:
+                    earth_idx = None
+                    for bi, b in enumerate(bodies_data):
+                        if b.get("name") == "Earth":
+                            earth_idx = bi
+                            break
+                    if earth_idx is not None and earth_idx < num_bodies:
+                        earth_pos = pos_snap_render[earth_idx].astype('f4')
+                        if 'projection' in prog_ephem_orbits:
+                            prog_ephem_orbits['projection'].write(projection)
+                        if 'view_rot' in prog_ephem_orbits:
+                            prog_ephem_orbits['view_rot'].write(view_rot)
+                        if 'u_cam_pos_double' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                        if 'u_bary_pos' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_bary_pos'].value = tuple(earth_pos)
+                        if 'u_color' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_color'].value = (0.0, 1.0, 1.0)
+                        if 'u_far' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_far'].value = far
+                        if 'u_depth_C' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_depth_C'].value = depth_C
+                        vao_ephem_orbits.render(moderngl.LINE_STRIP, vertices=self._artemis_polyline_len)
+
                 if self.comparison_enabled and self.n_orbits_cmp > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
                     orbit_ssbo_out.bind_to_storage_buffer(binding=1)
@@ -4457,7 +4508,8 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
 
-            if show_orbits and (n_orbits > 0 or (self.comparison_enabled and self.n_orbits_cmp > 0)):
+            has_artemis_orbit = ephemeris_mode_active and getattr(self, "_artemis_polyline_len", 0) > 0
+            if show_orbits and (n_orbits > 0 or has_artemis_orbit or (self.comparison_enabled and self.n_orbits_cmp > 0)):
                 if self.orbit_msaa_fbo is not None:
                     # Orbit lines get their own MSAA buffer; the resolved result is
                     # blended back over the (non-MSAA) scene afterwards.
@@ -4679,13 +4731,19 @@ class App(InputHandlerMixin):
                             props_c, trans_c, thick_c = get_cached_atmosphere_properties(atmo_info, mass_sm_c)
                             thick_km = float(atmo_info.get('atmo_radius_km', 0.0) - atmo_info.get('planet_radius_km', 0.0))
                             scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                            active_atmos_buf[i_ac, 0:3] = trans_c
+                            r_c_km = float(atmo_info.get('planet_radius_km', rad_c * 149597870.7))
+                            # Limb-grazing vertical optical depth: the atmosphere-pass
+                            # casterShadowTerm consumes grazing tau directly (no internal
+                            # grazing_factor multiplication, unlike the sphere shader which
+                            # receives the plain vertical OD via the scene UBO).
+                            tau_vert_c = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                            grazing_factor_c = math.sqrt(2.0 * math.pi * max(r_c_km, 1e-6) / max(scale_height_km, 1e-3))
+                            active_atmos_buf[i_ac, 0:3] = tau_vert_c * grazing_factor_c
                             active_atmos_buf[i_ac, 3] = thick_km
                             active_max_bend_buf[i_ac] = compute_max_bend(
                                 rad_c, scale_height_km,
                                 float(props_c.get('refractivity', 0.00029)),
                                 beta_ext=props_c.get('beta_rayleigh'))
-                            r_c_km = float(atmo_info.get('planet_radius_km', rad_c * 149597870.7))
                             path_len_m_c = math.sqrt(2.0 * math.pi * r_c_km * 1000.0 * scale_height_km * 1000.0)
                             tau_o3_c = props_c.get('beta_abs_layered', np.zeros(3)) * path_len_m_c
                             active_caster_ozone_buf[i_ac, 0:3] = tau_o3_c
@@ -5050,7 +5108,10 @@ class App(InputHandlerMixin):
                             if atmo is not None:
                                 props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
                                 scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
+                                # ring.frag's casterShadowTerm expects the plain vertical
+                                # optical depth (it applies the grazing factor internally).
+                                _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                                u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
                                 if u_ring_host_refractivity is not None:
                                     u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
                                 if u_ring_host_max_bend is not None:
@@ -5137,7 +5198,10 @@ class App(InputHandlerMixin):
                             if atmo is not None:
                                 props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
                                 scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                                u_ring_host_atmo.value = (float(trans_c[0]), float(trans_c[1]), float(trans_c[2]), scale_height_km)
+                                # ring.frag's casterShadowTerm expects the plain vertical
+                                # optical depth (it applies the grazing factor internally).
+                                _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                                u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
                                 if u_ring_host_refractivity is not None:
                                     u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
                                 if u_ring_host_max_bend is not None:

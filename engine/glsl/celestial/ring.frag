@@ -304,7 +304,10 @@ void main() {
             }
         }
         
-        float alpha = compute_refraction_angle(C_km, view_ray, d_km);
+        // Total (un-parallaxed) bend: the anchored rotation below applies the
+        // (1 - s_min/d) parallax geometrically; using the parallaxed alpha here
+        // would double-count it.
+        float alpha = compute_refraction_total(C_km, view_ray, d_km);
         if (alpha > 1e-7) {
             vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
             float u_len = length(u_dir);

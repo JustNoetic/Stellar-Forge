@@ -30,6 +30,9 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
     vec4 u_caster_ozone[MAX_CASTERS];
+    // Vertical Chapman-ozone column (rgb) + layer Gaussian width km (w).
+    // Appended tail member: older SceneData declarations remain offset-valid.
+    vec4 u_caster_ozone_vert[MAX_CASTERS];
 };
 uniform float screen_height;
 uniform float fov_factor;
@@ -70,6 +73,8 @@ flat out float f_my_scale_height;
 flat out vec3 f_my_atmo_color;
 flat out vec3 f_my_mie_tau;
 flat out float f_my_mie_h;
+flat out vec3 f_my_o3_tau;
+flat out vec2 f_my_o3_layer;
 
 vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
     if (abs(angle) < 1e-7) return v;
@@ -104,14 +109,20 @@ void main() {
     vec3 my_atmo_color = in_color;
     vec3 my_mie_tau = vec3(0.0);
     float my_mie_h = 1.2;
+    vec3 my_o3_tau = vec3(0.0);
+    vec2 my_o3_layer = vec2(0.0, 6.0);
     for (int j = 0; j < u_num_casters; j++) {
-        if (distance(u_casters[j].xyz, in_offset) < 1e-4) {
+        // Positions are bit-identical copies from the same CPU buffer, so a
+        // tight epsilon suffices (1e-4 AU would misclassify close-in moons).
+        if (distance(u_casters[j].xyz, in_offset) < 1e-7) {
             my_atmo_tint = u_caster_atmos[j].xyz;
             my_atmo_h = u_caster_atmos[j].w;
             my_scale_height = u_caster_colors[j].w;
             my_atmo_color = u_caster_colors[j].xyz;
             my_mie_tau = u_caster_mie[j].xyz;
             my_mie_h = max(u_caster_mie[j].w, 0.2);
+            my_o3_tau = u_caster_ozone_vert[j].xyz;
+            my_o3_layer = vec2(u_caster_ozone[j].w, max(u_caster_ozone_vert[j].w, 0.1));
             break;
         }
     }
@@ -121,6 +132,8 @@ void main() {
     f_my_atmo_color = my_atmo_color;
     f_my_mie_tau = my_mie_tau;
     f_my_mie_h = my_mie_h;
+    f_my_o3_tau = my_o3_tau;
+    f_my_o3_layer = my_o3_layer;
 
     if (u_is_cloud_pass) {
         // Mean optically-thick cloud deck near ~500 hPa (p/p0 ~ 0.45):
