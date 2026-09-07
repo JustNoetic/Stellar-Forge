@@ -8,6 +8,9 @@ sphere_fragment_shader = load_shader("celestial/sphere.frag")
 point_celestial_vertex_shader = load_shader("celestial/point_celestial.vert")
 point_celestial_fragment_shader = load_shader("celestial/point_celestial.frag")
 
+starfield_vertex_shader = load_shader("celestial/starfield.vert")
+starfield_fragment_shader = load_shader("celestial/starfield.frag")
+
 
 
 orbit_compute_shader = load_shader("compute/orbit.comp")

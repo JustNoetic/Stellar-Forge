@@ -22,8 +22,9 @@
 ```
 Stellar-Forge/
 ├── engine/
-│   ├── main.py                 # Entry point. faulthandler + try/except crash logger.
+│   ├── main.py                 # Entry point. stderr redirect (frozen-safe) + faulthandler + crash logger.
 │   ├── app.py                  # ★ MAIN: App class, GLFW window, render loop, ImGui UI
+│   ├── path_utils.py           # get_bundled_path() / get_external_path() — frozen/.exe-safe paths
 │   ├── __init__.py             # Master package re-exporter with sys.modules aliases
 │   ├── core/                   # Base constants, SIMD/Numba math, GLFW input
 │   │   ├── constants.py        # Physical & astronomical constants
@@ -59,6 +60,7 @@ Stellar-Forge/
 │       ├── atmosphere/         # Raymarching & LUT generation shaders (.vert, .frag)
 │       └── post/               # Bloom, composite, accumulation & ringshine shaders (.vert, .frag)
 ├── data/
+│   ├── gaia/                   # GAIA star catalog binary (stars.bin) + fetch logs
 │   ├── system.json             # Active default system
 │   ├── systems/<Name>/{meta.json,system.json}   # System presets (Solar System, Achernar, Ephemeris Mode)
 │   ├── kernels/                # Downloaded SPICE kernels (.bsp/.tpc/.tls)
@@ -67,13 +69,19 @@ Stellar-Forge/
 │   └── horizons_cache.json     # Cache for JPL Horizons REST queries
 ├── scripts/
 │   ├── fetch_horizons.py       # Query JPL Horizons REST → update system JSON state vectors
+│   ├── fetch_gaia.py           # Fetch Gaia DR3 (+Hipparcos bright supplement) → data/gaia/stars.bin
+│   ├── test_gaia.py            # GAIA starfield sanity checks (synthetic bake + real catalog)
 │   ├── accuracy_test.py        # 1-yr integration benchmark vs JPL Horizons ground truth (RTN errors)
 │   ├── perf_test.py            # PerfTracker: patches functions to measure startup/frame timing
 │   ├── calibrate_moon_albedo.py# Rescale a diffuse map's linear-space mean to a real albedo target (Moon → 0.12)
 │   └── test_spice.py           # Quick SPICE kernel loader validation
 ├── textures/                   # Planet/ring textures (loaded by app.py at startup)
 ├── exports/                    # Exported cosmetic JSON per body
+├── dist/                       # PyInstaller output (generated; not committed to git)
+│   └── Stellar-Forge/          # Ready-to-run: Stellar-Forge.exe + _internal/ + data/ + textures/
 ├── run.bat                     # Windows one-click venv + deps + launch
+├── build.bat                   # One-click PyInstaller build + zip for GitHub Releases
+├── stellar_forge.spec          # PyInstaller configuration (entry point, DLLs, datas, excludes)
 ├── imgui.ini                   # Saved ImGui layout
 └── README.md / PROJECT_MAP.md  # Docs
 ```
@@ -85,10 +93,23 @@ Stellar-Forge/
 For each file: responsibilities, key symbols (with approximate line numbers), and
 "edit here when you want to…".
 
-### 3.1 `engine/main.py` (15 lines)
+### 3.1 `engine/main.py` (~32 lines)
+- **Frozen-safe stderr redirect** (top of file, before any imports): when running as a
+  PyInstaller windowed `.exe`, `sys.stdout`/`sys.stderr` are `None`; they are redirected to
+  `os.devnull` / `main_error.txt` before anything else runs.
 - `if __name__ == "__main__"`: enables `faulthandler`, wraps `App().run()` in try/except,
-  dumps `main_error.txt`.
-- **Edit when:** changing startup/error handling/CLI args.
+  appends to `main_error.txt` on crash. Launch with `python engine/main.py` or `run.bat`.
+- **Edit when:** changing startup/error handling/CLI args, or the crash-log path.
+
+### 3.1b `engine/path_utils.py` (~60 lines)
+- `_project_root()` — returns project root when running from source, or the `.exe`'s directory
+  when frozen (PyInstaller sets `sys.frozen = True` and `sys._MEIPASS`).
+- `get_bundled_path(*parts)` — resolves paths for read-only engine assets bundled *inside* the
+  `.exe` (e.g. GLSL shaders): uses `sys._MEIPASS` when frozen, project root otherwise.
+- `get_external_path(*parts)` — resolves paths for user-editable assets that live *next to* the
+  `.exe` (e.g. `data/`, `textures/`, `exports/`): always relative to `_project_root()`.
+- **Used by:** `shader_loader.py`, `spice_manager.py`, `input_handler.py`, `app.py`.
+- **Edit when:** adding new asset directories, or changing what is bundled vs. external.
 
 ### 3.2 `engine/core/constants.py` (16 lines)
 - `SECONDS_PER_YEAR`, `C_AU_YR`, `FOV_DEG`, `G` (AU³/M☉/yr²), `OBLIQUITY`,
@@ -224,6 +245,7 @@ spectral classification.
   - `ring_*` (`glsl/celestial/ring.*`), `hz_*` (`glsl/celestial/hz.*`).
   - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*` — Volumetric raymarching atmosphere shaders (with primary ray refraction & vertex bounding expansion).
   - `point_celestial.*` (`glsl/celestial/`) — Subpixel point-light quad pass (apparent_px < 3.0); refracts the body's apparent position via `apply_refraction` (parallax-weighted with Newton-Raphson inverse apparent solver `solve_refraction_apparent` and solid-body occlusion guard), cross-fades against the mesh over apparent_px ∈ [2.0, 3.0].
+  - `starfield.*` (`glsl/celestial/`) — GAIA catalog point sprites (camera-relative f4 VBO packed per frame by `StarCatalog.pack_render`, 475k stars, < 0.5 ms via `_pack_kernel` @njit(parallel)); far-plane distance clamp + manual behind-camera degeneration; `gl_FragDepth = 0.999999` for log-depth occlusion; additive blend, HDR, feeds bloom/diffraction spikes.
   - `common/refraction.glsl` — Shared refraction math: `compute_refraction_angle` (parallax-weighted apparent displacement) vs `compute_refraction_total` (un-parallaxed total ray turn); `solve_refraction_apparent` inverts the deflection for point lights/orbits via damped Newton-Raphson to ensure smooth, monotonic setting without orbit-lever inversion jumps; `refract_chord_blocked` tests apparent-ray periapsis to occlude bodies behind the solid planet.
 
 **Edit when:** editing GLSL shader logic inside `engine/glsl/` or uniform bindings in `shaders.py`.
@@ -247,6 +269,21 @@ spectral classification.
 - `rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)` (~L301).
 
 **Edit when:** mesh generation, ring geometry, frustum culling math, time formatting.
+
+### 3.12b `engine/rendering/star_catalog.py` — GAIA starfield layer (render-only)
+- `StarCatalog` (~L40) — loads `data/gaia/stars.bin` (from `scripts/fetch_gaia.py`):
+  - `load(path)` — reads header + structured records; silently disabled when missing.
+  - `_bake(rec)` — ICRS→ecliptic (rotation about X by `OBLIQUITY`)→render frame `(x, z, -y)`;
+    3D positions from parallax; proper motion as linear AU/yr velocity; J2016.0→J2000
+    back-propagation; absolute G magnitude; BP−RP→Teff→RGB (vectorized Tanner Helland,
+    matches `system_manager.temperature_to_rgb`); pre-scaled flux `10^(-0.4·M_G)·1e13`.
+  - `pack_render(t_years, frame_origin)` (~L170) — per-frame interleaved f4 (N,7)
+    `[rel_xyz, rgb, intensity]` via `_pack_kernel` (`@njit(parallel=True, cache=True)`);
+    caches on (origin, t); `fresh` flag gates the VBO upload in `app.py`.
+- **Not a physics body** — never enters `Simulation`/`shared_state`; drawn once per frame
+  after the sphere pass (depth-test on / write-off, additive blend), before atmosphere pass 1.
+- **Edit when:** changing starfield data flow, brightness model, or adding interstellar
+  camera support (needs an f8 path / per-star re-anchoring near stars).
 
 ### 3.13 `engine/app.py` (6404 lines) — ★ the big one
 **Top-level (module scope):**
@@ -320,6 +357,8 @@ spectral classification.
 - `accuracy_test.py` — `get_parent_center(body_name, parent_name)`, `main()`. Runs 1-yr forward integration vs JPL Horizons, prints RTN km error table.
 - `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
 - `calibrate_moon_albedo.py` — calibrates a diffuse texture so its cos(latitude)-weighted mean *linear* reflectance matches a real-world albedo target (default 0.12, the Moon's actual surface reflectance). Applies the scale in linear space via an exact 256-entry sRGB LUT (`--path`, `--target`, `--quality`). Originals are backed up under `textures_originals/` before overwriting.
+- `fetch_gaia.py` — fetches a magnitude-limited Gaia DR3 subset (24 RA bands, TAP sync) plus a Hipparcos bright-star supplement (V < 2.5; Gaia photometry is saturation-broken for these, e.g. Sirius A), propagated to the J2016.0 epoch. Writes `data/gaia/stars.bin` (32-byte records: ra/dec/plx/pmra/pmdec/rv/G/BP-RP, f4).
+- `test_gaia.py` — synthetic bake tests (frame transforms, proper-motion packing, intensity formula, vectorized blackbody RGB) + real-catalog checks (Alpha Cen/Proxima distance, Sirius photometry, Barnard's star drift, pack timing < 5 ms).
 - `test_spice.py` — minimal SPICE loader sanity check.
 
 ---
@@ -445,6 +484,9 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Want to… | File | Symbol / Region |
 |---|---|---|
 | Change launch/crash handling | `engine/main.py` | top-level |
+| Resolve paths in frozen .exe | `engine/path_utils.py` | `get_bundled_path`, `get_external_path` |
+| Add a bundled asset (inside .exe) | `stellar_forge.spec` → `datas`, then `get_bundled_path` in code | — |
+| Add an external asset (next to .exe) | `build.bat` (xcopy step) + `get_external_path` in code | — |
 | Tune physical constants | `engine/core/constants.py` | — |
 | Change Newtonian/GR/J2/J4 forces | `engine/physics/physics_core.py` | `compute_custom_forces`, `compute_all_accelerations` |
 | Change IAS15 integrator | `engine/physics/physics_core.py` | `ias15_step_numba` + helpers |
@@ -470,6 +512,9 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change Body Inspector | `engine/app.py` | inspector block |
 | Change system-switch / ephemeris modal | `engine/app.py` | `_trigger_ephem_switch/exit`, `_render_ephem_setup_modal` |
 | Fetch real ephemerides offline | `scripts/fetch_horizons.py` | `main` |
+| Fetch/rebuild GAIA star catalog | `scripts/fetch_gaia.py` | `main` |
+| Change starfield rendering / catalog packing | `engine/rendering/star_catalog.py`, `engine/glsl/celestial/starfield.*` | `StarCatalog`, `_pack_kernel` |
+| Validate GAIA starfield | `scripts/test_gaia.py` | `main` |
 | Validate physics accuracy | `scripts/accuracy_test.py` | `main` |
 | Profile startup/frames | `scripts/perf_test.py` | `PerfTracker` (env `STELLAR_FORGE_PERF=1`) |
 | Calibrate a texture's real-world albedo | `scripts/calibrate_moon_albedo.py` | `calibrate` |

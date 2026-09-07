@@ -339,6 +339,7 @@ from engine.physics.physics_core import *
 from engine.physics.physics_core import _extract_render_state, _update_hierarchy_core
 from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
+from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 from engine.ui import render_ui
@@ -492,6 +493,9 @@ class App(InputHandlerMixin):
             "edit_mode": False,
             "edit_data": {},
             "ly_threshold_au": DEFAULT_LY_THRESHOLD_AU,
+            "show_gaia_stars": True,
+            "star_point_size": 2.0,
+            "star_intensity": 1.0,
             "show_settings_modal": False,
             "atmo_quality": 2,
             "atmo_resolution": 1.0,
@@ -588,6 +592,7 @@ class App(InputHandlerMixin):
         self.atmo_lowres_trans_tex = {0: [None, None], 1: [None, None], 2: [None, None]}
         self.prev_atmo_view_proj = None
         self.prev_atmo_cam_pos = None
+        self.star_catalog = None
         self.prev_atmo_exposure = 1.0
         self.prev_atmo_body_offsets = {}
         self.prev_atmo_body_offsets_cmp = {}
@@ -691,6 +696,9 @@ class App(InputHandlerMixin):
                 "spike_quality": self.camera.get("spike_quality", 0),
                 "msaa_samples": self.camera.get("msaa_samples", 4),
                 "show_orbits": self.camera.get("show_orbits", True),
+                "show_gaia_stars": self.camera.get("show_gaia_stars", True),
+                "star_point_size": self.camera.get("star_point_size", 2.0),
+                "star_intensity": self.camera.get("star_intensity", 1.0),
                 "orbit_fade_dir_idx": self.camera.get("orbit_fade_dir_idx", 0),
                 "orbit_min_alpha": self.camera.get("orbit_min_alpha", 0.3),
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
@@ -980,6 +988,10 @@ class App(InputHandlerMixin):
         self.ring_textures = self.ring_textures_front
         self.ring_gl_textures = self.ring_gl_textures_front
         textures_dir = get_external_path("textures")
+
+        # GAIA star catalog (render-only layer; see GAIA_STARS_PLAN.md)
+        self.star_catalog = StarCatalog()
+        self.star_catalog.load(get_external_path("data", "gaia", "stars.bin"))
 
 
         from engine.rendering.texture_streamer import TextureStreamer
@@ -1357,6 +1369,16 @@ class App(InputHandlerMixin):
     
         prog_spheres = ctx.program(vertex_shader=sphere_vertex_shader, fragment_shader=sphere_fragment_shader)
         prog_point_celestial = ctx.program(vertex_shader=point_celestial_vertex_shader, fragment_shader=point_celestial_fragment_shader)
+
+        # GAIA starfield point pass (PROGRAM_POINT_SIZE required for gl_PointSize)
+        prog_starfield = ctx.program(vertex_shader=starfield_vertex_shader, fragment_shader=starfield_fragment_shader)
+        star_vbo = None
+        star_vao = None
+        if self.star_catalog is not None and self.star_catalog.loaded:
+            ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+            star_vbo = ctx.buffer(reserve=self.star_catalog.count * 7 * 4, dynamic=True)
+            star_vao = ctx.vertex_array(prog_starfield, [(star_vbo, '3f 3f 1f', 'in_pos', 'in_color', 'in_intensity')])
+
         prog_culling_compute = ctx.compute_shader(culling_compute_shader)
     
         prog_gpu_orbits = ctx.program(vertex_shader=orbit_vertex_shader, fragment_shader=orbit_fragment_shader)
@@ -4226,7 +4248,7 @@ class App(InputHandlerMixin):
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -4901,6 +4923,27 @@ class App(InputHandlerMixin):
                 ctx.cull_face = 'back'
                 ctx.depth_func = '<'
                 ctx.disable(moderngl.BLEND)
+
+            # --- GAIA starfield point pass (render-only catalog layer) ---
+            if star_vao is not None and self.camera.get("show_gaia_stars", True):
+                packed = self.star_catalog.pack_render(display_t, cam_origin)
+                if packed is not None:
+                    if self.star_catalog.fresh:
+                        star_vbo.write(packed)
+                    prog_starfield['projection'].write(projection.astype('f4').tobytes())
+                    prog_starfield['view'].write(view.astype('f4').tobytes())
+                    prog_starfield['u_far'].value = float(far)
+                    prog_starfield['screen_height'].value = float(self.fb_height)
+                    prog_starfield['u_point_base'].value = float(self.camera.get("star_point_size", 2.0))
+                    prog_starfield['u_max_point_px'].value = 10.0
+                    prog_starfield['u_intensity_scale'].value = float(self.camera.get("star_intensity", 1.0))
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.depth_mask = False
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                    star_vao.render(moderngl.POINTS)
+                    ctx.depth_mask = True
+                    ctx.disable(moderngl.BLEND)
 
             def execute_atmosphere_pass(clip_mode, target_list=None):
                 if not self.camera.get("atmo_enabled", True):

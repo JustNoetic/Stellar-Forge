@@ -156,6 +156,9 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         settings_changed = False
 
         c_so, app.camera["show_orbits"] = imgui.checkbox("Show Orbits", app.camera.get("show_orbits", True))
+        c_gaia, app.camera["show_gaia_stars"] = imgui.checkbox("GAIA Starfield", app.camera.get("show_gaia_stars", True))
+        if c_gaia and app.star_catalog is not None and not app.star_catalog.loaded:
+            imgui.text_colored("Run scripts/fetch_gaia.py to build data/gaia/stars.bin", 1.0, 0.7, 0.3, 1.0)
         if c_so: settings_changed = True
 
         c_hz, app.camera["show_habitable_zone"] = imgui.checkbox("Show Habitable Zones", app.camera.get("show_habitable_zone", False))
