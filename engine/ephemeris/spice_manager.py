@@ -4,13 +4,15 @@ import spiceypy as spice
 import numpy as np
 import threading
 
+from engine.path_utils import get_external_path
+
 class SpiceManager:
     """
     Manages SPICE kernels and Ephemeris Mode operations.
     Handles downloading basic kernels from NAIF and converting state vectors.
     """
     
-    KERNEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "kernels"))
+    KERNEL_DIR = get_external_path("data", "kernels")
     
     # Essential NAIF kernels for a basic Solar System ephemeris
     DEFAULT_KERNELS = {
@@ -143,7 +145,7 @@ class SpiceManager:
         self.download_speed_str = ""
         self.download_speed_bytes_per_sec = 0.0
         self.download_error = None
-        self.settings_path = os.path.join("data", "ephemeris_settings.json")
+        self.settings_path = get_external_path("data", "ephemeris_settings.json")
         self.enabled_kernels = {k: (k in self.ESSENTIAL_KERNELS) for k in self.DEFAULT_KERNELS.keys()}
         self.settings_initialized = False
         self._load_settings()

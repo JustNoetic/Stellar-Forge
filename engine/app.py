@@ -2,6 +2,9 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from engine.path_utils import get_bundled_path, get_external_path
+
+
 import math
 import OpenGL
 OpenGL.ERROR_CHECKING = False
@@ -648,7 +651,7 @@ class App(InputHandlerMixin):
         try:
             import json
             import os
-            settings_path = os.path.join("data", "graphics_settings.json")
+            settings_path = get_external_path("data", "graphics_settings.json")
             if os.path.exists(settings_path):
                 with open(settings_path, 'r') as f:
                     saved = json.load(f)
@@ -661,8 +664,8 @@ class App(InputHandlerMixin):
         try:
             import json
             import os
-            os.makedirs("data", exist_ok=True)
-            settings_path = os.path.join("data", "graphics_settings.json")
+            os.makedirs(get_external_path("data"), exist_ok=True)
+            settings_path = get_external_path("data", "graphics_settings.json")
             saved = {
                 "atmo_quality": self.camera.get("atmo_quality", 2),
                 "atmo_resolution": self.camera.get("atmo_resolution", 1.0),
@@ -976,7 +979,8 @@ class App(InputHandlerMixin):
         self.ring_gl_textures_back = {}  # name_lower -> ModernGL Texture
         self.ring_textures = self.ring_textures_front
         self.ring_gl_textures = self.ring_gl_textures_front
-        textures_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'textures')
+        textures_dir = get_external_path("textures")
+
 
         from engine.rendering.texture_streamer import TextureStreamer
 
@@ -1457,8 +1461,8 @@ class App(InputHandlerMixin):
 
             # Load Aperture Kernel Texture
             ker_candidates = [
-                os.path.join("textures", "bloom", "kernel_8point.bin"),
-                os.path.join("textures", "bloom", "kernelTex.bin"),
+                get_external_path("textures", "bloom", "kernel_8point.bin"),
+                get_external_path("textures", "bloom", "kernelTex.bin"),
             ]
             ker_path = None
             for kp in ker_candidates:

@@ -1,8 +1,10 @@
 import os
 import re
 
+from engine.path_utils import get_bundled_path
+
 _SHADER_CACHE = {}
-_GLSL_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "glsl")
+_GLSL_BASE_DIR = get_bundled_path("engine", "glsl")
 _INCLUDE_PATTERN = re.compile(r'^\s*#include\s+["<]([^">]+)[">]\s*$', re.MULTILINE)
 
 def _resolve_includes(code: str, current_dir: str, visited: set | None = None) -> str:

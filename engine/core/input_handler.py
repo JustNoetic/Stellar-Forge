@@ -5,12 +5,14 @@ import numpy as np
 import glfw
 import imgui
 
+from engine.path_utils import get_external_path
+
 class InputHandlerMixin:
     """Mixin class for GLFW input callbacks and graphics settings persistence."""
 
     def load_settings(self):
         try:
-            settings_path = os.path.join("data", "graphics_settings.json")
+            settings_path = get_external_path("data", "graphics_settings.json")
             if os.path.exists(settings_path):
                 with open(settings_path, 'r') as f:
                     saved = json.load(f)
@@ -21,8 +23,8 @@ class InputHandlerMixin:
 
     def save_settings(self):
         try:
-            os.makedirs("data", exist_ok=True)
-            settings_path = os.path.join("data", "graphics_settings.json")
+            os.makedirs(get_external_path("data"), exist_ok=True)
+            settings_path = get_external_path("data", "graphics_settings.json")
             saved = {
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
