@@ -748,10 +748,69 @@ void main() {
             float a_p = acos(cos_a_p);
             float planet_phase = (sin(a_p) + (3.141592653589793 - a_p) * cos_a_p) / 3.141592653589793;
 
+            // Gate planetshine by the host planet's own shadow. Inside the
+            // planet's umbra the Sun is hidden behind the planet, so from the
+            // ring point only the planet's night hemisphere is visible: the
+            // illuminated day side (the sole source of planetshine) is on the far
+            // side and cannot light the ring. The Lambertian phase term above only
+            // vanishes at the exact anti-solar point, so without this gate
+            // planetshine bleeds past the terminator into the planet's shadow on
+            // the rings. This mirrors the direct-illumination host-shadow block:
+            // 0 in umbra, 1 outside, smooth through the penumbra, with the
+            // atmospheric-refraction limb glow preserved (grazing refracted
+            // sunlight through the planet's atmosphere may still faintly reach
+            // the ring).
+            vec3 host_shadow = vec3(1.0);
+            {
+                float t_proj = dot(frag_to_host, L_host);
+                if (t_proj > 0.0) {
+                    vec3 cross_vec = cross(frag_to_host, L_host);
+                    float perp_sq = dot(cross_vec, cross_vec);
+
+                    float star_radius = u_stars_pos_radius[s].w;
+                    float star_radius_over_dist = star_radius / max(dist_host_star, 1e-6);
+
+                    float host_r = u_host_planet_radius;
+                    float host_atmo_h = u_host_planet_atmo.w;
+                    float host_r_minor = u_host_planet_R_minor;
+
+                    float max_effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
+                    float max_r_penumbra = max_effective_r + dist_host * star_radius_over_dist;
+                    if (perp_sq <= max_r_penumbra * max_r_penumbra) {
+                        vec3 perp_vec = frag_to_host - t_proj * L_host;
+                        if (host_r_minor < host_r - 1e-5) {
+                            host_r = get_oblate_radius(host_r, host_r_minor, u_host_planet_pole_obl.xyz, L_host, perp_vec);
+                        }
+                        float directional_star_r = star_radius;
+                        float star_r_minor = u_stars_poles_obl[s].w;
+                        if (star_r_minor < star_radius - 1e-5) {
+                            directional_star_r = get_oblate_radius(star_radius, star_r_minor, u_stars_poles_obl[s].xyz, L_host, perp_vec);
+                        }
+                        float local_star_radius_over_dist = directional_star_r / max(dist_host_star, 1e-6);
+                        float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
+                        float r_penumbra = effective_r + dist_host * local_star_radius_over_dist;
+                        if (perp_sq <= r_penumbra * r_penumbra) {
+                            float inv_dist = 1.0 / dist_host;
+                            float alpha = local_star_radius_over_dist;
+                            float beta = host_r * inv_dist;
+                            float gamma = sqrt(perp_sq) * inv_dist;
+                            float penumbra_outer = alpha + beta;
+                            float penumbra_inner = abs(beta - alpha);
+                            float max_bend = u_host_planet_max_bend > 0.0
+                                ? u_host_planet_max_bend
+                                : (host_atmo_h > 0.0
+                                    ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.10)
+                                    : 0.0);
+                            host_shadow = casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, max_bend, u_host_planet_atmo, u_host_planet_ozone, u_host_planet_atmo.w, dist_host);
+                        }
+                    }
+                }
+            }
+
             // Planetshine flux reaching the ring point: Lambertian sphere illumination
             vec3 planetshine_irradiance = u_host_planet_color * star_color * irradiance * planet_phase * (solid_angle * 0.6666667);
 
-            total_planetshine += planetshine_irradiance * active_shine_color * ring_planet_response;
+            total_planetshine += planetshine_irradiance * active_shine_color * ring_planet_response * host_shadow;
         }
     }
 
