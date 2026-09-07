@@ -69,6 +69,7 @@ Stellar-Forge/
 │   ├── fetch_horizons.py       # Query JPL Horizons REST → update system JSON state vectors
 │   ├── accuracy_test.py        # 1-yr integration benchmark vs JPL Horizons ground truth (RTN errors)
 │   ├── perf_test.py            # PerfTracker: patches functions to measure startup/frame timing
+│   ├── calibrate_moon_albedo.py# Rescale a diffuse map's linear-space mean to a real albedo target (Moon → 0.12)
 │   └── test_spice.py           # Quick SPICE kernel loader validation
 ├── textures/                   # Planet/ring textures (loaded by app.py at startup)
 ├── exports/                    # Exported cosmetic JSON per body
@@ -318,6 +319,7 @@ spectral classification.
 - `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
 - `accuracy_test.py` — `get_parent_center(body_name, parent_name)`, `main()`. Runs 1-yr forward integration vs JPL Horizons, prints RTN km error table.
 - `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
+- `calibrate_moon_albedo.py` — calibrates a diffuse texture so its cos(latitude)-weighted mean *linear* reflectance matches a real-world albedo target (default 0.12, the Moon's actual surface reflectance). Applies the scale in linear space via an exact 256-entry sRGB LUT (`--path`, `--target`, `--quality`). Originals are backed up under `textures_originals/` before overwriting.
 - `test_spice.py` — minimal SPICE loader sanity check.
 
 ---
@@ -470,6 +472,7 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Fetch real ephemerides offline | `scripts/fetch_horizons.py` | `main` |
 | Validate physics accuracy | `scripts/accuracy_test.py` | `main` |
 | Profile startup/frames | `scripts/perf_test.py` | `PerfTracker` (env `STELLAR_FORGE_PERF=1`) |
+| Calibrate a texture's real-world albedo | `scripts/calibrate_moon_albedo.py` | `calibrate` |
 
 ---
 

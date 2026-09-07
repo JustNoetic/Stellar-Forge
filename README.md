@@ -382,6 +382,7 @@ Stellar-Forge/
 │   ├── fetch_horizons.py        # Fetch J2000 state vectors directly from JPL Horizons REST API
 │   ├── perf_test.py             # Benchmark engine startup and frame performance (STELLAR_FORGE_PERF=1)
 │   ├── accuracy_test.py         # Physics solver validation against JPL Horizons ground truth
+│   ├── calibrate_moon_albedo.py # Calibrate a diffuse map's mean linear albedo to real-world values
 │   └── test_spice.py            # Validation script for checking SPICE kernel playback loader
 ├── exports/                     # Exported per-body cosmetic JSON files
 ├── run.bat                      # Quick launch batch script for Windows (venv + deps + launch)
