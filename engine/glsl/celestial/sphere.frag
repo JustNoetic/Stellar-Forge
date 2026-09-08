@@ -213,6 +213,15 @@ float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
 void main() {
     if (f_clip_z <= 0.0) discard;
 
+    // Fully-subpixel bodies are rendered exclusively by the point-light pass
+    // (alpha == 0 here). Discard instead of emitting a zero-alpha fragment so
+    // the 3 px min-size-clamped geometry does NOT write depth: an invisible
+    // subpixel planet would otherwise depth-occlude the subpixel sun sprite
+    // behind it as a full 3 px disk (phantom transit / eclipse black-out).
+    if (f_subpixel_factor > 0.999) {
+        discard;
+    }
+
     // To avoid double-rendering and Z-fighting when CULL_FACE is disabled:
     // If the camera is outside the bounding sphere, we only want the front face.
     // If the camera is inside the bounding sphere, we only want the back face.
@@ -407,7 +416,17 @@ void main() {
         }
         
         float mesh_weight_star = 1.0 - f_subpixel_factor;
-        final_star_color *= mesh_weight_star;
+        // Flux compensation for the min-size clamp: the mesh is inflated to
+        // f_clamped_min_px (3 px) apparent diameter, which mid-fade would
+        // overweight its total flux by (3/apparent)^2 relative to the true
+        // solid angle. Scaling by (apparent/clamped)^2 keeps the composite
+        // mesh+point flux exactly proportional to the true solid angle at
+        // every apparent size, so the hand-off to the point light is
+        // flux-continuous with no mid-fade bump.
+        float flux_comp = (f_apparent_px < f_clamped_min_px)
+            ? (f_apparent_px * f_apparent_px) / (f_clamped_min_px * f_clamped_min_px)
+            : 1.0;
+        final_star_color *= mesh_weight_star * flux_comp;
         float star_alpha = mesh_weight_star;
         out_color = vec4(final_star_color, star_alpha);
     } else {
@@ -947,7 +966,15 @@ void main() {
 
         // Mesh transition weight for seamless hand-off with point-light quad (apparent_px in [1.5, 2.5])
         float mesh_weight_planet = 1.0 - f_subpixel_factor;
-        final_color *= mesh_weight_planet;
+        // Same flux compensation as the star branch: the 3 px min-size clamp
+        // inflates the disk area, so dim the clamped mesh by
+        // (apparent/clamped)^2 to keep total flux tied to the true solid angle
+        // (the point pass already scales as apparent^2, so the composite is
+        // exactly flux-continuous across the whole transition).
+        float flux_comp_p = (f_apparent_px < f_clamped_min_px)
+            ? (f_apparent_px * f_apparent_px) / (f_clamped_min_px * f_clamped_min_px)
+            : 1.0;
+        final_color *= mesh_weight_planet * flux_comp_p;
         float planet_alpha = mesh_weight_planet;
 
         if (u_is_cloud_pass) {

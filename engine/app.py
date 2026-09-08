@@ -1377,7 +1377,7 @@ class App(InputHandlerMixin):
         if self.star_catalog is not None and self.star_catalog.loaded:
             ctx.enable(moderngl.PROGRAM_POINT_SIZE)
             star_vbo = ctx.buffer(reserve=self.star_catalog.count * 7 * 4, dynamic=True)
-            star_vao = ctx.vertex_array(prog_starfield, [(star_vbo, '3f 3f 1f', 'in_pos', 'in_color', 'in_intensity')])
+            star_vao = ctx.vertex_array(prog_starfield, [(star_vbo, '3f 3f 1f', 'in_pos', 'in_color', 'in_flux')])
 
         prog_culling_compute = ctx.compute_shader(culling_compute_shader)
     
@@ -4932,10 +4932,27 @@ class App(InputHandlerMixin):
                         star_vbo.write(packed)
                     prog_starfield['projection'].write(projection.astype('f4').tobytes())
                     prog_starfield['view'].write(view.astype('f4').tobytes())
+                    # Eye position relative to the pack frame origin — drives the
+                    # per-star inverse-square flux falloff in starfield.vert.
+                    prog_starfield['u_eye'].value = (float(cam_pos_f8[0]), float(cam_pos_f8[1]), float(cam_pos_f8[2]))
                     prog_starfield['u_far'].value = float(far)
                     prog_starfield['screen_height'].value = float(self.fb_height)
                     prog_starfield['u_point_base'].value = float(self.camera.get("star_point_size", 2.0))
+                    # Physical HDR calibration: anchor the catalog flux scale to the
+                    # system star's radiance units (mesh luminance 0.8333*L/R^2,
+                    # irradiance L/d^2, solar constant at 1 AU = 1.0). A solar star
+                    # (M_G = 4.67) at 1 AU must peak exactly like the system sun's
+                    # subpixel point sprite: 0.8333*(h*fov)^2/4 * L/d^2. Solving
+                    # against the sprite's flux-conserving normalization
+                    # (1 / (size^2 * 0.2524)) gives u_cal = 3.879*(h*fov)^2*size^2/1e13.
+                    _star_size_px = min(10.0, max(2.0, float(self.camera.get("star_point_size", 2.0)) * (self.fb_height / 1080.0)))
+                    prog_starfield['u_flux_calib'].value = float(
+                        3.879 * (self.fb_height * fov_factor) ** 2 * _star_size_px * _star_size_px / 1.0e13)
                     prog_starfield['u_max_point_px'].value = 10.0
+                    # 2 px sprite floor: a 1 px point samples the PSF Gaussian at a
+                    # single fragment whose PointCoord depends on the star's subpixel
+                    # position, so stars blink/shimmer as the camera moves.
+                    prog_starfield['u_min_point_px'].value = 2.0
                     prog_starfield['u_intensity_scale'].value = float(self.camera.get("star_intensity", 1.0))
                     ctx.enable(moderngl.DEPTH_TEST)
                     ctx.depth_mask = False

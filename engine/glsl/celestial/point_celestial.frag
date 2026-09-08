@@ -43,8 +43,12 @@ void main() {
     // Effective visual radius:
     // f_apparent_px is the physical projected DIAMETER.
     // Physical mesh radius is therefore R_mesh_px = 0.5 * f_apparent_px.
+    // Stars use a 2 px diameter PSF floor (R_min = 1.0) for stable subpixel
+    // sampling; with the quadratic flux exponent below, total flux equals
+    // R_mesh_px^2 regardless of R_min, so this is purely an anti-shimmer
+    // measure and preserves the mesh hand-off at R_mesh_px >= 1.0.
+    float R_min = (f_is_star > 0.5) ? 1.0 : 0.5;
     float R_mesh_px = f_apparent_px * 0.5;
-    float R_min = 0.5;
     float R_eff = max(R_mesh_px, R_min);
 
     // Crisp anti-aliased circular disk boundary centered precisely at R_eff:
@@ -61,7 +65,8 @@ void main() {
 
     // Subpixel Flux Scaling:
     // On a discrete monitor grid, a pixel covers ~40x the area of a human foveal cone.
-    // For stars, strict quadratic 1/d^2 energy conservation is maintained (exponent 2.0).
+    // For stars, strict quadratic 1/d^2 energy conservation is maintained (exponent 2.0):
+    // flux_scale * R_eff^2 = R_mesh_px^2 exactly, independent of R_min.
     // For planets, an exponent of 1.3 models the human eye's point-spread contrast response (Ricco's Law),
     // ensuring brilliant planets like Venus (m = -4.5) remain prominently visible against twilight skies,
     // while smoothly and seamlessly matching the physical 1:1 3D mesh at R_mesh_px >= R_min (1.0 at >= 0.5 px).

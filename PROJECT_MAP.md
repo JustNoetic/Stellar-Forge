@@ -239,13 +239,13 @@ spectral classification.
 - `engine/rendering/shader_loader.py`: In-memory GLSL loader (`load_shader`) loading source files from `engine/glsl/`.
 - `engine/rendering/shaders.py`: Dynamically re-exports loaded GLSL shaders:
   - `culling_compute_shader` (`glsl/compute/culling.comp`) — GPU frustum/occlusion culling compute.
-  - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres (with ray refraction `compute_refraction_angle` & vertex bounding expansion).
+  - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres (with ray refraction `compute_refraction_angle` & vertex bounding expansion). Fully-subpixel fragments (f_subpixel_factor > 0.999) are discarded so the 3 px min-size-clamped mesh never writes phantom depth over the subpixel star sprite (transit black-out fix).
   - `orbit_compute_shader` (`glsl/compute/orbit.comp`), `orbit_*` (`glsl/celestial/orbit.*`).
   - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`).
   - `ring_*` (`glsl/celestial/ring.*`), `hz_*` (`glsl/celestial/hz.*`).
   - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*` — Volumetric raymarching atmosphere shaders (with primary ray refraction & vertex bounding expansion).
-  - `point_celestial.*` (`glsl/celestial/`) — Subpixel point-light quad pass (apparent_px < 3.0); refracts the body's apparent position via `apply_refraction` (parallax-weighted with Newton-Raphson inverse apparent solver `solve_refraction_apparent` and solid-body occlusion guard), cross-fades against the mesh over apparent_px ∈ [2.0, 3.0].
-  - `starfield.*` (`glsl/celestial/`) — GAIA catalog point sprites (camera-relative f4 VBO packed per frame by `StarCatalog.pack_render`, 475k stars, < 0.5 ms via `_pack_kernel` @njit(parallel)); far-plane distance clamp + manual behind-camera degeneration; `gl_FragDepth = 0.999999` for log-depth occlusion; additive blend, HDR, feeds bloom/diffraction spikes.
+  - `point_celestial.*` (`glsl/celestial/`) — Subpixel point-light quad pass (apparent_px < 3.0); refracts the body's apparent position via `apply_refraction` (parallax-weighted with Newton-Raphson inverse apparent solver `solve_refraction_apparent` and solid-body occlusion guard), cross-fades against the mesh over apparent_px ∈ [2.0, 3.0]. Star sprites apply analytic circle-circle transit/occultation occlusion against all casters (true (Rp/Rs)² transit depth, partial phases for subpixel eclipses).
+  - `starfield.*` (`glsl/celestial/`) — GAIA catalog point sprites (camera-relative f4 VBO packed per frame by `StarCatalog.pack_render`, 475k stars, < 0.5 ms via `_pack_kernel` @njit(parallel)); per-eye inverse-square flux falloff `I = flux·u_flux_calib / d_eye²` in the vertex shader (`u_eye` + `u_flux_calib` uniforms; calib anchors M_G=4.67 @ 1 AU to the system sun's sprite peak `0.8333·(h·fov)²/4`, so one exposure governs planets, sun, and stars alike); FIXED PSF sprite size (peak ∝ flux — true magnitude scale; bloom grows bright stars); far-plane distance clamp (eye-relative) + manual behind-camera degeneration; `gl_FragDepth = 0.999999` for log-depth occlusion; additive blend, HDR, feeds bloom/diffraction spikes.
   - `common/refraction.glsl` — Shared refraction math: `compute_refraction_angle` (parallax-weighted apparent displacement) vs `compute_refraction_total` (un-parallaxed total ray turn); `solve_refraction_apparent` inverts the deflection for point lights/orbits via damped Newton-Raphson to ensure smooth, monotonic setting without orbit-lever inversion jumps; `refract_chord_blocked` tests apparent-ray periapsis to occlude bodies behind the solid planet.
 
 **Edit when:** editing GLSL shader logic inside `engine/glsl/` or uniform bindings in `shaders.py`.
@@ -276,7 +276,7 @@ spectral classification.
   - `_bake(rec)` — ICRS→ecliptic (rotation about X by `OBLIQUITY`)→render frame `(x, z, -y)`;
     3D positions from parallax; proper motion as linear AU/yr velocity; J2016.0→J2000
     back-propagation; absolute G magnitude; BP−RP→Teff→RGB (vectorized Tanner Helland,
-    matches `system_manager.temperature_to_rgb`); pre-scaled flux `10^(-0.4·M_G)·1e13`.
+    matches `system_manager.temperature_to_rgb`); pre-scaled intrinsic flux `10^(-0.4·M_G)·1e13` (constant per star — the eye-distance 1/d² falloff and HDR calibration live in `starfield.vert` via `u_eye`/`u_flux_calib`, keeping the pack cache independent of camera motion).
   - `pack_render(t_years, frame_origin)` (~L170) — per-frame interleaved f4 (N,7)
     `[rel_xyz, rgb, intensity]` via `_pack_kernel` (`@njit(parallel=True, cache=True)`);
     caches on (origin, t); `fresh` flag gates the VBO upload in `app.py`.

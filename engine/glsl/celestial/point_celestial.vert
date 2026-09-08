@@ -83,9 +83,14 @@ void main() {
     float apparent_px = (in_radius / max(1e-9, dist)) * screen_height * fov_factor;
     f_apparent_px = apparent_px;
 
-    // Physical mesh radius in screen pixels (apparent_px is diameter)
+    // Physical mesh radius in screen pixels (apparent_px is diameter).
+    // Stars use a 2 px diameter PSF floor (R_min = 1.0): flux conservation
+    // (exponent 2.0 below) is independent of R_min, so enlarging the sprite
+    // only spreads the same light over more pixels — stabilizing subpixel
+    // sampling without changing total brightness.
+    float R_min = (in_is_star > 0.5) ? 1.0 : 0.5;
     float R_mesh_px = apparent_px * 0.5;
-    float R_eff = max(R_mesh_px, 0.5);
+    float R_eff = max(R_mesh_px, R_min);
     float quad_radius_px = R_eff + 1.0;
     float quad_size_px = quad_radius_px * 2.0;
     float half_size_px = quad_radius_px;
@@ -118,6 +123,49 @@ void main() {
         // (c1=0.4, c2=0.2) evaluated by the 3D star mesh, ensuring seamless bloom and radiance hand-off
         float surface_luminance = u_hdr_enabled ? (0.8333 * star_lum / (star_r * star_r)) : 1.0;
         surface_color = in_color * surface_luminance;
+
+        // --- Analytic subpixel transit / occultation -------------------------
+        // A body in front of the star blocks only the geometrically overlapping
+        // fraction of the stellar disk (circle-circle intersection), NOT the
+        // whole sprite: an Earth transit dims the sun by (Rp/Rs)^2 ~ 1e-4, and
+        // subpixel lunar eclipses get true partial phases. (The old behavior
+        // was a full black-out because both bodies' meshes were min-size
+        // clamped to 3 px and the invisible occluder still wrote depth.)
+        vec3 star_rel = in_offset - u_camera_pos;
+        float dist_star_raw = length(star_rel);
+        if (dist_star_raw > 1e-6 && u_num_casters > 0) {
+            float a_ang = star_r / dist_star_raw;          // star angular radius (rad)
+            vec3 star_dir = star_rel / dist_star_raw;
+            float blocked = 0.0;
+            for (int j = 0; j < u_num_casters; j++) {
+                vec3 crel = u_casters[j].xyz - u_camera_pos;
+                float dc = length(crel);
+                // Occluder must be in front of the star (skip self: positions
+                // are bit-identical copies from the same CPU buffer).
+                if (dc < 1e-6 || dc >= dist_star_raw) continue;
+                if (distance(u_casters[j].xyz, in_offset) < 1e-7) continue;
+                float b_ang = u_casters[j].w / dc;         // occluder angular radius
+                float cos_d = clamp(dot(star_dir, crel / dc), -1.0, 1.0);
+                float d_ang = acos(cos_d);                 // center separation
+                if (d_ang >= a_ang + b_ang) continue;      // no overlap
+                if (d_ang <= b_ang - a_ang) { blocked = 1.0; break; }  // total occultation
+                float overlap;
+                if (d_ang <= a_ang - b_ang) {
+                    overlap = b_ang * b_ang;               // occulter fully inside disk
+                } else {
+                    // Circle-circle lens area (standard closed form)
+                    float aa = a_ang * a_ang;
+                    float bb = b_ang * b_ang;
+                    float x1 = clamp((d_ang*d_ang + aa - bb) / (2.0*d_ang*a_ang), -1.0, 1.0);
+                    float x2 = clamp((d_ang*d_ang + bb - aa) / (2.0*d_ang*b_ang), -1.0, 1.0);
+                    overlap = aa * acos(x1) + bb * acos(x2)
+                            - 0.5 * sqrt(max(0.0, (-d_ang + a_ang + b_ang) * (d_ang + a_ang - b_ang)
+                                                 * (d_ang - a_ang + b_ang) * (d_ang + a_ang + b_ang)));
+                }
+                blocked = max(blocked, clamp(overlap / (max(a_ang * a_ang, 1e-30) * PI), 0.0, 1.0));
+            }
+            surface_color *= (1.0 - blocked);
+        }
     } else {
         // Primary star reflection
         vec3 star_pos = u_stars_pos_radius[0].xyz;

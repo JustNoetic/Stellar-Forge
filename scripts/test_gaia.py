@@ -7,7 +7,7 @@ Two suites:
      and vectorized blackbody RGB vs system_manager.temperature_to_rgb.
   2. Real-catalog tests (run if data/gaia/stars.bin exists, i.e. after
      scripts/fetch_gaia.py): Proxima Centauri position/distance, Sirius
-     brightness/color, Barnard's star proper motion, HDR intensity ranking.
+     brightness/color, Barnard's star proper motion, HDR flux packing.
 
 Usage:
     python scripts/test_gaia.py
@@ -107,10 +107,11 @@ def test_synthetic_bake():
         cat.pack_render(1000.0, np.zeros(3))
         check("pack cache (fresh=False on repeat)", not cat.fresh)
 
-        # Intensity: both A and C have M_G = 5 - 5*(log10(10)-1) = 5.
-        # I = 10^(-0.4*5) * 1e13 / (10 pc in AU)^2 = 1e11 / 4.2545e12 = 0.0235
-        check("HDR intensity formula", abs(packed[0, 6] - 0.02350) < 0.0005,
-              f"I={packed[0, 6]:.5f}")
+        # Flux: both A and C have M_G = 5 - 5*(log10(10)-1) = 5.
+        # Packed flux = 10^(-0.4*5) * 1e13 = 1e11. (The eye-distance
+        # inverse-square falloff lives in starfield.vert, not in the pack.)
+        check("HDR flux formula", abs(packed[0, 6] - 1.0e11) < 1.0e7,
+              f"flux={packed[0, 6]:.6g}")
     finally:
         os.unlink(path)
 
@@ -176,13 +177,17 @@ def test_real_catalog(path):
     else:
         print("  [SKIP] Barnard's star tests (not in catalog depth)")
 
-    # --- HDR intensity ranking from Earth (cam at origin, t=0) ---
+    # --- Packed flux is the constant pre-scaled intrinsic flux
+    # 10^(-0.4*M_G) * 1e13; the eye-distance inverse-square falloff is
+    # applied per-frame in starfield.vert, so the pack itself is eye-free.
     packed = cat.pack_render(0.0, np.zeros(3))
-    intens = packed[:, 6]
-    i_bright_app = int(np.argmax(intens))
-    check("brightest apparent star is catalog-brightest (Sirius/Canopus)",
-          i_bright_app == int(np.argmin(rec['g'])),
-          f"I={intens[i_bright_app]:.2f}")
+    fluxes = packed[:, 6]
+    expected_flux = np.power(10.0, -0.4 * cat.abs_mag.astype('f8')) * 1e13
+    check("packed flux = 10^(-0.4*M_G)*1e13 (all stars)",
+          np.allclose(fluxes, expected_flux, rtol=1e-4),
+          f"max rel err {np.max(np.abs(fluxes - expected_flux) / expected_flux):.2e}")
+    check("brightest intrinsic flux is smallest M_G",
+          int(np.argmax(fluxes)) == int(np.argmin(cat.abs_mag)))
 
     # --- pack_render timing ---
     cat.pack_render(1.0, np.array([1.0, 2.0, 3.0]))  # force fresh
@@ -192,20 +197,18 @@ def test_real_catalog(path):
     ms = (time.perf_counter() - t0) / 10 * 1000.0
     check("pack_render < 5 ms/frame", ms < 5.0, f"{ms:.2f} ms @ {cat.count:,} stars")
 
-    # If a deep catalog exists, verify Proxima's near-invisibility from Earth;
-    # otherwise verify the nearest star's intensity against its own magnitude.
-    # Invariant: measured intensity ratio == 10^(-0.4*(m1 - m2)) from catalog
-    # magnitudes, regardless of which star is nearest.
-    ratio = intens[i_near] / intens.max()
-    expected = 10.0 ** (-0.4 * (rec['g'][i_near] - rec['g'].min()))
-    check("intensity ratio matches catalog flux ratio (within 20%)",
+    # Intrinsic luminosity ratio: flux ratio == 10^(-0.4*(M1 - M2)) from
+    # absolute magnitudes (the pack is distance-independent by design).
+    ratio = fluxes[i_near] / fluxes.max()
+    expected = 10.0 ** (-0.4 * (cat.abs_mag[i_near] - cat.abs_mag.min()))
+    check("flux ratio matches 10^(-0.4*dM_G) (within 20%)",
           abs(ratio - expected) / expected < 0.2,
           f"{ratio:.4g} vs expected {expected:.4g}")
     if plx.max() > 760.0:
         i_prox = int(np.argmax(plx))
-        check("Proxima near-invisible from Earth (I < 1% of brightest)",
-              intens[i_prox] < 0.01 * intens.max(),
-              f"I_Prox={intens[i_prox]:.4f}")
+        check("Proxima intrinsically faint (flux < 1% of brightest)",
+              fluxes[i_prox] < 0.01 * fluxes.max(),
+              f"flux_Prox={fluxes[i_prox]:.4g}")
 
 
 def main():

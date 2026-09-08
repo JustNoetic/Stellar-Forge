@@ -5,6 +5,7 @@
 
 in vec3 f_color;
 in float f_intensity;
+in float f_point_size;
 
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
@@ -21,7 +22,19 @@ void main() {
     float r = sqrt(r2);
     float falloff = exp(-r2 * 3.5) * (1.0 - smoothstep(0.6, 1.0, r));
 
-    vec3 rgb = f_color * (f_intensity * u_intensity_scale * falloff);
+    // Flux-conserving normalization (energy conservation for an unresolved
+    // source): the sprite's total integrated energy equals f_intensity
+    // regardless of point size. FALLOFF_MEAN is the profile's average over
+    // the unit disk (= 2 * integral_0^1 falloff(r) * r dr ~ 0.2524), so
+    // dividing by size^2 * FALLOFF_MEAN keeps total flux constant while the
+    // peak scales with 1/size^2 — bigger sprites spread the same light over
+    // more pixels (surface-brightness preservation). This removes the old
+    // non-physical size^2 total-flux growth and, together with the >= 2 px
+    // sprite floor, stabilizes subpixel sampling to kill shimmer.
+    const float FALLOFF_MEAN = 0.2524;
+    float flux_norm = 1.0 / (f_point_size * f_point_size * FALLOFF_MEAN);
+
+    vec3 rgb = f_color * (f_intensity * u_intensity_scale * falloff * flux_norm);
 
     // Camera exposure scaling — mirrors point_celestial.frag behavior
     if (u_hdr_enabled) {

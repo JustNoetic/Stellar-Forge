@@ -7,8 +7,10 @@ provides a render-only layer of real stars at their true 3D positions:
     ecliptic render frame (x, z, -y remap, see PROJECT_MAP gotchas).
   - Proper motion is applied ANALYTICALLY (p(t) = p0 + pm*t, linear approx),
     never through the physics system — GAIA stars are not Simulation bodies.
-  - Brightness is physical: intensity = 10^(-0.4*M_G) / d_au^2 * FLUX_SCALE,
-    evaluated per frame against the camera, so stars brighten as you approach.
+  - Brightness is physical: the packer emits each star's constant pre-scaled
+    flux 10^(-0.4*M_G) * FLUX_SCALE, and the inverse-square distance falloff
+    is applied per frame against the EYE in starfield.vert — stars brighten
+    as you approach and dim as you recede (same 1/d^2 law as system stars).
 
 Per-frame cost is one numpy pass (~1-2 ms @ 460k stars) packing a streamed f4
 VBO of interleaved [rel_xyz, rgb, intensity]. Result is cached: repacking only
@@ -160,7 +162,8 @@ class StarCatalog:
                        2800.0, 40000.0)
         self.rgb = _temperature_to_rgb_vec(teff)
 
-        # Pre-scaled flux: intensity = flux_scaled / d_au^2
+        # Pre-scaled intrinsic flux. The per-frame 1/d_au^2 eye-distance
+        # falloff lives in glsl/celestial/starfield.vert.
         self.flux_scaled = (np.power(10.0, -0.4 * self.abs_mag.astype('f8'))
                             * FLUX_SCALE).astype('f4')
 
@@ -179,9 +182,12 @@ class StarCatalog:
     # ------------------------------------------------------------------
 
     def pack_render(self, t_years, frame_origin):
-        """Pack interleaved f4 (N,7) [rel_xyz, rgb, intensity], frame-relative.
+        """Pack interleaved f4 (N,7) [rel_xyz, rgb, flux], frame-relative.
 
-        Returns a cached array when origin/time are unchanged. frame_origin is
+        Returns a cached array when origin/time are unchanged. The eye
+        position is deliberately NOT an input: the inverse-square flux
+        falloff is evaluated against the eye in the vertex shader, so this
+        pack (and its cache) survives free camera motion. frame_origin is
         the render-frame origin (tracked body's barycentric position, i.e. the
         same vector subtracted from sim bodies to get pos_rel_all), NOT the eye
         position — the eye offset is applied by the view matrix in the shader.
@@ -212,23 +218,24 @@ class StarCatalog:
 
 @njit(parallel=True, cache=True, nogil=True)
 def _pack_kernel(pos0, pm_vec, t_years, ox, oy, oz, flux_scaled, rgb, packed):
-    """Single fused pass: rel = pos0 + pm*t - origin, I = flux/|rel|^2.
-    All inputs f4; per-element math in f8, output stored f4."""
+    """Single fused pass: rel = pos0 + pm*t - origin, flux = 10^(-0.4*M_G)*1e13.
+
+    The eye-distance inverse-square falloff is applied in the vertex shader
+    (starfield.vert), NOT here — packing must stay independent of the camera
+    eye so the per-frame cache survives free flight. All inputs f4;
+    per-element math in f8, output stored f4."""
     n = pos0.shape[0]
     for i in prange(n):
         x = float(pos0[i, 0]) + float(pm_vec[i, 0]) * t_years - ox
         y = float(pos0[i, 1]) + float(pm_vec[i, 1]) * t_years - oy
         z = float(pos0[i, 2]) + float(pm_vec[i, 2]) * t_years - oz
-        d2 = x * x + y * y + z * z
-        if d2 < 1.0:
-            d2 = 1.0
         packed[i, 0] = x
         packed[i, 1] = y
         packed[i, 2] = z
         packed[i, 3] = rgb[i, 0]
         packed[i, 4] = rgb[i, 1]
         packed[i, 5] = rgb[i, 2]
-        packed[i, 6] = flux_scaled[i] / d2
+        packed[i, 6] = flux_scaled[i]
 
 
 def _temperature_to_rgb_vec(temp_k):
