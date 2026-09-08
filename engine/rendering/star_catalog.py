@@ -7,14 +7,16 @@ provides a render-only layer of real stars at their true 3D positions:
     ecliptic render frame (x, z, -y remap, see PROJECT_MAP gotchas).
   - Proper motion is applied ANALYTICALLY (p(t) = p0 + pm*t, linear approx),
     never through the physics system — GAIA stars are not Simulation bodies.
-  - Brightness is physical: the packer emits each star's constant pre-scaled
+    Positions are evaluated per frame in the VERTEX SHADER in double precision
+    (static f8 pos0 + f4 pm attributes, dvec3 u_origin + double u_t uniforms),
+    so there is no per-frame CPU packing and no per-frame VBO upload.
+  - Brightness is physical: each star carries its constant pre-scaled
     flux 10^(-0.4*M_G) * FLUX_SCALE, and the inverse-square distance falloff
     is applied per frame against the EYE in starfield.vert — stars brighten
     as you approach and dim as you recede (same 1/d^2 law as system stars).
 
-Per-frame cost is one numpy pass (~1-2 ms @ 460k stars) packing a streamed f4
-VBO of interleaved [rel_xyz, rgb, intensity]. Result is cached: repacking only
-happens when the camera position or sim time actually changed.
+Per-frame CPU cost is zero (uniform writes only); the pack_render()/
+_pack_kernel() CPU path is retained for offline tests and validation.
 """
 
 import os
@@ -66,7 +68,9 @@ class StarCatalog:
         self.abs_mag = None        # f4 (N,) absolute G magnitude
         self.rgb = None            # f4 (N,3) blackbody color from BP-RP
         self.dist_ly = None        # f8 (N,) distance in light years
-        # pack cache
+        # static GPU attribute arrays (see _bake)
+        self.pos0_f8 = None        # f8 (N,3) heliocentric AU — shader attribute
+        # pack cache (CPU path, kept for scripts/test_gaia.py)
         self._last_cam = None
         self._last_t = None
         self._last_packed = None
@@ -155,6 +159,8 @@ class StarCatalog:
         self.pos0 = dir_r * dist_au[:, None]
         # Gaia epoch J2016.0 -> J2000 sim epoch
         self.pos0 -= self.pm_vec * EPOCH_OFFSET_YEARS
+        # Stash f8 positions before the f4 downcast below (GPU static attr)
+        self._pos0_f8_stash = np.ascontiguousarray(self.pos0, dtype='f8')
 
         # --- Photometry ---------------------------------------------------
         self.abs_mag = (g - 5.0 * (np.log10(dist_pc) - 1.0)).astype('f4')
@@ -173,6 +179,14 @@ class StarCatalog:
         # phase, where pack_render would need an f8 path).
         self.pos0 = self.pos0.astype('f4')
         self.pm_vec = self.pm_vec.astype('f4')
+
+        # --- Static GPU attributes (per-frame packing moved to the shader) --
+        # Full-precision f8 heliocentric positions: the origin subtraction
+        # happens in the vertex shader (dvec3), so the catalog must keep an
+        # f8 copy — an f4 pos0 would lose ~100 AU absolute at parsec
+        # distances and make stars wobble when the camera sits near one.
+        self.pos0_f8 = self._pos0_f8_stash
+        del self._pos0_f8_stash
         n = self.count
         self._packed = np.empty((n, 7), 'f4')
         self._packed[:, 3:6] = self.rgb         # static across frames

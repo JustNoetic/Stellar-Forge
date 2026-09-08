@@ -47,9 +47,55 @@ float _refraction_setup(vec3 C, vec3 V, float d, out float s_min, out float delt
     return r_min;
 }
 
+// exp(x^2) * erfc(x) for x >= 0. Abramowitz & Stegun 7.1.26, whose polynomial
+// is exactly exp(x^2) * (1 - erf(x)), making this form overflow-safe for ALL x
+// (the naive exp(+x^2) * erfc(x) overflows/underflows f32 above x ~ 10, which
+// happens at high elevations where sqrt(|C|/2H) * sin(e) gets large).
+float refract_erfcx(float x) {
+    float t = 1.0 / (1.0 + 0.3275911 * x);
+    return max(0.0, t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
+           + t * (-1.453152027 + t * 1.061405429)))));
+}
+
 // Apparent angular displacement (parallax-weighted) of an object at distance d.
 // This is the quantity needed to displace a POINT object's apparent position.
 float compute_refraction_angle(vec3 C, vec3 V, float d) {
+    // Observer-inside regime: the ray LINE's periapsis lies BEHIND the camera
+    // (object above the camera's local horizontal plane). The light's closest
+    // approach to the planet is then the camera itself, so the bend must be
+    // integrated along the ASCENDING path away from the camera — not around
+    // the behind-camera periapsis. With the parabolic altitude approximation
+    // alt(s) ~ h + s*sin(e) + s^2/(2|C|), the accumulated deflection has a
+    // closed form:
+    //   R(e) = 0.5 * delta_cam * erfcx(sqrt(|C| / (2H)) * sin(e))
+    //   delta_cam = u_refract_max_bend * exp(-h / H)
+    // This reproduces standard atmospheric refraction tables (34' at the
+    // horizon, 24' @ 1 deg, 18' @ 2 deg, 9.9' @ 5 deg, 5.3' @ 10 deg) and is
+    // VALUE-continuous with the limb model at e = 0 (both equal 0.5*delta_cam).
+    // Evaluating this regime through the shared E_0 saturation tail instead
+    // collapses the deflection to zero by ~7 deg elevation — stars visibly
+    // "stop refracting" well before they set behind the horizon.
+    float s_min_pre = -dot(C, V);
+    if (s_min_pre < 0.0) {
+        float Rc = length(C);
+        if (Rc < 1e-6) return 0.0;
+        vec3 up = C / Rc;
+        float sin_e = clamp(dot(V, up), 0.0, 1.0);
+        float h = Rc - refract_solid_radius(up);
+        if (h > u_refract_scale_height * 15.0) return 0.0;
+        float delta_cam = u_refract_max_bend * exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
+        if (delta_cam <= 1e-9) return 0.0;
+        float k = Rc / (2.0 * max(1e-4, u_refract_scale_height));
+        float bend = 0.5 * delta_cam * refract_erfcx(sqrt(k) * sin_e);
+        // Object-side cutoff: only the bend accumulated between the camera
+        // and the object at distance d. E_d ~ 1 for anything beyond a few
+        // sigma_cam (every rendered body and all catalog stars).
+        float sigma_cam = sqrt(max(1e-4, Rc * u_refract_scale_height));
+        float x_d = d / (1.4142135 * sigma_cam);
+        float E_d = sign(x_d) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_d * x_d)));
+        return max(0.0, bend * E_d);
+    }
+
     float s_min, delta_rmin, sigma;
     float r_min = _refraction_setup(C, V, d, s_min, delta_rmin, sigma);
     if (r_min < 0.0) return 0.0;
@@ -106,7 +152,18 @@ float compute_refraction_total(vec3 C, vec3 V, float d) {
 vec3 solve_refraction_apparent(vec3 C, vec3 V, float d, out bool is_occluded) {
     is_occluded = false;
     float s_min = -dot(C, V);
-    if (s_min <= 0.0 || s_min >= d) return V;
+    // NOTE: deliberately NO "s_min <= 0" early-return here. A negative s_min
+    // means the true ray LINE's closest approach lies BEHIND the camera — i.e.
+    // the object sits above the camera's local horizontal plane (every sky
+    // object seen from a landed camera). The 0.5 * (E_d + E_0) factor in the
+    // deflection integral already accounts for the camera sitting past the
+    // bend's periapsis (E_0 goes negative), so gating here would zero the
+    // refraction for all above-horizon objects and let the full ~30 arcmin of
+    // horizon bend snap in discontinuously the instant an object sinks below
+    // the horizontal plane — the starfield "downward flick" bug. Only exclude
+    // rays that end before reaching the periapsis (object in front of the
+    // atmosphere; its light never traverses the dense shell).
+    if (s_min >= d) return V;
 
     vec3 u_dir = C - V * dot(C, V);
     float u_len = length(u_dir);
@@ -125,22 +182,43 @@ vec3 solve_refraction_apparent(vec3 C, vec3 V, float d, out bool is_occluded) {
     float alpha_0 = compute_refraction_angle(C, V, d);
     if (alpha_0 <= 1e-7) return V;
 
-    // Damped initial step: theta_0 = alpha_0 / (1 + (s_min / H) * alpha_0)
-    float theta = alpha_0 / (1.0 + (max(s_min, 0.0) / max(1e-4, u_refract_scale_height)) * alpha_0);
-
-    // 3 Newton-Raphson iterations to solve F(theta) = theta - alpha(V_app(theta)) = 0
-    for (int i = 0; i < 3; i++) {
-        vec3 V_test = V * cos(theta) + u_dir * sin(theta);
+    // Solve theta = alpha(V_app(theta)) for the apparent deflection.
+    // alpha(V) is monotonically non-increasing as V_app lifts away from the
+    // planet (the lifted ray's periapsis rises -> delta_rmin falls), so
+    // F(theta) = theta - alpha(V_app(theta)) is monotone increasing with
+    // F(0) = -alpha_0 < 0 and F(alpha_0) = alpha_0 - alpha(alpha_0) >= 0:
+    // the fixed point is ALWAYS bracketed by [0, alpha_0].
+    // The previous 3-step damped Newton-Raphson (F' ~= 1 + (s_min/H)*alpha)
+    // collapsed for distant observers: with the camera thousands of km above
+    // the bend region, s_min/H reaches the hundreds/thousands, each step
+    // closed only ~1/F' of the remaining gap, and 3 iterations left the solve
+    // at a small fraction of the true deflection — stars visibly stopped
+    // refracting and sank into the limb instead of stacking up compressed
+    // against the refracted horizon like the anchored mesh path. Bisection on
+    // the guaranteed bracket converges unconditionally at any observer
+    // distance; 12 halvings resolve alpha_0/4096 (< 0.02' for max_bend).
+    float lo_t = 0.0;
+    float hi_t = alpha_0;
+    for (int i = 0; i < 12; i++) {
+        float mid_t = 0.5 * (lo_t + hi_t);
+        vec3 V_test = V * cos(mid_t) + u_dir * sin(mid_t);
         float alpha = compute_refraction_angle(C, V_test, d);
-        float s_test = -dot(C, V_test);
-        float F = theta - alpha;
-        float F_prime = 1.0 + (max(s_test, 0.0) / max(1e-4, u_refract_scale_height)) * alpha;
-        theta = max(0.0, theta - F / F_prime);
+        if (alpha > mid_t) lo_t = mid_t; else hi_t = mid_t;
     }
+    float theta = 0.5 * (lo_t + hi_t);
 
     vec3 V_app = V * cos(theta) + u_dir * sin(theta);
     float s_app = -dot(C, V_app);
-    vec3 P_app = C + s_app * V_app;
+    // Occlusion must test the FORWARD ray's periapsis, not the line's. When
+    // the apparent direction rises above the local horizontal (s_app < 0), the
+    // line periapsis lies behind the camera and is strictly closer to the
+    // planet center than the camera itself — using it would spuriously flag
+    // refracted objects hanging above the horizon as occluded for any camera
+    // within a few hundred meters of the surface. Clamping to the forward
+    // extent makes the closest approach the camera position, which is only
+    // "blocked" when the camera itself is below the solid surface.
+    float s_app_fwd = max(s_app, 0.0);
+    vec3 P_app = C + s_app_fwd * V_app;
     float r_app = length(P_app);
     float solid_r = refract_solid_radius(r_app > 1e-6 ? (P_app / r_app) : vec3(0.0, 1.0, 0.0));
 

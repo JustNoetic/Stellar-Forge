@@ -70,8 +70,11 @@ void main() {
     // displaced across the sky by up to ~tan(max_bend) * dist (mirrors the
     // bg_expand in sphere.vert). Widen the frustum-test radius accordingly so
     // refracted bodies are not culled when their true position leaves the
-    // frustum. The s_min > 0 test excludes bodies in front of the atmosphere
-    // and the atmosphere host itself (whose closest approach is at the camera).
+    // frustum. The s_min_r < d_body test excludes bodies in front of the
+    // atmosphere (their light never traverses the dense shell). Above-horizon
+    // rays (line periapsis behind the camera) are evaluated at the clamped
+    // forward-ray periapsis — mirroring solve_refraction_apparent, which now
+    // refracts above-horizon objects too (no s_min <= 0 gate there).
     if (u_refract_max_bend > 1e-6) {
         vec3 Cr = u_camera_pos - u_refract_center;
         vec3 to_body = pos - u_camera_pos;
@@ -79,8 +82,9 @@ void main() {
         if (d_body > 1e-9) {
             vec3 Vr = to_body / d_body;
             float s_min_r = -dot(Cr, Vr);
-            if (s_min_r > 0.0 && s_min_r < d_body) {
-                float r_min_r = length(Cr + s_min_r * Vr) * u_au_to_km;
+            if (s_min_r < d_body) {
+                float s_fwd_r = max(s_min_r, 0.0);
+                float r_min_r = length(Cr + s_fwd_r * Vr) * u_au_to_km;
                 if (r_min_r < u_refract_radius + u_refract_scale_height * 15.0) {
                     r_cull += d_body * tan(u_refract_max_bend) * 1.5;
                 }
