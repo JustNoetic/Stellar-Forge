@@ -33,7 +33,7 @@
     "ringshine_enabled": true,
     "ringshine_band_count": 100,
     "inspector_frame": 0,
-    "fov": 38.46925059375,
+    "fov": 45.0,
     "flight_speed": 3.454720054381096e-07,
     "shadow_caster_budget": 8,
     "tex_stream_threshold_px": 485.0,
@@ -43,7 +43,7 @@
     "screenshot_accum_enabled": false,
     "photo_accum_target": 112,
     "screenshot_accum_target": 16,
-    "movement_mode": 0,
+    "movement_mode": 1,
     "refraction_enabled": true,
     "grav_lensing_enabled": true,
     "grav_lensing_multiplier": 1.0

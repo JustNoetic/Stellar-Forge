@@ -28,8 +28,6 @@ uniform float u_intensity_scale; // user brightness tuning (shared with .frag)
 uniform bool u_hdr_enabled;      // shared with .frag — gates u_exposure
 uniform float u_exposure;        // shared with .frag — camera exposure
 
-uniform bool u_equirectangular; // Render 360-degree sky into equirectangular map
-
 #include "common/refraction.glsl"
 
 out vec3 f_color;
@@ -68,33 +66,17 @@ void main() {
     pos = apply_atmospheric_refraction(pos, u_eye);
 
     vec4 clip = projection * view * vec4(pos, 1.0);
-    vec2 ndc;
-
-    if (u_equirectangular) {
-        // Evaluate position in OpenGL camera space (X right, Y up, Z back)
-        vec3 p_cam = (view * vec4(pos, 1.0)).xyz;
-        vec3 dir_cam = normalize(p_cam);
-        // Forward is -Z. atan(Y, X). Longitude angle is measured from +X in XZ plane.
-        float lon = atan(dir_cam.x, -dir_cam.z); // range [-PI, PI]
-        float lat = asin(dir_cam.y);             // range [-PI/2, PI/2]
-        
-        float u = lon / (2.0 * 3.14159265359); // [-0.5, 0.5]
-        float v = lat / 3.14159265359;         // [-0.5, 0.5]
-        
-        ndc = vec2(u * 2.0, v * 2.0);          // [-1.0, 1.0]
-        gl_Position = vec4(ndc, 0.0, 1.0);
-    } else {
-        // Points have no near-plane culling — degenerate any behind-camera vertex.
-        if (clip.w <= 0.0) {
-            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-            gl_PointSize = 0.0;
-            f_color = vec3(0.0);
-            f_intensity = 0.0;
-            return;
-        }
-        ndc = clip.xy / clip.w;
-        gl_Position = clip;
+    // Points have no near-plane culling — degenerate any behind-camera vertex.
+    if (clip.w <= 0.0) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        gl_PointSize = 0.0;
+        f_color = vec3(0.0);
+        f_intensity = 0.0;
+        return;
     }
+
+    vec2 ndc = clip.xy / clip.w;
+    gl_Position = clip;
 
     // Fixed PSF footprint: every star shares the same sprite size, so the
     // peak pixel radiance is directly proportional to flux — preserving the

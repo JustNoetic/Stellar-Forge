@@ -5,21 +5,21 @@
 //
 // Features:
 // 1. Physically continuous curved Einstein arcs and full closed Einstein rings.
-// 2. Dual-texture approach: sharp 1:1 unlensed stars on-screen, falling back
-//    to a 360-degree equirectangular map for deflected/off-screen sightlines.
-// 3. Natural secondary mirror images inside theta_E by sampling the opposite side.
-// 4. Kerr spin frame-dragging (Lense-Thirring) without coordinate blowups.
-// 5. Black hole shadow silhouette occlusion and depth-buffer integration.
+// 2. Single catalog rasterization pass (eliminates duplicate 460k vertex draws).
+// 3. 2.0x Overscan buffer: captures off-screen stars and secondary mirror images.
+// 4. Natural secondary mirror images inside theta_E by sampling the opposite side.
+// 5. Kerr spin frame-dragging (Lense-Thirring) without coordinate blowups.
+// 6. Black hole shadow silhouette occlusion and depth-buffer integration.
 
 in vec2 v_texcoord;
 
-uniform sampler2D u_starfield_tex; // Screen-space 1:1 render
-uniform sampler2D u_allsky_tex;    // 360-degree equirectangular render
+uniform sampler2D u_starfield_tex;
 
 uniform vec3 u_cam_forward;
 uniform vec3 u_cam_right;
 uniform vec3 u_cam_up;
 uniform vec2 u_tan_half_fov;            // Screen tan half FOV (tan(fov_x/2), tan(fov_y/2))
+uniform vec2 u_tan_half_fov_starfield;  // Overscan starfield buffer tan half FOV
 uniform vec3 u_camera_pos;              // AU (camera position in world render frame)
 uniform float u_screen_width;
 uniform float u_screen_height;
@@ -32,9 +32,13 @@ void main() {
     // Normalized Device Coordinates on the screen [-1, 1]
     vec2 ndc = v_texcoord * 2.0 - 1.0;
 
+    // Default overscan ratio if starfield tan FOV is not supplied:
+    vec2 tan_sf = u_tan_half_fov_starfield.x > 1e-6 ? u_tan_half_fov_starfield : u_tan_half_fov;
+
     // If gravitational lensing is not active or has negligible Schwarzschild radius:
     if (!u_grav_lens_enabled || u_grav_lens_rs <= 1e-6) {
-        vec4 base_color = texture(u_starfield_tex, v_texcoord);
+        vec2 ndc_sf = ndc * (u_tan_half_fov / tan_sf);
+        vec4 base_color = texture(u_starfield_tex, ndc_sf * 0.5 + 0.5);
         if (dot(base_color.rgb, base_color.rgb) <= 1e-12) discard;
         out_color = base_color;
         gl_FragDepth = 0.999999;
@@ -48,7 +52,21 @@ void main() {
     vec3 cam_to_lens = u_grav_lens_center - u_camera_pos;
     float d_l_au = length(cam_to_lens);
     if (d_l_au < 1e-6) {
-        vec4 base_color = texture(u_starfield_tex, v_texcoord);
+        vec2 ndc_sf = ndc * (u_tan_half_fov / tan_sf);
+        vec4 base_color = texture(u_starfield_tex, ndc_sf * 0.5 + 0.5);
+        if (dot(base_color.rgb, base_color.rgb) <= 1e-12) discard;
+        out_color = base_color;
+        gl_FragDepth = 0.999999;
+        return;
+    }
+
+    vec3 L = cam_to_lens / d_l_au; // Optical axis towards lens center
+    float cos_theta = clamp(dot(V, L), -1.0, 1.0);
+
+    // If the lens is behind the camera plane relative to this pixel sightline (cos_theta <= 1e-4):
+    if (cos_theta <= 1e-4) {
+        vec2 ndc_sf = ndc * (u_tan_half_fov / tan_sf);
+        vec4 base_color = texture(u_starfield_tex, ndc_sf * 0.5 + 0.5);
         if (dot(base_color.rgb, base_color.rgb) <= 1e-12) discard;
         out_color = base_color;
         gl_FragDepth = 0.999999;
@@ -77,9 +95,10 @@ void main() {
         discard;
     }
 
-    // If deflection is effectively zero, sample unlensed high-res starfield directly:
+    // If deflection is effectively zero, sample unlensed starfield directly:
     if (alpha <= 1e-7) {
-        vec4 base_color = texture(u_starfield_tex, v_texcoord);
+        vec2 ndc_sf = ndc * (u_tan_half_fov / tan_sf);
+        vec4 base_color = texture(u_starfield_tex, ndc_sf * 0.5 + 0.5);
         if (dot(base_color.rgb, base_color.rgb) <= 1e-12) discard;
         out_color = base_color;
         gl_FragDepth = 0.999999;
@@ -100,46 +119,44 @@ void main() {
     vec3 V_deflected = normalize(V * cos(alpha) - u_dir * sin(alpha));
 
     // Kerr spin frame-dragging (Lense-Thirring):
+    // Precesses the deflected sightline around the spin axis pole_n.
     if (abs(u_grav_lens_spin) > 1e-4) {
         vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
         float s_min = -dot(C_km, V);
         vec3 P_min = C_km + s_min * V;
         float b_km = max(length(P_min), u_grav_lens_rs * 1.5);
         
+        // Frame-dragging angle dphi ~ 2*G*J / (c^3 * b^2) = a_* * rs^2 / b^2
         float drag_angle = (u_grav_lens_spin * u_grav_lens_rs * u_grav_lens_rs * 2.0) / (b_km * b_km);
         drag_angle = clamp(drag_angle, -0.75, 0.75);
         
+        // Rodrigues rotation of V_deflected around pole_n by drag_angle:
         V_deflected = V_deflected * cos(drag_angle) 
                     + cross(pole_n, V_deflected) * sin(drag_angle) 
                     + pole_n * dot(pole_n, V_deflected) * (1.0 - cos(drag_angle));
         V_deflected = normalize(V_deflected);
     }
 
-    // Calculate deflected sightline in camera basis
-    float v_x = dot(V_deflected, u_cam_right);
-    float v_y = dot(V_deflected, u_cam_up);
-    float v_z = dot(V_deflected, u_cam_forward);
-
-    vec4 star_color = vec4(0.0);
-
-    // If deflected sightline points forward (z > 0), try to sample the high-res viewport screen texture:
-    if (v_z > 0.0) {
-        vec2 ndc_deflected = vec2(v_x / (v_z * u_tan_half_fov.x), v_y / (v_z * u_tan_half_fov.y));
-        if (abs(ndc_deflected.x) <= 1.0 && abs(ndc_deflected.y) <= 1.0) {
-            vec2 uv_deflected = ndc_deflected * 0.5 + 0.5;
-            star_color = texture(u_starfield_tex, uv_deflected);
-        }
+    // Project deflected sightline V_deflected into camera screen space:
+    float z_c = dot(V_deflected, u_cam_forward);
+    // If deflected behind the camera plane, it cannot be seen in this screen buffer:
+    if (z_c <= 1e-6) {
+        discard;
     }
 
-    // If it was completely off-screen or backwards, sample the 360-degree equirectangular allsky map!
-    if (dot(star_color.rgb, star_color.rgb) <= 1e-12) {
-        float lon = atan(v_x, -v_z); // Note: -v_z because forward is -Z in OpenGL camera space
-        float lat = asin(v_y);
-        float u = lon / (2.0 * 3.14159265359) + 0.5;
-        float v = lat / 3.14159265359 + 0.5;
-        star_color = texture(u_allsky_tex, vec2(u, v));
+    vec2 ndc_deflected = vec2(
+        dot(V_deflected, u_cam_right) / (z_c * tan_sf.x),
+        dot(V_deflected, u_cam_up) / (z_c * tan_sf.y)
+    );
+    vec2 uv_deflected = ndc_deflected * 0.5 + 0.5;
+
+    // Check bounds [0, 1]
+    if (uv_deflected.x < 0.0 || uv_deflected.x > 1.0 || uv_deflected.y < 0.0 || uv_deflected.y > 1.0) {
+        discard;
     }
 
+    // Sample unlensed starfield with bilinear filtering:
+    vec4 star_color = texture(u_starfield_tex, uv_deflected);
     if (dot(star_color.rgb, star_color.rgb) <= 1e-12) {
         discard;
     }

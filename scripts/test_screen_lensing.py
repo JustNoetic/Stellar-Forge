@@ -248,39 +248,29 @@ def main():
         print(f"7. Arbitrary angle camera rotation: FAILED (min peak = {min_peak_rot:.3f})")
         fails.append("arbitrary angle camera rotation")
 
-    # 8. Offscreen star captured by allsky equirectangular buffer test:
-    # We simulate a star located 180 degrees behind the camera.
-    # In equirectangular coordinates (u, v) where u = lon/2pi + 0.5, v = lat/pi + 0.5.
-    # Camera looks at -Z. Star behind is at +Z.
-    # lon = atan(v_x, -v_z). Star at +Z means v_z = -1, v_x = 0.
-    # lon = atan(0, 1) = 0.0 -> u = 0.5.
-    # lat = 0 -> v = 0.5.
-    # So the pixel at the center of the allsky map is EXACTLY behind the camera!
-    tex_allsky = ctx.texture((1024, 512), 4, dtype='f4')
-    tex_allsky.filter = (moderngl.LINEAR, moderngl.LINEAR)
-    Yo, Xo = np.ogrid[:512, :1024]
-    dist2_o = (Xo - 512)**2 + (Yo - 256)**2
-    raw_allsky = np.exp(-dist2_o / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
-    raw_allsky = np.repeat(raw_allsky, 4, axis=2)
-    tex_allsky.write(raw_allsky.tobytes())
+    # 8. Offscreen star captured by overscan buffer test:
+    # An unlensed star is placed outside the visible screen viewport at NDC_x = +1.18 (18% outside right edge).
+    # In a 2.0x overscan starfield texture (1024x1024), this star lives at NDC_starfield = +0.588
+    # (pixel X = 813.3, Y = 497.7 in the 1024x1024 overscan buffer).
+    tex_overscan = ctx.texture((1024, 1024), 4, dtype='f4')
+    tex_overscan.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    Yo, Xo = np.ogrid[:1024, :1024]
+    dist2_o = (Xo - 813.3)**2 + (Yo - 497.7)**2
+    raw_overscan = np.exp(-dist2_o / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
+    raw_overscan = np.repeat(raw_overscan, 4, axis=2)
+    tex_overscan.write(raw_overscan.tobytes())
 
     # Setup camera looking down -Z at origin lens:
     fbo_out.use()
     ctx.viewport = (0, 0, w, h)
-    
-    # We clear the regular starfield texture to black so only allsky has light
-    tex_starfield = ctx.texture((w, h), 4, dtype='f4')
-    tex_starfield.write(np.zeros((h, w, 4), dtype='f4').tobytes())
-    
-    tex_starfield.use(location=0)
-    tex_allsky.use(location=1)
-
+    tex_overscan.use(location=0)
+    tan_half_overscan = (tan_half_x * 2.0, tan_half_y * 2.0)
     if 'u_starfield_tex' in prog: prog['u_starfield_tex'].value = 0
-    if 'u_allsky_tex' in prog: prog['u_allsky_tex'].value = 1
     if 'u_cam_forward' in prog: prog['u_cam_forward'].value = tuple(float(x) for x in cam_fwd)
     if 'u_cam_right' in prog: prog['u_cam_right'].value = tuple(float(x) for x in cam_right)
     if 'u_cam_up' in prog: prog['u_cam_up'].value = tuple(float(x) for x in cam_up)
     if 'u_tan_half_fov' in prog: prog['u_tan_half_fov'].value = (float(tan_half_x), float(tan_half_y))
+    if 'u_tan_half_fov_starfield' in prog: prog['u_tan_half_fov_starfield'].value = tuple(float(x) for x in tan_half_overscan)
     if 'u_camera_pos' in prog: prog['u_camera_pos'].value = tuple(float(x) for x in cam_pos)
     if 'u_grav_lens_center' in prog: prog['u_grav_lens_center'].value = (0.0, 0.0, 0.0)
     if 'u_grav_lens_rs' in prog: prog['u_grav_lens_rs'].value = float(scaled_rs)
@@ -297,7 +287,7 @@ def main():
     unlensed_max = float(np.max(out_unlensed))
 
     # Step 8b: Under gravitational lensing, backward rays bend towards the lens and reach this offscreen star,
-    # pulling its secondary mirror image ONTO the screen:
+    # pulling its secondary mirror image ONTO the screen (x < 256):
     if 'u_grav_lens_enabled' in prog: prog['u_grav_lens_enabled'].value = True
     fbo_out.clear(0, 0, 0, 0)
     quad_vao.render(moderngl.TRIANGLE_STRIP)
@@ -306,19 +296,10 @@ def main():
     on_screen_slice = out_pixels_ov[256, :, 0]
     offscreen_peak = float(np.max(on_screen_slice))
     peak_pixel_x = int(np.argmax(on_screen_slice))
-    tex_allsky.release()
-    tex_starfield.release()
-    
-    
-    max_idx = np.unravel_index(np.argmax(out_pixels_ov[:,:,0]), out_pixels_ov[:,:,0].shape)
-    print(f"DEBUG: offscreen_peak over whole screen: {np.max(out_pixels_ov[:,:,0])} at {max_idx}")
-
-    # Use the max over the whole screen instead of just line 256
-    offscreen_peak = float(np.max(out_pixels_ov[:,:,0]))
-    peak_pixel_x = int(max_idx[1])
+    tex_overscan.release()
 
     if unlensed_max == 0.0 and offscreen_peak > 0.5:
-        print(f"8. Offscreen star lensing: PASSED (unlensed peak={unlensed_max:.1f}, lensed image pulled onto screen at x={peak_pixel_x}, y={max_idx[0]}, val={offscreen_peak:.3f})")
+        print(f"8. Offscreen star lensing: PASSED (unlensed peak={unlensed_max:.1f}, lensed image pulled onto screen at x={peak_pixel_x}, val={offscreen_peak:.3f})")
     else:
         print(f"8. Offscreen star lensing: FAILED (unlensed_max={unlensed_max:.3f}, lensed_peak={offscreen_peak:.3f})")
         fails.append("offscreen star lensing")
