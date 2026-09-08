@@ -1756,7 +1756,21 @@ def load_system_from_data(bodies_data_raw):
         idx = name_to_idx[name]
         mass = body.get('m', 0.0)
         color = hex_to_rgb(body.get('color', '#ffffff'))
-        radius_au = body.get('r', 1.0) * SOLAR_RADII_TO_AU
+
+        # Black holes: the event-horizon radius is derived DIRECTLY from the
+        # mass (r_s = 2GM/c^2 = 2.95325008 km per solar mass); any stored 'r'
+        # property is ignored. The rendered / culled size is the photon-capture
+        # (shadow) silhouette b_c = (3*sqrt(3)/2) * r_s — the only visible
+        # extent of a black hole.
+        _sp_bh = body.get('star_props', {}) or {}
+        if ('Black Hole' in (_sp_bh.get('class', '') or '')
+                or _sp_bh.get('stage', '') == 'Singularity'
+                or body.get('type') == 'Black Hole'):
+            _rs_km = 2.95325008 * mass
+            body['r'] = _rs_km / 696340.0
+            radius_au = (2.5980762 * _rs_km) / 149597870.7
+        else:
+            radius_au = body.get('r', 1.0) * SOLAR_RADII_TO_AU
 
         min_px = 1.0
 

@@ -170,6 +170,7 @@ Pure-Python / wrappers:
   derives visual data / atmo bodies / ring bodies / oblate list → returns **bundle dict** with keys:
     `sim, num_bodies, bodies_data, name_to_idx, visual_data, atmo_bodies, ring_bodies,
      oblate_physics_list, has_j2, has_gr, phys_star_idx, star_idx`.
+    Black-hole bodies: `r` property is ignored — event-horizon radius derived from mass (`2.95325008 km × M☉`, written back to `body['r']` for the inspector) and the visual/culling radius is the shadow silhouette `b_c = (3√3/2)·r_s`.
 
 Classes:
 - `Particle` (~L2267) — property accessors `x,y,z,vx,vy,vz,m,hash` into `sim.arr`.
@@ -247,6 +248,7 @@ spectral classification.
   - `point_celestial.*` (`glsl/celestial/`) — Subpixel point-light quad pass (apparent_px < 3.0); refracts the body's apparent position via `apply_refraction` (parallax-weighted with Newton-Raphson inverse apparent solver `solve_refraction_apparent` and solid-body occlusion guard), cross-fades against the mesh over apparent_px ∈ [2.0, 3.0]. Star sprites apply analytic circle-circle transit/occultation occlusion against all casters (true (Rp/Rs)² transit depth, partial phases for subpixel eclipses).
   - `starfield.*` (`glsl/celestial/`) — GAIA catalog point sprites; per-star positions computed per frame ON THE GPU in double precision (static f8 pos0 + f4 pm/color/flux buffers, `dvec3 u_origin` + `double u_t` uniforms — no CPU packing, no per-frame VBO upload); per-eye inverse-square flux falloff `I = flux·u_flux_calib / d_eye²` in the vertex shader (`u_eye` + `u_flux_calib` uniforms; calib anchors M_G=4.67 @ 1 AU to the system sun's sprite peak `0.8333·(h·fov)²/4`, so one exposure governs planets, sun, and stars alike); FIXED PSF sprite size (peak ∝ flux — true magnitude scale; bloom grows bright stars); atmospheric refraction via `apply_refraction` (same parallax-weighted model + limb occlusion guard as point lights); far-plane distance clamp (eye-relative) + manual behind-camera degeneration; **vertex-stage culling** in `starfield.vert` — frustum test with sprite-extent padding and exposure-threshold culling (peak center-pixel signal < 1e-6, mirroring the frag's limiting-magnitude fade) evaluated on the APPARENT (refracted) position so refraction-lifted stars stay visible; `gl_FragDepth = 0.999999` for log-depth occlusion; additive blend, HDR, feeds bloom/diffraction spikes.
   - `common/refraction.glsl` — Shared refraction math: `compute_refraction_angle` (parallax-weighted apparent displacement) vs `compute_refraction_total` (un-parallaxed total ray turn); `compute_refraction_angle` has a dedicated observer-inside closed form for s_min < 0 (object above the camera's horizontal plane): `R(e) = 0.5·delta_cam·erfcx(√(|C|/2H)·sin e)` via `refract_erfcx` (A&S 7.1.26), matching standard refraction tables and staying continuous with the limb model at e = 0; `solve_refraction_apparent` inverts the deflection for point lights/orbits/stars via 12-step bracketed bisection on [0, alpha_0] (the fixed point θ = α(V_app(θ)) is always bracketed there since α is monotone non-increasing — the old 3-step damped Newton-Raphson under-converged for distant observers, s_min/H ≫ 1, making stars stop refracting and sink into the limb); `refract_chord_blocked` tests apparent-ray periapsis to occlude bodies behind the solid planet. The solve deliberately has NO `s_min <= 0` gate (above-horizon objects from near-surface cameras must refract — the `0.5·(E_d+E_0)` factor handles the camera-past-periapsis geometry) and its occlusion test clamps to the forward-ray periapsis; removing either would resurface the starfield/point-light "downward flick" discontinuity at the camera's horizontal plane.
+    Also hosts the **gravitational lensing** math: `u_grav_lens_*` uniforms (center/rs/radius/type/enabled/strength/spin/pole), `compute_gravitational_deflection` (Einstein weak-field + 2PN + strong-field divergence, Kerr `b_c(φ)`, capture → `is_shadow`), and `apply_gravitational_deflection` (+ Lense-Thirring drag), composed into `apply_refraction` / `apply_refraction_eye` after the atmospheric bend (captured rays converge onto the lens center so the shadow disk depth-occludes them). Validate with `scripts/test_lensing_math.py` (GPU test of the shipped GLSL).
 
 **Edit when:** editing GLSL shader logic inside `engine/glsl/` or uniform bindings in `shaders.py`.
 
@@ -302,7 +304,8 @@ spectral classification.
 - `compute_ring_coplanar_masks(...)` (~L234, `@njit(cache=True)`) — coplanar ring-plane masks.
 - `get_cached_atmosphere_properties(atmo, mass_sm)` (~L253) — memoized atmosphere props.
 - `compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled)` (~L295, `@njit`) — CPU planetshine precompute.
-- **Active Refraction Uniform Setup** (~L3837) — passes distance-agnostic refraction parameters (`u_refract_center`, `u_refract_radius`, `u_refract_max_bend`, `u_refract_scale_height`, `u_refract_pole`, `u_refract_oblateness`) dynamically across active shaders (`prog_spheres`, `prog_rings`, `prog_atmo`, `prog_orbit`, etc.).
+- **Active Refraction Uniform Setup** (~L4318) — passes distance-agnostic refraction parameters (`u_refract_center`, `u_refract_radius`, `u_refract_max_bend`, `u_refract_scale_height`, `u_refract_pole`, `u_refract_oblateness`) dynamically across active shaders (`prog_spheres`, `prog_rings`, `prog_atmo`, `prog_orbit`, etc.).
+- **Active Gravitational Lens Uniform Setup** (immediately after) — scores all bodies (primary + comparison; BH ×1000, NS ×100, inspected ×5000) by `rs_km / cam_dist_au`, picks the active lens, and pushes `u_grav_lens_*` (center, rs = 2.95325008 km × M☉, type 0=Star/1=WD/2=NS/3=BH, enabled, strength, spin, pole) to every refraction-consuming program. Settings: `grav_lensing_enabled` / `grav_lensing_multiplier` (Graphics & Quality modal).
 
 **`class App`** (~L487) — the engine:
 - `__init__` (~L488) — camera dict (target, distance, fov, yaw/pitch/roll, exposure, hdr, tracking_idx,
@@ -355,7 +358,7 @@ spectral classification.
 - `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, and Jump in Time popup / timeline playback & scrubbing.
 - `outliner.py`: `render_system_outliner` — Left-anchored hierarchy tree with real-time substring search filter, inline + / - CRUD buttons, and comparison system tree.
 - `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Overview (physical + stellar properties, photometric albedo readouts), Orbit (osculating Keplerian elements, precession rates, Roche limit check, interactive editor), Atmosphere, Rings, and Cosmetics.
-- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings, Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, and SPICE Downloader.
+- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric refraction and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, and SPICE Downloader.
 - `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
 
 ### 3.15 `scripts/`
@@ -506,6 +509,8 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change scattering physics / gas table | `engine/physics/atmosphere_physics.py` | `compute_atmosphere_properties`, `GAS_PROPERTIES` |
 | Change orbital math / frame rotations | `engine/core/math_utils.py` | — |
 | Change sphere/ring/atmo/orbit/HZ shaders | `engine/glsl/` (`celestial/`, `atmosphere/`, `compute/`) | GLSL files loaded via `engine/rendering/shaders.py` |
+| Change gravitational lensing / BH shadow | `engine/glsl/common/refraction.glsl`, `engine/glsl/celestial/sphere.*`, `engine/glsl/atmosphere/atmo.*`, `engine/glsl/compute/culling.comp`, `engine/app.py` (lens uniform setup), `engine/physics/physics_core.py` (`load_system_from_data` BH radius) | — |
+| Validate lensing math on GPU | `scripts/test_lensing_math.py` | `main` |
 | Change bloom/tonemap/Accumulation shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
 | Change planetshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |

@@ -183,6 +183,20 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             changed_refr, app.camera["refraction_enabled"] = imgui.checkbox("Enable Atmospheric Refraction", app.camera.get("refraction_enabled", True))
             if changed_refr: settings_changed = True
 
+            # Gravitational Lensing
+            changed_lens, app.camera["grav_lensing_enabled"] = imgui.checkbox("Enable Gravitational Lensing", app.camera.get("grav_lensing_enabled", True))
+            if changed_lens: settings_changed = True
+            if app.camera.get("grav_lensing_enabled", True):
+                imgui.indent()
+                lens_mult = float(app.camera.get("grav_lensing_multiplier", 1.0))
+                changed_lensm, lens_mult = imgui.slider_float("Lensing Strength", lens_mult, 0.0, 5.0, "%.2fx")
+                if changed_lensm:
+                    app.camera["grav_lensing_multiplier"] = lens_mult
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Deflection multiplier for the dominant nearby lens (1.0 = GR).\nBlack-hole shadows, Einstein arcs and star deflection are always physical.")
+                imgui.unindent()
+
             # Planetshine & Ringshine
             changed_ps, app.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", app.camera.get("planetshine_enabled", True))
             if changed_ps: settings_changed = True

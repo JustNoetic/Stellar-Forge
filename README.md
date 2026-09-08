@@ -265,6 +265,12 @@ Planetary clouds are rendered using an independent oblate geometry shell dynamic
   - *For the Host Planet*: Evaluated using a macro-approximation based on the ring plane's area, elevation, solid angle, and a noon-fade term.
   - *For Orbiting Moons*: Dynamically projects the closest ring element to the moon, evaluates a wrapped Lambertian light model to mimic the ring plane's broad area-light profile, and calculates soft penumbral shadow softening as the moon enters/leaves the host planet's cylindrical shadow cylinder.
 
+### Gravitational Lensing & Black Hole Shadows
+- **Active Lens Selection**: Every frame the engine scores all bodies (primary + comparison system) by characteristic deflection strength `r_s / d`, boosted ×1000 for black holes, ×100 for neutron stars, and ×5000 for the currently inspected body, and binds the winner as the active gravitational lens (`u_grav_lens_*` uniforms) across all active programs.
+- **Deflection Model** (`common/refraction.glsl`): Weak-field Einstein deflection `2 r_s / b`, 2PN correction `(15π/16)(r_s/b)²`, strong-field logarithmic divergence approaching the photon sphere, a direction-aware Kerr critical radius `b_c(φ)` and Lense-Thirring frame-dragging lateral deflection for spinning lenses.
+- **Lensed Rendering**: Background bodies, atmospheres, orbits, habitable zones, subpixel point lights and the GAIA starfield are deflected through the shared `apply_refraction` path (captured rays converge onto the lens and are depth-occluded by the shadow). Mesh bounding geometry additionally expands by the Einstein angle `θ_E = √(2 r_s d_ls / (d_l d_s))` so lensed arcs are never clipped.
+- **Black Hole Shadows**: A black hole's size is derived directly from its mass — event horizon `r_s = 2GM/c²` (any stored `r` property is ignored) — and its own mesh renders the photon-capture shadow silhouette `b_c = (3√3/2) r_s` as a depth-writing black disk with spin-dependent silhouette asymmetry, kept mesh-resolved (min 3 px) and exempt from photometric culling.
+
 ### HDR, Bloom & Orbit MSAA
 1. **Bright Pass Filtering**: Isolates high-intensity pixels above a configurable threshold.
 2. **Downsample / Upsample Pyramid**: Progressive Gaussian blurring across 5 MIP levels for smooth lens flare blooming, driven by `bloom_downsample_shader_*` / `bloom_upsample_shader_fs`.

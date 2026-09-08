@@ -562,6 +562,38 @@ void main() {
         }
     }
 
+    // Gravitational Lensing Deflection (atmospheres seen past the lens).
+    // Composed after atmospheric refraction: rotates both the sky ray and the
+    // ring ray by the gravitational deflection angle.
+    bool is_grav_lens_host = u_grav_lens_enabled && u_grav_lens_rs > 1e-6
+        && length(u_body_offset - u_grav_lens_center) < 1e-6;
+    if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && !is_grav_lens_host) {
+        vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
+        float d_km = length(cam_to_body * u_au_to_km);
+        bool is_sh = false;
+        float alpha_gr = compute_gravitational_deflection(C_km, view_ray, d_km, is_sh);
+        if (is_sh) {
+            discard; // Blocked by the black hole shadow
+        }
+        if (alpha_gr > 1e-7) {
+            vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
+            float u_len = length(u_dir);
+            if (u_len > 1e-5) {
+                u_dir /= u_len;
+                vec3 bent = normalize(ray_dir * cos(alpha_gr) - u_dir * sin(alpha_gr));
+                float local_s_min = -dot(u_camera_pos - u_grav_lens_center, view_ray);
+                if (local_s_min > 0.0) {
+                    s_min_au = max(s_min_au, local_s_min);
+                    ring_s_min_au = max(ring_s_min_au, local_s_min);
+                    ray_origin_au = u_camera_pos + s_min_au * (view_ray - bent);
+                    ring_ray_origin_au = u_camera_pos + ring_s_min_au * (view_ray - bent);
+                }
+                ray_dir = bent;
+                ring_ray_dir = bent;
+            }
+        }
+    }
+
     // Precise ray origin in body-local coordinates, avoiding catastrophic cancellation.
     // We use the closest approach on the unrefracted ray to find a stable anchor point.
     float dist_to_center = length(cam_to_body);

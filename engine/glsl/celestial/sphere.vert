@@ -39,6 +39,14 @@ uniform float fov_factor;
 uniform float u_refract_max_bend;
 uniform bool u_is_cloud_pass;
 uniform float u_au_to_km;
+// Gravitational lensing (see common/refraction.glsl for the shared math).
+uniform vec3 u_grav_lens_center;
+uniform float u_grav_lens_rs;
+uniform float u_grav_lens_radius;
+uniform int u_grav_lens_type;
+uniform bool u_grav_lens_enabled;
+uniform float u_grav_lens_strength;
+uniform vec3 u_camera_pos;
 // Per-caster Mie vertical optical depth (xyz) + Mie scale height in km (w).
 // Separate from the UBO so Rayleigh/mixed (H_R) and Mie (H_Mie) can be
 // attenuated independently above the cloud deck.
@@ -210,7 +218,24 @@ void main() {
     }
 
     float atmo_expand = base_expand + bg_expand;
-    float bounding_radius = final_radius + atmo_expand;
+
+    // Gravitational Lensing expansion for Einstein rings and lensed background arcs
+    bool is_lens_bh_host = u_grav_lens_enabled && u_grav_lens_type == 3 && u_grav_lens_rs > 1e-6
+        && distance(in_offset, u_grav_lens_center) < 1e-6;
+    float grav_expand = 0.0;
+    if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && !is_lens_bh_host) {
+        float d_lens_km = length(u_grav_lens_center - u_camera_pos) * u_au_to_km;
+        float d_body_km = dist * u_au_to_km;
+        if (d_body_km > d_lens_km * 0.7) {
+            float d_ls_km = max(1.0, d_body_km - d_lens_km);
+            float theta_E = sqrt(max(0.0, 2.0 * u_grav_lens_rs * d_ls_km / (max(1.0, d_lens_km) * max(1.0, d_body_km))));
+            float max_ang = min(0.6, theta_E * 2.5 + (2.0 * u_grav_lens_rs / max(1.0, u_grav_lens_radius)));
+            grav_expand = dist * tan(max_ang) * 1.25;
+        }
+    }
+
+    float total_expand = max(atmo_expand, grav_expand);
+    float bounding_radius = final_radius + total_expand;
     f_bounding_radius = bounding_radius;
 
     vec3 bounding_world_pos = (scaled_pos * bounding_radius) + in_offset;
@@ -219,4 +244,11 @@ void main() {
 
     gl_Position = projection * view * vec4(bounding_world_pos, 1.0);
     f_clip_z = gl_Position.w;
+
+    // The black hole's own mesh renders ONLY the shadow silhouette (black,
+    // depth-writing). Never hand it off to the subpixel point-light pass: a
+    // point sprite cannot occlude the lensed background inside the shadow.
+    if (is_lens_bh_host) {
+        f_subpixel_factor = 0.0;
+    }
 }

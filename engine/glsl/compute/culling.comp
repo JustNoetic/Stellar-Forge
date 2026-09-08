@@ -53,6 +53,13 @@ uniform float u_refract_radius;
 uniform float u_refract_max_bend;
 uniform float u_refract_scale_height;
 uniform float u_au_to_km;
+// Gravitational lensing: the black-hole shadow silhouette must stay mesh-
+// rendered at ANY apparent size (the subpixel point-light pass cannot draw an
+// occluding shadow disk), and must never be photometrically culled.
+uniform vec3 u_grav_lens_center;
+uniform float u_grav_lens_rs;
+uniform int u_grav_lens_type;
+uniform bool u_grav_lens_enabled;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -174,6 +181,8 @@ void main() {
 
         bool is_star = (f2.x > 0.5);
         bool is_tracked = (int(idx) == u_tracking_idx);
+        bool is_bh_lens_host = u_grav_lens_enabled && u_grav_lens_type == 3 && u_grav_lens_rs > 1e-6
+            && distance(pos, u_grav_lens_center) < 1e-6;
 
         // --- Exposure-Dependent Photometric Flux Evaluation for Culling ---
         float exp_val = max(1e-6, u_exposure);
@@ -206,15 +215,15 @@ void main() {
         float limiting_threshold = 1.0e-5;
 
         // Dynamic culling for unresolved distant objects based on limiting magnitude
-        if (!is_tracked && apparent_px < 2.0 && peak_signal < limiting_threshold) {
+        if (!is_tracked && !is_bh_lens_host && apparent_px < 2.0 && peak_signal < limiting_threshold) {
             visible = false;
         }
 
         if (visible) {
             bool is_ultra = is_tracked || (apparent_px >= u_lod_thresh_ultra);
-            bool is_hi = !is_ultra && ((apparent_px >= u_lod_thresh_hi) || (is_star && apparent_px >= 2.0));
+            bool is_hi = !is_ultra && ((apparent_px >= u_lod_thresh_hi) || (is_star && apparent_px >= 2.0) || is_bh_lens_host);
             bool is_lo = !is_ultra && !is_hi && (apparent_px >= 2.0);
-            bool is_point = (apparent_px < 3.0);
+            bool is_point = (apparent_px < 3.0) && !is_bh_lens_host;
 
             if (is_ultra) {
                 uint slot = atomicAdd(cmds[3].instanceCount, 1u);

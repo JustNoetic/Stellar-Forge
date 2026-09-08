@@ -508,6 +508,8 @@ class App(InputHandlerMixin):
             "atmo_adaptive_steps_max": 128,
             "atmo_enabled": True,
             "refraction_enabled": True,
+            "grav_lensing_enabled": True,
+            "grav_lensing_multiplier": 1.0,
             "show_orbits": True,
             "orbit_fade_dir_idx": 0,
             "orbit_min_alpha": 0.3,
@@ -717,6 +719,9 @@ class App(InputHandlerMixin):
                 "photo_accum_target": self.camera.get("photo_accum_target", 0),
                 "screenshot_accum_target": self.camera.get("screenshot_accum_target", 16),
                 "movement_mode": self.camera.get("movement_mode", 0),
+                "refraction_enabled": self.camera.get("refraction_enabled", True),
+                "grav_lensing_enabled": self.camera.get("grav_lensing_enabled", True),
+                "grav_lensing_multiplier": self.camera.get("grav_lensing_multiplier", 1.0),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -4352,6 +4357,88 @@ class App(InputHandlerMixin):
                 refract_pole = (float(pole_ref[0]), float(pole_ref[1]), float(pole_ref[2]))
                 refract_oblateness = float(b_info.get('oblateness', 0.0))
 
+            # --- Active Gravitational Lens Uniform Setup ---
+            # One lens at a time: score every body (primary + comparison) by
+            # rs_km / cam_dist (deflection ~ rs/b), boosted for compact objects
+            # (Black Hole x1000, Neutron Star x100) and the inspected body
+            # (x5000, so the user always sees the lens they are inspecting).
+            grav_lens_center = (0.0, 0.0, 0.0)
+            grav_lens_rs = 0.0
+            grav_lens_radius = 0.0
+            grav_lens_type = 0  # 0=Star, 1=WhiteDwarf, 2=NeutronStar, 3=BlackHole
+            grav_lens_enabled = bool(self.camera.get("grav_lensing_enabled", True))
+            grav_lens_strength = float(self.camera.get("grav_lensing_multiplier", 1.0))
+
+            best_lens_score = -1.0
+            best_lens_idx = -1
+            best_lens_is_cmp = False
+
+            user_insp_idx = self.camera.get("inspected_idx")
+            user_insp_cmp = self.camera.get("inspected_is_cmp", False)
+
+            for lens_pass_cmp in (False, True):
+                if lens_pass_cmp and not self.comparison_enabled:
+                    break
+                _n_bodies = self.num_bodies_cmp if lens_pass_cmp else num_bodies
+                _mass_snap = self.mass_snap_cmp if lens_pass_cmp else mass_snap
+                _bodies = self.bodies_data_cmp if lens_pass_cmp else bodies_data
+                _pos_rel = cmp_pos_rel if lens_pass_cmp else pos_rel_all
+                for b_i in range(_n_bodies):
+                    m_val = float(_mass_snap[b_i])
+                    if m_val <= 1e-7:
+                        continue
+                    rs_km = 2.95325008 * m_val
+                    b_pos = _pos_rel[b_i]
+                    cam_dist_au = max(1e-6, math.sqrt(b_pos[0]**2 + b_pos[1]**2 + b_pos[2]**2))
+                    score = rs_km / cam_dist_au
+                    _sp = _bodies[b_i].get('star_props', {}) or {}
+                    _cls = _sp.get('class', '') or ''
+                    if 'Black Hole' in _cls or _sp.get('stage', '') == 'Singularity' or _bodies[b_i].get('type') == 'Black Hole':
+                        score *= 1000.0
+                    elif 'Neutron' in _cls or 'Pulsar' in _cls:
+                        score *= 100.0
+                    if b_i == user_insp_idx and lens_pass_cmp == user_insp_cmp:
+                        score *= 5000.0
+                    if score > best_lens_score:
+                        best_lens_score = score
+                        best_lens_idx = b_i
+                        best_lens_is_cmp = lens_pass_cmp
+
+            grav_lens_spin = 0.0
+            grav_lens_pole = (0.0, 1.0, 0.0)
+            if best_lens_idx >= 0:
+                b_data = self.bodies_data_cmp[best_lens_idx] if best_lens_is_cmp else bodies_data[best_lens_idx]
+                m_val = float(self.mass_snap_cmp[best_lens_idx]) if best_lens_is_cmp else float(mass_snap[best_lens_idx])
+                grav_lens_rs = 2.95325008 * m_val
+                pos_rel = cmp_pos_rel if best_lens_is_cmp else pos_rel_all
+                grav_lens_center = (float(pos_rel[best_lens_idx, 0]), float(pos_rel[best_lens_idx, 1]), float(pos_rel[best_lens_idx, 2]))
+
+                _sp_bh = b_data.get('star_props', {}) or {}
+                _cls_bh = _sp_bh.get('class', '') or ''
+                is_bh = 'Black Hole' in _cls_bh or _sp_bh.get('stage', '') == 'Singularity' or b_data.get('type') == 'Black Hole'
+                # Black hole: physical radius is the event horizon, derived
+                # from the mass (the stored 'r' property is ignored).
+                if is_bh:
+                    grav_lens_radius = grav_lens_rs
+                else:
+                    r_val = b_data.get('r', 1.0)
+                    grav_lens_radius = float(r_val) * SOLAR_RADIUS_KM
+
+                grav_lens_spin = float(_sp_bh.get('spin', _sp_bh.get('rot_frac', b_data.get('spin', 0.0))))
+                pole_ref = self.pole_n_arr_cmp[best_lens_idx] if best_lens_is_cmp else self.pole_n_arr[best_lens_idx]
+                p_norm = float(math.sqrt(pole_ref[0]**2 + pole_ref[1]**2 + pole_ref[2]**2))
+                if p_norm > 1e-6:
+                    grav_lens_pole = (float(pole_ref[0] / p_norm), float(pole_ref[1] / p_norm), float(pole_ref[2] / p_norm))
+
+                if is_bh:
+                    grav_lens_type = 3
+                elif 'Neutron' in _cls_bh or 'Pulsar' in _cls_bh:
+                    grav_lens_type = 2
+                elif 'White Dwarf' in _cls_bh:
+                    grav_lens_type = 1
+                else:
+                    grav_lens_type = 0
+
             for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_starfield, prog_culling_compute, getattr(self, 'prog_hz', None)):
                 if prog is not None:
                     if 'u_refract_center' in prog:
@@ -4366,6 +4453,22 @@ class App(InputHandlerMixin):
                         prog['u_refract_pole'].value = refract_pole
                     if 'u_refract_oblateness' in prog:
                         prog['u_refract_oblateness'].value = refract_oblateness
+                    if 'u_grav_lens_center' in prog:
+                        prog['u_grav_lens_center'].value = grav_lens_center
+                    if 'u_grav_lens_rs' in prog:
+                        prog['u_grav_lens_rs'].value = grav_lens_rs
+                    if 'u_grav_lens_radius' in prog:
+                        prog['u_grav_lens_radius'].value = grav_lens_radius
+                    if 'u_grav_lens_type' in prog:
+                        prog['u_grav_lens_type'].value = grav_lens_type
+                    if 'u_grav_lens_enabled' in prog:
+                        prog['u_grav_lens_enabled'].value = grav_lens_enabled
+                    if 'u_grav_lens_strength' in prog:
+                        prog['u_grav_lens_strength'].value = grav_lens_strength
+                    if 'u_grav_lens_spin' in prog:
+                        prog['u_grav_lens_spin'].value = float(grav_lens_spin)
+                    if 'u_grav_lens_pole' in prog:
+                        prog['u_grav_lens_pole'].value = grav_lens_pole
                     if 'u_au_to_km' in prog:
                         prog['u_au_to_km'].value = au_to_km_val
 

@@ -246,6 +246,32 @@ void main() {
     vec3 ray_origin = u_camera_pos;
     bool is_refract_host = length(f_center_pos - u_refract_center) < 1e-7;
 
+    // Black-hole lens host: the sphere mesh renders ONLY the event-horizon
+    // shadow silhouette. Any sightline whose impact parameter falls below the
+    // spin-aware capture radius b_c(phi) plunges through the horizon — render
+    // pure black and KEEP its depth so lensed stars / orbits / subpixel lights
+    // behind it are occluded. Outside the shadow the horizon itself is
+    // invisible, so the rest of the mesh is discarded.
+    bool is_grav_lens_host = u_grav_lens_enabled && u_grav_lens_type == 3 && u_grav_lens_rs > 1e-6
+        && length(f_center_pos - u_grav_lens_center) < 1e-6;
+    if (is_grav_lens_host) {
+        vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
+        // d_km = 0: the fragment ray terminates at the capture sphere, so the
+        // capture test must not additionally require the periapsis to lie in
+        // front of the fragment (silhouette rays have s_min == d_frag).
+        bool is_sh = false;
+        compute_gravitational_deflection(C_km, view_ray, 0.0, is_sh);
+        // Min-size clamp regime: the whole (inflated) mesh IS the shadow dot —
+        // the capture test must not shrink it back below the 3 px floor.
+        if (f_apparent_px < f_clamped_min_px) is_sh = true;
+        if (is_sh) {
+            out_color = vec4(0.0, 0.0, 0.0, 1.0);
+            gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
+            return;
+        }
+        discard;
+    }
+
     float s_min_au = 0.0;
     if (u_refract_max_bend > 1e-6) {
         if (!is_refract_host) {
@@ -309,6 +335,35 @@ void main() {
                             ray_dir = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // 2. Gravitational Lensing Deflection (background bodies viewed past the
+    // lens). Composed after atmospheric refraction: rotates the (possibly
+    // already-refracted) ray direction by the gravitational deflection angle
+    // and re-anchors the ray origin at the lens periapsis.
+    if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6) {
+        vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
+        float d_body_km = length(cam_to_center * u_au_to_km);
+
+        bool is_sh = false;
+        float alpha_gr = compute_gravitational_deflection(C_km, view_ray, d_body_km, is_sh);
+        if (is_sh) {
+            discard; // Ray captured by the black hole shadow
+        }
+        if (alpha_gr > 1e-7) {
+            vec3 u_dir = C_km - view_ray * dot(C_km, view_ray);
+            float u_len = length(u_dir);
+            if (u_len > 1e-5) {
+                u_dir /= u_len;
+                ray_dir = normalize(ray_dir * cos(alpha_gr) - u_dir * sin(alpha_gr));
+
+                float local_s_min = -dot(u_camera_pos - u_grav_lens_center, view_ray);
+                if (local_s_min > 0.0) {
+                    s_min_au = max(s_min_au, local_s_min);
+                    ray_origin = u_camera_pos + s_min_au * (view_ray - ray_dir);
                 }
             }
         }
