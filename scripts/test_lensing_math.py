@@ -112,6 +112,69 @@ def main():
         print(f"4. spin={spin:+.3f} {side} b={b_factor:.2f} rs: captured={sh} (expect {expect_sh})")
         if sh != expect_sh: fails.append(f"kerr spin={spin} {side} b={b_factor}")
 
+    # 5. Background source deflection (apply_refraction / apply_gravitational_deflection):
+    #    Verifies:
+    #      a. Deflection is directed OUTWARD (away from lens center).
+    #      b. Directly aligned star (beta ~ 0) deflects to Einstein ring theta_E.
+    #      c. Distant parsec stars (100 pc) retain float32 precision and match theory.
+    #      d. Large angles match Einstein weak-field 2*rs/b.
+    AU_KM = 149597870.7
+    STAR_CS = """
+    #version 430 core
+    layout(local_size_x = 1) in;
+    #include "common/refraction.glsl"
+    layout(std430, binding=0) buffer InB { vec4 in_pos[]; };
+    layout(std430, binding=1) buffer OutB { vec4 out_pos[]; };
+    uniform vec3 u_eye_pos;
+    void main() {
+        uint idx = gl_GlobalInvocationID.x;
+        vec3 p = in_pos[idx].xyz;
+        vec3 rel = p - u_eye_pos;
+        float d = length(rel);
+        vec3 dir = d > 1e-9 ? (rel / d) : vec3(0.0, 0.0, -1.0);
+        vec3 p_clamped = u_eye_pos + dir * min(d, 100000.0);
+        vec3 lensed = apply_refraction(p_clamped, u_eye_pos);
+        out_pos[idx] = vec4(lensed, 1.0);
+    }
+    """
+    star_src = STAR_CS.replace('#include "common/refraction.glsl"',
+                               load_shader('common/refraction.glsl').replace('#version 460 core', ''))
+    prog_star = ctx.compute_shader(star_src)
+    for name, val in [
+        ('u_grav_lens_enabled', True), ('u_grav_lens_center', (0.0, 0.0, 0.0)),
+        ('u_grav_lens_rs', float(rs_bh)), ('u_grav_lens_radius', float(rs_bh)),
+        ('u_grav_lens_type', 3), ('u_grav_lens_strength', 1.0),
+        ('u_grav_lens_spin', 0.0), ('u_grav_lens_pole', (0.0, 1.0, 0.0)),
+        ('u_au_to_km', float(AU_KM)), ('u_refract_max_bend', 0.0),
+        ('u_eye_pos', (0.0, 0.0, 1.0)),
+    ]:
+        if name in prog_star: prog_star[name].value = val
+
+    theta_E = math.sqrt(2.0 * rs_bh / AU_KM)
+    theta_E_as = math.degrees(theta_E) * 3600
+    x_vals = [0.0, 1e-4, 1e-2, 0.1, 1.0]
+    in_stars = [[x * 206265.0, 0.0, -20626500.0, 1.0] for x in x_vals]
+    in_arr = np.array(in_stars, dtype=np.float32)
+    in_b = ctx.buffer(in_arr.tobytes()); out_b = ctx.buffer(reserve=in_arr.nbytes)
+    in_b.bind_to_storage_buffer(0); out_b.bind_to_storage_buffer(1)
+    prog_star.run(group_x=len(in_stars))
+    res_stars = np.frombuffer(out_b.read(), dtype=np.float32).reshape((-1, 4))
+    prog_star.release(); in_b.release(); out_b.release()
+
+    for i, x in enumerate(x_vals):
+        orig_p = in_stars[i][:3]; lens_p = res_stars[i][:3]
+        orig_dir = np.array(orig_p) - np.array([0, 0, 1]); orig_dir /= np.linalg.norm(orig_dir)
+        lens_dir = np.array(lens_p) - np.array([0, 0, 1]); lens_dir /= np.linalg.norm(lens_dir)
+        orig_as = math.degrees(math.atan2(orig_dir[0], -orig_dir[2])) * 3600
+        lens_as = math.degrees(math.atan2(lens_dir[0], -lens_dir[2])) * 3600
+        beta = math.radians(orig_as / 3600)
+        exp_as = math.degrees(0.5 * (beta + math.sqrt(beta * beta + 4.0 * theta_E * theta_E))) * 3600
+        print(f"5. starfield deflection x={x:.4f} AU: orig={orig_as:.2f}\" -> lensed={lens_as:.2f}\" (expect {exp_as:.2f}\")")
+        if lens_as < orig_as - 0.05:
+            fails.append(f"inverted star deflection at x={x}")
+        if abs(lens_as - exp_as) > 1.0:
+            fails.append(f"star deflection error at x={x}")
+
     ctx.release()
     if fails:
         print("FAILED:", fails); sys_exit = 1

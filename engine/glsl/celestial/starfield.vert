@@ -53,25 +53,16 @@ void main() {
     float d2 = max(dist_eye * dist_eye, 1.0);
     float intensity = in_flux * u_flux_calib / d2;
 
-    // Atmospheric refraction: lift the apparent position of stars seen
-    // through a refracting atmosphere (same parallax-weighted model as the
-    // point-light pass, incl. the solid-limb occlusion guard — stars setting
-    // behind the limb return their true position and are depth-occluded by
-    // the planet mesh, instead of resurrecting above it).
-    pos = apply_refraction(pos, u_eye);
-    rel_eye = pos - u_eye;
-    dist_eye = length(rel_eye);
-
-    // Clamp distant stars to just inside the far plane, relative to the EYE:
-    // points have no parallax at these distances, so this is visually exact
-    // and prevents far-plane clipping of the distant catalog entries. The
-    // clamped position preserves the eye->star direction, and the intensity
-    // above uses the unclamped distance so brightness stays continuous
-    // across the clamp boundary (no popping).
+    // Atmospheric refraction & gravitational lensing: lift/deflect the apparent
+    // position of stars. Clamping distant stars to just inside the far plane
+    // relative to the eye BEFORE refraction prevents float32 catastrophic
+    // cancellation when catalog stars sit at parsec-scale distances (10^7 AU).
     float max_dist = u_far * 0.998;
-    if (dist_eye > max_dist) {
-        pos = u_eye + rel_eye * (max_dist / dist_eye);
-    }
+    float dist_clamped = min(dist_eye, max_dist);
+    vec3 dir_eye = dist_eye > 1e-9 ? (rel_eye / dist_eye) : vec3(0.0, 0.0, -1.0);
+    pos = u_eye + dir_eye * dist_clamped;
+
+    pos = apply_refraction(pos, u_eye);
 
     vec4 clip = projection * view * vec4(pos, 1.0);
     // Points have no near-plane culling — degenerate any behind-camera vertex.

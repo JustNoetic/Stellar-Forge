@@ -96,40 +96,86 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
     return max(0.0, final_alpha);
 }
 
-// Composed lens bend for a point/object seen past the lens: returns the
-// deflected direction and sets is_shadow for captured rays. Includes the
-// Lense-Thirring frame-dragging lateral deflection for spinning lenses.
+// Deflection of background sources (stars, orbits, point lights) past the lens.
+// Solves the gravitational lens equation for the apparent primary image direction:
+//   theta = 0.5 * (beta + sqrt(beta^2 + 4 * theta_E^2))
+// Pushes the apparent position radially OUTWARD from the lens center in the sky,
+// smoothly forming an Einstein ring at beta = 0 without divergent singularities,
+// and matching Einstein weak-field deflection alpha = 2*rs/b at large beta.
+// Sets is_shadow = true if the ray passes inside a solid body lens surface.
 vec3 apply_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_shadow) {
     is_shadow = false;
-    bool is_sh = false;
-    float alpha_gr = compute_gravitational_deflection(C_km, V, d_km, is_sh);
-    if (is_sh) {
-        is_shadow = true;
-        return V;
+    if (!u_grav_lens_enabled || u_grav_lens_rs <= 1e-6) return V;
+
+    float d_l_km = length(C_km);
+    if (d_l_km < 1.0) return V;
+
+    // Optical axis: unit vector from camera towards the lens center
+    vec3 L = -C_km / d_l_km;
+
+    // Angle beta between optical axis (lens) and undeflected source direction V.
+    // Using cross product avoids catastrophic cancellation of 1.0 - cos(beta) in float32.
+    vec3 cross_LV = cross(L, V);
+    float sin_beta = length(cross_LV);
+    float cos_beta = dot(L, V);
+    if (cos_beta <= 0.0) return V; // Source is behind the camera / past 90 degrees
+    float beta = atan(sin_beta, cos_beta);
+
+    // If source is strictly in front of the lens plane along the optical axis,
+    // its light never traverses past the lens — no deflection.
+    if (d_km > 0.0 && d_km * cos_beta <= d_l_km) return V;
+
+    // Finite-distance factor d_ls / d_s (approaches 1.0 for distant catalog stars)
+    float geom_factor = 1.0;
+    if (d_km > 0.0) {
+        float d_ls_km = d_km * cos_beta - d_l_km;
+        geom_factor = clamp(d_ls_km / d_km, 0.0, 1.0);
     }
-    if (alpha_gr <= 1e-7) return V;
 
-    vec3 u_dir = C_km - V * dot(C_km, V);
-    float u_len = length(u_dir);
-    if (u_len <= 1e-5) return V;
-    u_dir /= u_len;
+    float strength = u_grav_lens_strength > 0.0 ? u_grav_lens_strength : 1.0;
+    float theta_E2 = (2.0 * u_grav_lens_rs * geom_factor * strength) / d_l_km;
+    if (theta_E2 <= 1e-18) return V;
+    float theta_E = sqrt(theta_E2);
 
-    // Safe Frame-dragging Lense-Thirring lateral deflection
-    if (abs(u_grav_lens_spin) > 1e-4) {
-        vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
-        vec3 cross_drag = cross(pole_n, V);
-        float len_drag = length(cross_drag);
-        if (len_drag > 1e-4) {
-            vec3 drag_dir = cross_drag / len_drag;
-            float r_cam_km = length(C_km);
-            float metric_factor = sqrt(max(1e-4, 1.0 - u_grav_lens_rs / max(1e-4, r_cam_km)));
-            float b_km = u_len / metric_factor;
-            float drag_angle = clamp((u_grav_lens_rs * u_grav_lens_rs * u_grav_lens_spin) / max(1.0, b_km * b_km), -0.5, 0.5);
-            u_dir = normalize(u_dir + drag_dir * drag_angle);
+    // Unit vector in the observer's sky plane pointing radially away from lens center towards source
+    vec3 u_dir;
+    if (sin_beta > 1e-7) {
+        u_dir = cross(cross_LV, L) / sin_beta;
+    } else {
+        vec3 ref = abs(L.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        u_dir = normalize(cross(L, ref));
+    }
+
+    // Exact primary image root of the gravitational lens equation:
+    // theta^2 - beta*theta - theta_E^2 = 0  ==>  theta = 0.5 * (beta + sqrt(beta^2 + 4*theta_E^2))
+    float theta = 0.5 * (beta + sqrt(beta * beta + 4.0 * theta_E2));
+
+    // Solid body occlusion for non-black-hole lenses (e.g. star, white dwarf, neutron star)
+    if (u_grav_lens_type != 3 && u_grav_lens_radius > 0.0) {
+        float theta_body = u_grav_lens_radius / d_l_km;
+        if (theta < theta_body) {
+            is_shadow = true;
+            return V;
         }
     }
 
-    return normalize(V * cos(alpha_gr) - u_dir * sin(alpha_gr));
+    // Deflected apparent sightline (pushed radially outward along u_dir)
+    vec3 V_app = normalize(L * cos(theta) + u_dir * sin(theta));
+
+    // Safe Frame-dragging Lense-Thirring lateral deflection for spinning Kerr lenses
+    if (abs(u_grav_lens_spin) > 1e-4) {
+        vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
+        vec3 drag_dir = cross(pole_n, V_app);
+        float len_drag = length(drag_dir);
+        if (len_drag > 1e-4) {
+            drag_dir /= len_drag;
+            float b_km = d_l_km * sin(theta);
+            float drag_angle = clamp((u_grav_lens_rs * u_grav_lens_rs * u_grav_lens_spin) / max(1.0, b_km * b_km), -0.5, 0.5);
+            V_app = normalize(V_app * cos(drag_angle) + drag_dir * sin(drag_angle));
+        }
+    }
+
+    return V_app;
 }
 
 // Oblate-aware solid body radius along a given direction from the refract center.
@@ -363,32 +409,31 @@ vec3 apply_refraction(vec3 world_pos, vec3 cam_pos) {
     // 1. Atmospheric refraction (only when an atmosphere refracts nearby).
     if (u_refract_max_bend > 1e-6 && length(world_pos - u_refract_center) > 1e-7) {
         vec3 C_km = (cam_pos - u_refract_center) * u_au_to_km;
-        vec3 P_km = (world_pos - u_refract_center) * u_au_to_km;
-        vec3 true_vec = P_km - C_km;
-        float d_km = length(true_vec);
-        if (d_km > 1e-5) {
-            vec3 V = true_vec / d_km;
+        vec3 true_vec_au = world_pos - cam_pos;
+        float d_au = length(true_vec_au);
+        if (d_au > 1e-7) {
+            vec3 V = true_vec_au / d_au;
+            float d_km = d_au * u_au_to_km;
             bool is_occluded = false;
             vec3 V_app = solve_refraction_apparent(C_km, V, d_km, is_occluded);
-            if (!is_occluded) result = cam_pos + V_app * (d_km / u_au_to_km);
+            if (!is_occluded) result = cam_pos + V_app * d_au;
         }
     }
 
-    // 2. Gravitational lensing (independent of atmospheric state). Captured
-    // rays converge onto the lens itself — the black-hole shadow disk then
-    // depth-occludes them (stars / orbits / subpixel lights).
+    // 2. Gravitational lensing (independent of atmospheric state).
     if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6
             && length(world_pos - u_grav_lens_center) > 1e-7) {
         vec3 C_km = (cam_pos - u_grav_lens_center) * u_au_to_km;
-        vec3 P_km = (result - u_grav_lens_center) * u_au_to_km;
-        vec3 true_vec = P_km - C_km;
-        float d_km = length(true_vec);
-        if (d_km > 1e-5) {
-            vec3 V = true_vec / d_km;
+        vec3 true_vec_au = result - cam_pos;
+        float d_au = length(true_vec_au);
+        if (d_au > 1e-7) {
+            vec3 V = true_vec_au / d_au;
+            float d_km = d_au * u_au_to_km;
             bool is_shadow = false;
             vec3 V_app = apply_gravitational_deflection(C_km, V, d_km, is_shadow);
-            if (is_shadow) return u_grav_lens_center;
-            result = cam_pos + V_app * (d_km / u_au_to_km);
+            if (!is_shadow) {
+                result = cam_pos + V_app * d_au;
+            }
         }
     }
     return result;
@@ -399,29 +444,29 @@ vec3 apply_refraction_eye(vec3 eye_pos, vec3 cam_pos) {
 
     // 1. Atmospheric refraction.
     if (u_refract_max_bend > 1e-6) {
-        vec3 C_km = (cam_pos - u_refract_center) * u_au_to_km;
-        vec3 true_vec = eye_pos * u_au_to_km;
-        float d_km = length(true_vec);
-        if (d_km > 1e-5) {
-            vec3 V = true_vec / d_km;
+        float d_au = length(eye_pos);
+        if (d_au > 1e-7) {
+            vec3 C_km = (cam_pos - u_refract_center) * u_au_to_km;
+            vec3 V = eye_pos / d_au;
+            float d_km = d_au * u_au_to_km;
             bool is_occluded = false;
             vec3 V_app = solve_refraction_apparent(C_km, V, d_km, is_occluded);
-            if (!is_occluded) result = V_app * (d_km / u_au_to_km);
+            if (!is_occluded) result = V_app * d_au;
         }
     }
 
-    // 2. Gravitational lensing. eye_pos is camera-relative; captured rays map
-    // onto the lens's own (camera-relative) position.
+    // 2. Gravitational lensing. eye_pos is camera-relative.
     if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6) {
-        vec3 true_vec = result * u_au_to_km;
-        float d_km = length(true_vec);
-        if (d_km > 1e-5) {
+        float d_au = length(result);
+        if (d_au > 1e-7) {
             vec3 C_km = (cam_pos - u_grav_lens_center) * u_au_to_km;
-            vec3 V = true_vec / d_km;
+            vec3 V = result / d_au;
+            float d_km = d_au * u_au_to_km;
             bool is_shadow = false;
             vec3 V_app = apply_gravitational_deflection(C_km, V, d_km, is_shadow);
-            if (is_shadow) return u_grav_lens_center - cam_pos;
-            result = V_app * (d_km / u_au_to_km);
+            if (!is_shadow) {
+                result = V_app * d_au;
+            }
         }
     }
     return result;

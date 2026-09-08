@@ -4388,7 +4388,7 @@ class App(InputHandlerMixin):
                     if m_val <= 1e-7:
                         continue
                     rs_km = 2.95325008 * m_val
-                    b_pos = _pos_rel[b_i]
+                    b_pos = _pos_rel[b_i] - cam_pos
                     cam_dist_au = max(1e-6, math.sqrt(b_pos[0]**2 + b_pos[1]**2 + b_pos[2]**2))
                     score = rs_km / cam_dist_au
                     _sp = _bodies[b_i].get('star_props', {}) or {}
