@@ -64,6 +64,24 @@ void main() {
     float in_is_star = f2.x;
     float lum_eq = f4.w;
 
+    // Black holes emit no light: never render them as point sprites. Their
+    // shadow is drawn exclusively by the sphere mesh (min 3 px black disk,
+    // see sphere.vert / culling.comp is_bh_lens_host guards). Without this a
+    // stale vis_point slot could still emit a glowing subpixel quad for the
+    // BH when it is far away / untracked.
+    if (u_grav_lens_enabled && u_grav_lens_type == 3 && u_grav_lens_rs > 1e-6
+            && distance(in_offset, u_grav_lens_center) < 1e-6) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        f_color = vec3(0.0);
+        f_is_star = 0.0;
+        f_clip_z = 1.0;
+        f_center_px = vec2(-10000.0);
+        f_apparent_px = 0.0;
+        f_half_size_px = 0.0;
+        f_surface_color = vec3(0.0);
+        return;
+    }
+
     float aspect = projection[1][1] / max(1e-6, projection[0][0]);
     float screen_width = screen_height * aspect;
 

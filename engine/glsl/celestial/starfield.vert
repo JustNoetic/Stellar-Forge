@@ -28,6 +28,8 @@ uniform float u_intensity_scale; // user brightness tuning (shared with .frag)
 uniform bool u_hdr_enabled;      // shared with .frag — gates u_exposure
 uniform float u_exposure;        // shared with .frag — camera exposure
 
+uniform bool u_equirectangular; // Render 360-degree sky into equirectangular map
+
 #include "common/refraction.glsl"
 
 out vec3 f_color;
@@ -53,25 +55,45 @@ void main() {
     float d2 = max(dist_eye * dist_eye, 1.0);
     float intensity = in_flux * u_flux_calib / d2;
 
-    // Atmospheric refraction & gravitational lensing: lift/deflect the apparent
-    // position of stars. Clamping distant stars to just inside the far plane
-    // relative to the eye BEFORE refraction prevents float32 catastrophic
-    // cancellation when catalog stars sit at parsec-scale distances (10^7 AU).
+    // Atmospheric refraction: lift the apparent position of stars near planetary limbs.
+    // Clamping distant stars to just inside the far plane relative to the eye
+    // BEFORE refraction prevents float32 catastrophic cancellation when catalog
+    // stars sit at parsec-scale distances (10^7 AU).
+    // Gravitational lensing is decoupled from point sprites and evaluated in screen space.
     float max_dist = u_far * 0.998;
     float dist_clamped = min(dist_eye, max_dist);
     vec3 dir_eye = dist_eye > 1e-9 ? (rel_eye / dist_eye) : vec3(0.0, 0.0, -1.0);
     pos = u_eye + dir_eye * dist_clamped;
 
-    pos = apply_refraction(pos, u_eye);
+    pos = apply_atmospheric_refraction(pos, u_eye);
 
     vec4 clip = projection * view * vec4(pos, 1.0);
-    // Points have no near-plane culling — degenerate any behind-camera vertex.
-    if (clip.w <= 0.0) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        gl_PointSize = 0.0;
-        f_color = vec3(0.0);
-        f_intensity = 0.0;
-        return;
+    vec2 ndc;
+
+    if (u_equirectangular) {
+        // Evaluate position in OpenGL camera space (X right, Y up, Z back)
+        vec3 p_cam = (view * vec4(pos, 1.0)).xyz;
+        vec3 dir_cam = normalize(p_cam);
+        // Forward is -Z. atan(Y, X). Longitude angle is measured from +X in XZ plane.
+        float lon = atan(dir_cam.x, -dir_cam.z); // range [-PI, PI]
+        float lat = asin(dir_cam.y);             // range [-PI/2, PI/2]
+        
+        float u = lon / (2.0 * 3.14159265359); // [-0.5, 0.5]
+        float v = lat / 3.14159265359;         // [-0.5, 0.5]
+        
+        ndc = vec2(u * 2.0, v * 2.0);          // [-1.0, 1.0]
+        gl_Position = vec4(ndc, 0.0, 1.0);
+    } else {
+        // Points have no near-plane culling — degenerate any behind-camera vertex.
+        if (clip.w <= 0.0) {
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            gl_PointSize = 0.0;
+            f_color = vec3(0.0);
+            f_intensity = 0.0;
+            return;
+        }
+        ndc = clip.xy / clip.w;
+        gl_Position = clip;
     }
 
     // Fixed PSF footprint: every star shares the same sprite size, so the
@@ -101,7 +123,6 @@ void main() {
     //    2/H NDC), which is conservative in X on wide aspect ratios — it can
     //    only under-cull, never pop a visible star.
     float pad_ndc = u_max_point_px / max(screen_height, 1.0) * 2.0;
-    vec2 ndc = clip.xy / clip.w;
     bool on_screen = all(lessThanEqual(abs(ndc), vec2(1.0 + pad_ndc)));
 
     // 2. Exposure-threshold culling: mirror starfield.frag exactly. The
@@ -124,8 +145,6 @@ void main() {
         f_point_size = gl_PointSize;
         return;
     }
-
-    gl_Position = clip;
 
     f_color = in_color;
     f_intensity = intensity;

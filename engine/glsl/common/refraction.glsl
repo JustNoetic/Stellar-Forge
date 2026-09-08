@@ -20,6 +20,45 @@ uniform bool u_grav_lens_enabled;     // master enable flag
 uniform float u_grav_lens_strength;   // deflection multiplier (default 1.0)
 uniform float u_grav_lens_spin;       // Kerr dimensionless spin a_* in (-1, 1)
 uniform vec3 u_grav_lens_pole;        // spin axis unit vector (render frame)
+uniform int u_grav_image;             // lens image selection: 0 = primary image, 1 = secondary (mirror) image
+
+// Point-source magnification written by apply_gravitational_deflection for the
+// selected image (u_grav_image). Consumers (starfield.vert) multiply their flux
+// by it; capture / occlusion set it to 0 so the lensed sprite is culled.
+float g_grav_magnification = 1.0;
+
+// Spin-aware (Kerr) critical shadow radius b_c(phi, theta_o): narrows on the
+// prograde side and widens on the retrograde side relative to the spin axis.
+// ray_perp_dir is the light's periapsis direction from the lens center (which
+// side of the lens the ray bends around) — it selects prograde vs retrograde
+// photon orbits. Shared by the backward ray tracer (mesh fragments) and the
+// forward lens solver (secondary-image capture test).
+// NOTE on sign convention: V in our shaders is the BACKWARD ray direction
+// (camera -> source), while physical photons travel source -> camera (-V).
+// Orbital angular momentum flips sign with direction, so the prograde side
+// (photon L aligned with spin, smaller capture radius) is along
+// cross(cam_dir, pole), NOT cross(pole, cam_dir). E.g. pole=+Y, camera=+Z:
+// source behind at -Z, physical light +Z; r=+X gives L=rPhys x vPhys=-Y
+// (retrograde, larger b_c), r=-X gives +Y (prograde, smaller b_c).
+// cross(cam,pole)=ZxY=-X correctly marks -X as prograde.
+float grav_critical_b(vec3 C_km, vec3 ray_perp_dir) {
+    float b_c = 2.5980762 * u_grav_lens_rs; // 3*sqrt(3)/2 * rs
+    if (abs(u_grav_lens_spin) > 1e-4) {
+        vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
+        vec3 cam_dir = C_km / max(1e-4, length(C_km));
+        vec3 cross_p = cross(cam_dir, pole_n);
+        float len_cp = length(cross_p);
+        if (len_cp > 1e-4) {
+            vec3 prograde_dir = cross_p / len_cp;
+            float len_rp = length(ray_perp_dir);
+            vec3 ray_perp = len_rp > 1e-4 ? (ray_perp_dir / len_rp) : prograde_dir;
+            float cos_phi = clamp(dot(ray_perp, prograde_dir), -1.0, 1.0);
+            float spin_factor = u_grav_lens_spin * clamp(len_cp, 0.0, 1.0);
+            b_c *= (1.0 - 0.35 * spin_factor * cos_phi);
+        }
+    }
+    return b_c;
+}
 
 // Gravitational deflection of a sightline past the lens (Einstein weak-field
 // + 2PN + strong-field divergence near the photon sphere). C_km is the camera
@@ -29,6 +68,7 @@ uniform vec3 u_grav_lens_pole;        // spin axis unit vector (render frame)
 // ray plunges through the event horizon and the object must be suppressed.
 float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_shadow) {
     is_shadow = false;
+    g_grav_magnification = 1.0;
     if (!u_grav_lens_enabled || u_grav_lens_rs <= 1e-6) return 0.0;
 
     float rs = u_grav_lens_rs;
@@ -39,23 +79,7 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
     float b = length(P_min) / metric_factor; // impact parameter in km
 
     // Safe direction-aware Kerr critical shadow radius b_c(phi, theta_o)
-    float b_c_base = 2.5980762 * rs; // 3*sqrt(3)/2 * rs
-    float b_c = b_c_base;
-
-    if (abs(u_grav_lens_spin) > 1e-4) {
-        vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
-        vec3 cam_dir = C_km / max(1e-4, r_cam_km);
-        vec3 cross_p = cross(pole_n, cam_dir);
-        float len_cp = length(cross_p);
-        if (len_cp > 1e-4) {
-            vec3 prograde_dir = cross_p / len_cp;
-            float len_pmin = length(P_min);
-            vec3 ray_perp = len_pmin > 1e-4 ? (P_min / len_pmin) : prograde_dir;
-            float cos_phi = clamp(dot(ray_perp, prograde_dir), -1.0, 1.0);
-            float spin_factor = u_grav_lens_spin * clamp(len_cp, 0.0, 1.0);
-            b_c = b_c_base * (1.0 - 0.35 * spin_factor * cos_phi);
-        }
-    }
+    float b_c = grav_critical_b(C_km, P_min);
 
     // Ray capture for black hole shadow
     if (u_grav_lens_type == 3 && b <= b_c && s_min > 0.0 && (d_km <= 0.0 || s_min < d_km)) {
@@ -97,18 +121,29 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
 }
 
 // Deflection of background sources (stars, orbits, point lights) past the lens.
-// Solves the gravitational lens equation for the apparent primary image direction:
-//   theta = 0.5 * (beta + sqrt(beta^2 + 4 * theta_E^2))
-// Pushes the apparent position radially OUTWARD from the lens center in the sky,
-// smoothly forming an Einstein ring at beta = 0 without divergent singularities,
-// and matching Einstein weak-field deflection alpha = 2*rs/b at large beta.
-// Sets is_shadow = true if the ray passes inside a solid body lens surface.
+// Solves the gravitational lens equation for BOTH point-mass images:
+//   theta_+ = 0.5 * ( beta + sqrt(beta^2 + 4*theta_E^2))   (outside theta_E)
+//   theta_- = 0.5 * (-beta + sqrt(beta^2 + 4*theta_E^2))   (inside theta_E, mirrored)
+// The primary image is pushed radially OUTWARD and always lands at theta >= theta_E
+// (images pile up onto the Einstein ring as beta -> 0). The secondary image appears
+// on the OPPOSITE side of the lens with |theta_2| < theta_E, scaled by its
+// point-source magnification mu_2 = (u^2+2)/(2u*sqrt(u^2+4)) - 0.5 (u = beta/theta_E):
+// comparable in brightness near the ring, demagnified ~ (theta_E/beta)^4 far away.
+// Without the secondary image the interior of the Einstein ring would be a star-free
+// void ~ b_E/b_c ~ 10^4x wider than the true black-hole shadow silhouette, which
+// visually reads as a gigantic black hole.
+// u_grav_image selects which image this call produces; g_grav_magnification receives
+// the point-source magnification of the produced image (0 = captured / occluded).
+// Sets is_shadow = true if the image ray is captured or blocked by the lens body.
 vec3 apply_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_shadow) {
     is_shadow = false;
+    g_grav_magnification = 1.0;
     if (!u_grav_lens_enabled || u_grav_lens_rs <= 1e-6) return V;
 
+    bool secondary = (u_grav_image == 1);
+
     float d_l_km = length(C_km);
-    if (d_l_km < 1.0) return V;
+    if (d_l_km < 1.0) { if (secondary) g_grav_magnification = 0.0; return V; }
 
     // Optical axis: unit vector from camera towards the lens center
     vec3 L = -C_km / d_l_km;
@@ -118,12 +153,13 @@ vec3 apply_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_s
     vec3 cross_LV = cross(L, V);
     float sin_beta = length(cross_LV);
     float cos_beta = dot(L, V);
-    if (cos_beta <= 0.0) return V; // Source is behind the camera / past 90 degrees
+    if (cos_beta <= 0.0) { if (secondary) g_grav_magnification = 0.0; return V; } // Source is behind the camera / past 90 degrees
     float beta = atan(sin_beta, cos_beta);
 
     // If source is strictly in front of the lens plane along the optical axis,
-    // its light never traverses past the lens — no deflection.
-    if (d_km > 0.0 && d_km * cos_beta <= d_l_km) return V;
+    // its light never traverses past the lens — no deflection. For the secondary
+    // pass this means "no image at all", so report zero magnification (cull).
+    if (d_km > 0.0 && d_km * cos_beta <= d_l_km) { if (secondary) g_grav_magnification = 0.0; return V; }
 
     // Finite-distance factor d_ls / d_s (approaches 1.0 for distant catalog stars)
     float geom_factor = 1.0;
@@ -134,7 +170,7 @@ vec3 apply_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_s
 
     float strength = u_grav_lens_strength > 0.0 ? u_grav_lens_strength : 1.0;
     float theta_E2 = (2.0 * u_grav_lens_rs * geom_factor * strength) / d_l_km;
-    if (theta_E2 <= 1e-18) return V;
+    if (theta_E2 <= 1e-18) { if (secondary) g_grav_magnification = 0.0; return V; }
     float theta_E = sqrt(theta_E2);
 
     // Unit vector in the observer's sky plane pointing radially away from lens center towards source
@@ -146,34 +182,63 @@ vec3 apply_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_s
         u_dir = normalize(cross(L, ref));
     }
 
-    // Exact primary image root of the gravitational lens equation:
-    // theta^2 - beta*theta - theta_E^2 = 0  ==>  theta = 0.5 * (beta + sqrt(beta^2 + 4*theta_E^2))
-    float theta = 0.5 * (beta + sqrt(beta * beta + 4.0 * theta_E2));
+    // Exact roots of the gravitational lens equation:
+    //   theta^2 - beta*theta - theta_E^2 = 0
+    // Primary:  theta_+ = 0.5 * ( beta + disc)  — apparent angle on the source side.
+    // Secondary: theta_2 = 0.5 * (disc - beta)  — |theta_2| < theta_E, mirrored to
+    // the OPPOSITE side of the lens (signed root is negative).
+    float disc = sqrt(beta * beta + 4.0 * theta_E2);
+    float theta = secondary ? 0.5 * (disc - beta) : 0.5 * (beta + disc);
 
-    // Solid body occlusion for non-black-hole lenses (e.g. star, white dwarf, neutron star)
+    // Point-source magnification of the selected image:
+    //   u = beta / theta_E,  A = (u^2 + 2) / (2 u sqrt(u^2 + 4))
+    //   mu_+ = A + 0.5  (primary: brightens towards the ring, -> 1 far away)
+    //   mu_2 = A - 0.5  (secondary: near-ring bright, -> 0 far from the axis)
+    // Both diverge as beta -> 0 (the ring pile-up); the clamp stands in for the
+    // finite-source-size effects that cap real magnification.
+    float u_beta = max(beta / theta_E, 1e-8);
+    float A = (u_beta * u_beta + 2.0) / (2.0 * u_beta * sqrt(u_beta * u_beta + 4.0));
+    g_grav_magnification = clamp(secondary ? (A - 0.5) : (A + 0.5), 0.0, 10.0);
+
+    // Solid body occlusion for non-black-hole lenses (e.g. star, white dwarf, neutron
+    // star): the primary image would land inside the stellar disk, the secondary image
+    // is hidden BEHIND the lens body — either way the light never reaches the observer.
     if (u_grav_lens_type != 3 && u_grav_lens_radius > 0.0) {
         float theta_body = u_grav_lens_radius / d_l_km;
         if (theta < theta_body) {
             is_shadow = true;
+            g_grav_magnification = 0.0;
             return V;
         }
     }
 
-    // Deflected apparent sightline (pushed radially outward along u_dir)
-    vec3 V_app = normalize(L * cos(theta) + u_dir * sin(theta));
-
-    // Safe Frame-dragging Lense-Thirring lateral deflection for spinning Kerr lenses
-    if (abs(u_grav_lens_spin) > 1e-4) {
-        vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
-        vec3 drag_dir = cross(pole_n, V_app);
-        float len_drag = length(drag_dir);
-        if (len_drag > 1e-4) {
-            drag_dir /= len_drag;
-            float b_km = d_l_km * sin(theta);
-            float drag_angle = clamp((u_grav_lens_rs * u_grav_lens_rs * u_grav_lens_spin) / max(1.0, b_km * b_km), -0.5, 0.5);
-            V_app = normalize(V_app * cos(drag_angle) + drag_dir * sin(drag_angle));
-        }
+    // Black-hole capture of the secondary image: its light passes the lens on the
+    // OPPOSITE side (ray periapsis along -u_dir) with impact parameter
+    // b_2 = d_l * |theta_2|. Rays with b_2 below the (spin-aware) critical radius
+    // plunge through the horizon — cull the image (the shadow disk also
+    // depth-occludes anything inside its silhouette as a second guard).
+    if (secondary && u_grav_lens_type == 3 && d_l_km * theta <= grav_critical_b(C_km, -u_dir)) {
+        g_grav_magnification = 0.0;
+        return V;
     }
+
+    // Deflected apparent sightline: primary pushed outward along +u_dir,
+    // secondary mirrored to the opposite side along -u_dir.
+    // NOTE: no Lense-Thirring lateral (out-of-plane) deflection is applied
+    // here. The previous implementation rotated V_app toward
+    // cross(pole, V_app) by rs^2*spin/b^2 (clamped to 0.5 rad). That had the
+    // wrong sign (V_app is the backward camera->source direction; physical
+    // light travels -V_app, flipping the drag side) and diverges as b->0, so
+    // every faint secondary image piling up near the lens center (b_2 -> 0,
+    // mu_2 -> 0) was smeared sideways by up to 28 deg. With pole~+Y that is a
+    // HORIZONTAL streak through the lens — exactly the GAIA-only "tunnel"
+    // in the screenshot (only the starfield renders secondaries, so only it
+    // showed the artifact). Spin now enters only via the (sign-corrected)
+    // asymmetric capture radius b_c(phi) above, which is the leading-order
+    // Kerr effect for the shadow silhouette.
+    vec3 V_app = secondary
+        ? normalize(L * cos(theta) - u_dir * sin(theta))
+        : normalize(L * cos(theta) + u_dir * sin(theta));
 
     return V_app;
 }
@@ -292,6 +357,32 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
 // displacement of compute_refraction_angle; feeding the parallax-weighted alpha
 // into an anchored bend would apply the (1 - s_min/d) factor twice.
 float compute_refraction_total(vec3 C, vec3 V, float d) {
+    // Observer-inside regime: s_min_pre < 0 means the ray line's periapsis lies
+    // BEHIND the camera — the object is above the camera's local horizontal
+    // plane. The camera IS the effective periapsis, so the anchored rotation
+    // happens at s=0 (no parallax factor) and total turn == apparent shift.
+    // Use the same erfcx closed-form as compute_refraction_angle so both paths
+    // agree and the point-light sprite / mesh hand-off is seamless.
+    float s_min_pre = -dot(C, V);
+    if (s_min_pre < 0.0) {
+        float Rc = length(C);
+        if (Rc < 1e-6) return 0.0;
+        vec3 up = C / Rc;
+        float sin_e = clamp(dot(V, up), 0.0, 1.0);
+        float h = Rc - refract_solid_radius(up);
+        if (h > u_refract_scale_height * 15.0) return 0.0;
+        float delta_cam = u_refract_max_bend * exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
+        if (delta_cam <= 1e-9) return 0.0;
+        float k = Rc / (2.0 * max(1e-4, u_refract_scale_height));
+        float bend = 0.5 * delta_cam * refract_erfcx(sqrt(k) * sin_e);
+        // Object-side cutoff: only the bend accumulated up to distance d.
+        // E_d ~ 1 for anything beyond a few sigma_cam (all sky objects/stars).
+        float sigma_cam = sqrt(max(1e-4, Rc * u_refract_scale_height));
+        float x_d = d / (1.4142135 * sigma_cam);
+        float E_d = sign(x_d) * sqrt(max(0.0, 1.0 - exp(-1.239 * x_d * x_d)));
+        return max(0.0, bend * E_d);
+    }
+
     float s_min, delta_rmin, sigma;
     float r_min = _refraction_setup(C, V, d, s_min, delta_rmin, sigma);
     if (r_min < 0.0) return 0.0;
@@ -403,10 +494,9 @@ bool refract_chord_blocked(vec3 C, vec3 V, float d) {
     return is_occ;
 }
 
-vec3 apply_refraction(vec3 world_pos, vec3 cam_pos) {
+vec3 apply_atmospheric_refraction(vec3 world_pos, vec3 cam_pos) {
     vec3 result = world_pos;
-
-    // 1. Atmospheric refraction (only when an atmosphere refracts nearby).
+    // Atmospheric refraction (only when an atmosphere refracts nearby).
     if (u_refract_max_bend > 1e-6 && length(world_pos - u_refract_center) > 1e-7) {
         vec3 C_km = (cam_pos - u_refract_center) * u_au_to_km;
         vec3 true_vec_au = world_pos - cam_pos;
@@ -419,6 +509,11 @@ vec3 apply_refraction(vec3 world_pos, vec3 cam_pos) {
             if (!is_occluded) result = cam_pos + V_app * d_au;
         }
     }
+    return result;
+}
+
+vec3 apply_refraction(vec3 world_pos, vec3 cam_pos) {
+    vec3 result = apply_atmospheric_refraction(world_pos, cam_pos);
 
     // 2. Gravitational lensing (independent of atmospheric state).
     if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6

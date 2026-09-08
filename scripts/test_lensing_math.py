@@ -94,21 +94,24 @@ def main():
         if sh != expect_sh: fails.append(f"shadow {label}")
 
     # 4. Kerr spin: prograde rays (with the spin) capture SMALLER b, retrograde
-    #    rays LARGER. pole=+Y, cam_dir=+Z -> prograde periapsis dir = +X.
-    #    cos_phi = dot(ray_perp, prograde): +X periapsis -> +1, -X -> -1.
-    b_c_pos = 2.5980762 * rs_bh * (1.0 - 0.35 * 0.998)   # ~1.69 rs (prograde side)
-    b_c_neg = 2.5980762 * rs_bh * (1.0 + 0.35 * 0.998)   # ~3.50 rs (retrograde side)
+    #    rays LARGER. pole=+Y, cam_dir=+Z -> prograde periapsis dir = -X.
+    #    (Physical photons travel source->camera (+Z here); r=+X gives
+    #    L=rxv=-Y = retrograde. The old code used the backward-ray L and had
+    #    this mirrored.) cos_phi = dot(ray_perp, prograde): -X -> +1, +X -> -1.
+    b_c_pro = 2.5980762 * rs_bh * (1.0 - 0.35 * 0.998)   # ~1.69 rs (prograde, -X side)
+    b_c_ret = 2.5980762 * rs_bh * (1.0 + 0.35 * 0.998)   # ~3.50 rs (retrograde, +X side)
     for spin, sign, b_factor, expect_sh in (
-            (+0.998, -1.0, 2.90, True),   # retrograde side, b < b_c_neg -> captured
-            (+0.998, -1.0, 3.70, False),  # retrograde side, b > b_c_neg -> free
-            (+0.998, +1.0, 2.30, False),  # prograde side,  b > b_c_pos -> free
-            (+0.998, +1.0, 1.20, True),   # prograde side,  b < b_c_pos -> captured
-            (-0.998, -1.0, 2.30, False),  # reversed spin mirrors the asymmetry
-            (-0.998, +1.0, 2.30, True)):
+            (+0.998, +1.0, 2.90, True),   # retrograde side (+X), b < b_c_ret -> captured
+            (+0.998, +1.0, 3.70, False),  # retrograde side (+X), b > b_c_ret -> free
+            (+0.998, -1.0, 2.30, False),  # prograde side (-X),  b > b_c_pro -> free
+            (+0.998, -1.0, 1.20, True),   # prograde side (-X),  b < b_c_pro -> captured
+            (-0.998, +1.0, 2.30, False),  # reversed spin mirrors the asymmetry
+            (-0.998, -1.0, 2.30, True)):
         b_km = b_factor * rs_bh
         C = np.array([sign * b_km, 0.0, 1e9])
         a, sh = run_case(ctx, C, V, 0.0, rs_km=rs_bh, lens_type=3, spin=spin)
-        side = 'retrograde' if sign < 0 else 'prograde '
+        # NOTE: sign=+1 (+X periapsis) is RETROGRADE for spin>0 (see above).
+        side = 'retrograde' if (sign > 0) == (spin > 0) else 'prograde '
         print(f"4. spin={spin:+.3f} {side} b={b_factor:.2f} rs: captured={sh} (expect {expect_sh})")
         if sh != expect_sh: fails.append(f"kerr spin={spin} {side} b={b_factor}")
 
@@ -133,8 +136,9 @@ def main():
         float d = length(rel);
         vec3 dir = d > 1e-9 ? (rel / d) : vec3(0.0, 0.0, -1.0);
         vec3 p_clamped = u_eye_pos + dir * min(d, 100000.0);
+        g_grav_magnification = 1.0;
         vec3 lensed = apply_refraction(p_clamped, u_eye_pos);
-        out_pos[idx] = vec4(lensed, 1.0);
+        out_pos[idx] = vec4(lensed, g_grav_magnification);
     }
     """
     star_src = STAR_CS.replace('#include "common/refraction.glsl"',
@@ -152,7 +156,7 @@ def main():
 
     theta_E = math.sqrt(2.0 * rs_bh / AU_KM)
     theta_E_as = math.degrees(theta_E) * 3600
-    x_vals = [0.0, 1e-4, 1e-2, 0.1, 1.0]
+    x_vals = [0.0, 1e-4, 1e-2, 0.1, 1.0, 100.0]
     in_stars = [[x * 206265.0, 0.0, -20626500.0, 1.0] for x in x_vals]
     in_arr = np.array(in_stars, dtype=np.float32)
     in_b = ctx.buffer(in_arr.tobytes()); out_b = ctx.buffer(reserve=in_arr.nbytes)
@@ -174,6 +178,58 @@ def main():
             fails.append(f"inverted star deflection at x={x}")
         if abs(lens_as - exp_as) > 1.0:
             fails.append(f"star deflection error at x={x}")
+
+    # 6. Secondary (mirror) lensing image: the second root of the lens equation
+    #    theta_2 = (sqrt(beta^2 + 4*theta_E^2) - beta)/2 must appear on the
+    #    OPPOSITE side of the lens with |theta_2| < theta_E, flux scaled by the
+    #    point-source magnification mu_2 = (u^2+2)/(2u*sqrt(u^2+4)) - 0.5.
+    #    Sources whose secondary ray is captured (|theta_2| < b_c/d_l) must be
+    #    culled (magnification 0, true position returned).
+    def run_star_pass(image):
+        src = STAR_CS.replace('#include "common/refraction.glsl"',
+                              load_shader('common/refraction.glsl').replace('#version 460 core', ''))
+        prog = ctx.compute_shader(src)
+        for name, val in [
+            ('u_grav_lens_enabled', True), ('u_grav_lens_center', (0.0, 0.0, 0.0)),
+            ('u_grav_lens_rs', float(rs_bh)), ('u_grav_lens_radius', float(rs_bh)),
+            ('u_grav_lens_type', 3), ('u_grav_lens_strength', 1.0),
+            ('u_grav_lens_spin', 0.0), ('u_grav_lens_pole', (0.0, 1.0, 0.0)),
+            ('u_au_to_km', float(AU_KM)), ('u_refract_max_bend', 0.0),
+            ('u_eye_pos', (0.0, 0.0, 1.0)), ('u_grav_image', int(image)),
+        ]:
+            if name in prog: prog[name].value = val
+        arr = np.array(in_stars, dtype=np.float32)
+        b_in = ctx.buffer(arr.tobytes()); b_out = ctx.buffer(reserve=arr.nbytes)
+        b_in.bind_to_storage_buffer(0); b_out.bind_to_storage_buffer(1)
+        prog.run(group_x=len(in_stars))
+        out = np.frombuffer(b_out.read(), dtype=np.float32).reshape((-1, 4)).copy()
+        prog.release(); b_in.release(); b_out.release()
+        return out
+
+    sec_res = run_star_pass(1)
+    for i, x in enumerate(x_vals):
+        orig_p = in_stars[i][:3]
+        orig_dir = np.array(orig_p) - np.array([0, 0, 1]); orig_dir /= np.linalg.norm(orig_dir)
+        orig_as = math.degrees(math.atan2(orig_dir[0], -orig_dir[2])) * 3600
+        beta = math.radians(orig_as / 3600)
+        u = max(beta / theta_E, 1e-8)
+        A = (u * u + 2.0) / (2.0 * u * math.sqrt(u * u + 4.0))
+        exp_mu = max(min(A - 0.5, 10.0), 0.0)
+        exp2_as = math.degrees(0.5 * (math.sqrt(beta * beta + 4.0 * theta_E * theta_E) - beta)) * 3600
+        sec_dir = np.array(sec_res[i][:3]) - np.array([0, 0, 1]); sec_dir /= np.linalg.norm(sec_dir)
+        sec_as = math.degrees(math.atan2(sec_dir[0], -sec_dir[2])) * 3600
+        got_mu = float(sec_res[i][3])
+        captured = exp2_as < math.degrees(2.5980762 * rs_bh / AU_KM) * 3600  # |theta_2| < b_c/d_l
+        if captured:
+            ok = got_mu == 0.0 and abs(sec_as - orig_as) < 1.0  # true position, culled
+        else:
+            ok = sec_as < 0.0 and abs(abs(sec_as) - exp2_as) < max(0.1, exp2_as * 1e-2) \
+                 and abs(got_mu - exp_mu) <= max(1e-3, exp_mu * 5e-2)
+        tag = 'captured' if captured else 'mirror image'
+        print(f"6. secondary image x={x}: lensed={sec_as:.4f}\" mag={got_mu:.5g} "
+              f"(expect {exp2_as:.4f}\" mu_2={exp_mu:.5g}, {tag})")
+        if not ok:
+            fails.append(f"secondary image x={x}")
 
     ctx.release()
     if fails:

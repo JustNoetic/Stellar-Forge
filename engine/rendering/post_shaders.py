@@ -18,6 +18,9 @@ accum_shader_fs = load_shader("post/accum.frag")
 star_streak_shader_vs = bloom_downsample_shader_vs
 star_streak_shader_fs = load_shader("post/star_streak.frag")
 
+grav_lens_starfield_shader_vs = bloom_downsample_shader_vs
+grav_lens_starfield_shader_fs = load_shader("post/grav_lens_starfield.frag")
+
 # FFT Convolution Bloom compute shaders
 conv_bloom_common_src = load_shader("post/conv_bloom_common.glsl")
 conv_bloom_kernel_src = load_shader("post/conv_bloom_kernel.comp")

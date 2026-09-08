@@ -3002,6 +3002,10 @@ class App(InputHandlerMixin):
                 self.bloom_texs = []
                 if self.streak_fbo: self.streak_fbo.release(); self.streak_fbo = None
                 if self.streak_tex: self.streak_tex.release(); self.streak_tex = None
+                if getattr(self, "starfield_fbo", None): self.starfield_fbo.release(); self.starfield_fbo = None
+                if getattr(self, "starfield_tex", None): self.starfield_tex.release(); self.starfield_tex = None
+                if getattr(self, "allsky_fbo", None): self.allsky_fbo.release(); self.allsky_fbo = None
+                if getattr(self, "allsky_tex", None): self.allsky_tex.release(); self.allsky_tex = None
                 
                 # Rebuild
                 self.hdr_resolve_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
@@ -3016,6 +3020,20 @@ class App(InputHandlerMixin):
                 
                 self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
                 
+                # Starfield buffer (1:1 screen resolution for perfect unlensed stars)
+                self.starfield_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
+                self.starfield_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.starfield_tex.repeat_x = False
+                self.starfield_tex.repeat_y = False
+                self.starfield_fbo = ctx.framebuffer(color_attachments=[self.starfield_tex])
+                
+                # All-sky equirectangular buffer for 360-degree gravitational lensing capture
+                self.allsky_tex = ctx.texture((4096, 2048), 4, dtype='f4')
+                self.allsky_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.allsky_tex.repeat_x = True   # longitude wraps around
+                self.allsky_tex.repeat_y = False
+                self.allsky_fbo = ctx.framebuffer(color_attachments=[self.allsky_tex])
+
                 self.accum_tex_a = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
                 self.accum_tex_a.filter = (moderngl.LINEAR, moderngl.LINEAR)
                 self.accum_fbo_a = ctx.framebuffer(color_attachments=[self.accum_tex_a])
@@ -5066,13 +5084,88 @@ class App(InputHandlerMixin):
                 # position, so stars blink/shimmer as the camera moves.
                 prog_starfield['u_min_point_px'].value = 2.0
                 prog_starfield['u_intensity_scale'].value = float(self.camera.get("star_intensity", 1.0))
-                ctx.enable(moderngl.DEPTH_TEST)
-                ctx.depth_mask = False
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-                star_vao.render(moderngl.POINTS)
-                ctx.depth_mask = True
-                ctx.disable(moderngl.BLEND)
+                is_screen_grav_lens_active = (
+                    grav_lens_enabled and grav_lens_rs > 0.0 and
+                    getattr(self, 'starfield_fbo', None) is not None and
+                    getattr(self, 'allsky_fbo', None) is not None and
+                    getattr(self, 'prog_grav_lens_starfield', None) is not None and
+                    getattr(self, 'quad_vao_grav_lens_starfield', None) is not None
+                )
+
+                if is_screen_grav_lens_active:
+                    # Pass 1: Render unlensed starfield into self.starfield_fbo (exact screen res)
+                    if 'u_equirectangular' in prog_starfield: prog_starfield['u_equirectangular'].value = False
+                    prog_starfield['projection'].write(proj_f8.astype('f4').tobytes())
+                    prog_starfield['screen_height'].value = float(self.fb_height)
+
+                    self.starfield_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.clear(0.0, 0.0, 0.0, 0.0)
+                    ctx.disable(moderngl.DEPTH_TEST)
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                    star_vao.render(moderngl.POINTS)
+
+                    # Pass 2: Render allsky equirectangular map for 360-degree capture
+                    if 'u_equirectangular' in prog_starfield: prog_starfield['u_equirectangular'].value = True
+                    # Set height to 2048 to scale point sprites correctly in the 4096x2048 map
+                    prog_starfield['screen_height'].value = 2048.0
+                    
+                    self.allsky_fbo.use()
+                    ctx.viewport = (0, 0, 4096, 2048)
+                    ctx.clear(0.0, 0.0, 0.0, 0.0)
+                    star_vao.render(moderngl.POINTS)
+
+                    # Pass 3: Screen-space backward gravitational deflection onto HDR buffer
+                    self.hdr_resolve_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.depth_func = '<'
+                    ctx.depth_mask = False
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+
+                    self.starfield_tex.use(location=0)
+                    self.allsky_tex.use(location=1)
+                    p_lens = self.prog_grav_lens_starfield
+                    if 'u_starfield_tex' in p_lens: p_lens['u_starfield_tex'].value = 0
+                    if 'u_allsky_tex' in p_lens: p_lens['u_allsky_tex'].value = 1
+                    
+                    cam_right = view_f8[:3, 0]
+                    cam_up = view_f8[:3, 1]
+                    cam_fwd = -view_f8[:3, 2]
+
+                    if 'u_cam_forward' in p_lens: p_lens['u_cam_forward'].value = (float(cam_fwd[0]), float(cam_fwd[1]), float(cam_fwd[2]))
+                    if 'u_cam_right' in p_lens: p_lens['u_cam_right'].value = (float(cam_right[0]), float(cam_right[1]), float(cam_right[2]))
+                    if 'u_cam_up' in p_lens: p_lens['u_cam_up'].value = (float(cam_up[0]), float(cam_up[1]), float(cam_up[2]))
+                    if 'u_tan_half_fov' in p_lens:
+                        fov_y_rad = math.radians(self.camera["fov"])
+                        tan_half_y = math.tan(fov_y_rad * 0.5)
+                        tan_half_x = tan_half_y * aspect_ratio
+                        p_lens['u_tan_half_fov'].value = (float(tan_half_x), float(tan_half_y))
+                    if 'u_camera_pos' in p_lens: p_lens['u_camera_pos'].value = (float(cam_pos_f8[0]), float(cam_pos_f8[1]), float(cam_pos_f8[2]))
+                    if 'u_screen_width' in p_lens: p_lens['u_screen_width'].value = float(self.fb_width)
+                    if 'u_screen_height' in p_lens: p_lens['u_screen_height'].value = float(self.fb_height)
+                    if 'u_au_to_km' in p_lens: p_lens['u_au_to_km'].value = au_to_km_val
+
+                    self.quad_vao_grav_lens_starfield.render(moderngl.TRIANGLE_STRIP)
+                    ctx.depth_mask = True
+                    ctx.disable(moderngl.BLEND)
+                else:
+                    # Standard direct render when gravitational lensing is inactive
+                    if 'u_equirectangular' in prog_starfield: prog_starfield['u_equirectangular'].value = False
+                    prog_starfield['projection'].write(proj_f8.astype('f4').tobytes())
+                    prog_starfield['screen_height'].value = float(self.fb_height)
+
+                    self.hdr_resolve_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.depth_mask = False
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                    star_vao.render(moderngl.POINTS)
+                    ctx.depth_mask = True
+                    ctx.disable(moderngl.BLEND)
 
             def execute_atmosphere_pass(clip_mode, target_list=None):
                 if not self.camera.get("atmo_enabled", True):
