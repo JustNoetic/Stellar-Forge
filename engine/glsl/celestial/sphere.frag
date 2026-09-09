@@ -139,17 +139,6 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
         float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
         vec3 tau_grazing_0 = atmo_param.xyz * grazing_factor;
 
-        if (gamma >= penumbra_inner) {
-            float z_direct_km = (gamma - penumbra_inner) * dist_km;
-            if (z_direct_km < 60.0) {
-                vec3 tau_R_d = tau_grazing_0 * exp(-z_direct_km / H_scale);
-                float z_diff_d = (z_direct_km - z_peak) / sigma_z;
-                vec3 tau_O3_d = ozone_param.xyz * exp(-0.5 * z_diff_d * z_diff_d);
-                vec3 T_direct = exp(-(tau_R_d + tau_O3_d));
-                vec3 pen_filter = clamp(T_direct + vec3(clamp((z_direct_km - 40.0) / 15.0, 0.0, 1.0)), 0.0, 1.0);
-                sh = geom_sh * pen_filter;
-            }
-        }
 
         // For an extended light source (like the Sun), the transmitted light is dominated
         // by the rays passing through the highest possible altitude (least required bend).
@@ -177,10 +166,12 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
             vec3 tau_total = tau_R + tau_O3;
             vec3 atmo_transmittance = exp(-tau_total);
 
-            // Physical Atmospheric Ring Geometric Dilution (1/D falloff)
-            // The atmospheric lens is a ring, not a point lens, so light diverges in 1D, not 2D.
-            // Geometric intensity factor f = (2 * H_scale) / (alpha * D)
-            float ring_intensity = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
+            // Physical Atmospheric Ring Geometric Dilution with Radial Astigmatic Defocusing:
+            // Tangential divergence scales as 1/D around the ring. Radial divergence across the
+            // exponential atmosphere density gradient (d_theta/dz = -theta/H) dilutes flux by
+            // 1 / (1 + D * theta / H), giving true 3D 1/D^2 energy conservation at large distances.
+            float radial_defocus = 1.0 / (1.0 + (dist_km * max(req_bend, 1e-6)) / H_scale);
+            float ring_intensity = ((2.0 * H_scale) / max(alpha * dist_km, 1e-9)) * radial_defocus;
             
             // Smooth surface grazing fade to zero at solid body boundary (h = 0, atmo_depth = 1)
             float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);

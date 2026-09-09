@@ -323,26 +323,24 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                     dist_sq_k = vk_x*vk_x + vk_y*vk_y + vk_z*vk_z
                     perp_sq = max(0.0, dist_sq_k - t*t)
                     
-                    r_penumbra = radii[k] + t * (star_radii[s] / c_dist)
+                    r_penumbra = radii[k] + t * (star_radii[s] / c_dist) + radii[j]
                     if perp_sq < r_penumbra * r_penumbra:
                         inv_t = 1.0 / t
                         beta = radii[k] * inv_t
                         gamma = np.sqrt(perp_sq) * inv_t
                         alpha = star_radii[s] / c_dist
+                        theta_j = radii[j] * inv_t
                         
-                        p_out = alpha + beta
-                        p_in = abs(beta - alpha)
+                        p_out = alpha + beta + theta_j
+                        p_in = max(0.0, abs(beta - alpha) - theta_j)
                         
-                        if gamma < p_in:
-                            occ = 1.0
-                        else:
-                            t_val = max(0.0, min(1.0, (gamma - p_out) / (p_in - p_out + 1e-12)))
-                            occ = t_val * t_val * (3.0 - 2.0 * t_val)
+                        t_val = max(0.0, min(1.0, (p_out - gamma) / max(1e-12, p_out - p_in)))
+                        occ = t_val * t_val * (3.0 - 2.0 * t_val)
                             
                         max_occ = min(1.0, (beta * beta) / max(1e-12, alpha * alpha))
                         scale_area = min(1.0, (radii[k] / max(1e-6, radii[j])) ** 2)
                         max_occ *= scale_area
-                        shadow_factor *= (1.0 - max_occ * occ)
+                        shadow_factor *= max(0.0, 1.0 - max_occ * occ)
                         
             if shadow_factor > 0.001:
                 irradiance = (star_lums[s] / max(c_dist * c_dist, 1e-8)) if hdr_enabled else 1.0
