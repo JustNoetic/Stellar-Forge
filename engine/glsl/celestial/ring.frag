@@ -97,8 +97,7 @@ out vec4 out_color;
 const float PI = 3.14159265358979323846;
 
 uniform bool u_is_textured;
-uniform sampler2D u_ring_texture_front;
-uniform sampler2D u_ring_texture_back;
+uniform sampler2D u_ring_texture;
 
 float HenyeyGreensteinPhaseFunction(float eccentricity, float viewDirDotLight) {
     float g = eccentricity;
@@ -340,9 +339,7 @@ void main() {
 
     float r = length(hit_local);
 
-    vec3 total_color_front = vec3(0.0);
-    vec3 total_color_back = vec3(0.0);
-    vec3 total_color_fwd = vec3(0.0);
+    vec3 total_color = vec3(0.0);
     float total_tau = 0.0;
     float total_faded_tau = 0.0;
     float total_scatter = 0.0;
@@ -358,35 +355,28 @@ void main() {
 
         if (r >= inner_r - dr && r <= outer_r + dr) {
             float t = (r - inner_r) / max(1e-6, outer_r - inner_r);
-            vec4 tex_val_front;
-            vec4 tex_val_back;
+            vec4 tex_val;
             bool plane_is_textured = u_is_textured && (u_ring_planes[i].is_textured > 0.5);
             if (plane_is_textured) {
-                tex_val_front = texture(u_ring_texture_front, vec2(clamp(t, 0.0, 1.0), 0.5));
-                tex_val_back  = texture(u_ring_texture_back,  vec2(clamp(t, 0.0, 1.0), 0.5));
+                tex_val = texture(u_ring_texture, vec2(clamp(t, 0.0, 1.0), 0.5));
             } else {
-                tex_val_front = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0));
-                tex_val_back = tex_val_front;
+                tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0));
             }
-            tex_val_front.rgb = pow(tex_val_front.rgb, vec3(2.2));
-            tex_val_back.rgb  = pow(tex_val_back.rgb,  vec3(2.2));
+            tex_val.rgb = pow(tex_val.rgb, vec3(2.2));
 
             float layer_hue = u_ring_planes[i].hue_shift;
             float layer_sat = u_ring_planes[i].saturation;
             float layer_bri = u_ring_planes[i].brightness;
             float layer_boost = u_ring_planes[i].alpha_boost;
             if (plane_is_textured && (abs(layer_hue) > 1e-4 || abs(layer_sat - 1.0) > 1e-4 || abs(layer_bri - 1.0) > 1e-4)) {
-                tex_val_front.rgb = adjust_hsba(tex_val_front.rgb, layer_hue, layer_sat, layer_bri);
-                tex_val_back.rgb  = adjust_hsba(tex_val_back.rgb,  layer_hue, layer_sat, layer_bri);
+                tex_val.rgb = adjust_hsba(tex_val.rgb, layer_hue, layer_sat, layer_bri);
             }
 
-            float alpha = tex_val_front.a;
+            float alpha = tex_val.a;
             if (plane_is_textured && alpha > 1e-5 && abs(layer_boost - 1.0) > 1e-4) {
                 alpha = clamp(pow(alpha, 1.0 / max(0.01, layer_boost)), 0.0, 1.0);
             }
-            vec3 r_color_front = tex_val_front.rgb;
-            vec3 r_color_back  = tex_val_back.rgb;
-            vec3 r_color_fwd   = r_color_front;
+            vec3 r_color = tex_val.rgb;
 
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
 
@@ -411,17 +401,15 @@ void main() {
             }
 
             if (tau > 0.0) {
-                total_color_front += plane_color * r_color_front * tau;
-                total_color_back  += plane_color * r_color_back  * tau;
-                total_color_fwd   += plane_color * r_color_fwd   * tau;
+                total_color += plane_color * r_color * tau;
                 total_scatter += u_ring_planes[i].scatter * tau;
                 total_asym += u_ring_planes[i].asymmetry * tau;
                 total_backscatter += u_ring_planes[i].backscatter * tau;
                 total_tau += tau;
                 total_faded_tau += tau_faded;
+                total_unlit_factor += u_ring_planes[i].unlit_factor * tau;
                 if (plane_is_textured) {
                     total_textured_tau += tau;
-                    total_unlit_factor += u_ring_planes[i].unlit_factor * tau;
                 }
             }
         }
@@ -441,14 +429,12 @@ void main() {
     float physical_alpha = 1.0 - exp(-total_tau / cosViewRayVertical);
     float faded_alpha = 1.0 - exp(-total_faded_tau / cosViewRayVertical);
 
-    vec3 f_color_front = total_color_front / max(1e-6, total_tau);
-    vec3 f_color_back  = total_color_back  / max(1e-6, total_tau);
-    vec3 f_color_fwd   = total_color_fwd   / max(1e-6, total_tau);
-    vec4 f_color = vec4(f_color_front, physical_alpha);
+    vec3 f_color_rgb = total_color / max(1e-6, total_tau);
+    vec4 f_color = vec4(f_color_rgb, physical_alpha);
     float f_scatter = total_scatter / max(1e-6, total_tau);
     float f_asymmetry = total_asym / max(1e-6, total_tau);
     float f_backscatter = total_backscatter / max(1e-6, total_tau);
-    float f_unlit_factor = total_textured_tau > 0.0 ? (total_unlit_factor / total_textured_tau) : 1.0;
+    float f_unlit_factor = total_tau > 0.0 ? (total_unlit_factor / total_tau) : 1.0;
 
     bool is_textured_ring = (total_textured_tau > 0.5 * total_tau);
 
@@ -533,10 +519,11 @@ void main() {
             // f_scatter controls forward/backward balance (0 = backward dominant, 1 = forward dominant)
             float balance = clamp(f_scatter, 0.0, 1.0);
             float phaseFunc = mix(pf_backward, pf_forward, balance);
-            single_scatter_s = scatteredLight * phaseFunc;
+            float unlit_mult = onLitSide ? 1.0 : f_unlit_factor;
+            single_scatter_s = scatteredLight * phaseFunc * unlit_mult;
             
             // Isotropic multiple scattering only applies to backscattering chunks, not pure forward-scattering dust
-            ms_s = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * (1.0 - balance);
+            ms_s = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * (1.0 - balance) * unlit_mult;
 
             // Opposition surge: brightening at low phase angles on single scattering (lit side only)
             if (onLitSide) {
@@ -666,11 +653,7 @@ void main() {
             }
         }
 
-        float lit_blend = smoothstep(-0.02, 0.02, cam_side * sun_side);
-        float fwd_blend = smoothstep(-0.3, 0.7, cos_theta);
-        vec3 lit_color_star = (total_textured_tau > 0.5 * total_tau) ? mix(f_color_front, f_color_fwd, fwd_blend) : f_color_front;
-        vec3 active_ring_color = (total_textured_tau > 0.5 * total_tau) ? mix(f_color_back, lit_color_star, lit_blend) : f_color_front;
-        total_direct_illum_color += star_color * active_ring_color * direct_illum_s * shadow_s;
+        total_direct_illum_color += star_color * f_color.rgb * direct_illum_s * shadow_s;
     }
 
     vec3 total_planetshine = vec3(0.0);
@@ -687,8 +670,7 @@ void main() {
         // Effective elevation of the 3D spherical planet disk above/below the 2D ring plane
         float planet_elevation = max(0.5 * sin_alpha_planet, 0.05);
 
-        float lit_blend_p = smoothstep(-0.02, 0.02, cam_side);
-        vec3 active_shine_color = (is_textured_ring) ? mix(f_color_back, f_color_front, lit_blend_p) : f_color_front;
+        vec3 active_shine_color = f_color.rgb;
 
         for (int s = 0; s < u_num_stars; s++) {
             vec3 star_pos = u_stars_pos_radius[s].xyz;

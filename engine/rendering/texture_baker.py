@@ -4,7 +4,7 @@ from PIL import Image
 import moderngl
 from engine.rendering.render_utils import generate_ring_shadow_grad, rebuild_ring_render_group
 
-def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0, unlit_mult=1.0, alpha_boost=1.0):
+def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0, alpha_boost=1.0):
     out = arr_rgba.copy()
     rgb = out[..., :3]
     maxc = np.max(rgb, axis=-1)
@@ -38,7 +38,7 @@ def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0,
     h6 = hsv[..., 0] * 6.0
     i = np.floor(h6).astype(int) % 6
     f = h6 - np.floor(h6)
-    v = np.clip(hsv[..., 2] * unlit_mult, 0.0, 1.0)
+    v = np.clip(hsv[..., 2], 0.0, 1.0)
     s = np.clip(hsv[..., 1], 0.0, 1.0)
 
     p = v * (1.0 - s)
@@ -84,60 +84,49 @@ def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=No
 
     os.makedirs(textures_dir, exist_ok=True)
 
-    front_path = os.path.join(textures_dir, f"{body_name}_ring_front.png")
-    back_path = os.path.join(textures_dir, f"{body_name}_ring_back.png")
+    cand_rings_png = os.path.join(textures_dir, "Rings.png")
+    cand_body_ring = os.path.join(textures_dir, f"{body_name}_ring.png")
+    if os.path.exists(cand_rings_png):
+        ring_path = cand_rings_png
+    elif os.path.exists(cand_body_ring):
+        ring_path = cand_body_ring
+    else:
+        ring_path = cand_body_ring
 
-    img_front = app.ring_textures_front.get(name_lower)
-    img_back = app.ring_textures_back.get(name_lower)
-
-    if img_front is None:
-        print(f"[Texture Editor] No front ring texture found for {body_name}")
+    img_ring = app.ring_textures.get(name_lower)
+    if img_ring is None:
+        print(f"[Texture Editor] No ring texture found for {body_name}")
         return False
 
-    if img_back is None:
-        img_back = img_front.copy()
-
-    arr_front = np.array(img_front, dtype=np.float32) / 255.0
-    arr_back = np.array(img_back, dtype=np.float32) / 255.0
+    arr_ring = np.array(img_ring, dtype=np.float32) / 255.0
 
     hue = ring_item.get('hue_shift', 0.0)
     sat = ring_item.get('saturation', 1.0)
     bri = ring_item.get('brightness', 1.0)
     op = ring_item.get('opacity', 1.0)
-    unlit = ring_item.get('unlit_factor', 1.0)
     boost = ring_item.get('alpha_boost', 1.0)
 
-    baked_front = apply_hsba_np(arr_front, hue, sat, bri, opacity_mult=op, unlit_mult=1.0, alpha_boost=boost)
-    baked_back = apply_hsba_np(arr_back, hue, sat, bri, opacity_mult=op, unlit_mult=unlit, alpha_boost=boost)
+    baked_ring = apply_hsba_np(arr_ring, hue, sat, bri, opacity_mult=op, alpha_boost=boost)
+    baked_ring_u8 = np.clip(baked_ring * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-    baked_front_u8 = np.clip(baked_front * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    baked_back_u8 = np.clip(baked_back * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    img_ring_new = Image.fromarray(baked_ring_u8, mode='RGBA')
 
-    img_front_new = Image.fromarray(baked_front_u8, mode='RGBA')
-    img_back_new = Image.fromarray(baked_back_u8, mode='RGBA')
+    img_ring_new.save(ring_path)
+    print(f"[Texture Editor] Baked and saved ring texture to {ring_path}")
 
-    os.makedirs(textures_dir, exist_ok=True)
-    img_front_new.save(front_path)
-    img_back_new.save(back_path)
-    print(f"[Texture Editor] Baked and saved ring textures to {front_path} and {back_path}")
-
-    app.ring_textures_front[name_lower] = img_front_new
-    app.ring_textures_back[name_lower] = img_back_new
+    app.ring_textures[name_lower] = img_ring_new
 
     ctx = app.ctx
     aniso_value = app.camera.get("anisotropy", 16.0)
-    tex_f = ctx.texture(img_front_new.size, 4, img_front_new.tobytes())
-    tex_f.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-    tex_f.repeat_x = False; tex_f.repeat_y = False; tex_f.build_mipmaps(); tex_f.anisotropy = aniso_value
+    tex = ctx.texture(img_ring_new.size, 4, img_ring_new.tobytes())
+    tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    tex.repeat_x = False
+    tex.repeat_y = False
+    tex.build_mipmaps()
+    tex.anisotropy = aniso_value
 
-    tex_b = ctx.texture(img_back_new.size, 4, img_back_new.tobytes())
-    tex_b.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-    tex_b.repeat_x = False; tex_b.repeat_y = False; tex_b.build_mipmaps(); tex_b.anisotropy = aniso_value
+    app.ring_gl_textures[name_lower] = tex
 
-    app.ring_gl_textures_front[name_lower] = tex_f
-    app.ring_gl_textures_back[name_lower] = tex_b
-
-    ring_item['unlit_factor'] = 1.0
     ring_item['saturation'] = 1.0
     ring_item['hue_shift'] = 0.0
     ring_item['brightness'] = 1.0
@@ -145,7 +134,7 @@ def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=No
     ring_item['alpha_boost'] = 1.0
 
     if ring_precomputed is not None and ring_render_groups is not None and ring_gradient_tex is not None:
-        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=np.array(img_front_new, dtype='f4')/255.0)
+        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=np.array(img_ring_new, dtype='f4') / 255.0)
         ring_item['shadow_grad'] = shadow_grad
         app.body_ring_indices = rebuild_ring_render_group(ring_item['body_idx'], ctx, app.prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
     return True

@@ -990,12 +990,8 @@ class App(InputHandlerMixin):
                 img_rgba = Image.merge('RGBA', (white, white, white, img_l))
             return img_rgba.resize((2048, 1024), Image.Resampling.LANCZOS)
 
-        self.ring_textures_front = {}  # name_lower -> PIL.Image (4096, 1)
-        self.ring_textures_back = {}   # name_lower -> PIL.Image (4096, 1)
-        self.ring_gl_textures_front = {} # name_lower -> ModernGL Texture
-        self.ring_gl_textures_back = {}  # name_lower -> ModernGL Texture
-        self.ring_textures = self.ring_textures_front
-        self.ring_gl_textures = self.ring_gl_textures_front
+        self.ring_textures = {}     # name_lower -> PIL.Image (4096, 1)
+        self.ring_gl_textures = {}  # name_lower -> ModernGL Texture
         textures_dir = get_external_path("textures")
 
         # GAIA star catalog (render-only layer; see GAIA_STARS_PLAN.md)
@@ -1016,33 +1012,18 @@ class App(InputHandlerMixin):
                     folder_path = os.path.join(root, dir_name)
                     r_files = glob.glob(os.path.join(folder_path, '*.png')) + glob.glob(os.path.join(folder_path, '*.jpg'))
                     name_lower = dir_name.lower()
-                    r_front_path, r_back_path, r_single_path = None, None, None
+                    r_path = None
                     for f in r_files:
                         fname_lower = os.path.splitext(os.path.basename(f))[0].lower()
-                        if fname_lower in [name_lower + "_ring_front", name_lower + "_rings_front", name_lower + "_front", "ring_front", "rings_front", "front"]:
-                            r_front_path = f
-                        elif fname_lower in [name_lower + "_ring_back", name_lower + "_rings_back", name_lower + "_back", "ring_back", "rings_back", "back"]:
-                            r_back_path = f
-                        elif fname_lower in [name_lower + "_ring", name_lower + "_rings", "ring", "rings"]:
-                            r_single_path = f
-                    if r_front_path:
+                        if fname_lower in [name_lower + "_ring", name_lower + "_rings", "ring", "rings",
+                                           name_lower + "_ring_front", name_lower + "_rings_front", name_lower + "_front", "ring_front", "rings_front", "front"]:
+                            r_path = f
+                            break
+                    if r_path:
                         try:
-                            img_front = Image.open(r_front_path).convert('RGBA')
-                            img_back = Image.open(r_back_path).convert('RGBA') if r_back_path else img_front
-                            self.ring_gl_textures_front[name_lower] = img_front
-                            self.ring_gl_textures_back[name_lower] = img_back
-                            self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
-                            self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
-                        except Exception as e:
-                            print(f"Failed to load front/back ring textures in folder {folder_path}: {e}")
-                    elif r_single_path:
-                        try:
-                            img = Image.open(r_single_path).convert('RGBA')
-                            self.ring_gl_textures_front[name_lower] = img
-                            self.ring_gl_textures_back[name_lower] = img
-                            img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
-                            self.ring_textures_front[name_lower] = img_ds
-                            self.ring_textures_back[name_lower] = img_ds
+                            img = Image.open(r_path).convert('RGBA')
+                            self.ring_gl_textures[name_lower] = img
+                            self.ring_textures[name_lower] = img.resize((4096, 1), Image.Resampling.LANCZOS)
                         except Exception as e:
                             print(f"Failed to load ring texture in folder {folder_path}: {e}")
 
@@ -1056,57 +1037,24 @@ class App(InputHandlerMixin):
                     ring_base_names.add(clean_name)
             for name in sorted(list(ring_base_names)):
                 name_lower = name.lower()
-                if name_lower in self.ring_textures_front:
+                if name_lower in self.ring_textures:
                     continue
-                f_front, f_back, f_single = None, None, None
+                f_single = None
                 for ext in ['.png', '.jpg']:
-                    for pattern in [f"{name}_ring_front{ext}", f"{name}_rings_front{ext}", f"{name}_front{ext}"]:
+                    for pattern in [f"{name}_ring{ext}", f"{name}_rings{ext}", f"{name}_ring_front{ext}", f"{name}_rings_front{ext}", f"{name}_front{ext}"]:
                         p = os.path.join(textures_dir, pattern)
-                        if os.path.exists(p): f_front = p; break
-                    for pattern in [f"{name}_ring_back{ext}", f"{name}_rings_back{ext}", f"{name}_back{ext}"]:
-                        p = os.path.join(textures_dir, pattern)
-                        if os.path.exists(p): f_back = p; break
-                    for pattern in [f"{name}_ring{ext}", f"{name}_rings{ext}"]:
-                        p = os.path.join(textures_dir, pattern)
-                        if os.path.exists(p): f_single = p; break
-                try:
-                    if f_front:
-                        img_front = Image.open(f_front).convert('RGBA')
-                        img_back = Image.open(f_back).convert('RGBA') if f_back else img_front
-                        self.ring_gl_textures_front[name_lower] = img_front
-                        self.ring_gl_textures_back[name_lower] = img_back
-                        self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
-                        self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
-                    elif f_single:
+                        if os.path.exists(p):
+                            f_single = p
+                            break
+                    if f_single:
+                        break
+                if f_single:
+                    try:
                         img = Image.open(f_single).convert('RGBA')
-                        self.ring_gl_textures_front[name_lower] = img
-                        self.ring_gl_textures_back[name_lower] = img
-                        img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
-                        self.ring_textures_front[name_lower] = img_ds
-                        self.ring_textures_back[name_lower] = img_ds
-                except Exception as e:
-                    print(f"Failed to load root ring texture {name}: {e}")
-                            
-                    if r_front_path:
-                        try:
-                            img_front = Image.open(r_front_path).convert('RGBA')
-                            img_back = Image.open(r_back_path).convert('RGBA') if r_back_path else img_front
-                            self.ring_gl_textures_front[name_lower] = img_front
-                            self.ring_gl_textures_back[name_lower] = img_back
-                            self.ring_textures_front[name_lower] = img_front.resize((4096, 1), Image.Resampling.LANCZOS)
-                            self.ring_textures_back[name_lower] = img_back.resize((4096, 1), Image.Resampling.LANCZOS)
-                        except Exception as e:
-                            print(f"Failed to load front/back ring textures in folder {path}: {e}")
-                    elif r_single_path:
-                        try:
-                            img = Image.open(r_single_path).convert('RGBA')
-                            self.ring_gl_textures_front[name_lower] = img
-                            self.ring_gl_textures_back[name_lower] = img
-                            img_ds = img.resize((4096, 1), Image.Resampling.LANCZOS)
-                            self.ring_textures_front[name_lower] = img_ds
-                            self.ring_textures_back[name_lower] = img_ds
-                        except Exception as e:
-                            print(f"Failed to load ring texture in folder {path}: {e}")
+                        self.ring_gl_textures[name_lower] = img
+                        self.ring_textures[name_lower] = img.resize((4096, 1), Image.Resampling.LANCZOS)
+                    except Exception as e:
+                        print(f"Failed to load root ring texture {name}: {e}")
         
         if has_j2:
             oblate_indices = np.array([x[0] for x in oblate_physics_list], dtype=np.int32)
@@ -1408,10 +1356,8 @@ class App(InputHandlerMixin):
         prog_ephem_orbits = ctx.program(vertex_shader=ephem_orbit_vertex_shader, fragment_shader=ephem_orbit_fragment_shader)
     
         prog_rings = ctx.program(vertex_shader=ring_vertex_shader, fragment_shader=ring_fragment_shader)
-        if 'u_ring_texture_front' in prog_rings:
-            prog_rings['u_ring_texture_front'].value = 4
-        if 'u_ring_texture_back' in prog_rings:
-            prog_rings['u_ring_texture_back'].value = 5
+        if 'u_ring_texture' in prog_rings:
+            prog_rings['u_ring_texture'].value = 4
     
         prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
         
@@ -1607,7 +1553,7 @@ class App(InputHandlerMixin):
             b_data = bodies_data[body_idx]
             b_name = b_data['name']
             name_lower = b_name.lower()
-            if name_lower in self.ring_textures_front and len(rings_data) > 0:
+            if name_lower in self.ring_textures and len(rings_data) > 0:
                 tex_inner_f = b_data.get('ring_texture_inner')
                 tex_outer_f = b_data.get('ring_texture_outer')
                 
@@ -1660,7 +1606,7 @@ class App(InputHandlerMixin):
                     r_backscatter = first.get('backscatter', -0.3)
                 
                 # Sample the texture
-                img_data = np.frombuffer(self.ring_textures_front[name_lower].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                img_data = np.frombuffer(self.ring_textures[name_lower].tobytes(), dtype=np.uint8).astype('f4') / 255.0
                 img_data = img_data.reshape(4096, 4)
                 tex_sampled = img_data # take 4096 samples
                 
@@ -2158,7 +2104,7 @@ class App(InputHandlerMixin):
         self.body_textures_ssbo.bind_to_storage_buffer(binding=10)
 
         # Convert ring PIL images into ModernGL textures
-        for name_lower, img in list(self.ring_gl_textures_front.items()):
+        for name_lower, img in list(self.ring_gl_textures.items()):
             try:
                 tex = ctx.texture(img.size, 4, img.tobytes())
                 tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
@@ -2166,21 +2112,9 @@ class App(InputHandlerMixin):
                 tex.repeat_y = False
                 tex.build_mipmaps()
                 tex.anisotropy = aniso_value
-                self.ring_gl_textures_front[name_lower] = tex
+                self.ring_gl_textures[name_lower] = tex
             except Exception as e:
-                print(f"Failed to compile OpenGL front texture for ring {name_lower}: {e}")
-
-        for name_lower, img in list(self.ring_gl_textures_back.items()):
-            try:
-                tex = ctx.texture(img.size, 4, img.tobytes())
-                tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
-                tex.repeat_x = False
-                tex.repeat_y = False
-                tex.build_mipmaps()
-                tex.anisotropy = aniso_value
-                self.ring_gl_textures_back[name_lower] = tex
-            except Exception as e:
-                print(f"Failed to compile OpenGL back texture for ring {name_lower}: {e}")
+                print(f"Failed to compile OpenGL texture for ring {name_lower}: {e}")
 
         n_orbits = 0
         n_orbits_hi = 0
@@ -2433,7 +2367,7 @@ class App(InputHandlerMixin):
                     b_data_sw = bodies_data[body_idx_r]
                     name_lower_sw = b_data_sw['name'].lower()
                     
-                    if name_lower_sw in self.ring_textures_front and len(rings_data_r) > 0:
+                    if name_lower_sw in self.ring_textures and len(rings_data_r) > 0:
                         tex_inner_f = b_data_sw.get('ring_texture_inner')
                         tex_outer_f = b_data_sw.get('ring_texture_outer')
                         
@@ -2478,7 +2412,7 @@ class App(InputHandlerMixin):
                             r_asymmetry = first.get('asymmetry', 0.7)
                             r_backscatter = first.get('backscatter', -0.3)
                         
-                        img_data = np.frombuffer(self.ring_textures_front[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
+                        img_data = np.frombuffer(self.ring_textures[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
                         img_data = img_data.reshape(4096, 4)
                         tex_sampled_sw = img_data
                         
@@ -4287,8 +4221,12 @@ class App(InputHandlerMixin):
                     self.prog_ringshine_map['u_ring_normal'].write(ring_normals_buf)
                 if 'u_ring_params' in self.prog_ringshine_map:
                     self.prog_ringshine_map['u_ring_params'].write(ring_params_buf)
-                for idx, r in enumerate(ring_precomputed[:n_ring_planes]):
-                    if idx >= 16: break
+                for bi, unified_idx in self.body_ring_indices.items():
+                    if unified_idx >= 16: break
+                    body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                    active_rings = [r for r in body_rings if r['opacity'] > 0.0]
+                    r = active_rings[0] if active_rings else (body_rings[0] if body_rings else {})
+                    idx = unified_idx
                     if f'u_ring_planes[{idx}].unlit_factor' in self.prog_ringshine_map:
                         self.prog_ringshine_map[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
                     if f'u_ring_planes[{idx}].saturation' in self.prog_ringshine_map:
@@ -4301,8 +4239,14 @@ class App(InputHandlerMixin):
                         self.prog_ringshine_map[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
                     if f'u_ring_planes[{idx}].is_textured' in self.prog_ringshine_map:
                         self.prog_ringshine_map[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                    if f'u_ring_planes[{idx}].asymmetry' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].asymmetry'].value = float(r.get('asymmetry', 0.436))
+                    if f'u_ring_planes[{idx}].backscatter' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].backscatter'].value = float(r.get('backscatter', -0.65711))
+                    if f'u_ring_planes[{idx}].scatter' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].scatter'].value = float(r.get('scatter', 1.69))
                 if 'u_ringshine_band_count' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 256))
+                    self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 10))
                 _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
                 self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
                 _perf_gpu_end(_gq)
@@ -5485,14 +5429,12 @@ class App(InputHandlerMixin):
                         prog_rings['u_num_ring_planes'].value = len(body_rings)
                         b_name = bodies_data[bi]['name']
                         name_lower = b_name.lower()
-                        is_textured = name_lower in self.ring_textures_front
+                        is_textured = name_lower in self.ring_textures
                         if 'u_is_textured' in prog_rings:
                             prog_rings['u_is_textured'].value = is_textured
                         if is_textured:
-                            if name_lower in self.ring_gl_textures_front:
-                                self.ring_gl_textures_front[name_lower].use(location=4)
-                            if name_lower in self.ring_gl_textures_back:
-                                self.ring_gl_textures_back[name_lower].use(location=5)
+                            if name_lower in self.ring_gl_textures:
+                                self.ring_gl_textures[name_lower].use(location=4)
                         for idx, r in enumerate(body_rings):
                             if idx >= 16: break
                             prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
@@ -5572,14 +5514,12 @@ class App(InputHandlerMixin):
                         prog_rings['u_num_ring_planes'].value = len(body_rings)
                         b_name = self.bodies_data_cmp[bi]['name']
                         name_lower = b_name.lower()
-                        is_textured = name_lower in self.ring_textures_front
+                        is_textured = name_lower in self.ring_textures
                         if 'u_is_textured' in prog_rings:
                             prog_rings['u_is_textured'].value = is_textured
                         if is_textured:
-                            if name_lower in self.ring_gl_textures_front:
-                                self.ring_gl_textures_front[name_lower].use(location=4)
-                            if name_lower in self.ring_gl_textures_back:
-                                self.ring_gl_textures_back[name_lower].use(location=5)
+                            if name_lower in self.ring_gl_textures:
+                                self.ring_gl_textures[name_lower].use(location=4)
                         for idx, r in enumerate(body_rings):
                             if idx >= 16: break
                             prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
