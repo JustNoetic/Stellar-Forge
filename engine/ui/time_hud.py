@@ -147,7 +147,9 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     btn_spacing = 8.0
     text_w = imgui.calc_text_size(date_str)[0]
     btn_w = imgui.calc_text_size(btn_label)[0] + style.frame_padding.x * 2.0
-    total_right_w = text_w + btn_spacing + btn_w
+    ms_btn_label = "Milestones"
+    ms_btn_w = (imgui.calc_text_size(ms_btn_label)[0] + style.frame_padding.x * 2.0 + btn_spacing) if ephemeris_mode_active else 0.0
+    total_right_w = text_w + btn_spacing + btn_w + ms_btn_w
     target_x = bar_w - style.window_padding.x - total_right_w
 
     # If space is too tight for the full timezone string, shorten long timezone name
@@ -157,7 +159,7 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
             short_tz = cur_tz[:4]
         date_str = f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {short_tz}"
         text_w = imgui.calc_text_size(date_str)[0]
-        total_right_w = text_w + btn_spacing + btn_w
+        total_right_w = text_w + btn_spacing + btn_w + ms_btn_w
         target_x = bar_w - style.window_padding.x - total_right_w
 
     if target_x > left_end_x + 10:
@@ -182,5 +184,10 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
             jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
             jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
             jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+
+    if ephemeris_mode_active:
+        imgui.same_line(spacing=btn_spacing)
+        if imgui.button(ms_btn_label):
+            app.camera["show_spacecraft_milestones"] = True
 
     imgui.end()

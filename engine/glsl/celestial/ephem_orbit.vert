@@ -1,10 +1,11 @@
 #version 460 core
-in vec3 in_pos;
+in vec4 in_pos;
 uniform mat4 projection;
 uniform mat4 view_rot;
-uniform vec4 u_cam_pos_double;
-uniform vec3 u_bary_pos;
+uniform dvec4 u_cam_pos_double;
+uniform dvec3 u_bary_pos_double;
 uniform vec3 u_color;
+uniform float u_alpha;
 uniform float u_depth_C;
 uniform float u_far;
 
@@ -13,10 +14,10 @@ uniform float u_far;
 out vec4 f_color;
 out float f_clip_z;
 void main() {
-    vec3 world_pos = in_pos + u_bary_pos;
-    vec3 cam_pos = u_cam_pos_double.xyz;
-    vec3 app_world_pos = apply_refraction(world_pos, cam_pos);
-    vec3 eye_pos = app_world_pos - cam_pos;
+    dvec3 eye_pos_d = (dvec3(in_pos.xyz) + u_bary_pos_double) - u_cam_pos_double.xyz;
+    vec3 eye_pos = vec3(eye_pos_d);
+    vec3 cam_pos = vec3(u_cam_pos_double.xyz);
+    vec3 app_eye_pos = apply_refraction_eye(eye_pos, cam_pos);
 
     vec3 final_rgb = u_color * 0.4;
     float max_c = max(final_rgb.r, max(final_rgb.g, final_rgb.b));
@@ -26,7 +27,12 @@ void main() {
         final_rgb = vec3(0.25);
     }
 
-    f_color = vec4(final_rgb, 1.0);
-    gl_Position = projection * view_rot * vec4(eye_pos, 1.0);
+    float alpha = in_pos.w;
+    if (u_alpha > 0.0) {
+        alpha *= u_alpha;
+    }
+
+    f_color = vec4(final_rgb, alpha);
+    gl_Position = projection * view_rot * vec4(app_eye_pos, 1.0);
     f_clip_z = gl_Position.w;
 }

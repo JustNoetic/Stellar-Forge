@@ -1,16 +1,193 @@
 import math
 import datetime
 import os
+import numpy as np
 import imgui
 from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
 from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic
 from engine.rendering.render_utils import compute_surface_albedo, format_distance_au, sim_time_from_date, format_sim_time_utc
 from engine.ephemeris.system_manager import SystemManager
 
+
+def _track_spacecraft(app, bodies_data, num_bodies, sc_name, focus_camera=True):
+    """Helper to select, inspect and optionally focus camera on a spacecraft body."""
+    for bi in range(min(len(bodies_data), num_bodies)):
+        if bodies_data[bi].get("name") == sc_name:
+            app.camera["tracking_idx"] = bi
+            app.camera["tracking_is_cmp"] = False
+            app.camera["tracking_bary"] = False
+            app.camera["tracking_mode"] = "body"
+            app.camera["cam_look"] = "aim"
+            app.camera["inspected_idx"] = bi
+            app.camera["inspected_is_cmp"] = False
+            app.camera["inspect_bary"] = False
+            app.show_inspector = True
+            if focus_camera:
+                # Approach offset: ~50,000 km (~0.00035 AU) for good vantage of spacecraft and parent planet
+                app.camera["cam_pos_rel"] = np.array([0.0, 0.00015, 0.00035], dtype='f8')
+                app.camera["approach_delta"] = 0.0
+            return True
+    return False
+
+
+def render_spacecraft_milestones_modal(app, bodies_data, num_bodies, ephem_active):
+    """Render dedicated historic spacecraft milestones dialog (Ephemeris mode only)."""
+    if not app.camera.get("show_spacecraft_milestones", False):
+        return
+    if not ephem_active:
+        app.camera["show_spacecraft_milestones"] = False
+        return
+
+    imgui.set_next_window_size(560, 580, imgui.FIRST_USE_EVER)
+    imgui.set_next_window_position(app.fb_width // 2 - 280, app.fb_height // 2 - 290, imgui.FIRST_USE_EVER)
+    expanded, app.camera["show_spacecraft_milestones"] = imgui.begin("Historic Spacecraft Milestones###spacecraft_milestones_modal", True)
+    if not expanded:
+        imgui.end()
+        return
+
+    imgui.text_colored("Historic Spacecraft Missions & Milestones", 0.4, 0.8, 1.0)
+    imgui.text_wrapped("Explore pivotal scientific encounters and orbital maneuvers with real-time SPICE ephemeris trajectories.")
+    imgui.spacing()
+
+    auto_track = app.camera.setdefault("milestone_auto_track", True)
+    _, app.camera["milestone_auto_track"] = imgui.checkbox("Auto-track and focus spacecraft upon jumping", app.camera["milestone_auto_track"])
+    imgui.separator()
+
+    def do_jump(y, m, d, h, mn, s, sc_name):
+        target_t = sim_time_from_date(y, m, d, h, mn, s, is_utc=True)
+        app.time_ctrl["sync_t"] = target_t
+        app.camera["jump_use_utc"] = True
+        if app.camera.get("milestone_auto_track", True):
+            _track_spacecraft(app, bodies_data, num_bodies, sc_name)
+
+    if imgui.begin_tab_bar("spacecraft_milestone_tabs"):
+        # ── 1. Artemis II Tab ──
+        if imgui.begin_tab_item("Artemis II (2026)")[0]:
+            imgui.spacing()
+            artemis_idx = next((i for i, b in enumerate(bodies_data[:num_bodies]) if b.get("name") == "Artemis II"), None)
+            if artemis_idx is not None:
+                imgui.text_colored("[ACTIVE] Artemis II SPICE Ephemeris Active", 0.3, 1.0, 0.4)
+                imgui.same_line()
+                if imgui.button("Focus Orion##btn_artemis"):
+                    _track_spacecraft(app, bodies_data, num_bodies, "Artemis II")
+            else:
+                imgui.text_colored("[INACTIVE] Artemis II kernel not loaded in active system.", 1.0, 0.8, 0.3)
+                imgui.same_line()
+                if imgui.button("Open Kernel Settings...##artemis_cfg"):
+                    app._show_ephem_setup_modal = True
+
+            imgui.text_wrapped("NASA's first crewed mission under the Artemis program. The Orion spacecraft carries 4 astronauts on a lunar flyby free-return trajectory.")
+            imgui.spacing()
+
+            imgui.begin_child("artemis_milestones_scroll", 0, -40, border=True)
+
+            artemis_milestones = [
+                ("1. ICPS Stage Separation", 2026, 4, 2, 2, 0, 0,
+                 "2026-04-02 02:00:00 UTC (MET 03:24:18)",
+                 "Orion separates from the Interim Cryogenic Propulsion Stage into a 23.6-hour high Earth elliptical checkout orbit (Liftoff Apr 1 22:35 UTC)."),
+                ("2. High-Perigee Pass & TLI Burn", 2026, 4, 2, 23, 46, 13,
+                 "2026-04-02 23:46:13 UTC",
+                 "Perigee close pass (1,949 km altitude) & Trans-Lunar Injection maneuver committing Orion to lunar transit."),
+                ("3. Lunar Flyby Closest Approach", 2026, 4, 6, 22, 42, 26,
+                 "2026-04-06 22:42:26 UTC",
+                 "Closest approach to the lunar farside (~4,804 km altitude / 6,541 km distance from Moon center) under free-return gravity assist."),
+                ("4. Atmospheric Entry Interface", 2026, 4, 10, 23, 50, 0,
+                 "2026-04-10 23:50:00 UTC",
+                 "Final SPK ephemeris state before high-speed atmospheric entry at ~11 km/s (Pacific splashdown Apr 11 00:07 UTC)."),
+            ]
+
+            for title, y, m, d, h, mn, s, badge, desc in artemis_milestones:
+                imgui.push_id(title)
+                imgui.text_colored(title, 0.0, 1.0, 1.0)
+                imgui.same_line()
+                imgui.text_colored(f"[{badge}]", 0.7, 0.8, 0.9)
+                imgui.text_wrapped(desc)
+                if imgui.button(f"Jump to Epoch##{title}"):
+                    do_jump(y, m, d, h, mn, s, "Artemis II")
+                imgui.same_line()
+                if imgui.button(f"Focus##{title}"):
+                    _track_spacecraft(app, bodies_data, num_bodies, "Artemis II")
+                imgui.spacing()
+                imgui.separator()
+                imgui.pop_id()
+
+            imgui.end_child()
+            imgui.end_tab_item()
+
+        # ── 2. Cassini-Huygens Tab ──
+        if imgui.begin_tab_item("Cassini-Huygens (2004-2017)")[0]:
+            imgui.spacing()
+            cassini_idx = next((i for i, b in enumerate(bodies_data[:num_bodies]) if b.get("name") == "Cassini"), None)
+            if cassini_idx is not None:
+                imgui.text_colored("[ACTIVE] Cassini SPICE Ephemeris Active", 0.3, 1.0, 0.4)
+                imgui.same_line()
+                if imgui.button("Focus Cassini##btn_cassini"):
+                    _track_spacecraft(app, bodies_data, num_bodies, "Cassini")
+            else:
+                imgui.text_colored("[INACTIVE] Cassini kernel not loaded in active system.", 1.0, 0.8, 0.3)
+                imgui.same_line()
+                if imgui.button("Open Kernel Settings...##cassini_cfg"):
+                    app._show_ephem_setup_modal = True
+
+            imgui.text_wrapped("Flagship 13-year mission by NASA/ESA/ASI exploring Saturn, its spectacular rings, and moon systems, culminating in the Grand Finale.")
+            imgui.spacing()
+
+            imgui.begin_child("cassini_milestones_scroll", 0, -40, border=True)
+
+            cassini_milestones = [
+                ("1. Saturn Orbit Insertion (SOI)", 2004, 7, 1, 2, 48, 0,
+                 "2004-07-01 02:48:00 UTC",
+                 "Main engine burn firing for 96 minutes to brake into orbit, flying through the gap between Saturn's F and G rings."),
+                ("2. Huygens Probe Separation", 2004, 12, 25, 2, 0, 0,
+                 "2004-12-25 02:00:00 UTC",
+                 "Release of ESA's Huygens probe on a 21-day ballistic collision course to descend and land on the surface of Titan."),
+                ("3. Enceladus Cryovolcanic Plumes", 2005, 7, 14, 19, 55, 0,
+                 "2005-07-14 19:55:00 UTC",
+                 "Historic 175 km close flyby discovering active cryovolcanic geysers erupting from south polar fractures."),
+                ("4. Saturn Ring Plane Equinox", 2009, 8, 11, 12, 0, 0,
+                 "2009-08-11 12:00:00 UTC",
+                 "Sun illuminates the ring plane edge-on, casting dramatic vertical shadows from embedded moonlets and exposing ring spokes."),
+                ("5. Grand Finale Dive #1", 2017, 4, 26, 9, 0, 0,
+                 "2017-04-26 09:00:00 UTC",
+                 "First of 22 daring dives through the unexplored 2,000 km gap between Saturn's upper atmosphere and its innermost D ring."),
+                ("6. The Grand Finale: Final Atmospheric Plunge", 2017, 9, 15, 10, 31, 0,
+                 "2017-09-15 10:31:00 UTC",
+                 "Terminal dive into Saturn's atmosphere, transmitting continuous real-time science data until spacecraft disintegration."),
+            ]
+
+            for title, y, m, d, h, mn, s, badge, desc in cassini_milestones:
+                imgui.push_id(title)
+                imgui.text_colored(title, 0.95, 0.65, 0.35)
+                imgui.same_line()
+                imgui.text_colored(f"[{badge}]", 0.7, 0.8, 0.9)
+                imgui.text_wrapped(desc)
+                if imgui.button(f"Jump to Epoch##{title}"):
+                    do_jump(y, m, d, h, mn, s, "Cassini")
+                imgui.same_line()
+                if imgui.button(f"Focus##{title}"):
+                    _track_spacecraft(app, bodies_data, num_bodies, "Cassini")
+                imgui.spacing()
+                imgui.separator()
+                imgui.pop_id()
+
+            imgui.end_child()
+            imgui.end_tab_item()
+
+        imgui.end_tab_bar()
+
+    imgui.spacing()
+    if imgui.button("Close##close_spacecraft_milestones", width=-1):
+        app.camera["show_spacecraft_milestones"] = False
+
+    imgui.end()
+
+
 def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, num_bodies, mass_snap, pos_snap_render, vel_snap_render, visual_arr, cur_y, cur_m, cur_d, display_t, switch_triggers, cur_h=0, cur_mn=0, cur_s=0, cur_tz="UTC"):
     """Render all popup dialogs and modal windows."""
     load_system_from_data = switch_triggers["load_system"]
     trigger_ephem_switch = switch_triggers["ephem_switch"]
+    ephem_active = app.shared_state.get("ephemeris_mode", False)
+    kepler_active = app.shared_state.get("keplerian_mode", False)
 
     # ── 1. Graphics & Quality Settings Modal ──
     if app.camera.get("show_settings_modal", False):
@@ -391,7 +568,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             "Saturn Moons": ["sat441.bsp", "sat455.bsp", "sat456.bsp", "sat457.bsp", "sat459.bsp"],
             "Uranus Moons": ["ura111.bsp"],
             "Neptune Moons": ["nep095.bsp", "nep105.bsp", "nep104.bsp"],
-            "Pluto System": ["plu060.bsp"]
+            "Pluto System": ["plu060.bsp"],
+            "Spacecraft Missions": ["artemis2.bsp", "cassini.bsp"]
         }
 
         for group_name, k_list in groups.items():
@@ -557,19 +735,26 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             if imgui.button("-1 Year"):
                 jd[0] -= 1
 
+            if ephem_active:
+                imgui.spacing()
+                imgui.text_colored("Spacecraft Historic Milestones:", 0.4, 0.8, 1.0)
+                if imgui.button("Open Spacecraft Milestones Modal...", width=-1):
+                    app.camera["show_spacecraft_milestones"] = True
+                imgui.spacing()
+
             imgui.separator()
             # Action button
             if ephem_active or kepler_active:
                 imgui.text_wrapped("Directly synchronizes the celestial positions to the specified target epoch.")
                 imgui.spacing()
-                if imgui.button("🚀 Jump to Date", width=-1):
+                if imgui.button("Jump to Date", width=-1):
                     target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5], is_utc=use_utc)
                     app.time_ctrl["sync_t"] = target_t
                     app.camera["show_jump_modal"] = False
             else:
                 imgui.text_wrapped("Integrates an accurate 1,000-step N-body trajectory from the current time to the target date, opening an interactive timeline scrubber.")
                 imgui.spacing()
-                if imgui.button("⏳ Render Timeline to Date", width=-1):
+                if imgui.button("Render Timeline to Date", width=-1):
                     target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5], is_utc=use_utc)
                     app.time_ctrl["target_t"] = target_t
                     app.time_ctrl["cancel_render"] = False
@@ -580,3 +765,6 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             if imgui.button("Close", width=-1):
                 app.camera["show_jump_modal"] = False
         imgui.end()
+
+    # ── 7. Dedicated Historic Spacecraft Milestones Modal (Ephemeris Mode) ──
+    render_spacecraft_milestones_modal(app, bodies_data, num_bodies, ephem_active)

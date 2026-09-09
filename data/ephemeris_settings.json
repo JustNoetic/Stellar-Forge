@@ -17,5 +17,6 @@
     "nep105.bsp": false,
     "plu060.bsp": false,
     "mar099s.bsp": false,
-    "artemis2.bsp": true
+    "artemis2.bsp": true,
+    "cassini.bsp": true
 }

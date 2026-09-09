@@ -1956,8 +1956,11 @@ class App(InputHandlerMixin):
         uniform_orbit_far = prog_gpu_orbits['u_far']
         uniform_orbit_depth_C = prog_gpu_orbits['u_depth_C']
     
-        vbo_ephem_orbits = ctx.buffer(reserve=1000 * 12)
+        vbo_ephem_orbits = ctx.buffer(reserve=6000 * 12)
         vao_ephem_orbits = ctx.vertex_array(prog_ephem_orbits, [(vbo_ephem_orbits, '3f', 'in_pos')])
+
+        vbo_cassini_orbits = ctx.buffer(reserve=3000 * 16)
+        vao_cassini_orbits = ctx.vertex_array(prog_ephem_orbits, [(vbo_cassini_orbits, '4f', 'in_pos')])
     
         uniform_ring_centers = prog_spheres['u_ring_center']
         uniform_ring_normals = prog_spheres['u_ring_normal']
@@ -2327,12 +2330,18 @@ class App(InputHandlerMixin):
                     keplerian_mode_active = False
                     self.shared_state["keplerian_mode"] = False
                     self._artemis_polyline_loaded = False
+                    self._cassini_trail_loaded = False
+                    self._cassini_trail_len = 0
+                    self._cassini_trail_et = None
                 elif is_ephem_exit:
                     ephemeris_mode_active = False
                     active_system_name = switch_req_name
                     self.shared_state["ephemeris_mode"] = False
                     self._artemis_polyline_loaded = False
                     self._artemis_polyline_len = 0
+                    self._cassini_trail_loaded = False
+                    self._cassini_trail_len = 0
+                    self._cassini_trail_et = None
                     if to_keplerian:
                         keplerian_mode_active = True
                         self.shared_state["keplerian_mode"] = True
@@ -3146,6 +3155,9 @@ class App(InputHandlerMixin):
                     self._ephem_mapping = sys_mgr_spice.get_body_mapping(bodies_data, et_epoch)
                     self._ephem_mapping_ver = id(bodies_data)
                     self._ephem_mapping_len = len(bodies_data)
+                    self._artemis_polyline_loaded = False
+                    self._cassini_trail_loaded = False
+                    self._cassini_trail_et = None
                     
                 sys_mgr_spice.populate_states_fast(et, self._ephem_mapping, pos_snap_render, vel_snap_render, spice_valid_mask)
     
@@ -3885,15 +3897,30 @@ class App(InputHandlerMixin):
                         np.zeros(3, dtype='f8'))
                     last_orbit_pos_snap = pos_snap_render.copy()
 
-                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded and not getattr(self, "_artemis_polyline_loaded", False):
-                        if -1024 in getattr(self, "_ephem_mapping", []):
-                            pts = sys_mgr_spice.get_trajectory_polyline(-1024, observer_id=399, num_samples=1000)
-                            if pts is not None:
-                                if vbo_ephem_orbits.size < pts.nbytes:
-                                    vbo_ephem_orbits.orphan(pts.nbytes)
-                                vbo_ephem_orbits.write(pts.tobytes())
-                                self._artemis_polyline_len = len(pts)
-                                self._artemis_polyline_loaded = True
+                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
+                        if not getattr(self, "_artemis_polyline_loaded", False):
+                            if -1024 in getattr(self, "_ephem_mapping", []):
+                                pts = sys_mgr_spice.get_trajectory_polyline(-1024, observer_id=399, num_samples=5000)
+                                if pts is not None:
+                                    if vbo_ephem_orbits.size < pts.nbytes:
+                                        vbo_ephem_orbits.orphan(pts.nbytes)
+                                    vbo_ephem_orbits.write(pts.tobytes())
+                                    self._artemis_polyline_len = len(pts)
+                                    self._artemis_polyline_loaded = True
+
+                        if -82 in getattr(self, "_ephem_mapping", []):
+                            last_c_et = getattr(self, "_cassini_trail_et", None)
+                            if last_c_et is None or abs(et - last_c_et) > 86400.0 * 2.0:
+                                c_pts = sys_mgr_spice.get_spacecraft_trail(-82, observer_id=699, center_et=et, window_days=30.0, num_samples=2000)
+                                if c_pts is not None:
+                                    if vbo_cassini_orbits.size < c_pts.nbytes:
+                                        vbo_cassini_orbits.orphan(c_pts.nbytes)
+                                    vbo_cassini_orbits.write(c_pts.tobytes())
+                                    self._cassini_trail_len = len(c_pts)
+                                    self._cassini_trail_loaded = True
+                                    self._cassini_trail_et = et
+                                else:
+                                    self._cassini_trail_len = 0
                     
                     if n_orbits > 0:
                         valid_orbits = orbit_data_buf[:n_orbits]
@@ -4600,22 +4627,50 @@ class App(InputHandlerMixin):
                             earth_idx = bi
                             break
                     if earth_idx is not None and earth_idx < num_bodies:
-                        earth_pos = pos_snap_render[earth_idx].astype('f4')
+                        earth_pos_f8 = pos_snap_render[earth_idx]
                         if 'projection' in prog_ephem_orbits:
                             prog_ephem_orbits['projection'].write(projection)
                         if 'view_rot' in prog_ephem_orbits:
                             prog_ephem_orbits['view_rot'].write(view_rot)
                         if 'u_cam_pos_double' in prog_ephem_orbits:
                             prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                        if 'u_bary_pos' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_bary_pos'].value = tuple(earth_pos)
+                        if 'u_bary_pos_double' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_bary_pos_double'].value = (float(earth_pos_f8[0]), float(earth_pos_f8[1]), float(earth_pos_f8[2]))
                         if 'u_color' in prog_ephem_orbits:
                             prog_ephem_orbits['u_color'].value = (0.0, 1.0, 1.0)
+                        if 'u_alpha' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_alpha'].value = 1.0
                         if 'u_far' in prog_ephem_orbits:
                             prog_ephem_orbits['u_far'].value = far
                         if 'u_depth_C' in prog_ephem_orbits:
                             prog_ephem_orbits['u_depth_C'].value = depth_C
                         vao_ephem_orbits.render(moderngl.LINE_STRIP, vertices=self._artemis_polyline_len)
+
+                if ephemeris_mode_active and getattr(self, "_cassini_trail_len", 0) > 0:
+                    saturn_idx = None
+                    for bi, b in enumerate(bodies_data):
+                        if b.get("name") == "Saturn":
+                            saturn_idx = bi
+                            break
+                    if saturn_idx is not None and saturn_idx < num_bodies:
+                        saturn_pos_f8 = pos_snap_render[saturn_idx]
+                        if 'projection' in prog_ephem_orbits:
+                            prog_ephem_orbits['projection'].write(projection)
+                        if 'view_rot' in prog_ephem_orbits:
+                            prog_ephem_orbits['view_rot'].write(view_rot)
+                        if 'u_cam_pos_double' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                        if 'u_bary_pos_double' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_bary_pos_double'].value = (float(saturn_pos_f8[0]), float(saturn_pos_f8[1]), float(saturn_pos_f8[2]))
+                        if 'u_color' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_color'].value = (0.95, 0.65, 0.35)
+                        if 'u_alpha' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_alpha'].value = 1.0
+                        if 'u_far' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_far'].value = far
+                        if 'u_depth_C' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_depth_C'].value = depth_C
+                        vao_cassini_orbits.render(moderngl.LINE_STRIP, vertices=self._cassini_trail_len)
 
                 if self.comparison_enabled and self.n_orbits_cmp > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -4674,7 +4729,9 @@ class App(InputHandlerMixin):
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
 
             has_artemis_orbit = ephemeris_mode_active and getattr(self, "_artemis_polyline_len", 0) > 0
-            if show_orbits and (n_orbits > 0 or has_artemis_orbit or (self.comparison_enabled and self.n_orbits_cmp > 0)):
+            has_cassini_orbit = ephemeris_mode_active and getattr(self, "_cassini_trail_len", 0) > 0
+            has_spacecraft_orbit = has_artemis_orbit or has_cassini_orbit
+            if show_orbits and (n_orbits > 0 or has_spacecraft_orbit or (self.comparison_enabled and self.n_orbits_cmp > 0)):
                 if self.orbit_msaa_fbo is not None:
                     # Orbit lines get their own MSAA buffer; the resolved result is
                     # blended back over the (non-MSAA) scene afterwards.

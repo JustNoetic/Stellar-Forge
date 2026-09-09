@@ -215,15 +215,17 @@ spectral classification.
   - `check_missing_kernels()` (~L185) — compares settings vs on-disk.
   - `download_kernels_async(on_complete)` (~L196) — threaded download with progress hook.
   - `load_kernels(force=False)` (~L308) — `spiceypy.furnsh`.
-  - `_discover_bodies()` (~L332) — enumerate SPICE IDs.
+  - `_discover_bodies()` (~L332) — enumerate SPICE IDs (incl. spacecraft Artemis II `-1024`, Cassini `-82`).
   - `datetime_to_et(dt)` (~L374), `get_body_state(body_id, et)` (~L386),
     `get_all_states(et)` (~L422).
   - `get_body_mapping(bodies_data, test_et)` (~L446) — match JSON bodies → SPICE IDs.
   - `populate_states_fast(et, mapping, pos_out, vel_out, valid_out)` (~L473) — batch state query.
   - `_get_body_properties(body_id, fallback_mass_kg, fallback_radius_km)` (~L513).
   - `build_ephemeris_system(et, template_bodies)` (~L559) — assembles bodies_data for Ephemeris Mode.
+  - `get_trajectory_polyline(body_id, observer_id, num_samples)` (~L846) — adaptive curvature arc-length resampling for spacecraft polylines (Artemis II).
+  - `get_spacecraft_trail(body_id, observer_id, center_et, window_days, num_samples)` (~L924) — sliding-window trajectory trail with cosine-squared alpha fading for long missions (Cassini).
 
-**Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build.
+**Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build, spacecraft trajectory polylines.
 
 ### 3.9 `engine/physics/star_calc.py` (365 lines)
 - `StarCalculator` (~L3) — all `@staticmethod`/`@classmethod`:
@@ -242,7 +244,7 @@ spectral classification.
   - `culling_compute_shader` (`glsl/compute/culling.comp`) — GPU frustum/occlusion culling compute.
   - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres (with ray refraction `compute_refraction_angle` & vertex bounding expansion). Fully-subpixel fragments (f_subpixel_factor > 0.999) are discarded so the 3 px min-size-clamped mesh never writes phantom depth over the subpixel star sprite (transit black-out fix).
   - `orbit_compute_shader` (`glsl/compute/orbit.comp`), `orbit_*` (`glsl/celestial/orbit.*`).
-  - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`).
+  - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`) — Spacecraft ephemeris trajectory rendering; uses 64-bit Relative-to-Eye (RTE) double-precision subtraction (`uniform dvec4 u_cam_pos_double; uniform dvec3 u_bary_pos_double;`) eliminating high-frequency orbit jitter, with per-vertex alpha decay (`in vec4 in_pos`, `u_alpha`).
   - `ring_*` (`glsl/celestial/ring.*`), `hz_*` (`glsl/celestial/hz.*`).
   - `atmo_*` (`glsl/atmosphere/atmo.*`), `atmo_lut_*`, `multi_scatter_lut_*` — Volumetric raymarching atmosphere shaders (with primary ray refraction & vertex bounding expansion).
   - `point_celestial.*` (`glsl/celestial/`) — Subpixel point-light quad pass (apparent_px < 3.0); refracts the body's apparent position via `apply_refraction` (parallax-weighted with Newton-Raphson inverse apparent solver `solve_refraction_apparent` and solid-body occlusion guard), cross-fades against the mesh over apparent_px ∈ [2.0, 3.0]. Star sprites apply analytic circle-circle transit/occultation occlusion against all casters (true (Rp/Rs)² transit depth, partial phases for subpixel eclipses).
@@ -355,15 +357,16 @@ spectral classification.
 
 ### 3.14 `engine/ui/` — Modular Dear ImGui Interface ('Orion UI')
 - `__init__.py`: Master `render_ui` orchestrator coordinating all UI passes when `app.ui_visible` is True.
-- `menu_bar.py`: `render_main_menu_bar` — Systems switch/create/delete, Physics modes (IAS15, Keplerian, SPICE), View (Free Flight, Simple Orbit, FOV, UI toggles), Render (MSAA, HDR, Atmosphere, Refraction, Planetshine, Ringshine), Tools (Ephemeris, Comparison, Distance Units, Accumulation), Quick HUD (physics badge, F12 Screenshot button, Settings cog).
-- `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, and Jump in Time popup / timeline playback & scrubbing.
+- `menu_bar.py`: `render_main_menu_bar` — Systems switch/create/delete, Physics modes (IAS15, Keplerian, SPICE, Spacecraft Historic Milestones modal trigger), View (Free Flight, Simple Orbit, FOV, UI toggles), Render (MSAA, HDR, Atmosphere, Refraction, Planetshine, Ringshine), Tools (Ephemeris, Spacecraft Historic Milestones, Comparison, Distance Units, Accumulation), Quick HUD (physics badge, F12 Screenshot button, Settings cog).
+- `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, Milestones button (Ephemeris mode), and Jump in Time popup / timeline playback & scrubbing.
 - `outliner.py`: `render_system_outliner` — Left-anchored hierarchy tree with real-time substring search filter, inline + / - CRUD buttons, and comparison system tree.
 - `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Overview (physical + stellar properties, photometric albedo readouts), Orbit (osculating Keplerian elements, precession rates, Roche limit check, interactive editor), Atmosphere, Rings, and Cosmetics.
-- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric refraction and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, and SPICE Downloader.
+- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric refraction and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, SPICE Downloader, Jump to Date / Render Timeline, and Dedicated Spacecraft Historic Milestones Modal (`render_spacecraft_milestones_modal`: Artemis II and Cassini-Huygens with auto-track & camera focus).
 - `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
 
 ### 3.15 `scripts/`
 - `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
+- `fetch_cassini_kernel.py` — queries NASA JPL Horizons for Cassini Cartesian state vectors (57,887 records, 2-hr cadence) over the full 2004–2017 mission and compiles Type 9 SPK binary kernel `cassini.bsp`.
 - `accuracy_test.py` — `get_parent_center(body_name, parent_name)`, `main()`. Runs 1-yr forward integration vs JPL Horizons, prints RTN km error table.
 - `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
 - `calibrate_moon_albedo.py` — calibrates a diffuse texture so its cos(latitude)-weighted mean *linear* reflectance matches a real-world albedo target (default 0.12, the Moon's actual surface reflectance). Applies the scale in linear space via an exact 256-entry sRGB LUT (`--path`, `--target`, `--quality`). Originals are backed up under `textures_originals/` before overwriting.

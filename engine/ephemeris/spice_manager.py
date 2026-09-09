@@ -34,7 +34,8 @@ class SpiceManager:
         "nep105.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep105.bsp",
         "plu060.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/plu060.bsp",
         "mar099s.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp",
-        "artemis2.bsp": "HORIZONS_API"
+        "artemis2.bsp": "HORIZONS_API",
+        "cassini.bsp": "HORIZONS_API"
     }
     
     KERNEL_DESCRIPTIONS = {
@@ -42,6 +43,7 @@ class SpiceManager:
         "pck00010.tpc": "Planetary Constants (Required)",
         "de440s.bsp": "Planetary Ephemeris (Required)",
         "artemis2.bsp": "Artemis II Lunar Flyby (Orion) [144KB]",
+        "cassini.bsp": "Cassini Saturn Tour (2004-2017) [3.1MB]",
         "jup347.bsp": "Irregular Jupiter Moons (879MB)",
         "jup348.bsp": "Irregular Jupiter Moons (57MB)",
         "jup349.bsp": "Irregular Jupiter Moons (93MB)",
@@ -80,6 +82,17 @@ class SpiceManager:
             "is_spacecraft": True,
             "mission_start_utc": "2026-04-02 02:00:00",
             "mission_end_utc": "2026-04-10 23:50:00"
+        },
+        -82: {
+            "name": "Cassini",
+            "type": "Spacecraft",
+            "color": "#e6a15c",
+            "radius_km": 0.005,
+            "mass_kg": 5600.0,
+            "parentId": "Saturn",
+            "is_spacecraft": True,
+            "mission_start_utc": "2004-07-01 14:00:00",
+            "mission_end_utc": "2017-09-15 10:00:00"
         },
         499: {"name": "Mars", "type": "Planet", "color": "#c1440e", "radius_km": 3389.5, "mass_kg": 6.4171e23},
         401: {"name": "Phobos", "type": "Moon", "color": "#a0a0a0", "radius_km": 11.26, "mass_kg": 1.0659e16},
@@ -257,6 +270,30 @@ class SpiceManager:
                             self.download_progress = (i + frac) / total_files
                             self.download_status = f"Artemis II: {msg}"
                         ok, msg, _ = generate_artemis2_spk(output_dir=self.KERNEL_DIR, progress_callback=_artemis_hook)
+                        if not ok:
+                            raise RuntimeError(msg)
+                    except Exception as e:
+                        if self.cancel_requested:
+                            self.download_status = "Download cancelled."
+                        else:
+                            print(f"[SPICE] Failed to generate {filename}: {e}")
+                            self.download_status = f"Error generating {filename}"
+                            self.download_error = str(e)
+                        self.is_downloading = False
+                        return
+                    continue
+
+                if filename == "cassini.bsp":
+                    self.current_download_file = filename
+                    self.download_status = f"Generating {filename} from JPL Horizons ({i+1}/{total_files})..."
+                    try:
+                        from scripts.fetch_cassini_kernel import generate_cassini_spk
+                        def _cassini_hook(frac, msg):
+                            if self.cancel_requested:
+                                raise InterruptedError("Download cancelled by user.")
+                            self.download_progress = (i + frac) / total_files
+                            self.download_status = f"Cassini: {msg}"
+                        ok, msg, _ = generate_cassini_spk(output_dir=self.KERNEL_DIR, progress_callback=_cassini_hook)
                         if not ok:
                             raise RuntimeError(msg)
                     except Exception as e:
@@ -806,10 +843,11 @@ class SpiceManager:
             
         return bodies_data
 
-    def get_trajectory_polyline(self, body_id=-1024, observer_id=399, num_samples=1000):
+    def get_trajectory_polyline(self, body_id=-1024, observer_id=399, num_samples=5000):
         """
         Samples the 3D trajectory of a body relative to an observer (e.g. Earth 399)
-        across its mission duration. Returns an (N, 3) float32 numpy array in engine render frame:
+        across its mission duration with curvature- and proximity-adaptive arc-length resampling.
+        Returns an (N, 3) float32 numpy array in engine render frame:
         X = x * KM_TO_AU, Y = z * KM_TO_AU, Z = -y * KM_TO_AU.
         """
         if not self.kernels_loaded:
@@ -818,18 +856,154 @@ class SpiceManager:
         if not info or "mission_start_utc" not in info:
             return None
         try:
+            from scipy.interpolate import CubicSpline
+
             et_start = spice.str2et(info["mission_start_utc"])
             et_end = spice.str2et(info["mission_end_utc"])
-            et_samples = np.linspace(et_start, et_end, num_samples)
-            points = np.empty((num_samples, 3), dtype=np.float32)
+
+            # 1. Sample raw states densely in time across the mission
+            n_raw = 10000
+            raw_et = np.linspace(et_start, et_end, n_raw)
+            raw_pos = np.empty((n_raw, 3), dtype=np.float64)
+            for i, t in enumerate(raw_et):
+                st, _ = spice.spkgeo(body_id, t, 'ECLIPJ2000', observer_id)
+                raw_pos[i] = st[:3]
+
+            # 2. Fit smooth physical trajectory in time
+            spl_t = CubicSpline(raw_et, raw_pos)
+
+            # 3. Compute raw segment distances and turning angles (curvature)
+            diffs = np.diff(raw_pos, axis=0)
+            ds = np.linalg.norm(diffs, axis=1)
+
+            v1 = diffs[:-1]
+            v2 = diffs[1:]
+            dots = np.sum(v1 * v2, axis=1)
+            norms = ds[:-1] * ds[1:]
+            raw_angles = np.arccos(np.clip(dots / np.maximum(norms, 1e-12), -1.0, 1.0))
+            avg_ds = 0.5 * (ds[:-1] + ds[1:])
+            kappa_pts = raw_angles / np.maximum(avg_ds, 1e-3)
+            seg_kappa = np.concatenate([[kappa_pts[0]], 0.5 * (kappa_pts[:-1] + kappa_pts[1:]), [kappa_pts[-1]]])
+
+            # 4. Compute proximity-based weights (observer e.g. Earth, and Moon if relative to Earth)
+            r_obs = np.linalg.norm(raw_pos, axis=1)
+            r_obs_mid = 0.5 * (r_obs[:-1] + r_obs[1:])
+
+            w = 1.0 + 800.0 * seg_kappa + (40000.0 / np.maximum(r_obs_mid, 6400.0))**1.6
+
+            if observer_id == 399:
+                try:
+                    moon_et = np.linspace(et_start, et_end, 200)
+                    moon_pos_coarse = np.array([spice.spkgeo(301, t, 'ECLIPJ2000', 399)[0][:3] for t in moon_et])
+                    moon_spl = CubicSpline(moon_et, moon_pos_coarse)
+                    moon_pos = moon_spl(raw_et)
+                    r_moon = np.linalg.norm(raw_pos - moon_pos, axis=1)
+                    r_m_mid = 0.5 * (r_moon[:-1] + r_moon[1:])
+                    w += (30000.0 / np.maximum(r_m_mid, 1750.0))**2.0
+                except Exception:
+                    pass
+
+            # 5. Resample evenly along weighted cumulative arc length
+            cum_w = np.concatenate([[0.0], np.cumsum(ds * w)])
+            s_target = np.linspace(0.0, cum_w[-1], num_samples)
+            t_targets = np.interp(s_target, cum_w, raw_et)
+
+            pts = spl_t(t_targets)
+
+            # 6. Convert to engine render frame (X=x, Y=z, Z=-y) in AU
+            render_pts = np.empty((num_samples, 3), dtype=np.float32)
             km_to_au = float(self.KM_TO_AU)
-            for i, et in enumerate(et_samples):
-                st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', observer_id)
-                # Engine render frame swap: X=x, Y=z, Z=-y
-                points[i, 0] = float(st[0] * km_to_au)
-                points[i, 1] = float(st[2] * km_to_au)
-                points[i, 2] = float(-st[1] * km_to_au)
-            return points
+            render_pts[:, 0] = pts[:, 0] * km_to_au
+            render_pts[:, 1] = pts[:, 2] * km_to_au
+            render_pts[:, 2] = -pts[:, 1] * km_to_au
+            return render_pts
         except Exception as e:
             print(f"[SPICE] Failed to sample trajectory polyline for {body_id}: {e}")
+            return None
+
+    def get_spacecraft_trail(self, body_id=-82, observer_id=699, center_et=None, window_days=30.0, num_samples=2000):
+        """
+        Samples a sliding-window 3D trajectory trail for a spacecraft centered around `center_et`
+        relative to an observer body (e.g. Saturn 699/6).
+        Returns an (N, 4) float32 numpy array:
+        X = x * KM_TO_AU, Y = z * KM_TO_AU, Z = -y * KM_TO_AU, W = alpha (fades to 0 at edges).
+        """
+        if not self.kernels_loaded:
+            return None
+        info = self.SPICE_BODIES.get(body_id)
+        if not info or "mission_start_utc" not in info:
+            return None
+        try:
+            from scipy.interpolate import CubicSpline
+
+            m_start = spice.str2et(info["mission_start_utc"])
+            m_end = spice.str2et(info["mission_end_utc"])
+
+            if center_et is None:
+                center_et = m_start + 86400.0
+
+            window_sec = float(window_days) * 86400.0
+            # If current time is far outside mission, no trail
+            if center_et < m_start - window_sec or center_et > m_end + window_sec:
+                return None
+
+            t_start = max(center_et - window_sec, m_start)
+            t_end = min(center_et + window_sec, m_end)
+            if t_end - t_start < 3600.0:
+                return None
+
+            # Resolve observer (e.g. Saturn 699 vs Saturn Barycenter 6)
+            obs_id = observer_id
+            if observer_id in (699, 6):
+                try:
+                    spice.spkgeo(699, center_et, 'ECLIPJ2000', 0)
+                    obs_id = 699
+                except Exception:
+                    obs_id = 6
+
+            # Dense sample in time
+            n_raw = 1000
+            raw_et = np.linspace(t_start, t_end, n_raw)
+            raw_pos = np.empty((n_raw, 3), dtype=np.float64)
+            for i, t in enumerate(raw_et):
+                st, _ = spice.spkgeo(body_id, t, 'ECLIPJ2000', obs_id)
+                raw_pos[i] = st[:3]
+
+            spl_t = CubicSpline(raw_et, raw_pos)
+            diffs = np.diff(raw_pos, axis=0)
+            ds = np.linalg.norm(diffs, axis=1)
+
+            v1 = diffs[:-1]
+            v2 = diffs[1:]
+            dots = np.sum(v1 * v2, axis=1)
+            norms = ds[:-1] * ds[1:]
+            raw_angles = np.arccos(np.clip(dots / np.maximum(norms, 1e-12), -1.0, 1.0))
+            avg_ds = 0.5 * (ds[:-1] + ds[1:])
+            kappa_pts = raw_angles / np.maximum(avg_ds, 1e-3)
+            seg_kappa = np.concatenate([[kappa_pts[0]], 0.5 * (kappa_pts[:-1] + kappa_pts[1:]), [kappa_pts[-1]]])
+
+            r_obs = np.linalg.norm(raw_pos, axis=1)
+            r_obs_mid = 0.5 * (r_obs[:-1] + r_obs[1:])
+
+            w = 1.0 + 500.0 * seg_kappa + (100000.0 / np.maximum(r_obs_mid, 60000.0))**1.6
+            cum_w = np.concatenate([[0.0], np.cumsum(ds * w)])
+            s_target = np.linspace(0.0, cum_w[-1], num_samples)
+            t_targets = np.interp(s_target, cum_w, raw_et)
+
+            pts = spl_t(t_targets)
+
+            # Cosine-squared fading window: 1.0 at center_et, 0.0 at edges
+            d_t = np.abs(t_targets - center_et) / window_sec
+            alphas = np.cos(np.clip(d_t, 0.0, 1.0) * (np.pi * 0.5)) ** 2
+
+            render_pts = np.empty((num_samples, 4), dtype=np.float32)
+            km_to_au = float(self.KM_TO_AU)
+            render_pts[:, 0] = pts[:, 0] * km_to_au
+            render_pts[:, 1] = pts[:, 2] * km_to_au
+            render_pts[:, 2] = -pts[:, 1] * km_to_au
+            render_pts[:, 3] = alphas.astype(np.float32)
+
+            return render_pts
+        except Exception as e:
+            print(f"[SPICE] Failed to sample spacecraft trail for {body_id}: {e}")
             return None

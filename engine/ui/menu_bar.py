@@ -106,6 +106,9 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                     app.shared_state["keplerian_export"] = True
 
         if ephemeris_mode_active:
+            if imgui.menu_item("Spacecraft Historic Milestones...")[0]:
+                app.camera["show_spacecraft_milestones"] = True
+
             if imgui.menu_item("Export to N-Body System")[0]:
                 switch_triggers["ephem_export"](display_t, cur_y, cur_m, cur_d)
 
@@ -266,6 +269,10 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                 jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
                 jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
                 jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+
+        if ephemeris_mode_active:
+            if imgui.menu_item("Spacecraft Historic Milestones...")[0]:
+                app.camera["show_spacecraft_milestones"] = True
 
         if imgui.menu_item("SPICE Ephemeris Kernel Settings...")[0]:
             app._show_ephem_setup_modal = True
