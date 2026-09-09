@@ -305,6 +305,7 @@ def main():
         fails.append("offscreen star lensing")
 
     ctx.release()
+
     if fails:
         print(f"\nSummary: FAILED ({fails})")
         return 1

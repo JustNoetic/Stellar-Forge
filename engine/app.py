@@ -5114,7 +5114,7 @@ class App(InputHandlerMixin):
                         fov_starfield_deg, aspect_ratio, near, far, dtype='f8'
                     )
                     prog_starfield['projection'].write(proj_starfield_f8.astype('f4').tobytes())
-                    prog_starfield['screen_height'].value = float(self.starfield_tex.height)
+                    prog_starfield['screen_height'].value = float(self.fb_height)
 
                     # Pass 1: Render unlensed starfield into self.starfield_fbo with expanded coverage
                     self.starfield_fbo.use()
@@ -5138,6 +5138,7 @@ class App(InputHandlerMixin):
                     p_lens = self.prog_grav_lens_starfield
                     if 'u_starfield_tex' in p_lens:
                         p_lens['u_starfield_tex'].value = 0
+
                     cam_right = view_f8[:3, 0]
                     cam_up = view_f8[:3, 1]
                     cam_fwd = -view_f8[:3, 2]

@@ -139,8 +139,7 @@ void main() {
 
     // Project deflected sightline V_deflected into camera screen space:
     float z_c = dot(V_deflected, u_cam_forward);
-    // If deflected behind the camera plane, it cannot be seen in this screen buffer:
-    if (z_c <= 1e-6) {
+    if (z_c <= 1e-4) {
         discard;
     }
 
@@ -148,15 +147,14 @@ void main() {
         dot(V_deflected, u_cam_right) / (z_c * tan_sf.x),
         dot(V_deflected, u_cam_up) / (z_c * tan_sf.y)
     );
-    vec2 uv_deflected = ndc_deflected * 0.5 + 0.5;
 
-    // Check bounds [0, 1]
-    if (uv_deflected.x < 0.0 || uv_deflected.x > 1.0 || uv_deflected.y < 0.0 || uv_deflected.y > 1.0) {
+    if (abs(ndc_deflected.x) > 1.0 || abs(ndc_deflected.y) > 1.0) {
         discard;
     }
 
-    // Sample unlensed starfield with bilinear filtering:
+    vec2 uv_deflected = ndc_deflected * 0.5 + 0.5;
     vec4 star_color = texture(u_starfield_tex, uv_deflected);
+
     if (dot(star_color.rgb, star_color.rgb) <= 1e-12) {
         discard;
     }
