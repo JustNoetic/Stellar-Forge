@@ -523,7 +523,7 @@ void main() {
             single_scatter_s = scatteredLight * phaseFunc * unlit_mult;
             
             // Isotropic multiple scattering only applies to backscattering chunks, not pure forward-scattering dust
-            ms_s = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * (1.0 - balance) * unlit_mult;
+            ms_s = onLitSide ? (AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * (1.0 - balance) * unlit_mult) : 0.0;
 
             // Opposition surge: brightening at low phase angles on single scattering (lit side only)
             if (onLitSide) {

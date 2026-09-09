@@ -266,13 +266,12 @@ void main() {
 
         // Multiple scattering
         float ms_sunlit = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, tau_phys, true) * ms_weight;
-        float ms_unlit  = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, tau_phys, false) * ms_weight;
 
         // Opposition surge
         float surge = OppositionSurge(-cos_theta_phase, tau_phys);
 
-        vec3 band_color_sunlit = band_raw_rgb * (scatteredLight_sunlit * pf * surge + (plane_is_textured ? ms_sunlit : 0.0));
-        vec3 band_color_unlit  = band_raw_rgb * (scatteredLight_unlit * pf + (plane_is_textured ? ms_unlit : 0.0)) * layer_unlit;
+        vec3 band_color_sunlit = band_raw_rgb * (scatteredLight_sunlit * pf * surge + ms_sunlit);
+        vec3 band_color_unlit  = band_raw_rgb * (scatteredLight_unlit * pf) * layer_unlit;
         vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
 
         // --- PLANETARY SHADOW ON RING (CDF & LUT) ---
