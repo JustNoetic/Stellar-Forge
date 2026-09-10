@@ -60,7 +60,6 @@ void main() {
         return;
     }
 
-
     // Lens-centric camera coordinates in km:
     vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
 
@@ -111,12 +110,16 @@ void main() {
     if (abs(u_grav_lens_spin) > 1e-4) {
         vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
         float s_min = -dot(C_km, V);
-        vec3 P_min = C_km + s_min * V;
-        float b_km = max(length(P_min), u_grav_lens_rs * 1.5);
-        
-        // Frame-dragging angle dphi ~ 2*G*J / (c^3 * b^2) = a_* * rs^2 / b^2
-        float drag_angle = (u_grav_lens_spin * u_grav_lens_rs * u_grav_lens_rs * 2.0) / (b_km * b_km);
-        drag_angle = clamp(drag_angle, -0.75, 0.75);
+        float r_c = max(length(C_km), u_grav_lens_rs * 1.5);
+        float cos_t = clamp(s_min / r_c, -1.0, 1.0);
+        float b_eff;
+        if (s_min > 0.0) {
+            vec3 P_min = C_km + s_min * V;
+            b_eff = max(length(P_min), u_grav_lens_rs * 1.5);
+        } else {
+            b_eff = r_c;
+        }
+        float drag_angle = clamp((u_grav_lens_spin * u_grav_lens_rs * u_grav_lens_rs * (1.0 + cos_t)) / (b_eff * b_eff), -0.75, 0.75);
         
         // Rodrigues rotation of V_deflected around pole_n by drag_angle:
         V_deflected = V_deflected * cos(drag_angle) 

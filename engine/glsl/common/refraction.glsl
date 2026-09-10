@@ -91,41 +91,48 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
 
     float rs = u_grav_lens_rs;
     float r_cam_km = length(C_km);
-    float metric_factor = sqrt(max(1e-4, 1.0 - rs / max(1e-4, r_cam_km)));
+    if (r_cam_km < 1e-4) return 0.0;
+
     float s_min = -dot(C_km, V);
+    float cos_theta = clamp(s_min / r_cam_km, -1.0, 1.0);
+
+    // Closest approach along the ray line: P_min = C_km + s_min * V
     vec3 P_min = C_km + s_min * V;
-    float b = length(P_min) / metric_factor; // impact parameter in km
+    float metric_factor = sqrt(max(1e-4, 1.0 - rs / max(1e-4, r_cam_km)));
+    float b = max(1e-4, length(P_min) / metric_factor); // impact parameter in km
 
     // Gralla-Lupsasca direction-aware Kerr critical shadow radius b_c(phi, theta_o)
     float b_c = grav_critical_b(C_km, P_min);
 
-    // Ray capture for black hole shadow
-    if (u_grav_lens_type == 3 && b <= b_c && s_min > 0.0 && (d_km <= 0.0 || s_min < d_km)) {
+    // Ray capture for black hole shadow:
+    // Only inward-heading rays (s_min > 0) whose impact parameter plunges inside b_c
+    if (u_grav_lens_type == 3 && s_min > 0.0 && b <= b_c && (d_km <= 0.0 || s_min < d_km)) {
         is_shadow = true;
         return 0.0;
     }
 
-    if (b < 1e-4) return 0.0;
+    // Unified weak-field geometric deflection integral:
+    // Integrates the transverse gravitational acceleration along the segment [0, d_km]
+    // (or [0, infinity) for distant catalog stars).
+    // Closed form: alpha_weak = (rs / b) * ( d_s / sqrt(b^2 + d_s^2) + cos_theta )
+    //   - For theta < 90 (s_min > 0): approaches full Einstein deflection (2 * rs / b) as s_min >> b
+    //   - At theta = 90 (s_min = 0): exactly (rs / b) = (rs / r_cam)
+    //   - For theta > 90 (s_min < 0): matches (rs / r_cam) * cot(theta / 2) with zero discontinuity
+    //   - At theta = 180 (cos_theta = -1): smoothly vanishes to 0.0
+    float d_s = (d_km > 0.0) ? (d_km - s_min) : 1e12;
+    float denom_s = sqrt(b * b + d_s * d_s);
+    float term_s = d_s / max(1e-6, denom_s);
+    float term_0 = cos_theta;
+    float geom_sum = max(0.0, term_s + term_0);
+    float alpha_weak = (rs / b) * geom_sum;
 
-    // Finite-distance geometric factor along ray segment [0, d_km] (or [0, inf) for catalog stars)
-    float denom_0 = sqrt(b * b + s_min * s_min);
-    float term_0 = s_min / max(1e-6, denom_0);
-    float term_s = 1.0;
-    if (d_km > 0.0) {
-        float d_s = d_km - s_min;
-        float denom_s = sqrt(b * b + d_s * d_s);
-        term_s = d_s / max(1e-6, denom_s);
-    }
-    float geom_factor = clamp(0.5 * (term_s + term_0), 0.0, 1.0);
-
-    // Weak field Einstein deflection: 2 * rs / b
-    float alpha_weak = 2.0 * rs / b;
-
-    // Higher-order 2PN correction: (15*pi/16) * (rs/b)^2
-    // Scaled by peri_factor so rays pointing away from the lens (s_min <= 0)
-    // stay purely weak-field along r >= d_l without virtual periastron blowup.
+    // Strong-field and higher-order 2PN periastron corrections:
+    // These effects arise strictly from near-horizon periapsis passage.
+    // They are smoothly scaled by peri_factor = clamp(cos_theta, 0.0, 1.0) so they
+    // activate for inward-moving rays approaching the Kerr photon sphere and
+    // smoothly vanish to zero as s_min -> 0 (no virtual periastron behind observer).
+    float peri_factor = clamp(cos_theta, 0.0, 1.0);
     float b_ratio = rs / b;
-    float peri_factor = clamp(term_0, 0.0, 1.0);
     float alpha_2pn = alpha_weak + 2.945243 * b_ratio * b_ratio * peri_factor;
     float alpha_gr = alpha_2pn;
 
@@ -163,8 +170,7 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
     }
 
     float strength = u_grav_lens_strength > 0.0 ? u_grav_lens_strength : 1.0;
-    float final_alpha = alpha_gr * geom_factor * strength;
-    return max(0.0, final_alpha);
+    return max(0.0, alpha_gr * strength);
 }
 
 // Deflection of background sources (stars, orbits, point lights) past the lens.
@@ -200,7 +206,32 @@ vec3 apply_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_s
     vec3 cross_LV = cross(L, V);
     float sin_beta = length(cross_LV);
     float cos_beta = dot(L, V);
-    if (cos_beta <= 0.0) { if (secondary) g_grav_magnification = 0.0; return V; } // Source is behind the camera / past 90 degrees
+    if (cos_beta <= 0.0) {
+        if (secondary) {
+            g_grav_magnification = 0.0;
+            return V;
+        }
+        // Outward regime (source at beta >= 90 deg from lens):
+        // Smooth cot(beta/2) deflection away from lens axis:
+        vec3 u_dir;
+        if (sin_beta > 1e-7) {
+            u_dir = cross(cross_LV, L) / sin_beta;
+        } else {
+            vec3 ref = abs(L.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+            u_dir = normalize(cross(L, ref));
+        }
+        float geom = 1.0;
+        if (d_km > 0.0) {
+            float s_min = d_l_km * cos_beta;
+            float d_s = d_km - s_min;
+            float b_line = d_l_km * sin_beta;
+            geom = clamp(d_s / max(1e-6, sqrt(b_line * b_line + d_s * d_s)), 0.0, 1.0);
+        }
+        float strength = u_grav_lens_strength > 0.0 ? u_grav_lens_strength : 1.0;
+        float alpha_out = (u_grav_lens_rs / d_l_km) * (sin_beta / max(1e-4, 1.0 - cos_beta)) * geom * strength;
+        g_grav_magnification = 1.0;
+        return normalize(V * cos(alpha_out) + u_dir * sin(alpha_out));
+    }
     float beta = atan(sin_beta, cos_beta);
 
     // If source is strictly in front of the lens plane along the optical axis,

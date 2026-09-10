@@ -358,6 +358,26 @@ void main() {
                 }
             }
         }
+
+        // Kerr spin frame-dragging (Lense-Thirring):
+        // Precesses the deflected sightline around the spin axis pole_n.
+        if (abs(u_grav_lens_spin) > 1e-4) {
+            vec3 spin_pole = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
+            float r_c = max(length(C_km), u_grav_lens_rs * 1.5);
+            float s_min_km = -dot(C_km, view_ray);
+            float cos_t = clamp(s_min_km / r_c, -1.0, 1.0);
+            float b_eff;
+            if (s_min_km > 0.0) {
+                vec3 P_min = C_km + s_min_km * view_ray;
+                b_eff = max(length(P_min), u_grav_lens_rs * 1.5);
+            } else {
+                b_eff = r_c;
+            }
+            float drag_angle = clamp((u_grav_lens_spin * u_grav_lens_rs * u_grav_lens_rs * (1.0 + cos_t)) / (b_eff * b_eff), -0.75, 0.75);
+            float cd = cos(drag_angle);
+            float sd = sin(drag_angle);
+            ray_dir = normalize(ray_dir * cd + cross(spin_pole, ray_dir) * sd + spin_pole * dot(spin_pole, ray_dir) * (1.0 - cd));
+        }
     }
 
     vec3 pole_n = pole_n_pre;

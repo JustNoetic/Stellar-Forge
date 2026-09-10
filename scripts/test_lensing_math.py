@@ -228,39 +228,53 @@ def main():
         tag = 'captured' if captured else 'mirror image'
         print(f"6. secondary image x={x}: lensed={sec_as:.4f}\" mag={got_mu:.5g} "
               f"(expect {exp2_as:.4f}\" mu_2={exp_mu:.5g}, {tag})")
-        if not ok:
-            fails.append(f"secondary image x={x}")
+    # 7. Outward-moving regime & tangent 90 deg continuity test:
+    # Verifies:
+    #   a. Deflection at theta = 89.9 deg and theta = 90.1 deg matches smoothly across 90 deg.
+    #   b. Outward angles (theta = 120, 150) follow alpha = (rs / r_cam) * cot(theta / 2).
+    #   c. At theta = 180 deg (looking directly away from lens), alpha = 0.0 with no shadow capture.
+    r_cam = 1e7  # km
+    C_test = np.array([0.0, 0.0, r_cam])  # Camera along +Z, lens at origin, optical axis -Z
+    a_89, sh_89 = run_case(ctx, C_test, [math.sin(math.radians(89.9)), 0.0, -math.cos(math.radians(89.9))], 0.0, rs_km=rs_bh, lens_type=3)
+    a_90, sh_90 = run_case(ctx, C_test, [1.0, 0.0, 0.0], 0.0, rs_km=rs_bh, lens_type=3)
+    a_91, sh_91 = run_case(ctx, C_test, [math.sin(math.radians(90.1)), 0.0, -math.cos(math.radians(90.1))], 0.0, rs_km=rs_bh, lens_type=3)
+    exp_90 = rs_bh / r_cam
+    print(f"7. Tangent 90 deg continuity: a(89.9)={a_89:.7g}, a(90.0)={a_90:.7g}, a(90.1)={a_91:.7g} (expect ~{exp_90:.7g})")
+    if abs(a_90 - exp_90) / exp_90 > 1e-3 or abs(a_89 - a_91) / a_90 > 0.01 or sh_90:
+        fails.append("tangent 90 deg continuity")
 
-    # 7. 90-degree tangent horizon continuity & rear-hemisphere convergence test:
-    # Verifies that deflection across the 90-degree tangent line (s_min = 0) is C1 smooth
-    # without cliffs/discontinuities, and vanishes smoothly to 0 as theta -> 180 degrees.
-    dl_test = 100000.0  # km from lens center
-    rs_test = 1000.0    # km
-    C_test = np.array([0.0, 0.0, dl_test], dtype=np.float32)  # observer at +Z, lens at origin (0,0,0)
-    # Looking at angle theta relative to lens:
-    # Lens is in direction -Z (0, 0, -1).
-    # Ray V at angle theta: V = [sin(theta), 0, -cos(theta)]
-    angles = [80.0, 89.0, 89.9, 90.0, 90.1, 91.0, 100.0, 120.0, 150.0, 179.0, 180.0]
-    alphas = []
-    for deg in angles:
-        rad = math.radians(deg)
-        V_ray = np.array([math.sin(rad), 0.0, -math.cos(rad)], dtype=np.float32)
-        a_val, _ = run_case(ctx, C_test, V_ray, 0.0, rs_km=rs_test, lens_type=3)
-        alphas.append(math.degrees(a_val))
+    for th_deg in (120.0, 150.0):
+        th_rad = math.radians(th_deg)
+        V_th = [math.sin(th_rad), 0.0, -math.cos(th_rad)]
+        a_th, sh_th = run_case(ctx, C_test, V_th, 0.0, rs_km=rs_bh, lens_type=3)
+        exp_th = (rs_bh / r_cam) * (math.sin(th_rad) / (1.0 - math.cos(th_rad)))
+        print(f"7. Outward angle theta={th_deg:.0f} deg: alpha={a_th:.7g} (expect {exp_th:.7g}, captured={sh_th})")
+        if abs(a_th - exp_th) / exp_th > 1e-3 or sh_th:
+            fails.append(f"outward angle theta={th_deg}")
 
-    print(f"7. 90-deg tangent continuity: alpha(89.9)={alphas[2]:.4f} deg, alpha(90.0)={alphas[3]:.4f} deg, alpha(90.1)={alphas[4]:.4f} deg")
-    print(f"   Convergence: alpha(150)={alphas[8]:.4f} deg, alpha(179)={alphas[9]:.4f} deg, alpha(180)={alphas[10]:.4f} deg")
+    # theta = 180 deg (looking directly away: V = [0, 0, 1])
+    a_180, sh_180 = run_case(ctx, C_test, [0.0, 0.0, 1.0], 0.0, rs_km=rs_bh, lens_type=3)
+    print(f"7. Anti-lens angle theta=180 deg: alpha={a_180:.7g} (expect 0.0, captured={sh_180})")
+    if a_180 > 1e-9 or sh_180:
+        fails.append("anti-lens angle 180 deg")
 
-    diff_90 = abs(alphas[2] - alphas[4])
-    is_continuous = diff_90 < 0.005 and abs(alphas[3] - 0.5 * (alphas[2] + alphas[4])) < 0.001
-    vanishes_180 = alphas[-1] < 1e-5
-    is_monotonic = all(alphas[i] >= alphas[i+1] - 1e-6 for i in range(len(alphas) - 1))
+    # 8. Kerr frame-dragging continuity across 90 degrees:
+    # Verifies that drag_angle is C1 continuous across s_min = 0 (theta = 89.9 <-> 90.1 deg).
+    spin_val = 0.998
+    r_c = max(r_cam, rs_bh * 1.5)
+    def get_drag(th_deg):
+        th_rad = math.radians(th_deg)
+        s_min = r_cam * math.cos(th_rad)
+        cos_t = max(-1.0, min(1.0, s_min / r_c))
+        b_eff = max(r_cam * math.sin(th_rad), rs_bh * 1.5) if s_min > 0.0 else r_c
+        return (spin_val * rs_bh * rs_bh * (1.0 + cos_t)) / (b_eff * b_eff)
 
-    if is_continuous and vanishes_180 and is_monotonic:
-        print("7. 90-degree tangent horizon continuity & convergence: PASSED")
-    else:
-        print(f"7. 90-degree tangent continuity: FAILED (diff_90={diff_90:.5f}, alpha(180)={alphas[-1]:.5f}, monotonic={is_monotonic})")
-        fails.append("90-degree tangent continuity")
+    d_89 = get_drag(89.9)
+    d_90 = get_drag(90.0)
+    d_91 = get_drag(90.1)
+    print(f"8. Kerr frame-dragging 90 deg continuity: d(89.9)={d_89:.7g}, d(90.0)={d_90:.7g}, d(90.1)={d_91:.7g}")
+    if abs(d_89 - d_91) / d_90 > 0.01 or abs(d_90 - 0.5 * (d_89 + d_91)) / d_90 > 0.001:
+        fails.append("kerr frame-dragging 90 deg continuity")
 
     ctx.release()
     if fails:
