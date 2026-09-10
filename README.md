@@ -267,16 +267,15 @@ Planetary clouds are rendered using an independent oblate geometry shell dynamic
 
 ### Gravitational Lensing & Black Hole Shadows
 - **Active Lens Selection**: Every frame the engine scores all bodies (primary + comparison system) by characteristic deflection strength `r_s / d`, boosted ×1000 for black holes, ×100 for neutron stars, and ×5000 for the currently inspected body, and binds the winner as the active gravitational lens (`u_grav_lens_*` uniforms) across all active programs.
-- **Deflection Model** (`common/refraction.glsl`): Weak-field Einstein deflection `2 r_s / b`, 2PN correction `(15π/16)(r_s/b)²`, strong-field logarithmic divergence approaching the photon sphere, a direction-aware Kerr critical radius `b_c(φ)` and Lense-Thirring frame-dragging lateral deflection for spinning lenses.
-- **Lensed Rendering**: Background bodies, atmospheres, orbits, habitable zones, and subpixel point lights are deflected through the shared `apply_refraction` path (captured rays converge onto the lens and are depth-occluded by the shadow). Mesh bounding geometry additionally expands by the Einstein angle `θ_E = √(2 r_s d_ls / (d_l d_s))` so lensed arcs are never clipped.
-- **Screen-Space Sky Gravitational Lensing (GAIA Starfield)**: Unlike forward point sprites which break into discrete points under strong lensing, the 475k-star GAIA catalog renders into an offscreen HDR floating-point starfield buffer (`self.starfield_fbo`), which is then processed by a screen-space backward gravitational deflection pass (`post/grav_lens_starfield.frag`). This inverse ray-deflection pass:
-  - Dynamically deflects backward sightlines towards the lens using 2PN-corrected Einstein deflection $\alpha = \frac{2 r_s}{b} + \frac{15\pi}{16}\left(\frac{r_s}{b}\right)^2$ and logarithmic strong-field divergence.
-  - Generates continuous, unbroken curved Einstein rings and arcs around the lens with native subpixel crispness.
+- **Deflection Model** (`common/refraction.glsl`): **Gralla–Lupsasca (2020) analytical Kerr lensing**, featuring the exact closed-form Kerr shadow boundary $b_c(\phi)$, universal fractional Lyapunov exponent $\gamma(a_*, \phi)$, matched 2PN Einstein deflection $\alpha = \frac{2 r_s}{b} + \frac{15\pi}{16}\left(\frac{r_s}{b}\right)^2$, and universal logarithmic photon-ring singularity $\alpha \sim -\frac{1}{\gamma}\ln\left(\frac{b-b_c}{b_c}\right)$ with Lense-Thirring spin frame-dragging.
+- **Unified Screen-Space Gravitational Lensing (Approach A)**: Rather than fracturing geometry across separate forward approximations, background subpixel point lights ($d > d_{\text{lens}}$) and the 475k-star GAIA catalog are rendered unlensed into an offscreen HDR floating-point overscan buffer (`self.starfield_fbo`), which is then processed by a unified screen-space backward gravitational deflection pass (`post/grav_lens_starfield.frag`). This inverse ray-deflection pass:
+  - Dynamically deflects backward sightlines towards the lens using the Gralla–Lupsasca matched asymptotic Kerr formulation.
+  - Generates continuous, unbroken curved Einstein rings and arcs around the lens with native subpixel crispness for both stars and planets.
   - Naturally produces secondary mirror images inside $\theta_E$ by sampling the opposite side of the starfield buffer.
   - Accurately captures Kerr spin frame-dragging (Lense-Thirring Rodrigues precession) without coordinate blowups.
-  - Automatically respects black hole shadow silhouettes ($b < b_c$) with correct depth occlusion (`gl_FragDepth = 0.999999`).
-  - Eliminates duplicate catalog draw calls by replacing the multi-catalog forward pass with a single rasterization pass.
-- **Black Hole Shadows**: A black hole's size is derived directly from its mass — event horizon `r_s = 2GM/c²` (any stored `r` property is ignored) — and its own mesh renders the photon-capture shadow silhouette `b_c = (3√3/2) r_s` as a depth-writing black disk with spin-dependent silhouette asymmetry, kept mesh-resolved (min 3 px) and exempt from photometric culling.
+  - Automatically respects black hole shadow silhouettes ($b \le b_c$) with correct depth occlusion (`gl_FragDepth = 0.999999`).
+  - Distant 3D meshes and atmospheres use the exact same Gralla–Lupsasca backward deflection kernel in their fragment shaders.
+- **Black Hole Shadows**: A black hole's size is derived directly from its mass — event horizon `r_s = 2GM/c²` (any stored `r` property is ignored) — and its own mesh renders the photon-capture shadow silhouette `b_c(\phi)` as a depth-writing black disk with spin-dependent silhouette asymmetry, kept mesh-resolved (min 3 px) and exempt from photometric culling.
 
 ### HDR, Bloom & Orbit MSAA
 1. **Bright Pass Filtering**: Isolates high-intensity pixels above a configurable threshold.

@@ -36,6 +36,10 @@ uniform float fov_factor;
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform vec3 u_camera_pos;
+uniform bool u_lensing_to_starfield;
+uniform float u_lens_dist;
+uniform mat4 u_custom_projection;
+uniform bool u_use_custom_proj;
 
 #include "common/refraction.glsl"
 
@@ -82,12 +86,55 @@ void main() {
         return;
     }
 
-    float aspect = projection[1][1] / max(1e-6, projection[0][0]);
+    mat4 cur_proj = u_use_custom_proj ? u_custom_projection : projection;
+    float aspect = cur_proj[1][1] / max(1e-6, cur_proj[0][0]);
     float screen_width = screen_height * aspect;
 
-    vec3 app_world_pos = apply_refraction(in_offset, u_camera_pos);
+    float dist_to_cam = length(in_offset - u_camera_pos);
+    float lens_dist = (u_lens_dist > 0.0) ? u_lens_dist : length(u_grav_lens_center - u_camera_pos);
 
-    vec4 center_clip = projection * view * vec4(app_world_pos, 1.0);
+    // Screen-space Gravitational Lensing Routing (Approach A):
+    // When u_lensing_to_starfield is true (pass 1: rendering into starfield_fbo with overscan):
+    //   - Background bodies (dist_to_cam > lens_dist) render unlensed into the starfield buffer.
+    //   - Foreground bodies (dist_to_cam <= lens_dist) are culled in this pass.
+    // When u_lensing_to_starfield is false (pass 2: rendering into scene hdr_resolve_fbo):
+    //   - If lensing is active, background bodies were already captured by starfield_fbo and will be
+    //     deflected in screen space, so cull them here to avoid duplicate rendering.
+    //   - Foreground bodies (in front of the lens) render directly here.
+    if (u_lensing_to_starfield) {
+        if (!u_grav_lens_enabled || u_grav_lens_rs <= 1e-6 || dist_to_cam <= lens_dist) {
+            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+            f_color = vec3(0.0);
+            f_is_star = 0.0;
+            f_clip_z = 1.0;
+            f_center_px = vec2(-10000.0);
+            f_apparent_px = 0.0;
+            f_half_size_px = 0.0;
+            f_surface_color = vec3(0.0);
+            return;
+        }
+    } else if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6) {
+        if (dist_to_cam > lens_dist) {
+            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+            f_color = vec3(0.0);
+            f_is_star = 0.0;
+            f_clip_z = 1.0;
+            f_center_px = vec2(-10000.0);
+            f_apparent_px = 0.0;
+            f_half_size_px = 0.0;
+            f_surface_color = vec3(0.0);
+            return;
+        }
+    }
+
+    // When rendering into the starfield buffer for screen-space lensing,
+    // apply only atmospheric refraction; gravitational deflection will be applied
+    // continuously across the screen in the post-process pass!
+    vec3 app_world_pos = u_lensing_to_starfield
+        ? apply_atmospheric_refraction(in_offset, u_camera_pos)
+        : apply_refraction(in_offset, u_camera_pos);
+
+    vec4 center_clip = cur_proj * view * vec4(app_world_pos, 1.0);
     if (center_clip.w <= 1e-6) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         return;

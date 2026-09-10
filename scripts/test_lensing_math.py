@@ -231,6 +231,37 @@ def main():
         if not ok:
             fails.append(f"secondary image x={x}")
 
+    # 7. 90-degree tangent horizon continuity & rear-hemisphere convergence test:
+    # Verifies that deflection across the 90-degree tangent line (s_min = 0) is C1 smooth
+    # without cliffs/discontinuities, and vanishes smoothly to 0 as theta -> 180 degrees.
+    dl_test = 100000.0  # km from lens center
+    rs_test = 1000.0    # km
+    C_test = np.array([0.0, 0.0, dl_test], dtype=np.float32)  # observer at +Z, lens at origin (0,0,0)
+    # Looking at angle theta relative to lens:
+    # Lens is in direction -Z (0, 0, -1).
+    # Ray V at angle theta: V = [sin(theta), 0, -cos(theta)]
+    angles = [80.0, 89.0, 89.9, 90.0, 90.1, 91.0, 100.0, 120.0, 150.0, 179.0, 180.0]
+    alphas = []
+    for deg in angles:
+        rad = math.radians(deg)
+        V_ray = np.array([math.sin(rad), 0.0, -math.cos(rad)], dtype=np.float32)
+        a_val, _ = run_case(ctx, C_test, V_ray, 0.0, rs_km=rs_test, lens_type=3)
+        alphas.append(math.degrees(a_val))
+
+    print(f"7. 90-deg tangent continuity: alpha(89.9)={alphas[2]:.4f} deg, alpha(90.0)={alphas[3]:.4f} deg, alpha(90.1)={alphas[4]:.4f} deg")
+    print(f"   Convergence: alpha(150)={alphas[8]:.4f} deg, alpha(179)={alphas[9]:.4f} deg, alpha(180)={alphas[10]:.4f} deg")
+
+    diff_90 = abs(alphas[2] - alphas[4])
+    is_continuous = diff_90 < 0.005 and abs(alphas[3] - 0.5 * (alphas[2] + alphas[4])) < 0.001
+    vanishes_180 = alphas[-1] < 1e-5
+    is_monotonic = all(alphas[i] >= alphas[i+1] - 1e-6 for i in range(len(alphas) - 1))
+
+    if is_continuous and vanishes_180 and is_monotonic:
+        print("7. 90-degree tangent horizon continuity & convergence: PASSED")
+    else:
+        print(f"7. 90-degree tangent continuity: FAILED (diff_90={diff_90:.5f}, alpha(180)={alphas[-1]:.5f}, monotonic={is_monotonic})")
+        fails.append("90-degree tangent continuity")
+
     ctx.release()
     if fails:
         print("FAILED:", fails); sys_exit = 1

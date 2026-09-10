@@ -60,18 +60,6 @@ void main() {
         return;
     }
 
-    vec3 L = cam_to_lens / d_l_au; // Optical axis towards lens center
-    float cos_theta = clamp(dot(V, L), -1.0, 1.0);
-
-    // If the lens is behind the camera plane relative to this pixel sightline (cos_theta <= 1e-4):
-    if (cos_theta <= 1e-4) {
-        vec2 ndc_sf = ndc * (u_tan_half_fov / tan_sf);
-        vec4 base_color = texture(u_starfield_tex, ndc_sf * 0.5 + 0.5);
-        if (dot(base_color.rgb, base_color.rgb) <= 1e-12) discard;
-        out_color = base_color;
-        gl_FragDepth = 0.999999;
-        return;
-    }
 
     // Lens-centric camera coordinates in km:
     vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;

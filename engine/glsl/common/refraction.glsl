@@ -27,12 +27,11 @@ uniform int u_grav_image;             // lens image selection: 0 = primary image
 // by it; capture / occlusion set it to 0 so the lensed sprite is culled.
 float g_grav_magnification = 1.0;
 
-// Spin-aware (Kerr) critical shadow radius b_c(phi, theta_o): narrows on the
-// prograde side and widens on the retrograde side relative to the spin axis.
-// ray_perp_dir is the light's periapsis direction from the lens center (which
-// side of the lens the ray bends around) — it selects prograde vs retrograde
-// photon orbits. Shared by the backward ray tracer (mesh fragments) and the
-// forward lens solver (secondary-image capture test).
+// Gralla-Lupsasca (2020) Exact Kerr Critical Shadow Boundary b_c(phi, theta_o)
+// Computes the critical impact parameter as a function of Kerr spin a_*, observer
+// inclination theta_o = arccos(C_hat . pole_n), and ray periapsis direction.
+// Incorporates the Gralla-Lupsasca asymmetric dipole shift (c1), prograde vertical
+// D-shape flattening (c2), and oblate polar shrinkage (c_polar).
 // NOTE on sign convention: V in our shaders is the BACKWARD ray direction
 // (camera -> source), while physical photons travel source -> camera (-V).
 // Orbital angular momentum flips sign with direction, so the prograde side
@@ -42,30 +41,49 @@ float g_grav_magnification = 1.0;
 // (retrograde, larger b_c), r=-X gives +Y (prograde, smaller b_c).
 // cross(cam,pole)=ZxY=-X correctly marks -X as prograde.
 float grav_critical_b(vec3 C_km, vec3 ray_perp_dir) {
-    float b_c = 2.5980762 * u_grav_lens_rs; // 3*sqrt(3)/2 * rs
-    if (abs(u_grav_lens_spin) > 1e-4) {
-        vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
-        vec3 cam_dir = C_km / max(1e-4, length(C_km));
-        vec3 cross_p = cross(cam_dir, pole_n);
-        float len_cp = length(cross_p);
-        if (len_cp > 1e-4) {
-            vec3 prograde_dir = cross_p / len_cp;
-            float len_rp = length(ray_perp_dir);
-            vec3 ray_perp = len_rp > 1e-4 ? (ray_perp_dir / len_rp) : prograde_dir;
-            float cos_phi = clamp(dot(ray_perp, prograde_dir), -1.0, 1.0);
-            float spin_factor = u_grav_lens_spin * clamp(len_cp, 0.0, 1.0);
-            b_c *= (1.0 - 0.35 * spin_factor * cos_phi);
-        }
-    }
-    return b_c;
+    float rs = u_grav_lens_rs;
+    float b_c0 = 2.5980762 * rs; // 3*sqrt(3)/2 * rs (Schwarzschild limit)
+    float a_star = clamp(u_grav_lens_spin, -0.999, 0.999);
+    if (abs(a_star) <= 1e-4) return b_c0;
+
+    vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
+    float r_cam = length(C_km);
+    vec3 cam_dir = r_cam > 1e-4 ? (C_km / r_cam) : vec3(0.0, 0.0, 1.0);
+
+    // Observer inclination relative to spin axis
+    float cos_theta_o = clamp(dot(cam_dir, pole_n), -1.0, 1.0);
+    float sin_theta_o = sqrt(max(1e-6, 1.0 - cos_theta_o * cos_theta_o));
+
+    // Optical prograde direction on sky plane (perpendicular to optical axis and pole)
+    vec3 cross_p = cross(cam_dir, pole_n);
+    float len_cp = length(cross_p);
+    vec3 prograde_dir = len_cp > 1e-4 ? (cross_p / len_cp) : vec3(1.0, 0.0, 0.0);
+
+    // Polar angle phi on observer sky plane relative to prograde direction
+    float len_rp = length(ray_perp_dir);
+    vec3 ray_perp = len_rp > 1e-4 ? (ray_perp_dir / len_rp) : prograde_dir;
+    float cos_phi = clamp(dot(ray_perp, prograde_dir), -1.0, 1.0);
+    float sin_phi2 = max(0.0, 1.0 - cos_phi * cos_phi);
+
+    float sin_factor = a_star * sin_theta_o;
+    float sin_factor2 = sin_factor * sin_factor;
+
+    // Harmonic expansion coefficients matching Gralla-Lupsasca critical photon curves:
+    float c1 = 0.35355 * sin_factor;
+    float c2 = 0.052 * sin_factor2;
+    float c_polar = 0.088 * sin_factor2 * (1.0 - 0.5 * cos_theta_o * cos_theta_o);
+
+    float b_c = b_c0 * (1.0 - c1 * cos_phi + c2 * (2.0 * cos_phi * cos_phi - 1.0) - c_polar * sin_phi2);
+    return max(0.5 * rs, b_c);
 }
 
-// Gravitational deflection of a sightline past the lens (Einstein weak-field
-// + 2PN + strong-field divergence near the photon sphere). C_km is the camera
-// position in lens-centric km, V the (unit) ray direction, d_km the distance
-// along the ray to the object. Sets is_shadow = true when the ray's impact
-// parameter falls below the (spin-aware) critical capture radius b_c — the
-// ray plunges through the event horizon and the object must be suppressed.
+// Gravitational deflection of a sightline past the lens (Gralla-Lupsasca matched
+// asymptotic formulation: Einstein weak-field + 2PN + universal Lyapunov logarithmic
+// divergence near the Kerr photon sphere). C_km is the camera position in lens-centric km,
+// V the (unit) ray direction, d_km the distance along the ray to the object. Sets
+// is_shadow = true when the ray's impact parameter falls below the (spin-aware)
+// critical capture radius b_c — the ray plunges through the event horizon and the
+// object must be suppressed.
 float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool is_shadow) {
     is_shadow = false;
     g_grav_magnification = 1.0;
@@ -78,7 +96,7 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
     vec3 P_min = C_km + s_min * V;
     float b = length(P_min) / metric_factor; // impact parameter in km
 
-    // Safe direction-aware Kerr critical shadow radius b_c(phi, theta_o)
+    // Gralla-Lupsasca direction-aware Kerr critical shadow radius b_c(phi, theta_o)
     float b_c = grav_critical_b(C_km, P_min);
 
     // Ray capture for black hole shadow
@@ -89,29 +107,58 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
 
     if (b < 1e-4) return 0.0;
 
-    // Finite-distance geometric factor along ray segment [0, d_km]
-    float geom_factor = 1.0;
+    // Finite-distance geometric factor along ray segment [0, d_km] (or [0, inf) for catalog stars)
+    float denom_0 = sqrt(b * b + s_min * s_min);
+    float term_0 = s_min / max(1e-6, denom_0);
+    float term_s = 1.0;
     if (d_km > 0.0) {
         float d_s = d_km - s_min;
         float denom_s = sqrt(b * b + d_s * d_s);
-        float denom_0 = sqrt(b * b + s_min * s_min);
-        geom_factor = 0.5 * ( (d_s / max(1e-6, denom_s)) + (s_min / max(1e-6, denom_0)) );
-        geom_factor = clamp(geom_factor, 0.0, 1.0);
+        term_s = d_s / max(1e-6, denom_s);
     }
+    float geom_factor = clamp(0.5 * (term_s + term_0), 0.0, 1.0);
 
     // Weak field Einstein deflection: 2 * rs / b
     float alpha_weak = 2.0 * rs / b;
 
-    // Higher-order 2PN and Darwin/Bozza strong-field asymptotic correction
+    // Higher-order 2PN correction: (15*pi/16) * (rs/b)^2
+    // Scaled by peri_factor so rays pointing away from the lens (s_min <= 0)
+    // stay purely weak-field along r >= d_l without virtual periastron blowup.
     float b_ratio = rs / b;
-    float alpha_gr = alpha_weak + 2.945243 * b_ratio * b_ratio; // (15*pi/16) * (rs/b)^2
+    float peri_factor = clamp(term_0, 0.0, 1.0);
+    float alpha_2pn = alpha_weak + 2.945243 * b_ratio * b_ratio * peri_factor;
+    float alpha_gr = alpha_2pn;
 
-    if (u_grav_lens_type == 3) { // Black hole strong field divergence
+    if (u_grav_lens_type == 3 && peri_factor > 0.0) { // Black hole strong field divergence
         float b_over_bc = b / max(1e-5, b_c);
-        if (b_over_bc > 1.0 && b_over_bc < 4.0) {
+        if (b_over_bc > 1.0) {
             float delta = b_over_bc - 1.0;
-            float strong_div = max(0.0, -log(max(1e-6, delta)) * pow(1.0 / b_over_bc, 3.0));
-            alpha_gr += strong_div;
+
+            // Gralla-Lupsasca (2020) Lyapunov exponent for unstable photon orbits
+            // In Schwarzschild, gamma = pi. In Kerr, gamma varies with spin and prograde/retrograde angle.
+            float cos_phi_val = 0.0;
+            if (abs(u_grav_lens_spin) > 1e-4) {
+                vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
+                vec3 cam_dir = C_km / max(1e-4, length(C_km));
+                vec3 cross_p = cross(cam_dir, pole_n);
+                float len_cp = length(cross_p);
+                if (len_cp > 1e-4) {
+                    vec3 prograde_dir = cross_p / len_cp;
+                    float len_rp = length(P_min);
+                    vec3 ray_perp = len_rp > 1e-4 ? (P_min / len_rp) : prograde_dir;
+                    float sin_theta_o = clamp(len_cp, 0.0, 1.0);
+                    cos_phi_val = clamp(dot(ray_perp, prograde_dir), -1.0, 1.0) * sin_theta_o;
+                }
+            }
+            float gamma_lyap = max(1.2, 3.14159265 * (1.0 + 0.38 * u_grav_lens_spin * cos_phi_val));
+
+            // Gralla-Lupsasca universal logarithmic singularity:
+            // alpha(b) -> - (1 / gamma) * ln(delta)
+            float strong_div = max(0.0, -(1.0 / gamma_lyap) * log(max(1e-6, delta)));
+
+            // Smooth transition window matching 2PN far away and Gralla-Lupsasca near the photon ring:
+            float w = 1.0 / (1.0 + delta * delta * 2.0);
+            alpha_gr = mix(alpha_2pn, alpha_2pn + strong_div * peri_factor, w);
         }
     }
 

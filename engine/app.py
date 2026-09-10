@@ -1326,6 +1326,12 @@ class App(InputHandlerMixin):
     
         prog_spheres = ctx.program(vertex_shader=sphere_vertex_shader, fragment_shader=sphere_fragment_shader)
         prog_point_celestial = ctx.program(vertex_shader=point_celestial_vertex_shader, fragment_shader=point_celestial_fragment_shader)
+        if 'u_lensing_to_starfield' in prog_point_celestial:
+            prog_point_celestial['u_lensing_to_starfield'].value = False
+        if 'u_use_custom_proj' in prog_point_celestial:
+            prog_point_celestial['u_use_custom_proj'].value = False
+        if 'u_lens_dist' in prog_point_celestial:
+            prog_point_celestial['u_lens_dist'].value = 0.0
 
         # GAIA starfield point pass (PROGRAM_POINT_SIZE required for gl_PointSize)
         # Static attribute buffers written ONCE at startup; per-frame position
@@ -4468,6 +4474,14 @@ class App(InputHandlerMixin):
                         prog['u_grav_lens_pole'].value = grav_lens_pole
                     if 'u_au_to_km' in prog:
                         prog['u_au_to_km'].value = au_to_km_val
+                    if 'u_lens_dist' in prog:
+                        if grav_lens_enabled:
+                            dx = grav_lens_center[0] - cam_pos[0]
+                            dy = grav_lens_center[1] - cam_pos[1]
+                            dz = grav_lens_center[2] - cam_pos[2]
+                            prog['u_lens_dist'].value = float(math.sqrt(dx*dx + dy*dy + dz*dz))
+                        else:
+                            prog['u_lens_dist'].value = 0.0
 
             if 'u_is_cloud_pass' in prog_spheres:
                 prog_spheres['u_is_cloud_pass'].value = False
@@ -4492,6 +4506,14 @@ class App(InputHandlerMixin):
             # Pass 2: Dedicated Subpixel / Point Light Pass (apparent_px < 2.5)
             # Tests depth against scene, blends light, does not write depth
             ctx.depth_mask = False
+            if 'u_lensing_to_starfield' in prog_point_celestial:
+                prog_point_celestial['u_lensing_to_starfield'].value = False
+            if 'u_use_custom_proj' in prog_point_celestial:
+                prog_point_celestial['u_use_custom_proj'].value = False
+            if 'screen_height' in prog_point_celestial:
+                prog_point_celestial['screen_height'].value = float(self.fb_height)
+            if 'fov_factor' in prog_point_celestial:
+                prog_point_celestial['fov_factor'].value = float(fov_factor)
             vis_point_buffer.bind_to_storage_buffer(binding=3)
             vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
             _perf_gpu_end(_gq)
@@ -5125,6 +5147,24 @@ class App(InputHandlerMixin):
                     ctx.enable(moderngl.BLEND)
                     ctx.blend_func = (moderngl.ONE, moderngl.ONE)
                     star_vao.render(moderngl.POINTS)
+
+                    # Pass 1b: Render background subpixel point lights into self.starfield_fbo with expanded coverage
+                    # so they are lensed in screen-space with the exact same Gralla-Lupsasca deflection as GAIA stars
+                    if 'u_lensing_to_starfield' in prog_point_celestial:
+                        prog_point_celestial['u_lensing_to_starfield'].value = True
+                        if 'u_use_custom_proj' in prog_point_celestial:
+                            prog_point_celestial['u_use_custom_proj'].value = True
+                        if 'u_custom_projection' in prog_point_celestial:
+                            prog_point_celestial['u_custom_projection'].write(proj_starfield_f8.astype('f4').tobytes())
+                        if 'screen_height' in prog_point_celestial:
+                            prog_point_celestial['screen_height'].value = float(self.starfield_tex.height)
+                        if 'fov_factor' in prog_point_celestial:
+                            prog_point_celestial['fov_factor'].value = float(1.0 / tan_half_y_starfield)
+                        vis_point_buffer.bind_to_storage_buffer(binding=3)
+                        vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
+                        prog_point_celestial['u_lensing_to_starfield'].value = False
+                        if 'u_use_custom_proj' in prog_point_celestial:
+                            prog_point_celestial['u_use_custom_proj'].value = False
 
                     # Pass 2: Screen-space backward gravitational deflection onto the scene HDR buffer
                     self.hdr_resolve_fbo.use()

@@ -99,6 +99,22 @@ void main() {
         }
     }
 
+    // Gravitational Lensing envelope: bodies seen past the lens can be displaced
+    // across the sky by up to theta_E * dist. Widen the frustum-test radius accordingly
+    // so lensed background bodies are not culled at screen edges.
+    if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6) {
+        float d_lens = length(u_grav_lens_center - u_camera_pos);
+        float d_body = length(pos - u_camera_pos);
+        if (d_body > d_lens * 0.7) {
+            float d_ls_km = max(1.0, (d_body - d_lens) * u_au_to_km);
+            float d_l_km = max(1.0, d_lens * u_au_to_km);
+            float d_s_km = max(1.0, d_body * u_au_to_km);
+            float theta_E = sqrt(max(0.0, 2.0 * u_grav_lens_rs * d_ls_km / (d_l_km * d_s_km)));
+            float max_ang = min(0.6, theta_E * 2.5);
+            r_cull += d_body * tan(max_ang) * 1.25;
+        }
+    }
+
     // 1. Frustum Culling
     bool visible = true;
     for (int p = 0; p < 6; p++) {

@@ -24,6 +24,7 @@ import moderngl
 from pyrr import matrix44
 
 from engine.rendering.post_shaders import grav_lens_starfield_shader_vs, grav_lens_starfield_shader_fs
+from engine.rendering.shaders import point_celestial_vertex_shader, point_celestial_fragment_shader
 
 def main():
     ctx = moderngl.create_standalone_context()
@@ -303,6 +304,26 @@ def main():
     else:
         print(f"8. Offscreen star lensing: FAILED (unlensed_max={unlensed_max:.3f}, lensed_peak={offscreen_peak:.3f})")
         fails.append("offscreen star lensing")
+
+    # 9. Point Celestial Shader & Unified Screen-Space Lensing:
+    # Verifies that point_celestial compiles with u_lensing_to_starfield, u_lens_dist,
+    # u_custom_projection, and u_use_custom_proj uniforms for Approach A routing.
+    try:
+        prog_pt = ctx.program(vertex_shader=point_celestial_vertex_shader,
+                              fragment_shader=point_celestial_fragment_shader)
+        has_uniforms = all(u in prog_pt for u in ('u_lensing_to_starfield', 'u_lens_dist',
+                                                  'u_custom_projection', 'u_use_custom_proj'))
+        if has_uniforms:
+            print("9. Point celestial compilation & routing uniforms: PASSED")
+        else:
+            missing = [u for u in ('u_lensing_to_starfield', 'u_lens_dist',
+                                   'u_custom_projection', 'u_use_custom_proj') if u not in prog_pt]
+            print(f"9. Point celestial routing uniforms missing ({missing}): FAILED")
+            fails.append("point celestial uniforms")
+        prog_pt.release()
+    except Exception as e:
+        print(f"9. Point celestial compilation FAILED: {e}")
+        fails.append(f"point celestial compile: {e}")
 
     ctx.release()
 
