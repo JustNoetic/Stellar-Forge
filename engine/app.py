@@ -5348,8 +5348,33 @@ class App(InputHandlerMixin):
             ringed_atmos = [a for a in sorted_atmos if _body_needs_ring_clip(a)]
             ringless_atmos = [a for a in sorted_atmos if not _body_needs_ring_clip(a)]
 
+            def _is_atmo_behind_rings(entry):
+                if n_ring_planes == 0 and not (self.comparison_enabled and getattr(self, 'ring_render_groups_cmp', None)):
+                    return False
+                _sq, _a, _is_c = entry
+                for _k in range(n_ring_planes):
+                    _c_ring = ring_centers_buf[_k, 0:3]
+                    _rk_vec = _c_ring - cam_pos
+                    _d_ring_sq = float(_rk_vec[0]**2 + _rk_vec[1]**2 + _rk_vec[2]**2)
+                    if _sq > _d_ring_sq:
+                        return True
+                if self.comparison_enabled and getattr(self, 'ring_render_groups_cmp', None):
+                    for _g in self.ring_render_groups_cmp:
+                        _bi_cmp = _g['body_idx']
+                        _c_ring = cmp_pos_rel[_bi_cmp]
+                        _rk_vec = _c_ring - cam_pos
+                        _d_ring_sq = float(_rk_vec[0]**2 + _rk_vec[1]**2 + _rk_vec[2]**2)
+                        if _sq > _d_ring_sq:
+                            return True
+                return False
+
+            ringless_behind = [a for a in ringless_atmos if _is_atmo_behind_rings(a)]
+            ringless_front = [a for a in ringless_atmos if not _is_atmo_behind_rings(a)]
+
             # --- Pass 1: Atmosphere behind rings ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
+            if ringless_behind:
+                execute_atmosphere_pass(0, ringless_behind)
             if ringed_atmos:
                 execute_atmosphere_pass(1, ringed_atmos)
             _perf_gpu_end(_gq)
@@ -5589,12 +5614,12 @@ class App(InputHandlerMixin):
                 ctx.disable(moderngl.BLEND)
             _perf_gpu_end(_gq)
     
-            # --- Pass 2: Atmosphere in front of rings & ringless bodies ---
+            # --- Pass 2: Atmosphere in front of rings & ringless bodies in front ---
             _gq = _perf_gpu_begin(ctx, "gpu_atmo_front")
             if ringed_atmos:
                 execute_atmosphere_pass(2, ringed_atmos)
-            if ringless_atmos:
-                execute_atmosphere_pass(0, ringless_atmos)
+            if ringless_front:
+                execute_atmosphere_pass(0, ringless_front)
             _perf_gpu_end(_gq)
 
             # Update temporal reprojection history state for next frame
