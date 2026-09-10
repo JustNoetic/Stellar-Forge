@@ -252,9 +252,6 @@ void main() {
         // front of the fragment (silhouette rays have s_min == d_frag).
         bool is_sh = false;
         compute_gravitational_deflection(C_km, view_ray, 0.0, is_sh);
-        // Min-size clamp regime: the whole (inflated) mesh IS the shadow dot —
-        // the capture test must not shrink it back below the 3 px floor.
-        if (f_apparent_px < f_clamped_min_px) is_sh = true;
         if (is_sh) {
             out_color = vec4(0.0, 0.0, 0.0, 1.0);
             gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);

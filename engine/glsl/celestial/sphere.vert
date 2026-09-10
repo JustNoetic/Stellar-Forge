@@ -177,8 +177,11 @@ void main() {
     float final_radius = in_radius;
     float brightness_scale = 1.0;
 
+    bool is_lens_bh_host = u_grav_lens_enabled && u_grav_lens_type == 3 && u_grav_lens_rs > 1e-6
+        && distance(in_offset, u_grav_lens_center) < 1e-6;
+
     f_clamped_min_px = 3.0;
-    if (apparent_px > 1e-6 && apparent_px < f_clamped_min_px) {
+    if (!is_lens_bh_host && apparent_px > 1e-6 && apparent_px < f_clamped_min_px) {
         final_radius = in_radius * (f_clamped_min_px / apparent_px);
     }
 
@@ -211,8 +214,9 @@ void main() {
 
     // Background body deflection: distant bodies (dist > 2.0 * final_radius) seen through
     // a foreground atmosphere can appear shifted across the sky by up to tan(max_bend).
+    // Black hole lens hosts render only their own capture silhouette and must not expand.
     float bg_expand = 0.0;
-    if (u_refract_max_bend > 0.0 && dist > final_radius * 2.0) {
+    if (u_refract_max_bend > 0.0 && dist > final_radius * 2.0 && !is_lens_bh_host) {
         float max_bg_expand = max(0.0, dist * 0.40 - final_radius);
         bg_expand = min(dist * tan(u_refract_max_bend) * 1.5, max_bg_expand);
     }
@@ -220,8 +224,6 @@ void main() {
     float atmo_expand = base_expand + bg_expand;
 
     // Gravitational Lensing expansion for Einstein rings and lensed background arcs
-    bool is_lens_bh_host = u_grav_lens_enabled && u_grav_lens_type == 3 && u_grav_lens_rs > 1e-6
-        && distance(in_offset, u_grav_lens_center) < 1e-6;
     float grav_expand = 0.0;
     if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && !is_lens_bh_host) {
         float d_lens_km = length(u_grav_lens_center - u_camera_pos) * u_au_to_km;
