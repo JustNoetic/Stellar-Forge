@@ -40,41 +40,108 @@ float g_grav_magnification = 1.0;
 // source behind at -Z, physical light +Z; r=+X gives L=rPhys x vPhys=-Y
 // (retrograde, larger b_c), r=-X gives +Y (prograde, smaller b_c).
 // cross(cam,pole)=ZxY=-X correctly marks -X as prograde.
-float grav_critical_b(vec3 C_km, vec3 ray_perp_dir) {
+// Exact Kerr Critical Shadow (Bardeen 1973 Null Geodesic Potential)
+// Evaluates whether an incoming sightline with closest-approach vector P_min
+// plunges through the event horizon (is captured) or scatters back out to infinity.
+// Evaluates the depressed quartic radial potential R(r) = (r^2 + a^2 - a*xi)^2 - Delta*((a-xi)^2 + eta).
+// Since R(r_+) >= 0 and R(+inf) > 0, the ray has turning points outside the horizon
+// if and only if the stationary point r_min of R'(r) = 0 has R(r_min) <= 0.
+// Solving the depressed cubic R'(r) = 4*r^3 + 2*c2*r + c1 = 0 in closed form
+// yields the exact textbook Bardeen (1973) D-shaped shadow for any Kerr spin and inclination.
+bool is_kerr_shadow(vec3 C_km, vec3 P_min) {
     float rs = u_grav_lens_rs;
-    float b_c0 = 2.5980762 * rs; // 3*sqrt(3)/2 * rs (Schwarzschild limit)
+    if (rs <= 1e-6) return false;
+    float M = 0.5 * rs;
     float a_star = clamp(u_grav_lens_spin, -0.999, 0.999);
-    if (abs(a_star) <= 1e-4) return b_c0;
+    
+    // In Schwarzschild limit, shadow is a circle of radius 3*sqrt(3)*M = 2.5980762*rs
+    if (abs(a_star) <= 1e-4) {
+        float b_c0 = 2.5980762 * rs;
+        return length(P_min) <= b_c0;
+    }
 
     vec3 pole_n = length(u_grav_lens_pole) > 1e-4 ? normalize(u_grav_lens_pole) : vec3(0.0, 1.0, 0.0);
     float r_cam = length(C_km);
     vec3 cam_dir = r_cam > 1e-4 ? (C_km / r_cam) : vec3(0.0, 0.0, 1.0);
 
-    // Observer inclination relative to spin axis
     float cos_theta_o = clamp(dot(cam_dir, pole_n), -1.0, 1.0);
     float sin_theta_o = sqrt(max(1e-6, 1.0 - cos_theta_o * cos_theta_o));
 
-    // Optical prograde direction on sky plane (perpendicular to optical axis and pole)
     vec3 cross_p = cross(cam_dir, pole_n);
     float len_cp = length(cross_p);
     vec3 prograde_dir = len_cp > 1e-4 ? (cross_p / len_cp) : vec3(1.0, 0.0, 0.0);
+    vec3 pole_sky = cross(prograde_dir, cam_dir);
 
-    // Polar angle phi on observer sky plane relative to prograde direction
+    // Projected coordinates on sky plane (in km)
+    float X = dot(P_min, prograde_dir);
+    float Y = dot(P_min, pole_sky);
+
+    // Dimensionless Bardeen impact parameters (normalized by M = rs/2)
+    float al = -X / M;
+    float be = Y / M;
+
+    float xi = -al * sin_theta_o;
+    float eta = be * be + (al * al - a_star * a_star) * (cos_theta_o * cos_theta_o);
+
+    // Rays with eta + a^2*cos^2 < 0 cannot physically reach the observer's inclination
+    if (eta + a_star * a_star * cos_theta_o * cos_theta_o < 0.0) return false;
+
+    // Coefficients of depressed quartic R(r) = r^4 + c2*r^2 + c1*r + c0
+    float K = (a_star - xi) * (a_star - xi) + eta;
+    float c2 = a_star * a_star - xi * xi - eta;
+    float c1 = 2.0 * K;
+    float c0 = -a_star * a_star * eta;
+
+    // Stationary points of R(r): roots of depressed cubic r^3 + p*r + q = 0
+    float p = c2 * 0.5;
+    float q = c1 * 0.25;
+    float p3 = p * p * p * (1.0 / 27.0);
+    float q2 = q * q * 0.25;
+    float disc = q2 + p3;
+
+    float r_min;
+    if (disc < 0.0) {
+        float phi = acos(clamp(-q / (2.0 * sqrt(max(1e-9, -p3))), -1.0, 1.0));
+        float s = 2.0 * sqrt(max(0.0, -p * (1.0 / 3.0)));
+        r_min = max(s * cos(phi * (1.0 / 3.0)),
+                max(s * cos((phi + 6.2831853) * (1.0 / 3.0)),
+                    s * cos((phi + 12.5663706) * (1.0 / 3.0))));
+    } else {
+        float sqrt_d = sqrt(disc);
+        float u = -q * 0.5 + sqrt_d;
+        float v = -q * 0.5 - sqrt_d;
+        r_min = sign(u) * pow(abs(u), 1.0 / 3.0) + sign(v) * pow(abs(v), 1.0 / 3.0);
+    }
+
+    float r_plus = 1.0 + sqrt(max(0.0, 1.0 - a_star * a_star));
+    float r_turn = max(r_plus, r_min);
+    float val_at_min = ((r_turn * r_turn + c2) * r_turn + c1) * r_turn + c0;
+    return val_at_min > 0.0;
+}
+
+// Critical impact parameter b_c(phi, theta_o) along ray_perp_dir in km
+// Evaluates the exact D-shaped Bardeen shadow boundary via 7 bisection steps
+// against the Kerr null geodesic capture potential.
+float grav_critical_b(vec3 C_km, vec3 ray_perp_dir) {
+    float rs = u_grav_lens_rs;
+    if (abs(u_grav_lens_spin) <= 1e-4) {
+        return 2.5980762 * rs;
+    }
     float len_rp = length(ray_perp_dir);
-    vec3 ray_perp = len_rp > 1e-4 ? (ray_perp_dir / len_rp) : prograde_dir;
-    float cos_phi = clamp(dot(ray_perp, prograde_dir), -1.0, 1.0);
-    float sin_phi2 = max(0.0, 1.0 - cos_phi * cos_phi);
-
-    float sin_factor = a_star * sin_theta_o;
-    float sin_factor2 = sin_factor * sin_factor;
-
-    // Harmonic expansion coefficients matching Gralla-Lupsasca critical photon curves:
-    float c1 = 0.35355 * sin_factor;
-    float c2 = 0.052 * sin_factor2;
-    float c_polar = 0.088 * sin_factor2 * (1.0 - 0.5 * cos_theta_o * cos_theta_o);
-
-    float b_c = b_c0 * (1.0 - c1 * cos_phi + c2 * (2.0 * cos_phi * cos_phi - 1.0) - c_polar * sin_phi2);
-    return max(0.5 * rs, b_c);
+    vec3 u_dir = len_rp > 1e-4 ? (ray_perp_dir / len_rp) : vec3(1.0, 0.0, 0.0);
+    
+    // Bisection between b_lo = 0.5 rs and b_hi = 4.0 rs
+    float b_lo = 0.5 * rs;
+    float b_hi = 4.0 * rs;
+    for (int i = 0; i < 7; i++) {
+        float b_mid = 0.5 * (b_lo + b_hi);
+        if (is_kerr_shadow(C_km, u_dir * b_mid)) {
+            b_lo = b_mid;
+        } else {
+            b_hi = b_mid;
+        }
+    }
+    return 0.5 * (b_lo + b_hi);
 }
 
 // Gravitational deflection of a sightline past the lens (Gralla-Lupsasca matched
@@ -101,15 +168,17 @@ float compute_gravitational_deflection(vec3 C_km, vec3 V, float d_km, out bool i
     float metric_factor = sqrt(max(1e-4, 1.0 - rs / max(1e-4, r_cam_km)));
     float b = max(1e-4, length(P_min) / metric_factor); // impact parameter in km
 
-    // Gralla-Lupsasca direction-aware Kerr critical shadow radius b_c(phi, theta_o)
-    float b_c = grav_critical_b(C_km, P_min);
-
     // Ray capture for black hole shadow:
-    // Only inward-heading rays (s_min > 0) whose impact parameter plunges inside b_c
-    if (u_grav_lens_type == 3 && s_min > 0.0 && b <= b_c && (d_km <= 0.0 || s_min < d_km)) {
-        is_shadow = true;
-        return 0.0;
+    // Only inward-heading rays (s_min > 0)
+    if (u_grav_lens_type == 3 && s_min > 0.0 && (d_km <= 0.0 || s_min < d_km)) {
+        if (is_kerr_shadow(C_km, P_min)) {
+            is_shadow = true;
+            return 0.0;
+        }
     }
+
+    // Direction-aware Kerr critical shadow radius b_c(phi, theta_o) for logarithmic divergence
+    float b_c = grav_critical_b(C_km, P_min);
 
     // Unified weak-field geometric deflection integral:
     // Integrates the transverse gravitational acceleration along the segment [0, d_km]

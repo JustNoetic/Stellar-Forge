@@ -238,6 +238,10 @@ void main() {
 
     float total_expand = max(atmo_expand, grav_expand);
     float bounding_radius = final_radius + total_expand;
+    if (is_lens_bh_host) {
+        float rs_au = (u_grav_lens_rs / max(1.0, u_au_to_km));
+        bounding_radius = max(bounding_radius, rs_au * 4.2);
+    }
     f_bounding_radius = bounding_radius;
 
     vec3 bounding_world_pos = (scaled_pos * bounding_radius) + in_offset;

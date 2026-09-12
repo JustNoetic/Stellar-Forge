@@ -7,6 +7,9 @@ from engine.path_utils import get_bundled_path, get_external_path
 
 import math
 import OpenGL
+import OpenGL.error
+if hasattr(OpenGL.error, '_ErrorChecker') and OpenGL.error._ErrorChecker is not None:
+    OpenGL.error._ErrorChecker.glCheckError = lambda self, result, *args, **kwargs: result
 OpenGL.ERROR_CHECKING = False
 import glfw
 import moderngl
@@ -558,6 +561,8 @@ class App(InputHandlerMixin):
         self.streak_tex = None
         self.starfield_fbo = None
         self.starfield_tex = None
+        self.starfield_cubemap = None
+        self.starfield_cube_fbos = []
         self.prog_star_streak = None
         self.quad_vao_streak = None
         self.last_fb_size = (0, 0)
@@ -1431,6 +1436,14 @@ class App(InputHandlerMixin):
         )
         if 'u_starfield_tex' in self.prog_grav_lens_starfield:
             self.prog_grav_lens_starfield['u_starfield_tex'].value = 0
+        if 'u_starfield_cubemap' in self.prog_grav_lens_starfield:
+            self.prog_grav_lens_starfield['u_starfield_cubemap'].value = 1
+        if 'u_has_starfield_tex' in self.prog_grav_lens_starfield:
+            self.prog_grav_lens_starfield['u_has_starfield_tex'].value = False
+        try:
+            gl.glEnable(gl.GL_TEXTURE_CUBE_MAP_SEAMLESS)
+        except Exception:
+            pass
 
         # Compile FFT Convolution Bloom Compute Shaders
         try:
@@ -2966,6 +2979,15 @@ class App(InputHandlerMixin):
                 if self.streak_tex: self.streak_tex.release(); self.streak_tex = None
                 if getattr(self, "starfield_fbo", None): self.starfield_fbo.release(); self.starfield_fbo = None
                 if getattr(self, "starfield_tex", None): self.starfield_tex.release(); self.starfield_tex = None
+                if getattr(self, "starfield_cube_fbos", None):
+                    for fbo in self.starfield_cube_fbos:
+                        try: fbo.release()
+                        except Exception: pass
+                    self.starfield_cube_fbos = []
+                if getattr(self, "starfield_cubemap", None):
+                    try: self.starfield_cubemap.release()
+                    except Exception: pass
+                    self.starfield_cubemap = None
                 
                 # Rebuild
                 self.hdr_resolve_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
@@ -2980,16 +3002,36 @@ class App(InputHandlerMixin):
                 
                 self.hdr_resolve_fbo = ctx.framebuffer(color_attachments=[self.hdr_resolve_tex], depth_attachment=self.depth_texture)
                 
-                # Overscan starfield buffer: renders an expanded sky coverage (up to 2.0x FOV)
-                # so that stars located off-screen have their light bent onto the viewport
-                # by gravitational lensing and secondary mirror images.
-                sf_w = min(4096, int(self.fb_width * 2.0))
-                sf_h = min(4096, int(self.fb_height * 2.0))
-                self.starfield_tex = ctx.texture((sf_w, sf_h), 4, dtype='f4')
+                # High-res 1:1 screen-space starfield texture for native pixel-sharp unlensed & near-frustum stars
+                self.starfield_tex = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
                 self.starfield_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
                 self.starfield_tex.repeat_x = False
                 self.starfield_tex.repeat_y = False
                 self.starfield_fbo = ctx.framebuffer(color_attachments=[self.starfield_tex])
+                
+                # Full 360-degree (4*pi steradian) celestial cubemap for gravitational lensing:
+                # Captures unlensed background stars in every direction across the entire sky,
+                # allowing sightlines deflected around the black hole / compact lens by any angle
+                # (including from 90 deg, 120 deg, or behind the observer) to be sampled without clipping.
+                cube_res = 2048 if max(self.fb_width, self.fb_height) > 2000 else 1024
+                self.starfield_cubemap = ctx.texture_cube((cube_res, cube_res), 4, dtype='f4')
+                self.starfield_cubemap.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self.starfield_cube_fbos = []
+                try:
+                    while gl.glGetError() != 0:
+                        pass
+                except Exception:
+                    pass
+                for face in range(6):
+                    fid = gl.glGenFramebuffers(1)
+                    gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fid)
+                    gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, self.starfield_cubemap.glo, 0)
+                    self.starfield_cube_fbos.append(ctx.detect_framebuffer(fid))
+                gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+                try:
+                    gl.glEnable(gl.GL_TEXTURE_CUBE_MAP_SEAMLESS)
+                except Exception:
+                    pass
 
                 self.accum_tex_a = ctx.texture((self.fb_width, self.fb_height), 4, dtype='f4')
                 self.accum_tex_a.filter = (moderngl.LINEAR, moderngl.LINEAR)
@@ -5117,54 +5159,63 @@ class App(InputHandlerMixin):
                 prog_starfield['u_intensity_scale'].value = float(self.camera.get("star_intensity", 1.0))
                 is_screen_grav_lens_active = (
                     grav_lens_enabled and grav_lens_rs > 0.0 and
-                    getattr(self, 'starfield_fbo', None) is not None and
+                    getattr(self, 'starfield_cubemap', None) is not None and
+                    getattr(self, 'starfield_cube_fbos', None) is not None and
+                    len(self.starfield_cube_fbos) == 6 and
                     getattr(self, 'prog_grav_lens_starfield', None) is not None and
                     getattr(self, 'quad_vao_grav_lens_starfield', None) is not None
                 )
 
                 if is_screen_grav_lens_active:
-                    # Calculate overscan FOV and projection to capture offscreen stars for lensing
-                    overscan_ratio = float(self.starfield_tex.width) / float(max(self.fb_width, 1))
-                    fov_y_rad = math.radians(self.camera["fov"])
-                    tan_half_y = math.tan(fov_y_rad * 0.5)
-                    tan_half_x = tan_half_y * aspect_ratio
+                    has_screen_tex = (getattr(self, 'starfield_fbo', None) is not None and
+                                      getattr(self, 'starfield_tex', None) is not None)
+                    if has_screen_tex:
+                        # Pass 1a: Render unlensed on-screen stars at native screen resolution into self.starfield_fbo
+                        self.starfield_fbo.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.clear(0.0, 0.0, 0.0, 0.0)
+                        ctx.disable(moderngl.DEPTH_TEST)
+                        ctx.enable(moderngl.BLEND)
+                        ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                        star_vao.render(moderngl.POINTS)
 
-                    tan_half_y_starfield = min(tan_half_y * overscan_ratio, math.tan(math.radians(72.0)))
-                    tan_half_x_starfield = tan_half_y_starfield * aspect_ratio
-                    fov_starfield_deg = math.degrees(math.atan(tan_half_y_starfield) * 2.0)
-
-                    proj_starfield_f8 = matrix44.create_perspective_projection_matrix(
-                        fov_starfield_deg, aspect_ratio, near, far, dtype='f8'
+                    # Pass 1b: Render unlensed 360-degree starfield into the 6 faces of self.starfield_cubemap (for offscreen stars)
+                    cube_res = self.starfield_cubemap.size[0]
+                    # 90-degree perspective projection for square cubemap faces (aspect = 1.0)
+                    cube_proj_f8 = matrix44.create_perspective_projection_matrix(
+                        90.0, 1.0, near, far, dtype='f8'
                     )
-                    prog_starfield['projection'].write(proj_starfield_f8.astype('f4').tobytes())
-                    prog_starfield['screen_height'].value = float(self.fb_height)
+                    prog_starfield['projection'].write(cube_proj_f8.astype('f4').tobytes())
+                    prog_starfield['screen_height'].value = float(cube_res)
 
-                    # Pass 1: Render unlensed starfield into self.starfield_fbo with expanded coverage
-                    self.starfield_fbo.use()
-                    ctx.viewport = (0, 0, self.starfield_tex.width, self.starfield_tex.height)
-                    ctx.clear(0.0, 0.0, 0.0, 0.0)
+                    # Physical HDR calibration and sprite sizing for 90-deg cubemap faces (fov_factor = 1.0):
+                    _star_size_px_cube = min(10.0, max(2.0, float(self.camera.get("star_point_size", 2.0)) * (cube_res / 1080.0)))
+                    prog_starfield['u_point_base'].value = float(_star_size_px_cube * (1080.0 / cube_res))
+                    prog_starfield['u_flux_calib'].value = float(
+                        3.879 * (cube_res * 1.0) ** 2 * _star_size_px_cube * _star_size_px_cube / 1.0e13)
+
+                    # OpenGL cubemap face orientation vectors (fwd, up):
+                    cube_face_directions = (
+                        (np.array([ 1.0,  0.0,  0.0], dtype='f8'), np.array([ 0.0, -1.0,  0.0], dtype='f8')),
+                        (np.array([-1.0,  0.0,  0.0], dtype='f8'), np.array([ 0.0, -1.0,  0.0], dtype='f8')),
+                        (np.array([ 0.0,  1.0,  0.0], dtype='f8'), np.array([ 0.0,  0.0,  1.0], dtype='f8')),
+                        (np.array([ 0.0, -1.0,  0.0], dtype='f8'), np.array([ 0.0,  0.0, -1.0], dtype='f8')),
+                        (np.array([ 0.0,  0.0,  1.0], dtype='f8'), np.array([ 0.0, -1.0,  0.0], dtype='f8')),
+                        (np.array([ 0.0,  0.0, -1.0], dtype='f8'), np.array([ 0.0, -1.0,  0.0], dtype='f8')),
+                    )
+
                     ctx.disable(moderngl.DEPTH_TEST)
                     ctx.enable(moderngl.BLEND)
                     ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-                    star_vao.render(moderngl.POINTS)
 
-                    # Pass 1b: Render background subpixel point lights into self.starfield_fbo with expanded coverage
-                    # so they are lensed in screen-space with the exact same Gralla-Lupsasca deflection as GAIA stars
-                    if 'u_lensing_to_starfield' in prog_point_celestial:
-                        prog_point_celestial['u_lensing_to_starfield'].value = True
-                        if 'u_use_custom_proj' in prog_point_celestial:
-                            prog_point_celestial['u_use_custom_proj'].value = True
-                        if 'u_custom_projection' in prog_point_celestial:
-                            prog_point_celestial['u_custom_projection'].write(proj_starfield_f8.astype('f4').tobytes())
-                        if 'screen_height' in prog_point_celestial:
-                            prog_point_celestial['screen_height'].value = float(self.starfield_tex.height)
-                        if 'fov_factor' in prog_point_celestial:
-                            prog_point_celestial['fov_factor'].value = float(1.0 / tan_half_y_starfield)
-                        vis_point_buffer.bind_to_storage_buffer(binding=3)
-                        vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
-                        prog_point_celestial['u_lensing_to_starfield'].value = False
-                        if 'u_use_custom_proj' in prog_point_celestial:
-                            prog_point_celestial['u_use_custom_proj'].value = False
+                    for face_idx, (fwd_dir, up_dir) in enumerate(cube_face_directions):
+                        fbo = self.starfield_cube_fbos[face_idx]
+                        fbo.use()
+                        ctx.viewport = (0, 0, cube_res, cube_res)
+                        ctx.clear(0.0, 0.0, 0.0, 0.0)
+                        view_face = matrix44.create_look_at(cam_pos_f8, cam_pos_f8 + fwd_dir, up_dir, dtype='f8')
+                        prog_starfield['view'].write(view_face.astype('f4').tobytes())
+                        star_vao.render(moderngl.POINTS)
 
                     # Pass 2: Screen-space backward gravitational deflection onto the scene HDR buffer
                     self.hdr_resolve_fbo.use()
@@ -5175,10 +5226,24 @@ class App(InputHandlerMixin):
                     ctx.enable(moderngl.BLEND)
                     ctx.blend_func = (moderngl.ONE, moderngl.ONE)
 
-                    self.starfield_tex.use(location=0)
                     p_lens = self.prog_grav_lens_starfield
-                    if 'u_starfield_tex' in p_lens:
-                        p_lens['u_starfield_tex'].value = 0
+                    if has_screen_tex:
+                        self.starfield_tex.use(location=0)
+                        if 'u_starfield_tex' in p_lens:
+                            p_lens['u_starfield_tex'].value = 0
+                        if 'u_has_starfield_tex' in p_lens:
+                            p_lens['u_has_starfield_tex'].value = True
+                    else:
+                        if 'u_has_starfield_tex' in p_lens:
+                            p_lens['u_has_starfield_tex'].value = False
+
+                    self.starfield_cubemap.use(location=1)
+                    if 'u_starfield_cubemap' in p_lens:
+                        p_lens['u_starfield_cubemap'].value = 1
+
+                    fov_y_rad = math.radians(self.camera["fov"])
+                    tan_half_y = math.tan(fov_y_rad * 0.5)
+                    tan_half_x = tan_half_y * aspect_ratio
 
                     cam_right = view_f8[:3, 0]
                     cam_up = view_f8[:3, 1]
@@ -5192,8 +5257,6 @@ class App(InputHandlerMixin):
                         p_lens['u_cam_up'].value = (float(cam_up[0]), float(cam_up[1]), float(cam_up[2]))
                     if 'u_tan_half_fov' in p_lens:
                         p_lens['u_tan_half_fov'].value = (float(tan_half_x), float(tan_half_y))
-                    if 'u_tan_half_fov_starfield' in p_lens:
-                        p_lens['u_tan_half_fov_starfield'].value = (float(tan_half_x_starfield), float(tan_half_y_starfield))
                     if 'u_camera_pos' in p_lens:
                         p_lens['u_camera_pos'].value = (float(cam_pos_f8[0]), float(cam_pos_f8[1]), float(cam_pos_f8[2]))
                     if 'u_screen_width' in p_lens:

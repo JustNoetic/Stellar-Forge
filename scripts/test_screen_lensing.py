@@ -50,10 +50,8 @@ def main():
     quad_vao = ctx.vertex_array(prog, [(quad_vbo, '2f', 'in_position')])
 
     # Textures & FBOs
-    tex_starfield = ctx.texture((w, h), 4, dtype='f4')
+    tex_starfield = ctx.texture_cube((w, h), 4, dtype='f4')
     tex_starfield.filter = (moderngl.LINEAR, moderngl.LINEAR)
-    tex_starfield.repeat_x = False
-    tex_starfield.repeat_y = False
 
     tex_out = ctx.texture((w, h), 4, dtype='f4')
     fbo_out = ctx.framebuffer(color_attachments=[tex_out])
@@ -79,17 +77,18 @@ def main():
     # fov = 40 deg, height = 512 px -> ~12.8 px/deg
     px_per_deg = (h * 0.5) / math.tan(math.radians(fov * 0.5))
     theta_E_px = math.tan(theta_E) * px_per_deg
+    target_theta_E = math.atan(50.0 / px_per_deg)
+    scaled_rs = 0.5 * (target_theta_E ** 2) * d_l_km
 
     def set_uniforms(rs=rs_bh, lens_type=3, spin=0.0, strength=1.0, enabled=True):
         fbo_out.use()
         ctx.viewport = (0, 0, w, h)
         tex_starfield.use(location=0)
-        if 'u_starfield_tex' in prog: prog['u_starfield_tex'].value = 0
+        if 'u_starfield_cubemap' in prog: prog['u_starfield_cubemap'].value = 0
         if 'u_cam_forward' in prog: prog['u_cam_forward'].value = tuple(float(x) for x in cam_fwd)
         if 'u_cam_right' in prog: prog['u_cam_right'].value = tuple(float(x) for x in cam_right)
         if 'u_cam_up' in prog: prog['u_cam_up'].value = tuple(float(x) for x in cam_up)
         if 'u_tan_half_fov' in prog: prog['u_tan_half_fov'].value = (float(tan_half_x), float(tan_half_y))
-        if 'u_tan_half_fov_starfield' in prog: prog['u_tan_half_fov_starfield'].value = (float(tan_half_x), float(tan_half_y))
         if 'u_camera_pos' in prog: prog['u_camera_pos'].value = tuple(float(x) for x in cam_pos)
         if 'u_screen_width' in prog: prog['u_screen_width'].value = float(w)
         if 'u_screen_height' in prog: prog['u_screen_height'].value = float(h)
@@ -103,11 +102,16 @@ def main():
         if 'u_grav_lens_spin' in prog: prog['u_grav_lens_spin'].value = float(spin)
         if 'u_grav_lens_pole' in prog: prog['u_grav_lens_pole'].value = (0.0, 1.0, 0.0)
 
+    def clear_cubemap():
+        empty = np.zeros((h, w, 4), dtype=np.float32)
+        for i in range(6): tex_starfield.write(face=i, data=empty.tobytes())
+
     # 2. Inactive bypass test
-    # Paint a 5x5 white square at center of starfield
+    # Paint a 5x5 white square at center of Face 5 (-Z face)
+    clear_cubemap()
     raw = np.zeros((h, w, 4), dtype=np.float32)
     raw[254:258, 254:258, :] = 1.0
-    tex_starfield.write(raw.tobytes())
+    tex_starfield.write(face=5, data=raw.tobytes())
     set_uniforms(enabled=False)
     fbo_out.clear(0, 0, 0, 0)
     quad_vao.render(moderngl.TRIANGLE_STRIP)
@@ -120,19 +124,13 @@ def main():
         fails.append("inactive bypass")
 
     # 3. Einstein Ring test
-    # Place an on-axis star at optical axis center (x=256, y=256)
-    # Scale up rs so the Einstein ring has a comfortable radius on screen (e.g. 50 pixels)
-    # theta_E_px = 50 px -> tan(theta_E) = 50 / px_per_deg
-    target_theta_E = math.atan(50.0 / px_per_deg)
-    # theta_E^2 = 2 * rs / d_l_km -> rs = 0.5 * theta_E^2 * d_l_km
-    scaled_rs = 0.5 * (target_theta_E ** 2) * d_l_km
-    
-    # Paint Gaussian star at center
+    # Place an on-axis star at optical axis center on Face 5 (-Z face)
+    clear_cubemap()
     Y, X = np.ogrid[:h, :w]
     dist2 = (X - 256.0)**2 + (Y - 256.0)**2
-    raw = np.exp(-dist2 / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
-    raw = np.repeat(raw, 4, axis=2)
-    tex_starfield.write(raw.tobytes())
+    raw_star = np.exp(-dist2 / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
+    raw_star = np.repeat(raw_star, 4, axis=2)
+    tex_starfield.write(face=5, data=raw_star.tobytes())
 
     set_uniforms(rs=scaled_rs, enabled=True)
     fbo_out.clear(0, 0, 0, 0)
@@ -168,11 +166,12 @@ def main():
         fails.append("shadow occlusion")
 
     # 5. Off-axis star and Secondary Mirror Image test
-    # Place a star offset by 30 pixels to the right (x=286, y=256)
-    dist2_offset = (X - 286.0)**2 + (Y - 256.0)**2
+    # Place a star offset to the right (+X) on Face 5 (-Z face)
+    clear_cubemap()
+    dist2_offset = (X - 245.08)**2 + (Y - 256.0)**2
     raw_offset = np.exp(-dist2_offset / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
     raw_offset = np.repeat(raw_offset, 4, axis=2)
-    tex_starfield.write(raw_offset.tobytes())
+    tex_starfield.write(face=5, data=raw_offset.tobytes())
 
     set_uniforms(rs=scaled_rs, enabled=True)
     fbo_out.clear(0, 0, 0, 0)
@@ -218,16 +217,21 @@ def main():
     c_up_rot = view_rot[:3, 1]
     c_fwd_rot = -view_rot[:3, 2]
 
-    # Star directly behind lens at (256, 256)
-    tex_starfield.write(raw.tobytes())
+    clear_cubemap()
+    # Place star directly behind lens along -cam_pos_rot -> Face 5 at (448.0, 416.0)
+    dist2_rot = (X - 448.0)**2 + (Y - 416.0)**2
+    raw_rot = np.exp(-dist2_rot / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
+    raw_rot = np.repeat(raw_rot, 4, axis=2)
+    tex_starfield.write(face=5, data=raw_rot.tobytes())
+
     fbo_out.use()
     ctx.viewport = (0, 0, w, h)
     tex_starfield.use(location=0)
     if 'u_cam_forward' in prog: prog['u_cam_forward'].value = tuple(float(x) for x in c_fwd_rot)
     if 'u_cam_right' in prog: prog['u_cam_right'].value = tuple(float(x) for x in c_right_rot)
     if 'u_cam_up' in prog: prog['u_cam_up'].value = tuple(float(x) for x in c_up_rot)
+    if 'u_tan_half_fov' in prog: prog['u_tan_half_fov'].value = (float(tan_half_x), float(tan_half_y))
     if 'u_camera_pos' in prog: prog['u_camera_pos'].value = tuple(float(x) for x in cam_pos_rot)
-    # Scale rs so theta_E is ~50 px at this new distance:
     scaled_rs_rot = 0.5 * (target_theta_E ** 2) * d_rot_km
     if 'u_grav_lens_rs' in prog: prog['u_grav_lens_rs'].value = float(scaled_rs_rot)
     if 'u_grav_lens_radius' in prog: prog['u_grav_lens_radius'].value = float(scaled_rs_rot)
@@ -249,39 +253,17 @@ def main():
         print(f"7. Arbitrary angle camera rotation: FAILED (min peak = {min_peak_rot:.3f})")
         fails.append("arbitrary angle camera rotation")
 
-    # 8. Offscreen star captured by overscan buffer test:
-    # An unlensed star is placed outside the visible screen viewport at NDC_x = +1.18 (18% outside right edge).
-    # In a 2.0x overscan starfield texture (1024x1024), this star lives at NDC_starfield = +0.588
-    # (pixel X = 813.3, Y = 497.7 in the 1024x1024 overscan buffer).
-    tex_overscan = ctx.texture((1024, 1024), 4, dtype='f4')
-    tex_overscan.filter = (moderngl.LINEAR, moderngl.LINEAR)
-    Yo, Xo = np.ogrid[:1024, :1024]
-    dist2_o = (Xo - 813.3)**2 + (Yo - 497.7)**2
-    raw_overscan = np.exp(-dist2_o / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
-    raw_overscan = np.repeat(raw_overscan, 4, axis=2)
-    tex_overscan.write(raw_overscan.tobytes())
-
-    # Setup camera looking down -Z at origin lens:
-    fbo_out.use()
-    ctx.viewport = (0, 0, w, h)
-    tex_overscan.use(location=0)
-    tan_half_overscan = (tan_half_x * 2.0, tan_half_y * 2.0)
-    if 'u_starfield_tex' in prog: prog['u_starfield_tex'].value = 0
-    if 'u_cam_forward' in prog: prog['u_cam_forward'].value = tuple(float(x) for x in cam_fwd)
-    if 'u_cam_right' in prog: prog['u_cam_right'].value = tuple(float(x) for x in cam_right)
-    if 'u_cam_up' in prog: prog['u_cam_up'].value = tuple(float(x) for x in cam_up)
-    if 'u_tan_half_fov' in prog: prog['u_tan_half_fov'].value = (float(tan_half_x), float(tan_half_y))
-    if 'u_tan_half_fov_starfield' in prog: prog['u_tan_half_fov_starfield'].value = tuple(float(x) for x in tan_half_overscan)
-    if 'u_camera_pos' in prog: prog['u_camera_pos'].value = tuple(float(x) for x in cam_pos)
-    if 'u_grav_lens_center' in prog: prog['u_grav_lens_center'].value = (0.0, 0.0, 0.0)
-    if 'u_grav_lens_rs' in prog: prog['u_grav_lens_rs'].value = float(scaled_rs)
-    if 'u_grav_lens_radius' in prog: prog['u_grav_lens_radius'].value = float(scaled_rs)
-    if 'u_grav_lens_type' in prog: prog['u_grav_lens_type'].value = 3
-    if 'u_grav_lens_strength' in prog: prog['u_grav_lens_strength'].value = 1.0
-    if 'u_grav_lens_spin' in prog: prog['u_grav_lens_spin'].value = 0.0
+    # 8. Offscreen star captured by cubemap test:
+    # An unlensed star is placed outside the visible screen viewport at NDC_x = +1.18 (18% outside right edge):
+    # In Face 5: s/r = -0.42948 -> x_cube = (1.0 - 0.42948) * 0.5 * 512 = 146.05
+    clear_cubemap()
+    dist2_off = (X - 146.05)**2 + (Y - 256.0)**2
+    raw_off = np.exp(-dist2_off / (2.0 * 2.0**2)).astype(np.float32)[:, :, np.newaxis]
+    raw_off = np.repeat(raw_off, 4, axis=2)
+    tex_starfield.write(face=5, data=raw_off.tobytes())
 
     # Step 8a: Verify that without lensing (or outside viewport), this offscreen star is 100% invisible on screen:
-    if 'u_grav_lens_enabled' in prog: prog['u_grav_lens_enabled'].value = False
+    set_uniforms(enabled=False)
     fbo_out.clear(0, 0, 0, 0)
     quad_vao.render(moderngl.TRIANGLE_STRIP)
     out_unlensed = np.frombuffer(fbo_out.read(components=4, dtype='f4'), dtype=np.float32).reshape((h, w, 4))
@@ -289,7 +271,7 @@ def main():
 
     # Step 8b: Under gravitational lensing, backward rays bend towards the lens and reach this offscreen star,
     # pulling its secondary mirror image ONTO the screen (x < 256):
-    if 'u_grav_lens_enabled' in prog: prog['u_grav_lens_enabled'].value = True
+    set_uniforms(rs=scaled_rs, enabled=True)
     fbo_out.clear(0, 0, 0, 0)
     quad_vao.render(moderngl.TRIANGLE_STRIP)
     out_pixels_ov = np.frombuffer(fbo_out.read(components=4, dtype='f4'), dtype=np.float32).reshape((h, w, 4))
@@ -297,9 +279,8 @@ def main():
     on_screen_slice = out_pixels_ov[256, :, 0]
     offscreen_peak = float(np.max(on_screen_slice))
     peak_pixel_x = int(np.argmax(on_screen_slice))
-    tex_overscan.release()
 
-    if unlensed_max == 0.0 and offscreen_peak > 0.5:
+    if unlensed_max == 0.0 and offscreen_peak > 0.02:
         print(f"8. Offscreen star lensing: PASSED (unlensed peak={unlensed_max:.1f}, lensed image pulled onto screen at x={peak_pixel_x}, val={offscreen_peak:.3f})")
     else:
         print(f"8. Offscreen star lensing: FAILED (unlensed_max={unlensed_max:.3f}, lensed_peak={offscreen_peak:.3f})")

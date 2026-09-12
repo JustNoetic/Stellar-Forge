@@ -93,18 +93,17 @@ def main():
         print(f"3. shadow {label} (b={b_km:.1f} km, b_c={b_c:.1f}): captured={sh} (expect {expect_sh})")
         if sh != expect_sh: fails.append(f"shadow {label}")
 
-    # 4. Kerr spin: prograde rays (with the spin) capture SMALLER b, retrograde
-    #    rays LARGER. pole=+Y, cam_dir=+Z -> prograde periapsis dir = -X.
-    #    (Physical photons travel source->camera (+Z here); r=+X gives
-    #    L=rxv=-Y = retrograde. The old code used the backward-ray L and had
-    #    this mirrored.) cos_phi = dot(ray_perp, prograde): -X -> +1, +X -> -1.
-    b_c_pro = 2.5980762 * rs_bh * (1.0 - 0.35 * 0.998)   # ~1.69 rs (prograde, -X side)
-    b_c_ret = 2.5980762 * rs_bh * (1.0 + 0.35 * 0.998)   # ~3.50 rs (retrograde, +X side)
+    # 4. Kerr spin: exact Bardeen (1973) D-shaped shadow boundaries for a_* = 0.998
+    #    at equatorial inclination (theta_o = 90 deg).
+    #    Prograde (flattened D-wall): alpha = -2.11 M -> b_c_pro ~ 1.055 rs (-X side)
+    #    Retrograde (circular limb): alpha = +7.00 M -> b_c_ret ~ 3.50 rs (+X side)
+    b_c_pro = 1.05545 * rs_bh   # ~1.06 rs (prograde, -X side)
+    b_c_ret = 3.49833 * rs_bh   # ~3.50 rs (retrograde, +X side)
     for spin, sign, b_factor, expect_sh in (
             (+0.998, +1.0, 2.90, True),   # retrograde side (+X), b < b_c_ret -> captured
             (+0.998, +1.0, 3.70, False),  # retrograde side (+X), b > b_c_ret -> free
             (+0.998, -1.0, 2.30, False),  # prograde side (-X),  b > b_c_pro -> free
-            (+0.998, -1.0, 1.20, True),   # prograde side (-X),  b < b_c_pro -> captured
+            (+0.998, -1.0, 0.90, True),   # prograde side (-X),  b < b_c_pro -> captured
             (-0.998, +1.0, 2.30, False),  # reversed spin mirrors the asymmetry
             (-0.998, -1.0, 2.30, True)):
         b_km = b_factor * rs_bh
