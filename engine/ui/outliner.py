@@ -116,6 +116,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
         show_buttons = (rect_min_y <= mouse_y <= rect_max_y) and (rect_min_x <= mouse_x <= rect_max_x)
 
         if clicked:
+            app.camera["edit_mode"] = False
             if app.camera["inspected_idx"] == idx and not app.camera.get("inspected_is_cmp", False):
                 if not app.camera["inspect_bary"]:
                     app.camera["inspect_bary"] = True
@@ -165,6 +166,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
                         })
                     app.camera["inspected_idx"] = None
                     app.camera["inspect_bary"] = False
+                    app.camera["edit_mode"] = False
                 imgui.pop_style_color(3)
 
             imgui.pop_style_var(1)
@@ -197,6 +199,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
             clicked = imgui.selectable(f"{label}##cmp_{idx}", is_inspected, 0, max(10.0, avail_w - 10.0))[0]
 
             if clicked:
+                app.camera["edit_mode"] = False
                 if app.camera["inspected_idx"] == idx and app.camera.get("inspected_is_cmp", False):
                     if not app.camera["inspect_bary"]:
                         app.camera["inspect_bary"] = True

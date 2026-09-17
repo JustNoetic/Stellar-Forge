@@ -2110,6 +2110,10 @@ class App(InputHandlerMixin):
         orbits_hi_cmp = np.zeros((0, 20), dtype='f8')
         orbits_med_cmp = np.zeros((0, 20), dtype='f8')
         orbits_low_cmp = np.zeros((0, 20), dtype='f8')
+        last_orbit_pos_snap = None
+        last_orbit_pos_snap_cmp = None
+        last_comparison_offset_au = None
+
     
         def build_atmo_lut(atmo, mass_sm, is_cmp=False):
             if 'lut_tex' in atmo and atmo['lut_tex']:
@@ -2787,6 +2791,10 @@ class App(InputHandlerMixin):
                                 
                                 visual_arr[idx][8] = f
                                 visual_data[idx][8] = f
+                                self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, self.pole_n_arr, self.tangent_arr, self.bitangent_arr = _build_rotation_props(bodies_data)
+                            elif "rotation_period" in op:
+                                bodies_data[idx]["rotation_period"] = op["rotation_period"]
+                                self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, self.pole_n_arr, self.tangent_arr, self.bitangent_arr = _build_rotation_props(bodies_data)
                             if "color" in op:
                                 c = op["color"]
                                 bodies_data[idx]["color"] = f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}"
@@ -2796,7 +2804,17 @@ class App(InputHandlerMixin):
                                 visual_data[idx][0:3] = c
                             if "star_props" in op:
                                 bodies_data[idx]["star_props"] = op["star_props"]
-                            if "pos" in op:
+                            if "rel_pos" in op and "rel_vel" in op:
+                                bodies_data[idx]["sv"] = {
+                                    "x": float(op["rel_pos"][0]),
+                                    "y": float(op["rel_pos"][1]),
+                                    "z": float(op["rel_pos"][2]),
+                                    "vx": float(op["rel_vel"][0]),
+                                    "vy": float(op["rel_vel"][1]),
+                                    "vz": float(op["rel_vel"][2])
+                                }
+                                last_orbit_pos_snap = None
+                            elif "pos" in op:
                                 pidx = parent_snap[idx]
                                 if pidx >= 0 and pidx != idx:
                                     bodies_data[idx]["sv"] = {
@@ -2807,6 +2825,10 @@ class App(InputHandlerMixin):
                                         "vy": float(op["vel"][1] - vel_snap[pidx][1]),
                                         "vz": float(op["vel"][2] - vel_snap[pidx][2])
                                     }
+                                last_orbit_pos_snap = None
+                            if "keplerian" in op:
+                                bodies_data[idx].update(op["keplerian"])
+                                last_orbit_pos_snap = None
                             if "type" in op:
                                 bodies_data[idx]["type"] = op["type"]
                                 is_star_arr[idx] = 1.0 if op["type"] == "Star" else 0.0
@@ -2815,6 +2837,7 @@ class App(InputHandlerMixin):
                                 visual_data[idx][4] = min_px
                                 non_star_indices = np.where(is_star_arr == 0.0)[0]
                                 n_casters_fixed = len(non_star_indices)
+
     
                     sys_mgr.save_system_data(active_system_name, bodies_data)
                     self.shared_state["crud_completed"].clear()

@@ -4,7 +4,21 @@ import json
 import numpy as np
 import imgui
 import glfw
-from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
+from engine.core.constants import (
+    DEFAULT_LY_THRESHOLD_AU,
+    G,
+    C_AU_YR,
+    SOLAR_RADII_TO_AU,
+    AU_TO_KM
+)
+from engine.core.math_utils import (
+    pole_to_ecliptic,
+    rotate_ecliptic_to_equatorial,
+    rotate_equatorial_to_ecliptic,
+    get_cartesian_from_keplerian
+)
+from engine.physics.physics_core import compute_keplerian_elements
+from engine.physics.star_calc import StarCalculator
 from engine.physics.atmosphere_physics import compute_mie_coefficients, GAS_PROPERTIES
 from engine.rendering.render_utils import (
     compute_surface_albedo,
@@ -116,6 +130,120 @@ def compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo
 
     return A_g, A_b, q, p_rgb
 
+def _apply_body_edits(app, insp_idx, body_info, parent_idx, cur_mass_snap, cur_pos_snap_render, cur_vel_snap_render, visual_arr):
+    """Package and dispatch edited physical and orbital properties to physics thread and system JSON."""
+    ed = app.camera["edit_data"]
+    rot_hours = float(ed.get("rotation_period", 0.0))
+    m_val = float(ed.get("mass", cur_mass_snap[insp_idx]))
+    r_km = float(ed.get("radius", body_info.get('r', 0.0) * 696340.0))
+    b_type = ed.get("type", body_info.get("type", "Terrestrial"))
+    body_name = body_info['name']
+
+    f = 0.0
+    j2 = 0.0
+    j4 = 0.0
+    if rot_hours > 0.0 and m_val > 0.0 and r_km > 0.0:
+        omega = 2.0 * math.pi / (rot_hours * 3600.0)
+        r_eq_m = r_km * 1000.0
+        mass_kg = m_val * 1.98847e30
+        G_SI = 6.6743e-11
+        m_param = (omega**2 * r_eq_m**3) / (G_SI * mass_kg)
+        if b_type in ("Moon", "Dwarf Planet"):
+            chi = 1.25
+        elif b_type == "Terrestrial":
+            chi = 0.95
+        else:
+            chi = 0.65
+        f = chi * m_param
+        j2 = m_param * (chi - 0.5)
+        j4 = -0.15 * (f**2)
+
+    pole_render = visual_arr[insp_idx, 5:8]
+    pole_ecl = [float(pole_render[0]), float(-pole_render[2]), float(pole_render[1])]
+
+    payload = {
+        "action": "UPDATE",
+        "idx": insp_idx,
+        "name": body_name,
+        "mass": m_val,
+        "radius": r_km,
+        "type": b_type,
+        "rotation_period": rot_hours,
+        "oblateness": f,
+        "J2": j2,
+        "j4": j4,
+        "pole_ecl": pole_ecl
+    }
+
+    if b_type == "Star" and ed.get("_preview"):
+        pr = ed["_preview"]
+        hx = pr["visual"]["colorHex"].lstrip('#')
+        payload["color"] = [int(hx[0:2], 16)/255.0, int(hx[2:4], 16)/255.0, int(hx[4:6], 16)/255.0]
+        payload["star_props"] = {
+            "mode": ed.get("star_mode", "evolution"),
+            "mass": ed["mass"] if ed.get("star_mode") == "evolution" else pr["physical"]["mass_msun"],
+            "metallicity": float(ed.get("metallicity", 0.0)),
+            "age_pct": float(ed.get("age_pct", 46.0)) / 100.0,
+            "evo_path": ed.get("evo_path", "standard"),
+            "radius": pr["physical"]["radius_rsun"],
+            "temp": pr["physical"]["temp_k"],
+            "lum": pr["physical"]["lum_lsun"],
+            "locked_rad": ed.get("locked_rad", True),
+            "locked_temp": ed.get("locked_temp", True),
+            "locked_lum": ed.get("locked_lum", False),
+            "class": pr["classification"]["fullDesignation"],
+            "stage": pr["evolution"]["phase"]
+        }
+
+    if parent_idx >= 0:
+        p_pos = cur_pos_snap_render[parent_idx]
+        p_vel = cur_vel_snap_render[parent_idx]
+        ppx, ppy, ppz = p_pos[0], -p_pos[2], p_pos[1]
+        pvx, pvy, pvz = p_vel[0], -p_vel[2], p_vel[1]
+        parent_m = cur_mass_snap[parent_idx]
+
+        a_val = float(ed.get("a", body_info.get("a", 1.0)))
+        e_val = float(ed.get("e", body_info.get("e", 0.0)))
+        inc_val = float(ed.get("inc", body_info.get("inc", 0.0)))
+        Omega_val = float(ed.get("Omega", body_info.get("Omega", 0.0)))
+        omega_val = float(ed.get("omega", body_info.get("omega", 0.0)))
+        M_val = float(ed.get("M", body_info.get("M", 0.0)))
+
+        c_pos, c_vel = get_cartesian_from_keplerian(
+            parent_m, m_val, a_val, e_val,
+            inc_val, Omega_val, omega_val, M_val
+        )
+
+        if app.camera.get("inspector_frame", 0) == 1:
+            pole_render_p = visual_arr[parent_idx, 5:8]
+            pole_ecl_p = np.array([pole_render_p[0], -pole_render_p[2], pole_render_p[1]])
+            c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl_p)
+
+        new_ecl_x = ppx + c_pos[0]
+        new_ecl_y = ppy + c_pos[1]
+        new_ecl_z = ppz + c_pos[2]
+
+        new_ecl_vx = pvx + c_vel[0]
+        new_ecl_vy = pvy + c_vel[1]
+        new_ecl_vz = pvz + c_vel[2]
+
+        payload["pos"] = [new_ecl_x, new_ecl_y, new_ecl_z]
+        payload["vel"] = [new_ecl_vx, new_ecl_vy, new_ecl_vz]
+        payload["rel_pos"] = [float(c_pos[0]), float(c_pos[1]), float(c_pos[2])]
+        payload["rel_vel"] = [float(c_vel[0]), float(c_vel[1]), float(c_vel[2])]
+        payload["keplerian"] = {
+            "a": a_val, "e": e_val, "inc": inc_val,
+            "Omega": Omega_val, "omega": omega_val, "M": M_val
+        }
+
+    with app.shared_state["lock"]:
+        app.shared_state["crud_queue"].append(payload)
+
+    body_info['r'] = r_km / 696340.0
+    visual_arr[insp_idx, 3] = body_info['r'] * SOLAR_RADII_TO_AU
+
+    app.camera["edit_mode"] = False
+
 def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_snap, subsys_mass_buf, subsys_pos_buf, subsys_vel_buf, pos_snap_render, vel_snap_render, visual_arr, cam_world_pos_f8, active_system_name, atmo_bodies, ring_bodies, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex):
     """Render the right-side tabbed Body Inspector panel."""
     if not getattr(app, "show_inspector", True):
@@ -157,6 +285,14 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     force_layout = getattr(app, "_last_fb_width", 0) != app.fb_width or getattr(app, "_last_fb_height", 0) != app.fb_height
     cond = imgui.ALWAYS if force_layout else imgui.ONCE
 
+    # Reset edit mode if inspected body changed
+    last_insp = app.camera.get("_last_inspected_idx")
+    last_cmp = app.camera.get("_last_inspected_is_cmp")
+    if last_insp != insp_idx or last_cmp != insp_is_cmp:
+        app.camera["edit_mode"] = False
+        app.camera["_last_inspected_idx"] = insp_idx
+        app.camera["_last_inspected_is_cmp"] = insp_is_cmp
+
     imgui.set_next_window_position(insp_x, insp_y, cond)
     imgui.set_next_window_size(insp_w, insp_h, cond)
 
@@ -164,6 +300,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     if not opened:
         app.camera["inspected_idx"] = None
         app.camera["inspect_bary"] = False
+        app.camera["edit_mode"] = False
         imgui.end()
         return
 
@@ -179,27 +316,34 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         imgui.text_colored(f"Type: {obj_type}", 0.7, 0.8, 1.0)
         if not insp_is_cmp:
             imgui.same_line(spacing=15)
-            changed_edit, app.camera["edit_mode"] = imgui.checkbox("Edit Mode", app.camera["edit_mode"])
-            if changed_edit and app.camera["edit_mode"]:
-                app.time_ctrl["multiplier"] = 0.0
-                sp = body_info.get("star_props", {})
-                app.camera["edit_data"] = {
-                    "mass": float(cur_mass_snap[insp_idx]),
-                    "radius": float(body_info.get('r', 0.0) * 696340.0),
-                    "rotation_period": float(body_info.get("rotation_period", 0.0)),
-                    "type": body_info.get("type", "Moon"),
-                    "a": 0.0, "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
-                    "init_orbit": True,
-                    "star_mode": sp.get("mode", "evolution"),
-                    "metallicity": sp.get("metallicity", 0.0),
-                    "age_pct": sp.get("age_pct", 0.46) * 100.0,
-                    "s_rad": sp.get("radius", float(body_info.get('r', 1.0))),
-                    "s_temp": sp.get("temp", 5778.0),
-                    "s_lum": sp.get("lum", 1.0),
-                    "locked_rad": sp.get("locked_rad", True),
-                    "locked_temp": sp.get("locked_temp", True),
-                    "locked_lum": sp.get("locked_lum", False)
-                }
+            changed_edit, app.camera["edit_mode"] = imgui.checkbox("Edit Mode", app.camera.get("edit_mode", False))
+            if changed_edit:
+                if app.camera["edit_mode"]:
+                    app.time_ctrl["multiplier"] = 0.0
+                    app.time_ctrl["paused"] = True
+                    sp = body_info.get("star_props", {})
+                    app.camera["edit_data"] = {
+                        "mass": float(cur_mass_snap[insp_idx]),
+                        "radius": float(body_info.get('r', 0.0) * 696340.0),
+                        "rotation_period": float(body_info.get("rotation_period", 0.0)),
+                        "type": body_info.get("type", "Moon"),
+                        "a": float(body_info.get("a", 1.0)),
+                        "e": float(body_info.get("e", 0.0)),
+                        "inc": float(body_info.get("inc", 0.0)),
+                        "Omega": float(body_info.get("Omega", 0.0)),
+                        "omega": float(body_info.get("omega", 0.0)),
+                        "M": float(body_info.get("M", 0.0)),
+                        "init_orbit": True,
+                        "star_mode": sp.get("mode", "evolution"),
+                        "metallicity": float(sp.get("metallicity", 0.0)),
+                        "age_pct": float(sp.get("age_pct", 0.46) * 100.0),
+                        "s_rad": float(sp.get("radius", float(body_info.get('r', 1.0)))),
+                        "s_temp": float(sp.get("temp", 5778.0)),
+                        "s_lum": float(sp.get("lum", 1.0)),
+                        "locked_rad": sp.get("locked_rad", True),
+                        "locked_temp": sp.get("locked_temp", True),
+                        "locked_lum": sp.get("locked_lum", False)
+                    }
 
     # Target position and radius calculation
     target_pos = cur_subsys_pos_buf[insp_idx].copy() if inspect_bary else cur_pos_snap_render[insp_idx].copy()
@@ -291,6 +435,76 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
     imgui.separator()
 
+    # ── Real-Time Relative Vectors & Osculating Keplerian Elements ──
+    has_parent = (parent_idx >= 0 and parent_idx < limit_bodies)
+    oe_a = float(body_info.get('a', 1.0))
+    oe_e = float(body_info.get('e', 0.0))
+    oe_inc = float(body_info.get('inc', 0.0))
+    oe_Omega = float(body_info.get('Omega', 0.0))
+    oe_omega = float(body_info.get('omega', 0.0))
+    oe_nu = 0.0
+    oe_M = float(body_info.get('M', 0.0))
+    oe_P = 0.0
+    rel_r = np.zeros(3, dtype='f8')
+    rel_v = np.zeros(3, dtype='f8')
+    axial_tilt_deg = None
+
+    if has_parent:
+        if inspect_bary:
+            bp = cur_subsys_pos_buf[insp_idx]
+            bv = cur_subsys_vel_buf[insp_idx]
+            pp = cur_pos_snap_render[parent_idx]
+            pv = cur_vel_snap_render[parent_idx]
+            rel_r = bp - pp
+            rel_v = bv - pv
+        else:
+            rel_r = cur_pos_snap_render[insp_idx] - cur_pos_snap_render[parent_idx]
+            rel_v = cur_vel_snap_render[insp_idx] - cur_vel_snap_render[parent_idx]
+            orb_h = np.cross(rel_r, rel_v)
+            h_norm = np.linalg.norm(orb_h)
+            if h_norm > 1e-12:
+                orb_normal = orb_h / h_norm
+                pole_ra = body_info.get('pole_ra')
+                pole_dec = body_info.get('pole_dec')
+                if pole_ra is not None and pole_dec is not None:
+                    body_pole = pole_to_ecliptic(pole_ra, pole_dec)
+                    body_pole_engine = np.array([body_pole[0], body_pole[2], -body_pole[1]])
+                    tilt_rad = math.acos(np.clip(np.dot(body_pole_engine, orb_normal), -1.0, 1.0))
+                    axial_tilt_deg = math.degrees(tilt_rad)
+
+        ecl_rx, ecl_ry, ecl_rz = rel_r[0], -rel_r[2], rel_r[1]
+        ecl_vx, ecl_vy, ecl_vz = rel_v[0], -rel_v[2], rel_v[1]
+
+        if app.camera.get("inspector_frame", 0) == 1:
+            pole_render_p = cur_visual_arr[parent_idx, 5:8]
+            pole_ecl_p = np.array([pole_render_p[0], -pole_render_p[2], pole_render_p[1]])
+            c_pos, c_vel = rotate_ecliptic_to_equatorial(
+                np.array([ecl_rx, ecl_ry, ecl_rz]), 
+                np.array([ecl_vx, ecl_vy, ecl_vz]), 
+                pole_ecl_p
+            )
+            ecl_rx, ecl_ry, ecl_rz = c_pos
+            ecl_vx, ecl_vy, ecl_vz = c_vel
+
+        orb_mass = body_mass if not inspect_bary else 0.0
+        mu = G * (cur_mass_snap[parent_idx] + orb_mass)
+        oe_a, oe_e, oe_inc, oe_Omega, oe_omega, oe_nu, oe_M, oe_P = \
+            compute_keplerian_elements(ecl_rx, ecl_ry, ecl_rz,
+                                       ecl_vx, ecl_vy, ecl_vz, mu)
+
+    # Initialize edit_data orbit if needed
+    if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
+        ed = app.camera["edit_data"]
+        if ed.get("init_orbit"):
+            if has_parent:
+                ed["a"] = float(oe_a)
+                ed["e"] = float(oe_e)
+                ed["inc"] = float(oe_inc)
+                ed["Omega"] = float(oe_Omega)
+                ed["omega"] = float(oe_omega)
+                ed["M"] = float(oe_M)
+            ed["init_orbit"] = False
+
     # ── Tabbed View ──
     has_atmo = (body_info.get('atmosphere') is not None)
     has_rings = (body_info.get('rings') is not None and len(body_info.get('rings', [])) > 0)
@@ -306,6 +520,109 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 else:
                     m_earth = bary_mass / 3.003e-6
                     imgui.text(f"  System Mass: {m_earth:.4f} M\u2295")
+            elif not insp_is_cmp and app.camera.get("edit_mode", False):
+                ed = app.camera["edit_data"]
+                types_list = ["Star", "Terrestrial", "Gas Giant", "Ice Giant", "Dwarf Planet", "Moon"]
+                if "type" not in ed: ed["type"] = body_info.get("type", "Moon")
+                type_idx = types_list.index(ed["type"]) if ed["type"] in types_list else 1
+                changed_t, type_idx = imgui.combo("Type", type_idx, types_list)
+                if changed_t: ed["type"] = types_list[type_idx]
+
+                if ed["type"] == "Star":
+                    changed_m, mode_idx = imgui.combo("Star Mode", 0 if ed.get("star_mode", "evolution")=="evolution" else 1, ["Evolution Track", "Surface Physics"])
+                    if changed_m: ed["star_mode"] = ["evolution", "surface"][mode_idx]
+
+                    if ed["star_mode"] == "evolution":
+                        _, ed["mass"] = imgui.drag_float(u"Mass (M\u2609)", ed["mass"], 0.01, 0.01, 300.0, format="%.4f")
+                        _, ed["metallicity"] = imgui.drag_float("[Fe/H] (dex)", ed.get("metallicity", 0.0), 0.01, -4.0, 1.0, format="%.3f")
+                        _, ed["age_pct"] = imgui.drag_float("Life Cycle (%)", ed.get("age_pct", 46.0), 0.1, -5.0, 120.0, format="%.1f%%")
+
+                        if ed["mass"] >= 45.0:
+                            imgui.text_colored("Humphreys-Davidson Limit Reached", 1.0, 0.5, 0.2)
+                            ed["evo_path"] = "stripping"
+                        elif ed["mass"] >= 25.0:
+                            if "evo_path" not in ed: ed["evo_path"] = "standard"
+                            changed_p, p_idx = imgui.combo("Evolution Branch", 0 if ed["evo_path"]=="standard" else 1, ["Red Supergiant", "LBV -> Wolf-Rayet"])
+                            if changed_p: ed["evo_path"] = ["standard", "stripping"][p_idx]
+                        else:
+                            ed["evo_path"] = "standard"
+
+                        try:
+                            age_pct = ed["age_pct"] / 100.0
+                            preview = StarCalculator.forge(mode="evolution", evo_path=ed.get("evo_path", "standard"), mass=ed["mass"], metallicity=ed["metallicity"], age_pct=age_pct)
+                            ed["radius"] = preview["physical"]["radius_rsun"] * 696340.0
+                            ed["_preview"] = preview
+                        except Exception:
+                            ed["_preview"] = None
+                    else:
+                        if "locked_rad" not in ed: ed["locked_rad"] = True
+                        if "locked_temp" not in ed: ed["locked_temp"] = True
+                        if "locked_lum" not in ed: ed["locked_lum"] = False
+                        num_locked = ed["locked_rad"] + ed["locked_temp"] + ed["locked_lum"]
+
+                        c1, ed["locked_rad"] = imgui.checkbox("##lr", ed["locked_rad"]); imgui.same_line(); _, ed["s_rad"] = imgui.drag_float(u"Radius (R\u2609)", ed.get("s_rad", 1.0), 0.05, 0.01, 2500.0, format="%.4f")
+                        c2, ed["locked_temp"] = imgui.checkbox("##lt", ed["locked_temp"]); imgui.same_line(); _, ed["s_temp"] = imgui.drag_float("Temp (K)", ed.get("s_temp", 5778.0), 10.0, 1000.0, 100000.0, format="%.0f")
+                        c3, ed["locked_lum"] = imgui.checkbox("##ll", ed["locked_lum"]); imgui.same_line(); _, ed["s_lum"] = imgui.drag_float(u"Luminosity (L\u2609)", ed.get("s_lum", 1.0), 0.01, 0.0001, 2000000.0, format="%.4f")
+
+                        if c1 and ed["locked_rad"] and num_locked == 2:
+                            if ed["locked_temp"] and not c2: ed["locked_temp"] = False
+                            elif ed["locked_lum"] and not c3: ed["locked_lum"] = False
+                        elif c2 and ed["locked_temp"] and num_locked == 2:
+                            if ed["locked_rad"] and not c1: ed["locked_rad"] = False
+                            elif ed["locked_lum"] and not c3: ed["locked_lum"] = False
+                        elif c3 and ed["locked_lum"] and num_locked == 2:
+                            if ed["locked_rad"] and not c1: ed["locked_rad"] = False
+                            elif ed["locked_temp"] and not c2: ed["locked_temp"] = False
+
+                        if ed["locked_rad"] + ed["locked_temp"] + ed["locked_lum"] != 2:
+                            imgui.text_colored("Must lock exactly 2 properties!", 1.0, 0.3, 0.3)
+                            ed["_preview"] = None
+                        else:
+                            try:
+                                preview = StarCalculator.forge(mode="surface", mass=1.0, metallicity=0.0,
+                                    radius=ed["s_rad"] if ed["locked_rad"] else None,
+                                    temp=ed["s_temp"] if ed["locked_temp"] else None,
+                                    lum=ed["s_lum"] if ed["locked_lum"] else None)
+                                ed["radius"] = preview["physical"]["radius_rsun"] * 696340.0
+                                ed["mass"] = preview["physical"]["mass_msun"]
+                                ed["_preview"] = preview
+                            except Exception:
+                                ed["_preview"] = None
+
+                    edit_mass = ed["mass"]
+                    edit_r_km = ed["radius"]
+                else:
+                    _, ed["mass"] = imgui.input_double(u"Mass (M\u2609)", ed["mass"], format="%e")
+                    _, ed["radius"] = imgui.input_double("Radius (km)", ed["radius"], format="%.1f")
+
+                    is_locked = False
+                    if has_parent:
+                        parent_m = cur_mass_snap[parent_idx]
+                        body_m = ed["mass"]
+                        r_km = ed["radius"]
+                        if body_m > 0 and r_km > 0:
+                            r_tid = 0.00084 * ((parent_m**2 / body_m)**(1.0/6.0)) * math.sqrt(r_km)
+                            a_val = ed.get("a", oe_a)
+                            if a_val < r_tid:
+                                is_locked = True
+                                total_m = parent_m + body_m
+                                p_years = math.sqrt(a_val**3 / total_m) if total_m > 0 else 0.0
+                                ed["rotation_period"] = p_years * 365.25 * 24.0
+
+                    if is_locked:
+                        imgui.text(f"  Rot Period: {ed['rotation_period']:.4f} hours [Tidally Locked]")
+                    else:
+                        _, ed["rotation_period"] = imgui.input_double("Rot Period (hours)", ed["rotation_period"], format="%.4f")
+                    edit_mass = ed["mass"]
+                    edit_r_km = ed["radius"]
+
+                if edit_r_km > 0.0:
+                    g_m_s2 = (1.32712440018e14 * edit_mass) / (edit_r_km ** 2)
+                    g_earth = g_m_s2 / 9.80665
+                    if g_m_s2 >= 1e-4:
+                        imgui.text(f"  Surface G: {g_m_s2:.3f} m/s² ({g_earth:.3f} g)")
+                    else:
+                        imgui.text(f"  Surface G: {g_m_s2:.3e} m/s² ({g_earth:.3e} g)")
             else:
                 if body_mass > 1e-4:
                     imgui.text(f"  Mass:    {body_mass:.6e} M\u2609")
@@ -338,18 +655,30 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     imgui.text(f"  Oblateness (f): {f_oblate:.4f}")
 
             # Stellar details
-            if not inspect_bary and 'star_props' in body_info:
-                sp = body_info['star_props']
+            if not inspect_bary and ('star_props' in body_info or (not insp_is_cmp and app.camera.get("edit_mode", False) and app.camera.get("edit_data", {}).get("type") == "Star")):
+                ed_pr = app.camera.get("edit_data", {}).get("_preview") if (not insp_is_cmp and app.camera.get("edit_mode", False)) else None
+                sp = body_info.get('star_props', {})
                 imgui.separator()
                 imgui.text_colored("Stellar Properties", 1.0, 0.85, 0.4)
-                imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
-                imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
-                imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
-                imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
+                if ed_pr:
+                    imgui.text(f"  Temperature: {ed_pr['physical']['temp_k']:,.0f} K")
+                    imgui.text(f"  Luminosity:  {ed_pr['physical']['lum_lsun']:.4f} L\u2609")
+                    imgui.text(f"  Spectral Cl: {ed_pr['classification']['fullDesignation']}")
+                    imgui.text(f"  Stage:       {ed_pr['evolution']['phase']}")
+                else:
+                    imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
+                    imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
+                    imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
+                    imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
 
-                if sp.get('mode') == 'evolution':
-                    imgui.text(f"  Metallicity: {sp.get('metallicity', 0.0):.3f}")
-                    age_gyr = sp.get('age', 0.0)
+                mode_val = app.camera.get("edit_data", {}).get("star_mode", sp.get('mode', 'evolution')) if (not insp_is_cmp and app.camera.get("edit_mode", False)) else sp.get('mode', 'evolution')
+                if mode_val == 'evolution':
+                    met_val = app.camera.get("edit_data", {}).get("metallicity", sp.get('metallicity', 0.0)) if (not insp_is_cmp and app.camera.get("edit_mode", False)) else sp.get('metallicity', 0.0)
+                    imgui.text(f"  Metallicity: {met_val:.3f}")
+                    if ed_pr:
+                        age_gyr = ed_pr['evolution']['age_gyr']
+                    else:
+                        age_gyr = sp.get('age', 0.0)
                     if age_gyr < 0.1:
                         imgui.text(f"  Age:         {age_gyr * 1000.0:,.1f} Myr")
                     else:
@@ -366,40 +695,120 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
         # ── Tab 2: Orbit & Dynamics ──
         if imgui.begin_tab_item("Orbit")[0]:
-            parent_name = cur_bodies_data[parent_idx]['name'] if 0 <= parent_idx < len(cur_bodies_data) else "Barycenter"
-            imgui.text_colored(f"Parent: {parent_name}", 0.6, 0.9, 1.0)
-            imgui.separator()
+            if not has_parent:
+                imgui.text_colored("Primary Central Body (No Parent Orbit)", 0.6, 0.9, 1.0)
+            else:
+                parent_name = cur_bodies_data[parent_idx]['name'] if 0 <= parent_idx < len(cur_bodies_data) else "Barycenter"
+                imgui.text_colored(f"Parent: {parent_name}", 0.6, 0.9, 1.0)
+                imgui.separator()
 
-            oe_a = float(body_info.get('a', 1.0))
-            oe_e = float(body_info.get('e', 0.0))
-            oe_inc = float(body_info.get('inc', 0.0))
-            oe_Omega = float(body_info.get('Omega', 0.0))
-            oe_omega = float(body_info.get('omega', 0.0))
-            oe_M = float(body_info.get('M', 0.0))
-
-            imgui.text(f"  Semi-major (a): {format_distance_au(oe_a, threshold_au=thresh_au, precision=6)}")
-            imgui.text(f"  Eccentricity (e): {oe_e:.6f}")
-            imgui.text(f"  Inclination (i):  {oe_inc:.3f}°")
-            imgui.text(f"  Long Asc Node (Ω):{oe_Omega:.3f}°")
-            imgui.text(f"  Arg Periapsis (ω):{oe_omega:.3f}°")
-            imgui.text(f"  Mean Anomaly (M): {oe_M:.3f}°")
-
-            periapsis = oe_a * (1.0 - oe_e)
-            apoapsis = oe_a * (1.0 + oe_e)
-            imgui.separator()
-            imgui.text(f"  Periapsis: {format_distance_au(periapsis, threshold_au=thresh_au, precision=5)}")
-            imgui.text(f"  Apoapsis:  {format_distance_au(apoapsis, threshold_au=thresh_au, precision=5)}")
-
-            # Orbital period
-            if parent_idx >= 0:
-                parent_m = cur_mass_snap[parent_idx]
-                tot_m = parent_m + body_mass
-                if tot_m > 0 and oe_a > 0:
-                    p_yr = math.sqrt(oe_a**3 / tot_m)
-                    if p_yr >= 1.0:
-                        imgui.text(f"  Period:    {p_yr:,.2f} years")
+                if axial_tilt_deg is not None:
+                    if axial_tilt_deg > 90.0:
+                        imgui.text(f"  Axial Tilt: {axial_tilt_deg:.2f}° (Retrograde)")
                     else:
-                        imgui.text(f"  Period:    {p_yr * 365.25:,.2f} days")
+                        imgui.text(f"  Axial Tilt: {axial_tilt_deg:.2f}°")
+
+                app.camera.setdefault("inspector_frame", 0)
+                changed_frame, app.camera["inspector_frame"] = imgui.combo("Reference Frame", app.camera["inspector_frame"], ["Ecliptic", "Equatorial"])
+                if changed_frame:
+                    app.save_settings()
+                    if not insp_is_cmp and app.camera.get("edit_mode", False):
+                        app.camera["edit_data"]["init_orbit"] = True
+
+                if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
+                    ed = app.camera["edit_data"]
+                    imgui.separator()
+                    imgui.text_colored("Edit Orbit", 0.5, 0.8, 1.0)
+                    _, ed["a"] = imgui.input_double("Semi-Major Axis (AU)", ed.get("a", oe_a), format="%.6f")
+                    _, ed["e"] = imgui.input_double("Eccentricity", ed.get("e", oe_e), format="%.6f")
+                    _, ed["inc"] = imgui.input_double("Inclination (deg)", ed.get("inc", oe_inc), format="%.3f")
+                    _, ed["Omega"] = imgui.input_double(u"\u03A9 (Long Asc Node)", ed.get("Omega", oe_Omega), format="%.3f")
+                    _, ed["omega"] = imgui.input_double(u"\u03C9 (Arg Periapsis)", ed.get("omega", oe_omega), format="%.3f")
+                    _, ed["M"] = imgui.input_double("Mean Anomaly (deg)", ed.get("M", oe_M), format="%.3f")
+
+                    # Live Roche limit calculation
+                    cur_parent_m = cur_mass_snap[parent_idx]
+                    cur_body_m = float(ed.get("mass", body_mass))
+                    cur_r_km = float(ed.get("radius", body_r_km))
+                    cur_a_val = float(ed.get("a", oe_a))
+                    cur_e_val = float(ed.get("e", oe_e))
+                    if cur_body_m > 0 and cur_r_km > 0:
+                        d_roche_km = 2.44 * cur_r_km * ((cur_parent_m / cur_body_m)**(1.0/3.0))
+                        d_roche_au = d_roche_km / AU_TO_KM
+                        periapsis_au = cur_a_val * (1.0 - cur_e_val)
+                        if periapsis_au < d_roche_au:
+                            imgui.spacing()
+                            imgui.text_colored("Warning: Orbit is within parent's Roche limit!", 1.0, 0.3, 0.3)
+                            imgui.text_colored(f"  Roche Limit: {format_distance_au(d_roche_au, threshold_au=thresh_au, precision=5)} ({d_roche_km:,.0f} km)", 0.7, 0.7, 0.7)
+                            imgui.text_colored(f"  Periapsis:   {format_distance_au(periapsis_au, threshold_au=thresh_au, precision=5)}", 0.7, 0.7, 0.7)
+                else:
+                    use_km = oe_a < 0.01
+                    if use_km:
+                        imgui.text(f"  Semi-major (a): {oe_a * AU_TO_KM:,.0f} km")
+                    else:
+                        imgui.text(f"  Semi-major (a): {format_distance_au(oe_a, threshold_au=thresh_au, precision=6)}")
+                    imgui.text(f"  Eccentricity (e): {oe_e:.6f}")
+                    imgui.text(f"  Inclination (i):  {oe_inc:.3f}°")
+                    imgui.text(f"  Long Asc Node (Ω):{oe_Omega:.3f}°")
+                    imgui.text(f"  Arg Periapsis (ω):{oe_omega:.3f}°")
+                    imgui.text(f"  True Anomaly (ν): {oe_nu:.3f}°")
+                    imgui.text(f"  Mean Anomaly (M): {oe_M:.3f}°")
+
+                imgui.separator()
+                imgui.text_colored("Derived Quantities", 1.0, 0.85, 0.4)
+                if oe_P > 0:
+                    if oe_P < 730:
+                        imgui.text(f"  Period:      {oe_P:.3f} days")
+                    else:
+                        imgui.text(f"  Period:      {oe_P/365.25:.4f} years")
+
+                active_a = ed["a"] if (not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary) else oe_a
+                active_e = ed["e"] if (not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary) else oe_e
+                periapsis = active_a * (1.0 - active_e)
+                apoapsis = active_a * (1.0 + active_e)
+                dist_au = math.sqrt(rel_r[0]**2 + rel_r[1]**2 + rel_r[2]**2)
+                vel_au_yr = math.sqrt(rel_v[0]**2 + rel_v[1]**2 + rel_v[2]**2)
+                vel_km_s = vel_au_yr * 4.7405
+
+                use_km = active_a < 0.01
+                if use_km:
+                    imgui.text(f"  Periapsis:   {periapsis * AU_TO_KM:,.0f} km")
+                    imgui.text(f"  Apoapsis:    {apoapsis * AU_TO_KM:,.0f} km")
+                    imgui.text(f"  Distance:    {dist_au * AU_TO_KM:,.0f} km")
+                else:
+                    imgui.text(f"  Periapsis:   {format_distance_au(periapsis, threshold_au=thresh_au, precision=6)}")
+                    imgui.text(f"  Apoapsis:    {format_distance_au(apoapsis, threshold_au=thresh_au, precision=6)}")
+                    imgui.text(f"  Distance:    {format_distance_au(dist_au, threshold_au=thresh_au, precision=6)}")
+                imgui.text(f"  Velocity:    {vel_km_s:.3f} km/s")
+
+                if oe_a > 0 and oe_e < 1.0 and not inspect_bary:
+                    imgui.separator()
+                    imgui.text_colored("Precession (arcsec/cy)", 1.0, 0.85, 0.4)
+                    c2 = C_AU_YR * C_AU_YR
+                    p_param = oe_a * (1.0 - oe_e * oe_e)
+                    if p_param > 0:
+                        gr_rad_per_orbit = 3.0 * mu / (oe_a * c2 * (1.0 - oe_e*oe_e))
+                        orbits_per_century = 36525.0 / oe_P if oe_P > 0 else 0
+                        gr_arcsec_cy = gr_rad_per_orbit * orbits_per_century * (180.0/math.pi) * 3600.0
+                        imgui.text(f"  GR (apsidal):  {gr_arcsec_cy:.2f}")
+                    else:
+                        imgui.text("  GR (apsidal):  0.00")
+
+                    j2_apsidal = 0.0
+                    j2_nodal = 0.0
+                    parent_j2 = cur_bodies_data[parent_idx].get('J2', 0.0)
+                    if parent_j2 > 0 and oe_P > 0:
+                        parent_r_au = cur_bodies_data[parent_idx].get('r', 0.0) * SOLAR_RADII_TO_AU
+                        n_mean = 2.0 * math.pi / (oe_P / 365.25)
+                        if p_param > 0:
+                            ratio2 = (parent_r_au / p_param) ** 2
+                            j2_apsidal_rad_yr = 1.5 * n_mean * parent_j2 * ratio2
+                            j2_nodal_rad_yr = -j2_apsidal_rad_yr * math.cos(math.radians(oe_inc))
+                            j2_apsidal = j2_apsidal_rad_yr * 100.0 * (180.0/math.pi) * 3600.0
+                            j2_nodal = j2_nodal_rad_yr * 100.0 * (180.0/math.pi) * 3600.0
+
+                    imgui.text(f"  J2 (apsidal):  {j2_apsidal:.2f}")
+                    imgui.text(f"  J2 (nodal):    {j2_nodal:.2f}")
 
             imgui.end_tab_item()
 
@@ -900,4 +1309,38 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
         imgui.end_tab_bar()
 
+        # ── Edit Mode Action Bar ──
+        if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
+            imgui.separator()
+            ed = app.camera.get("edit_data", {})
+            roche_violates = False
+            if has_parent:
+                parent_m = cur_mass_snap[parent_idx]
+                body_m = float(ed.get("mass", body_mass))
+                r_km = float(ed.get("radius", body_r_km))
+                a_val = float(ed.get("a", oe_a))
+                e_val = float(ed.get("e", oe_e))
+                if body_m > 0 and r_km > 0:
+                    d_roche_km = 2.44 * r_km * ((parent_m / body_m)**(1.0/3.0))
+                    d_roche_au = d_roche_km / AU_TO_KM
+                    periapsis_au = a_val * (1.0 - e_val)
+                    if periapsis_au < d_roche_au:
+                        roche_violates = True
+
+            if roche_violates:
+                imgui.text_colored("Warning: Orbit violates Roche limit!", 1.0, 0.3, 0.3)
+                imgui.text_colored("[Apply Changes Disabled]", 0.5, 0.5, 0.5)
+                if imgui.button("Cancel##edit_cancel_disabled", width=-1):
+                    app.camera["edit_mode"] = False
+            else:
+                half_w = (insp_w - 30) // 2
+                imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
+                if imgui.button("Apply Changes##apply_edits", width=half_w):
+                    _apply_body_edits(app, insp_idx, body_info, parent_idx, cur_mass_snap, cur_pos_snap_render, cur_vel_snap_render, cur_visual_arr)
+                imgui.pop_style_color()
+                imgui.same_line(spacing=10)
+                if imgui.button("Cancel##edit_cancel", width=half_w):
+                    app.camera["edit_mode"] = False
+
     imgui.end()
+
