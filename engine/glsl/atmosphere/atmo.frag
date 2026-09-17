@@ -1067,7 +1067,13 @@ void main() {
             }
         }
 
-        vec3 ring_normal_vec = (u_num_ring_planes > 0) ? u_ring_normal[0] : pole_dir_norm;
+        vec3 ring_normal_vec = pole_dir_norm;
+        for (int k = 0; k < u_num_ring_planes; k++) {
+            if ((u_ring_mask & (1u << k)) != 0u) {
+                ring_normal_vec = u_ring_normal[k];
+                break;
+            }
+        }
 
         // SpaceEngine Solstice Winter Model (atmosphere thickness is negligible compared to radius)
         vec3 mid_pos_sph = toSphericalSpace(mid_pos, u_pole_obl);
@@ -1309,31 +1315,31 @@ void main() {
             );
         }
 
-        if (u_ringshine_enabled && u_num_ring_planes > 0) {
+        if (u_ringshine_enabled && u_num_ring_planes > 0 && u_ring_mask != 0u) {
             vec3 ringshine_irradiance = vec3(0.0);
-            vec3 N = normalize(mid_pos);
+            vec3 P_dir = normalize(mid_pos);
             vec3 L_dir = L_mid;
 
-            vec3 ring_normal = ring_normal_vec;
-
-            vec3 antiL = -L_dir;
-            vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
-            float len_antiL_eq = length(antiL_eq_raw);
-            vec3 antiL_eq = len_antiL_eq > 1e-5 ? antiL_eq_raw / len_antiL_eq : vec3(-1.0, 0.0, 0.0);
-
-            vec3 N_eq_raw = N - ring_normal * dot(N, ring_normal);
-            float len_N_eq = length(N_eq_raw);
-            vec3 N_eq = len_N_eq > 1e-5 ? N_eq_raw / len_N_eq : vec3(1.0, 0.0, 0.0);
-
-            vec3 cross_rel = cross(antiL_eq, N_eq);
-            float sin_rel = dot(cross_rel, ring_normal);
-            float cos_rel = clamp(dot(N_eq, antiL_eq), -1.0, 1.0);
-            float phi_center = atan(sin_rel, cos_rel);
-
-            float frag_elevation = dot(N, ring_normal);
-
-            for (int j = 0; j < 1; j++) {
+            for (int j = 0; j < u_num_ring_planes; j++) {
                 if ((u_ring_mask & (1u << j)) == 0u) continue;
+                vec3 ring_normal = u_ring_normal[j];
+
+                vec3 antiL = -L_dir;
+                vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
+                float len_antiL_eq = length(antiL_eq_raw);
+                vec3 antiL_eq = len_antiL_eq > 1e-5 ? antiL_eq_raw / len_antiL_eq : vec3(-1.0, 0.0, 0.0);
+
+                vec3 P_eq_raw = P_dir - ring_normal * dot(P_dir, ring_normal);
+                float len_P_eq = length(P_eq_raw);
+                vec3 P_eq = len_P_eq > 1e-5 ? P_eq_raw / len_P_eq : vec3(1.0, 0.0, 0.0);
+
+                vec3 cross_rel = cross(antiL_eq, P_eq);
+                float sin_rel = dot(cross_rel, ring_normal);
+                float cos_rel = clamp(dot(P_eq, antiL_eq), -1.0, 1.0);
+                float phi_center = atan(sin_rel, cos_rel);
+
+                float frag_elevation = dot(P_dir, ring_normal);
+
                 float x_prime = phi_center / PI;
                 float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 

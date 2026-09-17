@@ -296,14 +296,18 @@ $$\text{out\_color} = \text{vec4}(\mathbf{E}_{\text{total}} \cdot \pi, \; 1.0)$$
 
 Ringshine is evaluated exclusively for the **host planet** (`if (!is_host_planet) continue;`). For each surface fragment with normal $\mathbf{N}$ and incident star vector $\mathbf{L}$:
 
-1. **Surface elevation**:
-   $$\text{frag\_elevation} = \mathbf{N} \cdot \mathbf{n}_{\text{ring}}$$
+1. **Normalized planetocentric elevation** $\sin\lambda$:
+   $$\mathbf{P}_{\text{dir}} = \text{normalize}(\mathbf{P}_{\text{rel}})$$
+   $$\text{frag\_elevation} = \mathbf{P}_{\text{dir}} \cdot \mathbf{n}_{\text{ring}}$$
 
 2. **Meridian azimuth angle** $\phi_{\text{center}}$ relative to the anti-solar point:
-   - Project $\mathbf{N}$ and $-\mathbf{L}$ into the equatorial ring plane:
-     $$\mathbf{N}_{\text{eq}} = \text{normalize}(\mathbf{N} - \mathbf{n}_{\text{ring}}(\mathbf{N} \cdot \mathbf{n}_{\text{ring}})), \qquad \mathbf{L}_{-\text{eq}} = \text{normalize}(-\mathbf{L} - \mathbf{n}_{\text{ring}}(-\mathbf{L} \cdot \mathbf{n}_{\text{ring}}))$$
+   - Project $\mathbf{P}_{\text{dir}}$ and $-\mathbf{L}$ into the equatorial ring plane:
+     $$\mathbf{P}_{\text{eq}} = \text{normalize}(\mathbf{P}_{\text{dir}} - \mathbf{n}_{\text{ring}}(\mathbf{P}_{\text{dir}} \cdot \mathbf{n}_{\text{ring}})), \qquad \mathbf{L}_{-\text{eq}} = \text{normalize}(-\mathbf{L} - \mathbf{n}_{\text{ring}}(-\mathbf{L} \cdot \mathbf{n}_{\text{ring}}))$$
    - Azimuth angle:
-     $$\phi_{\text{center}} = \text{atan2}\!\big((\mathbf{L}_{-\text{eq}} \times \mathbf{N}_{\text{eq}}) \cdot \mathbf{n}_{\text{ring}}, \;\; \mathbf{N}_{\text{eq}} \cdot \mathbf{L}_{-\text{eq}}\big)$$
+     $$\phi_{\text{center}} = \text{atan2}\!\big((\mathbf{L}_{-\text{eq}} \times \mathbf{P}_{\text{eq}}) \cdot \mathbf{n}_{\text{ring}}, \;\; \mathbf{P}_{\text{eq}} \cdot \mathbf{L}_{-\text{eq}}\big)$$
+
+> [!IMPORTANT]
+> **Planetocentric Position vs Surface Normal**: Both [`sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag) and [`atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag) parameterize the ringshine lookup manifold using the unit radial position vector $\mathbf{P}_{\text{dir}} = \text{normalize}(\mathbf{P}_{\text{rel}})$. Evaluating elevation and meridian using the surface normal $\mathbf{N}$ is physically incorrect: $\mathbf{N}$ is distorted by planetary oblateness ($\tan\phi_{\text{geodetic}} = (1-f)^{-2} \tan\lambda_{\text{centric}}$, shifting normals by up to $6.5^\circ$ on Saturn) and perturbed by normal maps (`TBN * map_normal`), causing the zero-irradiance equator line to decouple from the geometric ring plane. Using $\mathbf{P}_{\text{dir}}$ guarantees that $\mathbf{P}_{\text{dir}} \cdot \mathbf{n}_{\text{ring}} = 0$ exactly on the equator, ensuring seamless alignment between the ground terrain, atmospheric haze, and edge-on ring plane.
 
 3. **Invert power-1.5 warping via power-$2/3$**:
    $$\phi_{\text{uv}} = \text{sign}\!\left(\frac{\phi_{\text{center}}}{\pi}\right) \cdot \left|\frac{\phi_{\text{center}}}{\pi}\right|^{2/3} \cdot 0.5 + 0.5$$

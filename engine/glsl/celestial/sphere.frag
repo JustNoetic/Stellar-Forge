@@ -931,8 +931,8 @@ void main() {
 
             if (!is_host_planet) continue;
 
-            float frag_elevation = dot(N, ring_normal);
-            float moon_h = -dot(frag_to_center, ring_normal);
+            vec3 P_dir = normalize(P_rel);
+            float frag_elevation = dot(P_dir, ring_normal);
 
             for (int s = 0; s < u_num_stars; s++) {
                 vec3 star_pos = u_stars_pos_radius[s].xyz;
@@ -955,10 +955,10 @@ void main() {
 
                 // --- PRE-INTEGRATED LUT RINGSHINE FOR HOST PLANET ONLY ---
 
-                // Fragment equator normal vector (in ring plane)
-                vec3 N_eq_raw = N - ring_normal * dot(N, ring_normal);
-                float len_N_eq = length(N_eq_raw);
-                vec3 N_eq = len_N_eq > 1e-5 ? N_eq_raw / len_N_eq : vec3(1.0, 0.0, 0.0);
+                // Fragment equator position vector (in ring plane)
+                vec3 P_eq_raw = P_dir - ring_normal * dot(P_dir, ring_normal);
+                float len_P_eq = length(P_eq_raw);
+                vec3 P_eq = len_P_eq > 1e-5 ? P_eq_raw / len_P_eq : vec3(1.0, 0.0, 0.0);
 
                 // Anti-solar vector projection in ring plane
                 vec3 antiL = -L;
@@ -967,9 +967,9 @@ void main() {
                 vec3 antiL_eq = len_antiL_eq > 1e-5 ? antiL_eq_raw / len_antiL_eq : vec3(-1.0, 0.0, 0.0);
 
                 // Azimuth angle phi_center between anti-solar vector and surface fragment meridian
-                vec3 cross_rel = cross(antiL_eq, N_eq);
+                vec3 cross_rel = cross(antiL_eq, P_eq);
                 float sin_rel = dot(cross_rel, ring_normal);
-                float cos_rel = clamp(dot(N_eq, antiL_eq), -1.0, 1.0);
+                float cos_rel = clamp(dot(P_eq, antiL_eq), -1.0, 1.0);
                 float phi_center = atan(sin_rel, cos_rel);
 
                 float x_prime = phi_center / PI;
