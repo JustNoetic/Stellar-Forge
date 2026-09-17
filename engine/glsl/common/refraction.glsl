@@ -246,6 +246,13 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
 // displacement of compute_refraction_angle; feeding the parallax-weighted alpha
 // into an anchored bend would apply the (1 - s_min/d) factor twice.
 float compute_refraction_total(vec3 C, vec3 V, float d) {
+    // Above the local horizon the line periapsis is behind the observer.
+    // Mesh callers clamp the bend anchor to the camera in this regime, so
+    // their effective rotation must equal the point path's displacement.
+    // The limb Gaussian below clamps a below-ground line periapsis and loses
+    // the ascending-path tail, under-refracting meshes relative to sprites.
+    if (dot(C, V) > 0.0) return compute_refraction_angle(C, V, d);
+
     float s_min, delta_rmin, sigma;
     float r_min = _refraction_setup(C, V, d, s_min, delta_rmin, sigma);
     if (r_min < 0.0) return 0.0;
