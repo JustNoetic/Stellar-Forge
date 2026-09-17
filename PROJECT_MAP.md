@@ -257,8 +257,9 @@ spectral classification.
   - `bloom_downsample.frag`, `bloom_upsample.frag` — HDR bloom pyramid.
   - `composite.frag` — tonemap (ACES) + exposure + bloom composite.
   - `accum.frag` — jitter accumulation resolve for screenshots and scene.
+  - `ringshine_map.frag` — dynamic per-frame ringshine irradiance map bake (4-point area-weighted Gauss-Legendre quadrature, shadow CDF integration).
 
-**Edit when:** bloom, tonemapping, exposure, accumulation.
+**Edit when:** bloom, tonemapping, exposure, accumulation, ringshine dynamic bake map.
 
 ### 3.12 `engine/rendering/render_utils.py` (343 lines)
 - `hex_to_rgb`, `sample_gradient` — color helpers.
@@ -515,6 +516,8 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
 | Change planetshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
 | Change ring texture baking | `engine/rendering/texture_baker.py` | `bake_and_export_ring_textures` |
+| Change ringshine irradiance map / shadow CDF | `engine/glsl/post/ringshine_map.frag`, `engine/app.py` (`build_ringshine_lut`) | `build_ringshine_lut` |
+| Validate ringshine accuracy vs Monte Carlo | `scripts/ringshine_benchmark.py` | `main` |
 | Change GLFW input callbacks & settings persistence | `engine/core/input_handler.py`, `engine/app.py` | `InputHandlerMixin`, `App` callbacks & movement mode |
 | Change camera, UI, main render loop | `engine/app.py` | `class App`, `run()` |
 | Change eclipse LUT build | `engine/app.py` | `build_eclipse_lut` |

@@ -678,7 +678,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                                 ring_item['alpha_boost'] = 1.0
                                 changed_unlit = True
                             imgui.same_line()
-                            if imgui.button(f"Bake & Save Textures##{i}"):
+                            if imgui.button(f"Bake & Save Texture##{i}"):
                                 b_name = cur_bodies_data[insp_idx]['name']
                                 bake_and_export_ring_textures(app, b_name, ring_item, ring_precomputed, ring_render_groups, ring_gradient_tex)
                             imgui.tree_pop()

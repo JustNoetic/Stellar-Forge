@@ -206,7 +206,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
             if app.camera.get("ringshine_enabled", True):
                 imgui.indent()
-                ringshine_bands = int(app.camera.get("ringshine_band_count", 256))
+                ringshine_bands = int(app.camera.get("ringshine_band_count", 100))
                 changed_rsb, ringshine_bands = imgui.slider_int("Ringshine Bands", ringshine_bands, 4, 1024)
                 if changed_rsb:
                     app.camera["ringshine_band_count"] = ringshine_bands

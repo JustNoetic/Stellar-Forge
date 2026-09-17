@@ -336,6 +336,15 @@ def extract_frustum_planes(vp):
             planes[i] /= length
     return planes
 
+@njit(cache=True)
+def is_sphere_in_frustum(pos, radius, planes):
+    """Test if a sphere (pos, radius) intersects or is inside the view frustum."""
+    for i in range(6):
+        d = pos[0] * planes[i, 0] + pos[1] * planes[i, 1] + pos[2] * planes[i, 2] + planes[i, 3]
+        if d < -radius:
+            return False
+    return True
+
 def create_icosphere_mesh(subdivisions=4):
     """Create a unit icosphere mesh with interleaved positions and normals."""
     t = (1.0 + math.sqrt(5.0)) / 2.0

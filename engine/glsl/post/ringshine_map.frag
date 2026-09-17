@@ -74,6 +74,41 @@ float GetRingPhaseFunctions(float dotLight, float alpha, float asym, float back_
     return phaseFunctions.x + phaseFunctions.y;
 }
 
+float CornetteShanksPhaseFunction(float eccentricity, float viewDirDotLight) {
+    float g = eccentricity;
+    float g2 = g * g;
+    float mu = viewDirDotLight;
+    float denom = pow(max(1e-6, 1.0 + g2 - 2.0 * g * mu), 1.5);
+    return (1.5 * (1.0 + mu * mu) * (1.0 - g2)) / ((2.0 + g2) * denom * 4.0 * PI);
+}
+
+
+float HapkeHFunction(float mu, float gamma) {
+    return (1.0 + 2.0 * mu) / (1.0 + 2.0 * mu * gamma);
+}
+
+float AnalyticMultipleScattering(float mu_v, float mu_0, float tau, bool onLitSide) {
+    float w0 = 0.92;
+    float gamma = sqrt(max(1e-4, 1.0 - w0));
+    float Hv = HapkeHFunction(mu_v, gamma);
+    float H0 = HapkeHFunction(mu_0, gamma);
+
+    if (onLitSide) {
+        float path_term = 1.0 - exp(-tau * (1.0 / mu_v + 1.0 / mu_0));
+        float mu_ratio = mu_0 / max(1e-4, mu_v + mu_0);
+        return max(0.0, w0 * mu_ratio * (Hv * H0 - 1.0) * path_term) / (4.0 * PI);
+    } else {
+        float exp_trans = exp(-gamma * tau / max(1e-4, mu_0));
+        float direct_atten = exp(-tau / max(1e-4, mu_0));
+        float diff_trans = max(0.0, exp_trans - direct_atten);
+        float boundary_factor = (Hv - 1.0) * (H0 - 1.0);
+        return max(0.0, w0 * diff_trans * (1.0 + 0.5 * boundary_factor) * mu_0) / (4.0 * PI);
+    }
+}
+
+const vec4 QUAD_T = vec4(0.0694318442, 0.3300094782, 0.6699905218, 0.9305681558);
+const vec4 QUAD_W = vec4(0.1739274226, 0.3260725774, 0.3260725774, 0.1739274226);
+
 float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
     float TWO_PI = 6.28318530717958647692;
     float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
@@ -123,11 +158,21 @@ void main() {
     float cos_sun_elev = sqrt(max(0.0, 1.0 - sin_sun_elev * sin_sun_elev));
 
     float same_hemisphere = sun_elevation * frag_elevation;
-    float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
+    float same_hemi_t = (same_hemisphere >= 0.0) ? 1.0 : 0.0;
 
     int band_count = clamp(u_ringshine_band_count, 4, 1024);
     vec3 total_ring_irradiance = vec3(0.0);
     float log_r_ratio = log(max(1.001, outer_r / max(1e-5, inner_r)));
+
+    bool plane_is_textured = (u_ring_planes[k].is_textured > 0.5);
+    float layer_hue   = u_ring_planes[k].hue_shift;
+    float layer_sat   = u_ring_planes[k].saturation;
+    float layer_bri   = u_ring_planes[k].brightness;
+    float layer_unlit = u_ring_planes[k].unlit_factor;
+    float layer_boost = u_ring_planes[k].alpha_boost;
+    float layer_asym  = u_ring_planes[k].asymmetry;
+    float layer_backasym = u_ring_planes[k].backscatter;
+    float layer_scatter  = u_ring_planes[k].scatter;
 
     for (int m = 0; m < band_count; m++) {
         float u0 = float(m) / float(band_count);
@@ -138,68 +183,43 @@ void main() {
         float r_m1 = inner_r * exp(u1 * log_r_ratio);
         float r_mid = inner_r * exp(u_mid * log_r_ratio);
         float dr = (r_m1 - r_m0) / max(1e-5, host_radius);
-        float frac_mid = clamp((r_mid - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
 
-        vec4 ring_texel = texture(u_ring_gradients, vec2(frac_mid, (float(k) + 0.5) / 16.0));
-        if (ring_texel.a < 1e-4) continue;
+        // --- 4-POINT AREA-WEIGHTED GAUSS-LEGENDRE QUADRATURE ---
+        float sum_area = 0.0;
+        float sum_alpha = 0.0;
+        vec3 sum_color = vec3(0.0);
 
-        bool plane_is_textured = (u_ring_planes[k].is_textured > 0.5);
-        float layer_hue   = u_ring_planes[k].hue_shift;
-        float layer_sat   = u_ring_planes[k].saturation;
-        float layer_bri   = u_ring_planes[k].brightness;
-        float layer_unlit = u_ring_planes[k].unlit_factor;
-        float layer_boost = u_ring_planes[k].alpha_boost;
+        for (int s = 0; s < 4; s++) {
+            float t_sub = u0 + QUAD_T[s] * (u1 - u0);
+            float r_s = inner_r * exp(t_sub * log_r_ratio);
+            float frac_s = clamp((r_s - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
+            vec4 samp = texture(u_ring_gradients, vec2(frac_s, (float(k) + 0.5) / 16.0));
+            float w_area = r_s * QUAD_W[s];
+            sum_area += w_area;
+            sum_alpha += samp.a * w_area;
+            sum_color += samp.rgb * (samp.a * w_area);
+        }
+
+        if (sum_area < 1e-9 || sum_alpha < 1e-9) continue;
+
+        float band_raw_alpha = sum_alpha / sum_area;
+        vec3 band_raw_rgb = sum_color / sum_alpha;
 
         if (plane_is_textured && (abs(layer_hue) > 1e-4 || abs(layer_sat - 1.0) > 1e-4 || abs(layer_bri - 1.0) > 1e-4)) {
-            ring_texel.rgb = adjust_hsba(ring_texel.rgb, layer_hue, layer_sat, layer_bri);
+            band_raw_rgb = adjust_hsba(band_raw_rgb, layer_hue, layer_sat, layer_bri);
         }
 
-        if (plane_is_textured && ring_texel.a > 1e-5 && abs(layer_boost - 1.0) > 1e-4) {
-            ring_texel.a = clamp(pow(ring_texel.a, 1.0 / max(0.01, layer_boost)), 0.0, 1.0);
+        if (plane_is_textured && band_raw_alpha > 1e-5 && abs(layer_boost - 1.0) > 1e-4) {
+            band_raw_alpha = clamp(pow(band_raw_alpha, 1.0 / max(0.01, layer_boost)), 0.0, 1.0);
         }
 
-        float alpha_phys = clamp(ring_texel.a * opacity, 0.0, 0.999);
+        float alpha_phys = clamp(band_raw_alpha * opacity, 0.0, 0.999);
         float tau_phys = -log(max(1e-4, 1.0 - alpha_phys));
 
-        float cosViewRayVertical = max(sin_lat, 1e-4);
-        float cosLightRayVertical = max(sin_sun_elev, 1e-4);
-        float viewDensity = tau_phys / cosViewRayVertical;
-        float lightDensity = tau_phys / cosLightRayVertical;
-
-        float layer_asym = u_ring_planes[k].asymmetry;
-        float layer_backasym = u_ring_planes[k].backscatter;
-
-        float scatteredLight_sunlit = viewDensity / (viewDensity + lightDensity) * (1.0 - exp(-viewDensity - lightDensity));
-        float pf_sunlit = GetRingPhaseFunctions(0.70, alpha_phys, layer_asym, layer_backasym);
-        
-        // Hapke H-Functions for Multiple Scattering
-        float w0 = 0.92;
-        float gamma = sqrt(max(1e-4, 1.0 - w0));
-        float Hv = (1.0 + 2.0 * cosViewRayVertical) / (1.0 + 2.0 * cosViewRayVertical * gamma);
-        float H0 = (1.0 + 2.0 * cosLightRayVertical) / (1.0 + 2.0 * cosLightRayVertical * gamma);
-        float path_term = 1.0 - exp(-tau_phys * (1.0 / cosViewRayVertical + 1.0 / cosLightRayVertical));
-        float mu_ratio = cosLightRayVertical / max(1e-4, cosViewRayVertical + cosLightRayVertical);
-        
-        float inv_4pi = 1.0 / (4.0 * 3.14159265358979);
-        float dust_to_chunks = clamp((alpha_phys - 0.1) / 0.5, 0.0, 1.0);
-        float ms_sunlit = max(0.0, w0 * mu_ratio * (Hv * H0 - 1.0) * path_term * dust_to_chunks) * inv_4pi;
-
-        vec3 band_color_sunlit = ring_texel.rgb * (scatteredLight_sunlit * pf_sunlit + (plane_is_textured ? ms_sunlit : 0.0));
-
-        float denominator = lightDensity - viewDensity;
-        float scatteredLight_unlit = 0.0;
-        if (abs(denominator) > 1e-6) {
-            scatteredLight_unlit = (exp(-viewDensity) - exp(-lightDensity)) * viewDensity / denominator;
-        } else {
-            scatteredLight_unlit = viewDensity * exp(-viewDensity);
-        }
-        float pf_unlit = GetRingPhaseFunctions(-0.70, alpha_phys, layer_asym, layer_backasym);
-        vec3 band_color_unlit = ring_texel.rgb * (scatteredLight_unlit * pf_unlit * layer_unlit);
-
-        vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
-
         float norm_r = r_mid / max(1e-5, host_radius);
+        float cos_lat = sqrt(max(0.0, 1.0 - sin_lat * sin_lat));
 
+        // --- PLANETARY SHADOW ON RING (CDF & LUT) ---
         float delta_alpha_shadow = 0.0;
         if (norm_r <= 1.0 / sin_sun_elev) {
             float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
@@ -215,6 +235,48 @@ void main() {
 
         float shadow_fraction = clamp(0.5 * (cdf2 - cdf1), 0.0, 1.0);
         float band_illum = max(0.0, 1.0 - shadow_fraction);
+
+        if (band_illum < 1e-6) continue;
+
+        // --- EXACT SLANT ANGLE & DISTANCE ---
+        float d2 = max(1e-6, norm_r * norm_r + 1.0 - 2.0 * norm_r * cos_lat);
+        float d = sqrt(d2);
+
+        float cosViewRayVertical = clamp(sin_lat / d, 0.001, 1.0);
+        float cosLightRayVertical = clamp(sin_sun_elev, 0.001, 1.0);
+        float viewDensity = tau_phys / cosViewRayVertical;
+        float lightDensity = tau_phys / cosLightRayVertical;
+
+        // --- DOMINANT GEOMETRIC PHASE ANGLE ---
+        float cos_theta_phase = ((norm_r - cos_lat) * cos_sun_elev * cos(phi_center) + sin_sun_elev * sin_lat) / d;
+        cos_theta_phase = clamp(cos_theta_phase, -1.0, 1.0);
+
+        float pf = 0.0;
+        float ms_weight = 0.0;
+        if (plane_is_textured) {
+            pf = GetRingPhaseFunctions(cos_theta_phase, alpha_phys, layer_asym, layer_backasym);
+            ms_weight = clamp((alpha_phys - 0.1) / 0.5, 0.0, 1.0);
+        } else {
+            float pf_fwd = CornetteShanksPhaseFunction(layer_asym, cos_theta_phase);
+            float pf_back = CornetteShanksPhaseFunction(layer_backasym, cos_theta_phase);
+            float bal = clamp(layer_scatter, 0.0, 1.0);
+            pf = mix(pf_back, pf_fwd, bal);
+            ms_weight = 1.0 - bal;
+        }
+
+        // Single scattering (no opposition surge: ring elements at opposition are inside the planet's shadow)
+        float scatteredLight_sunlit = viewDensity / (viewDensity + lightDensity) * (1.0 - exp(-viewDensity - lightDensity));
+        float denom = lightDensity - viewDensity;
+        float scatteredLight_unlit = (abs(denom) > 1e-6) ?
+            (exp(-viewDensity) - exp(-lightDensity)) * viewDensity / denom :
+            viewDensity * exp(-viewDensity);
+
+        // Multiple scattering
+        float ms_sunlit = AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, tau_phys, true) * ms_weight;
+
+        vec3 band_color_sunlit = band_raw_rgb * (scatteredLight_sunlit * pf + ms_sunlit);
+        vec3 band_color_unlit  = band_raw_rgb * (scatteredLight_unlit * pf) * layer_unlit;
+        vec3 band_color = mix(band_color_unlit, band_color_sunlit, same_hemi_t);
 
         float u_tex_lut = 0.5 / 256.0 + sin_lat * (255.0 / 256.0);
         float v_tex_lut = 0.5 / 256.0 + v_tex * (255.0 / 256.0);

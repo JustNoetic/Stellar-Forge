@@ -49,7 +49,7 @@ class InputHandlerMixin:
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
                 "planetshine_enabled": self.camera.get("planetshine_enabled", True),
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
-                "ringshine_band_count": self.camera.get("ringshine_band_count", 10),
+                "ringshine_band_count": self.camera.get("ringshine_band_count", 100),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
