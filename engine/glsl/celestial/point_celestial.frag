@@ -80,9 +80,9 @@ void main() {
     }
 
     // --- Exposure-Dependent Limiting Magnitude Extinction ---
-    // Smoothly fade to black when peak signal drops below sensor detection floor
+    // Smoothly fade to black when peak signal drops below sensor detection floor (matches starfield.frag)
     float peak_signal = max(rgb.r, max(rgb.g, rgb.b));
-    float limiting_threshold = 1.0e-5;
+    float limiting_threshold = 1.0e-6;
     float extinction_fade = smoothstep(limiting_threshold, limiting_threshold * 2.5, peak_signal);
     if (extinction_fade <= 0.0) {
         discard;
