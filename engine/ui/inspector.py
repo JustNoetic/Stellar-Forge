@@ -671,6 +671,14 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
                     imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
 
+                hz_lum = ed_pr['physical']['lum_lsun'] if ed_pr else sp.get('lum', 0.0)
+                if math.isfinite(hz_lum) and hz_lum > 0:
+                    imgui.text("  Habitable Zone (optimistic):")
+                    imgui.text(f"    Inner: {format_distance_au(math.sqrt(hz_lum / 1.78), threshold_au=thresh_au, precision=5)}")
+                    imgui.text(f"    Outer: {format_distance_au(math.sqrt(hz_lum / 0.32), threshold_au=thresh_au, precision=5)}")
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Luminosity-based boundaries matching the habitable-zone overlay.\nNot a prediction of an individual planet's climate.")
+
                 mode_val = app.camera.get("edit_data", {}).get("star_mode", sp.get('mode', 'evolution')) if (not insp_is_cmp and app.camera.get("edit_mode", False)) else sp.get('mode', 'evolution')
                 if mode_val == 'evolution':
                     met_val = app.camera.get("edit_data", {}).get("metallicity", sp.get('metallicity', 0.0)) if (not insp_is_cmp and app.camera.get("edit_mode", False)) else sp.get('metallicity', 0.0)
@@ -726,21 +734,6 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     _, ed["omega"] = imgui.input_double(u"\u03C9 (Arg Periapsis)", ed.get("omega", oe_omega), format="%.3f")
                     _, ed["M"] = imgui.input_double("Mean Anomaly (deg)", ed.get("M", oe_M), format="%.3f")
 
-                    # Live Roche limit calculation
-                    cur_parent_m = cur_mass_snap[parent_idx]
-                    cur_body_m = float(ed.get("mass", body_mass))
-                    cur_r_km = float(ed.get("radius", body_r_km))
-                    cur_a_val = float(ed.get("a", oe_a))
-                    cur_e_val = float(ed.get("e", oe_e))
-                    if cur_body_m > 0 and cur_r_km > 0:
-                        d_roche_km = 2.44 * cur_r_km * ((cur_parent_m / cur_body_m)**(1.0/3.0))
-                        d_roche_au = d_roche_km / AU_TO_KM
-                        periapsis_au = cur_a_val * (1.0 - cur_e_val)
-                        if periapsis_au < d_roche_au:
-                            imgui.spacing()
-                            imgui.text_colored("Warning: Orbit is within parent's Roche limit!", 1.0, 0.3, 0.3)
-                            imgui.text_colored(f"  Roche Limit: {format_distance_au(d_roche_au, threshold_au=thresh_au, precision=5)} ({d_roche_km:,.0f} km)", 0.7, 0.7, 0.7)
-                            imgui.text_colored(f"  Periapsis:   {format_distance_au(periapsis_au, threshold_au=thresh_au, precision=5)}", 0.7, 0.7, 0.7)
                 else:
                     use_km = oe_a < 0.01
                     if use_km:
@@ -780,6 +773,32 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     imgui.text(f"  Apoapsis:    {format_distance_au(apoapsis, threshold_au=thresh_au, precision=6)}")
                     imgui.text(f"  Distance:    {format_distance_au(dist_au, threshold_au=thresh_au, precision=6)}")
                 imgui.text(f"  Velocity:    {vel_km_s:.3f} km/s")
+
+                if not inspect_bary:
+                    imgui.separator()
+                    imgui.text_colored("Gravitational Limits", 1.0, 0.85, 0.4)
+                    parent_mass = cur_mass_snap[parent_idx]
+                    if parent_mass > 0 and body_mass > 0 and dist_au > 0:
+                        # Match the instantaneous radius used by hierarchy selection.
+                        hill_au = dist_au * (body_mass / (3.0 * parent_mass)) ** (1.0 / 3.0)
+                        imgui.text(f"  Hill Radius (now): {format_distance_au(hill_au, threshold_au=thresh_au, precision=5)}")
+                        if imgui.is_item_hovered():
+                            imgui.set_tooltip("Approximate sphere of influence around this body, at its current distance from its parent.\nUses the live state, not unapplied edits; not a guaranteed stable satellite orbit.\nThe approximation assumes this body is much less massive than its parent.")
+                    else:
+                        imgui.text_disabled("  Hill Radius: N/A")
+
+                    editing = not insp_is_cmp and app.camera.get("edit_mode", False)
+                    limit_mass = float(ed.get("mass", body_mass)) if editing else body_mass
+                    limit_radius = float(ed.get("radius", body_r_km)) if editing else body_r_km
+                    if parent_mass > 0 and limit_mass > 0 and limit_radius > 0:
+                        roche_au = 2.44 * limit_radius / AU_TO_KM * (parent_mass / limit_mass) ** (1.0 / 3.0)
+                        imgui.text(f"  Roche Limit (fluid): {format_distance_au(roche_au, threshold_au=thresh_au, precision=5)}")
+                        if imgui.is_item_hovered():
+                            imgui.set_tooltip("Distance from the parent's center below which this body may be tidally disrupted.\nFluid, strengthless-body approximation using this body's mass and radius.\nUses proposed mass, radius and periapsis in Edit Mode.")
+                        if periapsis < roche_au:
+                            imgui.text_colored("  Periapsis is inside Roche limit", 1.0, 0.3, 0.3)
+                    else:
+                        imgui.text_disabled("  Roche Limit: N/A")
 
                 if oe_a > 0 and oe_e < 1.0 and not inspect_bary:
                     imgui.separator()
@@ -875,6 +894,9 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 src_label_atmo = "texture map" if surf_src_atmo == 'texture' else ("albedo scale" if surf_src_atmo == 'albedo_scale' else "base color")
                 imgui.text(f"Surface Albedo: {A_surf_atmo:.3f} ({src_label_atmo})")
                 imgui.text(f"Bond Albedo (A_b): {albedo:.3f} (q = {q_val:.2f})")
+                imgui.text(f"Equilibrium Temperature: {t_eq_atmo:.1f} K")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Before greenhouse warming; uses the existing atmospheric model's orbital distance and Bond albedo.")
 
                 # Calculate temperature dynamically from greenhouse effect
                 comp = atmo_item.get('composition', {})
@@ -908,6 +930,8 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
                 current_height = atmo_item['atmo_radius_km'] - R_km
                 imgui.text(f"Atmosphere Height: {current_height:,.1f} km")
+                imgui.text(f"Gas Scale Height: {props['scale_height_km']:.2f} km")
+                imgui.text(f"Mean Molar Mass: {props['molar_mass'] * 1000.0:.2f} g/mol")
 
                 changed_p, new_p = imgui.drag_float("Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
                 if changed_p:

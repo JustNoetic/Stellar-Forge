@@ -361,6 +361,8 @@ spectral classification.
 - `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, and Jump in Time popup / timeline playback & scrubbing.
 - `outliner.py`: `render_system_outliner` — Left-anchored hierarchy tree with real-time substring search filter, inline + / - CRUD buttons, and comparison system tree.
 - `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Edit Mode (interactive editing of physical/stellar properties and osculating Keplerian orbital elements with reference frame selection, dynamic Roche limit checks, Darwin/Maclaurin oblateness auto-calculation, and real-time CRUD synchronization), Overview, Orbit, Atmosphere, Rings, and Cosmetics.
+  - Orbit gravitational-limit readouts: instantaneous Hill radius from live body/parent mass and separation (same approximation as hierarchy selection); fluid Roche distance from the parent's center for the selected body's mass/radius, with proposed edit values and periapsis warning. No limit readouts for barycenters or parentless bodies; the existing edit Apply restriction remains unchanged.
+  - Stellar Overview exposes optimistic HZ bounds matching the overlay (`sqrt(lum/1.78)`, `sqrt(lum/0.32)`); Atmosphere exposes its existing equilibrium temperature and cached gas scale height/molar mass.
 
 - `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric refraction and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, and SPICE Downloader.
 - `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
