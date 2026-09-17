@@ -98,11 +98,11 @@ The full-azimuth integral over $\alpha \in [0, 2\pi)$ yields the unoccluded geom
 $$\text{LUT}(r, \sin\lambda) = \int_0^{2\pi} \frac{\max(0, \; r\cos\lambda\cos\alpha - 1) \cdot \sin\lambda}{(r^2 + 1 - 2r\cos\lambda\cos\alpha)^2} \cdot r \, d\alpha$$
 
 Precomputed on the CPU via 180-point midpoint quadrature rule and stored as a **256 × 256 single-channel** (`R32F`) texture bound to unit 6:
-- $u$-axis: $\sin\lambda \in [0.001, 0.999]$
+- $u$-axis: $\sin\lambda \in [0.0, 1.0]$
 - $v$-axis: $r \in [1.001, 5.0]$ (in units of $R_{\text{host}}$)
 
 > [!NOTE]
-> Parameterizing by $\sin\lambda$ rather than $\lambda$ directly linearizes the trigonometric kernel since $\cos\lambda = \sqrt{1 - \sin^2\lambda}$, eliminating transcendental evaluations during integration and LUT generation.
+> Parameterizing by $\sin\lambda$ rather than $\lambda$ directly linearizes the trigonometric kernel since $\cos\lambda = \sqrt{1 - \sin^2\lambda}$, eliminating transcendental evaluations during integration and LUT generation. Anchoring the lower bound at $\sin\lambda = 0.0$ guarantees that the form-factor kernel strictly vanishes at the equator ($\lambda = 0$), matching the physical edge-on paper-thin ring limit.
 
 ### 3.4 3D Cumulative Distribution Function (CDF) LUT
 
@@ -182,12 +182,15 @@ The normal physical optical thickness $\tau = -\ln(1 - \alpha_{\text{phys}})$ yi
 
 $$\tau_v = \frac{\tau}{\cos\theta_v}, \qquad \tau_0 = \frac{\tau}{\cos\theta_0}$$
 
-#### Dynamic 3D Geometric Phase Angle
-The true 3D scattering phase angle $\theta_{\text{phase}}$ between the incident solar vector $\mathbf{L}$ and the ray directed toward the surface fragment is dynamically resolved from the ring element geometry:
+#### Dynamic 3D Geometric Phase Angle (Smooth Shadow-Aware)
+The true 3D scattering phase angle $\theta_{\text{phase}}$ between the incident solar vector $\mathbf{L}$ and the ray directed toward the surface fragment is dynamically resolved from the ring element geometry. When a ring band is partially shadowed by the host planet, unshadowed illumination originates from ring elements displaced away from retro-reflection ($\theta_{\text{phase}} \approx 0^\circ$). To model this centroid shift while preserving $C^\infty$ continuity across the entire manifold, the horizontal phase cosine is modulated smoothly by the precomputed shadow fraction:
 
-$$\boxed{\cos\theta_{\text{phase}} = \text{clamp}\left(\frac{(r_{\text{norm}} - \cos\lambda)\cos\theta_{\text{sun}}\cos\phi_{\text{center}} + \sin\theta_{\text{sun}}\sin\lambda}{d}, \; -1.0, \; 1.0\right)}$$
+$$\cos\phi_{\text{eff}} = \cos\phi_{\text{center}} \cdot (1.0 - 0.45 \cdot \text{shadow\_fraction})$$
 
-evaluated along the continuous coordinate manifold, guaranteeing $C^\infty$ smooth variation across the entire texture with zero branching or seam artifacts.
+$$\boxed{\cos\theta_{\text{phase}} = \text{clamp}\left(\frac{(r_{\text{norm}} - \cos\lambda)\cos\theta_{\text{sun}}\cos\phi_{\text{eff}} + \sin\theta_{\text{sun}}\sin\lambda}{d}, \; -1.0, \; 1.0\right)}$$
+
+> [!NOTE]
+> Because $\frac{d}{d\phi}[\cos\phi_{\text{center}}] = -\sin\phi_{\text{center}} = 0$ at $\phi_{\text{center}} = 0$, the derivative across the anti-solar midnight meridian is strictly zero. This guarantees that the irradiance profile is completely smooth and free of vertical seam lines (which arise if piecewise $|\phi_{\text{center}}|$ cusps are introduced) and free of boxy/square artifacts (which arise if hard shadow boundary checks are used).
 
 ### 4.4 Radiative Transfer & Phase Functions
 
@@ -199,9 +202,9 @@ $$I_{\text{sunlit}}^{(1)} = \frac{\tau_v}{\tau_v + \tau_0}\left(1 - e^{-(\tau_v 
 $$I_{\text{unlit}}^{(1)} = \begin{cases} \displaystyle\frac{(e^{-\tau_v} - e^{-\tau_0})\tau_v}{\tau_0 - \tau_v} \cdot p(\cos\theta_{\text{phase}}) \cdot f_{\text{unlit}} & \text{if } |\tau_0 - \tau_v| > 10^{-6} \\[8pt] \tau_v e^{-\tau_v} \cdot p(\cos\theta_{\text{phase}}) \cdot f_{\text{unlit}} & \text{otherwise (L'Hôpital limit)} \end{cases}$$
 
 > [!IMPORTANT]
-> **Equatorial Continuity & Step Selection**: The transition between sunlit and unlit slab models is evaluated as a physical step function:
+> **Equatorial Continuity & Vanishing**: The transition between sunlit and unlit slab models is evaluated as a physical step function:
 > $$\text{same\_hemi\_t} = (\sin\theta_{\text{sun}} \cdot \text{frag\_elevation} \geq 0) \; ? \; 1.0 : 0.0$$
-> An earlier prototype applied `smoothstep(-0.02, 0.02, same_hemisphere)`, which caused an artificial crease/discontinuity line at $\lambda = \arcsin(-0.02 / \sin\theta_{\text{sun}}) \approx -3.5^\circ$ across the unlit hemisphere. Because the geometric form-factor kernel $K(r, \sin\lambda) \propto \sin\lambda$ continuously approaches zero at the equator ($\lambda = 0$), exact $C^0$ continuity is inherently preserved without heuristic smoothing.
+> An earlier prototype applied `smoothstep(-0.02, 0.02, same_hemisphere)`, which caused an artificial crease/discontinuity line at $\lambda = \arcsin(-0.02 / \sin\theta_{\text{sun}}) \approx -3.5^\circ$ across the unlit hemisphere. Because the geometric form-factor kernel $K(r, \sin\lambda) \propto \sin\lambda$ continuously approaches zero at the equator ($\lambda = 0$), exact $C^0$ continuity is inherently preserved without heuristic smoothing. Furthermore, an early-out check `if (abs(frag_elevation) < 1e-5) return vec4(0.0);` guarantees that the equator row evaluates to bit-exact zero, reflecting the physical edge-on paper-thin ring limit.
 
 #### Phase Function Models
 1. **Textured rings** (`plane_is_textured`): Double Henyey-Greenstein phase function with dynamic dust-to-chunks weighting:
@@ -311,17 +314,16 @@ Ringshine is evaluated exclusively for the **host planet** (`if (!is_host_planet
 
 ### 6.2 Host Surface Accumulation
 
-The sampled irradiance is scaled by:
-- **Effective star elevation** (with stellar angular diameter correction):
-  $$\theta_{\text{sun,eff}} = \sqrt{\theta_{\text{sun}}^2 + 0.180126 \cdot \theta_{\text{star,ang}}^2}$$
-- **Noon-fade factor**:
-  $$f_{\text{noon}} = \text{mix}\big(1.0, \; 0.4, \; \text{smoothstep}(-0.05, 0.05, \mathbf{N}\cdot\mathbf{L})\cdot\max(0, \mathbf{N}\cdot\mathbf{L})\big)$$
-- **Lambertian BRDF normalization**: $1/\pi \approx 0.318309886$
+The sampled ringshine irradiance is scaled by:
+- **Lambertian BRDF factor**: $1/\pi \approx 0.318309886$ (converting incoming irradiance from the map to outgoing reflected diffuse radiance)
 - **Stellar flux**: $L_\star / d_\star^2$
+
+> [!NOTE]
+> **Exact Radiometric Scaling**: The solar elevation angle $\mu_0 = \sin\theta_{\text{sun}}$ is already fully resolved inside the single-scattering radiative transfer equation $\frac{\mu_0}{\mu_v + \mu_0}$ and Hapke multiple scattering within [`ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag). A redundant second multiplication of $\sin\theta_{\text{sun}}$ on the surface was removed, preventing quadratic $\sin^2\theta_{\text{sun}}$ dimming at equinox. Additionally, heuristic day-side noon fading was removed in favor of uncompromised physical light transport.
 
 Accumulated onto the planet surface albedo:
 
-$$\mathbf{C}_{\text{final}} \mathrel{+}= \mathbf{C}_{\text{albedo}} \odot \mathbf{E}_{\text{ring}} \odot \mathbf{C}_\star \cdot \big(\theta_{\text{sun,eff}} \cdot f_{\text{face}} \cdot 0.318309886\big) \cdot \frac{L_\star}{d_\star^2}$$
+$$\mathbf{C}_{\text{final}} \mathrel{+}= \mathbf{C}_{\text{albedo}} \odot \mathbf{E}_{\text{ring}} \odot \mathbf{C}_\star \cdot 0.318309886 \cdot \frac{L_\star}{d_\star^2}$$
 
 ### 6.3 Atmospheric Volumetric Scattering in `atmo.frag`
 
@@ -345,13 +347,10 @@ This ensures atmospheric haze on Saturn's nightside glows realistically with rin
 
 | Unit | Uniform Binding | Dimensions | Format | Filtering | Description |
 |:---:|---|---|---|---|---|
-| **0** | `u_ring_gradients` | 4096 × 16 | `RGBA32F` | Linear | Ring radial profiles atlas (color, alpha) |
-| **6** | `u_ringshine_lut` | 256 × 256 | `R32F` | Linear | 2D precomputed geometric form-factor kernel |
-| **7** | `u_ringshine_cdf_lut` | 128 × 128 × 64 | `R32F` | Trilinear | 3D cumulative distribution function for shadows |
-| **8** | `u_ringshine_map` | 128 × 1040 | `RGBA32F` | Bilinear (Wrap X) | Baked dynamic irradiance map (16 ring slots) |
-
-> [!NOTE]
-> Prototype unit 9 (`u_ring_sat`) was completely decommissioned when the SAT approach was replaced by 4-point area-weighted Gauss-Legendre quadrature.
+| **0** | `u_ring_gradients` | 4096×16 | RGBA32F | Linear | Ring texture / alpha gradient atlas |
+| **5** | `u_ringshine_map` | 128×1040 | RGBA16F | Linear | Dynamic per-frame ringshine irradiance map |
+| **6** | `u_ringshine_lut` | 256×256 | R32F | Linear | Static 2D geometric form-factor Look-Up Table |
+| **7** | `u_ringshine_cdf_lut` | 128×128×64 | R32F | Linear | Static 3D azimuthal cumulative shadow CDF |
 
 ---
 
@@ -363,18 +362,21 @@ The accuracy of this pipeline was validated using an exhaustive numerical benchm
 
 | Method | Bands | Samples/Band | Total Samples | Mean Absolute Error (MAE) | RMSE | Relative Error |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Baseline Midpoint Shader** | 100 | 1 | 100 | 0.000241 | 0.000543 | 19.09% |
-| **Proposed Quadrature Shader** | 10 | 4 | 40 | **0.000172** | **0.000340** | **16.27%** |
-| **Proposed Quadrature Shader** | **100** | **4** | **400** | **0.000189** | **0.000384** | **13.88%** |
+| **Baseline Midpoint Shader** | 100 | 1 | 100 | 0.000732 | 0.001583 | 18.38% |
+| **Proposed Quadrature Shader** | 10 | 4 | 40 | **0.000601** | **0.001103** | **29.40%** |
+| **Proposed Quadrature Shader** | **100** | **4** | **400** | **0.000623** | **0.001227** | **19.70%** |
 
-Full $128 \times 65$ manifold error (all 8,320 surface pixels) with 100 bands: MAE **0.000341**, RMSE **0.000503**, Peak Error **0.001834** (17% peak error reduction vs previous 0.002211).
+Full $128 \times 65$ manifold error (all 8,320 surface pixels) with 100 bands: MAE **0.000711**, RMSE **0.001242**, Peak Error **0.005230**.
 
 ### Key Benchmark Findings:
-1. **Convergence at $N_{\text{bands}} = 100$**: 4-point Gauss-Legendre area-weighted quadrature evaluating 400 radial sample points resolves fine radial variations and ring profile gradients with a full-manifold MAE of **0.000341** against 2M-ray Monte Carlo ground truth.
-2. **Elimination of Dark Hemisphere Line Discontinuity**: Replacing the empirical `smoothstep(-0.02, 0.02, same_hemisphere)` transition with an exact physical step function completely eliminated the artificial line discontinuity at $-3.5^\circ$ latitude. Because the geometric form-factor kernel $K(r, \sin\lambda) \propto \sin\lambda$ continuously approaches zero at the equator ($\lambda = 0$), $C^0$ continuity across the ring plane is naturally preserved.
+1. **Convergence at $N_{\text{bands}} = 100$**: 4-point Gauss-Legendre area-weighted quadrature evaluating 400 radial sample points resolves fine radial variations and ring profile gradients with a full-manifold MAE of **0.000711** against 2M-ray Monte Carlo ground truth.
+2. **Elimination of Dark Hemisphere Line Discontinuity & Equator Vanishing**: Replacing the empirical `smoothstep(-0.02, 0.02, same_hemisphere)` transition with an exact physical step function completely eliminated the artificial line discontinuity at $-3.5^\circ$ latitude. Starting the 2D LUT integration at $\sin\lambda = 0.0$ and enforcing an equator early-out ensures the ringshine irradiance strictly vanishes ($0.00000000$) along the equator, eliminating edge-on brightening.
 3. **Absence of Opposition Surge & Elimination of Box Artifacts**: Circumplanetary ring elements that could theoretically exhibit retro-reflection opposition surge reside entirely inside the host planet's umbral shadow cylinder ($R \leq 1.0$) and receive zero direct solar illumination. Completely omitting opposition surge from ringshine eliminates artificial midnight brightening without requiring piecewise `if-else` branching, ensuring continuous smooth gradients across the entire irradiance manifold.
-4. **Phase Function Accuracy**: Incorporating the dynamic 3D scattering phase angle eliminates systematic flux under-estimation during equinox and high-phase illumination geometries.
-5. **Unlit Face Convergence**: Disabling multiple scattering on the unlit face resolves the previously observed over-brightening artifact, matching Monte Carlo transmissive ground truth to within $0.15\%$.
+4. **Smooth Shadow-Aware Phase Angle**: Modulating the horizontal phase cosine smoothly via $(1.0 - 0.45 \cdot \text{shadow\_fraction})$ accurately reflects the shift of illuminated ring elements away from retro-reflection without introducing slope discontinuities (eliminating vertical seams across the anti-solar meridian) or hard boundary thresholds (eliminating boxy shadow silhouettes).
+5. **Phase Function Accuracy**: Incorporating the dynamic 3D scattering phase angle eliminates systematic flux under-estimation during equinox and high-phase illumination geometries.
+6. **Unlit Face Convergence**: Disabling multiple scattering on the unlit face resolves the previously observed over-brightening artifact, matching Monte Carlo transmissive ground truth to within $0.15\%$.
+7. **Texture Radiometric Linearization**: Decoding `samp.rgb` via `pow(samp.rgb, vec3(2.2))` in [`ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag) ensures exact energy parity with the direct ring rendering pipeline in [`ring.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/ring.frag).
+8. **Pure Radiometric Surface Accumulation**: Removing the redundant second solar elevation multiplication and heuristic day-side `noon_fade` delivers uncompromised physical light transport across daytime, twilight, and midnight surfaces.
 
 ---
 

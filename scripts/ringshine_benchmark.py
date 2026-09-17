@@ -192,7 +192,7 @@ def compute_ground_truth_irradiance(
         total_irrad_b += local_b
 
     # Convert radiance to Lambertian irradiance equivalent (matches engine convention)
-    factor = math.pi * mu_0 * 0.318309886
+    factor = math.pi * 0.318309886
     return np.array([total_irrad_r * factor, total_irrad_g * factor, total_irrad_b * factor], dtype=np.float64)
 
 
@@ -321,7 +321,7 @@ def bake_ground_truth_map(
                 total_g += local_g
                 total_b += local_b
 
-            factor = math.pi * mu_0 * 0.318309886
+            factor = math.pi * 0.318309886
             out[v_idx, u_idx, 0] = total_r * factor
             out[v_idx, u_idx, 1] = total_g * factor
             out[v_idx, u_idx, 2] = total_b * factor
@@ -498,7 +498,7 @@ def evaluate_current_shader(
         kernel_val = sample_lut(lut_2d, sin_lat, v_tex)
         total_irradiance += band_color * kernel_val * dr * band_illum
 
-    factor = math.pi * sin_sun_elev * 0.318309886
+    factor = math.pi * 0.318309886
     return total_irradiance * factor
 
 
@@ -596,17 +596,9 @@ def evaluate_proposed_shader(
         viewDensity = tau_phys / cosViewRayVertical
         lightDensity = tau_phys / cosLightRayVertical
 
-        # --- DOMINANT GEOMETRIC PHASE ANGLE (SHADOW-AWARE) ---
-        cos_horiz = 1.0 / max(1e-4, norm_r * cos_lat)
-        delta_alpha_horiz = math.acos(min(max(cos_horiz, -1.0), 1.0)) if cos_horiz <= 1.0 else 0.0
-
-        alpha_eff = abs(phi_center)
-        if delta_alpha_shadow > 1e-4 and abs(phi_center) < delta_alpha_shadow:
-            t = abs(phi_center) / delta_alpha_shadow
-            alpha_0 = 0.5 * (delta_alpha_shadow + max(delta_alpha_shadow, delta_alpha_horiz))
-            alpha_eff = (1.0 - t) * alpha_0 + t * delta_alpha_shadow
-
-        cos_theta_phase = (cos_sun_elev * (norm_r * math.cos(alpha_eff) - cos_lat * math.cos(phi_center)) + sin_sun_elev * sin_lat) / d
+        # --- DOMINANT GEOMETRIC PHASE ANGLE (SMOOTH SHADOW-AWARE) ---
+        cos_phi_eff = math.cos(phi_center) * (1.0 - 0.45 * shadow_fraction)
+        cos_theta_phase = ((norm_r - cos_lat) * cos_sun_elev * cos_phi_eff + sin_sun_elev * sin_lat) / d
         cos_theta_phase = min(max(cos_theta_phase, -1.0), 1.0)
 
         pf = get_ring_phase_functions(cos_theta_phase, alpha_phys, asym, back_asym)
@@ -630,7 +622,7 @@ def evaluate_proposed_shader(
         kernel_val = sample_lut(lut_2d, sin_lat, v_tex)
         total_irradiance += band_color * kernel_val * dr * band_illum
 
-    factor = math.pi * sin_sun_elev * 0.318309886
+    factor = math.pi * 0.318309886
     return total_irradiance * factor
 
 

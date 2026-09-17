@@ -1315,9 +1315,6 @@ void main() {
             vec3 L_dir = L_mid;
 
             vec3 ring_normal = ring_normal_vec;
-            float sun_elevation = dot(L_dir, ring_normal);
-            float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
-            float cos_sun_elev = sqrt(1.0 - sin_sun_elev * sin_sun_elev);
 
             vec3 antiL = -L_dir;
             vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
@@ -1334,17 +1331,6 @@ void main() {
             float phi_center = atan(sin_rel, cos_rel);
 
             float frag_elevation = dot(N, ring_normal);
-            float sin_lat = clamp(abs(frag_elevation), 0.001, 0.999);
-            float same_hemisphere = sun_elevation * frag_elevation;
-            float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
-
-            float NdotL = dot(N, L_dir);
-            float day_face = smoothstep(0.0, 0.1, NdotL) * max(0.0, NdotL);
-            float noon_fade = mix(1.0, 0.4, day_face);
-            float face_multiplier = mix(1.0, 1.0 * noon_fade, same_hemi_t);
-
-            float host_radius = u_planet_radius_km / u_au_to_km;
-            int band_count = clamp(u_ringshine_band_count, 4, 128);
 
             for (int j = 0; j < 1; j++) {
                 if ((u_ring_mask & (1u << j)) == 0u) continue;
@@ -1357,8 +1343,9 @@ void main() {
                 vec2 map_uv = vec2(phi_uv, (float(j) + elev_uv) / 16.0);
                 ringshine_irradiance += texture(u_ringshine_map, map_uv).rgb;
             }
-            float opacity = u_ring_params[0].z;
-            ringshine_irradiance *= (sin_sun_elev * face_multiplier * 0.318309886);
+            // Apply 1/PI (~0.318309886) factor to convert incoming irradiance map to ambient field.
+            // Note: Solar elevation (mu_0) is already fully resolved inside ringshine_map.frag radiative transfer.
+            ringshine_irradiance *= 0.318309886;
 
             float ambient_phase = 1.0 / (4.0 * PI);
             float ambient_phase_M = ambient_phase * (1.0 / max(0.15, 1.0 - u_precomp_mie.z * 0.5));

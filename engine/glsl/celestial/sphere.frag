@@ -953,15 +953,7 @@ void main() {
                 vec3 star_color = mix(eq_color, pole_color, star_sin_lat);
                 float star_lum = mix(eq_lum, pole_lum, star_sin_lat);
 
-                float sun_elevation = dot(L, ring_normal);
-                float star_ang_radius = star_radius / max(dist_to_star, 1e-6);
-                float effective_sun_elev = sqrt(sun_elevation * sun_elevation + 0.180126 * star_ang_radius * star_ang_radius);
-
-                float shine_intensity = 0.0;
-                vec3 ring_tint = u_ring_colors[k];
-
                 // --- PRE-INTEGRATED LUT RINGSHINE FOR HOST PLANET ONLY ---
-                float sin_lat = clamp(abs(frag_elevation), 0.001, 0.999);
 
                 // Fragment equator normal vector (in ring plane)
                 vec3 N_eq_raw = N - ring_normal * dot(N, ring_normal);
@@ -980,9 +972,6 @@ void main() {
                 float cos_rel = clamp(dot(N_eq, antiL_eq), -1.0, 1.0);
                 float phi_center = atan(sin_rel, cos_rel);
 
-                float same_hemisphere = sun_elevation * frag_elevation;
-                float same_hemi_t = smoothstep(-0.02, 0.02, same_hemisphere);
-
                 float x_prime = phi_center / PI;
                 float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
@@ -992,14 +981,10 @@ void main() {
                 vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
                 vec3 total_ring_irradiance = texture(u_ringshine_map, map_uv).rgb;
 
-                float NdotL = dot(N, L);
-                float day_face = smoothstep(-0.05, 0.05, NdotL) * max(0.0, NdotL);
-                float noon_fade = mix(1.0, 0.4, day_face);
-
-                float face_multiplier = mix(1.0, 1.0 * noon_fade, same_hemi_t);
-                // Apply 1/PI (~0.3183) physical BRDF normalization factor
-                shine_intensity = effective_sun_elev * face_multiplier * 0.318309886;
-                ring_tint = total_ring_irradiance;
+                // Apply 1/PI (~0.318309886) Lambertian BRDF factor to convert incoming irradiance map to surface reflection.
+                // Note: Solar elevation (mu_0) is already fully resolved inside ringshine_map.frag radiative transfer.
+                float shine_intensity = 0.318309886;
+                vec3 ring_tint = total_ring_irradiance;
 
                 float irradiance = u_hdr_enabled ? (star_lum / max(dist_to_star * dist_to_star, 1e-8)) : 1.0;
 

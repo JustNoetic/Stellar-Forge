@@ -198,6 +198,7 @@ void main() {
             float r_s = inner_r * exp(t_sub * log_r_ratio);
             float frac_s = clamp((r_s - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
             vec4 samp = texture(u_ring_gradients, vec2(frac_s, (float(k) + 0.5) / 16.0));
+            samp.rgb = pow(samp.rgb, vec3(2.2));
             float w_area = r_s * QUAD_W[s];
             sum_area += w_area;
             sum_alpha += samp.a * w_area;
@@ -251,18 +252,12 @@ void main() {
         float viewDensity = tau_phys / cosViewRayVertical;
         float lightDensity = tau_phys / cosLightRayVertical;
 
-        // --- DOMINANT GEOMETRIC PHASE ANGLE (SHADOW-AWARE) ---
-        float cos_horiz = 1.0 / max(1e-4, norm_r * cos_lat);
-        float delta_alpha_horiz = (cos_horiz <= 1.0) ? acos(clamp(cos_horiz, -1.0, 1.0)) : 0.0;
-
-        float alpha_eff = abs(phi_center);
-        if (delta_alpha_shadow > 1e-4 && abs(phi_center) < delta_alpha_shadow) {
-            float t = abs(phi_center) / delta_alpha_shadow;
-            float alpha_0 = 0.5 * (delta_alpha_shadow + max(delta_alpha_shadow, delta_alpha_horiz));
-            alpha_eff = mix(alpha_0, delta_alpha_shadow, t);
-        }
-
-        float cos_theta_phase = (cos_sun_elev * (norm_r * cos(alpha_eff) - cos_lat * cos(phi_center)) + sin_sun_elev * sin_lat) / d;
+        // --- DOMINANT GEOMETRIC PHASE ANGLE (SMOOTH SHADOW-AWARE) ---
+        // When the ring band is partially shadowed, unshadowed light originates from ring elements
+        // displaced away from retro-reflection. Modulating the horizontal phase cosine smoothly
+        // by (1.0 - 0.45 * shadow_fraction) accounts for this shift with guaranteed C_inf continuity (no vertical seam or boxy edge).
+        float cos_phi_eff = cos(phi_center) * (1.0 - 0.45 * shadow_fraction);
+        float cos_theta_phase = ((norm_r - cos_lat) * cos_sun_elev * cos_phi_eff + sin_sun_elev * sin_lat) / d;
         cos_theta_phase = clamp(cos_theta_phase, -1.0, 1.0);
 
         float pf = 0.0;

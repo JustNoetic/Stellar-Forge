@@ -1742,7 +1742,7 @@ class App(InputHandlerMixin):
             cdf_cum_irrad[:, :, 1:] = np.cumsum(trapz_step, axis=2)
 
             cdf_totals = cdf_cum_irrad[:, :, -1:]
-            cdf_normalized = np.where(cdf_totals > 1e-12, cdf_cum_irrad / cdf_totals, 1.0).astype(np.float32)
+            cdf_normalized = np.divide(cdf_cum_irrad, cdf_totals, out=np.ones_like(cdf_cum_irrad), where=cdf_totals > 1e-12).astype(np.float32)
 
             cdf_tex = ctx.texture3d((res_cdf_theta, res_cdf_r, res_cdf_lat), 1, cdf_normalized.tobytes(), dtype='f4')
             cdf_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)

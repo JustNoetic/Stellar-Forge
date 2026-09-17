@@ -74,6 +74,7 @@ Stellar-Forge/
 │   ├── accuracy_test.py        # 1-yr integration benchmark vs JPL Horizons ground truth (RTN errors)
 │   ├── perf_test.py            # PerfTracker: patches functions to measure startup/frame timing
 │   ├── calibrate_moon_albedo.py# Rescale a diffuse map's linear-space mean to a real albedo target (Moon → 0.12)
+│   ├── ringshine_benchmark.py  # Monte Carlo validation & shader comparison benchmark for ringshine
 │   └── test_spice.py           # Quick SPICE kernel loader validation
 ├── textures/                   # Planet/ring textures (loaded by app.py at startup)
 ├── exports/                    # Exported cosmetic JSON per body
