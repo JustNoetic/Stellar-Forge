@@ -1693,7 +1693,7 @@ class App(InputHandlerMixin):
 
         def build_ringshine_lut(ctx):
             res_x, res_y = 256, 256
-            sin_lats = np.linspace(0.001, 0.999, res_x, dtype=np.float32)
+            sin_lats = np.linspace(0.0, 1.0, res_x, dtype=np.float32)
             radii = np.linspace(1.001, 5.0, res_y, dtype=np.float32)
 
             sin_lat_grid = sin_lats[None, :]

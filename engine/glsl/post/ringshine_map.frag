@@ -150,7 +150,11 @@ void main() {
 
     float y = local_v * 2.0 - 1.0;
     float frag_elevation = sign(y) * pow(abs(y), 1.5);
-    float sin_lat = clamp(abs(frag_elevation), 0.001, 0.999);
+    if (abs(frag_elevation) < 1e-5) {
+        out_color = vec4(0.0);
+        return;
+    }
+    float sin_lat = clamp(abs(frag_elevation), 0.0, 0.999);
 
     vec3 L = u_sun_dir;
     float sun_elevation = dot(L, ring_normal);
@@ -247,8 +251,18 @@ void main() {
         float viewDensity = tau_phys / cosViewRayVertical;
         float lightDensity = tau_phys / cosLightRayVertical;
 
-        // --- DOMINANT GEOMETRIC PHASE ANGLE ---
-        float cos_theta_phase = ((norm_r - cos_lat) * cos_sun_elev * cos(phi_center) + sin_sun_elev * sin_lat) / d;
+        // --- DOMINANT GEOMETRIC PHASE ANGLE (SHADOW-AWARE) ---
+        float cos_horiz = 1.0 / max(1e-4, norm_r * cos_lat);
+        float delta_alpha_horiz = (cos_horiz <= 1.0) ? acos(clamp(cos_horiz, -1.0, 1.0)) : 0.0;
+
+        float alpha_eff = abs(phi_center);
+        if (delta_alpha_shadow > 1e-4 && abs(phi_center) < delta_alpha_shadow) {
+            float t = abs(phi_center) / delta_alpha_shadow;
+            float alpha_0 = 0.5 * (delta_alpha_shadow + max(delta_alpha_shadow, delta_alpha_horiz));
+            alpha_eff = mix(alpha_0, delta_alpha_shadow, t);
+        }
+
+        float cos_theta_phase = (cos_sun_elev * (norm_r * cos(alpha_eff) - cos_lat * cos(phi_center)) + sin_sun_elev * sin_lat) / d;
         cos_theta_phase = clamp(cos_theta_phase, -1.0, 1.0);
 
         float pf = 0.0;

@@ -335,7 +335,7 @@ def bake_ground_truth_map(
 
 def build_luts_numpy():
     res_x, res_y = 256, 256
-    sin_lats = np.linspace(0.001, 0.999, res_x, dtype=np.float32)
+    sin_lats = np.linspace(0.0, 1.0, res_x, dtype=np.float32)
     radii = np.linspace(1.001, 5.0, res_y, dtype=np.float32)
 
     sin_lat_grid = sin_lats[None, :]
@@ -513,9 +513,11 @@ def evaluate_proposed_shader(
     tex_radii, tex_rgb, tex_alpha,
     lut_2d, cdf_3d, band_count=100
 ):
-    sin_lat = min(max(abs(math.sin(phi_lat)), 0.001), 0.999)
-    cos_lat = math.sqrt(max(0.0, 1.0 - sin_lat * sin_lat))
     frag_elevation = math.sin(phi_lat)
+    if abs(frag_elevation) < 1e-5:
+        return np.zeros(3, dtype=np.float64)
+    sin_lat = min(max(abs(frag_elevation), 0.0), 0.999)
+    cos_lat = math.sqrt(max(0.0, 1.0 - sin_lat * sin_lat))
     sin_sun_elev = min(max(abs(math.sin(sun_elev)), 1e-4), 1.0)
     cos_sun_elev = math.sqrt(max(0.0, 1.0 - sin_sun_elev * sin_sun_elev))
     sun_elevation = math.sin(sun_elev)
@@ -594,7 +596,17 @@ def evaluate_proposed_shader(
         viewDensity = tau_phys / cosViewRayVertical
         lightDensity = tau_phys / cosLightRayVertical
 
-        cos_theta_phase = ((norm_r - cos_lat) * cos_sun_elev * math.cos(phi_center) + sin_sun_elev * sin_lat) / d
+        # --- DOMINANT GEOMETRIC PHASE ANGLE (SHADOW-AWARE) ---
+        cos_horiz = 1.0 / max(1e-4, norm_r * cos_lat)
+        delta_alpha_horiz = math.acos(min(max(cos_horiz, -1.0), 1.0)) if cos_horiz <= 1.0 else 0.0
+
+        alpha_eff = abs(phi_center)
+        if delta_alpha_shadow > 1e-4 and abs(phi_center) < delta_alpha_shadow:
+            t = abs(phi_center) / delta_alpha_shadow
+            alpha_0 = 0.5 * (delta_alpha_shadow + max(delta_alpha_shadow, delta_alpha_horiz))
+            alpha_eff = (1.0 - t) * alpha_0 + t * delta_alpha_shadow
+
+        cos_theta_phase = (cos_sun_elev * (norm_r * math.cos(alpha_eff) - cos_lat * math.cos(phi_center)) + sin_sun_elev * sin_lat) / d
         cos_theta_phase = min(max(cos_theta_phase, -1.0), 1.0)
 
         pf = get_ring_phase_functions(cos_theta_phase, alpha_phys, asym, back_asym)
