@@ -18,6 +18,7 @@ from engine.core.math_utils import (
     get_cartesian_from_keplerian
 )
 from engine.core.input_handler import _camera_yaw_pitch_from, _camera_get_up
+from engine.physics.refraction import get_apparent_look_direction
 from engine.physics.physics_core import compute_keplerian_elements
 from engine.physics.star_calc import StarCalculator
 from engine.physics.atmosphere_physics import compute_mie_coefficients, GAS_PROPERTIES
@@ -409,15 +410,27 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
             app.camera["centered_bary"] = inspect_bary
 
             # Immediately align view to center the object
-            dir_to_target = target_pos - cam_world_pos_f8
-            d_t = np.linalg.norm(dir_to_target)
-            if d_t > 1e-12:
-                fwd_t = dir_to_target / d_t
-                y_t, p_t = _camera_yaw_pitch_from(fwd_t)
-                app.camera["yaw"] = app.camera["yaw_actual"] = y_t
-                app.camera["pitch"] = app.camera["pitch_actual"] = p_t
-                cur_up = _camera_get_up(app.camera, fwd_t)
-                app.camera["up"] = cur_up.tolist()
+            refract_params, grav_lens_params = app._get_active_refraction_and_lens_params(
+                cam_world_pos_f8,
+                atmo_bodies=atmo_bodies,
+                pos_snap_render=pos_snap_render,
+                mass_snap=mass_snap,
+                bodies_data=bodies_data,
+                num_bodies=num_bodies,
+            )
+            fwd_t = get_apparent_look_direction(
+                cam_world_pos_f8,
+                target_pos,
+                refract_params=refract_params,
+                grav_lens_params=grav_lens_params,
+                target_body_idx=insp_idx,
+                target_is_cmp=insp_is_cmp,
+            )
+            y_t, p_t = _camera_yaw_pitch_from(fwd_t)
+            app.camera["yaw"] = app.camera["yaw_actual"] = y_t
+            app.camera["pitch"] = app.camera["pitch_actual"] = p_t
+            cur_up = _camera_get_up(app.camera, fwd_t)
+            app.camera["up"] = cur_up.tolist()
             app.camera["cam_look"] = "free"
             app.camera["approach_delta"] = 0.0
     if is_centered:

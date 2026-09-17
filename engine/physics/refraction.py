@@ -1,15 +1,11 @@
 import math
-import os
-import sys
 import numpy as np
-import moderngl
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from engine.rendering.shader_loader import load_shader
 from numba import njit
+from engine.core.constants import AU_TO_KM
 
 @njit(cache=True, fastmath=True)
 def refract_solid_radius(P_dir, radius, oblateness, pole):
+    """Oblate-aware solid body radius along P_dir from the refract center."""
     if 0.001 < oblateness < 0.99:
         pole_len = math.sqrt(pole[0]*pole[0] + pole[1]*pole[1] + pole[2]*pole[2])
         if pole_len > 1e-4:
@@ -24,12 +20,14 @@ def refract_solid_radius(P_dir, radius, oblateness, pole):
 
 @njit(cache=True, fastmath=True)
 def refract_erfcx(x):
+    """exp(x^2)*erfc(x), x>=0 — Abramowitz & Stegun 7.1.26 polynomial."""
     t = 1.0 / (1.0 + 0.3275911 * x)
     return max(0.0, t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
            + t * (-1.453152027 + t * 1.061405429)))))
 
 @njit(cache=True, fastmath=True)
 def _refraction_setup(C, V, max_bend, radius, scale_height, oblateness, pole):
+    """Shared refraction state setup for limb ray geometry."""
     if max_bend <= 1e-6:
         return -1.0, 0.0, 0.0, 0.0
     s_min = -(C[0]*V[0] + C[1]*V[1] + C[2]*V[2])
@@ -51,6 +49,8 @@ def _refraction_setup(C, V, max_bend, radius, scale_height, oblateness, pole):
 
 @njit(cache=True, fastmath=True)
 def compute_refraction_angle(C, V, d, max_bend, radius, scale_height, oblateness, pole):
+    """Apparent angular displacement (parallax-weighted) of an object at distance d.
+    Mirrors refraction.glsl compute_refraction_angle()."""
     s_min_pre = -(C[0]*V[0] + C[1]*V[1] + C[2]*V[2])
     if s_min_pre < 0.0:
         Rc = math.sqrt(C[0]*C[0] + C[1]*C[1] + C[2]*C[2])
@@ -95,6 +95,9 @@ def compute_refraction_angle(C, V, d, max_bend, radius, scale_height, oblateness
 
 @njit(cache=True, fastmath=True)
 def solve_refraction_apparent(C, V, d, max_bend, radius, scale_height, oblateness, pole):
+    """Inverts the refraction deflection equation theta = alpha(V_app(theta))
+    via 12-step bracketed bisection on [0, alpha_0].
+    Returns (V_app, is_occluded). Mirrors refraction.glsl solve_refraction_apparent()."""
     s_min = -(C[0]*V[0] + C[1]*V[1] + C[2]*V[2])
     if s_min >= d:
         return V, False
@@ -174,6 +177,8 @@ def solve_refraction_apparent(C, V, d, max_bend, radius, scale_height, oblatenes
 
 @njit(cache=True, fastmath=True)
 def compute_gravitational_deflection(C_km, V, d_km, rs, radius, lens_type, spin, pole, strength):
+    """Weak + strong field gravitational deflection angle.
+    Mirrors refraction.glsl compute_gravitational_deflection()."""
     if rs <= 1e-6:
         return 0.0, False
 
@@ -241,6 +246,8 @@ def compute_gravitational_deflection(C_km, V, d_km, rs, radius, lens_type, spin,
 
 @njit(cache=True, fastmath=True)
 def apply_gravitational_deflection(C_km, V, d_km, rs, radius, lens_type, spin, pole, strength):
+    """Applies gravitational deflection to ray V.
+    Mirrors refraction.glsl apply_gravitational_deflection()."""
     alpha_gr, is_sh = compute_gravitational_deflection(C_km, V, d_km, rs, radius, lens_type, spin, pole, strength)
     if is_sh:
         return V, True
@@ -293,145 +300,74 @@ def apply_gravitational_deflection(C_km, V, d_km, rs, radius, lens_type, spin, p
         return np.array((vx/v_norm, vy/v_norm, vz/v_norm), dtype=np.float64), False
     return V, False
 
-COMPUTE = """
-#version 430 core
-layout(local_size_x = 1) in;
-SHARED_REFRACTION
-layout(std430, binding=0) buffer Out { vec4 result; };
-uniform vec3 t_C;
-uniform vec3 t_V;
-uniform float t_d;
-uniform int t_mode; // 0=atmo, 1=lensing
-void main() {
-    if (t_mode == 0) {
-        bool occluded;
-        vec3 apparent = solve_refraction_apparent(t_C, t_V, t_d, occluded);
-        float lift = atan(length(cross(t_V, apparent)), dot(t_V, apparent));
-        result = vec4(apparent.x, apparent.y, apparent.z, lift);
-    } else {
-        bool is_shadow;
-        vec3 apparent = apply_gravitational_deflection(t_C, t_V, t_d, is_shadow);
-        float lift = atan(length(cross(t_V, apparent)), dot(t_V, apparent));
-        result = vec4(apparent.x, apparent.y, apparent.z, lift);
-    }
-}
-"""
+def get_apparent_look_direction(
+    cam_world_pos,
+    target_world_pos,
+    refract_params=None,
+    grav_lens_params=None,
+    target_body_idx=None,
+    target_is_cmp=False
+):
+    """Given camera and target world positions (in AU), computes the apparent unit
+    look direction vector (in world space) by accounting for atmospheric refraction
+    and gravitational lensing deflection.
 
-def main():
-    ctx = moderngl.create_standalone_context(require=430)
-    prog = ctx.compute_shader(COMPUTE.replace("SHARED_REFRACTION", load_shader("common/refraction.glsl")))
-    buf = ctx.buffer(reserve=16)
-    buf.bind_to_storage_buffer(0)
-    
-    radius = 6371.0
-    max_bend = math.radians(68.0 / 60.0)
-    scale_height = 8.5
-    oblateness = 0.0
-    pole = np.array((0.0, 1.0, 0.0), dtype=np.float64)
+    If the camera looks along the returned unit vector, the target object's apparent
+    refracted image will project exactly onto the center of the screen (0, 0) in NDC.
+    """
+    cam_world_pos = np.asarray(cam_world_pos, dtype=np.float64)
+    target_world_pos = np.asarray(target_world_pos, dtype=np.float64)
+    true_vec = target_world_pos - cam_world_pos
+    dist_au = float(np.linalg.norm(true_vec))
+    if dist_au < 1e-12:
+        return np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
-    for name, value in (
-        ("u_refract_radius", radius),
-        ("u_refract_max_bend", max_bend),
-        ("u_refract_scale_height", scale_height),
-        ("u_refract_oblateness", oblateness),
-        ("u_refract_pole", tuple(pole)),
-    ):
-        if name in prog:
-            prog[name].value = value
+    V = true_vec / dist_au
+    d_km = dist_au * AU_TO_KM
 
-    cases = []
-    for elevation in (0.0, 2.0, 5.0, 10.0):
-        e = math.radians(elevation)
-        cases.append((f"ground {elevation:g} deg", np.array((6371.002, 0.0, 0.0)), np.array((math.sin(e), 0.0, -math.cos(e)))))
-    cases.append(("space grazing limb", np.array((6376.0, 0.0, 10000.0)), np.array((0.0, 0.0, -1.0))))
-    cases.append(("above atmosphere", np.array((6571.0, 0.0, 0.0)), np.array((math.sin(0.1), 0.0, -math.cos(0.1)))))
+    # 1. Atmospheric Refraction
+    if refract_params is not None and refract_params.get("max_bend", 0.0) > 1e-6:
+        refract_body_idx = refract_params.get("body_idx", -1)
+        refract_is_cmp = refract_params.get("is_cmp", False)
+        # An object is not refracted relative to itself
+        if not (target_body_idx is not None and target_body_idx == refract_body_idx and target_is_cmp == refract_is_cmp):
+            refract_center = np.asarray(refract_params["center_world"], dtype=np.float64)
+            if np.linalg.norm(target_world_pos - refract_center) > 1e-7:
+                C_km = (cam_world_pos - refract_center) * AU_TO_KM
+                pole = np.asarray(refract_params.get("pole", (0.0, 1.0, 0.0)), dtype=np.float64)
+                V_app, _ = solve_refraction_apparent(
+                    C_km,
+                    V,
+                    d_km,
+                    float(refract_params["max_bend"]),
+                    float(refract_params["radius_km"]),
+                    float(refract_params["scale_height_km"]),
+                    float(refract_params.get("oblateness", 0.0)),
+                    pole
+                )
+                V = V_app
 
-    arcmin = 180.0 * 60.0 / math.pi
-    all_passed = True
-    prog["t_mode"].value = 0
-    try:
-        print("--- ATMOSPHERIC REFRACTION TESTS ---")
-        for label, C, V in cases:
-            d = 1e9
-            prog["t_C"].value = tuple(C)
-            prog["t_V"].value = tuple(V)
-            prog["t_d"].value = d
-            prog.run(group_x=1)
-            gpu_res = np.frombuffer(buf.read(), dtype=np.float32)
-            gpu_V_app = gpu_res[:3]
-            gpu_lift = gpu_res[3]
+    # 2. Gravitational Lensing
+    if grav_lens_params is not None and grav_lens_params.get("enabled", False) and grav_lens_params.get("rs_km", 0.0) > 1e-6:
+        lens_center = np.asarray(grav_lens_params["center_world"], dtype=np.float64)
+        if np.linalg.norm(target_world_pos - lens_center) > 1e-7:
+            C_km = (cam_world_pos - lens_center) * AU_TO_KM
+            pole_lens = np.asarray(grav_lens_params.get("pole", (0.0, 1.0, 0.0)), dtype=np.float64)
+            V_app, is_shadow = apply_gravitational_deflection(
+                C_km,
+                V,
+                d_km,
+                float(grav_lens_params["rs_km"]),
+                float(grav_lens_params.get("radius_km", 0.0)),
+                int(grav_lens_params.get("lens_type", 0)),
+                float(grav_lens_params.get("spin", 0.0)),
+                pole_lens,
+                float(grav_lens_params.get("strength", 1.0))
+            )
+            if not is_shadow:
+                V = V_app
 
-            py_V_app, py_occ = solve_refraction_apparent(C, V, d, max_bend, radius, scale_height, oblateness, pole)
-            cross_v = np.cross(V, py_V_app)
-            py_lift = math.atan2(np.linalg.norm(cross_v), np.dot(V, py_V_app))
-
-            diff = np.linalg.norm(gpu_V_app - py_V_app)
-            lift_diff_arcmin = abs(gpu_lift - py_lift) * arcmin
-            print(f"{label}:")
-            print(f"  GPU lift: {gpu_lift * arcmin:.4f}' | Python lift: {py_lift * arcmin:.4f}' | diff: {lift_diff_arcmin:.6f}'")
-            if diff > 1e-4 or lift_diff_arcmin > 0.01:
-                print(f"  FAILED mismatch {diff}")
-                all_passed = False
-            else:
-                print(f"  MATCH!")
-
-        print("\n--- GRAVITATIONAL LENSING TESTS ---")
-        prog["t_mode"].value = 1
-        rs = 10.0
-        r_surf = 10.0
-        lens_type = 3
-        spin = 0.5
-        pole_lens = np.array((0.0, 1.0, 0.0), dtype=np.float64)
-        strength = 1.0
-        for name, value in (
-            ("u_grav_lens_enabled", True),
-            ("u_grav_lens_rs", rs),
-            ("u_grav_lens_radius", r_surf),
-            ("u_grav_lens_type", lens_type),
-            ("u_grav_lens_spin", spin),
-            ("u_grav_lens_pole", tuple(pole_lens)),
-            ("u_grav_lens_strength", strength),
-        ):
-            if name in prog:
-                prog[name].value = value
-
-        lens_cases = [
-            ("BH grazing impact b ~ 50 km", np.array((0.0, 0.0, 1000.0)), np.array((0.05, 0.0, -0.998749))),
-            ("BH medium impact b ~ 200 km", np.array((0.0, 0.0, 1000.0)), np.array((0.2, 0.0, -0.979796))),
-            ("BH high impact b ~ 1000 km", np.array((0.0, 0.0, 1000.0)), np.array((0.707106, 0.0, -0.707106))),
-        ]
-        for label, C, V in lens_cases:
-            V = V / np.linalg.norm(V)
-            d = 5000.0
-            prog["t_C"].value = tuple(C)
-            prog["t_V"].value = tuple(V)
-            prog["t_d"].value = d
-            prog.run(group_x=1)
-            gpu_res = np.frombuffer(buf.read(), dtype=np.float32)
-            gpu_V_app = gpu_res[:3]
-            gpu_lift = gpu_res[3]
-
-            py_V_app, py_sh = apply_gravitational_deflection(C, V, d, rs, r_surf, lens_type, spin, pole_lens, strength)
-            cross_v = np.cross(V, py_V_app)
-            py_lift = math.atan2(np.linalg.norm(cross_v), np.dot(V, py_V_app))
-
-            diff = np.linalg.norm(gpu_V_app - py_V_app)
-            lift_diff_arcmin = abs(gpu_lift - py_lift) * arcmin
-            print(f"{label}:")
-            print(f"  GPU lift: {gpu_lift * arcmin:.4f}' | Python lift: {py_lift * arcmin:.4f}' | diff: {lift_diff_arcmin:.6f}'")
-            if diff > 1e-4 or lift_diff_arcmin > 0.01:
-                print(f"  FAILED mismatch {diff}")
-                all_passed = False
-            else:
-                print(f"  MATCH!")
-    finally:
-        buf.release()
-        prog.release()
-        ctx.release()
-
-    if not all_passed:
-        raise AssertionError("GPU vs Python mismatch!")
-    print("\nALL ATMOSPHERE AND LENSING CASES MATCHED GPU WITHIN 0.001 ARCMIN!")
-
-if __name__ == "__main__":
-    main()
+    norm_v = np.linalg.norm(V)
+    if norm_v > 1e-12:
+        V = V / norm_v
+    return V

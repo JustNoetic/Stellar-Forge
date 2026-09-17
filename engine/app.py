@@ -450,6 +450,7 @@ from engine.rendering.planetshine import (
 )
 from engine.rendering.texture_baker import apply_hsba_np, bake_and_export_ring_textures
 from engine.core.input_handler import InputHandlerMixin
+from engine.physics.refraction import get_apparent_look_direction
 
 _ROT_FOLLOW_ALT_AU = 200.0 / AU_TO_KM  # camera rides the body's rotation below 200 km altitude
 
@@ -881,6 +882,200 @@ class App(InputHandlerMixin):
     
     
     
+    def _get_active_refraction_and_lens_params(
+        self,
+        cam_world_pos,
+        atmo_bodies=None,
+        pos_snap_render=None,
+        mass_snap=None,
+        bodies_data=None,
+        num_bodies=None,
+    ):
+        if atmo_bodies is None:
+            atmo_bodies = getattr(self, "atmo_bodies", [])
+        if pos_snap_render is None:
+            pos_snap_render = getattr(self, "pos_snap_render", None)
+        if mass_snap is None:
+            mass_snap = getattr(self, "mass_snap", None)
+        if bodies_data is None:
+            bodies_data = getattr(self, "bodies_data", None)
+        if num_bodies is None:
+            num_bodies = getattr(self, "num_bodies", 0)
+
+        cam_world_pos = np.asarray(cam_world_pos, dtype='f8')
+
+        # 1. Atmospheric Refraction Setup
+        refract_params = None
+        au_to_km_val = 149597870.7
+
+        if self.camera.get("refraction_enabled", True) and (atmo_bodies or (self.comparison_enabled and getattr(self, "atmo_bodies_cmp", None))):
+            closest_atmo = None
+            closest_sq_dist = float('inf')
+            closest_is_cmp = False
+            closest_pos_world = None
+
+            if atmo_bodies and pos_snap_render is not None:
+                for atmo in atmo_bodies:
+                    bi = atmo['body_idx']
+                    b_pos = pos_snap_render[bi]
+                    dx = float(b_pos[0] - cam_world_pos[0])
+                    dy = float(b_pos[1] - cam_world_pos[1])
+                    dz = float(b_pos[2] - cam_world_pos[2])
+                    sq_dist = dx*dx + dy*dy + dz*dz
+                    if sq_dist < closest_sq_dist:
+                        closest_sq_dist = sq_dist
+                        closest_atmo = atmo
+                        closest_is_cmp = False
+                        closest_pos_world = b_pos
+
+            if self.comparison_enabled and getattr(self, "atmo_bodies_cmp", None) and getattr(self, "pos_snap_cmp", None) is not None:
+                for atmo in self.atmo_bodies_cmp:
+                    bi_cmp = atmo['body_idx']
+                    b_pos = self.pos_snap_cmp[bi_cmp] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                    dx = float(b_pos[0] - cam_world_pos[0])
+                    dy = float(b_pos[1] - cam_world_pos[1])
+                    dz = float(b_pos[2] - cam_world_pos[2])
+                    sq_dist = dx*dx + dy*dy + dz*dz
+                    if sq_dist < closest_sq_dist:
+                        closest_sq_dist = sq_dist
+                        closest_atmo = atmo
+                        closest_is_cmp = True
+                        closest_pos_world = b_pos
+
+            if closest_atmo is not None and closest_pos_world is not None:
+                bi_curr = closest_atmo['body_idx']
+                mass_sm_curr = self.mass_snap_cmp[bi_curr] if closest_is_cmp else (mass_snap[bi_curr] if mass_snap is not None else 1.0)
+                props_c, trans_c, thick_c = get_cached_atmosphere_properties(closest_atmo, mass_sm_curr)
+                cam_dist_au = math.sqrt(closest_sq_dist)
+                refract_radius_km = float(closest_atmo['planet_radius_km'])
+                refract_scale_height = float(props_c.get('scale_height_km', 8.5))
+                refractivity = float(props_c.get('refractivity', 0.00029))
+                planet_radius_au = closest_atmo['planet_radius_km'] / au_to_km_val
+
+                refract_max_bend = compute_max_bend(
+                    planet_radius_au, refract_scale_height, refractivity,
+                    beta_ext=props_c.get('beta_rayleigh'))
+                if cam_dist_au > 0.95:
+                    fade = max(0.0, 1.0 - (cam_dist_au - 0.95) / 0.05)
+                    refract_max_bend *= fade
+
+                b_info = self.bodies_data_cmp[bi_curr] if closest_is_cmp else (bodies_data[bi_curr] if bodies_data is not None else {})
+                pole_ref = self.pole_n_arr_cmp[bi_curr] if closest_is_cmp else self.pole_n_arr[bi_curr]
+                p_norm = math.sqrt(pole_ref[0]**2 + pole_ref[1]**2 + pole_ref[2]**2)
+                if p_norm > 1e-6:
+                    refract_pole = (float(pole_ref[0]/p_norm), float(pole_ref[1]/p_norm), float(pole_ref[2]/p_norm))
+                else:
+                    refract_pole = (0.0, 1.0, 0.0)
+                refract_oblateness = float(b_info.get('oblateness', 0.0))
+
+                refract_params = {
+                    'body_idx': bi_curr,
+                    'is_cmp': closest_is_cmp,
+                    'center_world': closest_pos_world,
+                    'radius_km': refract_radius_km,
+                    'max_bend': refract_max_bend,
+                    'scale_height_km': refract_scale_height,
+                    'pole': refract_pole,
+                    'oblateness': refract_oblateness,
+                }
+
+        # 2. Gravitational Lens Setup
+        grav_lens_params = None
+        grav_lens_enabled = bool(self.camera.get("grav_lensing_enabled", True))
+        grav_lens_strength = float(self.camera.get("grav_lensing_multiplier", 1.0))
+
+        if grav_lens_enabled:
+            best_lens_score = -1.0
+            best_lens_idx = -1
+            best_lens_is_cmp = False
+            best_lens_pos_world = None
+
+            user_insp_idx = self.camera.get("inspected_idx")
+            user_insp_cmp = self.camera.get("inspected_is_cmp", False)
+
+            for lens_pass_cmp in (False, True):
+                if lens_pass_cmp and not self.comparison_enabled:
+                    break
+                _n_bodies = self.num_bodies_cmp if lens_pass_cmp else num_bodies
+                _mass_snap = self.mass_snap_cmp if lens_pass_cmp else mass_snap
+                _bodies = self.bodies_data_cmp if lens_pass_cmp else bodies_data
+                _pos_snap = self.pos_snap_cmp if lens_pass_cmp else pos_snap_render
+                if _pos_snap is None or _mass_snap is None or _bodies is None:
+                    continue
+
+                for b_i in range(_n_bodies):
+                    m_val = float(_mass_snap[b_i])
+                    if m_val <= 1e-7:
+                        continue
+                    rs_km = 2.95325008 * m_val
+                    b_pos = _pos_snap[b_i].copy()
+                    if lens_pass_cmp:
+                        b_pos[0] += self.comparison_offset_au
+                    dx = float(b_pos[0] - cam_world_pos[0])
+                    dy = float(b_pos[1] - cam_world_pos[1])
+                    dz = float(b_pos[2] - cam_world_pos[2])
+                    cam_dist_au = max(1e-6, math.sqrt(dx*dx + dy*dy + dz*dz))
+                    score = rs_km / cam_dist_au
+                    _sp = _bodies[b_i].get('star_props', {}) or {}
+                    _cls = _sp.get('class', '') or ''
+                    if 'Black Hole' in _cls or _sp.get('stage', '') == 'Singularity' or _bodies[b_i].get('type') == 'Black Hole':
+                        score *= 1000.0
+                    elif 'Neutron' in _cls or 'Pulsar' in _cls:
+                        score *= 100.0
+                    if b_i == user_insp_idx and lens_pass_cmp == user_insp_cmp:
+                        score *= 5000.0
+                    if score > best_lens_score:
+                        best_lens_score = score
+                        best_lens_idx = b_i
+                        best_lens_is_cmp = lens_pass_cmp
+                        best_lens_pos_world = b_pos
+
+            if best_lens_idx >= 0 and best_lens_pos_world is not None:
+                b_data = self.bodies_data_cmp[best_lens_idx] if best_lens_is_cmp else bodies_data[best_lens_idx]
+                m_val = float(self.mass_snap_cmp[best_lens_idx]) if best_lens_is_cmp else float(mass_snap[best_lens_idx])
+                grav_lens_rs = 2.95325008 * m_val
+
+                _sp_bh = b_data.get('star_props', {}) or {}
+                _cls_bh = _sp_bh.get('class', '') or ''
+                is_bh = 'Black Hole' in _cls_bh or _sp_bh.get('stage', '') == 'Singularity' or b_data.get('type') == 'Black Hole'
+                if is_bh:
+                    grav_lens_radius = grav_lens_rs
+                else:
+                    r_val = b_data.get('r', 1.0)
+                    grav_lens_radius = float(r_val) * SOLAR_RADIUS_KM
+
+                grav_lens_spin = float(_sp_bh.get('spin', _sp_bh.get('rot_frac', b_data.get('spin', 0.0))))
+                pole_ref = self.pole_n_arr_cmp[best_lens_idx] if best_lens_is_cmp else self.pole_n_arr[best_lens_idx]
+                p_norm = float(math.sqrt(pole_ref[0]**2 + pole_ref[1]**2 + pole_ref[2]**2))
+                if p_norm > 1e-6:
+                    grav_lens_pole = (float(pole_ref[0] / p_norm), float(pole_ref[1] / p_norm), float(pole_ref[2] / p_norm))
+                else:
+                    grav_lens_pole = (0.0, 1.0, 0.0)
+
+                if is_bh:
+                    grav_lens_type = 3
+                elif 'Neutron' in _cls_bh or 'Pulsar' in _cls_bh:
+                    grav_lens_type = 2
+                elif 'White Dwarf' in _cls_bh:
+                    grav_lens_type = 1
+                else:
+                    grav_lens_type = 0
+
+                grav_lens_params = {
+                    'body_idx': best_lens_idx,
+                    'is_cmp': best_lens_is_cmp,
+                    'center_world': best_lens_pos_world,
+                    'rs_km': grav_lens_rs,
+                    'radius_km': grav_lens_radius,
+                    'lens_type': grav_lens_type,
+                    'enabled': grav_lens_enabled,
+                    'strength': grav_lens_strength,
+                    'spin': grav_lens_spin,
+                    'pole': grav_lens_pole,
+                }
+
+        return refract_params, grav_lens_params
+
     def run(self):
         if _PERF_ENABLED:
             import sys
@@ -3367,7 +3562,22 @@ class App(InputHandlerMixin):
                     dir_to_target = t_pos - cam_world_pos
                     dist_to_target = np.linalg.norm(dir_to_target)
                     if dist_to_target > 1e-12:
-                        fwd_target = dir_to_target / dist_to_target
+                        refract_params, grav_lens_params = self._get_active_refraction_and_lens_params(
+                            cam_world_pos,
+                            atmo_bodies=atmo_bodies,
+                            pos_snap_render=pos_snap_render,
+                            mass_snap=mass_snap,
+                            bodies_data=bodies_data,
+                            num_bodies=num_bodies,
+                        )
+                        fwd_target = get_apparent_look_direction(
+                            cam_world_pos,
+                            t_pos,
+                            refract_params=refract_params,
+                            grav_lens_params=grav_lens_params,
+                            target_body_idx=c_idx,
+                            target_is_cmp=c_is_cmp,
+                        )
                         yaw_target, pitch_target = _camera_yaw_pitch_from(fwd_target)
                         cam["yaw"] = yaw_target
                         cam["pitch"] = pitch_target
@@ -4337,7 +4547,17 @@ class App(InputHandlerMixin):
                         if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
                             build_atmo_lut(atmo, mass_sm_curr, is_cmp)
 
-            # --- Active Refraction Uniform Setup ---
+            # --- Active Refraction & Lens Uniform Setup ---
+            cam_world_pos_now = cam_origin + rel
+            refract_params, grav_lens_params = self._get_active_refraction_and_lens_params(
+                cam_world_pos_now,
+                atmo_bodies=atmo_bodies,
+                pos_snap_render=pos_snap_render,
+                mass_snap=mass_snap,
+                bodies_data=bodies_data,
+                num_bodies=num_bodies,
+            )
+
             refract_center = (0.0, 0.0, 0.0)
             refract_radius_km = 0.0
             refract_max_bend = 0.0
@@ -4346,115 +4566,34 @@ class App(InputHandlerMixin):
             refract_oblateness = 0.0
             au_to_km_val = 149597870.7
 
-            if sorted_atmos:
-                closest_sq_dist, closest_atmo, is_cmp = sorted_atmos[-1]
-                bi_curr = closest_atmo['body_idx']
-                mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
-                props_c, trans_c, thick_c = get_cached_atmosphere_properties(closest_atmo, mass_sm_curr)
-                cam_dist_au = math.sqrt(closest_sq_dist)
-                
-                pos_rel = cmp_pos_rel if is_cmp else pos_rel_all
-                refract_center = (float(pos_rel[bi_curr, 0]), float(pos_rel[bi_curr, 1]), float(pos_rel[bi_curr, 2]))
-                refract_radius_km = float(closest_atmo['planet_radius_km'])
-                refract_scale_height = float(props_c.get('scale_height_km', 8.5))
-                refractivity = float(props_c.get('refractivity', 0.00029))
-                planet_radius_au = closest_atmo['planet_radius_km'] / au_to_km_val
-                if self.camera.get("refraction_enabled", True):
-                    refract_max_bend = compute_max_bend(
-                        planet_radius_au, refract_scale_height, refractivity,
-                        beta_ext=props_c.get('beta_rayleigh'))
-                    if cam_dist_au > 0.95:
-                        fade = max(0.0, 1.0 - (cam_dist_au - 0.95) / 0.05)
-                        refract_max_bend *= fade
-                else:
-                    refract_max_bend = 0.0
+            if refract_params is not None:
+                rc_rel = refract_params['center_world'] - cam_origin
+                refract_center = (float(rc_rel[0]), float(rc_rel[1]), float(rc_rel[2]))
+                refract_radius_km = float(refract_params['radius_km'])
+                refract_max_bend = float(refract_params['max_bend'])
+                refract_scale_height = float(refract_params['scale_height_km'])
+                refract_pole = tuple(float(x) for x in refract_params['pole'])
+                refract_oblateness = float(refract_params['oblateness'])
 
-                b_info = self.bodies_data_cmp[bi_curr] if is_cmp else bodies_data[bi_curr]
-                pole_ref = self.pole_n_arr_cmp[bi_curr] if is_cmp else self.pole_n_arr[bi_curr]
-                refract_pole = (float(pole_ref[0]), float(pole_ref[1]), float(pole_ref[2]))
-                refract_oblateness = float(b_info.get('oblateness', 0.0))
-
-            # --- Active Gravitational Lens Uniform Setup ---
-            # One lens at a time: score every body (primary + comparison) by
-            # rs_km / cam_dist (deflection ~ rs/b), boosted for compact objects
-            # (Black Hole x1000, Neutron Star x100) and the inspected body
-            # (x5000, so the user always sees the lens they are inspecting).
             grav_lens_center = (0.0, 0.0, 0.0)
             grav_lens_rs = 0.0
             grav_lens_radius = 0.0
-            grav_lens_type = 0  # 0=Star, 1=WhiteDwarf, 2=NeutronStar, 3=BlackHole
+            grav_lens_type = 0
             grav_lens_enabled = bool(self.camera.get("grav_lensing_enabled", True))
             grav_lens_strength = float(self.camera.get("grav_lensing_multiplier", 1.0))
-
-            best_lens_score = -1.0
-            best_lens_idx = -1
-            best_lens_is_cmp = False
-
-            user_insp_idx = self.camera.get("inspected_idx")
-            user_insp_cmp = self.camera.get("inspected_is_cmp", False)
-
-            for lens_pass_cmp in (False, True):
-                if lens_pass_cmp and not self.comparison_enabled:
-                    break
-                _n_bodies = self.num_bodies_cmp if lens_pass_cmp else num_bodies
-                _mass_snap = self.mass_snap_cmp if lens_pass_cmp else mass_snap
-                _bodies = self.bodies_data_cmp if lens_pass_cmp else bodies_data
-                _pos_rel = cmp_pos_rel if lens_pass_cmp else pos_rel_all
-                for b_i in range(_n_bodies):
-                    m_val = float(_mass_snap[b_i])
-                    if m_val <= 1e-7:
-                        continue
-                    rs_km = 2.95325008 * m_val
-                    b_pos = _pos_rel[b_i]
-                    cam_dist_au = max(1e-6, math.sqrt(b_pos[0]**2 + b_pos[1]**2 + b_pos[2]**2))
-                    score = rs_km / cam_dist_au
-                    _sp = _bodies[b_i].get('star_props', {}) or {}
-                    _cls = _sp.get('class', '') or ''
-                    if 'Black Hole' in _cls or _sp.get('stage', '') == 'Singularity' or _bodies[b_i].get('type') == 'Black Hole':
-                        score *= 1000.0
-                    elif 'Neutron' in _cls or 'Pulsar' in _cls:
-                        score *= 100.0
-                    if b_i == user_insp_idx and lens_pass_cmp == user_insp_cmp:
-                        score *= 5000.0
-                    if score > best_lens_score:
-                        best_lens_score = score
-                        best_lens_idx = b_i
-                        best_lens_is_cmp = lens_pass_cmp
-
             grav_lens_spin = 0.0
             grav_lens_pole = (0.0, 1.0, 0.0)
-            if best_lens_idx >= 0:
-                b_data = self.bodies_data_cmp[best_lens_idx] if best_lens_is_cmp else bodies_data[best_lens_idx]
-                m_val = float(self.mass_snap_cmp[best_lens_idx]) if best_lens_is_cmp else float(mass_snap[best_lens_idx])
-                grav_lens_rs = 2.95325008 * m_val
-                pos_rel = cmp_pos_rel if best_lens_is_cmp else pos_rel_all
-                grav_lens_center = (float(pos_rel[best_lens_idx, 0]), float(pos_rel[best_lens_idx, 1]), float(pos_rel[best_lens_idx, 2]))
 
-                _sp_bh = b_data.get('star_props', {}) or {}
-                _cls_bh = _sp_bh.get('class', '') or ''
-                is_bh = 'Black Hole' in _cls_bh or _sp_bh.get('stage', '') == 'Singularity' or b_data.get('type') == 'Black Hole'
-                # Black hole: physical radius is the event horizon, derived
-                # from the mass (the stored 'r' property is ignored).
-                if is_bh:
-                    grav_lens_radius = grav_lens_rs
-                else:
-                    r_val = b_data.get('r', 1.0)
-                    grav_lens_radius = float(r_val) * SOLAR_RADIUS_KM
-
-                grav_lens_spin = float(_sp_bh.get('spin', _sp_bh.get('rot_frac', b_data.get('spin', 0.0))))
-                pole_ref = self.pole_n_arr_cmp[best_lens_idx] if best_lens_is_cmp else self.pole_n_arr[best_lens_idx]
-                p_norm = float(math.sqrt(pole_ref[0]**2 + pole_ref[1]**2 + pole_ref[2]**2))
-                if p_norm > 1e-6:
-                    grav_lens_pole = (float(pole_ref[0] / p_norm), float(pole_ref[1] / p_norm), float(pole_ref[2] / p_norm))
-
-                if is_bh:
-                    grav_lens_type = 3
-                elif 'Neutron' in _cls_bh or 'Pulsar' in _cls_bh:
-                    grav_lens_type = 2
-                elif 'White Dwarf' in _cls_bh:
-                    grav_lens_type = 1
-                else:
-                    grav_lens_type = 0
+            if grav_lens_params is not None:
+                gl_rel = grav_lens_params['center_world'] - cam_origin
+                grav_lens_center = (float(gl_rel[0]), float(gl_rel[1]), float(gl_rel[2]))
+                grav_lens_rs = float(grav_lens_params['rs_km'])
+                grav_lens_radius = float(grav_lens_params['radius_km'])
+                grav_lens_type = int(grav_lens_params['lens_type'])
+                grav_lens_enabled = bool(grav_lens_params['enabled'])
+                grav_lens_strength = float(grav_lens_params['strength'])
+                grav_lens_spin = float(grav_lens_params['spin'])
+                grav_lens_pole = tuple(float(x) for x in grav_lens_params['pole'])
 
             for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_starfield, prog_culling_compute, getattr(self, 'prog_hz', None)):
                 if prog is not None:
