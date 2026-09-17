@@ -487,6 +487,9 @@ class App(InputHandlerMixin):
             "tracking_idx": 0,
             "tracking_is_cmp": False,
             "tracking_mode": "body",
+            "centered_idx": None,
+            "centered_is_cmp": False,
+            "centered_bary": False,
             "inspected_idx": None,
             "inspected_is_cmp": False,
             "inspect_bary": False,
@@ -745,6 +748,7 @@ class App(InputHandlerMixin):
             if movement_mode == 1:
                 # Simple Orbit mode: scroll wheel zooms camera in / out relative to tracked object
                 self.camera["approach_delta"] += yoffset * 0.15
+                self.camera["centered_idx"] = None
             else:
                 # Free Flight mode: scroll wheel changes flight velocity (Space Engine style, ~1.15x per notch).
                 speed = self.camera.get("flight_speed", 0.1)
@@ -783,6 +787,9 @@ class App(InputHandlerMixin):
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
         movement_mode = self.camera.get("movement_mode", 0)
         
+        if (self.camera.get("left_dragging", False) or self.camera.get("right_dragging", False)) and (abs(dx) > 0 or abs(dy) > 0):
+            self.camera["centered_idx"] = None
+
         if self.camera["left_dragging"] and self.camera["right_dragging"]:
             # LMB+RMB: radial approach / recede toward the tracked body's surface.
             # Drag down (dy > 0) = move closer; drag up = pull back. Applied per-frame
@@ -821,6 +828,8 @@ class App(InputHandlerMixin):
         flight_keys = {glfw.KEY_W: "w", glfw.KEY_A: "a", glfw.KEY_S: "s", glfw.KEY_D: "d"}
         if key in flight_keys:
             self.camera["keys"][flight_keys[key]] = (action != glfw.RELEASE)
+            if action == glfw.PRESS:
+                self.camera["centered_idx"] = None
             return
     
         if action == glfw.PRESS or action == glfw.REPEAT:
@@ -2477,6 +2486,9 @@ class App(InputHandlerMixin):
                 # Reset self.camera and UI state
                 self.camera["tracking_idx"] = 0
                 self.camera["tracking_is_cmp"] = False
+                self.camera["centered_idx"] = None
+                self.camera["centered_is_cmp"] = False
+                self.camera["centered_bary"] = False
                 self.camera["inspected_idx"] = None
                 self.camera["inspected_is_cmp"] = False
                 self.camera["inspect_bary"] = False
@@ -3087,6 +3099,7 @@ class App(InputHandlerMixin):
                 if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
                     d_roll += 60.0 * dt_render
                 if d_roll != 0.0:
+                    cam["centered_idx"] = None
                     fwd_v = -rel / max(np.linalg.norm(rel), 1e-300) if cam["cam_look"] == "aim" else _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
                     cur_up = _camera_get_up(cam, fwd_v)
                     new_up = _camera_rot_axis(fwd_v, math.radians(d_roll)) @ cur_up
@@ -3097,6 +3110,7 @@ class App(InputHandlerMixin):
                 if glfw.get_key(window, glfw.KEY_F) == glfw.PRESS:
                     if not getattr(self, "_f_key_held", False):
                         self.camera["cam_look"] = "aim"
+                        self.camera["centered_idx"] = None
                         self._f_key_held = True
                 else:
                     self._f_key_held = False
@@ -3172,6 +3186,7 @@ class App(InputHandlerMixin):
 
             # 1) Camera approach / zoom gesture: radial move toward the tracked body's surface
             if cam["approach_delta"] != 0.0:
+                cam["centered_idx"] = None
                 r_ap = np.linalg.norm(rel)
                 if r_ap > 1e-300 and cam["tracking_idx"] is not None and cam["tracking_mode"] == "body" and track_r > 0.0:
                     surf_r = _ellipsoid_surface_radius(track_r, track_f, track_pole, rel)
@@ -3310,6 +3325,7 @@ class App(InputHandlerMixin):
             nm = np.linalg.norm(move)
             if nm > 1e-12:
                 rel = rel + (move / nm) * cam["flight_speed"] * dt_render
+                cam["centered_idx"] = None
 
             # 3b) floor: push back out of the ground after movement
             if track_r > 0.0 and cam["tracking_mode"] == "body":
@@ -3328,6 +3344,40 @@ class App(InputHandlerMixin):
             cam["cam_vel"][:] = (rel - rel_prev) / max(dt_render, 1e-9)
 
             cam_origin = base_pos
+
+            # If camera is currently in centered mode, orient towards the target object
+            if cam.get("centered_idx") is not None:
+                c_idx = cam["centered_idx"]
+                c_is_cmp = cam.get("centered_is_cmp", False)
+                c_bary = cam.get("centered_bary", False)
+                limit = self.num_bodies_cmp if c_is_cmp else num_bodies
+                if 0 <= c_idx < limit and (not ephemeris_mode_active or spice_valid_mask[c_idx]):
+                    if c_is_cmp:
+                        if c_bary:
+                            t_pos = self.subsys_pos_buf_cmp[c_idx].copy() + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                        else:
+                            t_pos = self.pos_snap_cmp[c_idx].copy() + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                    else:
+                        if c_bary:
+                            t_pos = subsys_pos_buf[c_idx].copy()
+                        else:
+                            t_pos = pos_snap_render[c_idx].copy()
+
+                    cam_world_pos = base_pos + rel
+                    dir_to_target = t_pos - cam_world_pos
+                    dist_to_target = np.linalg.norm(dir_to_target)
+                    if dist_to_target > 1e-12:
+                        fwd_target = dir_to_target / dist_to_target
+                        yaw_target, pitch_target = _camera_yaw_pitch_from(fwd_target)
+                        cam["yaw"] = yaw_target
+                        cam["pitch"] = pitch_target
+                        cam["yaw_actual"] = yaw_target
+                        cam["pitch_actual"] = pitch_target
+                        cam["cam_look"] = "free"
+                        cur_up = _camera_get_up(cam, fwd_target)
+                        cam["up"] = cur_up.tolist()
+                else:
+                    cam["centered_idx"] = None
     
             if hierarchy_ver != cached_hierarchy_ver:
                 cached_children_map = {}

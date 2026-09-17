@@ -17,6 +17,7 @@ from engine.core.math_utils import (
     rotate_equatorial_to_ecliptic,
     get_cartesian_from_keplerian
 )
+from engine.core.input_handler import _camera_yaw_pitch_from, _camera_get_up
 from engine.physics.physics_core import compute_keplerian_elements
 from engine.physics.star_calc import StarCalculator
 from engine.physics.atmosphere_physics import compute_mie_coefficients, GAS_PROPERTIES
@@ -373,8 +374,12 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
     if imgui.button(f"{track_btn_label}##track_btn"):
         if is_tracked:
+            app.camera["target"] = cam_world_pos_f8.copy()
+            app.camera["cam_pos_rel"] = np.zeros(3, dtype='f8')
+            app.camera["cam_pos_rel_prev"] = np.zeros(3, dtype='f8')
             app.camera["tracking_idx"] = None
             app.camera["cam_look"] = "free"
+            app.camera["centered_idx"] = None
         else:
             app.camera["tracking_idx"] = insp_idx
             app.camera["tracking_is_cmp"] = insp_is_cmp
@@ -383,23 +388,45 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
             app.camera["cam_pos_rel"] = (cam_world_pos_f8 - target_pos).copy()
             app.camera["cam_look"] = "aim"
             app.camera["approach_delta"] = 0.0
+            app.camera["centered_idx"] = None
     if is_tracked:
         imgui.pop_style_color()
 
     # 2. Center Object Button
+    is_centered = (app.camera.get("centered_idx") == insp_idx and
+                   app.camera.get("centered_is_cmp", False) == insp_is_cmp and
+                   app.camera.get("centered_bary", False) == inspect_bary)
     imgui.same_line(spacing=6)
-    if imgui.button("Center##center_btn"):
-        app.camera["tracking_idx"] = insp_idx
-        app.camera["tracking_is_cmp"] = insp_is_cmp
-        app.camera["tracking_bary"] = inspect_bary
-        app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
-        app.camera["cam_pos_rel"] = (cam_world_pos_f8 - target_pos).copy()
-        app.camera["cam_look"] = "aim"
-        app.camera["approach_delta"] = 0.0
+    center_btn_label = "Centered" if is_centered else "Center"
+    if is_centered:
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
+    if imgui.button(f"{center_btn_label}##center_btn"):
+        if is_centered:
+            app.camera["centered_idx"] = None
+        else:
+            app.camera["centered_idx"] = insp_idx
+            app.camera["centered_is_cmp"] = insp_is_cmp
+            app.camera["centered_bary"] = inspect_bary
+
+            # Immediately align view to center the object
+            dir_to_target = target_pos - cam_world_pos_f8
+            d_t = np.linalg.norm(dir_to_target)
+            if d_t > 1e-12:
+                fwd_t = dir_to_target / d_t
+                y_t, p_t = _camera_yaw_pitch_from(fwd_t)
+                app.camera["yaw"] = app.camera["yaw_actual"] = y_t
+                app.camera["pitch"] = app.camera["pitch_actual"] = p_t
+                cur_up = _camera_get_up(app.camera, fwd_t)
+                app.camera["up"] = cur_up.tolist()
+            app.camera["cam_look"] = "free"
+            app.camera["approach_delta"] = 0.0
+    if is_centered:
+        imgui.pop_style_color()
 
     # 3. Go To Planet / Object Button
     imgui.same_line(spacing=6)
     if imgui.button("Go To##goto_btn"):
+        app.camera["centered_idx"] = None
         app.camera["tracking_idx"] = insp_idx
         app.camera["tracking_is_cmp"] = insp_is_cmp
         app.camera["tracking_bary"] = inspect_bary
@@ -425,6 +452,8 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         if app.camera["tracking_idx"] == insp_idx and app.camera.get("tracking_is_cmp", False) == insp_is_cmp:
             app.camera["tracking_bary"] = app.camera["inspect_bary"]
             app.camera["tracking_mode"] = "bary" if app.camera["inspect_bary"] else "body"
+        if app.camera.get("centered_idx") == insp_idx and app.camera.get("centered_is_cmp", False) == insp_is_cmp:
+            app.camera["centered_bary"] = app.camera["inspect_bary"]
 
     # Altitude & Distance Readout
     thresh_au = app.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)

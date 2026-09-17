@@ -79,6 +79,7 @@ class InputHandlerMixin:
             if movement_mode == 1:
                 # Simple Orbit mode: scroll wheel zooms camera in / out relative to tracked object
                 self.camera["approach_delta"] += yoffset * 0.15
+                self.camera["centered_idx"] = None
             else:
                 # Free Flight mode: scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
                 speed = self.camera.get("flight_speed", 0.1)
@@ -116,6 +117,9 @@ class InputHandlerMixin:
         
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
         movement_mode = self.camera.get("movement_mode", 0)
+
+        if (self.camera.get("left_dragging", False) or self.camera.get("right_dragging", False)) and (abs(dx) > 0 or abs(dy) > 0):
+            self.camera["centered_idx"] = None
         
         if self.camera["left_dragging"] and self.camera["right_dragging"]:
             # LMB+RMB: radial approach / recede toward the tracked body's surface.
@@ -137,7 +141,7 @@ class InputHandlerMixin:
                 _camera_pivot_apply(self.camera, dx, dy, sensitivity)
                 self.camera["cam_look"] = "free"
             else:
-                # Free Flight mode: RMB drag trackball orbit around the pivot
+                # Free Flight mode: RMB trackball orbit around the pivot
                 _camera_orbit_apply(self.camera, dx, dy, sensitivity)
     
         self.camera["last_x"], self.camera["last_y"] = xpos, ypos
@@ -153,6 +157,8 @@ class InputHandlerMixin:
         flight_keys = {glfw.KEY_W: "w", glfw.KEY_A: "a", glfw.KEY_S: "s", glfw.KEY_D: "d"}
         if key in flight_keys:
             self.camera["keys"][flight_keys[key]] = (action != glfw.RELEASE)
+            if action == glfw.PRESS:
+                self.camera["centered_idx"] = None
             return
     
         if action == glfw.PRESS or action == glfw.REPEAT:
