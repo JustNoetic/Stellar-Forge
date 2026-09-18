@@ -21,6 +21,7 @@ def main():
         ("prog_gpu_orbits", "celestial/orbit.vert", "celestial/orbit.frag"),
         ("prog_hz", "celestial/hz.vert", "celestial/hz.frag"),
         ("prog_atmo", "atmosphere/atmo.vert", "atmosphere/atmo.frag"),
+        ("prog_sky_view", "atmosphere/sky_view_lut.vert", "atmosphere/sky_view_lut.frag"),
     ]
 
     all_passed = True

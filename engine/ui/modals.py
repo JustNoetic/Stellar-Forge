@@ -22,9 +22,9 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
             # Atmosphere Quality
             atmo_quality = app.camera.get("atmo_quality", 1)
-            changed_aq, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)"])
+            changed_aq, atmo_quality = imgui.combo("Atmosphere Quality", atmo_quality, ["Off", "Low (2D Shadows)", "High (Volumetric)", "Analytical (Sky-View + Slicing)"])
             if changed_aq:
-                app.camera["atmo_quality"] = min(2, atmo_quality)
+                app.camera["atmo_quality"] = min(3, atmo_quality)
                 settings_changed = True
 
             if atmo_quality > 0:

@@ -598,6 +598,12 @@ class App(InputHandlerMixin):
         self.atmo_lowres_trans_tex = {0: [None, None], 1: [None, None], 2: [None, None]}
         self.prev_atmo_view_proj = None
         self.prev_atmo_cam_pos = None
+
+        # Sky-View LUT resources (Mode 3: Analytical)
+        self.prog_sky_view = None
+        self.sky_view_tex = None
+        self.sky_view_fbo = None
+        self.quad_vao_sky_view = None
         self.star_catalog = None
         self.prev_atmo_exposure = 1.0
         self.prev_atmo_body_offsets = {}
@@ -1589,7 +1595,16 @@ class App(InputHandlerMixin):
                 p['u_history_scatter'].value = 10
             if 'u_history_trans' in p:
                 p['u_history_trans'].value = 11
+            if 'u_sky_view_lut' in p:
+                p['u_sky_view_lut'].value = 12
         
+        self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
+        self.sky_view_tex = ctx.texture((256, 256), 4, dtype='f2')
+        self.sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.sky_view_tex.repeat_x = True
+        self.sky_view_tex.repeat_y = False
+        self.sky_view_fbo = ctx.framebuffer(color_attachments=[self.sky_view_tex])
+
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
         self.prog_composite = ctx.program(vertex_shader=composite_shader_vs, fragment_shader=composite_shader_fs)
@@ -1697,6 +1712,7 @@ class App(InputHandlerMixin):
         self.quad_vao_atmo_comp = ctx.vertex_array(self.prog_atmo_composite, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_atmo_upsample = ctx.vertex_array(self.prog_atmo_upsample, [(quad_vbo, '2f', 'in_position')])
         self.quad_vao_streak = ctx.vertex_array(self.prog_star_streak, [(quad_vbo, '2f', 'in_position')])
+        self.quad_vao_sky_view = ctx.vertex_array(self.prog_sky_view, [(quad_vbo, '2f', 'in_position')])
         
         # Compile Habitable Zone Shader
         self.prog_hz = ctx.program(vertex_shader=hz_vertex_shader, fragment_shader=hz_fragment_shader)
@@ -2226,7 +2242,7 @@ class App(InputHandlerMixin):
         orbit_fade_dir_idx = self.camera.get("orbit_fade_dir_idx", 0)
         orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
         orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
-        atmo_quality = min(self.camera.get("atmo_quality", 1), 2)
+        atmo_quality = min(self.camera.get("atmo_quality", 1), 3)
         now_dt = datetime.datetime.now()
         jump_date = [now_dt.year, now_dt.month, now_dt.day, now_dt.hour, now_dt.minute, now_dt.second]
         scrub_index = [0]
@@ -3099,7 +3115,7 @@ class App(InputHandlerMixin):
             orbit_fade_dir_idx = self.camera.get("orbit_fade_dir_idx", 0)
             orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
             orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
-            atmo_quality = min(self.camera.get("atmo_quality", 2), 2)
+            atmo_quality = min(self.camera.get("atmo_quality", 2), 3)
             
             glfw.poll_events()
             
@@ -5176,6 +5192,8 @@ class App(InputHandlerMixin):
                     _b_pole_len = float(np.linalg.norm(_b_pole_raw))
                     _p_pole_norm = _b_pole_raw / _b_pole_len if _b_pole_len > 1e-4 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
+                    _star0_s_dir_sph = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    _star0_comb_int = np.array([1.0, 1.0, 1.0], dtype=np.float32)
                     _n_stars_to_precomp = min(len(stars_pos_radius), 4)
                     for _s in range(_n_stars_to_precomp):
                         _s_pos = np.array(stars_pos_radius[_s][0:3], dtype=np.float32)
@@ -5219,6 +5237,10 @@ class App(InputHandlerMixin):
                         _tanPhi = _cosPhi / math.sqrt(max(1.0 - _cosPhi * _cosPhi, 1e-4))
                         _solstice_f = float(np.clip(_tanPhi * 1.8, 0.0, 1.0))
 
+                        if _s == 0:
+                            _star0_s_dir_sph = _s_dir_sph
+                            _star0_comb_int = _comb_int
+
                         # Pack into staging buffer
                         _b_idx = 192 + _s * 4
                         self.atmo_staging[_b_idx : _b_idx + 3] = _comb_int
@@ -5234,6 +5256,82 @@ class App(InputHandlerMixin):
 
                         _b_idx = 240 + _s * 4
                         self.atmo_staging[_b_idx : _b_idx + 4] = [_solstice_f, _s_pole_dot, _d_star, _s_rad]
+
+                    # Mode 3: Analytical Sky-View LUT pass
+                    if atmo_quality == 3 and self.prog_sky_view is not None:
+                        cam_rel_au = cam_pos - body_pos_rel
+                        cam_rel_km = cam_rel_au * AU_TO_KM
+                        if f_scale > 1.00001:
+                            h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
+                            cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
+                        else:
+                            cam_sph_km = cam_rel_km
+                        cam_norm = cam_sph_km / max(1.0, float(atmo['planet_radius_km']))
+
+                        # Planet local basis aligned with axial tilt
+                        p_up = _p_pole_norm
+                        p_ref = np.array([0.0, 1.0, 0.0], dtype=np.float32) if abs(p_up[1]) < 0.99 else np.array([0.0, 0.1, 1.0], dtype=np.float32)
+                        p_right = np.cross(p_up, p_ref)
+                        p_right = p_right / np.linalg.norm(p_right)
+                        p_fwd = np.cross(p_right, p_up)
+
+                        cam_local = np.array([
+                            np.dot(cam_norm, p_right),
+                            np.dot(cam_norm, p_up),
+                            np.dot(cam_norm, p_fwd)
+                        ], dtype=np.float32)
+
+                        sun_local = np.array([
+                            np.dot(_star0_s_dir_sph, p_right),
+                            np.dot(_star0_s_dir_sph, p_up),
+                            np.dot(_star0_s_dir_sph, p_fwd)
+                        ], dtype=np.float32)
+                        sun_local_len = float(np.linalg.norm(sun_local))
+                        if sun_local_len > 1e-6:
+                            sun_local = sun_local / sun_local_len
+
+                        atmo_density = float(atmo.get('density', 24.0))
+                        atmo_tint = tuple(atmo.get('tint', [0.35, 0.65, 1.0]))
+
+                        self.sky_view_fbo.use()
+                        ctx.viewport = (0, 0, 256, 256)
+                        ctx.disable(moderngl.DEPTH_TEST)
+                        ctx.disable(moderngl.BLEND)
+                        ctx.disable(moderngl.CULL_FACE)
+
+                        self.prog_sky_view['u_cam_pos'].value = tuple(cam_local)
+                        self.prog_sky_view['u_sun_dir'].value = tuple(sun_local)
+                        self.prog_sky_view['u_sun_color'].value = tuple(_star0_comb_int.astype(np.float32))
+                        self.prog_sky_view['u_atmo_tint'].value = atmo_tint
+                        self.prog_sky_view['u_planet_radius'].value = 1.0
+                        self.prog_sky_view['u_atmo_radius'].value = float(atmo['atmo_radius_km']) / max(1.0, float(atmo['planet_radius_km']))
+                        self.prog_sky_view['u_scale_height'].value = float(props['scale_height_km']) / max(1.0, float(atmo['planet_radius_km']))
+                        self.prog_sky_view['u_density'].value = atmo_density
+
+                        self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
+
+                        # Restore framebuffer and raster state for atmosphere polyhedron rendering
+                        if is_lowres:
+                            target_fbo = self.atmo_lowres_fbo[clip_mode][self.atmo_ping_pong_idx.get(clip_mode, 0)]
+                            target_fbo.use()
+                            ctx.viewport = (0, 0, target_fbo.width, target_fbo.height)
+                        else:
+                            self.hdr_resolve_fbo.use()
+                            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                            ctx.enable(moderngl.BLEND)
+                            gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+
+                        ctx.depth_func = '<='
+                        ctx.enable(moderngl.CULL_FACE)
+                        ctx.cull_face = 'front'
+                        ctx.disable(moderngl.DEPTH_TEST)
+                        ctx.depth_mask = False
+
+                        self.sky_view_tex.use(location=12)
+                        if 'u_density' in cur_prog:
+                            cur_prog['u_density'].value = atmo_density
+                        if 'u_atmo_tint' in cur_prog:
+                            cur_prog['u_atmo_tint'].value = atmo_tint
 
                     # Single buffer upload per atmosphere body
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
@@ -5296,7 +5394,7 @@ class App(InputHandlerMixin):
                     isinstance(self.atmo_lowres_fbo, dict) and 
                     self.atmo_lowres_fbo.get(clip_mode, [None])[0] is not None
                 )
-                use_vrs = (atmo_res < 0.999 or temporal_accum) and has_atmo_fbos
+                use_vrs = (atmo_res < 0.999 or temporal_accum) and has_atmo_fbos and (atmo_quality != 3)
                 
                 pending_lowres_atmos = []
                 

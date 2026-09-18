@@ -36,6 +36,8 @@ multi_scatter_lut_fragment_shader = load_shader("atmosphere/multi_scatter_lut.fr
 
 ringshine_map_vertex_shader = load_shader("post/ringshine_map.vert")
 ringshine_map_fragment_shader = load_shader("post/ringshine_map.frag")
+sky_view_lut_vertex_shader = load_shader("atmosphere/sky_view_lut.vert")
+sky_view_lut_fragment_shader = load_shader("atmosphere/sky_view_lut.frag")
 
 atmo_upsample_fragment_shader = load_shader("atmosphere/atmo_upsample.frag")
 

@@ -242,10 +242,14 @@ python scripts/accuracy_test.py
 - **Oblate Star Geometry**: Corrects light cone and shadow penumbra geometry for fast-rotating, oblate host stars (e.g., Achernar), projecting elliptical stellar disks during eclipses and occultations.
 
 ### Physically Based Atmospheric Scattering & Refraction
-Utilizes a multi-step precomputation technique inspired by Bruneton et al. combined with real-time atmospheric refraction:
+Utilizes a multi-step precomputation technique inspired by Bruneton et al. combined with real-time atmospheric refraction and selectable rendering quality modes:
 1. **Transmittance LUT**: Precomputes optical depth for Rayleigh and Mie scattering across altitudes and zenith angles.
 2. **Multi-Scattering LUT**: Approximates higher-order light bounces inside the atmosphere.
-3. **Real-Time Raymarching Shader**: Combines Rayleigh scattering (sky color), Mie scattering (sun halos), and gas absorption in real time.
+3. **Atmosphere Quality Modes (`u_atmo_quality`)**:
+   - **Mode 0 (`Off`)**: Atmosphere rendering disabled.
+   - **Mode 1 (`Low (2D Shadows)`)**: Fast numerical raymarcher with analytical 2D planar ring shadow attenuation.
+   - **Mode 2 (`High (Volumetric)`)**: Full volumetric raymarcher with per-step 3D volumetric ring shadow integration, adaptive step dithering, and temporal accumulation.
+   - **Mode 3 (`Analytical (Sky-View + Slicing)`)**: High-performance analytical atmosphere pipeline combining a per-frame 256×256 Sky-View Look-Up Table (`prog_sky_view` / `sky_view_lut.*`) and analytical depth slicing for circumplanetary ring shadows. Precomputes unshadowed in-scattering and view-transmittance, transforms coordinates into the parent planet's axial-tilt local frame where the ring plane is $Y = 0$, solves quadratic equations for ring boundary intersections in $\mathcal{O}(1)$ to isolate the shadow interval $[c_s, c_e]$, and executes an 8-step footprint-filtered quadrature only within the shadow interval to subtract the light deficit $\Delta L$. Produces crisp, pixel-perfect volumetric ring shadows with zero raymarch step noise.
 4. **Atmospheric Refraction & Lensing**: Calculates physical ray bending derived from surface refractivity ($n_{\text{mix}} - 1$), scale height, and planetary oblateness. Two complementary quantities are shared via `refraction.glsl`: the parallax-weighted apparent displacement (`compute_refraction_angle`) applied to subpixel point lights, orbits, and habitable-zone visuals, and the total un-parallaxed ray turn (`compute_refraction_total`) used for anchored ray-bending in body meshes (`sphere.frag`), volumetric atmospheres (`atmo.frag`), and rings (`ring.frag`). Point lights invert the ray deflection using 12-step bracketed bisection (`solve_refraction_apparent`).
    Above the observer's local horizon, both paths share the ascending-atmosphere `erfcx` correction; mesh rays pivot at the camera rather than a behind-camera periapsis. GPU regression: `python scripts/test_refraction_math.py` checks their alignment from ground and space.
 5. **Distance-Agnostic Focal Lensing**: Supports refraction at arbitrary distances (e.g. Earth's atmosphere refractive lensing and sun-hugging ring effects when viewed from lunar focal distances or when background moons set behind planetary limbs).
