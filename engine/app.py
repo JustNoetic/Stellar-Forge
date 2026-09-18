@@ -1599,6 +1599,10 @@ class App(InputHandlerMixin):
                 p['u_sky_view_lut'].value = 12
         
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
+        if 'u_transmittance_lut' in self.prog_sky_view:
+            self.prog_sky_view['u_transmittance_lut'].value = 1
+        if 'u_multi_scatter_lut' in self.prog_sky_view:
+            self.prog_sky_view['u_multi_scatter_lut'].value = 3
         self.sky_view_tex = ctx.texture((256, 256), 4, dtype='f2')
         self.sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.sky_view_tex.repeat_x = True
@@ -5257,6 +5261,9 @@ class App(InputHandlerMixin):
                         _b_idx = 240 + _s * 4
                         self.atmo_staging[_b_idx : _b_idx + 4] = [_solstice_f, _s_pole_dot, _d_star, _s_rad]
 
+                    # Single buffer upload per atmosphere body (must precede Sky-View LUT pass)
+                    self.atmo_ssbo.write(self.atmo_staging.tobytes())
+
                     # Mode 3: Analytical Sky-View LUT pass
                     if atmo_quality == 3 and self.prog_sky_view is not None:
                         cam_rel_au = cam_pos - body_pos_rel
@@ -5266,32 +5273,11 @@ class App(InputHandlerMixin):
                             cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
                         else:
                             cam_sph_km = cam_rel_km
-                        cam_norm = cam_sph_km / max(1.0, float(atmo['planet_radius_km']))
 
-                        # Planet local basis aligned with axial tilt
-                        p_up = _p_pole_norm
-                        p_ref = np.array([0.0, 1.0, 0.0], dtype=np.float32) if abs(p_up[1]) < 0.99 else np.array([0.0, 0.1, 1.0], dtype=np.float32)
-                        p_right = np.cross(p_up, p_ref)
-                        p_right = p_right / np.linalg.norm(p_right)
-                        p_fwd = np.cross(p_right, p_up)
-
-                        cam_local = np.array([
-                            np.dot(cam_norm, p_right),
-                            np.dot(cam_norm, p_up),
-                            np.dot(cam_norm, p_fwd)
-                        ], dtype=np.float32)
-
-                        sun_local = np.array([
-                            np.dot(_star0_s_dir_sph, p_right),
-                            np.dot(_star0_s_dir_sph, p_up),
-                            np.dot(_star0_s_dir_sph, p_fwd)
-                        ], dtype=np.float32)
-                        sun_local_len = float(np.linalg.norm(sun_local))
-                        if sun_local_len > 1e-6:
-                            sun_local = sun_local / sun_local_len
-
-                        atmo_density = float(atmo.get('density', 24.0))
-                        atmo_tint = tuple(atmo.get('tint', [0.35, 0.65, 1.0]))
+                        if 'lut_tex' in atmo and atmo['lut_tex']:
+                            atmo['lut_tex'].use(location=1)
+                        if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
+                            atmo['lut_multi_scatter'].use(location=3)
 
                         self.sky_view_fbo.use()
                         ctx.viewport = (0, 0, 256, 256)
@@ -5299,14 +5285,8 @@ class App(InputHandlerMixin):
                         ctx.disable(moderngl.BLEND)
                         ctx.disable(moderngl.CULL_FACE)
 
-                        self.prog_sky_view['u_cam_pos'].value = tuple(cam_local)
-                        self.prog_sky_view['u_sun_dir'].value = tuple(sun_local)
-                        self.prog_sky_view['u_sun_color'].value = tuple(_star0_comb_int.astype(np.float32))
-                        self.prog_sky_view['u_atmo_tint'].value = atmo_tint
-                        self.prog_sky_view['u_planet_radius'].value = 1.0
-                        self.prog_sky_view['u_atmo_radius'].value = float(atmo['atmo_radius_km']) / max(1.0, float(atmo['planet_radius_km']))
-                        self.prog_sky_view['u_scale_height'].value = float(props['scale_height_km']) / max(1.0, float(atmo['planet_radius_km']))
-                        self.prog_sky_view['u_density'].value = atmo_density
+                        self.prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km.astype(np.float32))
+                        self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
 
                         self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
 
@@ -5328,14 +5308,7 @@ class App(InputHandlerMixin):
                         ctx.depth_mask = False
 
                         self.sky_view_tex.use(location=12)
-                        if 'u_density' in cur_prog:
-                            cur_prog['u_density'].value = atmo_density
-                        if 'u_atmo_tint' in cur_prog:
-                            cur_prog['u_atmo_tint'].value = atmo_tint
 
-                    # Single buffer upload per atmosphere body
-                    self.atmo_ssbo.write(self.atmo_staging.tobytes())
-                    
                     cur_vao.render(moderngl.TRIANGLES)
     
                 ctx.depth_mask = True
