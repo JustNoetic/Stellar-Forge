@@ -306,7 +306,7 @@ spectral classification.
 - `compute_max_bend(caster_r_au, atmo_h_km)` (~L225) — eclipse shadow bending limit.
 - `compute_ring_coplanar_masks(...)` (~L234, `@njit(cache=True)`) — coplanar ring-plane masks.
 - `get_cached_atmosphere_properties(atmo, mass_sm)` (~L253) — memoized atmosphere props.
-- `compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled)` (~L295, `@njit`) — CPU planetshine precompute.
+- `compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled, ring_params, ring_normals, ring_colors, planetshine_enabled, ringshine_enabled)` (~L278, `@njit`) — CPU planetshine & moon ringshine precompute.
 - **Active Refraction Uniform Setup** (~L4318) — passes distance-agnostic refraction parameters (`u_refract_center`, `u_refract_radius`, `u_refract_max_bend`, `u_refract_scale_height`, `u_refract_pole`, `u_refract_oblateness`) dynamically across active shaders (`prog_spheres`, `prog_rings`, `prog_atmo`, `prog_orbit`, etc.).
 - **Active Gravitational Lens Uniform Setup** (immediately after) — scores all bodies (primary + comparison; BH ×1000, NS ×100, inspected ×5000) by `rs_km / cam_dist_au`, picks the active lens, and pushes `u_grav_lens_*` (center, rs = 2.95325008 km × M☉, type 0=Star/1=WD/2=NS/3=BH, enabled, strength, spin, pole) to every refraction-consuming program. Settings: `grav_lensing_enabled` / `grav_lensing_multiplier` (Graphics & Quality modal).
 
@@ -519,7 +519,7 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Validate lensing math on GPU | `scripts/test_lensing_math.py` | `main` |
 | Change bloom/tonemap/Accumulation shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
-| Change planetshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
+| Change planetshine & moon ringshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
 | Change ring texture baking | `engine/rendering/texture_baker.py` | `bake_and_export_ring_textures` |
 | Change ringshine irradiance map / shadow CDF | `engine/glsl/post/ringshine_map.frag`, `engine/app.py` (`build_ringshine_lut`) | `build_ringshine_lut` |
 | Validate ringshine accuracy vs Monte Carlo | `scripts/ringshine_benchmark.py` | `main` |

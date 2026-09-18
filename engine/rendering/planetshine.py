@@ -275,14 +275,18 @@ def compute_body_rotation_angles_jit(sim_t_sec, rot_period_arr, w0_arr, tidally_
     return angles
 
 @njit
-def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled):
+def compute_planetshine_numba(
+    pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled,
+    ring_params=None, ring_normals=None, ring_colors=None,
+    planetshine_enabled=True, ringshine_enabled=True
+):
     N = len(pos)
     num_stars = len(star_positions)
     
     planetshine_dirs = np.zeros((N, 3), dtype=np.float32)
     planetshine_colors = np.zeros((N, 3), dtype=np.float32)
     
-    if num_stars == 0:
+    if num_stars == 0 or (not planetshine_enabled and not ringshine_enabled):
         return planetshine_dirs, planetshine_colors
         
     j_lit = np.zeros((N, num_stars), dtype=np.float32)
@@ -368,14 +372,57 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
             dz = pos_j[2] - pos_i[2]
             dist_sq = dx*dx + dy*dy + dz*dz
             
+            # Check for active rings on caster j
+            has_ring = False
+            r_in = 0.0
+            r_out = 0.0
+            r_opacity = 0.0
+            r_unlit = 1.0
+            if ring_params is not None and ringshine_enabled:
+                r_in = ring_params[j, 0]
+                r_out = ring_params[j, 1]
+                r_opacity = ring_params[j, 2]
+                r_unlit = ring_params[j, 3]
+                if r_out > 1e-6 and r_opacity > 1e-4:
+                    has_ring = True
+            
+            max_extent = max(r_j, r_out) if has_ring else r_j
             min_dist = r_j * 1.05
-            max_dist = r_j * 300.0 
+            max_dist = max_extent * 300.0 
             if dist_sq < min_dist * min_dist or dist_sq > max_dist * max_dist:
                 continue
                 
             solid_angle = (r_j * r_j) / dist_sq
-            if solid_angle < 1e-8:
+            if solid_angle < 1e-8 and not has_ring:
                 continue
+            
+            # Precompute geometry for caster rings seen by receiver i
+            dist = math.sqrt(dist_sq)
+            inv_d = 1.0 / dist if dist > 1e-6 else 0.0
+            u_moon_x = -dx * inv_d
+            u_moon_y = -dy * inv_d
+            u_moon_z = -dz * inv_d
+            
+            ring_solid_angle = 0.0
+            rn_x, rn_y, rn_z = 0.0, 0.0, 0.0
+            sin_B_v = 0.0
+            tau_ring = 0.0
+            lit_frac = 1.0
+            
+            if has_ring and dist > 1e-6 and ring_normals is not None:
+                rn_x = ring_normals[j, 0]
+                rn_y = ring_normals[j, 1]
+                rn_z = ring_normals[j, 2]
+                sin_B_v = u_moon_x * rn_x + u_moon_y * rn_y + u_moon_z * rn_z
+                mu_v = abs(sin_B_v)
+                
+                # Projected solid angle: (R_out^2 - R_in^2) * mu_v / d^2
+                ring_solid_angle = max(0.0, (r_out * r_out - r_in * r_in) * mu_v) / dist_sq
+                tau_ring = -math.log(max(1e-4, 1.0 - min(0.999, r_opacity)))
+                
+                # Cylindrical shadow of host planet across ring plane
+                shadow_frac = min(0.5, (2.0 * r_j) / max(1e-6, 3.1415926535 * (r_out + r_in)))
+                lit_frac = max(0.0, 1.0 - shadow_frac)
             
             for s in range(num_stars):
                 if j_lit[j, s] < 1e-6:
@@ -402,19 +449,71 @@ def compute_planetshine_numba(pos, radii, colors, is_star, star_positions, star_
                 else:
                     continue
 
-                cos_a = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
-                cos_a = max(-1.0, min(1.0, cos_a))
-                a = np.arccos(cos_a)
-                phase = (np.sin(a) + (np.pi - a) * cos_a) / np.pi
-                
-                light_r = star_colors[s, 0] * phase * j_lit[j, s]
-                light_g = star_colors[s, 1] * phase * j_lit[j, s]
-                light_b = star_colors[s, 2] * phase * j_lit[j, s]
-            
+                # 1. Planet Disk Bounce
+                planet_bounce_r = 0.0
+                planet_bounce_g = 0.0
+                planet_bounce_b = 0.0
                 boost = 1.5 
-                bounce_r = colors[j, 0] * light_r * solid_angle * (2.0 / 3.0) * boost
-                bounce_g = colors[j, 1] * light_g * solid_angle * (2.0 / 3.0) * boost
-                bounce_b = colors[j, 2] * light_b * solid_angle * (2.0 / 3.0) * boost
+                
+                if planetshine_enabled and solid_angle >= 1e-8:
+                    cos_a = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
+                    cos_a = max(-1.0, min(1.0, cos_a))
+                    a = np.arccos(cos_a)
+                    phase = (np.sin(a) + (np.pi - a) * cos_a) / np.pi
+                    
+                    light_r = star_colors[s, 0] * phase * j_lit[j, s]
+                    light_g = star_colors[s, 1] * phase * j_lit[j, s]
+                    light_b = star_colors[s, 2] * phase * j_lit[j, s]
+                
+                    planet_bounce_r = colors[j, 0] * light_r * solid_angle * (2.0 / 3.0) * boost
+                    planet_bounce_g = colors[j, 1] * light_g * solid_angle * (2.0 / 3.0) * boost
+                    planet_bounce_b = colors[j, 2] * light_b * solid_angle * (2.0 / 3.0) * boost
+                
+                # 2. Planetary Ring Bounce (Ringshine on Moons)
+                ring_bounce_r = 0.0
+                ring_bounce_g = 0.0
+                ring_bounce_b = 0.0
+                
+                if has_ring and ring_solid_angle > 1e-8 and ring_colors is not None:
+                    sin_B_sun = cx * rn_x + cy * rn_y + cz * rn_z
+                    mu_0 = max(1e-4, abs(sin_B_sun))
+                    same_hemi = sin_B_sun * sin_B_v
+                    
+                    if same_hemi >= 0.0:
+                        # Sunlit face: direct reflection / backscatter
+                        face_factor = 1.0
+                    else:
+                        # Unlit face: transmitted light through the ring slab
+                        face_factor = r_unlit * math.exp(-tau_ring / mu_0)
+                        
+                    # Scattering phase angle: angle between solar ray L and ray from planet to moon
+                    cos_theta = cx * u_moon_x + cy * u_moon_y + cz * u_moon_z
+                    cos_theta = max(-1.0, min(1.0, cos_theta))
+                    
+                    # Double Henyey-Greenstein particulate phase function (gf=0.436, gb=-0.657)
+                    gf = 0.436
+                    gb = -0.657
+                    denom_f = max(1e-6, 1.0 + gf * gf - 2.0 * gf * cos_theta)
+                    denom_b = max(1e-6, 1.0 + gb * gb - 2.0 * gb * cos_theta)
+                    pf_f = (1.0 - gf * gf) / (denom_f * math.sqrt(denom_f))
+                    pf_b = (1.0 - gb * gb) / (denom_b * math.sqrt(denom_b))
+                    pf_ring = 0.7 * pf_f + 0.3 * pf_b
+                    
+                    ring_r = ring_colors[j, 0]
+                    ring_g = ring_colors[j, 1]
+                    ring_b = ring_colors[j, 2]
+                    
+                    ring_light_r = star_colors[s, 0] * pf_ring * j_lit[j, s] * face_factor * lit_frac
+                    ring_light_g = star_colors[s, 1] * pf_ring * j_lit[j, s] * face_factor * lit_frac
+                    ring_light_b = star_colors[s, 2] * pf_ring * j_lit[j, s] * face_factor * lit_frac
+                    
+                    ring_bounce_r = ring_r * ring_light_r * ring_solid_angle * (2.0 / 3.0) * boost
+                    ring_bounce_g = ring_g * ring_light_g * ring_solid_angle * (2.0 / 3.0) * boost
+                    ring_bounce_b = ring_b * ring_light_b * ring_solid_angle * (2.0 / 3.0) * boost
+                
+                bounce_r = planet_bounce_r + ring_bounce_r
+                bounce_g = planet_bounce_g + ring_bounce_g
+                bounce_b = planet_bounce_b + ring_bounce_b
                 
                 lum = bounce_r * 0.2126 + bounce_g * 0.7152 + bounce_b * 0.0722
                 

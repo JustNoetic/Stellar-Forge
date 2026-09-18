@@ -3938,6 +3938,55 @@ class App(InputHandlerMixin):
                     star_lums[_k] = float(_bd["star_props"]["lum"])
                     
             hdr_enabled = self.camera.get("hdr_enabled", True)
+            planetshine_enabled = self.camera.get("planetshine_enabled", True)
+            ringshine_enabled = self.camera.get("ringshine_enabled", True)
+
+            # Build per-body ring parameters for ringshine-augmented planetshine
+            n_ps_bodies = total_render_bodies
+            if not hasattr(self, '_ps_ring_params') or self._ps_ring_params.shape[0] != n_ps_bodies:
+                self._ps_ring_params = np.zeros((n_ps_bodies, 4), dtype=np.float32)
+                self._ps_ring_normals = np.zeros((n_ps_bodies, 3), dtype=np.float32)
+                self._ps_ring_colors = np.zeros((n_ps_bodies, 3), dtype=np.float32)
+            else:
+                self._ps_ring_params[:] = 0.0
+                self._ps_ring_normals[:] = 0.0
+                self._ps_ring_colors[:] = 0.0
+
+            ps_ring_params = self._ps_ring_params
+            ps_ring_normals = self._ps_ring_normals
+            ps_ring_colors = self._ps_ring_colors
+
+            if ring_precomputed:
+                for r in ring_precomputed:
+                    bi = r['body_idx']
+                    if bi < num_bodies and r['opacity'] > 0.0:
+                        if ps_ring_params[bi, 1] == 0.0:
+                            ps_ring_params[bi, 0] = r['inner_r']
+                            ps_ring_params[bi, 1] = r['outer_r']
+                            ps_ring_params[bi, 2] = r['opacity']
+                            ps_ring_params[bi, 3] = float(r.get('unlit_factor', 1.0))
+                            ps_ring_normals[bi] = r['pole']
+                            ps_ring_colors[bi] = r['raw_color']
+                        else:
+                            ps_ring_params[bi, 0] = min(ps_ring_params[bi, 0], r['inner_r'])
+                            ps_ring_params[bi, 1] = max(ps_ring_params[bi, 1], r['outer_r'])
+                            ps_ring_params[bi, 2] = max(ps_ring_params[bi, 2], r['opacity'])
+
+            if self.comparison_enabled and hasattr(self, 'ring_precomputed_cmp') and self.ring_precomputed_cmp:
+                for r in self.ring_precomputed_cmp:
+                    bi = num_bodies + r['body_idx']
+                    if bi < n_ps_bodies and r['opacity'] > 0.0:
+                        if ps_ring_params[bi, 1] == 0.0:
+                            ps_ring_params[bi, 0] = r['inner_r']
+                            ps_ring_params[bi, 1] = r['outer_r']
+                            ps_ring_params[bi, 2] = r['opacity']
+                            ps_ring_params[bi, 3] = float(r.get('unlit_factor', 1.0))
+                            ps_ring_normals[bi] = r['pole']
+                            ps_ring_colors[bi] = r['raw_color']
+                        else:
+                            ps_ring_params[bi, 0] = min(ps_ring_params[bi, 0], r['inner_r'])
+                            ps_ring_params[bi, 1] = max(ps_ring_params[bi, 1], r['outer_r'])
+                            ps_ring_params[bi, 2] = max(ps_ring_params[bi, 2], r['opacity'])
             
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
@@ -3948,7 +3997,12 @@ class App(InputHandlerMixin):
                 star_colors,
                 star_lums,
                 star_radii, # Pass radii to Numba
-                hdr_enabled
+                hdr_enabled,
+                ps_ring_params,
+                ps_ring_normals,
+                ps_ring_colors,
+                planetshine_enabled,
+                ringshine_enabled
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
             all_instances[:total_render_bodies, 20:23] = planetshine_colors

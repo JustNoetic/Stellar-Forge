@@ -55,9 +55,9 @@ graph TD
 
 | Stage | Where | Cost | Output |
 |---|---|---|---|
-| **1. Irradiance & CDF LUTs** | CPU at startup ([`app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py#L1726-L1785)) | One-time ~50ms | `ringshine_lut_tex` (256²) + `ringshine_cdf_tex` (128×128×64) |
+| **1. Irradiance & CDF LUTs** | CPU at startup ([`app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py#L1898-L1957)) | One-time ~50ms | `ringshine_lut_tex` (256²) + `ringshine_cdf_tex` (128×128×64) |
 | **2. Dynamic Map Bake** | GPU per-frame ([`ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag)) | ~0.04–0.08ms @ 100 bands | `ringshine_map_tex` (128×1040) |
-| **3. Fragment Sampling** | GPU per-fragment ([`sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag#L971-L1016), [`atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag#L1303-L1361)) | $O(1)$ per fragment | Surface diffuse color and atmospheric scattering |
+| **3. Fragment Sampling** | GPU per-fragment ([`sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag#L914-L991), [`atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag#L1306-L1351)) | $O(1)$ per fragment | Surface diffuse color and atmospheric scattering |
 
 ---
 
@@ -131,7 +131,7 @@ The dynamic ringshine map is an off-screen **128 × 1040** `RGBA32F` framebuffer
 $$\phi_{\text{center}} = \text{sign}(x) \cdot |x|^{1.5} \cdot \pi$$
 
 - **Vertical axis** ($v \in [0,1] \to y \in [-1,1]$): surface elevation relative to the ring plane:
-$$\text{frag\_elevation} = \text{sign}(y) \cdot |y|^{1.5}, \qquad \sin\lambda = \text{clamp}(|\text{frag\_elevation}|, 0.001, 0.999)$$
+$$\text{frag\_elevation} = \text{sign}(y) \cdot |y|^{1.5}, \qquad \sin\lambda = \text{clamp}(|\text{frag\_elevation}|, 0.0, 0.999)$$
 
 > [!IMPORTANT]
 > The power-1.5 warping concentrates texel density near $\phi_{\text{center}} = 0$ (the midnight/noon meridian) and near $\lambda = 0$ (the equator), where illumination gradients and shadow boundaries are steepest. Sampling on the surface uses the exact power-$2/3$ inverse mapping, completely preventing stepping artifacts at a compact resolution of only $128 \times 65$ texels per ring plane.
@@ -164,8 +164,9 @@ For each band $[u_0, u_1]$:
 3. The ring gradient atlas `u_ring_gradients` is sampled at $\text{frac}_s$.
 4. Contributions are weighted by the differential cylindrical ring area metric $w_{\text{area}} = r_s \cdot \text{QUAD\_W}[s]$:
    $$\overline{\alpha}_{\text{raw}} = \frac{\sum_{s=0}^3 \text{samp}_s.\alpha \cdot w_{\text{area}, s}}{\sum_{s=0}^3 w_{\text{area}, s}}, \qquad \overline{\mathbf{C}}_{\text{raw}} = \frac{\sum_{s=0}^3 \text{samp}_s.\text{rgb} \cdot (\text{samp}_s.\alpha \cdot w_{\text{area}, s})}{\sum_{s=0}^3 \text{samp}_s.\alpha \cdot w_{\text{area}, s}}$$
+5. Optional artistic parameters are applied to textured rings (hue, saturation, and brightness via `adjust_hsba`, and power-law alpha boost $\overline{\alpha} \leftarrow \overline{\alpha}^{1/\text{boost}}$) before evaluating physical opacity $\alpha_{\text{phys}} = \overline{\alpha} \cdot \text{opacity}$ and optical depth $\tau_{\text{phys}} = -\ln(1 - \alpha_{\text{phys}})$.
 
-This provides exact numerical integration of polynomial profiles up to degree 7, enabling **100 bands (400 radial sample evaluations)** to achieve $>98\%$ error reduction compared to traditional midpoint sampling while resolving fine radial structures across Cassini Division and ring boundaries (full manifold MAE $0.000353$ vs Monte Carlo ground truth).
+This provides exact numerical integration of polynomial profiles up to degree 7, enabling **100 bands (400 radial sample evaluations)** to achieve significant error reduction and eliminate stepping artifacts compared to traditional midpoint sampling while resolving fine radial structures across Cassini Division and ring boundaries (full manifold MAE **$0.000711$**, RMSE **$0.001242$** vs Monte Carlo ground truth).
 
 ### 4.3 Exact Slant Optical Depths & True 3D Phase Angle
 
@@ -226,7 +227,10 @@ Opposition surge (coherent backscatter and shadow hiding) produces intense brigh
 #### Hapke Multiple Scattering (Lit Side Only)
 Multiple scattering is modeled using the Hapke/Chandrasekhar $H$-function approximation:
 $$H(\mu) = \frac{1 + 2\mu}{1 + 2\mu\gamma}, \qquad \gamma = \sqrt{1 - w_0} \quad (w_0 = 0.92)$$
-$$I_{\text{MS}} = w_0 \frac{\cos\theta_0}{\cos\theta_v + \cos\theta_0} \big(H(\cos\theta_v)H(\cos\theta_0) - 1\big)\big(1 - e^{-\tau(1/\cos\theta_v + 1/\cos\theta_0)}\big) \cdot w_{\text{chunk}}$$
+$$I_{\text{MS}} = \frac{w_0}{4\pi} \frac{\cos\theta_0}{\cos\theta_v + \cos\theta_0} \big(H(\cos\theta_v)H(\cos\theta_0) - 1\big)\big(1 - e^{-\tau(1/\cos\theta_v + 1/\cos\theta_0)}\big) \cdot w_{\text{MS}}$$
+
+where the multiple scattering weight $w_{\text{MS}}$ modulates isotropic scattering based on ring composition:
+$$w_{\text{MS}} = \begin{cases} \text{clamp}\left(\frac{\alpha_{\text{phys}} - 0.1}{0.5}, \; 0.0, \; 1.0\right) & \text{for textured rings (chunks vs dust)} \\[6pt] 1.0 - \text{scatter\_balance} & \text{for procedural rings} \end{cases}$$
 
 > [!IMPORTANT]
 > **Unlit Face Multiple Scattering Fix**: Multiple scattering is **only evaluated on the sunlit face** ($I_{\text{MS}}$). It is omitted from the unlit transmission side. In thin circumplanetary ring slabs, through-slab multiple scattering is negligible; adding it on the unlit side produces unphysical over-brightening of nightside ringshine.
@@ -294,7 +298,7 @@ $$\text{out\_color} = \text{vec4}(\mathbf{E}_{\text{total}} \cdot \pi, \; 1.0)$$
 
 ### 6.1 Inverse UV Mapping in `sphere.frag`
 
-Ringshine is evaluated exclusively for the **host planet** (`if (!is_host_planet) continue;`). For each surface fragment with normal $\mathbf{N}$ and incident star vector $\mathbf{L}$:
+Ringshine is evaluated exclusively for the **host planet** (`if (!is_host_planet) continue;`). For each surface fragment with planetocentric relative position $\mathbf{P}_{\text{rel}}$ and incident star vector $\mathbf{L}$:
 
 1. **Normalized planetocentric elevation** $\sin\lambda$:
    $$\mathbf{P}_{\text{dir}} = \text{normalize}(\mathbf{P}_{\text{rel}})$$
@@ -331,9 +335,12 @@ $$\mathbf{C}_{\text{final}} \mathrel{+}= \mathbf{C}_{\text{albedo}} \odot \mathb
 
 ### 6.3 Atmospheric Volumetric Scattering in `atmo.frag`
 
-In the atmospheric raymarcher ([`atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag#L1303-L1361)), ringshine functions as a diffuse, planet-wrapping ambient light field driving Rayleigh, Mie, and multiple scattering:
+In the atmospheric raymarcher ([`atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag#L1306-L1351)), ringshine functions as a diffuse, planet-wrapping ambient light field driving Rayleigh, Mie, and multiple scattering:
 
 ```glsl
+// Scale incoming ringshine irradiance by 1/PI (~0.318309886) Lambertian ambient field factor
+ringshine_irradiance *= 0.318309886;
+
 float ambient_phase = 1.0 / (4.0 * PI);
 float ambient_phase_M = ambient_phase * (1.0 / max(0.15, 1.0 - u_precomp_mie.z * 0.5));
 scattered += star_combined_intensity * ringshine_irradiance * (
@@ -352,9 +359,9 @@ This ensures atmospheric haze on Saturn's nightside glows realistically with rin
 | Unit | Uniform Binding | Dimensions | Format | Filtering | Description |
 |:---:|---|---|---|---|---|
 | **0** | `u_ring_gradients` | 4096×16 | RGBA32F | Linear | Ring texture / alpha gradient atlas |
-| **5** | `u_ringshine_map` | 128×1040 | RGBA16F | Linear | Dynamic per-frame ringshine irradiance map |
 | **6** | `u_ringshine_lut` | 256×256 | R32F | Linear | Static 2D geometric form-factor Look-Up Table |
-| **7** | `u_ringshine_cdf_lut` | 128×128×64 | R32F | Linear | Static 3D azimuthal cumulative shadow CDF |
+| **7** | `u_ringshine_cdf_lut` | 128×128×64 | R32F | Trilinear | Static 3D azimuthal cumulative shadow CDF |
+| **8** | `u_ringshine_map` | 128×1040 | RGBA32F | Bilinear (Wrap X) | Dynamic per-frame ringshine irradiance map (16 ring slots) |
 
 ---
 
@@ -402,11 +409,11 @@ At default settings (100 bands), the dynamic map bake executes in **less than 80
 
 | Component | File | Key Symbols / Line Reference |
 |---|---|---|
-| Startup LUT & CDF Generation | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | `build_ringshine_lut()` (~L1726–1785) |
-| Dynamic Map Bake (Vertex) | [`engine/glsl/post/ringshine_map.vert`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.vert) | Passthrough full-screen quad (~L1–12) |
-| Dynamic Map Bake (Fragment) | [`engine/glsl/post/ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag) | `QUAD_T`, `QUAD_W`, `eval_ringshine_cdf`, `OppositionSurge`, band loop (~L1–304) |
-| Host Surface Application | [`engine/glsl/celestial/sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag) | Inverse UV warp, `u_ringshine_map` lookup (~L971–1016) |
-| Atmosphere Volumetric Scattering | [`engine/glsl/atmosphere/atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag) | Ambient phase, Mie asymmetry, multi-scattering (~L1303–1361) |
-| Host Ring Shader Consistency | [`engine/glsl/celestial/ring.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/ring.frag) | Shared phase functions, unlit MS gating (~L520–540) |
-| Texture & Uniform Binding | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | FBO binding, uniform dispatch (~L4251–4305) |
-| Radiative Transfer Verification | [`scripts/ringshine_benchmark.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/scripts/ringshine_benchmark.py) | Monte Carlo ground-truth validator (~L1–664) |
+| Startup LUT & CDF Generation | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | `build_ringshine_lut()` (~L1898–1957) |
+| Dynamic Map Bake (Vertex) | [`engine/glsl/post/ringshine_map.vert`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.vert) | Passthrough full-screen quad (~L1–8) |
+| Dynamic Map Bake (Fragment) | [`engine/glsl/post/ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag) | `QUAD_T`, `QUAD_W`, `eval_ringshine_cdf`, Chandrasekhar slab, Hapke MS, band loop (~L1–300) |
+| Host Surface Application | [`engine/glsl/celestial/sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag) | Planetocentric projection, inverse UV warp, `u_ringshine_map` lookup (~L914–991) |
+| Atmosphere Volumetric Scattering | [`engine/glsl/atmosphere/atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag) | Ambient phase, Mie asymmetry, ringshine scattering (~L1306–1351) |
+| Host Ring Shader Consistency | [`engine/glsl/celestial/ring.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/ring.frag) | Shared phase functions, unlit MS gating (~L501–535) |
+| Texture & Uniform Binding | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | FBO binding, uniform dispatch, map texture bind (~L4434–4504) |
+| Radiative Transfer Verification | [`scripts/ringshine_benchmark.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/scripts/ringshine_benchmark.py) | Monte Carlo ground-truth validator & texture exporter (~L1–1001) |

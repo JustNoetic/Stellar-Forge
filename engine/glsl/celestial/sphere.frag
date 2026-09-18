@@ -983,7 +983,7 @@ void main() {
         }
 
         vec3 final_color = local_f_color * total_diffuse_color + total_specular_color;
-        if (u_planetshine_enabled) {
+        if (u_planetshine_enabled || u_ringshine_enabled) {
             final_color += local_f_color * bounce_light;
         }
         if (u_ringshine_enabled) {

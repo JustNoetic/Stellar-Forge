@@ -1240,7 +1240,7 @@ void main() {
             vec3 ms_shadow = sample_shadow;
             total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * ms_shadow * int_factor;
 
-            if (u_planetshine_enabled) {
+            if (u_planetshine_enabled || u_ringshine_enabled) {
                 float light_cos_theta_ps = dot(current_pos_sph, body_planetshine_dir) / sample_len;
                 float vis_fraction_ps = smoothstep(-cos_planet - 0.05, -cos_planet + 0.05, light_cos_theta_ps);
                 vec3 transmittance_to_ps = get_transmittance_precomputed(v_norm, light_cos_theta_ps);
@@ -1289,7 +1289,7 @@ void main() {
             total_ms
         );
 
-        if (s == 0 && u_planetshine_enabled && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
+        if (s == 0 && (u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
             float cos_theta_ps = dot(ray_dir, body_planetshine_dir);
             float phase_R_ps = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_ps * cos_theta_ps);
             float phase_M_ps_scalar = u_precomp_mie.x * (1.0 + cos_theta_ps * cos_theta_ps)
