@@ -126,10 +126,21 @@ void main() {
     vec3 L_scatter = atmo.rgb;
     float T = atmo.a;
 
+    if (!cam_inside_atmo && theta > theta_horizon) {
+        float t_limb = (theta - theta_horizon) / max(max_theta - theta_horizon, 1e-5);
+        float limb_fade = clamp((1.0 - t_limb) * 128.0, 0.0, 1.0);
+        L_scatter *= limb_fade;
+    }
+
     // =========================================================================
     // Phase 3: Analytical Depth Slicing for Volumetric Ring Shadow in Atmosphere
     // =========================================================================
     vec3 delta_L = vec3(0.0);
+    vec3 slice_total = vec3(0.0);
+    bool has_shadow_interval = false;
+    float total_shadow_len = 0.0;
+    float total_ring_blocked_accum = 0.0;
+    float shadow_step_count = 0.0;
 
     if (u_volumetric_shadow && abs(u_sun_dir.y) > 1e-5 && s_start < s_end) {
         vec3 L = normalize(u_sun_dir);
@@ -144,48 +155,59 @@ void main() {
         float qb = 2.0 * (A.x * B.x + A.z * B.z);
         float qc = A.x * A.x + A.z * A.z;
 
-        if (qa > 1e-6) {
-            float disc_out = qb * qb - 4.0 * qa * (qc - u_ring_outer * u_ring_outer);
-            if (disc_out >= 0.0) {
-                float sq_out = sqrt(disc_out);
-                float s_out_min = (-qb - sq_out) / (2.0 * qa);
-                float s_out_max = (-qb + sq_out) / (2.0 * qa);
+        // Shadow validity window: lambda = -(C_y + s*V_y)/L_y > 0
+        float w_min = s_start;
+        float w_max = s_end;
 
-                float disc_in = qb * qb - 4.0 * qa * (qc - u_ring_inner * u_ring_inner);
+        if (abs(V.y) > 1e-6) {
+            float s_crit = -u_cam_pos.y / V.y;
+            if ((V.y / L.y) > 0.0) {
+                w_max = min(w_max, s_crit);
+            } else {
+                w_min = max(w_min, s_crit);
+            }
+        } else {
+            if (-u_cam_pos.y / L.y <= 0.0) {
+                w_min = 1e9; // Entire ray is unshadowed
+            }
+        }
 
-                vec2 intervals[2];
-                int num_intervals = 0;
+        if (w_min < w_max) {
+            vec2 intervals[2];
+            int num_intervals = 0;
 
-                if (disc_in <= 0.0) {
-                    intervals[0] = vec2(s_out_min, s_out_max);
-                    num_intervals = 1;
-                } else {
-                    float sq_in = sqrt(disc_in);
-                    float s_in_min = (-qb - sq_in) / (2.0 * qa);
-                    float s_in_max = (-qb + sq_in) / (2.0 * qa);
-                    intervals[0] = vec2(s_out_min, s_in_min);
-                    intervals[1] = vec2(s_in_max, s_out_max);
-                    num_intervals = 2;
-                }
+            if (qa > 1e-6) {
+                float disc_out = qb * qb - 4.0 * qa * (qc - u_ring_outer * u_ring_outer);
+                if (disc_out >= 0.0) {
+                    float sq_out = sqrt(disc_out);
+                    float s_out_min = (-qb - sq_out) / (2.0 * qa);
+                    float s_out_max = (-qb + sq_out) / (2.0 * qa);
 
-                // Shadow validity window: lambda = -(C_y + s*V_y)/L_y > 0
-                float w_min = s_start;
-                float w_max = s_end;
+                    float disc_in = qb * qb - 4.0 * qa * (qc - u_ring_inner * u_ring_inner);
 
-                if (abs(V.y) > 1e-6) {
-                    float s_crit = -u_cam_pos.y / V.y;
-                    if ((V.y / L.y) > 0.0) {
-                        w_max = min(w_max, s_crit);
+                    if (disc_in <= 0.0) {
+                        intervals[0] = vec2(s_out_min, s_out_max);
+                        num_intervals = 1;
                     } else {
-                        w_min = max(w_min, s_crit);
-                    }
-                } else {
-                    if (-u_cam_pos.y / L.y <= 0.0) {
-                        w_min = 1e9; // Entire ray is unshadowed
+                        float sq_in = sqrt(disc_in);
+                        float s_in_min = (-qb - sq_in) / (2.0 * qa);
+                        float s_in_max = (-qb + sq_in) / (2.0 * qa);
+                        intervals[0] = vec2(s_out_min, s_in_min);
+                        intervals[1] = vec2(s_in_max, s_out_max);
+                        num_intervals = 2;
                     }
                 }
+            } else {
+                // Degenerate case: view ray is parallel or anti-parallel to sunlight (V || L).
+                // All points along the chord project onto the equatorial ring plane at point A.
+                float r_A = length(A.xz);
+                if (r_A >= u_ring_inner && r_A <= u_ring_outer) {
+                    intervals[0] = vec2(w_min, w_max);
+                    num_intervals = 1;
+                }
+            }
 
-                if (w_min < w_max) {
+            if (num_intervals > 0) {
                     float sigma_s = u_density;
                     float sigma_t = u_density * 1.1;
                     float inv_sin_sun = 1.0 / max(abs(L.y), 0.05);
@@ -201,6 +223,8 @@ void main() {
                         float ce = min(intervals[inv].y, w_max);
 
                         if (ce > cs + 1e-5) {
+                            has_shadow_interval = true;
+                            total_shadow_len += (ce - cs);
                             if (u_analytical_slicing) {
                                 // Continuous footprint-filtered quadrature (Physically Exact, No Aliasing)
                                 const int QUAD_STEPS = 8;
@@ -252,20 +276,21 @@ void main() {
                                         ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
                                     }
 
-                                    if (ring_blocked > 1e-4) {
-                                        vec2 tatmo_sun = ray_sphere_intersect(Pq, L, u_atmo_radius);
-                                        float dt_sun = max(0.0, tatmo_sun.y) / 4.0;
-                                        float tau_sun = 0.0;
-                                        for (int k = 0; k < 4; k++) {
-                                            vec3 Ps = Pq + (float(k) + 0.5) * dt_sun * L;
-                                            float hs = max(0.0, length(Ps) - u_planet_radius);
-                                            tau_sun += exp(-hs / max(u_scale_height, 1e-4)) * dt_sun;
-                                        }
-                                        float trans_to_sun = exp(-sigma_t * tau_sun);
-
-                                        vec3 step_inscatter = u_sun_color * u_atmo_tint * (rhoq * sigma_s) * trans_to_sun * ds;
-                                        delta_L += T_run * step_inscatter * ring_blocked;
+                                    vec2 tatmo_sun = ray_sphere_intersect(Pq, L, u_atmo_radius);
+                                    float dt_sun = max(0.0, tatmo_sun.y) / 4.0;
+                                    float tau_sun = 0.0;
+                                    for (int k = 0; k < 4; k++) {
+                                        vec3 Ps = Pq + (float(k) + 0.5) * dt_sun * L;
+                                        float hs = max(0.0, length(Ps) - u_planet_radius);
+                                        tau_sun += exp(-hs / max(u_scale_height, 1e-4)) * dt_sun;
                                     }
+                                    float trans_to_sun = exp(-sigma_t * tau_sun);
+
+                                    vec3 step_inscatter = u_sun_color * u_atmo_tint * (rhoq * sigma_s) * trans_to_sun * ds;
+                                    delta_L += T_run * step_inscatter * ring_blocked;
+                                    slice_total += T_run * step_inscatter;
+                                    total_ring_blocked_accum += ring_blocked;
+                                    shadow_step_count += 1.0;
 
                                     float step_trans = exp(-rhoq * sigma_t * ds);
                                     T_run *= step_trans;
@@ -317,22 +342,23 @@ void main() {
                                         ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
                                     }
 
-                                    if (ring_blocked > 1e-4) {
-                                        // Sunlight optical depth from parcel to top of atmosphere
-                                        vec2 tatmo_sun = ray_sphere_intersect(Pq, L, u_atmo_radius);
-                                        float dt_sun = max(0.0, tatmo_sun.y) / 4.0;
-                                        float tau_sun = 0.0;
-                                        for (int k = 0; k < 4; k++) {
-                                            vec3 Ps = Pq + (float(k) + 0.5) * dt_sun * L;
-                                            float hs = max(0.0, length(Ps) - u_planet_radius);
-                                            tau_sun += exp(-hs / max(u_scale_height, 1e-4)) * dt_sun;
-                                        }
-                                        float trans_to_sun = exp(-sigma_t * tau_sun);
-
-                                        // In-scattered light erroneously included by the unshadowed LUT
-                                        vec3 step_inscatter = u_sun_color * u_atmo_tint * (rhoq * sigma_s) * trans_to_sun * ds;
-                                        delta_L += T_run * step_inscatter * ring_blocked;
+                                    // Sunlight optical depth from parcel to top of atmosphere
+                                    vec2 tatmo_sun = ray_sphere_intersect(Pq, L, u_atmo_radius);
+                                    float dt_sun = max(0.0, tatmo_sun.y) / 4.0;
+                                    float tau_sun = 0.0;
+                                    for (int k = 0; k < 4; k++) {
+                                        vec3 Ps = Pq + (float(k) + 0.5) * dt_sun * L;
+                                        float hs = max(0.0, length(Ps) - u_planet_radius);
+                                        tau_sun += exp(-hs / max(u_scale_height, 1e-4)) * dt_sun;
                                     }
+                                    float trans_to_sun = exp(-sigma_t * tau_sun);
+
+                                    // In-scattered light erroneously included by the unshadowed LUT
+                                    vec3 step_inscatter = u_sun_color * u_atmo_tint * (rhoq * sigma_s) * trans_to_sun * ds;
+                                    delta_L += T_run * step_inscatter * ring_blocked;
+                                    slice_total += T_run * step_inscatter;
+                                    total_ring_blocked_accum += ring_blocked;
+                                    shadow_step_count += 1.0;
 
                                     float step_trans = exp(-rhoq * sigma_t * ds);
                                     T_run *= step_trans;
@@ -343,10 +369,29 @@ void main() {
                 }
             }
         }
-    }
 
     // Subtract volumetric shadow light deficit
-    vec3 L_atmo = max(vec3(0.0), L_scatter - delta_L);
+    vec3 L_atmo = L_scatter;
+    if (has_shadow_interval) {
+        float chord_len = max(s_end - s_start, 1e-4);
+        float chord_coverage = clamp(total_shadow_len / chord_len, 0.0, 1.0);
+
+        vec3 shadow_factor;
+        if (dot(slice_total, vec3(1.0)) > 1e-6) {
+            shadow_factor = clamp(delta_L / max(slice_total, vec3(1e-6)), vec3(0.0), vec3(1.0));
+        } else {
+            float avg_blocked = (shadow_step_count > 0.0) ? (total_ring_blocked_accum / shadow_step_count) : 1.0;
+            shadow_factor = vec3(clamp(avg_blocked, 0.0, 1.0));
+        }
+
+        vec3 alpha = clamp(slice_total / max(L_scatter, vec3(1e-6)), vec3(0.0), vec3(1.0));
+        vec3 blend_alpha = smoothstep(vec3(0.3), vec3(0.7), alpha);
+        vec3 blend_cov = vec3(smoothstep(0.7, 0.98, chord_coverage));
+        vec3 blend = max(blend_alpha, blend_cov);
+
+        vec3 eff_slice = mix(slice_total, L_scatter, blend);
+        L_atmo = max(vec3(0.0), L_scatter - eff_slice * shadow_factor);
+    }
 
     // Foreground ring occlusion: if the view ray pierces a foreground ring before entering the atmosphere
     if (abs(V.y) > 1e-6) {

@@ -33,7 +33,13 @@ def test_ring_shadow():
     sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
     sky_view_tex.repeat_x = True
     sky_view_tex.repeat_y = False
-    sky_view_fbo = ctx.framebuffer(color_attachments=[sky_view_tex])
+
+    sky_view_trans_tex = ctx.texture((256, 256), 4, dtype='f2')
+    sky_view_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    sky_view_trans_tex.repeat_x = True
+    sky_view_trans_tex.repeat_y = False
+
+    sky_view_fbo = ctx.framebuffer(color_attachments=[sky_view_tex, sky_view_trans_tex])
 
     quad_verts = np.array([-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0], dtype='f4')
     quad_vbo = ctx.buffer(quad_verts.tobytes())
@@ -131,6 +137,7 @@ def test_ring_shadow():
     depth_tex.use(location=9)
     sky_view_tex.use(location=12)
     ring_shadow_tex.use(location=13)
+    sky_view_trans_tex.use(location=14)
 
     if 'u_transmittance_lut' in prog_sky_view: prog_sky_view['u_transmittance_lut'].value = 1
     if 'u_multi_scatter_lut' in prog_sky_view: prog_sky_view['u_multi_scatter_lut'].value = 3
@@ -144,6 +151,7 @@ def test_ring_shadow():
     if 'u_ringshine_map' in prog_atmo: prog_atmo['u_ringshine_map'].value = 8
     if 'u_depth_texture' in prog_atmo: prog_atmo['u_depth_texture'].value = 9
     if 'u_sky_view_lut' in prog_atmo: prog_atmo['u_sky_view_lut'].value = 12
+    if 'u_sky_view_trans_lut' in prog_atmo: prog_atmo['u_sky_view_trans_lut'].value = 14
 
     # Sun shining from angle (e.g. 25 degrees above ring plane)
     sun_elev = math.radians(25.0)
@@ -309,7 +317,112 @@ def test_ring_shadow():
         diff_from_base = np.linalg.norm(rgb_val - base_shadow_val)
         print(f"{test_s:6d} | R={rgb_val[0]:.6f} G={rgb_val[1]:.6f} B={rgb_val[2]:.6f} | {diff_from_base:.6f}")
 
+    # --- Regression Test: Anti-Solar Line-of-Sight (V || -L) ---
+    print("\n--- Testing Exact Anti-Solar View (V || -L, Looking directly at shadow from Sun) ---")
+    r_mid = 0.5 * (r_inner_km + r_outer_km)
+    p_ring_au = np.array([0.0, 0.0, r_mid / AU_TO_KM], dtype=np.float32)
+    b_proj = float(np.dot(p_ring_au, sun_dir))
+    c_proj = float(np.dot(p_ring_au, p_ring_au)) - (planet_r_km / AU_TO_KM)**2
+    lam_proj = b_proj - math.sqrt(max(0.0, b_proj*b_proj - c_proj))
+    shadow_target = p_ring_au - lam_proj * sun_dir
 
+    cam_dist_as = 2.0 * atmo_r_au
+    cam_pos_as = shadow_target + sun_dir * cam_dist_as
+    cam_pos_km_as = cam_pos_as * AU_TO_KM
+    h_pole_as = float(np.dot(cam_pos_km_as, pole_dir))
+    cam_sph_km_as = cam_pos_km_as + (h_pole_as * (f_scale - 1.0)) * pole_dir
+
+    cam_up_as = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    view_dir_as = -sun_dir
+    if abs(np.dot(cam_up_as, view_dir_as)) > 0.9:
+        cam_up_as = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    view_mat_as = matrix44.create_look_at(cam_pos_as, shadow_target, cam_up_as, dtype='f4')
+    fov_as = 20.0
+    proj_mat_as = matrix44.create_perspective_projection_matrix(fov_as, w / h, 1e-4, 100.0, dtype='f4')
+
+    ubo_staging[0:16] = proj_mat_as.ravel()
+    ubo_staging[16:32] = view_mat_as.ravel()
+    scene_ubo.write(ubo_staging.tobytes())
+
+    prog_atmo['u_inv_proj'].write(np.linalg.inv(proj_mat_as).astype('f4').tobytes())
+    prog_atmo['u_inv_view'].write(np.linalg.inv(view_mat_as).astype('f4').tobytes())
+    prog_atmo['u_camera_pos'].write(cam_pos_as.tobytes())
+
+    sky_view_fbo.use()
+    ctx.viewport = (0, 0, 256, 256)
+    ctx.disable(moderngl.DEPTH_TEST)
+    ctx.disable(moderngl.BLEND)
+    prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km_as)
+    prog_sky_view['u_sun_dir'].value = tuple(sun_dir)
+    quad_vao.render(moderngl.TRIANGLE_STRIP)
+
+    m2_as = render_and_get_image(2)
+    m3_as = render_and_get_image(3)
+
+    center_pixel_m2 = m2_as[300, 400, 0:3]
+    center_pixel_m3 = m3_as[300, 400, 0:3]
+    center_crop_m3 = m3_as[280:320, 380:420, 0:3]
+
+    print(f"Anti-solar Center Pixel (X=400, Y=300): Mode 2={center_pixel_m2} | Mode 3={center_pixel_m3}")
+    print(f"Anti-solar 40x40 Center Region Max RGB: {center_crop_m3.max():.6f}")
+    assert np.all(center_crop_m3 < 1e-4), f"Anti-solar bright oval regression detected! Max RGB: {center_crop_m3.max()}"
+    print("   [+] Anti-solar view passed: 0.000000 darkness, no bright oval artifact!")
+
+    # --- Regression Test 3: Grazing Limb in Ring Shadow (1-Pixel Line Artifact Test) ---
+    print("\n--- Testing Grazing Limb in Ring Shadow (1-Pixel Top Boundary Test) ---")
+    cam_dist_gl = 2.2 * atmo_r_au
+    cam_lat_gl = math.radians(-25.0)
+    cam_pos_gl = np.array([0.0, cam_dist_gl * math.sin(cam_lat_gl), cam_dist_gl * math.cos(cam_lat_gl)], dtype=np.float32)
+    cam_pos_km_gl = cam_pos_gl * AU_TO_KM
+    h_pole_gl = float(np.dot(cam_pos_km_gl, pole_dir))
+    cam_sph_km_gl = cam_pos_km_gl + (h_pole_gl * (f_scale - 1.0)) * pole_dir
+
+    limb_target = np.array([0.0, -atmo_r_au * 0.85, 0.0], dtype=np.float32)
+    view_mat_gl = matrix44.create_look_at(cam_pos_gl, limb_target, np.array([0.0, 1.0, 0.0], dtype=np.float32), dtype='f4')
+    proj_mat_gl = matrix44.create_perspective_projection_matrix(25.0, w / h, 1e-4, 100.0, dtype='f4')
+
+    ubo_staging[0:16] = proj_mat_gl.ravel()
+    ubo_staging[16:32] = view_mat_gl.ravel()
+    scene_ubo.write(ubo_staging.tobytes())
+
+    prog_atmo['u_inv_proj'].write(np.linalg.inv(proj_mat_gl).astype('f4').tobytes())
+    prog_atmo['u_inv_view'].write(np.linalg.inv(view_mat_gl).astype('f4').tobytes())
+    prog_atmo['u_camera_pos'].write(cam_pos_gl.tobytes())
+
+    sky_view_fbo.use()
+    ctx.viewport = (0, 0, 256, 256)
+    ctx.disable(moderngl.DEPTH_TEST)
+    ctx.disable(moderngl.BLEND)
+    prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km_gl)
+    prog_sky_view['u_sun_dir'].value = tuple(sun_dir)
+    quad_vao.render(moderngl.TRIANGLE_STRIP)
+
+    m2_gl = render_and_get_image(2)
+    m3_gl = render_and_get_image(3)
+
+    save_img(m2_gl[:, :, 0:3], "scripts/mode2_limb_shadow.png")
+    save_img(m3_gl[:, :, 0:3], "scripts/mode3_limb_shadow.png")
+    print("Saved scripts/mode2_limb_shadow.png and scripts/mode3_limb_shadow.png")
+
+    # Scan for any isolated 1-pixel line (non-zero flanked by zeros in vertical or horizontal direction)
+    m3_rgb_gl = m3_gl[:, :, 0:3]
+    isolated_pixels = []
+    for y_scan in range(1, h - 1):
+        for x_scan in range(1, w - 1):
+            v_curr = m3_rgb_gl[y_scan, x_scan]
+            v_up   = m3_rgb_gl[y_scan - 1, x_scan]
+            v_down = m3_rgb_gl[y_scan + 1, x_scan]
+            if np.any(v_curr > 0.002) and np.all(v_up < 1e-5) and np.all(v_down < 1e-5):
+                isolated_pixels.append((x_scan, y_scan, v_curr.tolist()))
+
+    print(f"Isolated 1-pixel lines found at limb: {len(isolated_pixels)}")
+    assert len(isolated_pixels) == 0, f"Detected {len(isolated_pixels)} isolated 1-pixel lines at the atmosphere boundary! Sample: {isolated_pixels[:5]}"
+    print("   [+] Grazing limb test passed: 0 isolated 1-pixel lines, seamless boundary transition!")
+
+    print("\n=======================================================")
+    print("ALL RING SHADOW BENCHMARKS & REGRESSION TESTS PASSED!")
+    print("=======================================================")
 
 if __name__ == "__main__":
     test_ring_shadow()

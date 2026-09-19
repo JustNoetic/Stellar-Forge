@@ -2,7 +2,8 @@
 #define PI 3.14159265358979323846
 
 in vec2 f_uv;
-out vec4 out_color;
+layout(location = 0) out vec4 out_color;
+layout(location = 1) out vec4 out_transmittance;
 
 layout(std430, binding = 8) buffer AtmoData {
     vec3  u_body_offset;
@@ -137,6 +138,7 @@ void main() {
     vec2 t_atmo = raySphereIntersect(u_cam_pos, V, u_atmo_radius_km);
     if (t_atmo.y < 0.0) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
+        out_transmittance = vec4(1.0);
         return;
     }
 
@@ -152,6 +154,7 @@ void main() {
 
     if (s_start >= s_end) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
+        out_transmittance = vec4(1.0);
         return;
     }
 
@@ -230,4 +233,5 @@ void main() {
 
     float mean_trans = dot(current_transmittance, vec3(0.333333));
     out_color = vec4(scattered, clamp(mean_trans, 0.0, 1.0));
+    out_transmittance = vec4(clamp(current_transmittance, vec3(0.0), vec3(1.0)), 1.0);
 }

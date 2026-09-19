@@ -3,6 +3,7 @@ import sys
 import math
 import numpy as np
 import moderngl
+import OpenGL.GL as gl
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -34,13 +35,19 @@ def test_mode3_pipeline():
     assert prog_sky_view is not None, "Failed to compile prog_sky_view"
     print("   [+] prog_sky_view compiled successfully.")
 
-    # 2. Allocate 256x256 RGBA16F Sky-View LUT texture and FBO
-    print("\n2. Allocating 256x256 RGBA16F Sky-View LUT texture & FBO...")
+    # 2. Allocate 256x256 RGBA16F Sky-View LUT textures and FBO
+    print("\n2. Allocating 256x256 RGBA16F Sky-View LUT textures & dual-target FBO...")
     sky_view_tex = ctx.texture((256, 256), 4, dtype='f2')
     sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
     sky_view_tex.repeat_x = True
     sky_view_tex.repeat_y = False
-    sky_view_fbo = ctx.framebuffer(color_attachments=[sky_view_tex])
+
+    sky_view_trans_tex = ctx.texture((256, 256), 4, dtype='f2')
+    sky_view_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    sky_view_trans_tex.repeat_x = True
+    sky_view_trans_tex.repeat_y = False
+
+    sky_view_fbo = ctx.framebuffer(color_attachments=[sky_view_tex, sky_view_trans_tex])
 
     # Screen quad VAO
     quad_verts = np.array([
@@ -138,21 +145,29 @@ def test_mode3_pipeline():
 
     quad_vao.render(moderngl.TRIANGLE_STRIP)
 
-    # Read back LUT pixels
-    lut_raw = sky_view_fbo.read(components=4, dtype='f2')
+    # Read back LUT pixels from both attachments
+    lut_raw = sky_view_fbo.read(attachment=0, components=4, dtype='f2')
     lut_data = np.frombuffer(lut_raw, dtype=np.float16).reshape((256, 256, 4)).astype(np.float32)
+
+    lut_trans_raw = sky_view_fbo.read(attachment=1, components=4, dtype='f2')
+    lut_trans_data = np.frombuffer(lut_trans_raw, dtype=np.float16).reshape((256, 256, 4)).astype(np.float32)
 
     assert not np.isnan(lut_data).any(), "NaN found in Sky-View LUT output!"
     assert not np.isinf(lut_data).any(), "Inf found in Sky-View LUT output!"
+    assert not np.isnan(lut_trans_data).any(), "NaN found in Sky-View Spectral Transmittance output!"
+    assert not np.isinf(lut_trans_data).any(), "Inf found in Sky-View Spectral Transmittance output!"
 
     scatter_rgb = lut_data[:, :, 0:3]
-    trans_a = lut_data[:, :, 3]
-    print(f"   [+] Sky-View LUT rendered successfully.")
+    trans_rgb = lut_trans_data[:, :, 0:3]
+    print(f"   [+] Sky-View dual-target LUT rendered successfully.")
     print(f"       Scatter RGB min: {scatter_rgb.min():.6f}, max: {scatter_rgb.max():.6f}, mean: {scatter_rgb.mean():.6f}")
-    print(f"       Transmittance A min: {trans_a.min():.6f}, max: {trans_a.max():.6f}, mean: {trans_a.mean():.6f}")
+    print(f"       Spectral Transmittance RGB min: {trans_rgb.min(axis=(0,1))}, max: {trans_rgb.max(axis=(0,1))}")
+    print(f"       Spectral Transmittance RGB mean: R={trans_rgb[:,:,0].mean():.6f}, G={trans_rgb[:,:,1].mean():.6f}, B={trans_rgb[:,:,2].mean():.6f}")
 
     assert scatter_rgb.max() > 0.0, "Sky-View LUT scatter RGB is entirely zero!"
-    assert trans_a.min() >= 0.0 and trans_a.max() <= 1.05, "Transmittance out of physical [0, 1] range!"
+    assert trans_rgb.min() >= 0.0 and trans_rgb.max() <= 1.05, "Transmittance out of physical [0, 1] range!"
+    assert trans_rgb[:,:,0].mean() > trans_rgb[:,:,2].mean(), "Expected Red transmittance > Blue transmittance due to Rayleigh scattering!"
+    print(f"   [+] Verified physical spectral extinction ordering: T_red ({trans_rgb[:,:,0].mean():.4f}) > T_blue ({trans_rgb[:,:,2].mean():.4f})!")
 
     # 4. Compile atmo shader and test Mode 3 evaluation
     print("\n4. Compiling atmo shader program...")
@@ -223,6 +238,7 @@ def test_mode3_pipeline():
     depth_tex.use(location=9)
     sky_view_tex.use(location=12)
     ring_shadow_tex.use(location=13)
+    sky_view_trans_tex.use(location=14)
 
     if 'u_ring_gradients' in prog_atmo: prog_atmo['u_ring_gradients'].value = 0
     if 'u_ring_shadow_tex' in prog_atmo: prog_atmo['u_ring_shadow_tex'].value = 13
@@ -233,6 +249,7 @@ def test_mode3_pipeline():
     if 'u_ringshine_map' in prog_atmo: prog_atmo['u_ringshine_map'].value = 8
     if 'u_depth_texture' in prog_atmo: prog_atmo['u_depth_texture'].value = 9
     if 'u_sky_view_lut' in prog_atmo: prog_atmo['u_sky_view_lut'].value = 12
+    if 'u_sky_view_trans_lut' in prog_atmo: prog_atmo['u_sky_view_trans_lut'].value = 14
 
     cam_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
     view_mat = matrix44.create_look_at(cam_pos, np.array([0.0, 0.0, 0.0], dtype=np.float32), cam_up, dtype='f4')
@@ -297,6 +314,46 @@ def test_mode3_pipeline():
 
         assert scene_rgb.max() > 0.0, f"Scene atmosphere render is completely black with steps={test_steps}!"
         print(f"   [+] Mode 3 produced valid non-zero HDR in-scattering with steps={test_steps}!")
+
+    # 7. Test Dual-Source Blending and Spectral Light Extinction
+    print("\n7. Testing Mode 3 Dual-Source Blending (glBlendFunc(GL_ONE, GL_SRC1_COLOR)) & Background Extinction...")
+    # Render unblended (black background) to get pure inscattering
+    scene_fbo.use()
+    ctx.viewport = (0, 0, w, h)
+    scene_fbo.clear(color=(0.0, 0.0, 0.0, 1.0), depth=1.0)
+    ctx.disable(moderngl.BLEND)
+    ctx.cull_face = 'front'
+    ctx.enable(moderngl.CULL_FACE)
+    ctx.disable(moderngl.DEPTH_TEST)
+    ctx.depth_mask = False
+    vao_atmo.render(moderngl.TRIANGLES)
+    inscatter_raw = scene_fbo.read(components=4, dtype='f2')
+    inscatter_data = np.frombuffer(inscatter_raw, dtype=np.float16).reshape((h, w, 4)).astype(np.float32)[:, :, 0:3]
+
+    # Render blended over pure white background (1.0, 1.0, 1.0)
+    scene_fbo.use()
+    ctx.viewport = (0, 0, w, h)
+    scene_fbo.clear(color=(1.0, 1.0, 1.0, 1.0), depth=1.0)
+    ctx.enable(moderngl.BLEND)
+    gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+    vao_atmo.render(moderngl.TRIANGLES)
+    ctx.disable(moderngl.BLEND)
+    blended_raw = scene_fbo.read(components=4, dtype='f2')
+    blended_data = np.frombuffer(blended_raw, dtype=np.float16).reshape((h, w, 4)).astype(np.float32)[:, :, 0:3]
+
+    # Transmitted background light is: Blended - Inscatter (since Background was 1.0)
+    transmitted_bg = np.clip(blended_data - inscatter_data, 0.0, 1.0)
+    atmo_mask = inscatter_data.max(axis=-1) > 0.005
+    assert atmo_mask.any(), "No atmosphere pixels detected!"
+
+    mean_trans_r = float(transmitted_bg[atmo_mask, 0].mean())
+    mean_trans_g = float(transmitted_bg[atmo_mask, 1].mean())
+    mean_trans_b = float(transmitted_bg[atmo_mask, 2].mean())
+
+    print(f"   [+] Dual-source blending executed successfully.")
+    print(f"       Extinguished Background RGB mean inside atmosphere: R={mean_trans_r:.6f}, G={mean_trans_g:.6f}, B={mean_trans_b:.6f}")
+    assert mean_trans_r > mean_trans_b, f"Expected Red transmittance ({mean_trans_r:.4f}) > Blue transmittance ({mean_trans_b:.4f}) through atmosphere!"
+    print(f"   [+] Physical spectral extinction verified: Background red light transmits more than blue light (R > B)!")
 
     print("\n" + "=" * 70)
     print("ALL MODE 3 PIPELINE TESTS PASSED!")

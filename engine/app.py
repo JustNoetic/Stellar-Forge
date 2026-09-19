@@ -603,6 +603,7 @@ class App(InputHandlerMixin):
         # Sky-View LUT resources (Mode 3: Analytical)
         self.prog_sky_view = None
         self.sky_view_tex = None
+        self.sky_view_trans_tex = None
         self.sky_view_fbo = None
         self.quad_vao_sky_view = None
         self.star_catalog = None
@@ -1601,6 +1602,8 @@ class App(InputHandlerMixin):
                 p['u_sky_view_lut'].value = 12
             if 'u_ring_shadow_tex' in p:
                 p['u_ring_shadow_tex'].value = 13
+            if 'u_sky_view_trans_lut' in p:
+                p['u_sky_view_trans_lut'].value = 14
         
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
         if 'u_transmittance_lut' in self.prog_sky_view:
@@ -1611,7 +1614,11 @@ class App(InputHandlerMixin):
         self.sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.sky_view_tex.repeat_x = True
         self.sky_view_tex.repeat_y = False
-        self.sky_view_fbo = ctx.framebuffer(color_attachments=[self.sky_view_tex])
+        self.sky_view_trans_tex = ctx.texture((256, 256), 4, dtype='f2')
+        self.sky_view_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.sky_view_trans_tex.repeat_x = True
+        self.sky_view_trans_tex.repeat_y = False
+        self.sky_view_fbo = ctx.framebuffer(color_attachments=[self.sky_view_tex, self.sky_view_trans_tex])
 
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -5322,6 +5329,7 @@ class App(InputHandlerMixin):
                         ctx.depth_mask = False
 
                         self.sky_view_tex.use(location=12)
+                        self.sky_view_trans_tex.use(location=14)
                         if ring_shadow_tex is not None:
                             if hasattr(self, "body_ring_indices") and bi in self.body_ring_indices:
                                 u_idx = self.body_ring_indices[bi]
