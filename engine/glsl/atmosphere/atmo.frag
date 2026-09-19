@@ -1015,9 +1015,12 @@ void main() {
                                         float h_mid  = max(0.0, length(cam_local_sph + s_mid_gap * ray_dir_sph) - u_planet_radius_km);
                                         float h_cs   = max(0.0, length(cam_local_sph + cs * ray_dir_sph) - u_planet_radius_km);
 
-                                        vec3 ext_p = beta_R * exp(-h_prev * inv_h_rayleigh) + beta_M_ext * exp(-h_prev * inv_h_mie);
-                                        vec3 ext_m = beta_R * exp(-h_mid * inv_h_rayleigh)  + beta_M_ext * exp(-h_mid * inv_h_mie);
-                                        vec3 ext_c = beta_R * exp(-h_cs * inv_h_rayleigh)   + beta_M_ext * exp(-h_cs * inv_h_mie);
+                                        float tO3_prev = (h_prev - u_ozone_peak_km) * inv_ozone_width;
+                                        float tO3_mid  = (h_mid  - u_ozone_peak_km) * inv_ozone_width;
+                                        float tO3_cs   = (h_cs   - u_ozone_peak_km) * inv_ozone_width;
+                                        vec3 ext_p = (beta_R + beta_A_mixed) * exp(-h_prev * inv_h_rayleigh) + beta_M_ext * exp(-h_prev * inv_h_mie) + beta_A_layered * exp(-(tO3_prev * tO3_prev));
+                                        vec3 ext_m = (beta_R + beta_A_mixed) * exp(-h_mid * inv_h_rayleigh)  + beta_M_ext * exp(-h_mid * inv_h_mie)  + beta_A_layered * exp(-(tO3_mid * tO3_mid));
+                                        vec3 ext_c = (beta_R + beta_A_mixed) * exp(-h_cs * inv_h_rayleigh)   + beta_M_ext * exp(-h_cs * inv_h_mie)   + beta_A_layered * exp(-(tO3_cs * tO3_cs));
                                         vec3 tau_gap = ((cs - prev_s) / 6.0) * (ext_p + 4.0 * ext_m + ext_c);
                                         T_run *= exp(-tau_gap);
                                     }
@@ -1113,6 +1116,17 @@ void main() {
                                             vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M_sca * rho_M_q * phase_M) * trans_to_sun * vis_fraction * u_star_color_irrad[0].rgb;
 
                                             delta_L += T_run * inscatter_direct * int_factor * ring_blocked;
+
+                                            // Multi-scatter deficit: the Sky-View LUT's total_ms includes unshadowed
+                                            // multi-scattered light.  Mode 2 attenuates multi-scatter by sample_shadow at
+                                            // each step; the LUT has no shadow, so we must subtract the blocked fraction
+                                            // here to match.  Structure mirrors sky_view_lut.frag line 209 (no phase fn,
+                                            // star_intensity applied outside) and Mode 2 line 1549 (ms_shadow = sample_shadow).
+                                            float h_norm_q = clamp(hq / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+                                            float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
+                                            float ms_v_q = sqrt(h_norm_q);
+                                            vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
+                                            delta_L += u_star_color_irrad[0].rgb * (beta_R * rho_R_q + beta_M * rho_M_q) * psi_q * T_run * int_factor * ring_blocked;
                                         }
 
                                         T_run *= T_step;
