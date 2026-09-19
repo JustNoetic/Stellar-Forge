@@ -27,7 +27,13 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 app.camera["atmo_quality"] = min(3, atmo_quality)
                 settings_changed = True
 
-            if atmo_quality > 0:
+            if atmo_quality == 3:
+                slicing_steps = int(app.camera.get("atmo_slicing_steps", 8))
+                changed_ss, slicing_steps = imgui.slider_int("Depth Slicing Steps", slicing_steps, 2, 32)
+                if changed_ss:
+                    app.camera["atmo_slicing_steps"] = slicing_steps
+                    settings_changed = True
+            elif atmo_quality > 0:
                 atmo_res = float(app.camera.get("atmo_resolution", 1.0))
                 changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")
                 if changed_res:

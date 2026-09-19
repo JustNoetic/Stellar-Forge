@@ -205,6 +205,15 @@ def test_mode3_pipeline():
     dummy_cdf = ctx.texture3d((1, 1, 1), 1, dtype='f4')
     dummy_map = ctx.texture((1, 1), 4, dtype='f4')
 
+    ring_shadow_tex = ctx.texture((4096, 1), 4, dtype='f4')
+    ring_shadow_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    ring_shadow_tex.repeat_x = False
+    ring_shadow_tex.repeat_y = False
+    shadow_data = np.zeros((1, 4096, 4), dtype='f4')
+    shadow_data[0, :, 3] = 0.8
+    ring_shadow_tex.write(shadow_data.tobytes())
+    ring_shadow_tex.build_mipmaps()
+
     ring_gradient_tex.use(location=0)
     trans_tex.use(location=1)
     multi_tex.use(location=3)
@@ -213,8 +222,10 @@ def test_mode3_pipeline():
     dummy_map.use(location=8)
     depth_tex.use(location=9)
     sky_view_tex.use(location=12)
+    ring_shadow_tex.use(location=13)
 
     if 'u_ring_gradients' in prog_atmo: prog_atmo['u_ring_gradients'].value = 0
+    if 'u_ring_shadow_tex' in prog_atmo: prog_atmo['u_ring_shadow_tex'].value = 13
     if 'u_transmittance_lut' in prog_atmo: prog_atmo['u_transmittance_lut'].value = 1
     if 'u_multi_scatter_lut' in prog_atmo: prog_atmo['u_multi_scatter_lut'].value = 3
     if 'u_ringshine_lut' in prog_atmo: prog_atmo['u_ringshine_lut'].value = 6
@@ -256,32 +267,36 @@ def test_mode3_pipeline():
     if 'u_ring_params' in prog_atmo: prog_atmo['u_ring_params'].write(ring_params.tobytes())
 
     prog_atmo['u_atmo_quality'].value = 3
+    if 'u_atmo_slicing_steps' in prog_atmo: prog_atmo['u_atmo_slicing_steps'].value = 8
     if 'u_density' in prog_atmo: prog_atmo['u_density'].value = 24.0
     if 'u_atmo_tint' in prog_atmo: prog_atmo['u_atmo_tint'].value = tuple(atmo_tint)
 
-    print("\n6. Rendering atmosphere mesh with Mode 3 (Analytical)...")
-    scene_fbo.use()
-    ctx.viewport = (0, 0, w, h)
-    scene_fbo.clear(color=(0.0, 0.0, 0.0, 1.0), depth=1.0)
-    ctx.cull_face = 'front'
-    ctx.enable(moderngl.CULL_FACE)
-    ctx.disable(moderngl.DEPTH_TEST)
-    ctx.depth_mask = False
+    for test_steps in [2, 8, 32]:
+        print(f"\n6. Rendering atmosphere mesh with Mode 3 (Analytical, u_atmo_slicing_steps={test_steps})...")
+        if 'u_atmo_slicing_steps' in prog_atmo:
+            prog_atmo['u_atmo_slicing_steps'].value = test_steps
+        scene_fbo.use()
+        ctx.viewport = (0, 0, w, h)
+        scene_fbo.clear(color=(0.0, 0.0, 0.0, 1.0), depth=1.0)
+        ctx.cull_face = 'front'
+        ctx.enable(moderngl.CULL_FACE)
+        ctx.disable(moderngl.DEPTH_TEST)
+        ctx.depth_mask = False
 
-    vao_atmo.render(moderngl.TRIANGLES)
+        vao_atmo.render(moderngl.TRIANGLES)
 
-    scene_raw = scene_fbo.read(components=4, dtype='f2')
-    scene_data = np.frombuffer(scene_raw, dtype=np.float16).reshape((h, w, 4)).astype(np.float32)
+        scene_raw = scene_fbo.read(components=4, dtype='f2')
+        scene_data = np.frombuffer(scene_raw, dtype=np.float16).reshape((h, w, 4)).astype(np.float32)
 
-    assert not np.isnan(scene_data).any(), "NaN in scene output for Mode 3!"
-    assert not np.isinf(scene_data).any(), "Inf in scene output for Mode 3!"
+        assert not np.isnan(scene_data).any(), f"NaN in scene output for Mode 3 with steps={test_steps}!"
+        assert not np.isinf(scene_data).any(), f"Inf in scene output for Mode 3 with steps={test_steps}!"
 
-    scene_rgb = scene_data[:, :, 0:3]
-    print(f"   [+] Atmosphere mesh rendered successfully with Mode 3.")
-    print(f"       Scene RGB min: {scene_rgb.min():.6f}, max: {scene_rgb.max():.6f}, mean: {scene_rgb.mean():.6f}")
+        scene_rgb = scene_data[:, :, 0:3]
+        print(f"   [+] Atmosphere mesh rendered successfully with steps={test_steps}.")
+        print(f"       Scene RGB min: {scene_rgb.min():.6f}, max: {scene_rgb.max():.6f}, mean: {scene_rgb.mean():.6f}")
 
-    assert scene_rgb.max() > 0.0, "Scene atmosphere render is completely black!"
-    print("   [+] Mode 3 produced valid non-zero HDR in-scattering!")
+        assert scene_rgb.max() > 0.0, f"Scene atmosphere render is completely black with steps={test_steps}!"
+        print(f"   [+] Mode 3 produced valid non-zero HDR in-scattering with steps={test_steps}!")
 
     print("\n" + "=" * 70)
     print("ALL MODE 3 PIPELINE TESTS PASSED!")

@@ -600,6 +600,12 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
         ring['row_idx'] = row_idx
         
     ring_gradient_tex.write(ring_gradient_data.tobytes())
+    ring_shadow_tex = getattr(ring_gradient_tex, 'shadow_tex', None)
+    if ring_shadow_tex is not None:
+        ring_shadow_tex.write(ring_gradient_data[0, :, :].tobytes())
+        ring_shadow_tex.build_mipmaps()
+        ring_shadow_tex.current_body_idx = 0
+    ring_gradient_tex.atlas_data = ring_gradient_data
     return body_indices
 
 

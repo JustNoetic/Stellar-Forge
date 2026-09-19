@@ -510,6 +510,7 @@ class App(InputHandlerMixin):
             "atmo_steps_max": 32,
             "atmo_adaptive_steps": True,
             "atmo_adaptive_steps_max": 128,
+            "atmo_slicing_steps": 8,
             "atmo_enabled": True,
             "refraction_enabled": True,
             "grav_lensing_enabled": True,
@@ -693,6 +694,7 @@ class App(InputHandlerMixin):
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
                 "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
+                "atmo_slicing_steps": self.camera.get("atmo_slicing_steps", 8),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_mode": self.camera.get("bloom_mode", 2),
@@ -1597,6 +1599,8 @@ class App(InputHandlerMixin):
                 p['u_history_trans'].value = 11
             if 'u_sky_view_lut' in p:
                 p['u_sky_view_lut'].value = 12
+            if 'u_ring_shadow_tex' in p:
+                p['u_ring_shadow_tex'].value = 13
         
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
         if 'u_transmittance_lut' in self.prog_sky_view:
@@ -1912,6 +1916,13 @@ class App(InputHandlerMixin):
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
+        ring_shadow_tex = ctx.texture((4096, 1), 4, dtype='f4')
+        ring_shadow_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        ring_shadow_tex.repeat_x = False
+        ring_shadow_tex.repeat_y = False
+        ring_shadow_tex.build_mipmaps()
+        ring_gradient_tex.shadow_tex = ring_shadow_tex
+        self.ring_shadow_tex = ring_shadow_tex
         self.body_ring_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
 
 
@@ -4920,6 +4931,7 @@ class App(InputHandlerMixin):
                 cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
     
                 if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
+                if 'u_atmo_slicing_steps' in cur_prog: cur_prog['u_atmo_slicing_steps'].value = int(self.camera.get("atmo_slicing_steps", 8))
                 if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
                 if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
                 
@@ -4944,6 +4956,8 @@ class App(InputHandlerMixin):
                     if 'u_ring_params' in cur_prog: cur_prog['u_ring_params'].write(ring_params_buf)
                     if 'u_ring_coplanar_mask' in cur_prog: cur_prog['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
                     ring_gradient_tex.use(location=0)
+                    if ring_shadow_tex is not None:
+                        ring_shadow_tex.use(location=13)
                 
                 if 'u_atmo_clip_mode' in cur_prog:
                     cur_prog['u_atmo_clip_mode'].value = clip_mode
@@ -5308,6 +5322,14 @@ class App(InputHandlerMixin):
                         ctx.depth_mask = False
 
                         self.sky_view_tex.use(location=12)
+                        if ring_shadow_tex is not None:
+                            if hasattr(self, "body_ring_indices") and bi in self.body_ring_indices:
+                                u_idx = self.body_ring_indices[bi]
+                                if getattr(ring_shadow_tex, 'current_body_idx', None) != u_idx and hasattr(ring_gradient_tex, 'atlas_data'):
+                                    ring_shadow_tex.write(ring_gradient_tex.atlas_data[u_idx, :, :].tobytes())
+                                    ring_shadow_tex.build_mipmaps()
+                                    ring_shadow_tex.current_body_idx = u_idx
+                            ring_shadow_tex.use(location=13)
 
                     cur_vao.render(moderngl.TRIANGLES)
     

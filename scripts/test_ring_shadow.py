@@ -106,6 +106,13 @@ def test_ring_shadow():
     ring_grad_tex = ctx.texture((4096, 16), 4, ring_grad_data.tobytes(), dtype='f4')
     ring_grad_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
 
+    ring_shadow_tex = ctx.texture((4096, 1), 4, dtype='f4')
+    ring_shadow_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+    ring_shadow_tex.repeat_x = False
+    ring_shadow_tex.repeat_y = False
+    ring_shadow_tex.write(ring_grad_data[0, :, :].tobytes())
+    ring_shadow_tex.build_mipmaps()
+
     trans_init = np.full((256, 256, 4), [0.85, 0.82, 0.75, 1.0], dtype=np.float32)
     trans_tex = ctx.texture((256, 256), 4, trans_init.tobytes(), dtype='f4')
 
@@ -123,11 +130,13 @@ def test_ring_shadow():
     dummy_map.use(location=8)
     depth_tex.use(location=9)
     sky_view_tex.use(location=12)
+    ring_shadow_tex.use(location=13)
 
     if 'u_transmittance_lut' in prog_sky_view: prog_sky_view['u_transmittance_lut'].value = 1
     if 'u_multi_scatter_lut' in prog_sky_view: prog_sky_view['u_multi_scatter_lut'].value = 3
 
     if 'u_ring_gradients' in prog_atmo: prog_atmo['u_ring_gradients'].value = 0
+    if 'u_ring_shadow_tex' in prog_atmo: prog_atmo['u_ring_shadow_tex'].value = 13
     if 'u_transmittance_lut' in prog_atmo: prog_atmo['u_transmittance_lut'].value = 1
     if 'u_multi_scatter_lut' in prog_atmo: prog_atmo['u_multi_scatter_lut'].value = 3
     if 'u_ringshine_lut' in prog_atmo: prog_atmo['u_ringshine_lut'].value = 6
@@ -283,6 +292,22 @@ def test_ring_shadow():
         l2 = np.linalg.norm(v2)
         l3 = np.linalg.norm(v3)
         print(f"{y:4d} | R={v2[0]:.4f} G={v2[1]:.4f} B={v2[2]:.4f} | R={v3[0]:.4f} G={v3[1]:.4f} B={v3[2]:.4f} | {abs(l3-l2):.4f}")
+
+    print("\n--- Testing Shadow Brightness Invariance Across Slicing Steps (X=400, Y=305) ---")
+    print(f"{'Steps':>6} | {'Mode 3 In-Shadow RGB':>28} | {'Diff from 8 steps':>18}")
+    print("-" * 60)
+    if 'u_atmo_slicing_steps' in prog_atmo:
+        prog_atmo['u_atmo_slicing_steps'].value = 8
+    d_base = render_and_get_image(3)
+    base_shadow_val = d_base[305, x_col, 0:3]
+
+    for test_s in [2, 4, 8, 16, 32]:
+        if 'u_atmo_slicing_steps' in prog_atmo:
+            prog_atmo['u_atmo_slicing_steps'].value = test_s
+        d = render_and_get_image(3)
+        rgb_val = d[305, x_col, 0:3]
+        diff_from_base = np.linalg.norm(rgb_val - base_shadow_val)
+        print(f"{test_s:6d} | R={rgb_val[0]:.6f} G={rgb_val[1]:.6f} B={rgb_val[2]:.6f} | {diff_from_base:.6f}")
 
 if __name__ == "__main__":
     test_ring_shadow()
