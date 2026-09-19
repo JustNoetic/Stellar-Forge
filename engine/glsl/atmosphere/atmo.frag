@@ -921,6 +921,7 @@ void main() {
 
         // Volumetric Ring Shadow via Analytical Depth Slicing
         vec3 delta_L = vec3(0.0);
+        vec3 slice_total = vec3(0.0);
         bool has_shadow_interval = false;
 
         vec3 p_up = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
@@ -1091,43 +1092,37 @@ void main() {
                                             ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
                                         }
 
-                                        // Solid planet shadow check (prevent shadow on unlit night side)
-                                        vec2 t_planet_sun = raySphereIntersect(Pq_sph, L_sun, u_planet_radius_km);
-                                        if (t_planet_sun.x > 0.0 && t_planet_sun.y > t_planet_sun.x) {
-                                            ring_blocked = 0.0;
-                                        }
+                                        // Note: Do not zero ring_blocked on the night side; if the parcel is in the
+                                        // shadow cone, multi-scattered light accumulated by the LUT must still be subtracted.
 
-                                        if (ring_blocked > 1e-4) {
-                                            float light_cos_theta = dot(Pq_sph, L_sun) / rq;
-                                            float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
-                                            float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
-                                            float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
-                                            vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, light_cos_theta) : vec3(0.0);
+                                        float light_cos_theta = dot(Pq_sph, L_sun) / rq;
+                                        float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
+                                        float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
+                                        float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
+                                        vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, light_cos_theta) : vec3(0.0);
 
-                                            float cos_theta_sun = dot(ray_dir_sph, L_sun);
-                                            float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_sun * cos_theta_sun);
-                                            float g = clamp(u_mie_g, 0.0, 0.88);
-                                            float c1 = (u_precomp_mie.x > 1e-6) ? u_precomp_mie.x : ((3.0 / (8.0 * PI)) * ((1.0 - g * g) / (2.0 + g * g)));
-                                            float c2 = (u_precomp_mie.y > 1e-6) ? u_precomp_mie.y : (1.0 + g * g);
-                                            float c3 = (u_precomp_mie.z > 1e-6) ? u_precomp_mie.z : (2.0 * g);
-                                            float phase_M = c1 * pow(c2 - c3 * cos_theta_sun, -1.5);
+                                        float cos_theta_sun = dot(ray_dir_sph, L_sun);
+                                        float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_sun * cos_theta_sun);
+                                        float g = clamp(u_mie_g, 0.0, 0.88);
+                                        float c1 = (u_precomp_mie.x > 1e-6) ? u_precomp_mie.x : ((3.0 / (8.0 * PI)) * ((1.0 - g * g) / (2.0 + g * g)));
+                                        float c2 = (u_precomp_mie.y > 1e-6) ? u_precomp_mie.y : (1.0 + g * g);
+                                        float c3 = (u_precomp_mie.z > 1e-6) ? u_precomp_mie.z : (2.0 * g);
+                                        float phase_M = c1 * (1.0 + cos_theta_sun * cos_theta_sun) / pow(max(1e-4, c2 - c3 * cos_theta_sun), 1.5);
 
-                                            vec3 beta_M_sca = beta_M;
-                                            vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M_sca * rho_M_q * phase_M) * trans_to_sun * vis_fraction * u_star_color_irrad[0].rgb;
+                                        vec3 beta_M_sca = beta_M;
+                                        vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M_sca * rho_M_q * phase_M) * trans_to_sun * vis_fraction * u_star_color_irrad[0].rgb;
 
-                                            delta_L += T_run * inscatter_direct * int_factor * ring_blocked;
+                                        // Multi-scatter component matching sky_view_lut.frag line 209
+                                        float h_norm_q = clamp(hq / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+                                        float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
+                                        float ms_v_q = sqrt(h_norm_q);
+                                        vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
+                                        vec3 inscatter_ms = u_star_color_irrad[0].rgb * (beta_R * rho_R_q + beta_M * rho_M_q) * psi_q;
 
-                                            // Multi-scatter deficit: the Sky-View LUT's total_ms includes unshadowed
-                                            // multi-scattered light.  Mode 2 attenuates multi-scatter by sample_shadow at
-                                            // each step; the LUT has no shadow, so we must subtract the blocked fraction
-                                            // here to match.  Structure mirrors sky_view_lut.frag line 209 (no phase fn,
-                                            // star_intensity applied outside) and Mode 2 line 1549 (ms_shadow = sample_shadow).
-                                            float h_norm_q = clamp(hq / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-                                            float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
-                                            float ms_v_q = sqrt(h_norm_q);
-                                            vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
-                                            delta_L += u_star_color_irrad[0].rgb * (beta_R * rho_R_q + beta_M * rho_M_q) * psi_q * T_run * int_factor * ring_blocked;
-                                        }
+                                        vec3 step_inscatter = (inscatter_direct + inscatter_ms) * T_run * int_factor;
+
+                                        delta_L += step_inscatter * ring_blocked;
+                                        slice_total += step_inscatter;
 
                                         T_run *= T_step;
                                     }
@@ -1141,7 +1136,15 @@ void main() {
             }
         }
 
-        vec3 L_atmo = max(vec3(0.0), L_scatter - delta_L);
+        vec3 L_atmo = L_scatter;
+        if (has_shadow_interval && dot(slice_total, vec3(1.0)) > 1e-6) {
+            vec3 shadow_factor = clamp(delta_L / max(slice_total, vec3(1e-6)), vec3(0.0), vec3(1.0));
+            vec3 alpha = clamp(slice_total / max(L_scatter, vec3(1e-6)), vec3(0.0), vec3(1.0));
+            vec3 blend = smoothstep(vec3(0.3), vec3(0.7), alpha);
+            vec3 eff_slice = mix(slice_total, L_scatter, blend);
+            L_atmo = max(vec3(0.0), L_scatter - eff_slice * shadow_factor);
+        }
+
         scattered = L_atmo;
         final_transmittance = vec3(T_lut);
     } else {

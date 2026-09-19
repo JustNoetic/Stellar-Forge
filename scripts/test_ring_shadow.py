@@ -283,31 +283,33 @@ def test_ring_shadow():
     print("Saved scripts/mode2_shadow.png and scripts/mode3_shadow.png")
 
     x_col = 400
-    print(f"\n--- Vertical slice at X={x_col} (Y from 300 to 450, through the shadow) ---")
+    print(f"\n--- Vertical slice at X={x_col} (Y from 90 to 230, through the shadow) ---")
     print(f"{'Y':>4} | {'Mode 2 (High)':>16} | {'Mode 3 (Analytical)':>19} | {'Diff':>8}")
     print("-" * 55)
-    for y in range(300, 450, 5):
+    for y in range(90, 230, 10):
         v2 = m2_rgb[y, x_col]
         v3 = m3_rgb[y, x_col]
         l2 = np.linalg.norm(v2)
         l3 = np.linalg.norm(v3)
         print(f"{y:4d} | R={v2[0]:.4f} G={v2[1]:.4f} B={v2[2]:.4f} | R={v3[0]:.4f} G={v3[1]:.4f} B={v3[2]:.4f} | {abs(l3-l2):.4f}")
 
-    print("\n--- Testing Shadow Brightness Invariance Across Slicing Steps (X=400, Y=305) ---")
+    print("\n--- Testing Shadow Brightness Invariance Across Slicing Steps (X=400, Y=180) ---")
     print(f"{'Steps':>6} | {'Mode 3 In-Shadow RGB':>28} | {'Diff from 8 steps':>18}")
     print("-" * 60)
     if 'u_atmo_slicing_steps' in prog_atmo:
         prog_atmo['u_atmo_slicing_steps'].value = 8
     d_base = render_and_get_image(3)
-    base_shadow_val = d_base[305, x_col, 0:3]
+    base_shadow_val = d_base[180, x_col, 0:3]
 
     for test_s in [2, 4, 8, 16, 32]:
         if 'u_atmo_slicing_steps' in prog_atmo:
             prog_atmo['u_atmo_slicing_steps'].value = test_s
         d = render_and_get_image(3)
-        rgb_val = d[305, x_col, 0:3]
+        rgb_val = d[180, x_col, 0:3]
         diff_from_base = np.linalg.norm(rgb_val - base_shadow_val)
         print(f"{test_s:6d} | R={rgb_val[0]:.6f} G={rgb_val[1]:.6f} B={rgb_val[2]:.6f} | {diff_from_base:.6f}")
+
+
 
 if __name__ == "__main__":
     test_ring_shadow()
