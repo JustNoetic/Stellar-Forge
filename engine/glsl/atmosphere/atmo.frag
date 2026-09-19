@@ -1024,41 +1024,67 @@ void main() {
                                         T_run *= T_gap;
                                     }
 
-                                    const int QUAD_STEPS = 12;
-                                    float ds = (ce - cs) / float(QUAD_STEPS);
+                                    // 2. Optical depth across the shadow slice (Simpson's 3-point rule, strictly O(1) with zero loops)
+                                    float s_mid = 0.5 * (cs + ce);
+                                    float h_cs  = max(0.0, length(cam_local_sph + cs * ray_dir_sph) - u_planet_radius_km);
+                                    float h_mid = max(0.0, length(cam_local_sph + s_mid * ray_dir_sph) - u_planet_radius_km);
+                                    float h_ce  = max(0.0, length(cam_local_sph + ce * ray_dir_sph) - u_planet_radius_km);
 
-                                    for (int q = 0; q < QUAD_STEPS; q++) {
-                                        float sq = cs + (float(q) + 0.5) * ds;
+                                    float rho_R_cs  = exp(-h_cs * inv_h_rayleigh);
+                                    float rho_R_mid = exp(-h_mid * inv_h_rayleigh);
+                                    float rho_R_ce  = exp(-h_ce * inv_h_rayleigh);
 
-                                        vec3 Pq = cam_local_sph + sq * ray_dir_sph;
-                                        float rq = length(Pq);
-                                        float hq = max(0.0, rq - u_planet_radius_km);
+                                    float rho_M_cs  = exp(-h_cs * inv_h_mie);
+                                    float rho_M_mid = exp(-h_mid * inv_h_mie);
+                                    float rho_M_ce  = exp(-h_ce * inv_h_mie);
 
-                                        float rho_R = exp(-hq * inv_h_rayleigh);
-                                        float rho_M = exp(-hq * inv_h_mie);
-                                        float h_O3 = abs(hq - u_ozone_peak_km);
-                                        float rho_O3 = max(0.0, 1.0 - h_O3 * inv_ozone_width);
+                                    float h_O3_cs  = abs(h_cs - u_ozone_peak_km);
+                                    float h_O3_mid = abs(h_mid - u_ozone_peak_km);
+                                    float h_O3_ce  = abs(h_ce - u_ozone_peak_km);
+                                    float rho_O3_cs  = max(0.0, 1.0 - h_O3_cs * inv_ozone_width);
+                                    float rho_O3_mid = max(0.0, 1.0 - h_O3_mid * inv_ozone_width);
+                                    float rho_O3_ce  = max(0.0, 1.0 - h_O3_ce * inv_ozone_width);
 
-                                        vec3 step_ext = beta_R * rho_R + beta_M_ext * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O3;
-                                        vec3 step_trans = exp(-step_ext * ds);
+                                    vec3 ext_cs  = beta_R * rho_R_cs  + beta_M_ext * rho_M_cs  + beta_A_mixed * rho_R_cs  + beta_A_layered * rho_O3_cs;
+                                    vec3 ext_mid = beta_R * rho_R_mid + beta_M_ext * rho_M_mid + beta_A_mixed * rho_R_mid + beta_A_layered * rho_O3_mid;
+                                    vec3 ext_ce  = beta_R * rho_R_ce  + beta_M_ext * rho_M_ce  + beta_A_mixed * rho_R_ce  + beta_A_layered * rho_O3_ce;
 
-                                        // Ring coordinate & opacity
-                                        vec3 P_sh = A + sq * B;
-                                        float r_mid = length(P_sh.xz);
-                                        float u_mid = (r_mid - r_inner) / ring_span;
+                                    vec3 tau_slice = ((ce - cs) / 6.0) * (ext_cs + 4.0 * ext_mid + ext_ce);
+                                    vec3 T_slice = exp(-tau_slice);
+                                    vec3 step_weight = T_run * (vec3(1.0) - T_slice);
 
-                                        float ring_blocked = 0.0;
-                                        if (u_mid >= 0.0 && u_mid <= 1.0) {
-                                            float raw_a = textureLod(u_ring_gradients, vec2(u_mid, ring_v_coord), 0.0).a;
-                                            float tau_ring = -log(max(1e-4, 1.0 - raw_a));
-                                            ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
-                                        }
+                                    // Footprint-filtered ring opacity across the exact shadow slice
+                                    vec3 P_cs = A + cs * B;
+                                    vec3 P_ce = A + ce * B;
+                                    vec3 P_mid = A + s_mid * B;
+                                    float r_cs = length(P_cs.xz);
+                                    float r_ce = length(P_ce.xz);
+                                    float r_mid = length(P_mid.xz);
 
-                                        vec3 step_weight = T_run * (vec3(1.0) - step_trans);
-                                        total_weight += step_weight;
-                                        blocked_weight += step_weight * ring_blocked;
-                                        T_run *= step_trans;
+                                    float u_cs = (r_cs - r_inner) / ring_span;
+                                    float u_ce = (r_ce - r_inner) / ring_span;
+                                    float u_mid = (r_mid - r_inner) / ring_span;
+
+                                    float du = max(1e-4, abs(u_ce - u_cs));
+                                    float lod = log2(max(1.0, du * 4096.0));
+
+                                    float ring_blocked = 0.0;
+                                    if (u_mid >= -0.05 && u_mid <= 1.05) {
+                                        float raw_a = textureLod(u_ring_gradients, vec2(clamp(u_mid, 0.0, 1.0), ring_v_coord), lod).a;
+                                        float tau_ring = -log(max(1e-4, 1.0 - raw_a));
+                                        ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
                                     }
+
+                                    // Solid planet shadow check (prevent shadow on unlit night side)
+                                    vec3 Pq_sph = cam_local_sph + s_mid * ray_dir_sph;
+                                    vec2 t_planet_sun = raySphereIntersect(Pq_sph, L_sun, u_planet_radius_km);
+                                    if (t_planet_sun.x > 0.0 && t_planet_sun.y > t_planet_sun.x) {
+                                        ring_blocked = 0.0;
+                                    }
+
+                                    total_weight += step_weight;
+                                    blocked_weight += step_weight * ring_blocked;
+                                    T_run *= T_slice;
 
                                     prev_s = ce;
                                 }
