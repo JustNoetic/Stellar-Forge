@@ -401,7 +401,7 @@ Full $128 \times 65$ manifold error (all 8,320 surface pixels) with 100 bands: M
 | Per-frame bake cost | — | **~0.04–0.08 ms** on modern GPUs ($N_{\text{bands}} = 100$) |
 | Startup precomputation | — | **~50 ms** one-time CPU execution |
 
-At default settings (100 bands), the dynamic map bake executes in **less than 80 microseconds**, leaving virtually the entire frame budget available for physics and atmospheric raymarching.
+At default settings (100 bands), the dynamic map bake executes in **less than 80 microseconds**, leaving virtually the entire frame budget available for physics and atmospheric rendering.
 
 ---
 

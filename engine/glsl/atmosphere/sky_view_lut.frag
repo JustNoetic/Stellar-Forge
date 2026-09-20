@@ -72,8 +72,6 @@ void main() {
     vec3 u_zenith = u_cam_pos / max(D, 1e-6);
     float D_clamped = max(D, u_planet_radius_km);
     bool cam_inside = (D <= u_atmo_radius_km);
-    float D_lut = cam_inside ? D_clamped : min(D_clamped, u_atmo_radius_km * 2.0);
-    vec3 cam_pos_lut = u_zenith * D_lut;
     vec3 L_sun = normalize(u_sun_dir);
 
     // Build continuous orthonormal basis aligned with local Zenith and Sun Azimuth
@@ -91,14 +89,18 @@ void main() {
     // Map f_uv.x in [0, 1] to azimuth phi in [0, 2*PI]
     float phi = f_uv.x * 2.0 * PI;
 
-    // Piecewise non-linear elevation mapping centered at horizon (Hillaire 2020)
-    float theta = 0.0;
+    vec3 ray_origin;
+    vec3 V;
+    float s_start = 0.0;
+    float s_end = 0.0;
     bool hits_ground = false;
 
     if (cam_inside) {
+        // Piecewise non-linear elevation mapping centered at horizon (Hillaire 2020)
         float sin_horizon = clamp(u_planet_radius_km / D_clamped, 0.0, 1.0);
         float theta_horizon = PI - asin(sin_horizon);
 
+        float theta = 0.0;
         if (f_uv.y <= 0.5) {
             // Ground disk: [theta_horizon, PI]
             // Row 0 is Nadir (theta = PI), row 127 is Horizon (theta = theta_horizon)
@@ -112,48 +114,58 @@ void main() {
             theta = theta_horizon * (1.0 - t * t);
             hits_ground = false;
         }
-    } else {
-        // Space observer: looking towards planet Nadir
-        // Use stable reference distance D_lut to evaluate sine angles without float32 cancellation
-        float sin_planet = clamp(u_planet_radius_km / D_lut, 0.0, 1.0);
-        float sin_atmo = clamp(u_atmo_radius_km / D_lut, 0.0, 1.0);
 
+        V = normalize(sin(theta) * (cos(phi) * x_basis + sin(phi) * y_basis) + cos(theta) * u_zenith);
+        ray_origin = u_zenith * D_clamped;
+
+        vec2 t_atmo = raySphereIntersect(ray_origin, V, u_atmo_radius_km);
+        if (t_atmo.y < 0.0) {
+            out_color = vec4(0.0, 0.0, 0.0, 1.0);
+            out_transmittance = vec4(1.0);
+            return;
+        }
+
+        s_start = max(0.0, t_atmo.x);
+        s_end = t_atmo.y;
+
+        if (hits_ground) {
+            vec2 t_planet = raySphereIntersect(ray_origin, V, u_planet_radius_km);
+            if (t_planet.x > 0.0) {
+                s_end = min(s_end, t_planet.x);
+            } else {
+                s_end = 0.0;
+            }
+        }
+    } else {
+        // Space observer: looking towards planet
+        // Exact mapping from impact parameter r_ca and azimuth phi
+        float r_ca;
         if (f_uv.y <= 0.5) {
             // Ground disk: impact parameter r_ca in [0, R_planet]
             float t = (0.5 - f_uv.y) / 0.5;
-            float sin_alpha = sin_planet * (1.0 - t * t);
-            float alpha = asin(clamp(sin_alpha, 0.0, 1.0));
-            theta = PI - alpha;
+            r_ca = u_planet_radius_km * max(0.0, 1.0 - t * t);
             hits_ground = true;
         } else {
             // Atmosphere limb: impact parameter r_ca in [R_planet, R_atmo]
             float t = (f_uv.y - 0.5) / 0.5;
-            float sin_alpha = sin_planet + (t * t) * (sin_atmo - sin_planet);
-            float alpha = asin(clamp(sin_alpha, 0.0, 1.0));
-            theta = PI - alpha;
+            r_ca = u_planet_radius_km + (t * t) * (u_atmo_radius_km - u_planet_radius_km);
             hits_ground = false;
         }
-    }
 
-    vec3 V = normalize(sin(theta) * (cos(phi) * x_basis + sin(phi) * y_basis) + cos(theta) * u_zenith);
+        vec3 e_phi = cos(phi) * x_basis + sin(phi) * y_basis;
+        float sin_alpha = clamp(r_ca / max(D, u_atmo_radius_km), 0.0, 1.0);
+        float cos_alpha = sqrt(max(0.0, 1.0 - sin_alpha * sin_alpha));
 
-    // Atmospheric bounding shell intersection
-    vec2 t_atmo = raySphereIntersect(cam_pos_lut, V, u_atmo_radius_km);
-    if (t_atmo.y < 0.0) {
-        out_color = vec4(0.0, 0.0, 0.0, 1.0);
-        out_transmittance = vec4(1.0);
-        return;
-    }
+        V = normalize(sin_alpha * e_phi - cos_alpha * u_zenith);
+        ray_origin = r_ca * cos_alpha * e_phi + r_ca * sin_alpha * u_zenith;
 
-    float s_start = max(0.0, t_atmo.x);
-    float s_end = t_atmo.y;
+        float r_ca_sq = r_ca * r_ca;
+        s_start = -sqrt(max(0.0, u_atmo_radius_km * u_atmo_radius_km - r_ca_sq));
 
-    if (hits_ground) {
-        vec2 t_planet = raySphereIntersect(cam_pos_lut, V, u_planet_radius_km);
-        if (t_planet.x > 0.0) {
-            s_end = min(s_end, t_planet.x);
+        if (hits_ground) {
+            s_end = -sqrt(max(0.0, u_planet_radius_km * u_planet_radius_km - r_ca_sq));
         } else {
-            s_end = 0.0;
+            s_end = +sqrt(max(0.0, u_atmo_radius_km * u_atmo_radius_km - r_ca_sq));
         }
     }
 
@@ -186,7 +198,7 @@ void main() {
 
     for (int i = 0; i < NUM_STEPS; i++) {
         float s = s_start + (float(i) + 0.5) * ds;
-        vec3 P = cam_pos_lut + s * V;
+        vec3 P = ray_origin + s * V;
         float r = length(P);
         float altitude = max(0.0, r - u_planet_radius_km);
 
