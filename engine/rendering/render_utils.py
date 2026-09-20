@@ -566,6 +566,66 @@ def bake_unified_shadow_profile(active_rings, min_r, max_r, res=4096):
         
     return bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, segment_opacities, segment_shadow_grads)
 
+def bake_station_cells(alpha_prof, max_cells=32, jump_thresh=0.10, sigma_texels=48.0, min_sep_texels=24.0):
+    """Bake ring-shadow slicing station-cell boundaries from a unified 1D ring alpha profile.
+
+    Boundaries are snapped to the profile's dominant discontinuities (smoothed Gaussian
+    gradient peaks), with any remaining cell budget distributed proportional to smoothed
+    total variation inside each segment. Returns an ascending array of u-space boundaries
+    in [0, 1] of length (num_cells + 1) (num_cells <= max_cells).
+    """
+    prof = np.asarray(alpha_prof, dtype=np.float64)
+    n = prof.size
+    if n < 4:
+        return np.array([0.0, 1.0])
+
+    # Gaussian-smoothed profile: robust against ringlet-level noise; recovers jump height.
+    # Zero-pad beyond the profile domain so the ring outer edge (alpha dropping to zero)
+    # registers as a genuine gradient peak instead of an asymmetric edge ramp.
+    sig = max(1.0, float(sigma_texels))
+    x = np.arange(-int(4 * sig), int(4 * sig) + 1)
+    gauss = np.exp(-0.5 * (x / sig) ** 2)
+    gauss /= gauss.sum()
+    pad = int(4 * sig)
+    a_s = np.convolve(np.concatenate([np.zeros(pad), prof, np.zeros(pad)]), gauss, mode='same')[pad:pad + n]
+
+    # Per-texel mass for budget distribution: |gradient| of the smoothed profile.
+    mass = np.abs(np.diff(a_s, prepend=a_s[0], append=a_s[-1]))
+
+    # Candidate edges: local maxima of smoothed jump height above threshold, strongest
+    # first, with a minimum separation of ~2 sigma so one edge cannot consume two cells.
+    jump = mass * sig * np.sqrt(2.0 * np.pi)
+    is_peak = (jump[1:-1] >= jump[:-2]) & (jump[1:-1] > jump[2:]) & (jump[1:-1] > jump_thresh)
+    peaks = np.where(is_peak)[0] + 1
+    bounds = []
+    if peaks.size > 0:
+        order = np.argsort(-jump[peaks])
+        min_sep = max(2.0 * sig, min_sep_texels)
+        for p in peaks[order]:
+            u = (p + 0.5) / n
+            if all(abs(u - b) > min_sep / n for b in bounds):
+                bounds.append(u)
+            if len(bounds) >= max_cells - 1:
+                break
+        bounds.sort()
+
+    # Fill remaining budget: split the highest-mass segment at its mass-weighted median.
+    bounds = [0.0] + bounds + [1.0]
+    while len(bounds) < max_cells + 1:
+        masses = []
+        for a_, b_ in zip(bounds[:-1], bounds[1:]):
+            i0, i1 = int(a_ * n), max(int(b_ * n), int(a_ * n) + 1)
+            masses.append(float(mass[i0:i1].sum()))
+        j = int(np.argmax(masses))
+        a_, b_ = bounds[j], bounds[j + 1]
+        i0, i1 = int(a_ * n), max(int(b_ * n), int(a_ * n) + 1)
+        cum = np.cumsum(mass[i0:i1])
+        med = i0 + int(np.searchsorted(cum, cum[-1] * 0.5))
+        nb = float(np.clip((med + 0.5) / n, a_ + 1.0 / n, b_ - 1.0 / n))
+        bounds = bounds[:j + 1] + [nb] + bounds[j + 1:]
+
+    return np.array(sorted(np.clip(bounds, 0.0, 1.0)))
+
 
 def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
     # Group rings by body
@@ -606,6 +666,11 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
         ring_shadow_tex.build_mipmaps()
         ring_shadow_tex.current_body_idx = 0
     ring_gradient_tex.atlas_data = ring_gradient_data
+
+    # Station-cell boundary cache for Mode 3 shadow slicing (see bake_station_cells).
+    # Keyed (body_idx, K); baked lazily by the app for the active cell count and reset
+    # whenever the ring atlas is rebuilt (profiles are stale otherwise).
+    ring_gradient_tex.station_cells = {}
     return body_indices
 
 

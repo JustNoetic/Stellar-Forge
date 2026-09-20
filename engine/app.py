@@ -4938,7 +4938,14 @@ class App(InputHandlerMixin):
                 cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
     
                 if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
-                if 'u_atmo_slicing_steps' in cur_prog: cur_prog['u_atmo_slicing_steps'].value = int(self.camera.get("atmo_slicing_steps", 8))
+                if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
+                    # Default station grid (uniform in u); ringed bodies override per-draw below.
+                    K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
+                    grid = np.zeros((9, 4), dtype='f4')
+                    grid.ravel()[:K_def + 1] = np.linspace(0.0, 1.0, K_def + 1)
+                    if 'u_ring_station_cells' in cur_prog:
+                        cur_prog['u_ring_station_cells'].write(grid.tobytes())
+                    cur_prog['u_ring_station_count'].value = K_def
                 if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
                 if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
                 
@@ -5338,6 +5345,21 @@ class App(InputHandlerMixin):
                                     ring_shadow_tex.build_mipmaps()
                                     ring_shadow_tex.current_body_idx = u_idx
                             ring_shadow_tex.use(location=13)
+                        # Station-cell grid baked from this body's ring profile (edges snapped
+                        # to ring discontinuities); replaces the uniform-in-s slice grid whose
+                        # phase quantization caused step banding. Lazy-baked per (body, K).
+                        if ('u_ring_station_count' in cur_prog and hasattr(ring_gradient_tex, 'station_cells')
+                                and hasattr(self, "body_ring_indices") and bi in self.body_ring_indices):
+                            u_idx = self.body_ring_indices[bi]
+                            K = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
+                            bounds = ring_gradient_tex.station_cells.get((bi, K))
+                            if bounds is None:
+                                bounds = bake_station_cells(ring_gradient_tex.atlas_data[u_idx, :, 3], max_cells=K)
+                                ring_gradient_tex.station_cells[(bi, K)] = bounds
+                            grid = np.zeros(36, dtype='f4')
+                            grid[:len(bounds)] = bounds
+                            cur_prog['u_ring_station_cells'].write(grid.tobytes())
+                            cur_prog['u_ring_station_count'].value = max(2, len(bounds) - 1)
 
                     cur_vao.render(moderngl.TRIANGLES)
     

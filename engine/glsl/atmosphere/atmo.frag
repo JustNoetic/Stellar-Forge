@@ -89,7 +89,8 @@ uniform vec3 u_ring_center[MAX_RING_PLANES];
 uniform vec3 u_ring_normal[MAX_RING_PLANES];
 uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform int u_atmo_clip_mode;
-uniform int u_atmo_slicing_steps;
+uniform vec4 u_ring_station_cells[9];   // 33 station-cell boundaries in u space (Kmax = 32), packed 4 per vec4
+uniform int u_ring_station_count;      // number of cells (boundaries = count + 1)
 
 uniform uint u_ring_coplanar_mask[16];
 uniform sampler2D u_eclipse_lut; // Kept to avoid uniform bound errors
@@ -381,6 +382,146 @@ vec3 get_transmittance(float r, float cos_theta) {
 vec3 get_transmittance_precomputed(float v, float cos_theta) {
     float u = 0.5 + 0.5 * sign(cos_theta) * sqrt(abs(cos_theta));
     return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
+}
+
+// --- Mode 3 station-locked ring-shadow quadrature helpers ---
+// Cell boundaries are baked on the CPU in ring coordinate u (see bake_station_cells in
+// render_utils.py) and packed 4 floats per vec4: index i -> element (i/4, i%4).
+float station_bound(int i) {
+    vec4 v = u_ring_station_cells[i >> 2];
+    int r = i & 3;
+    return (r == 0) ? v.x : ((r == 1) ? v.y : ((r == 2) ? v.z : v.w));
+}
+
+// Inverse of the chord radius parabola r^2(s) = qa*s^2 + qb*s + qc on one monotone branch.
+// sig = -1 selects the s < s_apex branch, +1 the s > s_apex branch.
+float station_s_of_u(float u, int sig, float qa, float qb, float qc, float r_inner, float ring_span) {
+    float r_t = r_inner + u * ring_span;
+    float disc_t = qb * qb - 4.0 * qa * (qc - r_t * r_t);
+    return (-qb + float(sig) * sqrt(max(disc_t, 0.0))) / (2.0 * qa);
+}
+
+// Accumulate one station cell of the Mode 3 volumetric ring shadow: Simpson-integrated
+// in-scatter over the cell's s-extent with one footprint-filtered ring opacity sample over
+// the cell's u-window, weighted by the running transmittance T_run.
+void accumulate_shadow_cell(
+    float s0, float s1, float u_mid, float du,
+    float inv_sin_sun,
+    vec3 cam_local_sph, vec3 ray_dir_sph, vec3 L_sun,
+    float phase_R, float phase_M,
+    vec3 beta_R, vec3 beta_M, vec3 beta_M_ext, vec3 beta_A_mixed, vec3 beta_A_layered,
+    float inv_h_rayleigh, float inv_h_mie, float inv_ozone_width,
+    inout vec3 T_run, inout vec3 delta_L, inout vec3 slice_total,
+    inout float total_blocked, inout float step_count)
+{
+    float dsc = s1 - s0;
+    float sm = 0.5 * (s0 + s1);
+
+    // Simpson 3-point density sampling over the cell's s-extent
+    vec3 P0 = cam_local_sph + s0 * ray_dir_sph;
+    vec3 Pm = cam_local_sph + sm * ray_dir_sph;
+    vec3 P1 = cam_local_sph + s1 * ray_dir_sph;
+    float h0 = max(0.0, length(P0) - u_planet_radius_km);
+    float hm = max(0.0, length(Pm) - u_planet_radius_km);
+    float h1 = max(0.0, length(P1) - u_planet_radius_km);
+    float tO3_0 = (h0 - u_ozone_peak_km) * inv_ozone_width;
+    float tO3_m = (hm - u_ozone_peak_km) * inv_ozone_width;
+    float tO3_1 = (h1 - u_ozone_peak_km) * inv_ozone_width;
+    float rho_R_q  = (exp(-h0 * inv_h_rayleigh) + 4.0 * exp(-hm * inv_h_rayleigh) + exp(-h1 * inv_h_rayleigh)) / 6.0;
+    float rho_M_q  = (exp(-h0 * inv_h_mie) + 4.0 * exp(-hm * inv_h_mie) + exp(-h1 * inv_h_mie)) / 6.0;
+    float rho_O3_q = (exp(-(tO3_0 * tO3_0)) + 4.0 * exp(-(tO3_m * tO3_m)) + exp(-(tO3_1 * tO3_1))) / 6.0;
+
+    vec3 ext_q = beta_R * rho_R_q + beta_M_ext * rho_M_q + beta_A_mixed * rho_R_q + beta_A_layered * rho_O3_q;
+    vec3 T_cell = exp(-ext_q * dsc);
+    vec3 int_factor = (vec3(1.0) - T_cell) / max(ext_q, vec3(1e-6));
+
+    // Footprint-filtered ring opacity over the cell's u-window
+    float ring_blocked = 0.0;
+    if (u_mid >= -0.05 && u_mid <= 1.05) {
+        float lod = log2(max(1.0, du * 4096.0));
+        float raw_a = textureLod(u_ring_shadow_tex, vec2(clamp(u_mid, 0.0, 1.0), 0.5), lod).a;
+        float tau_ring = -log(max(1e-4, 1.0 - raw_a));
+        ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
+    }
+    // Note: Do not zero ring_blocked on the night side; if the parcel is in the shadow cone,
+    // multi-scattered light accumulated by the LUT must still be subtracted.
+
+    // Direct in-scatter at the cell midpoint (matching sky_view_lut.frag single scattering)
+    float rq = max(length(Pm), 1e-6);
+    float light_cos_theta = dot(Pm, L_sun) / rq;
+    float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
+    float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
+    float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
+    vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, light_cos_theta) : vec3(0.0);
+    vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M * rho_M_q * phase_M)
+                             * trans_to_sun * vis_fraction * u_star_color_irrad[0].rgb;
+
+    // Multi-scatter component matching sky_view_lut.frag
+    float h_norm_q = clamp(hm / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+    float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
+    float ms_v_q = sqrt(h_norm_q);
+    vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
+    vec3 inscatter_ms = u_star_color_irrad[0].rgb * (beta_R * rho_R_q + beta_M * rho_M_q) * psi_q;
+
+    vec3 step_inscatter = (inscatter_direct + inscatter_ms) * T_run * int_factor;
+    delta_L += step_inscatter * ring_blocked;
+    slice_total += step_inscatter;
+    total_blocked += ring_blocked;
+    step_count += 1.0;
+    T_run *= T_cell;
+}
+
+// Walk station cells across one monotone-u branch of the shadow interval [cs, ce].
+// Cells are clipped to the interval's u-range and converted back to s via the branch
+// inverse; T_run is marched in ascending s (ascending u on the sig = +1 branch,
+// descending u on the sig = -1 branch).
+void walk_station_branch(
+    float cs, float ce, int sig,
+    float qa, float qb, float qc, float r_inner, float ring_span, float inv_sin_sun,
+    vec3 cam_local_sph, vec3 ray_dir_sph, vec3 L_sun,
+    float phase_R, float phase_M,
+    vec3 beta_R, vec3 beta_M, vec3 beta_M_ext, vec3 beta_A_mixed, vec3 beta_A_layered,
+    float inv_h_rayleigh, float inv_h_mie, float inv_ozone_width,
+    inout vec3 T_run, inout vec3 delta_L, inout vec3 slice_total,
+    inout float total_blocked, inout float step_count)
+{
+    float u_cs = (sqrt(max(qa * cs * cs + qb * cs + qc, 0.0)) - r_inner) / ring_span;
+    float u_ce = (sqrt(max(qa * ce * ce + qb * ce + qc, 0.0)) - r_inner) / ring_span;
+    float u_lo = clamp(min(u_cs, u_ce), 0.0, 1.0);
+    float u_hi = clamp(max(u_cs, u_ce), 0.0, 1.0);
+    if (u_hi <= u_lo) return;
+
+    int K = clamp(u_ring_station_count, 2, 32);
+
+    // First cell whose upper bound exceeds u_lo.
+    int j0 = K - 1;
+    for (int j = 0; j < K; j++) {
+        if (station_bound(j + 1) > u_lo) { j0 = j; break; }
+    }
+    // Last cell whose lower bound is below u_hi.
+    int j1 = 0;
+    for (int j = K - 1; j >= 0; j--) {
+        if (station_bound(j) < u_hi) { j1 = j; break; }
+    }
+
+    for (int t = 0; t <= j1 - j0; t++) {
+        int j = (sig > 0) ? (j0 + t) : (j1 - t);
+        float u_a = max(station_bound(j), u_lo);
+        float u_b = min(station_bound(j + 1), u_hi);
+        if (u_b <= u_a) continue;
+
+        float s_a = station_s_of_u(u_a, sig, qa, qb, qc, r_inner, ring_span);
+        float s_b = station_s_of_u(u_b, sig, qa, qb, qc, r_inner, ring_span);
+        float s0 = clamp(min(s_a, s_b), cs, ce);
+        float s1 = clamp(max(s_a, s_b), cs, ce);
+        if (s1 <= s0 + 1e-7) continue;
+
+        accumulate_shadow_cell(s0, s1, 0.5 * (u_a + u_b), u_b - u_a, inv_sin_sun,
+                               cam_local_sph, ray_dir_sph, L_sun, phase_R, phase_M,
+                               beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                               inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                               T_run, delta_L, slice_total, total_blocked, step_count);
+    }
 }
 
 float map_t_to_s(float t, float s_start, float s_end, float s_min, float p) {
@@ -897,7 +1038,6 @@ void main() {
         if (cam_inside) {
             float cos_theta = clamp(dot(V, u_zenith), -1.0, 1.0);
             float theta = acos(cos_theta);
-
             float x_proj = dot(V, x_basis);
             float y_proj = dot(V, y_basis);
             float phi = atan(y_proj, x_proj);
@@ -984,6 +1124,14 @@ void main() {
         vec3 sun_pos_km = (u_num_stars > 0) ? ((u_stars_pos_radius[0].xyz - planet_center_render) * u_au_to_km) : vec3(0.0, 1.0, 0.0);
         vec3 L_cart = normalize(sun_pos_km);
         vec3 L_ring = normalize(vec3(dot(L_cart, p_right), dot(L_cart, p_up), dot(L_cart, p_fwd)));
+        // Phase functions are constant along the view ray: hoist out of the ring loop.
+        float cos_theta_sun = dot(normalize(ray_dir_sph), L_sun);
+        float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_sun * cos_theta_sun);
+        float g = clamp(u_mie_g, 0.0, 0.88);
+        float c1 = (u_precomp_mie.x > 1e-6) ? u_precomp_mie.x : ((3.0 / (8.0 * PI)) * ((1.0 - g * g) / (2.0 + g * g)));
+        float c2 = (u_precomp_mie.y > 1e-6) ? u_precomp_mie.y : (1.0 + g * g);
+        float c3 = (u_precomp_mie.z > 1e-6) ? u_precomp_mie.z : (2.0 * g);
+        float phase_M = c1 * (1.0 + cos_theta_sun * cos_theta_sun) / pow(max(1e-4, c2 - c3 * cos_theta_sun), 1.5);
 
         if (u_num_ring_planes > 0 && abs(L_ring.y) > 1e-5 && s_start < s_end) {
             // Project ray P(s) = C_ring + s*V_ring onto equatorial ring plane Y = 0 along sunlight vector L_ring:
@@ -1087,107 +1235,50 @@ void main() {
                                     T_run *= exp(-tau_gap);
                                 }
 
-                                // Continuous footprint-filtered depth slicing quadrature across the shadow interval [cs, ce]
-                                int num_quad_steps = clamp(u_atmo_slicing_steps > 0 ? u_atmo_slicing_steps : 8, 2, 32);
-                                float ds = (ce - cs) / float(num_quad_steps);
-
-                                float h_ep = max(0.0, length(cam_local_sph + cs * ray_dir_sph) - u_planet_radius_km);
-                                float rho_R_ep = exp(-h_ep * inv_h_rayleigh);
-                                float rho_M_ep = exp(-h_ep * inv_h_mie);
-                                float t_O3_ep  = (h_ep - u_ozone_peak_km) * inv_ozone_width;
-                                float rho_O3_ep = exp(-(t_O3_ep * t_O3_ep));
-
-                                for (int q = 0; q < num_quad_steps; q++) {
-                                    float s_prev_q = cs + float(q) * ds;
-                                    float s_next_q = cs + float(q + 1) * ds;
-                                    float sq = 0.5 * (s_prev_q + s_next_q);
-
-                                    vec3 Pq_sph = cam_local_sph + sq * ray_dir_sph;
-                                    float rq = length(Pq_sph);
-                                    float hq = max(0.0, rq - u_planet_radius_km);
-
-                                    float rho_R_mid  = exp(-hq * inv_h_rayleigh);
-                                    float rho_M_mid  = exp(-hq * inv_h_mie);
-                                    float t_O3_mid   = (hq - u_ozone_peak_km) * inv_ozone_width;
-                                    float rho_O3_mid = exp(-(t_O3_mid * t_O3_mid));
-
-                                    float h_en = max(0.0, length(cam_local_sph + s_next_q * ray_dir_sph) - u_planet_radius_km);
-                                    float rho_R_en = exp(-h_en * inv_h_rayleigh);
-                                    float rho_M_en = exp(-h_en * inv_h_mie);
-                                    float t_O3_en  = (h_en - u_ozone_peak_km) * inv_ozone_width;
-                                    float rho_O3_en = exp(-(t_O3_en * t_O3_en));
-
-                                    float rho_R_q  = (rho_R_ep + 4.0 * rho_R_mid + rho_R_en) / 6.0;
-                                    float rho_M_q  = (rho_M_ep + 4.0 * rho_M_mid + rho_M_en) / 6.0;
-                                    float rho_O3_q = (rho_O3_ep + 4.0 * rho_O3_mid + rho_O3_en) / 6.0;
-
-                                    rho_R_ep  = rho_R_en;
-                                    rho_M_ep  = rho_M_en;
-                                    rho_O3_ep = rho_O3_en;
-
-                                    vec3 ext_q = beta_R * rho_R_q + beta_M_ext * rho_M_q + beta_A_mixed * rho_R_q + beta_A_layered * rho_O3_q;
-                                    vec3 tau_step = ext_q * ds;
-                                    vec3 T_step = exp(-tau_step);
-                                    vec3 int_factor = (vec3(1.0) - T_step) / max(ext_q, vec3(1e-6));
-
-                                    // Footprint-filtered ring opacity across the step
-                                    vec3 P_prev = A + s_prev_q * B;
-                                    vec3 P_next = A + s_next_q * B;
-                                    vec3 P_mid  = A + sq * B;
-
-                                    float r_prev = length(P_prev.xz);
-                                    float r_next = length(P_next.xz);
-                                    float r_mid  = length(P_mid.xz);
-
-                                    float u_prev = (r_prev - r_inner) / ring_span;
-                                    float u_next = (r_next - r_inner) / ring_span;
-                                    float u_mid  = 0.5 * (u_prev + u_next);
-
-                                    float du = max(1e-5, abs(u_next - u_prev));
-                                    float lod = log2(max(1.0, du * 4096.0));
-
-                                    float ring_blocked = 0.0;
-                                    if (u_mid >= -0.05 && u_mid <= 1.05) {
-                                        float raw_a = textureLod(u_ring_shadow_tex, vec2(clamp(u_mid, 0.0, 1.0), 0.5), lod).a;
-                                        float tau_ring = -log(max(1e-4, 1.0 - raw_a));
-                                        ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
+                                // Station-locked slicing quadrature across the shadow interval [cs, ce].
+                                // Cell boundaries are fixed in ring coordinate u (CPU-baked by
+                                // bake_station_cells, edges snapped to ring profile discontinuities), so
+                                // every view ray samples the same ring features with the same weights:
+                                // the grid is phase-locked to the ring structure instead of the screen,
+                                // which removes the step banding of the old uniform-in-s slicing.
+                                if (qa > 1e-6) {
+                                    if (num_intervals == 2) {
+                                        // Chord crosses the inner hole: interval 0 is the incoming
+                                        // (sig = -1) branch, interval 1 the outgoing (sig = +1) branch.
+                                        int sig = (inv == 0) ? -1 : 1;
+                                        walk_station_branch(cs, ce, sig, qa, qb, qc, r_inner, ring_span, inv_sin_sun,
+                                                            cam_local_sph, ray_dir_sph, L_sun, phase_R, phase_M,
+                                                            beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                                            inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                                                            T_run, delta_L, slice_total, total_ring_blocked_accum, shadow_step_count);
+                                    } else {
+                                        // Apex inside the annulus: split the single interval at the apex
+                                        // into incoming (sig = -1) and outgoing (sig = +1) branches.
+                                        float s_apex = clamp(-qb / (2.0 * qa), cs, ce);
+                                        walk_station_branch(cs, s_apex, -1, qa, qb, qc, r_inner, ring_span, inv_sin_sun,
+                                                            cam_local_sph, ray_dir_sph, L_sun, phase_R, phase_M,
+                                                            beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                                            inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                                                            T_run, delta_L, slice_total, total_ring_blocked_accum, shadow_step_count);
+                                        walk_station_branch(s_apex, ce, 1, qa, qb, qc, r_inner, ring_span, inv_sin_sun,
+                                                            cam_local_sph, ray_dir_sph, L_sun, phase_R, phase_M,
+                                                            beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                                            inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                                                            T_run, delta_L, slice_total, total_ring_blocked_accum, shadow_step_count);
                                     }
-
-                                    // Note: Do not zero ring_blocked on the night side; if the parcel is in the
-                                    // shadow cone, multi-scattered light accumulated by the LUT must still be subtracted.
-
-                                    float light_cos_theta = dot(Pq_sph, L_sun) / rq;
-                                    float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
-                                    float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
-                                    float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
-                                    vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, light_cos_theta) : vec3(0.0);
-
-                                    float cos_theta_sun = dot(normalize(ray_dir_sph), L_sun);
-                                    float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_sun * cos_theta_sun);
-                                    float g = clamp(u_mie_g, 0.0, 0.88);
-                                    float c1 = (u_precomp_mie.x > 1e-6) ? u_precomp_mie.x : ((3.0 / (8.0 * PI)) * ((1.0 - g * g) / (2.0 + g * g)));
-                                    float c2 = (u_precomp_mie.y > 1e-6) ? u_precomp_mie.y : (1.0 + g * g);
-                                    float c3 = (u_precomp_mie.z > 1e-6) ? u_precomp_mie.z : (2.0 * g);
-                                    float phase_M = c1 * (1.0 + cos_theta_sun * cos_theta_sun) / pow(max(1e-4, c2 - c3 * cos_theta_sun), 1.5);
-
-                                    vec3 beta_M_sca = beta_M;
-                                    vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M_sca * rho_M_q * phase_M) * trans_to_sun * vis_fraction * u_star_color_irrad[0].rgb;
-
-                                    // Multi-scatter component matching sky_view_lut.frag line 209
-                                    float h_norm_q = clamp(hq / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
-                                    float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
-                                    float ms_v_q = sqrt(h_norm_q);
-                                    vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
-                                    vec3 inscatter_ms = u_star_color_irrad[0].rgb * (beta_R * rho_R_q + beta_M * rho_M_q) * psi_q;
-
-                                    vec3 step_inscatter = (inscatter_direct + inscatter_ms) * T_run * int_factor;
-
-                                    delta_L += step_inscatter * ring_blocked;
-                                    slice_total += step_inscatter;
-                                    total_ring_blocked_accum += ring_blocked;
-                                    shadow_step_count += 1.0;
-
-                                    T_run *= T_step;
+                                } else {
+                                    // Degenerate chord (view ray parallel to sunlight in the ring frame):
+                                    // u is constant along the interval — integrate with uniform steps at fixed u.
+                                    int K = clamp(u_ring_station_count, 2, 32);
+                                    float u_A = (length(A.xz) - r_inner) / ring_span;
+                                    float ds = (ce - cs) / float(K);
+                                    for (int q = 0; q < K; q++) {
+                                        accumulate_shadow_cell(cs + float(q) * ds, cs + float(q + 1) * ds, u_A, 1e-5, inv_sin_sun,
+                                                               cam_local_sph, ray_dir_sph, L_sun, phase_R, phase_M,
+                                                               beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                                               inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                                                               T_run, delta_L, slice_total, total_ring_blocked_accum, shadow_step_count);
+                                    }
                                 }
 
                                 prev_s = ce;

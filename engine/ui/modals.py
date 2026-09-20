@@ -29,7 +29,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
             if atmo_quality == 3:
                 slicing_steps = int(app.camera.get("atmo_slicing_steps", 8))
-                changed_ss, slicing_steps = imgui.slider_int("Depth Slicing Steps", slicing_steps, 2, 32)
+                changed_ss, slicing_steps = imgui.slider_int("Shadow Slicing Cells", slicing_steps, 2, 32)
                 if changed_ss:
                     app.camera["atmo_slicing_steps"] = slicing_steps
                     settings_changed = True
