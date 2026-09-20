@@ -70,6 +70,10 @@ vec3 get_transmittance(float r, float cos_theta) {
 void main() {
     float D = length(u_cam_pos);
     vec3 u_zenith = u_cam_pos / max(D, 1e-6);
+    float D_clamped = max(D, u_planet_radius_km);
+    bool cam_inside = (D <= u_atmo_radius_km);
+    float D_lut = cam_inside ? D_clamped : min(D_clamped, u_atmo_radius_km * 2.0);
+    vec3 cam_pos_lut = u_zenith * D_lut;
     vec3 L_sun = normalize(u_sun_dir);
 
     // Build continuous orthonormal basis aligned with local Zenith and Sun Azimuth
@@ -91,10 +95,8 @@ void main() {
     float theta = 0.0;
     bool hits_ground = false;
 
-    bool cam_inside = (D <= u_atmo_radius_km);
-
     if (cam_inside) {
-        float sin_horizon = clamp(u_planet_radius_km / D, 0.0, 1.0);
+        float sin_horizon = clamp(u_planet_radius_km / D_clamped, 0.0, 1.0);
         float theta_horizon = PI - asin(sin_horizon);
 
         if (f_uv.y <= 0.5) {
@@ -112,21 +114,22 @@ void main() {
         }
     } else {
         // Space observer: looking towards planet Nadir
-        float sin_planet = clamp(u_planet_radius_km / D, 0.0, 1.0);
-        float sin_atmo = clamp(u_atmo_radius_km / D, 0.0, 1.0);
-        float alpha_planet = asin(sin_planet);
-        float alpha_atmo = asin(sin_atmo);
+        // Use stable reference distance D_lut to evaluate sine angles without float32 cancellation
+        float sin_planet = clamp(u_planet_radius_km / D_lut, 0.0, 1.0);
+        float sin_atmo = clamp(u_atmo_radius_km / D_lut, 0.0, 1.0);
 
         if (f_uv.y <= 0.5) {
-            // Ground disk: alpha in [0, alpha_planet]
+            // Ground disk: impact parameter r_ca in [0, R_planet]
             float t = (0.5 - f_uv.y) / 0.5;
-            float alpha = alpha_planet * (1.0 - t * t);
+            float sin_alpha = sin_planet * (1.0 - t * t);
+            float alpha = asin(clamp(sin_alpha, 0.0, 1.0));
             theta = PI - alpha;
             hits_ground = true;
         } else {
-            // Atmosphere limb: alpha in [alpha_planet, alpha_atmo]
+            // Atmosphere limb: impact parameter r_ca in [R_planet, R_atmo]
             float t = (f_uv.y - 0.5) / 0.5;
-            float alpha = alpha_planet + (t * t) * (alpha_atmo - alpha_planet);
+            float sin_alpha = sin_planet + (t * t) * (sin_atmo - sin_planet);
+            float alpha = asin(clamp(sin_alpha, 0.0, 1.0));
             theta = PI - alpha;
             hits_ground = false;
         }
@@ -135,7 +138,7 @@ void main() {
     vec3 V = normalize(sin(theta) * (cos(phi) * x_basis + sin(phi) * y_basis) + cos(theta) * u_zenith);
 
     // Atmospheric bounding shell intersection
-    vec2 t_atmo = raySphereIntersect(u_cam_pos, V, u_atmo_radius_km);
+    vec2 t_atmo = raySphereIntersect(cam_pos_lut, V, u_atmo_radius_km);
     if (t_atmo.y < 0.0) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
         out_transmittance = vec4(1.0);
@@ -146,9 +149,11 @@ void main() {
     float s_end = t_atmo.y;
 
     if (hits_ground) {
-        vec2 t_planet = raySphereIntersect(u_cam_pos, V, u_planet_radius_km);
+        vec2 t_planet = raySphereIntersect(cam_pos_lut, V, u_planet_radius_km);
         if (t_planet.x > 0.0) {
             s_end = min(s_end, t_planet.x);
+        } else {
+            s_end = 0.0;
         }
     }
 
@@ -181,7 +186,7 @@ void main() {
 
     for (int i = 0; i < NUM_STEPS; i++) {
         float s = s_start + (float(i) + 0.5) * ds;
-        vec3 P = u_cam_pos + s * V;
+        vec3 P = cam_pos_lut + s * V;
         float r = length(P);
         float altitude = max(0.0, r - u_planet_radius_km);
 

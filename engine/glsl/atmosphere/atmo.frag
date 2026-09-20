@@ -534,7 +534,17 @@ void main() {
             float h = r_cam - local_refract_radius;
             if (h < u_refract_scale_height * 15.0) {
                 float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
-                float max_terr_alpha = min(0.05, 0.5 * u_refract_max_bend * density);
+
+                // Physical geodetic coefficient of terrestrial refraction: k = (R / H) * (n_0 - 1)
+                // Derived algebraically from u_refract_max_bend = 2 * (n_0 - 1) * sqrt(pi * R / (2H)):
+                float k_refr = u_refract_max_bend * 0.5 * sqrt((2.0 * local_refract_radius) / max(1e-4, 3.141592653589793 * u_refract_scale_height));
+
+                // Horizon dip angle theta_dip = sqrt(2 * h_eff / R)
+                float h_eff = max(h, 0.002); // Minimum 2 meters eye level for landed observer
+                float theta_dip_eff = sqrt(2.0 * h_eff / local_refract_radius);
+
+                // Physical terrestrial horizon refraction angle: Delta_theta = 0.5 * k * density * theta_dip
+                float max_terr_alpha = clamp(0.5 * k_refr * density * theta_dip_eff, 0.0, 0.05);
 
                 if (max_terr_alpha > 1e-7) {
                     float mu = dot(view_ray, local_up);
@@ -630,7 +640,18 @@ void main() {
     vec2 s_atmo = raySphereIntersect(cam_local_sph, ray_dir_sph, u_atmo_radius_km);
     if (s_atmo.x > s_atmo.y) discard;
 
-    vec2 s_planet = raySphereIntersect(cam_local_sph, ray_dir_sph, u_planet_clip_km);
+    // Clamped camera distance for analytical planet intersection.
+    // Clamping to slightly outside the sphere (1e-4 km = 10 cm) ensures landed origins
+    // do not produce negative entry roots (t1 <= 0) when intersecting the planet.
+    float dist_to_planet_center_km = length(cam_local_sph);
+    vec3 cam_pos_eff = cam_local_sph;
+    if (dist_to_planet_center_km < u_planet_radius_km + 1e-4) {
+        cam_pos_eff = (dist_to_planet_center_km > 1e-4)
+            ? (cam_local_sph * ((u_planet_radius_km + 1e-4) / dist_to_planet_center_km))
+            : vec3(0.0, u_planet_radius_km + 1e-4, 0.0);
+    }
+
+    vec2 s_planet = raySphereIntersect(cam_pos_eff, ray_dir_sph, u_planet_clip_km);
 
     float s_start = max(0.0, s_atmo.x);
     float s_end = s_atmo.y;
@@ -733,13 +754,16 @@ void main() {
                 float s_depth = (scene_clip_z * u_au_to_km) / cos_angle;
                 s_depth -= ray_shift_au * u_au_to_km; // Convert from camera-relative to O_local_km relative
 
-                // Float32 depth buffers and absolute distance calculations are heavily quantized at large distances.
-                // Since the planet and rings already provide perfectly smooth analytical intersection bounds (s_end),
-                // we ONLY clamp to the depth buffer if it represents a distinct non-analytical object (e.g. spacecraft)
-                // clearly in front of the planet. This completely eliminates depth-buffer banding on the planet surface!
-                float error_margin = dist_to_center * 2500.0;
-                if (s_depth < s_end - error_margin) {
-                    s_end = s_depth;
+                // Only clamp and mark surface hit if the depth belongs to a local object within the planet's atmospheric envelope.
+                // Celestial objects (Sun at 1 AU, distant stars, other bodies) are far beyond max_local_ground_s
+                // and must NOT clamp s_end or set hits_surface, allowing atmospheric sunset extinction to apply.
+                float max_local_ground_s = length(cam_local_sph) + u_atmo_radius_km + 100.0;
+                if (s_depth <= max_local_ground_s) {
+                    float error_margin = dist_to_center * 2500.0;
+                    if (s_depth < s_end - error_margin) {
+                        s_end = s_depth;
+                        hits_surface = true;
+                    }
                 }
             }
         }
@@ -842,6 +866,7 @@ void main() {
         vec3 true_cam_sph_km = toSphericalSpace(true_cam_local_km, u_pole_obl);
         float D = length(true_cam_sph_km);
         vec3 u_zenith = true_cam_sph_km / max(D, 1e-6);
+        float D_eff = max(D, u_planet_radius_km);
 
         // Primary sunlight direction in spherical frame
         vec3 L_sun = (u_num_stars > 0) ? normalize(u_star_dir_sph_eff[0].xyz) : vec3(0.0, 1.0, 0.0);
@@ -863,55 +888,67 @@ void main() {
         vec3 y_basis = cross(u_zenith, x_basis);
 
         vec3 V = normalize(ray_dir_sph);
-        float cos_theta = clamp(dot(V, u_zenith), -1.0, 1.0);
-        float theta = acos(cos_theta);
-
-        float x_proj = dot(V, x_basis);
-        float y_proj = dot(V, y_basis);
-        float phi = atan(y_proj, x_proj);
-        if (phi < 0.0) phi += 2.0 * PI;
-        float u_lut = phi / (2.0 * PI);
-
+        float u_lut = 0.0;
         float v_lut = 0.0;
         bool cam_inside = (D <= u_atmo_radius_km);
-        bool is_ground = hits_surface;
+        bool is_ground = false;
         float t_limb = 0.0;
 
         if (cam_inside) {
-            float sin_horizon = clamp(u_planet_radius_km / D, 0.0, 1.0);
+            float cos_theta = clamp(dot(V, u_zenith), -1.0, 1.0);
+            float theta = acos(cos_theta);
+
+            float x_proj = dot(V, x_basis);
+            float y_proj = dot(V, y_basis);
+            float phi = atan(y_proj, x_proj);
+            if (phi < 0.0) phi += 2.0 * PI;
+            u_lut = phi / (2.0 * PI);
+
+            float sin_horizon = clamp(u_planet_radius_km / D_eff, 0.0, 1.0);
             float theta_horizon = PI - asin(sin_horizon);
 
-            if (is_ground) {
+            if (hits_surface) {
                 // Ground disk: [theta_horizon, PI]
                 float theta_clamped = max(theta, theta_horizon);
                 float t = sqrt(clamp((theta_clamped - theta_horizon) / max(1e-5, PI - theta_horizon), 0.0, 1.0));
                 v_lut = 0.5 * (1.0 - t);
                 v_lut = clamp(v_lut, 0.5 / 256.0, 127.5 / 256.0);
+                is_ground = true;
             } else {
                 // Sky dome: [0, theta_horizon]
+                // For rays near or below the geometric horizon looking at the sky / setting sun,
+                // clamp to theta_horizon to sample the tangent atmospheric path with maximum sunset extinction.
                 float theta_clamped = min(theta, theta_horizon);
                 float t = sqrt(clamp((theta_horizon - theta_clamped) / max(1e-5, theta_horizon), 0.0, 1.0));
                 v_lut = 0.5 + 0.5 * t;
                 v_lut = clamp(v_lut, 128.5 / 256.0, 255.5 / 256.0);
+                is_ground = false;
             }
         } else {
-            // Space observer: looking towards planet Nadir
-            float sin_planet = clamp(u_planet_radius_km / D, 0.0, 1.0);
-            float sin_atmo = clamp(u_atmo_radius_km / D, 0.0, 1.0);
-            float alpha_planet = asin(sin_planet);
-            float alpha_atmo = asin(sin_atmo);
-            float alpha = PI - theta; // Angular distance from nadir
+            // Space observer: compute stable impact parameter from local sphere-centered ray
+            // cam_local_sph is already anchored near the planet (~2 bounding radii away)
+            float t_ca = -dot(cam_local_sph, V);
+            vec3 P_ca = cam_local_sph + t_ca * V;
+            float r_ca = length(P_ca);
 
+            // Project P_ca onto view plane basis for azimuth phi (in kilometers, immune to float32 cancellation)
+            float x_proj_ca = dot(P_ca, x_basis);
+            float y_proj_ca = dot(P_ca, y_basis);
+            float phi_ca = (r_ca > 1e-4) ? atan(y_proj_ca, x_proj_ca) : 0.0;
+            if (phi_ca < 0.0) phi_ca += 2.0 * PI;
+            u_lut = phi_ca / (2.0 * PI);
+
+            is_ground = (r_ca <= u_planet_radius_km) || hits_surface;
             if (is_ground) {
-                // Ground disk: [0, alpha_planet]
-                float alpha_clamped = min(alpha, alpha_planet);
-                float t = sqrt(clamp((alpha_planet - alpha_clamped) / max(1e-5, alpha_planet), 0.0, 1.0));
+                // Ground disk: r_ca in [0, R_planet]
+                float r_clamped = min(r_ca, u_planet_radius_km);
+                float t = sqrt(clamp(1.0 - r_clamped / max(1e-3, u_planet_radius_km), 0.0, 1.0));
                 v_lut = 0.5 * (1.0 - t);
                 v_lut = clamp(v_lut, 0.5 / 256.0, 127.5 / 256.0);
             } else {
-                // Atmosphere limb: [alpha_planet, alpha_atmo]
-                float alpha_clamped = clamp(alpha, alpha_planet, alpha_atmo);
-                float t = sqrt(clamp((alpha_clamped - alpha_planet) / max(1e-5, alpha_atmo - alpha_planet), 0.0, 1.0));
+                // Atmosphere limb: r_ca in [R_planet, R_atmo]
+                float r_clamped = clamp(r_ca, u_planet_radius_km, u_atmo_radius_km);
+                float t = sqrt(clamp((r_clamped - u_planet_radius_km) / max(1e-3, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0));
                 t_limb = t;
                 v_lut = 0.5 + 0.5 * t;
                 v_lut = clamp(v_lut, 128.5 / 256.0, 255.5 / 256.0);
@@ -1125,7 +1162,7 @@ void main() {
                                     float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
                                     vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, light_cos_theta) : vec3(0.0);
 
-                                    float cos_theta_sun = dot(ray_dir_sph, L_sun);
+                                    float cos_theta_sun = dot(normalize(ray_dir_sph), L_sun);
                                     float phase_R = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_sun * cos_theta_sun);
                                     float g = clamp(u_mie_g, 0.0, 0.88);
                                     float c1 = (u_precomp_mie.x > 1e-6) ? u_precomp_mie.x : ((3.0 / (8.0 * PI)) * ((1.0 - g * g) / (2.0 + g * g)));

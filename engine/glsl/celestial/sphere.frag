@@ -307,7 +307,17 @@ void main() {
             float h = r_cam - local_refract_radius;
             if (h < u_refract_scale_height * 15.0) {
                 float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
-                float max_terr_alpha = min(0.05, 0.5 * u_refract_max_bend * density);
+
+                // Physical geodetic coefficient of terrestrial refraction: k = (R / H) * (n_0 - 1)
+                // Derived algebraically from u_refract_max_bend = 2 * (n_0 - 1) * sqrt(pi * R / (2H)):
+                float k_refr = u_refract_max_bend * 0.5 * sqrt((2.0 * local_refract_radius) / max(1e-4, 3.141592653589793 * u_refract_scale_height));
+
+                // Horizon dip angle theta_dip = sqrt(2 * h_eff / R)
+                float h_eff = max(h, 0.002); // Minimum 2 meters eye level for landed observer
+                float theta_dip_eff = sqrt(2.0 * h_eff / local_refract_radius);
+
+                // Physical terrestrial horizon refraction angle: Delta_theta = 0.5 * k * density * theta_dip
+                float max_terr_alpha = clamp(0.5 * k_refr * density * theta_dip_eff, 0.0, 0.05);
                 
                 if (max_terr_alpha > 1e-7) {
                     float mu = dot(view_ray, local_up);

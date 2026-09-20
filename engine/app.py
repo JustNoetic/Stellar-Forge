@@ -5253,7 +5253,7 @@ class App(InputHandlerMixin):
                         # toSphericalSpace of L
                         _p_proj = float(np.dot(_L_star, _p_pole_norm))
                         _p_perp = _L_star - _p_proj * _p_pole_norm
-                        _s_dir_sph = _p_perp * f_scale + _p_proj * _p_pole_norm
+                        _s_dir_sph = _p_perp + (_p_proj * f_scale) * _p_pole_norm
                         _s_dir_sph_len = float(np.linalg.norm(_s_dir_sph))
                         _s_dir_sph = _s_dir_sph / _s_dir_sph_len if _s_dir_sph_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
@@ -5534,18 +5534,7 @@ class App(InputHandlerMixin):
                         return True
                 return False
 
-            ringed_atmos = [a for a in sorted_atmos if _body_needs_ring_clip(a)]
-            ringless_atmos = [a for a in sorted_atmos if not _body_needs_ring_clip(a)]
-
-            # --- Pass 1: Atmosphere behind rings ---
-            _gq = _perf_gpu_begin(ctx, "gpu_atmo_behind")
-            if ringed_atmos:
-                execute_atmosphere_pass(1, ringed_atmos)
-            _perf_gpu_end(_gq)
-    
-            # --- Render Rings ---
-            _gq = _perf_gpu_begin(ctx, "gpu_rings")
-            if ring_render_groups or (self.comparison_enabled and self.ring_render_groups_cmp):
+            def render_single_ring_group(group, is_cmp=False):
                 ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -5556,182 +5545,178 @@ class App(InputHandlerMixin):
                     u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
                 ring_gradient_tex.use(location=0)
                 
-                if ring_render_groups:
-                    for group in ring_render_groups:
-                        bi = group['body_idx']
-                        body_pos_rel = pos_rel_all[bi]
-                        u_ring_body_offset.write(body_pos_rel)
-                        u_ring_host_pos.write(body_pos_rel)
-                        u_ring_host_radius.value = float(body_radii[bi])
-                        if u_ring_host_color is not None:
-                            u_ring_host_color.value = tuple(float(c) for c in body_colors[bi])
-                        f = float(all_instances[bi, 12])
-                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
-                        u_ring_host_pole_obl.value = (
-                            float(all_instances[bi, 9]),
-                            float(all_instances[bi, 10]),
-                            float(all_instances[bi, 11]),
-                            float(f_scale)
-                        )
-                        
-                        pos_host = pos_rel_all[bi]
-                        r_eq = float(body_radii[bi])
-                        pole = all_instances[bi, 9:12]
-                        pos_star = pos_rel_all[star_idx]
-                        to_star = pos_star - pos_host
-                        dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                        if dist_s > 1e-6:
-                            L = to_star / dist_s
+                bi = group['body_idx']
+                if not is_cmp:
+                    body_pos_rel = pos_rel_all[bi]
+                    u_ring_body_offset.write(body_pos_rel)
+                    u_ring_host_pos.write(body_pos_rel)
+                    u_ring_host_radius.value = float(body_radii[bi])
+                    if u_ring_host_color is not None:
+                        u_ring_host_color.value = tuple(float(c) for c in body_colors[bi])
+                    f = float(all_instances[bi, 12])
+                    f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+                    u_ring_host_pole_obl.value = (
+                        float(all_instances[bi, 9]),
+                        float(all_instances[bi, 10]),
+                        float(all_instances[bi, 11]),
+                        float(f_scale)
+                    )
+                    
+                    pos_host = pos_rel_all[bi]
+                    r_eq = float(body_radii[bi])
+                    pole = all_instances[bi, 9:12]
+                    pos_star = pos_rel_all[star_idx]
+                    to_star = pos_star - pos_host
+                    dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                    if dist_s > 1e-6:
+                        L = to_star / dist_s
+                    else:
+                        L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    p_dot_L = np.dot(pole, L)
+                    p_proj_sq = 1.0 - p_dot_L**2
+                    f_factor = 1.0 - f
+                    host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                    if u_ring_host_R_minor is not None:
+                        u_ring_host_R_minor.value = float(host_r_minor)
+                    if u_ring_host_atmo is not None:
+                        atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
+                        if atmo is not None:
+                            props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
+                            scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                            # ring.frag's casterShadowTerm expects the plain vertical
+                            # optical depth (it applies the grazing factor internally).
+                            _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                            u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
+                            if u_ring_host_refractivity is not None:
+                                u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
+                            if u_ring_host_max_bend is not None:
+                                u_ring_host_max_bend.value = compute_max_bend(body_radii[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
                         else:
-                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                        p_dot_L = np.dot(pole, L)
-                        p_proj_sq = 1.0 - p_dot_L**2
-                        f_factor = 1.0 - f
-                        host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
-                        if u_ring_host_R_minor is not None:
-                            u_ring_host_R_minor.value = float(host_r_minor)
-                        if u_ring_host_atmo is not None:
-                            atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
-                            if atmo is not None:
-                                props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
-                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                                # ring.frag's casterShadowTerm expects the plain vertical
-                                # optical depth (it applies the grazing factor internally).
-                                _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                                u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
-                                if u_ring_host_refractivity is not None:
-                                    u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
-                                if u_ring_host_max_bend is not None:
-                                    u_ring_host_max_bend.value = compute_max_bend(body_radii[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
-                            else:
-                                u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
-                                if u_ring_host_refractivity is not None:
-                                    u_ring_host_refractivity.value = 0.0
-                                if u_ring_host_max_bend is not None:
-                                    u_ring_host_max_bend.value = 0.0
-                        k = self.body_ring_indices.get(bi)
-                        if k is not None:
-                            u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
-                            u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
-                        
-                        body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
-                        prog_rings['u_num_ring_planes'].value = len(body_rings)
-                        b_name = bodies_data[bi]['name']
-                        name_lower = b_name.lower()
-                        is_textured = name_lower in self.ring_textures
-                        if 'u_is_textured' in prog_rings:
-                            prog_rings['u_is_textured'].value = is_textured
-                        if is_textured:
-                            if name_lower in self.ring_gl_textures:
-                                self.ring_gl_textures[name_lower].use(location=4)
-                        for idx, r in enumerate(body_rings):
-                            if idx >= 16: break
-                            prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
-                            prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
-                            prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
-                            prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
-                            prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
-                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
-                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
-                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
-                            prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
-                            prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
-                            prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
-                            prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
-                            prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
-                            prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
-                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
-                
-                if self.comparison_enabled and self.ring_render_groups_cmp:
-                    for group in self.ring_render_groups_cmp:
-                        bi = group['body_idx']
-                        body_pos_rel = cmp_pos_rel[bi].astype('f4')
-                        u_ring_body_offset.write(body_pos_rel)
-                        u_ring_host_pos.write(body_pos_rel)
-                        u_ring_host_radius.value = float(self.body_radii_cmp[bi])
-                        if u_ring_host_color is not None:
-                            u_ring_host_color.value = tuple(float(c) for c in self.body_colors_cmp[bi])
-                        
-                        body_idx_in_unified = num_bodies + bi
-                        f = float(all_instances[body_idx_in_unified, 12])
-                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
-                        u_ring_host_pole_obl.value = (
-                            float(all_instances[body_idx_in_unified, 9]),
-                            float(all_instances[body_idx_in_unified, 10]),
-                            float(all_instances[body_idx_in_unified, 11]),
-                            float(f_scale)
-                        )
-                        
-                        pos_host = cmp_pos_rel[bi]
-                        r_eq = float(self.body_radii_cmp[bi])
-                        pole = all_instances[body_idx_in_unified, 9:12]
-                        pos_star = cmp_pos_rel[self.star_idx_cmp]
-                        to_star = pos_star - pos_host
-                        dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                        if dist_s > 1e-6:
-                            L = to_star / dist_s
+                            u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                            if u_ring_host_refractivity is not None:
+                                u_ring_host_refractivity.value = 0.0
+                            if u_ring_host_max_bend is not None:
+                                u_ring_host_max_bend.value = 0.0
+                    k = self.body_ring_indices.get(bi)
+                    if k is not None:
+                        u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
+                        u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
+                    
+                    body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                    prog_rings['u_num_ring_planes'].value = len(body_rings)
+                    b_name = bodies_data[bi]['name']
+                    name_lower = b_name.lower()
+                    is_textured = name_lower in self.ring_textures
+                    if 'u_is_textured' in prog_rings:
+                        prog_rings['u_is_textured'].value = is_textured
+                    if is_textured:
+                        if name_lower in self.ring_gl_textures:
+                            self.ring_gl_textures[name_lower].use(location=4)
+                    for idx, r in enumerate(body_rings):
+                        if idx >= 16: break
+                        prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
+                        prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
+                        prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
+                        prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
+                        prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                        prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                        prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
+                        prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
+                        prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                        prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                        prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                        prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                        prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                        prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
+                    group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+                else:
+                    body_pos_rel = cmp_pos_rel[bi].astype('f4')
+                    u_ring_body_offset.write(body_pos_rel)
+                    u_ring_host_pos.write(body_pos_rel)
+                    u_ring_host_radius.value = float(self.body_radii_cmp[bi])
+                    if u_ring_host_color is not None:
+                        u_ring_host_color.value = tuple(float(c) for c in self.body_colors_cmp[bi])
+                    
+                    body_idx_in_unified = num_bodies + bi
+                    f = float(all_instances[body_idx_in_unified, 12])
+                    f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+                    u_ring_host_pole_obl.value = (
+                        float(all_instances[body_idx_in_unified, 9]),
+                        float(all_instances[body_idx_in_unified, 10]),
+                        float(all_instances[body_idx_in_unified, 11]),
+                        float(f_scale)
+                    )
+                    
+                    pos_host = cmp_pos_rel[bi]
+                    r_eq = float(self.body_radii_cmp[bi])
+                    pole = all_instances[body_idx_in_unified, 9:12]
+                    pos_star = cmp_pos_rel[self.star_idx_cmp]
+                    to_star = pos_star - pos_host
+                    dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                    if dist_s > 1e-6:
+                        L = to_star / dist_s
+                    else:
+                        L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    p_dot_L = np.dot(pole, L)
+                    p_proj_sq = 1.0 - p_dot_L**2
+                    f_factor = 1.0 - f
+                    host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                    if u_ring_host_R_minor is not None:
+                        u_ring_host_R_minor.value = float(host_r_minor)
+                    if u_ring_host_atmo is not None:
+                        atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
+                        if atmo is not None:
+                            props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
+                            scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                            # ring.frag's casterShadowTerm expects the plain vertical
+                            # optical depth (it applies the grazing factor internally).
+                            _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                            u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
+                            if u_ring_host_refractivity is not None:
+                                u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
+                            if u_ring_host_max_bend is not None:
+                                u_ring_host_max_bend.value = compute_max_bend(self.body_radii_cmp[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
                         else:
-                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                        p_dot_L = np.dot(pole, L)
-                        p_proj_sq = 1.0 - p_dot_L**2
-                        f_factor = 1.0 - f
-                        host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
-                        if u_ring_host_R_minor is not None:
-                            u_ring_host_R_minor.value = float(host_r_minor)
-                        if u_ring_host_atmo is not None:
-                            atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
-                            if atmo is not None:
-                                props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
-                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                                # ring.frag's casterShadowTerm expects the plain vertical
-                                # optical depth (it applies the grazing factor internally).
-                                _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                                u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
-                                if u_ring_host_refractivity is not None:
-                                    u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
-                                if u_ring_host_max_bend is not None:
-                                    u_ring_host_max_bend.value = compute_max_bend(self.body_radii_cmp[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
-                            else:
-                                u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
-                                if u_ring_host_refractivity is not None:
-                                    u_ring_host_refractivity.value = 0.0
-                                if u_ring_host_max_bend is not None:
-                                    u_ring_host_max_bend.value = 0.0
-                        u_ring_caster_mask_lo_uni.value = 0
-                        u_ring_caster_mask_hi_uni.value = 0
-                        body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
-                        prog_rings['u_num_ring_planes'].value = len(body_rings)
-                        b_name = self.bodies_data_cmp[bi]['name']
-                        name_lower = b_name.lower()
-                        is_textured = name_lower in self.ring_textures
-                        if 'u_is_textured' in prog_rings:
-                            prog_rings['u_is_textured'].value = is_textured
-                        if is_textured:
-                            if name_lower in self.ring_gl_textures:
-                                self.ring_gl_textures[name_lower].use(location=4)
-                        for idx, r in enumerate(body_rings):
-                            if idx >= 16: break
-                            prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
-                            prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
-                            prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
-                            prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
-                            prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
-                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
-                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
-                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
-                            prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
-                            prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
-                            prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
-                            prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
-                            prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
-                            prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
-                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+                            u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                            if u_ring_host_refractivity is not None:
+                                u_ring_host_refractivity.value = 0.0
+                            if u_ring_host_max_bend is not None:
+                                u_ring_host_max_bend.value = 0.0
+                    u_ring_caster_mask_lo_uni.value = 0
+                    u_ring_caster_mask_hi_uni.value = 0
+                    body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                    prog_rings['u_num_ring_planes'].value = len(body_rings)
+                    b_name = self.bodies_data_cmp[bi]['name']
+                    name_lower = b_name.lower()
+                    is_textured = name_lower in self.ring_textures
+                    if 'u_is_textured' in prog_rings:
+                        prog_rings['u_is_textured'].value = is_textured
+                    if is_textured:
+                        if name_lower in self.ring_gl_textures:
+                            self.ring_gl_textures[name_lower].use(location=4)
+                    for idx, r in enumerate(body_rings):
+                        if idx >= 16: break
+                        prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
+                        prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
+                        prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
+                        prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
+                        prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                        prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                        prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
+                        prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
+                        prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                        prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                        prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                        prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                        prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                        prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
+                    group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+
                 ctx.depth_mask = True
-            _perf_gpu_end(_gq)
-            
-            # Render Habitable Zone Visualizer
-            _gq = _perf_gpu_begin(ctx, "gpu_hz")
-            if self.camera.get("show_habitable_zone", False) and self.hz_vao is not None:
+
+            def render_habitable_zone():
+                if not (self.camera.get("show_habitable_zone", False) and self.hz_vao is not None):
+                    return
                 ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
@@ -5776,14 +5761,66 @@ class App(InputHandlerMixin):
                 
                 ctx.depth_mask = True
                 ctx.disable(moderngl.BLEND)
-            _perf_gpu_end(_gq)
-    
-            # --- Pass 2: Atmosphere in front of rings & ringless bodies ---
-            _gq = _perf_gpu_begin(ctx, "gpu_atmo_front")
-            if ringed_atmos:
-                execute_atmosphere_pass(2, ringed_atmos)
-            if ringless_atmos:
-                execute_atmosphere_pass(0, ringless_atmos)
+
+            # Assemble unified back-to-front queue of all transparent objects (atmospheres, rings, and habitable zone)
+            atmos_by_key = {(a['body_idx'], is_cmp): (sq_dist, a, is_cmp) for sq_dist, a, is_cmp in sorted_atmos}
+            rings_by_key = {}
+            if ring_render_groups:
+                for g in ring_render_groups:
+                    rings_by_key.setdefault((g['body_idx'], False), []).append(g)
+            if self.comparison_enabled and getattr(self, 'ring_render_groups_cmp', None):
+                for g in self.ring_render_groups_cmp:
+                    rings_by_key.setdefault((g['body_idx'], True), []).append(g)
+
+            all_trans_keys = list(set(atmos_by_key.keys()) | set(rings_by_key.keys()))
+
+            def _get_key_sq_dist(key):
+                if key in atmos_by_key:
+                    return atmos_by_key[key][0]
+                _bi, _is_c = key
+                _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                return float((_pos[0] - cam_pos[0])**2 + (_pos[1] - cam_pos[1])**2 + (_pos[2] - cam_pos[2])**2)
+
+            sorted_trans_keys = sorted(all_trans_keys, key=_get_key_sq_dist, reverse=True)
+
+            # Insert Habitable Zone visualizer at star distance if active
+            has_hz = self.camera.get("show_habitable_zone", False) and self.hz_vao is not None
+            if has_hz:
+                star_pos = pos_rel_all[star_idx]
+                star_sq_dist = float((star_pos[0] - cam_pos[0])**2 + (star_pos[1] - cam_pos[1])**2 + (star_pos[2] - cam_pos[2])**2)
+                ins_idx = len(sorted_trans_keys)
+                for i_k, k_item in enumerate(sorted_trans_keys):
+                    if _get_key_sq_dist(k_item) < star_sq_dist:
+                        ins_idx = i_k
+                        break
+                sorted_trans_keys.insert(ins_idx, ('__hz__', False))
+
+            # Render all transparent passes back-to-front
+            _gq = _perf_gpu_begin(ctx, "gpu_transparents")
+            for key in sorted_trans_keys:
+                if key[0] == '__hz__':
+                    render_habitable_zone()
+                    continue
+
+                _bi, _is_c = key
+                atmo_entry = atmos_by_key.get(key)
+                body_ring_groups = rings_by_key.get(key, [])
+
+                if atmo_entry is not None and body_ring_groups:
+                    if _body_needs_ring_clip(atmo_entry):
+                        execute_atmosphere_pass(1, [atmo_entry])
+                        for rg in body_ring_groups:
+                            render_single_ring_group(rg, is_cmp=_is_c)
+                        execute_atmosphere_pass(2, [atmo_entry])
+                    else:
+                        execute_atmosphere_pass(0, [atmo_entry])
+                        for rg in body_ring_groups:
+                            render_single_ring_group(rg, is_cmp=_is_c)
+                elif atmo_entry is not None:
+                    execute_atmosphere_pass(0, [atmo_entry])
+                elif body_ring_groups:
+                    for rg in body_ring_groups:
+                        render_single_ring_group(rg, is_cmp=_is_c)
             _perf_gpu_end(_gq)
 
             # Update temporal reprojection history state for next frame
