@@ -609,20 +609,26 @@ def bake_station_cells(alpha_prof, max_cells=32, jump_thresh=0.10, sigma_texels=
                 break
         bounds.sort()
 
-    # Fill remaining budget: split the highest-mass segment at its mass-weighted median.
+    # Fill remaining budget: split the highest-mass segment at its mass-weighted median
+    # (geometric midpoint when the segment has no gradient mass). Only segments wider
+    # than two texels are splittable, so the bound count strictly increases.
     bounds = [0.0] + bounds + [1.0]
     while len(bounds) < max_cells + 1:
-        masses = []
-        for a_, b_ in zip(bounds[:-1], bounds[1:]):
-            i0, i1 = int(a_ * n), max(int(b_ * n), int(a_ * n) + 1)
-            masses.append(float(mass[i0:i1].sum()))
+        cand = [(i, a_, b_) for i, (a_, b_) in enumerate(zip(bounds[:-1], bounds[1:]))
+                if b_ - a_ > 2.0 / n]
+        if not cand:
+            break
+        masses = np.array([float(mass[int(a_ * n):max(int(b_ * n), int(a_ * n) + 1)].sum())
+                           for _, a_, b_ in cand])
         j = int(np.argmax(masses))
-        a_, b_ = bounds[j], bounds[j + 1]
+        if masses[j] <= 1e-12:
+            j = int(np.argmax([b_ - a_ for _, a_, b_ in cand]))
+        i_seg, a_, b_ = cand[j]
         i0, i1 = int(a_ * n), max(int(b_ * n), int(a_ * n) + 1)
         cum = np.cumsum(mass[i0:i1])
-        med = i0 + int(np.searchsorted(cum, cum[-1] * 0.5))
+        med = (i0 + i1) // 2 if cum[-1] <= 1e-12 else i0 + int(np.searchsorted(cum, cum[-1] * 0.5))
         nb = float(np.clip((med + 0.5) / n, a_ + 1.0 / n, b_ - 1.0 / n))
-        bounds = bounds[:j + 1] + [nb] + bounds[j + 1:]
+        bounds = bounds[:i_seg + 1] + [nb] + bounds[i_seg + 1:]
 
     return np.array(sorted(np.clip(bounds, 0.0, 1.0)))
 
