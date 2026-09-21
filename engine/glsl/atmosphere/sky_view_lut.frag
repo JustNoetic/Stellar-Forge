@@ -51,6 +51,8 @@ uniform vec3 u_sun_dir; // Sunlight direction in planet local frame (normalized)
 uniform sampler2D u_transmittance_lut;
 uniform sampler2D u_multi_scatter_lut;
 
+#include "common/sun_terminator.glsl"
+
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
     float b = dot(origin, dir);
     float c = dot(origin, origin) - radius * radius;
@@ -215,8 +217,12 @@ void main() {
         float sin_planet = u_planet_radius_km / max(r, u_planet_radius_km + 0.01);
         float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
 
-        float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
-        vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(r, light_cos_theta) : vec3(0.0);
+        // Terminator: stellar-disc rise/set with refraction-extended penumbra
+        // (eff_star_rad = sin_star + max_bend), shared with the Mode 1/2 raymarchers.
+        vec2 term = sun_terminator(light_cos_theta, sin_planet, cos_planet,
+                                   u_star_pos_local[0].w, u_star_dir_sph_eff[0].w);
+        float vis_fraction = term.x;
+        vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(r, term.y) : vec3(0.0);
 
         vec3 sample_attenuation = current_transmittance * trans_to_sun * vis_fraction * int_factor;
         total_rayleigh += rho_R * sample_attenuation;

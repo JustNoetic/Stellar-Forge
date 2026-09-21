@@ -93,4 +93,4 @@ kernels/
 systems/
 main_error.txt
 screenshits/
-graphics_settings.json
+data/graphics_settings.json

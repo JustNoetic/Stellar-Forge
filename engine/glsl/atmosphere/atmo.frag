@@ -172,6 +172,7 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
 #define ATMO_DATA_HAS_AU_TO_KM 1
 #include "common/refraction.glsl"
 
+#include "common/sun_terminator.glsl"
 // Shared analytical eclipse penumbra + physical atmospheric lens optics & Danjon refraction tinting.
 // Inputs are per-caster quantities already resolved by the caller.
 vec3 casterShadowTerm(float alpha, float beta, float gamma,
@@ -451,8 +452,12 @@ void accumulate_shadow_cell(
     float light_cos_theta = dot(Pm, L_sun) / rq;
     float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
     float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
-    float vis_fraction = (light_cos_theta < -cos_planet) ? 0.0 : smoothstep(-cos_planet - 0.02, -cos_planet + 0.02, light_cos_theta);
-    vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, light_cos_theta) : vec3(0.0);
+    // Terminator matching sky_view_lut.frag / Mode 1-2: stellar-disc rise/set with
+    // refraction-extended penumbra (eff_star_rad = sin_star + max_bend).
+    vec2 term_q = sun_terminator(light_cos_theta, sin_planet, cos_planet,
+                                 u_star_pos_local[0].w, u_star_dir_sph_eff[0].w);
+    float vis_fraction = term_q.x;
+    vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
     vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M * rho_M_q * phase_M)
                              * trans_to_sun * vis_fraction * u_star_color_irrad[0].rgb;
 
@@ -1613,37 +1618,12 @@ void main() {
             float sin_planet = u_planet_radius_km / max(sample_len, u_planet_radius_km + 0.01);
             float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
 
-            float cos_outer = cos_planet * cos_sun_eff - sin_planet * effective_star_rad;
-            float cos_inner = cos_planet * cos_sun_eff + sin_planet * effective_star_rad;
-
-            float neg_light_cos = -light_cos_theta;
-            float vis_fraction = 1.0;
-            float effective_cos = light_cos_theta;
-
-            if (neg_light_cos <= cos_outer) {
-                // Daylight: Sun disc is 100% visible above the local horizon
-                vis_fraction = 1.0;
-                effective_cos = light_cos_theta;
-            } else if (neg_light_cos >= cos_inner) {
-                // Night side: Planet fully blocks the direct solar disc
-                float max_occ = min(1.0, (sin_planet * sin_planet) / max(1e-9, effective_star_rad * effective_star_rad));
-                vis_fraction = 1.0 - max_occ;
-                effective_cos = max(-cos_planet + 1e-5, light_cos_theta);
-            } else {
-                // Twilight / penumbral transition zone: Sun disc partially sets below horizon
-                float max_occ = min(1.0, (sin_planet * sin_planet) / max(1e-9, effective_star_rad * effective_star_rad));
-                float min_vis = 1.0 - max_occ;
-                float x_vis = (cos_planet * cos_sun_eff - neg_light_cos) / max(1e-7, sin_planet * effective_star_rad);
-                float s = smoothstep(-1.0, 1.0, x_vis);
-                vis_fraction = mix(min_vis, 1.0, s);
-
-                float sin_Z = sqrt(max(0.0, 1.0 - light_cos_theta * light_cos_theta));
-                float exact_disc_top_cos = light_cos_theta * cos_sun_eff + sin_Z * effective_star_rad;
-                float exact_disc_bot_cos = light_cos_theta * cos_sun_eff - sin_Z * effective_star_rad;
-                float disc_top_cos = (light_cos_theta > cos_sun_eff) ? 1.0 : exact_disc_top_cos;
-                float disc_bot_cos = max(exact_disc_bot_cos, -cos_planet + 1e-5);
-                effective_cos = max(-cos_planet + 1e-5, (disc_top_cos + disc_bot_cos) * 0.5);
-            }
+            // Terminator: stellar-disc rise/set with refraction-extended penumbra
+            // (effective_star_rad = sin_star + max_bend), shared with Mode 3.
+            vec2 term = sun_terminator(light_cos_theta, sin_planet, cos_planet,
+                                       effective_star_rad, cos_sun_eff);
+            float vis_fraction = term.x;
+            float effective_cos = term.y;
 
             float v_norm = sqrt(h_norm);
             vec3 transmittance_to_sun = (vis_fraction > 1e-4) ? get_transmittance_precomputed(v_norm, effective_cos) : vec3(0.0);
