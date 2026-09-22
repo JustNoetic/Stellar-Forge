@@ -1,6 +1,7 @@
 import math
 import datetime
 import os
+import numpy as np
 import imgui
 from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
 from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic
