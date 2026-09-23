@@ -1234,7 +1234,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         'body_idx': insp_idx,
                         'pole': pole_n.astype('f4'),
                         'inner_r': r_in, 'outer_r': r_out, 'opacity': 0.8,
-                        'scatter': 2.5, 'asymmetry': 0.8, 'backscatter': -0.3, 'shadow_grad': shadow_grad,
+                        'scatter': 0.0, 'asymmetry': 0.8, 'backscatter': -0.3, 'shadow_grad': shadow_grad,
                         'raw_color': color, 'gradient': grad,
                         'row_idx': len(ring_precomputed)
                     })

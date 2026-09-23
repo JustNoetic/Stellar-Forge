@@ -48,7 +48,7 @@ uniform sampler2D u_ring_gradients;
 uniform sampler2D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
 
-uniform vec3 u_sun_dir;
+uniform vec3 u_sun_dir[16];
 uniform int u_num_ring_planes;
 uniform vec3 u_ring_normal[16];
 uniform vec4 u_ring_params[16];
@@ -156,7 +156,7 @@ void main() {
     }
     float sin_lat = clamp(abs(frag_elevation), 0.0, 0.999);
 
-    vec3 L = u_sun_dir;
+    vec3 L = u_sun_dir[k];
     float sun_elevation = dot(L, ring_normal);
     float sin_sun_elev = clamp(abs(sun_elevation), 1e-4, 1.0);
     float cos_sun_elev = sqrt(max(0.0, 1.0 - sin_sun_elev * sin_sun_elev));

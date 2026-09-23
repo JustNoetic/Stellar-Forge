@@ -1361,6 +1361,26 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         is_star = op.get("type") == "Star"
                         if shared_state.get("is_star_mask") is not None:
                             shared_state["is_star_mask"] = np.append(shared_state["is_star_mask"], is_star)
+                        if "oblateness" in op and op.get("J2", 0.0) > 0.0:
+                            f = op["oblateness"]
+                            j2 = op.get("J2", 0.0)
+                            j4 = op.get("j4", 0.0)
+                            rot_period = op.get("rotation_period", 0.0)
+                            pole_ecl = np.array(op.get("pole_ecl", [0.0, 0.0, 1.0]), dtype=np.float64)
+                            r_au = op.get("radius", 6000.0) / 1.496e8
+                            name = op.get("name", "New Body")
+                            new_idx = num_bodies - 1
+                            opl = list(shared_state.get("oblate_physics_list", []))
+                            opl.append((new_idx, j2, j4, r_au, pole_ecl, mass, name, rot_period))
+                            shared_state["oblate_physics_list"] = opl
+                            has_j2 = len(opl) > 0
+                            shared_state["has_j2"] = has_j2
+                            shared_state["oblate_indices"] = np.array([x[0] for x in opl], dtype=np.int32)
+                            shared_state["oblate_j2"] = np.array([x[1] for x in opl], dtype=np.float64)
+                            shared_state["oblate_req"] = np.array([x[3] for x in opl], dtype=np.float64)
+                            shared_state["oblate_poles"] = np.array([x[4] for x in opl], dtype=np.float64)
+                            shared_state["oblate_masses"] = np.array([x[5] for x in opl], dtype=np.float64)
+                            attach_custom_forces(sim, has_j2, sim.has_gr, sim.phys_star_idx, opl)
                         op["idx"] = num_bodies - 1
                         shared_state["crud_completed"].append(op)
                             

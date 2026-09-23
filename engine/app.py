@@ -12,6 +12,7 @@ import glfw
 import moderngl
 import numpy as np
 import ctypes
+import struct
 
 import json
 
@@ -2153,6 +2154,7 @@ class App(InputHandlerMixin):
             [(vbo_ultra, '3f 3f', 'in_position', 'in_normal')],
             index_buffer=ibo_ultra
         )
+        self.single_cloud_body_buf = ctx.buffer(reserve=4)
     
         vao_atmo = ctx.vertex_array(
             prog_atmo,
@@ -2292,6 +2294,7 @@ class App(InputHandlerMixin):
         caster_mie_buf = np.zeros((64, 4), dtype='f4')
         ring_centers_buf = np.zeros((16, 3), dtype='f4')
         ring_normals_buf = np.zeros((16, 3), dtype='f4')
+        ring_sun_dirs_buf = np.zeros((16, 3), dtype='f4')
         ring_params_buf = np.zeros((16, 4), dtype='f4')
         ring_colors_buf = np.zeros((16, 3), dtype='f4')
         ring_5colors_buf = np.zeros((16, 5, 3), dtype='f4')
@@ -2936,6 +2939,14 @@ class App(InputHandlerMixin):
                                 "r": float(radius / 696340.0),
                                 "m": float(mass),
                                 "parentId": bodies_data[parent_idx]["name"],
+                                "rotation_period": float(op.get("rotation_period", 24.0)),
+                                "axial_tilt": float(op.get("axial_tilt", 0.0)),
+                                "tidally_locked": bool(op.get("tidally_locked", False)),
+                                "oblateness": float(op.get("oblateness", 0.0)),
+                                "J2": float(op.get("J2", 0.0)),
+                                "j4": float(op.get("j4", 0.0)),
+                                "pole_ra": float(op.get("pole_ra", 0.0)),
+                                "pole_dec": float(op.get("pole_dec", 90.0)),
                                 "sv": {
                                     "x": float(pos[0] - pos_snap[parent_idx][0]),
                                     "y": float(pos[1] - pos_snap[parent_idx][1]),
@@ -2972,13 +2983,16 @@ class App(InputHandlerMixin):
                             subsys_mass_buf = np.append(subsys_mass_buf, mass)
                             
                             min_px = 1.0
-                            new_vis = np.array([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0, color[0], color[1], color[2], 0.0, 0.0], dtype='f4')
+                            oblateness_val = float(op.get("oblateness", 0.0))
+                            pole_ren = op.get("pole_render", [0.0, 1.0, 0.0])
+                            prx, pry, prz = float(pole_ren[0]), float(pole_ren[1]), float(pole_ren[2])
+                            new_vis = np.array([color[0], color[1], color[2], r_au, min_px, prx, pry, prz, oblateness_val, color[0], color[1], color[2], 0.0, 0.0], dtype='f4')
                             visual_arr = np.vstack([visual_arr, new_vis])
                             visual_colors_f8 = np.vstack([visual_colors_f8, np.array(color, dtype='f8')])
                             body_colors = np.vstack([body_colors, np.array(color, dtype='f4')])
                             is_star_val = 1.0 if btype == "Star" else 0.0
                             is_star_arr = np.append(is_star_arr, is_star_val)
-                            visual_data.append([color[0], color[1], color[2], r_au, min_px, 0, 1, 0, 0, color[0], color[1], color[2], 0.0, 0.0])
+                            visual_data.append([color[0], color[1], color[2], r_au, min_px, prx, pry, prz, oblateness_val, color[0], color[1], color[2], 0.0, 0.0])
                             
                             inst_data_lo = np.vstack([inst_data_lo, np.zeros(INSTANCE_FLOATS, dtype='f4')])
                             inst_data_hi = np.vstack([inst_data_hi, np.zeros(INSTANCE_FLOATS, dtype='f4')])
@@ -3811,11 +3825,13 @@ class App(InputHandlerMixin):
             n_ring_planes = 0
             ring_centers_buf[:] = 0
             ring_normals_buf[:] = 0
+            ring_sun_dirs_buf[:] = 0
             ring_params_buf[:] = 0
             ring_colors_buf[:] = 0
             ring_5colors_buf[:] = 0
             
             n_ring_planes = len(self.body_ring_indices)
+            star_pos = pos_rel_all[star_idx]
             for bi, unified_idx in self.body_ring_indices.items():
                 if unified_idx >= 16:
                     break
@@ -3836,6 +3852,12 @@ class App(InputHandlerMixin):
                     colors5 = raw_color
                     
                 ring_centers_buf[unified_idx] = pos_rel_all[bi]
+                to_star = star_pos - pos_rel_all[bi]
+                to_star_norm = np.linalg.norm(to_star)
+                ring_sun_dirs_buf[unified_idx] = (
+                    to_star / to_star_norm if to_star_norm > 1e-6
+                    else np.array([0.0, 1.0, 0.0], dtype='f4')
+                )
                 ring_normals_buf[unified_idx] = pole
                 ring_params_buf[unified_idx, 0] = min_r
                 ring_params_buf[unified_idx, 1] = max_r
@@ -4586,14 +4608,8 @@ class App(InputHandlerMixin):
             if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
                 self.ringshine_map_fbo.use()
                 ctx.viewport = (0, 0, 128, 1040)
-                star_pos = pos_rel_all[star_idx]
-                host_pos = ring_centers_buf[0]
-                l_dir = star_pos - host_pos
-                l_norm = np.linalg.norm(l_dir)
-                if l_norm > 1e-6: l_dir /= l_norm
-                else: l_dir = np.array([0.0, 1.0, 0.0], dtype='f4')
                 if 'u_sun_dir' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_sun_dir'].value = tuple(l_dir.astype('f4'))
+                    self.prog_ringshine_map['u_sun_dir'].write(ring_sun_dirs_buf)
                 if 'u_num_ring_planes' in self.prog_ringshine_map:
                     self.prog_ringshine_map['u_num_ring_planes'].value = n_ring_planes
                 if 'u_ring_normal' in self.prog_ringshine_map:
@@ -5894,7 +5910,43 @@ class App(InputHandlerMixin):
                 ctx.depth_mask = True
                 ctx.disable(moderngl.BLEND)
 
-            # Assemble unified back-to-front queue of all transparent objects (atmospheres, rings, and habitable zone)
+            # Helper to check if a body has a cloud layer texture
+            def _body_has_clouds(bi, is_cmp=False):
+                if 'u_is_cloud_pass' not in prog_spheres or getattr(self, 'body_textures_ssbo', None) is None:
+                    return False
+                bdata = bodies_data_cmp if is_cmp else bodies_data
+                if bi >= len(bdata):
+                    return False
+                bname = bdata[bi].get('name', '').lower()
+                manifest_entry = getattr(self.texture_streamer, 'file_manifest', {}).get(bname, {}) if hasattr(self, 'texture_streamer') and self.texture_streamer else {}
+                c_path = manifest_entry.get('clouds')
+                if c_path and os.path.exists(c_path):
+                    return True
+                if bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
+                    return True
+                return False
+
+            def render_body_clouds(bi, is_cmp=False):
+                if not _body_has_clouds(bi, is_cmp=is_cmp):
+                    return
+                inst_idx = bi if not is_cmp else (num_bodies + bi)
+                self.single_cloud_body_buf.write(struct.pack('I', int(inst_idx)))
+                
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.enable(moderngl.DEPTH_TEST)
+                ctx.depth_func = '<='
+                ctx.disable(moderngl.CULL_FACE)
+                ctx.depth_mask = False
+                
+                prog_spheres['u_is_cloud_pass'].value = True
+                self.single_cloud_body_buf.bind_to_storage_buffer(binding=3)
+                vao_ultra.render(moderngl.TRIANGLES, instances=1)
+                prog_spheres['u_is_cloud_pass'].value = False
+                ctx.depth_mask = True
+                ctx.depth_func = '<'
+
+            # Assemble unified back-to-front queue of all transparent objects (atmospheres, rings, clouds, and habitable zone)
             atmos_by_key = {(a['body_idx'], is_cmp): (sq_dist, a, is_cmp) for sq_dist, a, is_cmp in sorted_atmos}
             rings_by_key = {}
             if ring_render_groups:
@@ -5904,7 +5956,16 @@ class App(InputHandlerMixin):
                 for g in self.ring_render_groups_cmp:
                     rings_by_key.setdefault((g['body_idx'], True), []).append(g)
 
-            all_trans_keys = list(set(atmos_by_key.keys()) | set(rings_by_key.keys()))
+            cloud_keys = set()
+            for _b_i in range(len(bodies_data)):
+                if _body_has_clouds(_b_i, is_cmp=False):
+                    cloud_keys.add((_b_i, False))
+            if self.comparison_enabled:
+                for _b_i in range(len(bodies_data_cmp)):
+                    if _body_has_clouds(_b_i, is_cmp=True):
+                        cloud_keys.add((_b_i, True))
+
+            all_trans_keys = list(set(atmos_by_key.keys()) | set(rings_by_key.keys()) | cloud_keys)
 
             def _get_key_sq_dist(key):
                 if key in atmos_by_key:
@@ -5929,6 +5990,7 @@ class App(InputHandlerMixin):
 
             # Render all transparent passes back-to-front
             _gq = _perf_gpu_begin(ctx, "gpu_transparents")
+            rendered_cloud_bodies = set()
             for key in sorted_trans_keys:
                 if key[0] == '__hz__':
                     render_habitable_zone()
@@ -5941,18 +6003,36 @@ class App(InputHandlerMixin):
                 if atmo_entry is not None and body_ring_groups:
                     if _body_needs_ring_clip(atmo_entry):
                         execute_atmosphere_pass(1, [atmo_entry])
+                        render_body_clouds(_bi, is_cmp=_is_c)
+                        rendered_cloud_bodies.add(key)
                         for rg in body_ring_groups:
                             render_single_ring_group(rg, is_cmp=_is_c)
                         execute_atmosphere_pass(2, [atmo_entry])
                     else:
                         execute_atmosphere_pass(0, [atmo_entry])
+                        render_body_clouds(_bi, is_cmp=_is_c)
+                        rendered_cloud_bodies.add(key)
                         for rg in body_ring_groups:
                             render_single_ring_group(rg, is_cmp=_is_c)
                 elif atmo_entry is not None:
                     execute_atmosphere_pass(0, [atmo_entry])
+                    render_body_clouds(_bi, is_cmp=_is_c)
+                    rendered_cloud_bodies.add(key)
                 elif body_ring_groups:
+                    render_body_clouds(_bi, is_cmp=_is_c)
+                    rendered_cloud_bodies.add(key)
                     for rg in body_ring_groups:
                         render_single_ring_group(rg, is_cmp=_is_c)
+                else:
+                    render_body_clouds(_bi, is_cmp=_is_c)
+                    rendered_cloud_bodies.add(key)
+
+            # Render any remaining cloud bodies not covered in sorted_trans_keys
+            for _ck in cloud_keys:
+                if _ck not in rendered_cloud_bodies:
+                    render_body_clouds(_ck[0], is_cmp=_ck[1])
+                    rendered_cloud_bodies.add(_ck)
+
             _perf_gpu_end(_gq)
 
             # Update temporal reprojection history state for next frame
@@ -5962,27 +6042,6 @@ class App(InputHandlerMixin):
             self.prev_atmo_body_offsets = {a['body_idx']: np.copy(pos_rel_all[a['body_idx']]) for a in atmo_bodies}
             if self.comparison_enabled:
                 self.prev_atmo_body_offsets_cmp = {a['body_idx']: np.copy(cmp_pos_rel[a['body_idx']]) for a in self.atmo_bodies_cmp}
-
-            # --- Pass 2.5: Dynamic Cloud Layer Pass (Rendered over atmosphere with physical view-transmittance fading) ---
-            if 'u_is_cloud_pass' in prog_spheres and getattr(self, 'body_textures_ssbo', None) is not None:
-                _gq = _perf_gpu_begin(ctx, "gpu_clouds")
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                ctx.enable(moderngl.DEPTH_TEST)
-                ctx.depth_func = '<='
-                ctx.disable(moderngl.CULL_FACE)
-                
-                prog_spheres['u_is_cloud_pass'].value = True
-                ctx.depth_mask = False
-                vis_hi_buffer.bind_to_storage_buffer(binding=3)
-                vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
-
-                vis_ultra_buffer.bind_to_storage_buffer(binding=3)
-                vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=3)
-                prog_spheres['u_is_cloud_pass'].value = False
-                ctx.depth_mask = True
-                ctx.depth_func = '<'
-                _perf_gpu_end(_gq)
 
 
 

@@ -29,6 +29,21 @@ def pole_to_ecliptic(pole_ra_deg, pole_dec_deg):
     return pole / n if n > 0 else np.array([0., 0., 1.])
 
 @njit(cache=True)
+def ecliptic_to_pole(pole_ecl):
+    """Convert unit vector in ecliptic coords to ICRF J2000 pole RA/Dec in degrees."""
+    cos_e, sin_e = math.cos(OBLIQUITY), math.sin(OBLIQUITY)
+    xe, ye, ze = pole_ecl[0], pole_ecl[1], pole_ecl[2]
+    x = xe
+    y = ye * cos_e - ze * sin_e
+    z = ye * sin_e + ze * cos_e
+    norm = math.sqrt(x * x + y * y + z * z)
+    if norm > 0:
+        x, y, z = x / norm, y / norm, z / norm
+    dec = math.degrees(math.asin(max(-1.0, min(1.0, z))))
+    ra = math.degrees(math.atan2(y, x)) % 360.0
+    return ra, dec
+
+@njit(cache=True)
 def build_equatorial_frame(pole_ecl):
     """Build 3x3 rotation matrix from parent equatorial frame to ecliptic."""
     z = pole_ecl / np.linalg.norm(pole_ecl)

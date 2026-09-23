@@ -4,7 +4,7 @@ import os
 import numpy as np
 import imgui
 from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
-from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic
+from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic, ecliptic_to_pole
 from engine.rendering.render_utils import compute_surface_albedo, format_distance_au, sim_time_from_date, format_sim_time_utc
 from engine.ephemeris.system_manager import SystemManager
 
@@ -280,8 +280,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
     # ── 2. Add Orbiting Body Modal ──
     if app.camera.get("add_mode", False):
-        imgui.set_next_window_size(360, 420, imgui.FIRST_USE_EVER)
-        imgui.set_next_window_position(app.fb_width // 2 - 180, app.fb_height // 2 - 210, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_size(380, 580, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_position(app.fb_width // 2 - 190, app.fb_height // 2 - 290, imgui.FIRST_USE_EVER)
         expanded, app.camera["add_mode"] = imgui.begin("Add Orbiting Body", True)
         if expanded:
             ad = app.camera["add_data"]
@@ -305,6 +305,74 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
             _, ad["radius"] = imgui.input_double("Radius (km)", ad["radius"], format="%.1f")
 
+            # ── Rotational & Oblateness Properties ──
+            imgui.separator()
+            imgui.text_colored("Rotational Properties", 1.0, 0.85, 0.4)
+
+            insp_idx = ad.get("parent_idx", 0)
+            if insp_idx >= num_bodies:
+                insp_idx = 0
+            parent_m = mass_snap[insp_idx]
+
+            real_mass = ad["mass"] * 3.694e-8 if is_moon else ad["mass"] * 3.003e-6
+            real_a = ad["a"] / 149597870.7 if is_moon else ad["a"]
+
+            is_locked = ad.get("tidally_locked", False)
+            chg_lock, is_locked = imgui.checkbox("Tidally Locked", is_locked)
+            if chg_lock:
+                ad["tidally_locked"] = is_locked
+
+            if is_locked:
+                tot_m = parent_m + real_mass
+                p_years = math.sqrt(real_a**3 / tot_m) if tot_m > 0 and real_a > 0 else 0.0
+                ad["rotation_period"] = p_years * 365.25 * 24.0
+                imgui.text(f"  Rot Period:     {ad['rotation_period']:.4f} h [Synchronous]")
+            else:
+                cur_rot = ad.get("rotation_period", 24.0)
+                _, cur_rot = imgui.input_double("Rot Period (hours)", cur_rot, format="%.4f")
+                ad["rotation_period"] = max(0.0, cur_rot)
+
+            cur_tilt = ad.get("axial_tilt", 0.0)
+            _, cur_tilt = imgui.input_double("Axial Tilt (deg)", cur_tilt, format="%.2f")
+            ad["axial_tilt"] = cur_tilt
+
+            # Live calculation of density and oblateness based on mass, radius, and rotation
+            r_km = max(0.1, float(ad.get("radius", 6371.0)))
+            rot_h = float(ad.get("rotation_period", 24.0))
+            b_type = ad.get("type", "Terrestrial")
+
+            r_m = r_km * 1000.0
+            mass_kg = real_mass * 1.98847e30
+            vol_m3 = (4.0 / 3.0) * math.pi * (r_m ** 3)
+            density_g_cm3 = (mass_kg / vol_m3) / 1000.0 if vol_m3 > 0 else 0.0
+
+            f_calc = 0.0
+            j2_calc = 0.0
+            j4_calc = 0.0
+            if rot_h > 0.0 and real_mass > 0.0 and r_km > 0.0:
+                G_SI = 6.6743e-11
+                omega = 2.0 * math.pi / (rot_h * 3600.0)
+                m_param = (omega**2 * r_m**3) / (G_SI * mass_kg)
+                if b_type in ("Moon", "Dwarf Planet"):
+                    chi = 1.25
+                elif b_type == "Terrestrial":
+                    chi = 0.95
+                else:
+                    chi = 0.65
+                f_calc = float(np.clip(chi * m_param, 0.0, 0.5))
+                j2_calc = float(m_param * (chi - 0.5))
+                j4_calc = float(-0.15 * (f_calc**2))
+
+            ad["oblateness"] = f_calc
+            ad["J2"] = j2_calc
+            ad["j4"] = j4_calc
+
+            imgui.text(f"  Mean Density:   {density_g_cm3:.2f} g/cm³")
+            imgui.text(f"  Oblateness (f): {f_calc:.5f}")
+            if j2_calc > 0.0:
+                imgui.text(f"  J2 Grav Harm:   {j2_calc:.6f}")
+
+            # ── Orbital Elements ──
             imgui.separator()
             imgui.text_colored("Orbital Elements", 1.0, 0.85, 0.4)
             _, ad["frame"] = imgui.combo("Reference Frame", ad["frame"], ["Ecliptic", "Equatorial"])
@@ -323,7 +391,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             imgui.separator()
             if imgui.button("Spawn Body", width=-1):
                 insp_idx = ad.get("parent_idx", 0)
-                if insp_idx >= num_bodies: insp_idx = 0
+                if insp_idx >= num_bodies:
+                    insp_idx = 0
                 parent_m = mass_snap[insp_idx]
                 p_pos = pos_snap_render[insp_idx]
                 p_vel = vel_snap_render[insp_idx]
@@ -339,9 +408,40 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 )
 
                 if ad["frame"] == 1:
-                    pole_render = visual_arr[insp_idx, 5:8]
-                    pole_ecl = np.array([pole_render[0], -pole_render[2], pole_render[1]])
-                    c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl)
+                    pole_render_p = visual_arr[insp_idx, 5:8]
+                    pole_ecl_p = np.array([pole_render_p[0], -pole_render_p[2], pole_render_p[1]])
+                    c_pos, c_vel = rotate_equatorial_to_ecliptic(c_pos, c_vel, pole_ecl_p)
+
+                # Compute orbit normal in ecliptic frame
+                orb_h = np.cross(c_pos, c_vel)
+                h_norm = np.linalg.norm(orb_h)
+                if h_norm > 1e-12:
+                    orb_n = orb_h / h_norm
+                else:
+                    orb_n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+                # Tilt spin axis relative to orbit normal by axial_tilt
+                tilt_deg = float(ad.get("axial_tilt", 0.0))
+                tilt_rad = math.radians(tilt_deg)
+                if abs(tilt_rad) < 1e-6:
+                    pole_ecl = orb_n
+                else:
+                    ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    if abs(np.dot(orb_n, ref)) > 0.99:
+                        ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                    perp = np.cross(orb_n, ref)
+                    perp_n = np.linalg.norm(perp)
+                    if perp_n > 1e-10:
+                        perp /= perp_n
+                    else:
+                        perp = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                    pole_ecl = orb_n * math.cos(tilt_rad) + perp * math.sin(tilt_rad)
+                    pole_norm = np.linalg.norm(pole_ecl)
+                    if pole_norm > 0:
+                        pole_ecl /= pole_norm
+
+                pole_render = np.array([pole_ecl[0], pole_ecl[2], -pole_ecl[1]], dtype=np.float32)
+                pole_ra, pole_dec = ecliptic_to_pole(pole_ecl)
 
                 new_ecl_x = ppx + c_pos[0]
                 new_ecl_y = ppy + c_pos[1]
@@ -360,7 +460,17 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     "type": ad["type"],
                     "parent_idx": insp_idx,
                     "pos": [new_ecl_x, new_ecl_y, new_ecl_z],
-                    "vel": [new_ecl_vx, new_ecl_vy, new_ecl_vz]
+                    "vel": [new_ecl_vx, new_ecl_vy, new_ecl_vz],
+                    "rotation_period": float(ad.get("rotation_period", 24.0)),
+                    "axial_tilt": tilt_deg,
+                    "tidally_locked": bool(ad.get("tidally_locked", False)),
+                    "oblateness": float(ad.get("oblateness", 0.0)),
+                    "J2": float(ad.get("J2", 0.0)),
+                    "j4": float(ad.get("j4", 0.0)),
+                    "pole_ra": float(pole_ra),
+                    "pole_dec": float(pole_dec),
+                    "pole_ecl": [float(pole_ecl[0]), float(pole_ecl[1]), float(pole_ecl[2])],
+                    "pole_render": [float(pole_render[0]), float(pole_render[1]), float(pole_render[2])]
                 }
                 with app.shared_state["lock"]:
                     app.shared_state["crud_queue"].append(payload)
