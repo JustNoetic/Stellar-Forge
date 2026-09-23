@@ -29,11 +29,46 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 settings_changed = True
 
             if atmo_quality == 3:
-                slicing_steps = int(app.camera.get("atmo_slicing_steps", 8))
-                changed_ss, slicing_steps = imgui.slider_int("Shadow Slicing Cells", slicing_steps, 2, 32)
-                if changed_ss:
-                    app.camera["atmo_slicing_steps"] = slicing_steps
+                sky_view_steps = int(app.camera.get("atmo_sky_view_steps", 24))
+                changed_sv, sky_view_steps = imgui.slider_int("Sky-View LUT Steps", sky_view_steps, 8, 64)
+                if changed_sv:
+                    app.camera["atmo_sky_view_steps"] = sky_view_steps
                     settings_changed = True
+
+                shadow_methods = ["Station-Locked Slicing", "Uniform Stochastic Raymarching"]
+                shadow_method = int(app.camera.get("atmo_shadow_method", 1))
+                shadow_method_idx = 0 if shadow_method == 0 else 1
+                changed_sm, shadow_method_idx = imgui.combo("Shadow Method", shadow_method_idx, shadow_methods)
+                if changed_sm:
+                    app.camera["atmo_shadow_method"] = shadow_method_idx
+                    settings_changed = True
+
+                if shadow_method_idx == 1:
+                    shadow_steps = int(app.camera.get("atmo_shadow_steps", 24))
+                    changed_steps, shadow_steps = imgui.slider_int("Shadow Ray Steps", shadow_steps, 4, 64)
+                    if changed_steps:
+                        app.camera["atmo_shadow_steps"] = shadow_steps
+                        settings_changed = True
+
+                    stochastic_steps = app.camera.get("atmo_stochastic", True)
+                    changed_stoch, stochastic_steps = imgui.checkbox("Stochastic Raymarching", stochastic_steps)
+                    if changed_stoch:
+                        app.camera["atmo_stochastic"] = stochastic_steps
+                        settings_changed = True
+
+                    if stochastic_steps:
+                        noise_types = ["Interleaved Gradient Noise (IGN)", "Spatiotemporal Blue Noise (STBN)"]
+                        cur_noise = int(app.camera.get("atmo_noise_type", 0))
+                        changed_nt, cur_noise = imgui.combo("Noise Type##mode3", cur_noise, noise_types)
+                        if changed_nt:
+                            app.camera["atmo_noise_type"] = cur_noise
+                            settings_changed = True
+                else:
+                    slicing_steps = int(app.camera.get("atmo_slicing_steps", 8))
+                    changed_ss, slicing_steps = imgui.slider_int("Shadow Slicing Cells", slicing_steps, 2, 32)
+                    if changed_ss:
+                        app.camera["atmo_slicing_steps"] = slicing_steps
+                        settings_changed = True
             elif atmo_quality > 0:
                 atmo_res = float(app.camera.get("atmo_resolution", 1.0))
                 changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")
@@ -72,6 +107,14 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 if changed_stoch:
                     app.camera["atmo_stochastic"] = stochastic_steps
                     settings_changed = True
+
+                if stochastic_steps:
+                    noise_types = ["Interleaved Gradient Noise (IGN)", "Spatiotemporal Blue Noise (STBN)"]
+                    cur_noise = int(app.camera.get("atmo_noise_type", 0))
+                    changed_nt, cur_noise = imgui.combo("Noise Type##mode2", cur_noise, noise_types)
+                    if changed_nt:
+                        app.camera["atmo_noise_type"] = cur_noise
+                        settings_changed = True
 
                 temporal_accum = app.camera.get("atmo_temporal_accum", True)
                 changed_ta, temporal_accum = imgui.checkbox("Temporal Integration (TAA)", temporal_accum)

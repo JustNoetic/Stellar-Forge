@@ -511,6 +511,10 @@ class App(InputHandlerMixin):
             "atmo_adaptive_steps": True,
             "atmo_adaptive_steps_max": 128,
             "atmo_slicing_steps": 8,
+            "atmo_shadow_method": 1,
+            "atmo_shadow_steps": 24,
+            "atmo_noise_type": 0,
+            "atmo_sky_view_steps": 24,
             "atmo_enabled": True,
             "refraction_enabled": True,
             "grav_lensing_enabled": True,
@@ -606,6 +610,9 @@ class App(InputHandlerMixin):
         self.sky_view_trans_tex = None
         self.sky_view_fbo = None
         self.quad_vao_sky_view = None
+        self.sky_view_width = 192
+        self.sky_view_height = 108
+        self.sky_view_baked_key = None
         self.star_catalog = None
         self.prev_atmo_exposure = 1.0
         self.prev_atmo_body_offsets = {}
@@ -696,6 +703,10 @@ class App(InputHandlerMixin):
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
                 "atmo_adaptive_steps_max": self.camera.get("atmo_adaptive_steps_max", 128),
                 "atmo_slicing_steps": self.camera.get("atmo_slicing_steps", 8),
+                "atmo_shadow_method": self.camera.get("atmo_shadow_method", 1),
+                "atmo_shadow_steps": self.camera.get("atmo_shadow_steps", 24),
+                "atmo_noise_type": self.camera.get("atmo_noise_type", 0),
+                "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_mode": self.camera.get("bloom_mode", 2),
@@ -1604,21 +1615,41 @@ class App(InputHandlerMixin):
                 p['u_ring_shadow_tex'].value = 13
             if 'u_sky_view_trans_lut' in p:
                 p['u_sky_view_trans_lut'].value = 14
+            if 'u_sky_view_star_lut' in p:
+                p['u_sky_view_star_lut'].value = (15, 16, 17, 18)
+            if 'u_stbn_tex' in p:
+                p['u_stbn_tex'].value = 19
         
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
+        if 'u_ring_gradients' in self.prog_sky_view:
+            self.prog_sky_view['u_ring_gradients'].value = 0
         if 'u_transmittance_lut' in self.prog_sky_view:
             self.prog_sky_view['u_transmittance_lut'].value = 1
         if 'u_multi_scatter_lut' in self.prog_sky_view:
             self.prog_sky_view['u_multi_scatter_lut'].value = 3
-        self.sky_view_tex = ctx.texture((256, 256), 4, dtype='f2')
+        if 'u_ringshine_map' in self.prog_sky_view:
+            self.prog_sky_view['u_ringshine_map'].value = 8
+        if 'u_num_steps' in self.prog_sky_view:
+            self.prog_sky_view['u_num_steps'].value = 24
+        self.sky_view_tex = ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
         self.sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.sky_view_tex.repeat_x = True
         self.sky_view_tex.repeat_y = False
-        self.sky_view_trans_tex = ctx.texture((256, 256), 4, dtype='f2')
+        self.sky_view_trans_tex = ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
         self.sky_view_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self.sky_view_trans_tex.repeat_x = True
         self.sky_view_trans_tex.repeat_y = False
-        self.sky_view_fbo = ctx.framebuffer(color_attachments=[self.sky_view_tex, self.sky_view_trans_tex])
+        # Per-star in-scatter slices (bake locations 2-5): Mode 3's ring-shadow
+        # slicing normalizes each star's shadow deficit against its own light.
+        self.sky_view_star_tex = []
+        for _ in range(4):
+            _t = ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
+            _t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            _t.repeat_x = True
+            _t.repeat_y = False
+            self.sky_view_star_tex.append(_t)
+        self.sky_view_fbo = ctx.framebuffer(
+            color_attachments=[self.sky_view_tex, self.sky_view_trans_tex] + self.sky_view_star_tex)
 
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -1712,6 +1743,32 @@ class App(InputHandlerMixin):
         except Exception as e:
             print(f"Warning: Failed to initialize FFT Convolution Bloom: {e}")
             self.conv_ker_tex = None
+        
+        # Load Spatiotemporal Blue Noise Texture (NVIDIA STBN 128x128x64)
+        stbn_candidates = [
+            get_external_path("textures", "noise", "stbn_scalar.bin"),
+            get_bundled_path("textures", "noise", "stbn_scalar.bin"),
+        ]
+        stbn_path = None
+        for sp in stbn_candidates:
+            if os.path.exists(sp):
+                stbn_path = sp
+                break
+
+        self.stbn_tex = None
+        if stbn_path:
+            try:
+                with open(stbn_path, "rb") as f:
+                    stbn_data = f.read()
+                if len(stbn_data) == 128 * 128 * 64:
+                    self.stbn_tex = ctx.texture3d((128, 128, 64), 1, data=stbn_data, dtype='f1')
+                    self.stbn_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+                    self.stbn_tex.repeat_x = True
+                    self.stbn_tex.repeat_y = True
+                    self.stbn_tex.repeat_z = True
+            except Exception as e:
+                print(f"Warning: Failed to load STBN texture: {e}")
+                self.stbn_tex = None
         
         quad_vertices = np.array([
             -1.0, -1.0,
@@ -4582,7 +4639,7 @@ class App(InputHandlerMixin):
             exposure = self.camera.get("exposure", 1.0)
             hdr_enabled = self.camera.get("hdr_enabled", True)
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view):
                 if 'u_exposure' in prog:
                     prog['u_exposure'].value = exposure
                 if 'u_hdr_enabled' in prog:
@@ -4938,15 +4995,22 @@ class App(InputHandlerMixin):
                 cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
     
                 if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
+                if 'u_atmo_shadow_method' in cur_prog:
+                    cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
                 if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
-                    # Default station grid (uniform in u); ringed bodies override per-draw below.
-                    K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
+                    shadow_method = int(self.camera.get("atmo_shadow_method", 1))
+                    if shadow_method == 1:
+                        K_def = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
+                    else:
+                        # Default station grid (uniform in u); ringed bodies override per-draw below.
+                        K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
                     grid = np.zeros((9, 4), dtype='f4')
                     grid.ravel()[:K_def + 1] = np.linspace(0.0, 1.0, K_def + 1)
                     if 'u_ring_station_cells' in cur_prog:
                         cur_prog['u_ring_station_cells'].write(grid.tobytes())
                     cur_prog['u_ring_station_count'].value = K_def
                 if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
+                if 'u_atmo_noise_type' in cur_prog: cur_prog['u_atmo_noise_type'].value = int(self.camera.get("atmo_noise_type", 0))
                 if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
                 
                 is_temporal = self.camera.get("atmo_temporal_accum", True) and getattr(self, "prev_atmo_view_proj", None) is not None
@@ -4972,6 +5036,9 @@ class App(InputHandlerMixin):
                     ring_gradient_tex.use(location=0)
                     if ring_shadow_tex is not None:
                         ring_shadow_tex.use(location=13)
+                
+                if self.stbn_tex is not None:
+                    self.stbn_tex.use(location=19)
                 
                 if 'u_atmo_clip_mode' in cur_prog:
                     cur_prog['u_atmo_clip_mode'].value = clip_mode
@@ -5050,36 +5117,47 @@ class App(InputHandlerMixin):
                             if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
                                 active_indices.append(child_bi)
                                 
-                    # CPU-side geometric eclipse culling: only keep casters that can geometrically cast an eclipse on this atmosphere
+                    # CPU-side geometric eclipse culling: only keep casters that can geometrically
+                    # cast an eclipse on this atmosphere. A caster is kept if it can eclipse ANY of
+                    # the (up to 4) baked stars, so multi-star systems don't lose secondary-star
+                    # eclipses (Mode 3's Sky-View LUT bake consumes all star slots).
                     if active_indices:
-                        pos_star = cmp_pos_rel[self.star_idx_cmp] if is_cmp else pos_rel_all[star_idx]
-                        to_star = pos_star - body_pos_rel
-                        dist_s_sq = float(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                        if dist_s_sq > 1e-12:
-                            dist_s = math.sqrt(dist_s_sq)
-                            L_star = to_star / dist_s
-                            star_rad = float(self.body_radii_cmp[self.star_idx_cmp] if is_cmp else body_radii[star_idx])
-                            star_tan = star_rad / max(dist_s, 1e-6)
-                            atmo_rad_au = float(atmo['atmo_radius_au'])
+                        atmo_rad_au = float(atmo['atmo_radius_au'])
+                        _any_star_valid = False
+                        filtered_active = []
+                        for idx_u in active_indices:
+                            is_c_cmp = (idx_u >= num_bodies)
+                            c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
+                            pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
+                            rad_c = float(self.body_radii_cmp[c_local_idx] if is_cmp else body_radii[c_local_idx])
 
-                            filtered_active = []
-                            for idx_u in active_indices:
-                                is_c_cmp = (idx_u >= num_bodies)
-                                c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
-                                pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
-                                rad_c = float(self.body_radii_cmp[c_local_idx] if is_c_cmp else body_radii[c_local_idx])
+                            D = pos_c - body_pos_rel
+                            d_sq = float(D[0]**2 + D[1]**2 + D[2]**2)
 
-                                D = pos_c - body_pos_rel
+                            keep = False
+                            for _st in stars_pos_radius[:4]:
+                                to_star = np.asarray(_st[0:3], dtype=np.float64) - body_pos_rel
+                                dist_s_sq = float(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                                if dist_s_sq <= 1e-12:
+                                    continue
+                                _any_star_valid = True
+                                dist_s = math.sqrt(dist_s_sq)
+                                L_star = to_star / dist_s
+                                star_tan = float(_st[3]) / max(dist_s, 1e-6)
+
                                 t_proj = float(D[0] * L_star[0] + D[1] * L_star[1] + D[2] * L_star[2])
                                 if t_proj <= 0.0:
-                                    continue # Caster is on the night side of planet
+                                    continue # Caster is on the night side of planet for this star
 
-                                d_sq = float(D[0]**2 + D[1]**2 + D[2]**2)
                                 perp_sq = max(0.0, d_sq - t_proj * t_proj)
                                 r_penumbra_max = rad_c * 1.5 + atmo_rad_au + t_proj * star_tan * 1.5
                                 if perp_sq <= r_penumbra_max * r_penumbra_max:
-                                    filtered_active.append(idx_u)
-                            active_indices = filtered_active
+                                    keep = True
+                                    break
+                            if keep:
+                                filtered_active.append(idx_u)
+                        # Preserve legacy behavior: if no star geometry was usable, don't cull.
+                        active_indices = filtered_active if _any_star_valid else active_indices
 
                     n_active = min(len(active_indices), 8)
                     active_indices = active_indices[:n_active]
@@ -5294,29 +5372,52 @@ class App(InputHandlerMixin):
 
                     # Mode 3: Analytical Sky-View LUT pass
                     if atmo_quality == 3 and self.prog_sky_view is not None:
-                        cam_rel_au = cam_pos - body_pos_rel
-                        cam_rel_km = cam_rel_au * AU_TO_KM
-                        if f_scale > 1.00001:
-                            h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
-                            cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
-                        else:
-                            cam_sph_km = cam_rel_km
+                        current_bake_key = (self.frame_counter, body_idx_in_unified)
+                        if self.sky_view_baked_key != current_bake_key:
+                            cam_rel_au = cam_pos - body_pos_rel
+                            cam_rel_km = cam_rel_au * AU_TO_KM
+                            if f_scale > 1.00001:
+                                h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
+                                cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
+                            else:
+                                cam_sph_km = cam_rel_km
 
-                        if 'lut_tex' in atmo and atmo['lut_tex']:
-                            atmo['lut_tex'].use(location=1)
-                        if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
-                            atmo['lut_multi_scatter'].use(location=3)
+                            if 'lut_tex' in atmo and atmo['lut_tex']:
+                                atmo['lut_tex'].use(location=1)
+                            if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
+                                atmo['lut_multi_scatter'].use(location=3)
 
-                        self.sky_view_fbo.use()
-                        ctx.viewport = (0, 0, 256, 256)
-                        ctx.disable(moderngl.DEPTH_TEST)
-                        ctx.disable(moderngl.BLEND)
-                        ctx.disable(moderngl.CULL_FACE)
+                            # Ring plane data + ringshine irradiance map for the baked
+                            # ringshine term (Stage 2) and external ring shadow evaluation;
+                            # instance SSBO (planetshine dir/color, ring mask) is globally bound at binding 2.
+                            if 'u_num_ring_planes' in self.prog_sky_view:
+                                self.prog_sky_view['u_num_ring_planes'].value = n_ring_planes
+                            if n_ring_planes > 0:
+                                if 'u_ring_center' in self.prog_sky_view:
+                                    self.prog_sky_view['u_ring_center'].write(ring_centers_buf)
+                                if 'u_ring_normal' in self.prog_sky_view:
+                                    self.prog_sky_view['u_ring_normal'].write(ring_normals_buf)
+                                if 'u_ring_params' in self.prog_sky_view:
+                                    self.prog_sky_view['u_ring_params'].write(ring_params_buf)
+                                if 'u_ring_coplanar_mask' in self.prog_sky_view:
+                                    self.prog_sky_view['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
+                                if ring_gradient_tex:
+                                    ring_gradient_tex.use(location=0)
+                            self.ringshine_map_tex.use(location=8)
 
-                        self.prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km.astype(np.float32))
-                        self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
+                            self.sky_view_fbo.use()
+                            ctx.viewport = (0, 0, self.sky_view_width, self.sky_view_height)
+                            ctx.disable(moderngl.DEPTH_TEST)
+                            ctx.disable(moderngl.BLEND)
+                            ctx.disable(moderngl.CULL_FACE)
 
-                        self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
+                            self.prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km.astype(np.float32))
+                            self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
+                            if 'u_num_steps' in self.prog_sky_view:
+                                self.prog_sky_view['u_num_steps'].value = int(self.camera.get("atmo_sky_view_steps", 24))
+
+                            self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
+                            self.sky_view_baked_key = current_bake_key
 
                         # Restore framebuffer and raster state for atmosphere polyhedron rendering
                         if is_lowres:
@@ -5337,6 +5438,8 @@ class App(InputHandlerMixin):
 
                         self.sky_view_tex.use(location=12)
                         self.sky_view_trans_tex.use(location=14)
+                        for _sv_i, _sv_t in enumerate(self.sky_view_star_tex):
+                            _sv_t.use(location=15 + _sv_i)
                         if ring_shadow_tex is not None:
                             if hasattr(self, "body_ring_indices") and bi in self.body_ring_indices:
                                 u_idx = self.body_ring_indices[bi]
@@ -5345,21 +5448,28 @@ class App(InputHandlerMixin):
                                     ring_shadow_tex.build_mipmaps()
                                     ring_shadow_tex.current_body_idx = u_idx
                             ring_shadow_tex.use(location=13)
-                        # Station-cell grid baked from this body's ring profile (edges snapped
-                        # to ring discontinuities); replaces the uniform-in-s slice grid whose
-                        # phase quantization caused step banding. Lazy-baked per (body, K).
-                        if ('u_ring_station_count' in cur_prog and hasattr(ring_gradient_tex, 'station_cells')
-                                and hasattr(self, "body_ring_indices") and bi in self.body_ring_indices):
-                            u_idx = self.body_ring_indices[bi]
-                            K = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
-                            bounds = ring_gradient_tex.station_cells.get((bi, K))
-                            if bounds is None:
-                                bounds = bake_station_cells(ring_gradient_tex.atlas_data[u_idx, :, 3], max_cells=K)
-                                ring_gradient_tex.station_cells[(bi, K)] = bounds
-                            grid = np.zeros(36, dtype='f4')
-                            grid[:len(bounds)] = bounds
-                            cur_prog['u_ring_station_cells'].write(grid.tobytes())
-                            cur_prog['u_ring_station_count'].value = max(2, len(bounds) - 1)
+                        if 'u_atmo_shadow_method' in cur_prog:
+                            cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
+                        shadow_method = int(self.camera.get("atmo_shadow_method", 1))
+                        if shadow_method == 1:
+                            if 'u_ring_station_count' in cur_prog:
+                                cur_prog['u_ring_station_count'].value = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
+                        else:
+                            # Station-cell grid baked from this body's ring profile (edges snapped
+                            # to ring discontinuities); replaces the uniform-in-s slice grid whose
+                            # phase quantization caused step banding. Lazy-baked per (body, K).
+                            if ('u_ring_station_count' in cur_prog and hasattr(ring_gradient_tex, 'station_cells')
+                                    and hasattr(self, "body_ring_indices") and bi in self.body_ring_indices):
+                                u_idx = self.body_ring_indices[bi]
+                                K = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
+                                bounds = ring_gradient_tex.station_cells.get((bi, K))
+                                if bounds is None:
+                                    bounds = bake_station_cells(ring_gradient_tex.atlas_data[u_idx, :, 3], max_cells=K)
+                                    ring_gradient_tex.station_cells[(bi, K)] = bounds
+                                grid = np.zeros(36, dtype='f4')
+                                grid[:len(bounds)] = bounds
+                                cur_prog['u_ring_station_cells'].write(grid.tobytes())
+                                cur_prog['u_ring_station_count'].value = max(2, len(bounds) - 1)
 
                     cur_vao.render(moderngl.TRIANGLES)
     

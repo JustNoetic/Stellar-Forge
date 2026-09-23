@@ -183,6 +183,19 @@ def main():
     prog_sky = ctx.program(vertex_shader=vs, fragment_shader=load("atmosphere/sky_view_lut.frag"))
     prog_sky["u_transmittance_lut"].value = 1
     prog_sky["u_multi_scatter_lut"].value = 3
+
+    # Scene UBO (binding 1): the bake now reads u_num_stars / u_stars_poles_obl
+    # from SceneData (same std140 layout as atmo.frag / app.py's scene_ubo).
+    scene = np.zeros(6304 // 4, dtype=np.float32)
+    scene.view(np.int32)[128 // 4] = 1          # u_num_stars
+    scene[656 // 4 : 656 // 4 + 4] = (0.0, 1.0, 0.0, 0.0)  # u_stars_poles_obl[0]
+    scene_ubo = ctx.buffer(scene.tobytes())
+    scene_ubo.bind_to_uniform_block(1)
+
+    # Instance SSBO (binding 2): the bake reads planetshine dir/color + ring
+    # mask from instances[u_body_idx * 7 + 3..5]; zeros disable all shines.
+    inst_ssbo = ctx.buffer(np.zeros(7 * 4, dtype=np.float32).tobytes())
+    inst_ssbo.bind_to_storage_buffer(binding=2)
     sky_tex_a = ctx.texture((256, 256), 4, dtype="f2")
     sky_tex_b = ctx.texture((256, 256), 4, dtype="f2")
     sky_fbo = ctx.framebuffer(color_attachments=[sky_tex_a, sky_tex_b])

@@ -4,8 +4,35 @@
 #define MAX_RING_PLANES 16
 #define PI 3.14159265358979
 
+uniform sampler3D u_stbn_tex;
+uniform int u_atmo_noise_type; // 0 = Interleaved Gradient Noise (IGN), 1 = Spatiotemporal Blue Noise (STBN)
+
 float get_ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+float get_stbn(vec2 screen_pos, float frame_idx) {
+    ivec3 sz = textureSize(u_stbn_tex, 0);
+    if (sz.x >= 64) {
+        ivec3 coord = ivec3(
+            int(screen_pos.x) & 127,
+            int(screen_pos.y) & 127,
+            int(frame_idx) & 63
+        );
+        float base_noise = texelFetch(u_stbn_tex, coord, 0).r;
+        float cycle = floor(frame_idx / 64.0);
+        return fract(base_noise + cycle * 0.61803398875);
+    }
+    float base_ign = get_ign(screen_pos);
+    return fract(base_ign + float(int(frame_idx) % 16) * 0.61803398875);
+}
+
+float get_stochastic_jitter(vec2 screen_pos, float frame_idx) {
+    if (u_atmo_noise_type == 1) {
+        return get_stbn(screen_pos, frame_idx);
+    }
+    float base_ign = get_ign(screen_pos);
+    return fract(base_ign + float(int(frame_idx) % 16) * 0.61803398875);
 }
 
 in vec3 f_local_pos;
@@ -291,8 +318,7 @@ void main() {
 
     float jitter = 0.5;
     if (u_stochastic_noise) {
-        float base_ign = get_ign(gl_FragCoord.xy);
-        jitter = fract(base_ign + float(int(u_frame_counter) % 16) * 0.6180339887);
+        jitter = get_stochastic_jitter(gl_FragCoord.xy, u_frame_counter);
     }
 
     // Step allocation for dedicated godray pass: 24 to 48 steps is ideal
