@@ -10,6 +10,8 @@ import OpenGL
 OpenGL.ERROR_CHECKING = False
 import glfw
 import moderngl
+if not hasattr(moderngl.Program, '__contains__'):
+    moderngl.Program.__contains__ = lambda self, name: self.get(name, None) is not None
 import numpy as np
 import ctypes
 import struct
@@ -90,6 +92,13 @@ def _ellipsoid_surface_radius(r_eq, f, pole, u):
     return math.sqrt((r_eq * r_eq * b * b) / denom)
 
 _ICOSPHERE_SAG_CACHE = {}
+
+_STATION_GRID_BYTES_CACHE = {}
+for _k in range(2, 65):
+    _g = np.zeros((9, 4), dtype='f4')
+    _nb = min(_k + 1, _g.size)
+    _g.ravel()[:_nb] = np.linspace(0.0, 1.0, _nb)
+    _STATION_GRID_BYTES_CACHE[_k] = _g.tobytes()
 
 def _icosphere_max_sag(subdivisions):
     """Max inward sag of the tessellated icosphere from its circumsphere,
@@ -625,6 +634,15 @@ class App(InputHandlerMixin):
         
         self.depth_texture = None
         self.prev_cam_origin = None
+
+        # Pre-allocated scratch buffers for render_atmosphere_pass
+        self._atmo_active_casters_buf = np.zeros((8, 4), dtype='f4')
+        self._atmo_active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
+        self._atmo_active_caster_r_minor_buf = np.zeros(8, dtype='f4')
+        self._atmo_active_atmos_buf = np.zeros((8, 4), dtype='f4')
+        self._atmo_active_max_bend_buf = np.zeros(8, dtype='f4')
+        self._atmo_active_caster_ozone_buf = np.zeros((8, 4), dtype='f4')
+        self._clouds_exist_cache = {}
         
         # Screenshot capture state
         self._screenshot_request = None      # (width, height) tuple when capture requested
@@ -2821,6 +2839,7 @@ class App(InputHandlerMixin):
                 scrub_index[0] = 0
     
                 print(f"[System] Switched to '{active_system_name}' ({num_bodies} bodies)")
+                self._clouds_exist_cache.clear()
     
             with self.shared_state_cmp["lock"]:
                 switch_complete_cmp = self.shared_state_cmp.get("system_switch_complete", False)
@@ -2840,6 +2859,7 @@ class App(InputHandlerMixin):
                 
                 self.visual_arr_cmp = np.array(self.visual_data_cmp, dtype='f4')
                 last_orbit_pos_snap_cmp = None
+                self._clouds_exist_cache.clear()
                 self.body_radii_cmp = np.array([v[3] for v in self.visual_data_cmp], dtype='f4')
                 self.body_colors_cmp = np.array([v[0:3] for v in self.visual_data_cmp], dtype='f4')
                 self.is_star_arr_cmp = np.zeros(self.num_bodies_cmp, dtype='f4')
@@ -4678,22 +4698,27 @@ class App(InputHandlerMixin):
             self.ringshine_map_tex.use(location=8)
             
             # Pass Exposure and HDR setting to shaders
-            exposure = self.camera.get("exposure", 1.0)
-            hdr_enabled = self.camera.get("hdr_enabled", True)
+            exposure = float(self.camera.get("exposure", 1.0))
+            hdr_enabled = bool(self.camera.get("hdr_enabled", True))
+            ps_enabled = bool(self.camera.get("planetshine_enabled", True))
+            rs_enabled = bool(self.camera.get("ringshine_enabled", True))
+            rs_band_count = int(self.camera.get("ringshine_band_count", 100))
+            rs_oblate = bool(self.camera.get("ringshine_oblate_enabled", True))
             
             for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view):
-                if 'u_exposure' in prog:
-                    prog['u_exposure'].value = exposure
-                if 'u_hdr_enabled' in prog:
-                    prog['u_hdr_enabled'].value = hdr_enabled
-                if 'u_planetshine_enabled' in prog:
-                    prog['u_planetshine_enabled'].value = self.camera.get("planetshine_enabled", True)
-                if 'u_ringshine_enabled' in prog:
-                    prog['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
-                if 'u_ringshine_band_count' in prog:
-                    prog['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 100))
-                if 'u_ringshine_oblate_enabled' in prog:
-                    prog['u_ringshine_oblate_enabled'].value = self.camera.get("ringshine_oblate_enabled", True)
+                if prog is None: continue
+                u = prog.get('u_exposure', None)
+                if u is not None: u.value = exposure
+                u = prog.get('u_hdr_enabled', None)
+                if u is not None: u.value = hdr_enabled
+                u = prog.get('u_planetshine_enabled', None)
+                if u is not None: u.value = ps_enabled
+                u = prog.get('u_ringshine_enabled', None)
+                if u is not None: u.value = rs_enabled
+                u = prog.get('u_ringshine_band_count', None)
+                if u is not None: u.value = rs_band_count
+                u = prog.get('u_ringshine_oblate_enabled', None)
+                if u is not None: u.value = rs_oblate
 
             inv_proj_bytes = np.linalg.inv(projection).astype('f4').tobytes()
             inv_view_bytes = np.linalg.inv(view).astype('f4').tobytes()
@@ -5048,11 +5073,15 @@ class App(InputHandlerMixin):
                     else:
                         # Default station grid (uniform in u); ringed bodies override per-draw below.
                         K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
-                    grid = np.zeros((9, 4), dtype='f4')
-                    n_bounds = min(K_def + 1, grid.size)
-                    grid.ravel()[:n_bounds] = np.linspace(0.0, 1.0, n_bounds)
+                    grid_bytes = _STATION_GRID_BYTES_CACHE.get(K_def)
+                    if grid_bytes is None:
+                        _g = np.zeros((9, 4), dtype='f4')
+                        _nb = min(K_def + 1, _g.size)
+                        _g.ravel()[:_nb] = np.linspace(0.0, 1.0, _nb)
+                        grid_bytes = _g.tobytes()
+                        _STATION_GRID_BYTES_CACHE[K_def] = grid_bytes
                     if 'u_ring_station_cells' in cur_prog:
-                        cur_prog['u_ring_station_cells'].write(grid.tobytes())
+                        cur_prog['u_ring_station_cells'].write(grid_bytes)
                     cur_prog['u_ring_station_count'].value = K_def
                 if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
                 if 'u_atmo_noise_type' in cur_prog: cur_prog['u_atmo_noise_type'].value = int(self.camera.get("atmo_noise_type", 0))
@@ -5089,17 +5118,17 @@ class App(InputHandlerMixin):
                     cur_prog['u_atmo_clip_mode'].value = clip_mode
                 self.atmo_ssbo.bind_to_storage_buffer(binding=8)
     
-                # Pre-build lookup tables outside the loop
-                atmo_lookup = {a['body_idx']: a for a in atmo_bodies}
+                # Reuse pre-built lookup table
+                atmo_lookup = atmo_by_body
                 atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
 
-                # Pre-allocate scratch arrays outside the loop
-                active_casters_buf = np.zeros((8, 4), dtype='f4')
-                active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
-                active_caster_r_minor_buf = np.zeros(8, dtype='f4')
-                active_atmos_buf = np.zeros((8, 4), dtype='f4')
-                active_max_bend_buf = np.zeros(8, dtype='f4')
-                active_caster_ozone_buf = np.zeros((8, 4), dtype='f4')
+                # Reuse persistent scratch arrays
+                active_casters_buf = self._atmo_active_casters_buf
+                active_poles_obl_buf = self._atmo_active_poles_obl_buf
+                active_caster_r_minor_buf = self._atmo_active_caster_r_minor_buf
+                active_atmos_buf = self._atmo_active_atmos_buf
+                active_max_bend_buf = self._atmo_active_max_bend_buf
+                active_caster_ozone_buf = self._atmo_active_caster_ozone_buf
 
                 for sq_dist, atmo, is_cmp in atmos_to_render:
                     bi = atmo['body_idx']
@@ -5954,13 +5983,18 @@ class App(InputHandlerMixin):
                 if bi >= len(bdata):
                     return False
                 bname = bdata[bi].get('name', '').lower()
+                cached = self._clouds_exist_cache.get(bname)
+                if cached is not None:
+                    return cached
                 manifest_entry = getattr(self.texture_streamer, 'file_manifest', {}).get(bname, {}) if hasattr(self, 'texture_streamer') and self.texture_streamer else {}
                 c_path = manifest_entry.get('clouds')
+                has_cloud = False
                 if c_path and os.path.exists(c_path):
-                    return True
-                if bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
-                    return True
-                return False
+                    has_cloud = True
+                elif bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
+                    has_cloud = True
+                self._clouds_exist_cache[bname] = has_cloud
+                return has_cloud
 
             def render_body_clouds(bi, is_cmp=False):
                 if not _body_has_clouds(bi, is_cmp=is_cmp):
@@ -6010,7 +6044,56 @@ class App(InputHandlerMixin):
                 _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
                 return float((_pos[0] - cam_pos[0])**2 + (_pos[1] - cam_pos[1])**2 + (_pos[2] - cam_pos[2])**2)
 
-            sorted_trans_keys = sorted(all_trans_keys, key=_get_key_sq_dist, reverse=True)
+            # CPU Frustum and Distance Culling for transparent entities (atmospheres, rings, clouds)
+            visible_trans_keys = []
+            tracking_bi = self.camera.get("tracking_idx")
+            tracking_is_cmp = bool(self.camera.get("tracking_is_cmp", False))
+
+            for key in all_trans_keys:
+                _bi, _is_c = key
+                # Rule 1: Always keep currently tracked body
+                if _bi == tracking_bi and _is_c == tracking_is_cmp:
+                    visible_trans_keys.append(key)
+                    continue
+
+                _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                dx = float(_pos[0] - cam_pos[0])
+                dy = float(_pos[1] - cam_pos[1])
+                dz = float(_pos[2] - cam_pos[2])
+                dist_sq = dx * dx + dy * dy + dz * dz
+
+                # Maximum bounding radius of this entity (atmo, rings, or body)
+                _atmo_rad = float(atmos_by_key[key][1]['atmo_radius_au']) if key in atmos_by_key else 0.0
+                _body_rad = float(self.body_radii_cmp[_bi] if _is_c else body_radii[_bi]) if _bi < (len(self.body_radii_cmp) if _is_c else len(body_radii)) else 0.0
+                _ring_rad = 0.0
+                if not _is_c and _bi in self.body_ring_indices:
+                    _u_idx = self.body_ring_indices[_bi]
+                    _ring_rad = float(ring_params_buf[_u_idx, 1])
+                elif _is_c and hasattr(self, 'body_ring_indices_cmp') and _bi in getattr(self, 'body_ring_indices_cmp', {}):
+                    _u_idx = self.body_ring_indices_cmp[_bi]
+                    _ring_rad = float(ring_params_buf[_u_idx, 1])
+
+                bound_r = max(_atmo_rad, _body_rad, _ring_rad)
+                if bound_r <= 0.0:
+                    continue
+
+                # Rule 2: Observer inside or in close vicinity of bounding sphere (never cull)
+                if dist_sq <= (bound_r * 2.0) ** 2:
+                    visible_trans_keys.append(key)
+                    continue
+
+                # Rule 3: Subpixel culling (< 2 px)
+                dist_to_cam = math.sqrt(dist_sq)
+                apparent_px = (bound_r / max(dist_to_cam, 1e-12)) * self.fb_height * fov_factor
+                if apparent_px < 2.0:
+                    continue
+
+                # Rule 4: Frustum test with 25% safety margin for atmospheric refraction & ring glints
+                if is_sphere_in_frustum(_pos, bound_r * 1.25, frustum_planes):
+                    visible_trans_keys.append(key)
+
+            sorted_trans_keys = sorted(visible_trans_keys, key=_get_key_sq_dist, reverse=True)
+            visible_trans_keys_set = set(visible_trans_keys)
 
             # Insert Habitable Zone visualizer at star distance if active
             has_hz = self.camera.get("show_habitable_zone", False) and self.hz_vao is not None
@@ -6063,9 +6146,9 @@ class App(InputHandlerMixin):
                     render_body_clouds(_bi, is_cmp=_is_c)
                     rendered_cloud_bodies.add(key)
 
-            # Render any remaining cloud bodies not covered in sorted_trans_keys
+            # Render any remaining visible cloud bodies not covered in sorted_trans_keys
             for _ck in cloud_keys:
-                if _ck not in rendered_cloud_bodies:
+                if _ck in visible_trans_keys_set and _ck not in rendered_cloud_bodies:
                     render_body_clouds(_ck[0], is_cmp=_ck[1])
                     rendered_cloud_bodies.add(_ck)
 

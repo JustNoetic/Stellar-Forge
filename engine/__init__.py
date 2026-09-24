@@ -1,4 +1,7 @@
 import sys
+import OpenGL
+OpenGL.ERROR_CHECKING = False
+OpenGL.ARRAY_SIZE_CHECKING = False
 
 from engine.core import constants, math_utils, input_handler
 from engine.physics import physics_core, kepler_analytical, atmosphere_physics, star_calc
