@@ -46,6 +46,7 @@ vec3 adjust_hsba(vec3 color, float hue_shift, float saturation, float brightness
 }
 
 uniform sampler2D u_ring_gradients;
+uniform sampler2D u_ring_props;
 uniform sampler3D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
 
@@ -175,16 +176,6 @@ void main() {
     vec3 total_ring_irradiance = vec3(0.0);
     float log_r_ratio = log(max(1.001, outer_r / max(1e-5, inner_r)));
 
-    bool plane_is_textured = (u_ring_planes[k].is_textured > 0.5);
-    float layer_hue   = u_ring_planes[k].hue_shift;
-    float layer_sat   = u_ring_planes[k].saturation;
-    float layer_bri   = u_ring_planes[k].brightness;
-    float layer_unlit = u_ring_planes[k].unlit_factor;
-    float layer_boost = u_ring_planes[k].alpha_boost;
-    float layer_asym  = u_ring_planes[k].asymmetry;
-    float layer_backasym = u_ring_planes[k].backscatter;
-    float layer_scatter  = u_ring_planes[k].scatter;
-
     for (int m = 0; m < band_count; m++) {
         float u0 = float(m) / float(band_count);
         float u1 = float(m + 1) / float(band_count);
@@ -217,16 +208,16 @@ void main() {
         float band_raw_alpha = sum_alpha / sum_area;
         vec3 band_raw_rgb = sum_color / sum_alpha;
 
-        if (plane_is_textured && (abs(layer_hue) > 1e-4 || abs(layer_sat - 1.0) > 1e-4 || abs(layer_bri - 1.0) > 1e-4)) {
-            band_raw_rgb = adjust_hsba(band_raw_rgb, layer_hue, layer_sat, layer_bri);
-        }
-
-        if (plane_is_textured && band_raw_alpha > 1e-5 && abs(layer_boost - 1.0) > 1e-4) {
-            band_raw_alpha = clamp(pow(band_raw_alpha, 1.0 / max(0.01, layer_boost)), 0.0, 1.0);
-        }
-
         float alpha_phys = clamp(band_raw_alpha * opacity, 0.0, 0.999);
         float tau_phys = -log(max(1e-4, 1.0 - alpha_phys));
+
+        float frac_mid = clamp((r_mid - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
+        vec4 props = texture(u_ring_props, vec2(frac_mid, (float(k) + 0.5) / 4.0));
+        float layer_asym = props.r;
+        float layer_backasym = props.g;
+        float layer_scatter = props.b;
+        bool plane_is_textured = (props.a >= 50.0);
+        float layer_unlit = plane_is_textured ? (props.a - 100.0) : props.a;
 
         float norm_r = r_mid / max(1e-5, host_radius);
 

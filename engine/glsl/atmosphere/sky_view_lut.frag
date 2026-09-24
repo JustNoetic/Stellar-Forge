@@ -127,6 +127,25 @@ vec3 fromSphericalSpace(vec3 p_sph, vec4 pole_scale) {
     return p_sph + (h_sph * (1.0 / f_scale - 1.0)) * pole;
 }
 
+// SpaceEngine Solstice Winter Model: suppressed aerosol Mie haze and azure Rayleigh in-scatter boost
+void eval_polar_winter(vec3 pos_sph, vec2 solstice_params, float has_rings,
+                       out float polar_haze_factor, out vec3 polar_rayleigh_boost) {
+    if (solstice_params.x < 1e-4 || has_rings < 0.5) {
+        polar_haze_factor = 1.0;
+        polar_rayleigh_boost = vec3(1.0);
+        return;
+    }
+    vec3 pole_dir_norm = (length(u_pole_obl.xyz) > 1e-4) ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
+    vec3 dir_norm = normalize(pos_sph);
+    float frag_pole_dot = dot(dir_norm, pole_dir_norm);
+    float mid_sin_lat = abs(frag_pole_dot);
+    float lat_factor = smoothstep(0.1, 0.7, mid_sin_lat);
+    float is_winter = step(solstice_params.y * frag_pole_dot, 0.0);
+    float winter_solstice_effect = lat_factor * is_winter * solstice_params.x * has_rings;
+    polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
+    polar_rayleigh_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
+}
+
 // Evaluates analytical penumbra/umbra shadow occlusion for external rings (belonging
 // to parent/neighbor bodies, e.g. Saturn's rings casting shadow onto Titan).
 // Circumplanetary (own) rings are skipped here because Mode 3 slices own-ring shadows
@@ -525,6 +544,7 @@ void main() {
     vec3 total_scatter = vec3(0.0); // single scattering, all stars, phases applied
     vec3 total_ms = vec3(0.0);      // multi scattering, all stars
     vec3 current_transmittance = vec3(1.0);
+    float has_rings = (ring_mask_bits != 0u) ? 1.0 : 0.0;
 
     for (int i = 0; i < num_steps; i++) {
         float s = s_start + (float(i) + 0.5) * ds;
@@ -532,8 +552,12 @@ void main() {
         float r = length(P);
         float altitude = max(0.0, r - u_planet_radius_km);
 
+        float polar_haze_factor0;
+        vec3 polar_rayleigh_boost0;
+        eval_polar_winter(P, u_star_solstice[0].xy, has_rings, polar_haze_factor0, polar_rayleigh_boost0);
+
         float rho_R = exp(-altitude * inv_h_rayleigh);
-        float rho_M = exp(-altitude * inv_h_mie);
+        float rho_M = exp(-altitude * inv_h_mie) * polar_haze_factor0;
         float t_ozone = (altitude - u_ozone_peak_km) * inv_ozone_width;
         float rho_O = exp(-(t_ozone * t_ozone));
 
@@ -554,6 +578,12 @@ void main() {
         float ms_v = sqrt(h_norm);
 
         for (int st = 0; st < n_stars; st++) {
+            vec3 polar_rayleigh_boost_st = polar_rayleigh_boost0;
+            if (st > 0) {
+                float dummy_haze;
+                eval_polar_winter(P, u_star_solstice[st].xy, has_rings, dummy_haze, polar_rayleigh_boost_st);
+            }
+
             float light_cos_theta = dot(Pn, star_L_sph[st]);
 
             // Terminator: stellar-disc rise/set with refraction-extended penumbra
@@ -581,7 +611,7 @@ void main() {
             if (vis_fraction > 1e-4) {
                 vec3 trans_to_sun = get_transmittance(r, term.y);
                 vec3 sample_attenuation = current_transmittance * trans_to_sun * vis_fraction * shadow * int_factor;
-                s_single = star_int[st] * (star_phase_R[st] * beta_R * rho_R
+                s_single = star_int[st] * (star_phase_R[st] * beta_R * (rho_R * polar_rayleigh_boost_st)
                                          + star_phase_M[st] * beta_M * rho_M) * sample_attenuation;
                 total_scatter += s_single;
             }

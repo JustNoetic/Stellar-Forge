@@ -65,6 +65,7 @@ layout(std430, binding = 2) buffer AllInstances {
 uint u_caster_mask_lo;
 uint u_caster_mask_hi;
 uint u_ring_mask;
+vec2 u_cur_solstice;
 
 uniform vec3 u_camera_pos;
 
@@ -192,6 +193,25 @@ vec3 fromSphericalSpace(vec3 p_sph, vec4 pole_scale) {
     vec3 pole = pole_scale.xyz;
     float h_sph = dot(p_sph, pole);
     return p_sph + (h_sph * (1.0 / f_scale - 1.0)) * pole;
+}
+
+// SpaceEngine Solstice Winter Model: suppressed aerosol Mie haze and azure Rayleigh in-scatter boost
+void eval_polar_winter(vec3 pos_sph, vec2 solstice_params, float has_rings,
+                       out float polar_haze_factor, out vec3 polar_rayleigh_boost) {
+    if (solstice_params.x < 1e-4 || has_rings < 0.5) {
+        polar_haze_factor = 1.0;
+        polar_rayleigh_boost = vec3(1.0);
+        return;
+    }
+    vec3 pole_dir_norm = (length(u_pole_obl.xyz) > 1e-4) ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
+    vec3 dir_norm = normalize(pos_sph);
+    float frag_pole_dot = dot(dir_norm, pole_dir_norm);
+    float mid_sin_lat = abs(frag_pole_dot);
+    float lat_factor = smoothstep(0.1, 0.7, mid_sin_lat);
+    float is_winter = step(solstice_params.y * frag_pole_dot, 0.0);
+    float winter_solstice_effect = lat_factor * is_winter * solstice_params.x * has_rings;
+    polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
+    polar_rayleigh_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
 }
 
 #define ATMO_DATA_HAS_AU_TO_KM 1
@@ -348,9 +368,14 @@ void accumulate_shadow_cell(
     float h1 = max(0.0, length(P1) - u_planet_radius_km);
     float tO3_0 = (h0 - u_ozone_peak_km) * inv_ozone_width;
     float tO3_m = (hm - u_ozone_peak_km) * inv_ozone_width;
+    float polar_haze_factor;
+    vec3 polar_rayleigh_boost;
+    float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
+    eval_polar_winter(Pm, u_cur_solstice, has_rings, polar_haze_factor, polar_rayleigh_boost);
+
     float tO3_1 = (h1 - u_ozone_peak_km) * inv_ozone_width;
     float rho_R_q  = (exp(-h0 * inv_h_rayleigh) + 4.0 * exp(-hm * inv_h_rayleigh) + exp(-h1 * inv_h_rayleigh)) / 6.0;
-    float rho_M_q  = (exp(-h0 * inv_h_mie) + 4.0 * exp(-hm * inv_h_mie) + exp(-h1 * inv_h_mie)) / 6.0;
+    float rho_M_q  = ((exp(-h0 * inv_h_mie) + 4.0 * exp(-hm * inv_h_mie) + exp(-h1 * inv_h_mie)) / 6.0) * polar_haze_factor;
     float rho_O3_q = (exp(-(tO3_0 * tO3_0)) + 4.0 * exp(-(tO3_m * tO3_m)) + exp(-(tO3_1 * tO3_1))) / 6.0;
 
     vec3 ext_q = beta_R * rho_R_q + beta_M_ext * rho_M_q + beta_A_mixed * rho_R_q + beta_A_layered * rho_O3_q;
@@ -379,7 +404,7 @@ void accumulate_shadow_cell(
                                  eff_star_rad, cos_sun_eff);
     float vis_fraction = term_q.x;
     vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
-    vec3 inscatter_direct = (beta_R * rho_R_q * phase_R + beta_M * rho_M_q * phase_M)
+    vec3 inscatter_direct = (beta_R * (rho_R_q * polar_rayleigh_boost) * phase_R + beta_M * rho_M_q * phase_M)
                              * trans_to_sun * vis_fraction * star_int;
 
     // Multi-scatter component matching sky_view_lut.frag
@@ -419,8 +444,13 @@ void march_uniform_shadow(
         float rq = max(length(Pq), 1e-6);
         float hq = max(0.0, rq - u_planet_radius_km);
 
+        float polar_haze_factor;
+        vec3 polar_rayleigh_boost;
+        float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
+        eval_polar_winter(Pq, u_cur_solstice, has_rings, polar_haze_factor, polar_rayleigh_boost);
+
         float rho_R = exp(-hq * inv_h_rayleigh);
-        float rho_M = exp(-hq * inv_h_mie);
+        float rho_M = exp(-hq * inv_h_mie) * polar_haze_factor;
         float tO3 = (hq - u_ozone_peak_km) * inv_ozone_width;
         float rho_O3 = exp(-(tO3 * tO3));
 
@@ -436,7 +466,7 @@ void march_uniform_shadow(
                                      eff_star_rad, cos_sun_eff);
         float vis_fraction = term_q.x;
         vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
-        vec3 inscatter_direct = (beta_R * rho_R * phase_R + beta_M * rho_M * phase_M)
+        vec3 inscatter_direct = (beta_R * (rho_R * polar_rayleigh_boost) * phase_R + beta_M * rho_M * phase_M)
                                  * trans_to_sun * vis_fraction * star_int;
 
         // Multiple scattering component matching sky_view_lut.frag
@@ -541,13 +571,18 @@ vec3 get_transmittance_segment(
     float hm = max(0.0, length(cam_local_sph + sm * ray_dir_sph) - u_planet_radius_km);
     float h1 = max(0.0, length(cam_local_sph + s1 * ray_dir_sph) - u_planet_radius_km);
 
+    float polar_haze_factor;
+    vec3 polar_rayleigh_boost;
+    float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
+    eval_polar_winter(cam_local_sph + sm * ray_dir_sph, u_cur_solstice, has_rings, polar_haze_factor, polar_rayleigh_boost);
+
     float tO3_0 = (h0 - u_ozone_peak_km) * inv_ozone_width;
     float tO3_m = (hm - u_ozone_peak_km) * inv_ozone_width;
     float tO3_1 = (h1 - u_ozone_peak_km) * inv_ozone_width;
 
-    vec3 ext0 = (beta_R + beta_A_mixed) * exp(-h0 * inv_h_rayleigh) + beta_M_ext * exp(-h0 * inv_h_mie) + beta_A_layered * exp(-(tO3_0 * tO3_0));
-    vec3 extm = (beta_R + beta_A_mixed) * exp(-hm * inv_h_rayleigh) + beta_M_ext * exp(-hm * inv_h_mie) + beta_A_layered * exp(-(tO3_m * tO3_m));
-    vec3 ext1 = (beta_R + beta_A_mixed) * exp(-h1 * inv_h_rayleigh) + beta_M_ext * exp(-h1 * inv_h_mie) + beta_A_layered * exp(-(tO3_1 * tO3_1));
+    vec3 ext0 = (beta_R + beta_A_mixed) * exp(-h0 * inv_h_rayleigh) + (beta_M_ext * polar_haze_factor) * exp(-h0 * inv_h_mie) + beta_A_layered * exp(-(tO3_0 * tO3_0));
+    vec3 extm = (beta_R + beta_A_mixed) * exp(-hm * inv_h_rayleigh) + (beta_M_ext * polar_haze_factor) * exp(-hm * inv_h_mie) + beta_A_layered * exp(-(tO3_m * tO3_m));
+    vec3 ext1 = (beta_R + beta_A_mixed) * exp(-h1 * inv_h_rayleigh) + (beta_M_ext * polar_haze_factor) * exp(-h1 * inv_h_mie) + beta_A_layered * exp(-(tO3_1 * tO3_1));
 
     vec3 tau = ((s1 - s0) / 6.0) * (ext0 + 4.0 * extm + ext1);
     return exp(-tau);
@@ -578,8 +613,13 @@ void march_bounded_shadow_blackrack(
         float rq = max(length(Pq), 1e-6);
         float hq = max(0.0, rq - u_planet_radius_km);
 
+        float polar_haze_factor;
+        vec3 polar_rayleigh_boost;
+        float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
+        eval_polar_winter(Pq, u_cur_solstice, has_rings, polar_haze_factor, polar_rayleigh_boost);
+
         float rho_R = exp(-hq * inv_h_rayleigh);
-        float rho_M = exp(-hq * inv_h_mie);
+        float rho_M = exp(-hq * inv_h_mie) * polar_haze_factor;
         float tO3 = (hq - u_ozone_peak_km) * inv_ozone_width;
         float rho_O3 = exp(-(tO3 * tO3));
 
@@ -595,7 +635,7 @@ void march_bounded_shadow_blackrack(
                                      eff_star_rad, cos_sun_eff);
         float vis_fraction = term_q.x;
         vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
-        vec3 inscatter_direct = (beta_R * rho_R * phase_R + beta_M * rho_M * phase_M_eff)
+        vec3 inscatter_direct = (beta_R * (rho_R * polar_rayleigh_boost) * phase_R + beta_M * rho_M * phase_M_eff)
                                  * trans_to_sun * vis_fraction * star_int;
 
         // Multiple scattering component matching sky_view_lut.frag
@@ -687,8 +727,13 @@ void march_bounded_eclipse_blackrack(
         float rq = max(length(Pq), 1e-6);
         float hq = max(0.0, rq - u_planet_radius_km);
 
+        float polar_haze_factor;
+        vec3 polar_rayleigh_boost;
+        float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
+        eval_polar_winter(Pq, u_cur_solstice, has_rings, polar_haze_factor, polar_rayleigh_boost);
+
         float rho_R = exp(-hq * inv_h_rayleigh);
-        float rho_M = exp(-hq * inv_h_mie);
+        float rho_M = exp(-hq * inv_h_mie) * polar_haze_factor;
         float tO3 = (hq - u_ozone_peak_km) * inv_ozone_width;
         float rho_O3 = exp(-(tO3 * tO3));
 
@@ -704,7 +749,7 @@ void march_bounded_eclipse_blackrack(
                                      eff_star_rad, cos_sun_eff);
         float vis_fraction = term_q.x;
         vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
-        vec3 inscatter_direct = (beta_R * rho_R * phase_R + beta_M * rho_M * phase_M_eff)
+        vec3 inscatter_direct = (beta_R * (rho_R * polar_rayleigh_boost) * phase_R + beta_M * rho_M * phase_M_eff)
                                  * trans_to_sun * vis_fraction * star_int;
 
         // Multiple scattering component matching sky_view_lut.frag
@@ -1329,6 +1374,7 @@ void main() {
         float limb_fade = limb_faded ? clamp((1.0 - t_limb) * 128.0, 0.0, 1.0) : 1.0;
 
         for (int st = 0; st < n_stars_m3; st++) {
+            u_cur_solstice = (st < 4) ? u_star_solstice[st].xy : vec2(0.0);
             vec3 sun_pos_km = u_star_pos_local[st].xyz;
             if (dot(sun_pos_km, sun_pos_km) < 1e-8) continue;
             vec3 L_cart = normalize(sun_pos_km);
@@ -1870,15 +1916,10 @@ void main() {
 
         // SpaceEngine Solstice Winter Model (atmosphere thickness is negligible compared to radius)
         vec3 mid_pos_sph = toSphericalSpace(mid_pos, u_pole_obl);
-        vec3 mid_dir_norm = normalize(mid_pos_sph);
-        float mid_sin_lat = abs(dot(mid_dir_norm, pole_dir_norm));
-        float lat_factor = smoothstep(0.1, 0.7, mid_sin_lat);
-        float frag_pole_dot = dot(mid_dir_norm, pole_dir_norm);
-        float is_winter = step(sun_pole_dot * frag_pole_dot, 0.0);
         float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
-        float winter_solstice_effect = lat_factor * is_winter * solstice_factor * has_rings;
-        float polar_haze_factor = mix(1.0, 0.05, winter_solstice_effect);
-        vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
+        float polar_haze_factor;
+        vec3 polar_rayleigh_inscatter_boost;
+        eval_polar_winter(mid_pos_sph, vec2(solstice_factor, sun_pole_dot), has_rings, polar_haze_factor, polar_rayleigh_inscatter_boost);
 
 
         vec3 total_rayleigh = vec3(0.0);

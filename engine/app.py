@@ -1922,15 +1922,14 @@ class App(InputHandlerMixin):
                     sum_asymmetry += seg.get('asymmetry', 0.7) * w
                     sum_backscatter += seg.get('backscatter', -0.3) * w
                     
-                # For textured rings, color and opacity come directly from the texture map
-                r_color = (1.0, 1.0, 1.0)
-                r_opacity = 1.0
+                first = textured_segs[0] if textured_segs else {}
+                r_color = hex_to_rgb(first.get('color', '#ffffff')) if first else (1.0, 1.0, 1.0)
+                r_opacity = first.get('opacity', 1.0) if first else 1.0
                 if total_w > 0.0:
                     r_scatter = sum_scatter / total_w
                     r_asymmetry = sum_asymmetry / total_w
                     r_backscatter = sum_backscatter / total_w
                 else:
-                    first = textured_segs[0]
                     r_scatter = first.get('scatter', 2.5)
                     r_asymmetry = first.get('asymmetry', 0.7)
                     r_backscatter = first.get('backscatter', -0.3)
@@ -1941,7 +1940,13 @@ class App(InputHandlerMixin):
                 tex_sampled = img_data # take 4096 samples
                 
                 # Generate shadow gradient from texture (no procedural gradient)
-                shadow_grad = generate_ring_shadow_grad(sorted_gradient=[], tex_sampled=tex_sampled)
+                shadow_grad = generate_ring_shadow_grad(
+                    sorted_gradient=[], tex_sampled=tex_sampled, raw_color=r_color,
+                    hue_shift=first.get('hue_shift', 0.0),
+                    saturation=first.get('saturation', 1.0),
+                    brightness=first.get('brightness', 1.0),
+                    alpha_boost=first.get('alpha_boost', 1.0)
+                )
                 colors5 = compute_5_ring_colors(tex_sampled=tex_sampled, raw_color=r_color)
                 
                 ring_precomputed.append({
@@ -1973,7 +1978,7 @@ class App(InputHandlerMixin):
                     p_r_backscatter = ring_seg.get('backscatter', -0.3)
                     
                     sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                    shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                    shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None, raw_color=p_r_color)
                     colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=p_r_color, gradient=sorted_gradient)
                     
                     ring_precomputed.append({
@@ -2006,7 +2011,7 @@ class App(InputHandlerMixin):
                     
                     sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
                     
-                    shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                    shadow_grad = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None, raw_color=r_color)
                     colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=r_color, gradient=sorted_gradient)
                     
                     ring_precomputed.append({
@@ -2031,6 +2036,12 @@ class App(InputHandlerMixin):
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
+        ring_props_tex = ctx.texture((4096, 4), 4, dtype='f4')
+        ring_props_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        ring_props_tex.repeat_x = False
+        ring_props_tex.repeat_y = False
+        ring_gradient_tex.props_tex = ring_props_tex
+        self.ring_props_tex = ring_props_tex
         ring_shadow_tex = ctx.texture((4096, 1), 4, dtype='f4')
         ring_shadow_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
         ring_shadow_tex.repeat_x = False
@@ -2096,6 +2107,7 @@ class App(InputHandlerMixin):
         self.ringshine_map_fbo = ctx.framebuffer(color_attachments=[self.ringshine_map_tex])
         self.prog_ringshine_map = ctx.program(vertex_shader=ringshine_map_vertex_shader, fragment_shader=ringshine_map_fragment_shader)
         if 'u_ring_gradients' in self.prog_ringshine_map: self.prog_ringshine_map['u_ring_gradients'].value = 0
+        if 'u_ring_props' in self.prog_ringshine_map: self.prog_ringshine_map['u_ring_props'].value = 5
         if 'u_ringshine_lut' in self.prog_ringshine_map: self.prog_ringshine_map['u_ringshine_lut'].value = 6
         if 'u_ringshine_cdf_lut' in self.prog_ringshine_map: self.prog_ringshine_map['u_ringshine_cdf_lut'].value = 7
         self.ringshine_map_vao = ctx.vertex_array(self.prog_ringshine_map, [(lut_vbo, '2f', 'in_position')])
@@ -2725,8 +2737,14 @@ class App(InputHandlerMixin):
                             r_scatter = sum_scatter / total_w
                             r_asymmetry = sum_asymmetry / total_w
                             r_backscatter = sum_backscatter / total_w
+                        first = textured_segs[0] if textured_segs else {}
+                        r_color = hex_to_rgb(first.get('color', '#ffffff')) if first else (1.0, 1.0, 1.0)
+                        r_opacity = first.get('opacity', 1.0) if first else 1.0
+                        if total_w > 0.0:
+                            r_scatter = sum_scatter / total_w
+                            r_asymmetry = sum_asymmetry / total_w
+                            r_backscatter = sum_backscatter / total_w
                         else:
-                            first = textured_segs[0]
                             r_scatter = first.get('scatter', 2.5)
                             r_asymmetry = first.get('asymmetry', 0.7)
                             r_backscatter = first.get('backscatter', -0.3)
@@ -2735,7 +2753,13 @@ class App(InputHandlerMixin):
                         img_data = img_data.reshape(4096, 4)
                         tex_sampled_sw = img_data
                         
-                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient=[], tex_sampled=tex_sampled_sw)
+                        shadow_grad_r = generate_ring_shadow_grad(
+                            sorted_gradient=[], tex_sampled=tex_sampled_sw, raw_color=r_color,
+                            hue_shift=first.get('hue_shift', 0.0),
+                            saturation=first.get('saturation', 1.0),
+                            brightness=first.get('brightness', 1.0),
+                            alpha_boost=first.get('alpha_boost', 1.0)
+                        )
                         colors5 = compute_5_ring_colors(tex_sampled=tex_sampled_sw, raw_color=r_color)
                         
                         ring_precomputed.append({
@@ -2755,7 +2779,7 @@ class App(InputHandlerMixin):
                             p_r_backscatter = ring_seg.get('backscatter', -0.3)
                             
                             sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                            shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                            shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None, raw_color=p_r_color)
                             colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=p_r_color, gradient=sorted_gradient)
                             
                             ring_precomputed.append({
@@ -2774,7 +2798,7 @@ class App(InputHandlerMixin):
                             r_asymmetry = ring_seg.get('asymmetry', 0.7)
                             r_backscatter = ring_seg.get('backscatter', -0.3)
                             sorted_gradient = sorted(ring_seg.get('gradient', []), key=lambda x: x['p'])
-                            shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None)
+                            shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=None, raw_color=r_color)
                             colors5 = compute_5_ring_colors(tex_sampled=None, raw_color=r_color, gradient=sorted_gradient)
                             ring_precomputed.append({
                                 'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
@@ -2918,7 +2942,7 @@ class App(InputHandlerMixin):
                         if name_lower_sw in self.ring_textures:
                             img_data = np.frombuffer(self.ring_textures[name_lower_sw].tobytes(), dtype=np.uint8).astype('f4') / 255.0
                             tex_sampled_sw = img_data.reshape(4096, 4)
-                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled_sw)
+                        shadow_grad_r = generate_ring_shadow_grad(sorted_gradient, tex_sampled=tex_sampled_sw, raw_color=r_color)
                         self.ring_precomputed_cmp.append({
                             'body_idx': body_idx_r, 'pole': pole_n_r.astype('f4'), 'inner_r': inner_r, 'outer_r': outer_r,
                             'opacity': r_opacity, 'scatter': r_scatter, 'asymmetry': r_asymmetry, 'backscatter': r_backscatter,
@@ -3875,16 +3899,17 @@ class App(InputHandlerMixin):
                 body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
                 active_rings = [r for r in body_rings if r['opacity'] > 0.0]
                 
-                if active_rings:
-                    min_r = min(r['inner_r'] for r in active_rings)
-                    max_r = max(r['outer_r'] for r in active_rings)
-                    opacity = 1.0
-                    pole = active_rings[0]['pole']
-                    raw_color = active_rings[0]['raw_color']
-                    colors5 = active_rings[0].get('5colors', raw_color)
+                if body_rings:
+                    min_r = min(r['inner_r'] for r in body_rings)
+                    max_r = max(r['outer_r'] for r in body_rings)
+                    opacity = 1.0 if active_rings else 0.0
+                    first_ring = active_rings[0] if active_rings else body_rings[0]
+                    pole = first_ring['pole']
+                    raw_color = first_ring['raw_color']
+                    colors5 = first_ring.get('5colors', raw_color)
                 else:
                     min_r, max_r, opacity = 0.0, 0.0, 0.0
-                    pole = body_rings[0]['pole'] if body_rings else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    pole = np.array([0.0, 1.0, 0.0], dtype=np.float32)
                     raw_color = (0.0, 0.0, 0.0)
                     colors5 = raw_color
                     
@@ -4111,36 +4136,72 @@ class App(InputHandlerMixin):
             ps_ring_colors = self._ps_ring_colors
 
             if ring_precomputed:
+                rings_by_bi = {}
                 for r in ring_precomputed:
                     bi = r['body_idx']
-                    if bi < num_bodies and r['opacity'] > 0.0:
-                        if ps_ring_params[bi, 1] == 0.0:
-                            ps_ring_params[bi, 0] = r['inner_r']
-                            ps_ring_params[bi, 1] = r['outer_r']
-                            ps_ring_params[bi, 2] = r['opacity']
-                            ps_ring_params[bi, 3] = float(r.get('unlit_factor', 1.0))
-                            ps_ring_normals[bi] = r['pole']
-                            ps_ring_colors[bi] = r['raw_color']
-                        else:
-                            ps_ring_params[bi, 0] = min(ps_ring_params[bi, 0], r['inner_r'])
-                            ps_ring_params[bi, 1] = max(ps_ring_params[bi, 1], r['outer_r'])
-                            ps_ring_params[bi, 2] = max(ps_ring_params[bi, 2], r['opacity'])
+                    if bi < num_bodies:
+                        rings_by_bi.setdefault(bi, []).append(r)
+                for bi, b_rings in rings_by_bi.items():
+                    act_rings = [r for r in b_rings if r['opacity'] > 0.0]
+                    if act_rings:
+                        min_r = min(r['inner_r'] for r in b_rings)
+                        max_r = max(r['outer_r'] for r in b_rings)
+                        total_annulus_area = max(1e-6, max_r * max_r - min_r * min_r)
+                        
+                        flux_sum = 0.0
+                        color_sum = np.zeros(3, dtype='f4')
+                        unlit_sum = 0.0
+                        for r in act_rings:
+                            seg_area = max(0.0, r['outer_r'] * r['outer_r'] - r['inner_r'] * r['inner_r'])
+                            seg_flux = seg_area * r['opacity']
+                            flux_sum += seg_flux
+                            color_sum += seg_flux * np.array(r['raw_color'], dtype='f4')
+                            unlit_sum += seg_flux * float(r.get('unlit_factor', 1.0))
+                            
+                        weighted_opacity = min(1.0, flux_sum / total_annulus_area)
+                        weighted_color = (color_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else act_rings[0]['raw_color']
+                        weighted_unlit = (unlit_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else 1.0
+                        
+                        ps_ring_params[bi, 0] = min_r
+                        ps_ring_params[bi, 1] = max_r
+                        ps_ring_params[bi, 2] = weighted_opacity
+                        ps_ring_params[bi, 3] = weighted_unlit
+                        ps_ring_normals[bi] = act_rings[0]['pole']
+                        ps_ring_colors[bi] = weighted_color
 
             if self.comparison_enabled and hasattr(self, 'ring_precomputed_cmp') and self.ring_precomputed_cmp:
+                rings_by_bi_cmp = {}
                 for r in self.ring_precomputed_cmp:
                     bi = num_bodies + r['body_idx']
-                    if bi < n_ps_bodies and r['opacity'] > 0.0:
-                        if ps_ring_params[bi, 1] == 0.0:
-                            ps_ring_params[bi, 0] = r['inner_r']
-                            ps_ring_params[bi, 1] = r['outer_r']
-                            ps_ring_params[bi, 2] = r['opacity']
-                            ps_ring_params[bi, 3] = float(r.get('unlit_factor', 1.0))
-                            ps_ring_normals[bi] = r['pole']
-                            ps_ring_colors[bi] = r['raw_color']
-                        else:
-                            ps_ring_params[bi, 0] = min(ps_ring_params[bi, 0], r['inner_r'])
-                            ps_ring_params[bi, 1] = max(ps_ring_params[bi, 1], r['outer_r'])
-                            ps_ring_params[bi, 2] = max(ps_ring_params[bi, 2], r['opacity'])
+                    if bi < n_ps_bodies:
+                        rings_by_bi_cmp.setdefault(bi, []).append(r)
+                for bi, b_rings in rings_by_bi_cmp.items():
+                    act_rings = [r for r in b_rings if r['opacity'] > 0.0]
+                    if act_rings:
+                        min_r = min(r['inner_r'] for r in b_rings)
+                        max_r = max(r['outer_r'] for r in b_rings)
+                        total_annulus_area = max(1e-6, max_r * max_r - min_r * min_r)
+                        
+                        flux_sum = 0.0
+                        color_sum = np.zeros(3, dtype='f4')
+                        unlit_sum = 0.0
+                        for r in act_rings:
+                            seg_area = max(0.0, r['outer_r'] * r['outer_r'] - r['inner_r'] * r['inner_r'])
+                            seg_flux = seg_area * r['opacity']
+                            flux_sum += seg_flux
+                            color_sum += seg_flux * np.array(r['raw_color'], dtype='f4')
+                            unlit_sum += seg_flux * float(r.get('unlit_factor', 1.0))
+                            
+                        weighted_opacity = min(1.0, flux_sum / total_annulus_area)
+                        weighted_color = (color_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else act_rings[0]['raw_color']
+                        weighted_unlit = (unlit_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else 1.0
+                        
+                        ps_ring_params[bi, 0] = min_r
+                        ps_ring_params[bi, 1] = max_r
+                        ps_ring_params[bi, 2] = weighted_opacity
+                        ps_ring_params[bi, 3] = weighted_unlit
+                        ps_ring_normals[bi] = act_rings[0]['pole']
+                        ps_ring_colors[bi] = weighted_color
             
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
@@ -4639,6 +4700,8 @@ class App(InputHandlerMixin):
             uniform_orbit_depth_C.value = depth_C
     
             ring_gradient_tex.use(location=0)
+            if hasattr(self, 'ring_props_tex') and self.ring_props_tex is not None:
+                self.ring_props_tex.use(location=5)
             ringshine_lut_tex.use(location=6)
             ringshine_cdf_tex.use(location=7)
 

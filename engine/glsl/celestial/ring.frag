@@ -380,7 +380,7 @@ void main() {
 
             float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
 
-            vec3 plane_color = plane_is_textured ? vec3(1.0) : u_ring_planes[i].color;
+            vec3 plane_color = u_ring_planes[i].color;
             float plane_opacity = u_ring_planes[i].opacity;
 
             float raw_a_physical = alpha * plane_opacity;

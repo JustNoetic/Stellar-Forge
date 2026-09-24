@@ -2,64 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 import moderngl
-from engine.rendering.render_utils import generate_ring_shadow_grad, rebuild_ring_render_group
-
-def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0, alpha_boost=1.0):
-    out = arr_rgba.copy()
-    rgb = out[..., :3]
-    maxc = np.max(rgb, axis=-1)
-    minc = np.min(rgb, axis=-1)
-    rangec = maxc - minc
-
-    hsv = np.zeros_like(rgb)
-    hsv[..., 2] = maxc * brightness
-
-    mask = rangec > 1e-6
-    hsv[..., 1][mask] = (rangec[mask] / (maxc[mask] + 1e-6)) * saturation
-
-    rc = np.zeros_like(maxc)
-    gc = np.zeros_like(maxc)
-    bc = np.zeros_like(maxc)
-    rc[mask] = (maxc[mask] - rgb[..., 0][mask]) / (rangec[mask] + 1e-6)
-    gc[mask] = (maxc[mask] - rgb[..., 1][mask]) / (rangec[mask] + 1e-6)
-    bc[mask] = (maxc[mask] - rgb[..., 2][mask]) / (rangec[mask] + 1e-6)
-
-    h = np.zeros_like(maxc)
-    r_mask = (rgb[..., 0] == maxc) & mask
-    g_mask = (rgb[..., 1] == maxc) & mask
-    b_mask = (rgb[..., 2] == maxc) & mask
-
-    h[r_mask] = bc[r_mask] - gc[r_mask]
-    h[g_mask] = 2.0 + rc[g_mask] - bc[g_mask]
-    h[b_mask] = 4.0 + gc[b_mask] - rc[b_mask]
-    h = (h / 6.0 + hue_shift) % 1.0
-    hsv[..., 0] = h
-
-    h6 = hsv[..., 0] * 6.0
-    i = np.floor(h6).astype(int) % 6
-    f = h6 - np.floor(h6)
-    v = np.clip(hsv[..., 2], 0.0, 1.0)
-    s = np.clip(hsv[..., 1], 0.0, 1.0)
-
-    p = v * (1.0 - s)
-    q = v * (1.0 - s * f)
-    t = v * (1.0 - s * (1.0 - f))
-
-    rgb_new = np.zeros_like(rgb)
-    idx0 = (i == 0); rgb_new[idx0] = np.stack([v[idx0], t[idx0], p[idx0]], axis=-1)
-    idx1 = (i == 1); rgb_new[idx1] = np.stack([q[idx1], v[idx1], p[idx1]], axis=-1)
-    idx2 = (i == 2); rgb_new[idx2] = np.stack([p[idx2], v[idx2], t[idx2]], axis=-1)
-    idx3 = (i == 3); rgb_new[idx3] = np.stack([p[idx3], q[idx3], v[idx3]], axis=-1)
-    idx4 = (i == 4); rgb_new[idx4] = np.stack([t[idx4], p[idx4], v[idx4]], axis=-1)
-    idx5 = (i == 5); rgb_new[idx5] = np.stack([v[idx5], p[idx5], q[idx5]], axis=-1)
-
-    out[..., :3] = np.clip(rgb_new, 0.0, 1.0)
-    alpha_val = np.clip(out[..., 3] * opacity_mult, 0.0, 1.0)
-    if abs(alpha_boost - 1.0) > 1e-4:
-        mask_nz = alpha_val > 1e-5
-        alpha_val[mask_nz] = np.clip(np.power(alpha_val[mask_nz], 1.0 / max(0.01, alpha_boost)), 0.0, 1.0)
-    out[..., 3] = alpha_val
-    return out
+from engine.rendering.render_utils import generate_ring_shadow_grad, rebuild_ring_render_group, apply_hsba_np
 
 def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=None, ring_render_groups=None, ring_gradient_tex=None):
     name_lower = body_name.lower()
@@ -134,7 +77,13 @@ def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=No
     ring_item['alpha_boost'] = 1.0
 
     if ring_precomputed is not None and ring_render_groups is not None and ring_gradient_tex is not None:
-        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=np.array(img_ring_new, dtype='f4') / 255.0)
+        sampled_arr = np.array(img_ring_new, dtype='f4') / 255.0
+        ring_item['tex_sampled'] = sampled_arr
+        shadow_grad = generate_ring_shadow_grad(
+            ring_item['gradient'],
+            tex_sampled=sampled_arr,
+            raw_color=ring_item.get('raw_color', (1.0, 1.0, 1.0))
+        )
         ring_item['shadow_grad'] = shadow_grad
         app.body_ring_indices = rebuild_ring_render_group(ring_item['body_idx'], ctx, app.prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
     return True

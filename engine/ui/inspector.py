@@ -1133,10 +1133,14 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     changed_bks, new_bks = imgui.drag_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.999, 0.999, "%.4f")
 
                     changed_unlit = False
+                    if not is_tex_layer:
+                        changed_unlit, new_unlit = imgui.drag_float(f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
+
                     changed_sat = False
                     changed_hue = False
                     changed_bri = False
                     changed_boost = False
+                    reset_edits = False
 
                     if is_tex_layer:
                         if imgui.tree_node(f"Texture Editor##{i}"):
@@ -1151,7 +1155,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                                 ring_item['hue_shift'] = 0.0
                                 ring_item['brightness'] = 1.0
                                 ring_item['alpha_boost'] = 1.0
-                                changed_unlit = True
+                                reset_edits = True
                             imgui.same_line()
                             if imgui.button(f"Bake & Save Texture##{i}"):
                                 b_name = cur_bodies_data[insp_idx]['name']
@@ -1195,7 +1199,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
                         imgui.tree_pop()
 
-                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or changed_unlit or changed_sat or changed_hue or changed_bri or changed_boost or grad_changed:
+                    if changed_in or changed_out or changed_col or changed_op or changed_scat or changed_asym or changed_bks or changed_unlit or changed_sat or changed_hue or changed_bri or changed_boost or grad_changed or reset_edits:
                         if changed_in: ring_item['inner_r'] = new_in / 149597870.7
                         if changed_out: ring_item['outer_r'] = new_out / 149597870.7
                         if changed_col: ring_item['raw_color'] = new_col
@@ -1203,13 +1207,22 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         if changed_scat: ring_item['scatter'] = new_scat
                         if changed_asym: ring_item['asymmetry'] = new_asym
                         if changed_bks: ring_item['backscatter'] = new_bks
-                        if changed_unlit: ring_item['unlit_factor'] = new_unlit
-                        if changed_sat: ring_item['saturation'] = new_sat
-                        if changed_hue: ring_item['hue_shift'] = new_hue
-                        if changed_bri: ring_item['brightness'] = new_bri
-                        if changed_boost: ring_item['alpha_boost'] = new_boost
+                        if not reset_edits:
+                            if changed_unlit: ring_item['unlit_factor'] = new_unlit
+                            if changed_sat: ring_item['saturation'] = new_sat
+                            if changed_hue: ring_item['hue_shift'] = new_hue
+                            if changed_bri: ring_item['brightness'] = new_bri
+                            if changed_boost: ring_item['alpha_boost'] = new_boost
 
-                        shadow_grad = generate_ring_shadow_grad(ring_item['gradient'], tex_sampled=ring_item.get('tex_sampled'))
+                        shadow_grad = generate_ring_shadow_grad(
+                            ring_item['gradient'],
+                            tex_sampled=ring_item.get('tex_sampled'),
+                            raw_color=ring_item.get('raw_color', (1.0, 1.0, 1.0)),
+                            hue_shift=ring_item.get('hue_shift', 0.0),
+                            saturation=ring_item.get('saturation', 1.0),
+                            brightness=ring_item.get('brightness', 1.0),
+                            alpha_boost=ring_item.get('alpha_boost', 1.0)
+                        )
                         ring_item['shadow_grad'] = shadow_grad
                         app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
 
@@ -1229,13 +1242,15 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     color = cur_visual_arr[insp_idx, 0:3]
                     grad = [{'p': 0.0, 'a': 0.0}, {'p': 0.5, 'a': 1.0}, {'p': 1.0, 'a': 0.0}]
                     pole_n = pole_render / np.linalg.norm(pole_render)
-                    shadow_grad = generate_ring_shadow_grad(grad)
+                    shadow_grad = generate_ring_shadow_grad(grad, raw_color=color)
                     ring_precomputed.append({
                         'body_idx': insp_idx,
                         'pole': pole_n.astype('f4'),
                         'inner_r': r_in, 'outer_r': r_out, 'opacity': 0.8,
                         'scatter': 0.0, 'asymmetry': 0.8, 'backscatter': -0.3, 'shadow_grad': shadow_grad,
                         'raw_color': color, 'gradient': grad,
+                        'unlit_factor': 1.0, 'saturation': 1.0, 'hue_shift': 0.0,
+                        'brightness': 1.0, 'alpha_boost': 1.0,
                         'row_idx': len(ring_precomputed)
                     })
                     app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
