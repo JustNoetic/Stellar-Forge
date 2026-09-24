@@ -74,7 +74,7 @@ def main():
     for steps in [16, 24, 32]:
         if "u_num_steps" in prog_sky:
             prog_sky["u_num_steps"].value = steps
-        for W, H in [(192, 108), (256, 256)]:
+        for W, H in [(192, 108), (256, 256), (384, 216)]:
             sky_texes = [ctx.texture((W, H), 4, dtype="f4") for _ in range(6)]
             sky_fbo = ctx.framebuffer(color_attachments=sky_texes)
             sky_fbo.use()
@@ -105,7 +105,7 @@ def main():
             sky_fbo.release()
 
     print(f"Luminance range: min={img[:, :, :3].min():.4f}, max={img[:, :, :3].max():.4f}, mean={img[:, :, :3].mean():.4f}")
-    print("192x108 Sky-View LUT validation: PASS")
+    print("Sky-View LUT resolution presets (Low/Medium/High) validation: PASS")
     return 0
 
 if __name__ == "__main__":

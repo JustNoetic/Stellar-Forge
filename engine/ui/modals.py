@@ -3,7 +3,7 @@ import datetime
 import os
 import numpy as np
 import imgui
-from engine.core.constants import DEFAULT_LY_THRESHOLD_AU
+from engine.core.constants import DEFAULT_LY_THRESHOLD_AU, SKY_VIEW_RES_LABELS
 from engine.core.math_utils import get_cartesian_from_keplerian, rotate_equatorial_to_ecliptic, ecliptic_to_pole
 from engine.rendering.render_utils import compute_surface_albedo, format_distance_au, sim_time_from_date, format_sim_time_utc
 from engine.ephemeris.system_manager import SystemManager
@@ -29,27 +29,35 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 settings_changed = True
 
             if atmo_quality == 3:
+                sky_view_res = int(app.camera.get("atmo_sky_view_res", 0))
+                sky_view_res_idx = min(len(SKY_VIEW_RES_LABELS) - 1, max(0, sky_view_res))
+                changed_svr, new_svr_idx = imgui.combo("Sky-View LUT Resolution", sky_view_res_idx, SKY_VIEW_RES_LABELS)
+                if changed_svr:
+                    app.camera["atmo_sky_view_res"] = new_svr_idx
+                    settings_changed = True
+
                 sky_view_steps = int(app.camera.get("atmo_sky_view_steps", 24))
                 changed_sv, sky_view_steps = imgui.slider_int("Sky-View LUT Steps", sky_view_steps, 8, 64)
                 if changed_sv:
                     app.camera["atmo_sky_view_steps"] = sky_view_steps
                     settings_changed = True
 
-                shadow_methods = ["Station-Locked Slicing", "Uniform Stochastic Raymarching"]
+                shadow_methods = ["Station-Locked Slicing", "Uniform Stochastic Raymarching", "Bounded Subtraction (Blackrack)"]
                 shadow_method = int(app.camera.get("atmo_shadow_method", 1))
-                shadow_method_idx = 0 if shadow_method == 0 else 1
+                shadow_method_idx = min(2, max(0, shadow_method))
                 changed_sm, shadow_method_idx = imgui.combo("Shadow Method", shadow_method_idx, shadow_methods)
                 if changed_sm:
                     app.camera["atmo_shadow_method"] = shadow_method_idx
                     settings_changed = True
 
-                if shadow_method_idx == 1:
+                if shadow_method_idx in (1, 2):
                     shadow_steps = int(app.camera.get("atmo_shadow_steps", 24))
                     changed_steps, shadow_steps = imgui.slider_int("Shadow Ray Steps", shadow_steps, 4, 64)
                     if changed_steps:
                         app.camera["atmo_shadow_steps"] = shadow_steps
                         settings_changed = True
 
+                if shadow_method_idx == 1:
                     stochastic_steps = app.camera.get("atmo_stochastic", True)
                     changed_stoch, stochastic_steps = imgui.checkbox("Stochastic Raymarching", stochastic_steps)
                     if changed_stoch:
@@ -63,12 +71,14 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                         if changed_nt:
                             app.camera["atmo_noise_type"] = cur_noise
                             settings_changed = True
-                else:
+                elif shadow_method_idx == 0:
                     slicing_steps = int(app.camera.get("atmo_slicing_steps", 8))
                     changed_ss, slicing_steps = imgui.slider_int("Shadow Slicing Cells", slicing_steps, 2, 32)
                     if changed_ss:
                         app.camera["atmo_slicing_steps"] = slicing_steps
                         settings_changed = True
+                elif shadow_method_idx == 2:
+                    imgui.text_colored("Deterministic midpoint quadrature with bounded cylinder culling (Blackrack / KSA).", 0.6, 0.8, 1.0)
             elif atmo_quality > 0:
                 atmo_res = float(app.camera.get("atmo_resolution", 1.0))
                 changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")
@@ -261,6 +271,11 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 if changed_rsb:
                     app.camera["ringshine_band_count"] = ringshine_bands
                     settings_changed = True
+                changed_rso, app.camera["ringshine_oblate_enabled"] = imgui.checkbox("Account for Host Oblateness", app.camera.get("ringshine_oblate_enabled", True))
+                if changed_rso:
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Physically models planetary polar flattening on shadow length, surface slant distance, and ring form factors.")
                 imgui.unindent()
 
             # Dynamic Texture Streaming

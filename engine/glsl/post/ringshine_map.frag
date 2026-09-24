@@ -18,6 +18,7 @@ struct RingPlane {
     float hue_shift;
     float brightness;
     float alpha_boost;
+    float oblateness;
 };
 
 vec3 rgb2hsv(vec3 c) {
@@ -45,7 +46,7 @@ vec3 adjust_hsba(vec3 color, float hue_shift, float saturation, float brightness
 }
 
 uniform sampler2D u_ring_gradients;
-uniform sampler2D u_ringshine_lut;
+uniform sampler3D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
 
 uniform vec3 u_sun_dir[16];
@@ -53,6 +54,7 @@ uniform int u_num_ring_planes;
 uniform vec3 u_ring_normal[16];
 uniform vec4 u_ring_params[16];
 uniform int u_ringshine_band_count;
+uniform bool u_ringshine_oblate_enabled;
 uniform RingPlane u_ring_planes[16];
 
 float HenyeyGreensteinPhaseFunction(float eccentricity, float viewDirDotLight) {
@@ -155,6 +157,11 @@ void main() {
         return;
     }
     float sin_lat = clamp(abs(frag_elevation), 0.0, 0.999);
+    float obl = (u_ringshine_oblate_enabled) ? clamp(u_ring_planes[k].oblateness, 0.0, 0.3) : 0.0;
+    float f_factor = 1.0 - obl;
+    float cos_lat = sqrt(max(0.0, 1.0 - sin_lat * sin_lat));
+    float denom_rho = sqrt(f_factor * f_factor * cos_lat * cos_lat + sin_lat * sin_lat);
+    float rho = (obl > 1e-5) ? (f_factor / max(1e-6, denom_rho)) : 1.0;
 
     vec3 L = u_sun_dir[k];
     float sun_elevation = dot(L, ring_normal);
@@ -222,13 +229,22 @@ void main() {
         float tau_phys = -log(max(1e-4, 1.0 - alpha_phys));
 
         float norm_r = r_mid / max(1e-5, host_radius);
-        float cos_lat = sqrt(max(0.0, 1.0 - sin_lat * sin_lat));
 
         // --- PLANETARY SHADOW ON RING (CDF & LUT) ---
         float delta_alpha_shadow = 0.0;
-        if (norm_r <= 1.0 / sin_sun_elev) {
-            float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
-            delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
+        if (obl > 1e-5) {
+            float a_shadow_sq = (f_factor * f_factor * cos_sun_elev * cos_sun_elev + sin_sun_elev * sin_sun_elev) / max(1e-8, sin_sun_elev * sin_sun_elev);
+            float a_shadow = sqrt(a_shadow_sq);
+            if (norm_r <= a_shadow) {
+                float C_eff = (f_factor * cos_sun_elev) / sqrt(max(1e-8, f_factor * f_factor * cos_sun_elev * cos_sun_elev + sin_sun_elev * sin_sun_elev));
+                float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, C_eff);
+                delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
+            }
+        } else {
+            if (norm_r <= 1.0 / sin_sun_elev) {
+                float arg = sqrt(max(0.0, 1.0 - 1.0 / (norm_r * norm_r))) / max(1e-4, cos_sun_elev);
+                delta_alpha_shadow = acos(clamp(arg, 0.0, 1.0));
+            }
         }
 
         float psi1 = -delta_alpha_shadow - phi_center;
@@ -244,10 +260,10 @@ void main() {
         if (band_illum < 1e-6) continue;
 
         // --- EXACT SLANT ANGLE & DISTANCE ---
-        float d2 = max(1e-6, norm_r * norm_r + 1.0 - 2.0 * norm_r * cos_lat);
+        float d2 = max(1e-6, norm_r * norm_r + rho * rho - 2.0 * norm_r * rho * cos_lat);
         float d = sqrt(d2);
 
-        float cosViewRayVertical = clamp(sin_lat / d, 0.001, 1.0);
+        float cosViewRayVertical = clamp((rho * sin_lat) / d, 0.001, 1.0);
         float cosLightRayVertical = clamp(sin_sun_elev, 0.001, 1.0);
         float viewDensity = tau_phys / cosViewRayVertical;
         float lightDensity = tau_phys / cosLightRayVertical;
@@ -257,7 +273,7 @@ void main() {
         // displaced away from retro-reflection. Modulating the horizontal phase cosine smoothly
         // by (1.0 - 0.45 * shadow_fraction) accounts for this shift with guaranteed C_inf continuity (no vertical seam or boxy edge).
         float cos_phi_eff = cos(phi_center) * (1.0 - 0.45 * shadow_fraction);
-        float cos_theta_phase = ((norm_r - cos_lat) * cos_sun_elev * cos_phi_eff + sin_sun_elev * sin_lat) / d;
+        float cos_theta_phase = ((norm_r - rho * cos_lat) * cos_sun_elev * cos_phi_eff + sin_sun_elev * (rho * sin_lat)) / d;
         cos_theta_phase = clamp(cos_theta_phase, -1.0, 1.0);
 
         float pf = 0.0;
@@ -289,7 +305,8 @@ void main() {
 
         float u_tex_lut = 0.5 / 256.0 + sin_lat * (255.0 / 256.0);
         float v_tex_lut = 0.5 / 256.0 + v_tex * (255.0 / 256.0);
-        float kernel_val = texture(u_ringshine_lut, vec2(u_tex_lut, v_tex_lut)).r;
+        float w_tex_lut = 0.5 / 16.0 + clamp(obl / 0.3, 0.0, 1.0) * (15.0 / 16.0);
+        float kernel_val = texture(u_ringshine_lut, vec3(u_tex_lut, v_tex_lut, w_tex_lut)).r;
 
         total_ring_irradiance += band_color * kernel_val * dr * band_illum;
     }

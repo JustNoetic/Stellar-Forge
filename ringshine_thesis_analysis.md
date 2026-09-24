@@ -34,13 +34,13 @@ The ringshine pipeline consists of three decoupled stages:
 ```mermaid
 graph TD
     subgraph "Stage 1: Startup (CPU, one-time)"
-        A["build_ringshine_lut()<br/>(engine/app.py)"] --> B["2D Irradiance Form-Factor LUT<br/>256×256, R32F (Unit 6)"]
+        A["build_ringshine_lut()<br/>(engine/rendering/render_utils.py)"] --> B["3D Irradiance Form-Factor LUT<br/>256×256×16, R32F (Unit 6, f ∈ [0, 0.3])"]
         A --> C["3D Azimuthal CDF LUT<br/>128×128×64, R32F (Unit 7)"]
     end
 
     subgraph "Stage 2: Per-Frame Bake (GPU)"
         D["ringshine_map.frag<br/>(100 bands, 4-pt Gauss-Legendre)"] --> E["Dynamic Ringshine Map<br/>128×1040, RGBA32F (Unit 8)"]
-        B -.->|"Geometric kernel K(r, sinλ)"| D
+        B -.->|"Geometric kernel K(r, sinλ, f)"| D
         C -.->|"Shadow fraction via CDF(ψ₂)−CDF(ψ₁)"| D
         F["Ring Gradients Atlas<br/>4096×16, RGBA32F (Unit 0)"] -.->|"4-point area-weighted quadrature"| D
     end
@@ -55,8 +55,8 @@ graph TD
 
 | Stage | Where | Cost | Output |
 |---|---|---|---|
-| **1. Irradiance & CDF LUTs** | CPU at startup ([`app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py#L1898-L1957)) | One-time ~50ms | `ringshine_lut_tex` (256²) + `ringshine_cdf_tex` (128×128×64) |
-| **2. Dynamic Map Bake** | GPU per-frame ([`ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag)) | ~0.04–0.08ms @ 100 bands | `ringshine_map_tex` (128×1040) |
+| **1. Irradiance & CDF LUTs** | CPU at startup ([`app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py#L1996-L2040), [`render_utils.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/rendering/render_utils.py)) | One-time ~250ms (Numba JIT) | `ringshine_lut_tex` (256×256×16) + `ringshine_cdf_tex` (128×128×64) |
+| **2. Dynamic Map Bake** | GPU per-frame ([`ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag)) | ~0.12–0.13ms @ 100 bands (all 16 ring slots) | `ringshine_map_tex` (128×1040) |
 | **3. Fragment Sampling** | GPU per-fragment ([`sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag#L914-L991), [`atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag#L1306-L1351)) | $O(1)$ per fragment | Surface diffuse color and atmospheric scattering |
 
 ---
@@ -119,6 +119,29 @@ Any arbitrary shadow arc $[\psi_1, \psi_2]$ can then be integrated in constant t
 
 $$\int_{\psi_1}^{\psi_2} dK \, d\alpha = F(\pi) \cdot \big[\text{CDF}(\psi_2) - \text{CDF}(\psi_1)\big]$$
 
+### 3.5 Generalization to Oblate Spheroids & 3D Form-Factor LUT
+
+Fast-rotating gas giants exhibit significant geometric flattening. For Saturn, the equatorial radius is $R_{\text{eq}} = 60,268\text{ km}$ while the polar radius is $R_{\text{pol}} = 54,364\text{ km}$, yielding an oblateness $f = \frac{R_{\text{eq}} - R_{\text{pol}}}{R_{\text{eq}}} \approx 0.09796$.
+
+On an oblate spheroid of unit equatorial radius ($a = 1$) and polar semi-axis $b = 1 - f$:
+1. **Geocentric Surface Distance**:
+   $$\rho(\lambda) = \frac{1 - f}{\sqrt{(1-f)^2 \cos^2\lambda + \sin^2\lambda}}$$
+   The surface point lies at $P = (\rho\cos\lambda, \; 0, \; \rho\sin\lambda)$.
+
+2. **Geodetic Normal & Horizon Tilt**:
+   The true outward surface normal is tilted toward the poles relative to the radial planetocentric vector:
+   $$\mathbf{N}_{\text{oblate}} = \frac{1}{\sqrt{\cos^2\lambda + (1-f)^{-4}\sin^2\lambda}} \left(\cos\lambda, \; 0, \; \frac{\sin\lambda}{(1-f)^2}\right)$$
+   $$\tan\phi_{\text{geodetic}} = \frac{1}{(1-f)^2} \tan\lambda$$
+   For Saturn ($f \approx 0.098$), this tilts the horizon by up to $\Delta\theta_n = 5.866^\circ$ at $\lambda = 45^\circ$, causing ring elements to appear significantly lower above the local horizon (or completely set beneath the horizon) compared to a sphere.
+
+3. **3D Form-Factor LUT Parameterization**:
+   To capture this effect in real time, the 2D form-factor table is generalized to a **3D texture** (`sampler3D u_ringshine_lut`, unit 6) of dimensions $256 \times 256 \times 16$ (`R32F`):
+   - $u$-axis (width = 256): $\sin\lambda \in [0.0, 1.0]$
+   - $v$-axis (height = 256): $r \in [1.001, 5.0]$
+   - $w$-axis (depth = 16): oblateness $f \in [0.0, 0.3]$
+   
+   Slice 0 ($w = 0, f = 0.0$) corresponds bit-exactly to the spherical form-factor kernel, ensuring zero regression when oblateness calculation is disabled.
+
 ---
 
 ## 4. Stage 2 — Per-Frame Dynamic Ringshine Map Bake (GPU)
@@ -170,14 +193,14 @@ This provides exact numerical integration of polynomial profiles up to degree 7,
 
 ### 4.3 Exact Slant Optical Depths & True 3D Phase Angle
 
-#### Exact Slant Factors via Finite Distance $d$
-Unlike distant stars or infinite slabs, the planet surface lies at finite Euclidean distance $d$ from the ring element. For a surface point at latitude $\sin\lambda$ and ring element at $r_{\text{norm}} = r_{\text{mid}} / R_{\text{host}}$:
+#### Exact Slant Factors via Finite Distance $d$ (Spherical and Oblate)
+Unlike distant stars or infinite slabs, the planet surface lies at finite Euclidean distance $d$ from the ring element. Accounting for planetary oblateness $f$ with local surface radius $\rho(\lambda) = \frac{1-f}{\sqrt{(1-f)^2 \cos^2\lambda + \sin^2\lambda}}$ (where $\rho \equiv 1.0$ when spherical or disabled):
 
-$$d^2 = \max(10^{-6}, \; r_{\text{norm}}^2 + 1 - 2 r_{\text{norm}}\cos\lambda), \qquad d = \sqrt{d^2}$$
+$$d^2 = \max(10^{-6}, \; r_{\text{norm}}^2 + \rho^2 - 2 r_{\text{norm}}\rho\cos\lambda), \qquad d = \sqrt{d^2}$$
 
 The vertical cosine of the view ray relative to the ring normal is:
 
-$$\cos\theta_v = \text{clamp}\left(\frac{\sin\lambda}{d}, \; 0.001, \; 1.0\right), \qquad \cos\theta_0 = \text{clamp}(|\sin\theta_{\text{sun}}|, \; 0.001, \; 1.0)$$
+$$\cos\theta_v = \text{clamp}\left(\frac{\rho\sin\lambda}{d}, \; 0.001, \; 1.0\right), \qquad \cos\theta_0 = \text{clamp}(|\sin\theta_{\text{sun}}|, \; 0.001, \; 1.0)$$
 
 The normal physical optical thickness $\tau = -\ln(1 - \alpha_{\text{phys}})$ yields slant optical depths:
 
@@ -188,7 +211,7 @@ The true 3D scattering phase angle $\theta_{\text{phase}}$ between the incident 
 
 $$\cos\phi_{\text{eff}} = \cos\phi_{\text{center}} \cdot (1.0 - 0.45 \cdot \text{shadow\_fraction})$$
 
-$$\boxed{\cos\theta_{\text{phase}} = \text{clamp}\left(\frac{(r_{\text{norm}} - \cos\lambda)\cos\theta_{\text{sun}}\cos\phi_{\text{eff}} + \sin\theta_{\text{sun}}\sin\lambda}{d}, \; -1.0, \; 1.0\right)}$$
+$$\boxed{\cos\theta_{\text{phase}} = \text{clamp}\left(\frac{(r_{\text{norm}} - \rho\cos\lambda)\cos\theta_{\text{sun}}\cos\phi_{\text{eff}} + \sin\theta_{\text{sun}}(\rho\sin\lambda)}{d}, \; -1.0, \; 1.0\right)}$$
 
 > [!NOTE]
 > Because $\frac{d}{d\phi}[\cos\phi_{\text{center}}] = -\sin\phi_{\text{center}} = 0$ at $\phi_{\text{center}} = 0$, the derivative across the anti-solar midnight meridian is strictly zero. This guarantees that the irradiance profile is completely smooth and free of vertical seam lines (which arise if piecewise $|\phi_{\text{center}}|$ cusps are introduced) and free of boxy/square artifacts (which arise if hard shadow boundary checks are used).
@@ -239,15 +262,31 @@ $$w_{\text{MS}} = \begin{cases} \text{clamp}\left(\frac{\alpha_{\text{phys}} - 0
 
 ## 5. Stage 2 — Analytical Planetary Shadow Integration
 
-### 5.1 Shadow Geometry
+### 5.1 Shadow Geometry (Spherical vs Oblate)
 
-The spherical host planet casts a cylindrical umbral shadow wedge into the equatorial ring plane. A ring element at normalized radius $r_{\text{norm}}$ intersects the shadow cylinder if:
+The host planet casts an umbral shadow wedge into the equatorial ring plane:
 
-$$r_{\text{norm}} \leq \frac{1}{\sin\theta_{\text{sun}}}$$
+#### Spherical Host ($f = 0$)
+For a spherical body of radius $R = 1$, the shadow boundary reaches out to the tip radius:
+$$a_{\text{shadow}} = \frac{1}{\sin\theta_{\text{sun}}}$$
 
-The azimuthal half-width $\Delta\alpha_{\text{shadow}}$ of the shadow cylinder at radius $r_{\text{norm}}$:
+The azimuthal half-width $\Delta\alpha_{\text{shadow}}$ at normalized radius $r_{\text{norm}}$ is:
+$$\Delta\alpha_{\text{shadow}} = \arccos\!\left(\frac{\sqrt{1 - 1/r_{\text{norm}}^2}}{\cos\theta_{\text{sun}}}\right)$$
 
-$$\boxed{\Delta\alpha_{\text{shadow}} = \arccos\!\left(\frac{\sqrt{1 - 1/r_{\text{norm}}^2}}{\cos\theta_{\text{sun}}}\right)}$$
+#### Oblate Host ($f > 0$)
+For an oblate spheroid with polar flattening $f = 1 - b/a$, the cylinder projected along the incident solar ray $\mathbf{L} = (-\cos\theta_{\text{sun}}, \; 0, \; \sin\theta_{\text{sun}})$ onto the equatorial plane ($z = 0$) forms an **ellipse** whose semi-major axis extends along the anti-solar axis:
+
+$$\boxed{a_{\text{shadow}} = \frac{\sqrt{(1-f)^2 \cos^2\theta_{\text{sun}} + \sin^2\theta_{\text{sun}}}}{\sin\theta_{\text{sun}}}}$$
+
+The effective projection cosine is compressed by polar flattening:
+
+$$C_{\text{eff}} = \frac{(1-f)\cos\theta_{\text{sun}}}{\sqrt{(1-f)^2 \cos^2\theta_{\text{sun}} + \sin^2\theta_{\text{sun}}}}$$
+
+yielding the exact oblate azimuthal half-width:
+
+$$\boxed{\Delta\alpha_{\text{shadow}} = \arccos\!\left(\text{clamp}\left(\frac{\sqrt{1 - 1/r_{\text{norm}}^2}}{C_{\text{eff}}}, \; 0.0, \; 1.0\right)\right)}$$
+
+When $f = 0$, $C_{\text{eff}} = \cos\theta_{\text{sun}}$ and $a_{\text{shadow}} = 1/\sin\theta_{\text{sun}}$, recovering the spherical case bit-exactly. On Saturn ($f \approx 0.098$) at solstice ($\theta_{\text{sun}} = 26.73^\circ$), $a_{\text{shadow}}$ shrinks from $2.223 R_{\text{eq}}$ down to $2.051 R_{\text{eq}}$ — a retraction of **$10,358\text{ km}$** that leaves outer ring regions unshadowed.
 
 Relative to the surface fragment's meridian at angle $\phi_{\text{center}}$, the shadowed azimuthal interval is:
 
@@ -359,7 +398,7 @@ This ensures atmospheric haze on Saturn's nightside glows realistically with rin
 | Unit | Uniform Binding | Dimensions | Format | Filtering | Description |
 |:---:|---|---|---|---|---|
 | **0** | `u_ring_gradients` | 4096×16 | RGBA32F | Linear | Ring texture / alpha gradient atlas |
-| **6** | `u_ringshine_lut` | 256×256 | R32F | Linear | Static 2D geometric form-factor Look-Up Table |
+| **6** | `u_ringshine_lut` | 256×256×16 | R32F | Linear / Trilinear | Static 3D geometric form-factor Look-Up Table (slices $f \in [0.0, 0.3]$) |
 | **7** | `u_ringshine_cdf_lut` | 128×128×64 | R32F | Trilinear | Static 3D azimuthal cumulative shadow CDF |
 | **8** | `u_ringshine_map` | 128×1040 | RGBA32F | Bilinear (Wrap X) | Dynamic per-frame ringshine irradiance map (16 ring slots) |
 
@@ -391,29 +430,115 @@ Full $128 \times 65$ manifold error (all 8,320 surface pixels) with 100 bands: M
 
 ---
 
-## 9. Computational Complexity & Performance Summary
+## 9. Host Planet Oblateness: Mathematical Formulation, Switchable Pipeline & Thesis Benchmark
+
+Rapidly rotating planets (e.g., Saturn with flattening $f \approx 0.098$, Jupiter with $f \approx 0.065$) deviate significantly from spherical symmetry. The Stellar-Forge ringshine pipeline fully supports host planet oblateness behind an interactive runtime switch (`u_ringshine_oblate_enabled`), allowing rigorous ablation and thesis benchmarking.
+
+### 9.1 Runtime Oblateness Switch Architecture
+- **Control Interface**: Exposed in `GraphicsSettings` (`"ringshine_oblate_enabled": true`), persisting to `data/graphics_settings.json` and toggleable at runtime via the "Account for Host Oblateness" checkbox under the Lighting / Ringshine UI menu.
+- **Shader Pipeline**: Dispatched via uniform `u_ringshine_oblate_enabled` to [`ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag).
+- **Bit-Exact Backwards Compatibility**: When the switch is disabled or when planet oblateness $f = 0.0$:
+  - `obl = 0.0`, surface radius $\rho(\lambda) \equiv 1.0$, and $C_{\text{eff}} = \cos\theta_{\text{sun}}$.
+  - The 3D form-factor texture lookup fetches slice 0 ($w = 0.5/16$), which is mathematically and numerically identical to the unperturbed spherical form-factor kernel.
+
+### 9.2 Analytical Shadow Geometry: Retraction & Illumination Area Gain
+Because the planet's polar diameter is compressed by $(1 - f)$, the umbral shadow projected onto the ring plane contracts from a semi-infinite cylinder into an ellipse. The shadow tip distance retracts from $1/\sin\theta_{\text{sun}}$ to $\frac{\sqrt{(1-f)^2 \cos^2\theta_{\text{sun}} + \sin^2\theta_{\text{sun}}}}{\sin\theta_{\text{sun}}}$.
+
+Quantitative evaluation across solar elevations for the Saturn system ($R_{\text{eq}} = 60,268\text{ km}$, $f = 0.0979624$, Ring disk: $1.145$ to $2.266 R_{\text{eq}}$):
+
+| Solar Elevation $\theta_{\text{sun}}$ | Spherical Tip ($R_{\text{eq}}$) | Oblate Tip ($R_{\text{eq}}$) | Tip Retraction ($\text{km}$) | Spherical Unshadowed % | Oblate Unshadowed % | Extra Illuminated Area ($\text{km}^2$) |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **$+3.00^\circ$** (Grazing) | 19.1073 | 17.2409 | **$+112,484\text{ km}$** | 79.82% | 79.84% | $+6,291,307\text{ km}^2$ |
+| **$+5.00^\circ$** | 11.4737 | 10.3587 | **$+67,199\text{ km}$** | 79.94% | 79.98% | $+17,608,980\text{ km}^2$ |
+| **$+10.00^\circ$** | 5.7588 | 5.2125 | **$+32,921\text{ km}$** | 80.48% | 80.65% | $+73,172,673\text{ km}^2$ |
+| **$+15.00^\circ$** | 3.8637 | 3.5118 | **$+21,206\text{ km}$** | 81.45% | 81.86% | $+177,518,657\text{ km}^2$ |
+| **$+20.00^\circ$** | 2.9238 | 2.6725 | **$+15,147\text{ km}$** | 83.00% | 83.84% | $+365,624,785\text{ km}^2$ |
+| **$+26.73^\circ$** (Solstice) | 2.2233 | 2.0514 | **$+10,358\text{ km}$** | 87.04% | 89.26% | **$+969,592,982\text{ km}^2$** |
+
+> [!IMPORTANT]
+> **Key Thesis Insight — Solstice Shadow Uncovering**:
+> At Saturn's maximum solstice tilt ($\theta_{\text{sun}} \approx 26.73^\circ$), the spherical shadow tip extends to $2.223 R_{\text{eq}}$, casting shadow over virtually all of Saturn's outer A-Ring ($2.266 R_{\text{eq}}$). Under oblate physics, the shadow tip retracts to $2.051 R_{\text{eq}}$, completely uncovering an outer ring annulus of over **$10,000\text{ km}$** ($> 969\text{ million km}^2$) of reflective ring area. This significantly increases ringshine flux cast onto Saturn's nightside equator and mid-latitudes.
+
+### 9.3 Form-Factor Coupling & Geodetic Surface Normal Tilt
+Planetary oblateness causes the local surface normal to tilt toward the pole:
+$$\tan\phi_{\text{geodetic}} = \frac{1}{(1-f)^2} \tan\lambda$$
+This tilts the horizon relative to the ring plane, reducing the geometric form factor $K(r, \lambda)$ at higher latitudes:
+
+| Planetocentric Latitude $\lambda$ | Surface Distance $\rho(\lambda)$ | Normal Tilt $\Delta\theta_n$ | $K(r=1.5, f=0)$ | $K(r=1.5, f=0.098)$ | Geometric Coupling Delta |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **$0.0^\circ$** (Equator) | 1.00000 | $+0.000^\circ$ | 0.000000 | 0.000000 | $0.00\%$ (vanishes edge-on) |
+| **$15.0^\circ$** | 0.99242 | $+3.227^\circ$ | 0.861046 | 0.797740 | **$-7.35\%$** |
+| **$30.0^\circ$** | 0.97255 | $+5.358^\circ$ | 0.372752 | 0.286818 | **$-23.05\%$** |
+| **$45.0^\circ$** | 0.94724 | $+5.866^\circ$ | 0.023861 | 0.000851 | **$-96.43\%$** |
+| **$\ge 60.0^\circ$** | 0.92381 | $+4.837^\circ$ | 0.000000 | 0.000000 | Ring below local horizon |
+
+### 9.4 GPU Execution Time & Hardware Query Benchmark
+Benchmarked on an **NVIDIA GeForce RTX 4060 Ti** GPU using ModernGL hardware timer queries ([`scripts/benchmark_ringshine_oblateness.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/scripts/benchmark_ringshine_oblateness.py)) evaluating all 16 ring slots ($128 \times 1040$ framebuffer, 100 radial bands with 4-point area-weighted quadrature):
+
+| Illumination Scenario | Spherical Bake ($\mu\text{s}$) | Oblate Bake ($\mu\text{s}$) | GPU Overhead ($\mu\text{s}$) | Full Manifold MAE | RMS Difference | Peak $\Delta E$ |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Grazing Sunlit ($+5.0^\circ$)** | 126.44 $\mu\text{s}$ | 129.26 $\mu\text{s}$ | $+2.82\ \mu\text{s}$ | 0.000230 | 0.000427 | 0.001612 |
+| **Intermediate Tilt ($+15.0^\circ$)** | 133.75 $\mu\text{s}$ | 138.41 $\mu\text{s}$ | $+4.66\ \mu\text{s}$ | 0.000610 | 0.001114 | 0.003666 |
+| **Solstice Tilt ($+26.73^\circ$)** | 129.55 $\mu\text{s}$ | 133.53 $\mu\text{s}$ | $+3.99\ \mu\text{s}$ | 0.001639 | 0.002578 | 0.008716 |
+| **Unlit Transmission ($-15.0^\circ$)** | 130.72 $\mu\text{s}$ | 130.59 $\mu\text{s}$ | $-0.13\ \mu\text{s}$ | 0.000610 | 0.001114 | 0.003666 |
+
+> [!NOTE]
+> **GPU Performance Analysis**:
+> The additional arithmetic instructions required for oblate shadow ellipse calculation and 3D texture address fetching add only **~2 to 4 microseconds** of total GPU execution time per frame across all 16 ring plane slots. Relative to a standard 60 FPS frame budget ($16,666\ \mu\text{s}$), this represents an overhead of **less than $0.025\%$ of the frame budget**, making the oblate model exceptionally viable for real-time rendering.
+
+### 9.5 Regional Latitudinal Flux Breakdown (Solstice Tilt $+26.73^\circ$)
+
+| Planetary Region | Spherical Mean Flux | Oblate Mean Flux | Regional MAE | Relative Flux Delta | Physical Mechanism |
+|---|:---:|:---:|:---:|:---:|---|
+| **Equatorial Zone ($0^\circ$ to $15^\circ$)** | 0.009804 | 0.010353 | 0.000577 | **$+5.60\%$** | Shadow contraction uncovers inner ring elements |
+| **Mid-Latitude Zone ($15^\circ$ to $45^\circ$)** | 0.039317 | 0.039710 | 0.003746 | **$+1.00\%$** | Balance between shadow retraction and normal tilt |
+| **High-Latitude Zone ($45^\circ$ to $75^\circ$)** | 0.012704 | 0.010611 | 0.002700 | **$-16.48\%$** | Normal tilt pushes rings toward local horizon |
+| **Polar Zone ($75^\circ$ to $90^\circ$)** | 0.000004 | 0.000000 | 0.000004 | **$-42.65\%$** | Rings sub-horizon geometry |
+| **Unlit Southern Hemisphere ($-90^\circ$ to $0^\circ$)** | 0.005111 | 0.005246 | 0.000739 | **$+2.63\%$** | Increased diffuse transmitted unshadowed area |
+
+### 9.6 Thesis Comparison Visual Composite
+The generated multi-panel benchmark figure comparing spherical vs oblate ringshine for Saturn is stored at:
+[`exports/ringshine_oblateness_comparison.png`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/exports/ringshine_oblateness_comparison.png)
+
+It illustrates:
+1. Spherical dynamic ringshine map ($f = 0.0$)
+2. Oblate dynamic ringshine map ($f = 0.098$)
+3. Absolute difference heatmap $|\Delta E|$ (peaking at $0.00872$)
+4. Relative percentage difference heatmap $\Delta E / E$ (reaching up to $74.8\%$ in steep gradient zones)
+5. Latitudinal cross-section irradiance profiles across midnight and twilight meridians
+6. Ring disk shadow boundary comparison showing the $10,358\text{ km}$ shadow tip contraction
+
+---
+
+## 10. Computational Complexity & Performance Summary
 
 | Operation | Naive Disk Integration | This Pipeline |
 |---|---|---|
 | Per-fragment evaluation | $O(N_r \times N_\alpha)$ per fragment (~$10^6$ ops) | **$O(1)$** (1 bilinear texture tap) |
 | Radial band profile query | $O(N_{\text{texels}})$ numerical averaging | **$O(1)$** (4 area-weighted quadrature taps) |
 | Shadow wedge integration | $O(N_\alpha)$ numerical raymarching | **$O(1)$** (2 CDF texture taps) |
-| Per-frame bake cost | — | **~0.04–0.08 ms** on modern GPUs ($N_{\text{bands}} = 100$) |
-| Startup precomputation | — | **~50 ms** one-time CPU execution |
+| Per-frame bake cost (Spherical) | — | **~0.12–0.13 ms** on modern GPUs ($N_{\text{bands}} = 100$, 16 slots) |
+| Per-frame bake cost (Oblate) | — | **~0.12–0.14 ms** on modern GPUs ($N_{\text{bands}} = 100$, 16 slots) |
+| Oblateness GPU overhead | — | **$< 4\ \mu\text{s}$** per frame ($< 0.025\%$ of 60 FPS budget) |
+| Startup precomputation | — | **~250 ms** one-time Numba parallel CPU execution |
 
-At default settings (100 bands), the dynamic map bake executes in **less than 80 microseconds**, leaving virtually the entire frame budget available for physics and atmospheric rendering.
+At default settings (100 bands), the dynamic map bake executes in **less than 140 microseconds**, leaving virtually the entire frame budget available for physics and atmospheric rendering.
 
 ---
 
-## 10. Source File Reference
+## 11. Source File Reference
 
 | Component | File | Key Symbols / Line Reference |
 |---|---|---|
-| Startup LUT & CDF Generation | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | `build_ringshine_lut()` (~L1898–1957) |
+| 3D Form-Factor LUT Precomputation | [`engine/rendering/render_utils.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/rendering/render_utils.py) | `build_ringshine_3d_lut_numba()` |
+| Startup LUT & CDF Generation | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | `build_ringshine_lut()` (~L1996–2040) |
 | Dynamic Map Bake (Vertex) | [`engine/glsl/post/ringshine_map.vert`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.vert) | Passthrough full-screen quad (~L1–8) |
-| Dynamic Map Bake (Fragment) | [`engine/glsl/post/ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag) | `QUAD_T`, `QUAD_W`, `eval_ringshine_cdf`, Chandrasekhar slab, Hapke MS, band loop (~L1–300) |
+| Dynamic Map Bake (Fragment) | [`engine/glsl/post/ringshine_map.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/post/ringshine_map.frag) | `QUAD_T`, `QUAD_W`, `eval_ringshine_cdf`, oblate shadow ellipse, Chandrasekhar slab, Hapke MS |
 | Host Surface Application | [`engine/glsl/celestial/sphere.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/sphere.frag) | Planetocentric projection, inverse UV warp, `u_ringshine_map` lookup (~L914–991) |
 | Atmosphere Volumetric Scattering | [`engine/glsl/atmosphere/atmo.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/atmosphere/atmo.frag) | Ambient phase, Mie asymmetry, ringshine scattering (~L1306–1351) |
 | Host Ring Shader Consistency | [`engine/glsl/celestial/ring.frag`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/glsl/celestial/ring.frag) | Shared phase functions, unlit MS gating (~L501–535) |
-| Texture & Uniform Binding | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | FBO binding, uniform dispatch, map texture bind (~L4434–4504) |
-| Radiative Transfer Verification | [`scripts/ringshine_benchmark.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/scripts/ringshine_benchmark.py) | Monte Carlo ground-truth validator & texture exporter (~L1–1001) |
+| Texture & Uniform Dispatch | [`engine/app.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/app.py) | FBO binding, uniform dispatch, map texture bind (~L4590–4648) |
+| UI & Settings Integration | [`engine/ui/modals.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/ui/modals.py), [`engine/ui/menu_bar.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/engine/ui/menu_bar.py) | "Account for Host Oblateness" checkbox |
+| Radiative Transfer Verification | [`scripts/ringshine_benchmark.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/scripts/ringshine_benchmark.py) | Monte Carlo ground-truth validator & texture exporter |
+| Oblateness Thesis Benchmark | [`scripts/benchmark_ringshine_oblateness.py`](file:///d:/Files/Coding/OpenGL/Stellar-Forge/scripts/benchmark_ringshine_oblateness.py) | GPU bake benchmark, analytical shadow geometry, composite visual exporter |
+

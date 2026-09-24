@@ -119,7 +119,7 @@ uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform int u_atmo_clip_mode;
 uniform vec4 u_ring_station_cells[9];   // 33 station-cell boundaries in u space (Kmax = 32), packed 4 per vec4
 uniform int u_ring_station_count;      // number of cells (boundaries = count + 1)
-uniform int u_atmo_shadow_method;      // 0 = Station-Locked Slicing, 1 = Uniform Stochastic Raymarching
+uniform int u_atmo_shadow_method;      // 0 = Station-Locked Slicing, 1 = Uniform Stochastic Raymarching, 2 = Bounded Subtraction (Blackrack)
 
 uniform uint u_ring_coplanar_mask[16];
 uniform sampler2D u_eclipse_lut; // Kept to avoid uniform bound errors
@@ -129,7 +129,7 @@ uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform bool u_planetshine_enabled;
 
-uniform sampler2D u_ringshine_lut;
+uniform sampler3D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
 uniform sampler2D u_ringshine_map;
 uniform bool u_ringshine_enabled;
@@ -525,6 +525,203 @@ void walk_station_branch(
                                beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
                                inv_h_rayleigh, inv_h_mie, inv_ozone_width,
                                T_run, delta_L, slice_total, total_blocked, step_count);
+    }
+}
+
+// 3-point Simpson quadrature for atmospheric transmittance along an unoccluded ray segment [s0, s1] (km)
+vec3 get_transmittance_segment(
+    float s0, float s1,
+    vec3 cam_local_sph, vec3 ray_dir_sph,
+    vec3 beta_R, vec3 beta_M_ext, vec3 beta_A_mixed, vec3 beta_A_layered,
+    float inv_h_rayleigh, float inv_h_mie, float inv_ozone_width)
+{
+    if (s1 <= s0 + 1e-4) return vec3(1.0);
+    float sm = 0.5 * (s0 + s1);
+    float h0 = max(0.0, length(cam_local_sph + s0 * ray_dir_sph) - u_planet_radius_km);
+    float hm = max(0.0, length(cam_local_sph + sm * ray_dir_sph) - u_planet_radius_km);
+    float h1 = max(0.0, length(cam_local_sph + s1 * ray_dir_sph) - u_planet_radius_km);
+
+    float tO3_0 = (h0 - u_ozone_peak_km) * inv_ozone_width;
+    float tO3_m = (hm - u_ozone_peak_km) * inv_ozone_width;
+    float tO3_1 = (h1 - u_ozone_peak_km) * inv_ozone_width;
+
+    vec3 ext0 = (beta_R + beta_A_mixed) * exp(-h0 * inv_h_rayleigh) + beta_M_ext * exp(-h0 * inv_h_mie) + beta_A_layered * exp(-(tO3_0 * tO3_0));
+    vec3 extm = (beta_R + beta_A_mixed) * exp(-hm * inv_h_rayleigh) + beta_M_ext * exp(-hm * inv_h_mie) + beta_A_layered * exp(-(tO3_m * tO3_m));
+    vec3 ext1 = (beta_R + beta_A_mixed) * exp(-h1 * inv_h_rayleigh) + beta_M_ext * exp(-h1 * inv_h_mie) + beta_A_layered * exp(-(tO3_1 * tO3_1));
+
+    vec3 tau = ((s1 - s0) / 6.0) * (ext0 + 4.0 * extm + ext1);
+    return exp(-tau);
+}
+
+// Method 2 (Blackrack): Deterministic midpoint raymarching across bounded ring shadow interval [cs, ce].
+// Uses cross-step derivative + screen-space LOD for ring anti-aliasing, Mie phase anti-halo scaling (0.95),
+// and single scattering + multiple scattering deficit subtraction.
+void march_bounded_shadow_blackrack(
+    float cs, float ce, float du_screen,
+    float qa, float qb, float qc, float r_inner, float ring_span, float inv_sin_sun,
+    vec3 cam_local_sph, vec3 ray_dir_sph, vec3 L_sun,
+    float phase_R, float phase_M,
+    float eff_star_rad, float cos_sun_eff, vec3 star_int,
+    vec3 beta_R, vec3 beta_M, vec3 beta_M_ext, vec3 beta_A_mixed, vec3 beta_A_layered,
+    float inv_h_rayleigh, float inv_h_mie, float inv_ozone_width,
+    int steps,
+    inout vec3 T_run, inout vec3 delta_L)
+{
+    float ds = (ce - cs) / float(steps);
+    float phase_M_eff = phase_M;
+
+    for (int q = 0; q < steps; q++) {
+        // Deterministic midpoint quadrature: zero jitter, zero temporal noise
+        float sq = cs + (float(q) + 0.5) * ds;
+
+        vec3 Pq = cam_local_sph + sq * ray_dir_sph;
+        float rq = max(length(Pq), 1e-6);
+        float hq = max(0.0, rq - u_planet_radius_km);
+
+        float rho_R = exp(-hq * inv_h_rayleigh);
+        float rho_M = exp(-hq * inv_h_mie);
+        float tO3 = (hq - u_ozone_peak_km) * inv_ozone_width;
+        float rho_O3 = exp(-(tO3 * tO3));
+
+        vec3 ext_q = beta_R * rho_R + beta_M_ext * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O3;
+        vec3 T_cell = exp(-ext_q * ds);
+        vec3 int_factor = (vec3(1.0) - T_cell) / max(ext_q, vec3(1e-6));
+
+        // Direct in-scatter at parcel Pq
+        float light_cos_theta = dot(Pq, L_sun) / rq;
+        float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
+        float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
+        vec2 term_q = sun_terminator(light_cos_theta, sin_planet, cos_planet,
+                                     eff_star_rad, cos_sun_eff);
+        float vis_fraction = term_q.x;
+        vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
+        vec3 inscatter_direct = (beta_R * rho_R * phase_R + beta_M * rho_M * phase_M_eff)
+                                 * trans_to_sun * vis_fraction * star_int;
+
+        // Multiple scattering component matching sky_view_lut.frag
+        float h_norm_q = clamp(hq / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+        float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
+        float ms_v_q = sqrt(h_norm_q);
+        vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
+        vec3 inscatter_ms = star_int * (beta_R * rho_R + beta_M * rho_M) * psi_q;
+
+        // Footprint-filtered ring opacity with cross-step derivative + screen LOD (Blackrack)
+        float r_sq = (qa > 1e-6) ? sqrt(max(0.0, qa * sq * sq + qb * sq + qc)) : sqrt(max(0.0, qc));
+        float u_q = (r_sq - r_inner) / ring_span;
+
+        float ring_blocked = 0.0;
+        if (u_q >= -0.05 && u_q <= 1.05) {
+            float s0 = cs + float(q) * ds;
+            float s1 = cs + float(q + 1) * ds;
+            float r_s0 = (qa > 1e-6) ? sqrt(max(0.0, qa * s0 * s0 + qb * s0 + qc)) : sqrt(max(0.0, qc));
+            float r_s1 = (qa > 1e-6) ? sqrt(max(0.0, qa * s1 * s1 + qb * s1 + qc)) : sqrt(max(0.0, qc));
+            float du_step = abs(r_s1 - r_s0) / ring_span;
+            float du_q = max(du_step * 0.5, du_screen);
+            float lod = log2(max(1.0, du_q * 4096.0));
+            float raw_a = textureLod(u_ring_shadow_tex, vec2(clamp(u_q, 0.0, 1.0), 0.5), lod).a;
+            float tau_ring = -log(max(1e-4, 1.0 - raw_a));
+            ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
+        }
+
+        vec3 step_blocked = (inscatter_direct + inscatter_ms) * ring_blocked * T_run * int_factor;
+        delta_L += step_blocked;
+        T_run *= T_cell;
+    }
+}
+
+// Analytical cylinder intersection bounding celestial eclipse casters (Blackrack approach)
+vec2 get_eclipse_cylinder_bounds(vec3 ray_origin, vec3 ray_dir, vec3 caster_pos, vec3 cone_axis, float cylinder_radius) {
+    vec3 origin_to_base = ray_origin - caster_pos;
+    float axis_dot_dir = dot(cone_axis, ray_dir);
+    float axis_dot_orig = dot(cone_axis, origin_to_base);
+
+    vec3 d_perp = ray_dir - axis_dot_dir * cone_axis;
+    vec3 o_perp = origin_to_base - axis_dot_orig * cone_axis;
+
+    float a = dot(d_perp, d_perp);
+    float b = dot(o_perp, d_perp);
+    float c = dot(o_perp, o_perp) - cylinder_radius * cylinder_radius;
+
+    if (a < 1e-8) {
+        if (c <= 0.0) return vec2(-1e9, 1e9);
+        return vec2(-1.0);
+    }
+
+    float disc = b * b - a * c;
+    if (disc < 0.0) return vec2(-1.0);
+
+    float sq = sqrt(disc);
+    float t1 = (-b - sq) / a;
+    float t2 = (-b + sq) / a;
+    return vec2(min(t1, t2), max(t1, t2));
+}
+
+// Method 2 (Blackrack): Raymarch bounded celestial shadow cone segment [cs, ce] for an eclipse caster
+void march_bounded_eclipse_blackrack(
+    float cs, float ce, float s_start,
+    vec3 cam_local, vec3 ray_dir, vec3 cam_local_sph, vec3 ray_dir_sph,
+    vec3 planet_center_render, vec3 L_cart, vec3 L_sun,
+    float phase_R, float phase_M,
+    float eff_star_rad, float cos_sun_eff, vec3 star_int,
+    float dist_to_star_au, float star_radius_au, float star_obl, vec3 star_pole,
+    int caster_idx,
+    vec3 beta_R, vec3 beta_M, vec3 beta_M_ext, vec3 beta_A_mixed, vec3 beta_A_layered,
+    float inv_h_rayleigh, float inv_h_mie, float inv_ozone_width,
+    int steps,
+    inout vec3 delta_L)
+{
+    float ds = (ce - cs) / float(steps);
+    float phase_M_eff = phase_M;
+
+    // Initialize transmittance from atmosphere entry (s_start) to shadow entry (cs)
+    vec3 T_run = get_transmittance_segment(s_start, cs, cam_local_sph, ray_dir_sph,
+                                           beta_R, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                           inv_h_rayleigh, inv_h_mie, inv_ozone_width);
+
+    uint caster_mask = (1u << caster_idx);
+
+    for (int q = 0; q < steps; q++) {
+        float sq = cs + (float(q) + 0.5) * ds;
+
+        vec3 Pq = cam_local_sph + sq * ray_dir_sph;
+        float rq = max(length(Pq), 1e-6);
+        float hq = max(0.0, rq - u_planet_radius_km);
+
+        float rho_R = exp(-hq * inv_h_rayleigh);
+        float rho_M = exp(-hq * inv_h_mie);
+        float tO3 = (hq - u_ozone_peak_km) * inv_ozone_width;
+        float rho_O3 = exp(-(tO3 * tO3));
+
+        vec3 ext_q = beta_R * rho_R + beta_M_ext * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O3;
+        vec3 T_cell = exp(-ext_q * ds);
+        vec3 int_factor = (vec3(1.0) - T_cell) / max(ext_q, vec3(1e-6));
+
+        // Direct in-scatter at parcel Pq
+        float light_cos_theta = dot(Pq, L_sun) / rq;
+        float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
+        float cos_planet = sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
+        vec2 term_q = sun_terminator(light_cos_theta, sin_planet, cos_planet,
+                                     eff_star_rad, cos_sun_eff);
+        float vis_fraction = term_q.x;
+        vec3 trans_to_sun = (vis_fraction > 1e-4) ? get_transmittance(rq, term_q.y) : vec3(0.0);
+        vec3 inscatter_direct = (beta_R * rho_R * phase_R + beta_M * rho_M * phase_M_eff)
+                                 * trans_to_sun * vis_fraction * star_int;
+
+        // Multiple scattering component matching sky_view_lut.frag
+        float h_norm_q = clamp(hq / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+        float ms_u_q = 0.5 + 0.5 * sign(light_cos_theta) * sqrt(abs(light_cos_theta));
+        float ms_v_q = sqrt(h_norm_q);
+        vec3 psi_q = textureLod(u_multi_scatter_lut, vec2(ms_u_q, ms_v_q), 0.0).rgb;
+        vec3 inscatter_ms = star_int * (beta_R * rho_R + beta_M * rho_M) * psi_q;
+
+        // Evaluate caster shadow at this parcel in render frame (AU)
+        vec3 P_render = planet_center_render + (cam_local + sq * ray_dir) / u_au_to_km;
+        vec3 shadow_val = compute_caster_shadow(P_render, L_cart, dist_to_star_au, star_radius_au, star_obl, star_pole, caster_mask);
+        vec3 caster_blocked = clamp(vec3(1.0) - shadow_val, vec3(0.0), vec3(1.0));
+
+        vec3 step_blocked = (inscatter_direct + inscatter_ms) * caster_blocked * T_run * int_factor;
+        delta_L += step_blocked;
+        T_run *= T_cell;
     }
 }
 
@@ -1137,7 +1334,8 @@ void main() {
             vec3 L_cart = normalize(sun_pos_km);
             vec3 L_ring = normalize(vec3(dot(L_cart, p_right), dot(L_cart, p_up), dot(L_cart, p_fwd)));
 
-            if (u_num_ring_planes == 0 || abs(L_ring.y) <= 1e-5 || s_start >= s_end) continue;
+            if (s_start >= s_end) continue;
+            bool can_do_rings = (u_num_ring_planes > 0 && abs(L_ring.y) > 1e-5);
 
             vec3 L_sun_s = normalize(u_star_dir_sph_eff[st].xyz);
             if (length(L_sun_s) < 1e-4) L_sun_s = L_sun; // fallback: primary direction
@@ -1156,7 +1354,7 @@ void main() {
             float total_shadow_len = 0.0;
             float total_ring_blocked_accum = 0.0;
             float shadow_step_count = 0.0;
-            {
+            if (can_do_rings) {
             // Project ray P(s) = C_ring + s*V_ring onto equatorial ring plane Y = 0 along sunlight vector L_ring:
             vec3 A = C_ring - (C_ring.y / L_ring.y) * L_ring;
             vec3 B = V_ring - (V_ring.y / L_ring.y) * L_ring;
@@ -1246,19 +1444,10 @@ void main() {
 
                                 // Account for unshadowed segment before this interval (from prev_s to cs)
                                 if (cs > prev_s + 1e-3) {
-                                    float s_mid_gap = 0.5 * (prev_s + cs);
-                                    float h_prev = max(0.0, length(cam_local_sph + prev_s * ray_dir_sph) - u_planet_radius_km);
-                                    float h_mid  = max(0.0, length(cam_local_sph + s_mid_gap * ray_dir_sph) - u_planet_radius_km);
-                                    float h_cs   = max(0.0, length(cam_local_sph + cs * ray_dir_sph) - u_planet_radius_km);
-
-                                    float tO3_prev = (h_prev - u_ozone_peak_km) * inv_ozone_width;
-                                    float tO3_mid  = (h_mid  - u_ozone_peak_km) * inv_ozone_width;
-                                    float tO3_cs   = (h_cs   - u_ozone_peak_km) * inv_ozone_width;
-                                    vec3 ext_p = (beta_R + beta_A_mixed) * exp(-h_prev * inv_h_rayleigh) + beta_M_ext * exp(-h_prev * inv_h_mie) + beta_A_layered * exp(-(tO3_prev * tO3_prev));
-                                    vec3 ext_m = (beta_R + beta_A_mixed) * exp(-h_mid * inv_h_rayleigh)  + beta_M_ext * exp(-h_mid * inv_h_mie)  + beta_A_layered * exp(-(tO3_mid * tO3_mid));
-                                    vec3 ext_c = (beta_R + beta_A_mixed) * exp(-h_cs * inv_h_rayleigh)   + beta_M_ext * exp(-h_cs * inv_h_mie)   + beta_A_layered * exp(-(tO3_cs * tO3_cs));
-                                    vec3 tau_gap = ((cs - prev_s) / 6.0) * (ext_p + 4.0 * ext_m + ext_c);
-                                    T_run *= exp(-tau_gap);
+                                    vec3 T_gap = get_transmittance_segment(prev_s, cs, cam_local_sph, ray_dir_sph,
+                                                                           beta_R, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                                                           inv_h_rayleigh, inv_h_mie, inv_ozone_width);
+                                    T_run *= T_gap;
                                 }
 
                                 if (u_atmo_shadow_method == 1) {
@@ -1272,6 +1461,20 @@ void main() {
                                                          inv_h_rayleigh, inv_h_mie, inv_ozone_width,
                                                          inv_jitter, N_steps,
                                                          T_run, delta_L, slice_total, total_ring_blocked_accum, shadow_step_count);
+                                } else if (u_atmo_shadow_method == 2) {
+                                    // Method 2: Bounded Subtraction (Blackrack) across [cs, ce]
+                                    int N_steps = clamp(u_ring_station_count, 8, 48);
+                                    float s_mid_inv = 0.5 * (cs + ce);
+                                    float r_mid_inv = (qa > 1e-6) ? sqrt(max(0.0, qa * s_mid_inv * s_mid_inv + qb * s_mid_inv + qc)) : sqrt(max(0.0, qc));
+                                    float u_mid_inv = (r_mid_inv - r_inner) / ring_span;
+                                    float du_screen = fwidth(u_mid_inv);
+                                    march_bounded_shadow_blackrack(cs, ce, du_screen, qa, qb, qc, r_inner, ring_span, inv_sin_sun,
+                                                                   cam_local_sph, ray_dir_sph, L_sun_s, phase_R_s, phase_M_s,
+                                                                   eff_star_rad_s, cos_sun_eff_s, star_int_s,
+                                                                   beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                                                                   inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                                                                   N_steps,
+                                                                   T_run, delta_L);
                                 } else {
                                     // Method 0: Station-locked slicing quadrature across the shadow interval [cs, ce].
                                     // Cell boundaries are fixed in ring coordinate u (CPU-baked by
@@ -1335,24 +1538,90 @@ void main() {
                 vec3 L_scatter_s = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
                 if (limb_faded) L_scatter_s *= limb_fade;
 
-                float chord_len = max(s_end - s_start, 1e-4);
-                float chord_coverage = clamp(total_shadow_len / chord_len, 0.0, 1.0);
-
-                vec3 shadow_factor;
-                if (dot(slice_total, vec3(1.0)) > 1e-6) {
-                    shadow_factor = clamp(delta_L / max(slice_total, vec3(1e-6)), vec3(0.0), vec3(1.0));
+                if (u_atmo_shadow_method == 2) {
+                    // Method 2 (Blackrack): Direct bounded subtraction
+                    delta_L = min(delta_L, L_scatter_s);
+                    L_atmo = max(vec3(0.0), L_atmo - delta_L);
                 } else {
-                    float avg_blocked = (shadow_step_count > 0.0) ? (total_ring_blocked_accum / shadow_step_count) : 1.0;
-                    shadow_factor = vec3(clamp(avg_blocked, 0.0, 1.0));
+                    float chord_len = max(s_end - s_start, 1e-4);
+                    float chord_coverage = clamp(total_shadow_len / chord_len, 0.0, 1.0);
+
+                    vec3 shadow_factor;
+                    if (dot(slice_total, vec3(1.0)) > 1e-6) {
+                        shadow_factor = clamp(delta_L / max(slice_total, vec3(1e-6)), vec3(0.0), vec3(1.0));
+                    } else {
+                        float avg_blocked = (shadow_step_count > 0.0) ? (total_ring_blocked_accum / shadow_step_count) : 1.0;
+                        shadow_factor = vec3(clamp(avg_blocked, 0.0, 1.0));
+                    }
+
+                    vec3 alpha = clamp(slice_total / max(L_scatter_s, vec3(1e-6)), vec3(0.0), vec3(1.0));
+                    vec3 blend_alpha = smoothstep(vec3(0.3), vec3(0.7), alpha);
+                    vec3 blend_cov = vec3(smoothstep(0.7, 0.98, chord_coverage));
+                    vec3 blend = max(blend_alpha, blend_cov);
+
+                    vec3 eff_slice = mix(slice_total, L_scatter_s, blend);
+                    L_atmo = max(vec3(0.0), L_atmo - eff_slice * shadow_factor);
+                }
+            }
+
+            // Method 2 (Blackrack): Analytical bounding cylinder culling + raymarching for celestial eclipse casters (moons/planets)
+            if (u_atmo_shadow_method == 2 && u_num_active_casters > 0) {
+                vec3 delta_L_eclipse = vec3(0.0);
+                vec3 cone_axis = -L_cart;
+
+                float dist_to_star_au = max(u_star_solstice[st].z, 1e-6);
+                float star_radius_au = u_star_solstice[st].w;
+                float star_obl = u_stars_poles_obl[st].w;
+                vec3 star_pole = u_stars_poles_obl[st].xyz;
+
+                for (int c = 0; c < u_num_active_casters; c++) {
+                    vec3 caster_pos_au = u_active_casters[c].xyz;
+                    float caster_r_au = u_active_casters[c].w;
+                    float atmo_h_au = u_active_caster_atmos[c].w;
+
+                    vec3 caster_local_km = (caster_pos_au - planet_center_render) * u_au_to_km;
+
+                    // Skip self-shadowing (host planet itself is not an external caster on its own atmosphere)
+                    if (length(caster_local_km) < 1.0) continue;
+
+                    // Check if caster lies between star and planet
+                    float t_caster = dot(caster_local_km, L_cart);
+                    if (t_caster <= 0.0) continue;
+
+                    float dist_to_caster_au = length(caster_pos_au - planet_center_render);
+                    float eff_r_au = caster_r_au + (atmo_h_au > 0.0 ? atmo_h_au * 4.0 : 0.0);
+                    float r_penumbra_au = eff_r_au + dist_to_caster_au * (star_radius_au / dist_to_star_au);
+                    float r_penumbra_km = r_penumbra_au * u_au_to_km * 1.15; // 15% safety dilation
+
+                    vec2 cyl_bounds = get_eclipse_cylinder_bounds(cam_local, ray_dir, caster_local_km, cone_axis, r_penumbra_km);
+                    if (cyl_bounds.y < 0.0) continue;
+
+                    float cs_c = max(cyl_bounds.x, s_start);
+                    float ce_c = min(cyl_bounds.y, s_end);
+                    if (ce_c <= cs_c + 1e-4) continue;
+
+                    int N_steps_eclipse = clamp(u_ring_station_count, 8, 32);
+                    march_bounded_eclipse_blackrack(
+                        cs_c, ce_c, s_start,
+                        cam_local, ray_dir, cam_local_sph, ray_dir_sph,
+                        planet_center_render, L_cart, L_sun_s,
+                        phase_R_s, phase_M_s,
+                        eff_star_rad_s, cos_sun_eff_s, star_int_s,
+                        dist_to_star_au, star_radius_au, star_obl, star_pole,
+                        c,
+                        beta_R, beta_M, beta_M_ext, beta_A_mixed, beta_A_layered,
+                        inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                        N_steps_eclipse,
+                        delta_L_eclipse);
                 }
 
-                vec3 alpha = clamp(slice_total / max(L_scatter_s, vec3(1e-6)), vec3(0.0), vec3(1.0));
-                vec3 blend_alpha = smoothstep(vec3(0.3), vec3(0.7), alpha);
-                vec3 blend_cov = vec3(smoothstep(0.7, 0.98, chord_coverage));
-                vec3 blend = max(blend_alpha, blend_cov);
-
-                vec3 eff_slice = mix(slice_total, L_scatter_s, blend);
-                L_atmo = max(vec3(0.0), L_atmo - eff_slice * shadow_factor);
+                if (dot(delta_L_eclipse, vec3(1.0)) > 1e-6) {
+                    vec3 L_scatter_s = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
+                    if (limb_faded) L_scatter_s *= limb_fade;
+                    vec3 max_sub = max(vec3(0.0), L_scatter_s - delta_L);
+                    delta_L_eclipse = min(delta_L_eclipse, max_sub);
+                    L_atmo = max(vec3(0.0), L_atmo - delta_L_eclipse);
+                }
             }
         } // per-star ring-shadow loop
 

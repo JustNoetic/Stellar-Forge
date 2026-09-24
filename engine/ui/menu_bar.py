@@ -178,6 +178,11 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
 
         c_rs, app.camera["ringshine_enabled"] = imgui.checkbox("Ringshine", app.camera.get("ringshine_enabled", True))
         if c_rs: settings_changed = True
+        if app.camera.get("ringshine_enabled", True):
+            imgui.indent()
+            c_rso, app.camera["ringshine_oblate_enabled"] = imgui.checkbox("Oblate Ringshine", app.camera.get("ringshine_oblate_enabled", True))
+            if c_rso: settings_changed = True
+            imgui.unindent()
 
         imgui.separator()
         c_hdr, app.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", app.camera.get("hdr_enabled", True))

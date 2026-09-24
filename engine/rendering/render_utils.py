@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from numba import njit
+from numba import njit, prange
 import datetime
 from engine.core.constants import *
 
@@ -719,5 +719,60 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
         
     body_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
     return body_indices
+
+
+@njit(parallel=True, fastmath=False, cache=True)
+def build_ringshine_3d_lut_numba(sin_lats, radii, flats, num_alpha=180):
+    """Precompute the 3D geometric form-factor Look-Up Table K(r, sin lambda, f).
+    
+    Dimensions:
+      res_z: oblateness f in [0.0, 0.3] (slice 0 is bit-exact spherical f=0)
+      res_y: normalized ring radius r in [1.001, 5.0] Req
+      res_x: sine of planetocentric latitude sin(lambda) in [0.0, 1.0]
+    
+    Returns a C-contiguous array of shape (res_z, res_y, res_x) in float32.
+    """
+    res_x = len(sin_lats)
+    res_y = len(radii)
+    res_z = len(flats)
+    lut = np.zeros((res_z, res_y, res_x), dtype=np.float32)
+    d_alpha = np.float32((2.0 * np.pi) / num_alpha)
+    
+    for z in prange(res_z):
+        f = flats[z]
+        f_factor = np.float32(1.0) - f
+        eta = np.float32(1.0) / max(np.float32(1e-4), f_factor * f_factor)
+        
+        for y in range(res_y):
+            r = radii[y]
+            
+            for x in range(res_x):
+                slat = sin_lats[x]
+                if slat < 1e-6:
+                    lut[z, y, x] = np.float32(0.0)
+                    continue
+                clat = np.sqrt(max(np.float32(0.0), np.float32(1.0) - slat * slat))
+                
+                denom_rho = np.sqrt(f_factor * f_factor * clat * clat + slat * slat)
+                rho = f_factor / max(np.float32(1e-6), denom_rho)
+                norm_denom = np.sqrt(clat * clat + (slat * eta) * (slat * eta))
+                
+                tot = np.float32(0.0)
+                for a_idx in range(num_alpha):
+                    alpha = a_idx * d_alpha
+                    cos_a = np.cos(alpha)
+                    
+                    d2 = max(np.float32(1e-6), r * r + rho * rho - np.float32(2.0) * r * rho * clat * cos_a)
+                    d = np.sqrt(d2)
+                    
+                    horizon_term = r * clat * cos_a - np.float32(1.0) / rho
+                    if horizon_term > 0.0:
+                        ndotl = horizon_term / (norm_denom * d)
+                        ring_mu = (rho * slat) / d
+                        tot += (ndotl * ring_mu / d2) * r * d_alpha
+                
+                lut[z, y, x] = tot
+    return lut
+
 
 

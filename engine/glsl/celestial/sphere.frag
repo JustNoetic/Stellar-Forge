@@ -81,7 +81,7 @@ uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform vec3 u_ring_colors[MAX_RING_PLANES];
 uniform vec3 u_ring_5colors[MAX_RING_PLANES * 5];
 uniform sampler2D u_ring_gradients;
-uniform sampler2D u_ringshine_lut;
+uniform sampler3D u_ringshine_lut;
 uniform sampler3D u_ringshine_cdf_lut;
 uniform sampler2D u_ringshine_map;
 uniform int u_num_ring_planes;

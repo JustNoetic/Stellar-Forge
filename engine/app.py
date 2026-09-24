@@ -516,6 +516,7 @@ class App(InputHandlerMixin):
             "atmo_shadow_steps": 24,
             "atmo_noise_type": 0,
             "atmo_sky_view_steps": 24,
+            "atmo_sky_view_res": 0,
             "atmo_enabled": True,
             "refraction_enabled": True,
             "grav_lensing_enabled": True,
@@ -526,6 +527,7 @@ class App(InputHandlerMixin):
             "show_habitable_zone": False,
             "planetshine_enabled": True,
             "ringshine_enabled": True,
+            "ringshine_oblate_enabled": True,
             "ringshine_band_count": 10,
             "bloom_mode": 2,
             "conv_bloom_intensity": 0.5,
@@ -609,6 +611,7 @@ class App(InputHandlerMixin):
         self.prog_sky_view = None
         self.sky_view_tex = None
         self.sky_view_trans_tex = None
+        self.sky_view_star_tex = []
         self.sky_view_fbo = None
         self.quad_vao_sky_view = None
         self.sky_view_width = 192
@@ -673,6 +676,8 @@ class App(InputHandlerMixin):
         self.scrub_index = [0]
         self.jump_date = [2026, 1, 1, 12, 0, 0]
         self.load_settings()
+        _sv_res_idx = max(0, min(len(SKY_VIEW_RESOLUTIONS) - 1, int(self.camera.get("atmo_sky_view_res", 0))))
+        self.sky_view_width, self.sky_view_height = SKY_VIEW_RESOLUTIONS[_sv_res_idx]
 
     def load_settings(self):
         try:
@@ -708,6 +713,7 @@ class App(InputHandlerMixin):
                 "atmo_shadow_steps": self.camera.get("atmo_shadow_steps", 24),
                 "atmo_noise_type": self.camera.get("atmo_noise_type", 0),
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
+                "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_mode": self.camera.get("bloom_mode", 2),
@@ -731,6 +737,7 @@ class App(InputHandlerMixin):
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
                 "planetshine_enabled": self.camera.get("planetshine_enabled", True),
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
+                "ringshine_oblate_enabled": self.camera.get("ringshine_oblate_enabled", True),
                 "ringshine_band_count": self.camera.get("ringshine_band_count", 10),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
                 "fov": self.camera.get("fov", 45.0),
@@ -752,6 +759,51 @@ class App(InputHandlerMixin):
                 json.dump(saved, f, indent=4)
         except Exception as e:
             print(f"Failed to save settings: {e}")
+
+    def resize_sky_view_lut(self, width, height):
+        if self.sky_view_width == width and self.sky_view_height == height and self.sky_view_fbo is not None:
+            return
+        self.sky_view_width = width
+        self.sky_view_height = height
+        if self.sky_view_tex is not None:
+            self.sky_view_tex.release()
+            self.sky_view_tex = None
+        if self.sky_view_trans_tex is not None:
+            self.sky_view_trans_tex.release()
+            self.sky_view_trans_tex = None
+        if hasattr(self, 'sky_view_star_tex') and self.sky_view_star_tex:
+            for _t in self.sky_view_star_tex:
+                _t.release()
+            self.sky_view_star_tex = []
+        if self.sky_view_fbo is not None:
+            self.sky_view_fbo.release()
+            self.sky_view_fbo = None
+
+        if self.ctx is None:
+            return
+
+        self.sky_view_tex = self.ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
+        self.sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.sky_view_tex.repeat_x = True
+        self.sky_view_tex.repeat_y = False
+
+        self.sky_view_trans_tex = self.ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
+        self.sky_view_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self.sky_view_trans_tex.repeat_x = True
+        self.sky_view_trans_tex.repeat_y = False
+
+        self.sky_view_star_tex = []
+        for _ in range(4):
+            _t = self.ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
+            _t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            _t.repeat_x = True
+            _t.repeat_y = False
+            self.sky_view_star_tex.append(_t)
+
+        self.sky_view_fbo = self.ctx.framebuffer(
+            color_attachments=[self.sky_view_tex, self.sky_view_trans_tex] + self.sky_view_star_tex
+        )
+        self.sky_view_baked_key = None
 
     def scroll_callback(self, window, xoffset, yoffset):
         if self.impl: self.impl.scroll_callback(window, xoffset, yoffset)
@@ -1630,27 +1682,7 @@ class App(InputHandlerMixin):
             self.prog_sky_view['u_multi_scatter_lut'].value = 3
         if 'u_ringshine_map' in self.prog_sky_view:
             self.prog_sky_view['u_ringshine_map'].value = 8
-        if 'u_num_steps' in self.prog_sky_view:
-            self.prog_sky_view['u_num_steps'].value = 24
-        self.sky_view_tex = ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
-        self.sky_view_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.sky_view_tex.repeat_x = True
-        self.sky_view_tex.repeat_y = False
-        self.sky_view_trans_tex = ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
-        self.sky_view_trans_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.sky_view_trans_tex.repeat_x = True
-        self.sky_view_trans_tex.repeat_y = False
-        # Per-star in-scatter slices (bake locations 2-5): Mode 3's ring-shadow
-        # slicing normalizes each star's shadow deficit against its own light.
-        self.sky_view_star_tex = []
-        for _ in range(4):
-            _t = ctx.texture((self.sky_view_width, self.sky_view_height), 4, dtype='f4')
-            _t.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            _t.repeat_x = True
-            _t.repeat_y = False
-            self.sky_view_star_tex.append(_t)
-        self.sky_view_fbo = ctx.framebuffer(
-            color_attachments=[self.sky_view_tex, self.sky_view_trans_tex] + self.sky_view_star_tex)
+        self.resize_sky_view_lut(self.sky_view_width, self.sky_view_height)
 
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -1992,33 +2024,18 @@ class App(InputHandlerMixin):
 
 
         def build_ringshine_lut(ctx):
-            res_x, res_y = 256, 256
+            res_x, res_y, res_z = 256, 256, 16
             sin_lats = np.linspace(0.0, 1.0, res_x, dtype=np.float32)
             radii = np.linspace(1.001, 5.0, res_y, dtype=np.float32)
+            flats = np.linspace(0.0, 0.3, res_z, dtype=np.float32)
 
-            sin_lat_grid = sin_lats[None, :]
-            cos_lat_grid = np.sqrt(np.maximum(0.0, 1.0 - sin_lat_grid**2))
-            r_grid = radii[:, None]
+            lut_3d = build_ringshine_3d_lut_numba(sin_lats, radii, flats, num_alpha=180)
 
-            num_alpha = 180
-            alpha = np.linspace(0.0, 2.0 * np.pi, num_alpha, endpoint=False, dtype=np.float32)[:, None, None]
-
-            cos_alpha = np.cos(alpha)
-            d2 = r_grid**2 + 1.0 - 2.0 * r_grid * cos_lat_grid * cos_alpha
-            d = np.sqrt(np.maximum(d2, 1e-6))
-
-            ndotl = np.maximum(0.0, (r_grid * cos_lat_grid * cos_alpha - 1.0) / d)
-            ring_mu = sin_lat_grid / d
-
-            d_alpha = (2.0 * np.pi) / num_alpha
-            diff_irradiance = (ndotl * ring_mu / np.maximum(d2, 1e-6)) * r_grid * d_alpha
-
-            lut_data = np.sum(diff_irradiance, axis=0, dtype=np.float32)
-
-            tex = ctx.texture((res_x, res_y), 1, lut_data.tobytes(), dtype='f4')
+            tex = ctx.texture3d((res_x, res_y, res_z), 1, lut_3d.tobytes(), dtype='f4')
             tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
             tex.repeat_x = False
             tex.repeat_y = False
+            tex.repeat_z = False
 
             # Precompute 3D Cumulative Distribution Function (CDF) Texture (64x128x128)
             res_cdf_lat, res_cdf_r, res_cdf_theta = 64, 128, 128
@@ -4640,8 +4657,17 @@ class App(InputHandlerMixin):
                         self.prog_ringshine_map[f'u_ring_planes[{idx}].backscatter'].value = float(r.get('backscatter', -0.65711))
                     if f'u_ring_planes[{idx}].scatter' in self.prog_ringshine_map:
                         self.prog_ringshine_map[f'u_ring_planes[{idx}].scatter'].value = float(r.get('scatter', 1.69))
+                    b_obl = 0.0
+                    if bi < len(bodies_data):
+                        b_obl = float(bodies_data[bi].get('oblateness', bodies_data[bi].get('f', 0.0)))
+                    elif self.comparison_enabled and hasattr(self, 'bodies_data_cmp') and (bi - num_bodies) < len(self.bodies_data_cmp):
+                        b_obl = float(self.bodies_data_cmp[bi - num_bodies].get('oblateness', self.bodies_data_cmp[bi - num_bodies].get('f', 0.0)))
+                    if f'u_ring_planes[{idx}].oblateness' in self.prog_ringshine_map:
+                        self.prog_ringshine_map[f'u_ring_planes[{idx}].oblateness'].value = b_obl
                 if 'u_ringshine_band_count' in self.prog_ringshine_map:
                     self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 100))
+                if 'u_ringshine_oblate_enabled' in self.prog_ringshine_map:
+                    self.prog_ringshine_map['u_ringshine_oblate_enabled'].value = self.camera.get("ringshine_oblate_enabled", True)
                 _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
                 self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
                 _perf_gpu_end(_gq)
@@ -4666,6 +4692,8 @@ class App(InputHandlerMixin):
                     prog['u_ringshine_enabled'].value = self.camera.get("ringshine_enabled", True)
                 if 'u_ringshine_band_count' in prog:
                     prog['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 100))
+                if 'u_ringshine_oblate_enabled' in prog:
+                    prog['u_ringshine_oblate_enabled'].value = self.camera.get("ringshine_oblate_enabled", True)
 
             inv_proj_bytes = np.linalg.inv(projection).astype('f4').tobytes()
             inv_view_bytes = np.linalg.inv(view).astype('f4').tobytes()
@@ -5015,13 +5043,14 @@ class App(InputHandlerMixin):
                     cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
                 if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
                     shadow_method = int(self.camera.get("atmo_shadow_method", 1))
-                    if shadow_method == 1:
+                    if shadow_method in (1, 2):
                         K_def = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
                     else:
                         # Default station grid (uniform in u); ringed bodies override per-draw below.
                         K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
                     grid = np.zeros((9, 4), dtype='f4')
-                    grid.ravel()[:K_def + 1] = np.linspace(0.0, 1.0, K_def + 1)
+                    n_bounds = min(K_def + 1, grid.size)
+                    grid.ravel()[:n_bounds] = np.linspace(0.0, 1.0, n_bounds)
                     if 'u_ring_station_cells' in cur_prog:
                         cur_prog['u_ring_station_cells'].write(grid.tobytes())
                     cur_prog['u_ring_station_count'].value = K_def
@@ -5388,6 +5417,11 @@ class App(InputHandlerMixin):
 
                     # Mode 3: Analytical Sky-View LUT pass
                     if atmo_quality == 3 and self.prog_sky_view is not None:
+                        _sv_res_idx = max(0, min(len(SKY_VIEW_RESOLUTIONS) - 1, int(self.camera.get("atmo_sky_view_res", 0))))
+                        _target_w, _target_h = SKY_VIEW_RESOLUTIONS[_sv_res_idx]
+                        if self.sky_view_width != _target_w or self.sky_view_height != _target_h:
+                            self.resize_sky_view_lut(_target_w, _target_h)
+
                         current_bake_key = (self.frame_counter, body_idx_in_unified)
                         if self.sky_view_baked_key != current_bake_key:
                             cam_rel_au = cam_pos - body_pos_rel
@@ -5431,6 +5465,8 @@ class App(InputHandlerMixin):
                             self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
                             if 'u_num_steps' in self.prog_sky_view:
                                 self.prog_sky_view['u_num_steps'].value = int(self.camera.get("atmo_sky_view_steps", 24))
+                            if 'u_atmo_shadow_method' in self.prog_sky_view:
+                                self.prog_sky_view['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
 
                             self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
                             self.sky_view_baked_key = current_bake_key
@@ -5467,7 +5503,7 @@ class App(InputHandlerMixin):
                         if 'u_atmo_shadow_method' in cur_prog:
                             cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
                         shadow_method = int(self.camera.get("atmo_shadow_method", 1))
-                        if shadow_method == 1:
+                        if shadow_method in (1, 2):
                             if 'u_ring_station_count' in cur_prog:
                                 cur_prog['u_ring_station_count'].value = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
                         else:
@@ -6508,6 +6544,11 @@ class App(InputHandlerMixin):
         if getattr(self, 'conv_ker_fft_tex', None): self.conv_ker_fft_tex.release()
         if getattr(self, 'conv_img_fft_tex', None): self.conv_img_fft_tex.release()
         if getattr(self, 'conv_ker_tex', None): self.conv_ker_tex.release()
+        if getattr(self, 'sky_view_tex', None): self.sky_view_tex.release()
+        if getattr(self, 'sky_view_trans_tex', None): self.sky_view_trans_tex.release()
+        for _t in getattr(self, 'sky_view_star_tex', []):
+            if _t: _t.release()
+        if getattr(self, 'sky_view_fbo', None): self.sky_view_fbo.release()
         self.impl.shutdown()
         glfw.terminate()
     

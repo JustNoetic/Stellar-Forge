@@ -104,6 +104,7 @@ uniform vec3 u_ring_center[MAX_RING_PLANES];
 uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform uint u_ring_coplanar_mask[16];
 uniform int  u_num_steps;
+uniform int  u_atmo_shadow_method;
 
 #include "common/sun_terminator.glsl"
 // Analytical caster eclipses (moons/planets), byte-identical to the Mode 1/2
@@ -564,7 +565,7 @@ void main() {
             // Analytical moon/planet caster eclipses with atmospheric refraction
             // ring + Danjon tinting, identical to the Mode 1/2 compute_shadow.
             vec3 shadow = vec3(1.0);
-            if (star_caster_mask[st] != 0u) {
+            if (u_atmo_shadow_method != 2 && star_caster_mask[st] != 0u) {
                 shadow = compute_caster_shadow(P_render, star_L_render[st],
                                                star_geo[st].z, star_geo[st].w,
                                                star_pole_obl[st].w, star_pole_obl[st].xyz,
