@@ -53,7 +53,8 @@ Stellar-Forge/
 │   │   └── viewport_hud.py     # Viewport floating HUD pill & toasts
 │   ├── ephemeris/              # Astronomical data & JPL Horizons/SPICE integration
 │   │   ├── system_manager.py   # System I/O, SystemSnapshot, derive_star_properties
-│   │   └── spice_manager.py    # SpiceManager: kernel download/load, SPICE state queries
+│   │   ├── spice_manager.py    # SpiceManager: kernel download/load, SPICE state queries
+│   │   └── spk_exporter.py     # Timeline -> Type 2/13 SPK (.bsp) export + async UI glue
 │   └── glsl/                   # Dedicated GLSL shader source files
 │       ├── compute/            # Frustum culling & orbit compute shaders (.comp)
 │       ├── celestial/          # Sphere, orbit, ring, HZ shaders (.vert, .frag)
@@ -78,6 +79,7 @@ Stellar-Forge/
 │   ├── test_skyview_terminator.py # GPU regression: Mode 3 terminator scales with star angular size + refraction (bakes real LUTs, quarter-phase limb geometry)
 │   ├── test_skyview_polar_winter.py # GPU regression: Mode 3 & Mode 2 SpaceEngine polar winter solstice parity for ringed planets
 │   ├── test_spice.py           # Quick SPICE kernel loader validation
+│   ├── test_spk_export.py      # Timeline → .bsp export round-trip vs analytic ground truth
 │   ├── ringshine_benchmark.py  # Ground-truth Monte Carlo validator for ringshine radiative transfer
 │   └── benchmark_ringshine_oblateness.py # Thesis benchmark & validation of host planet oblateness in ringshine
 ├── textures/                   # Planet/ring textures (loaded by app.py at startup)
@@ -168,9 +170,14 @@ Pure-Python / wrappers:
 - `attach_custom_forces(sim, has_j2, has_gr, phys_star_idx, oblate_physics_list)` (~L274).
 - `update_hierarchy(sim, num_bodies, current_parents, is_star_mask)` (~L933) → wraps `_update_hierarchy_core`.
 - `build_tree_order(parent_indices, num_bodies, positions)` (~L945) → DFS topo order + depths.
-- `physics_loop(sim, num_bodies, shared_state, time_ctrl, running)` (~L986) — **physics thread main loop**:
+- `estimate_min_orbital_period(pos, vel, mass, parent_indices)` (~L992) — shortest osculating
+  period via two-body energy; drives auto timeline recording density.
+- `physics_loop(sim, num_bodies, shared_state, time_ctrl, running)` (~L1027) — **physics thread main loop**:
     handles system-switch requests, snapshot save/restore, IAS15 vs Keplerian mode switching,
     hierarchy rebuild, step timing, writes `shared_state` under `shared_state["lock"]`.
+    Timeline render pass auto-scales `num_steps` to `TIMELINE_SAMPLES_PER_ORBIT` (100) per
+    fastest orbit (`time_ctrl["timeline_steps"]` > 0 overrides; capped by
+    `TIMELINE_MAX_STEPS` / `TIMELINE_MEM_BUDGET_MB`); publishes `timeline_steps_total`.
 - `load_system_from_data(bodies_data_raw)` (~L1710) — builds `Simulation`, attaches custom forces,
   derives visual data / atmo bodies / ring bodies / oblate list → returns **bundle dict** with keys:
     `sim, num_bodies, bodies_data, name_to_idx, visual_data, atmo_bodies, ring_bodies,
@@ -229,6 +236,27 @@ spectral classification.
   - `build_ephemeris_system(et, template_bodies)` (~L559) — assembles bodies_data for Ephemeris Mode.
 
 **Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build.
+
+### 3.8a `engine/ephemeris/spk_exporter.py`
+- `assign_spice_ids(body_names)` — map names → NAIF IDs (real IDs from `SpiceManager.SPICE_BODIES`,
+  fictional bodies get unique negatives from `FICTIONAL_ID_START = -100000`).
+- `resolve_display_epoch_et(spice_manager)` — ET of the display epoch (2026-01-01 12:00 UTC);
+  falls back to J2000 (0.0) if no leapseconds kernel is available.
+- `export_timeline_spk(filepath, timeline_raw, timeline_times, body_names, ..., spk_type=)` — encodes
+  `shared_state["timeline_raw"]` (f8 physics frame, AU / AU·yr⁻¹) as per-body SPK segments,
+  center = 0 (flat barycenter-absolute), frame `ECLIPJ2000` (physics frame == ECLIPJ2000 axes;
+  no rotation). **Type 2 (default):** per-interval Chebyshev least-squares fits using
+  position AND velocity rows (`_chebyshev_fit_records`, degree 13, tolerance-driven
+  interval doubling between ~6x and ~2.3x LS overdetermination, `CHEB_TOL_KM`);
+  `_probe_chebyshev_vs_hermite` cross-checks the fit against cubic Hermite at sample
+  midpoints to detect under-sampled input (warning surfaced in the export message).
+  **Type 13:** Hermite discrete states (pos+vel). Uniform decimation via `max_states`;
+  writes a `<file>.bsp.json` sidecar (epoch anchor, fit residuals, probe errors, ID
+  mapping) for re-import.
+- `export_timeline_spk_async(app, bodies_data)` — UI entry: lock-guarded snapshot of
+  `timeline_raw`/`timeline_times`, background writer thread, toast via `app._screenshot_toast`.
+
+**Edit when:** changing SPK export format, sampling/decimation, ID scheme, or epoch anchor.
 
 ### 3.9 `engine/physics/star_calc.py` (365 lines)
 - `StarCalculator` (~L3) — all `@staticmethod`/`@classmethod`:
@@ -515,10 +543,13 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change analytical Keplerian mode | `engine/physics/kepler_analytical.py` | `propagate_keplerian_system_numba`, `extract_all_kepler_elements` |
 | Change hierarchy/parent-tree logic | `engine/physics/physics_core.py` | `_update_hierarchy_core`, `build_tree_order` |
 | Change physics thread / system switching | `engine/physics/physics_core.py` | `physics_loop` |
+| Tune timeline recording density | `engine/physics/physics_core.py`, `engine/ui/modals.py` | `TIMELINE_SAMPLES_PER_ORBIT`, `estimate_min_orbital_period`, resolution combo |
 | Change how systems load from JSON | `engine/physics/physics_core.py` | `load_system_from_data` |
 | Change system file I/O / presets | `engine/ephemeris/system_manager.py` | `SystemManager`, `SystemSnapshot` |
 | Change star classification/evolution | `engine/physics/star_calc.py`, `engine/ephemeris/system_manager.py` | `StarCalculator.forge`, `derive_star_properties` |
 | Change SPICE / Ephemeris Mode | `engine/ephemeris/spice_manager.py` | `SpiceManager` |
+| Export recorded timeline → .bsp SPK kernel | `engine/ephemeris/spk_exporter.py`, `engine/ui/time_hud.py` | `export_timeline_spk`, `export_timeline_spk_async`, "Export .bsp" button |
+| Validate SPK timeline export round-trip | `scripts/test_spk_export.py` | `main` |
 | Change scattering physics / gas table | `engine/physics/atmosphere_physics.py` | `compute_atmosphere_properties`, `GAS_PROPERTIES` |
 | Change orbital math / frame rotations | `engine/core/math_utils.py` | — |
 | Change sphere/ring/atmo/orbit/HZ shaders | `engine/glsl/` (`celestial/`, `atmosphere/`, `compute/`) | GLSL files loaded via `engine/rendering/shaders.py` |

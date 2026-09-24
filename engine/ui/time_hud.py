@@ -1,8 +1,9 @@
 import imgui
 import math
 from engine.rendering.render_utils import format_time_speed, sim_time_from_date
+from engine.ephemeris.spk_exporter import export_timeline_spk_async
 
-def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, display_t, dt_render, tl_active, tl_prog, tl_times, is_scrubbing, ephemeris_mode_active, keplerian_mode_active):
+def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, display_t, dt_render, tl_active, tl_prog, tl_times, is_scrubbing, ephemeris_mode_active, keplerian_mode_active, bodies_data=None):
     """Render the bottom time transport bar and timeline controls."""
     if not getattr(app, "show_time_hud", True):
         return
@@ -39,7 +40,11 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
         return
 
     if tl_active and tl_prog < 1.0:
-        imgui.text("Rendering Timeline...")
+        total_steps = app.shared_state.get("timeline_steps_total", 0)
+        if total_steps:
+            imgui.text(f"Rendering Timeline... ({total_steps:,} steps)")
+        else:
+            imgui.text("Rendering Timeline...")
         imgui.same_line()
         rate = app.shared_state.get("timeline_rate", 0.0)
         if rate > 0.0:
@@ -100,6 +105,15 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
             with app.shared_state["lock"]:
                 app.shared_state["timeline_active"] = False
             app.time_ctrl["timeline_playing"] = False
+
+        imgui.same_line(spacing=10)
+        if getattr(app, "_spk_exporting", False):
+            imgui.text_colored("Exporting SPK...", 0.55, 0.85, 1.0)
+        else:
+            if imgui.button("Export .bsp"):
+                export_timeline_spk_async(app, bodies_data)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Encode the recorded timeline as a NASA SPICE\nChebyshev (Type 2) SPK kernel (.bsp) in the exports/ folder.")
 
         imgui.end()
         return

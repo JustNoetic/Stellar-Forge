@@ -650,6 +650,7 @@ class App(InputHandlerMixin):
         self._screenshot_orig_fb = None      # (orig_w, orig_h) saved during capture
         self._screenshot_toast = None        # (message, timestamp) for status notification
         self._screenshot_saving = False      # True while background save thread is running
+        self._spk_exporting = False          # True while a background SPK (.bsp) timeline export is running
         
         self.quad_vao_down = None
         self.quad_vao_up = None
@@ -671,6 +672,7 @@ class App(InputHandlerMixin):
             "timeline_playing": False,
             "timeline_speed": 10.0,
             "timeline_scrub_float": 0.0,
+            "timeline_steps": 0,
         }
         self.shared_state = None
         self.comparison_enabled = False
@@ -1502,6 +1504,7 @@ class App(InputHandlerMixin):
             "timeline_playing": False,
             "timeline_speed": 10.0,
             "timeline_scrub_float": 0.0,
+            "timeline_steps": 0,
         }
         
         # Trigger an initial system switch request for comparison system to compile its VBO/VAOs and populate shared states

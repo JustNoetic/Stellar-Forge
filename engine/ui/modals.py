@@ -742,8 +742,19 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     app.time_ctrl["sync_t"] = target_t
                     app.camera["show_jump_modal"] = False
             else:
-                imgui.text_wrapped("Integrates an accurate 1,000-step N-body trajectory from the current time to the target date, opening an interactive timeline scrubber.")
+                imgui.text_wrapped("Integrates an accurate N-body trajectory from the current time to the target date, opening an interactive timeline scrubber.")
                 imgui.spacing()
+                res_options = ["Auto (adaptive)", "1,000 steps", "10,000 steps", "50,000 steps", "200,000 steps"]
+                res_values = [0, 1000, 10000, 50000, 200000]
+                res_idx = app.camera.setdefault("timeline_res_idx", 0)
+                imgui.text("Timeline Resolution:")
+                imgui.same_line()
+                imgui.push_item_width(170)
+                changed_res, res_idx = imgui.combo("##tl_res", res_idx, res_options)
+                imgui.pop_item_width()
+                if changed_res:
+                    app.camera["timeline_res_idx"] = res_idx
+                app.time_ctrl["timeline_steps"] = res_values[res_idx]
                 if imgui.button("⏳ Render Timeline to Date", width=-1):
                     target_t = sim_time_from_date(jd[0], jd[1], jd[2], jd[3], jd[4], jd[5], is_utc=use_utc)
                     app.time_ctrl["target_t"] = target_t

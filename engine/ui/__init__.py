@@ -117,7 +117,8 @@ def render_ui(
         tl_active, tl_prog, tl_times,
         is_scrubbing,
         ephemeris_mode_active,
-        keplerian_mode_active
+        keplerian_mode_active,
+        bodies_data=bodies_data
     )
 
     # 5. Viewport Floating HUD & Toast Notifications

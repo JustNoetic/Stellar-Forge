@@ -6,7 +6,7 @@ OpenGL.ARRAY_SIZE_CHECKING = False
 from engine.core import constants, math_utils, input_handler
 from engine.physics import physics_core, kepler_analytical, atmosphere_physics, star_calc
 from engine.rendering import render_utils, imgui_renderer, planetshine, texture_baker, shader_loader, shaders, post_shaders
-from engine.ephemeris import system_manager, spice_manager
+from engine.ephemeris import system_manager, spice_manager, spk_exporter
 
 # Backward-compatibility sys.modules aliases
 sys.modules['constants'] = constants
@@ -25,6 +25,7 @@ sys.modules['shaders'] = shaders
 sys.modules['post_shaders'] = post_shaders
 sys.modules['system_manager'] = system_manager
 sys.modules['spice_manager'] = spice_manager
+sys.modules['spk_exporter'] = spk_exporter
 
 from engine.core.constants import *
 from engine.core.math_utils import *

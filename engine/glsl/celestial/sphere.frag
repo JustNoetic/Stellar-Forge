@@ -623,17 +623,38 @@ void main() {
             float sin_alpha = clamp(star_ang_radius, 0.0, 1.0);
 
             // Lambert cosine law with soft terminator
-            float NdotL = dot(N, L);
-            float effective_NdotL = NdotL;
+            vec3 sun_facing_norm = is_inside ? -N : N;
+            float sun_cos = dot(sun_facing_norm, L);
+            float effective_sun_cos = sun_cos;
             if (u_is_cloud_pass) {
                 // Mean cloud deck ~0.8H (~500 hPa); higher than the old 0.35H haze
                 // so the terminator delay sqrt(2*z/R) matches high clouds staying lit.
                 float cloud_h_km = f_my_scale_height * 0.8;
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
-                effective_NdotL += term_offset;
+                effective_sun_cos += term_offset;
             }
-            float diffuse = clamp((effective_NdotL + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+            float NdotL = effective_sun_cos;
+
+            float diffuse = 0.0;
+            if (u_is_cloud_pass) {
+                if (is_inside) {
+                    // Underside of cloud illuminated by transmitted sunlight through the cloud slab
+                    float top_illum = clamp((effective_sun_cos + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+                    // Through-slab diffuse transmission (0.50) + forward translucency when looking towards sun
+                    float cos_trans = -dot(V, L);
+                    float forward_trans = pow(max(0.0, cos_trans), 4.0) * 0.35;
+                    diffuse = top_illum * (0.50 + forward_trans);
+                } else {
+                    diffuse = clamp((effective_sun_cos + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+                    // Subtle forward scattering ("silver lining") along the backlit crescent rim
+                    float cos_forward = -dot(V, L);
+                    float silver_lining = pow(max(0.0, cos_forward), 6.0) * 0.35 * clamp(effective_sun_cos + 0.1, 0.0, 1.0);
+                    diffuse += silver_lining;
+                }
+            } else {
+                diffuse = clamp((effective_sun_cos + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+            }
 
             vec3 incoming_light_tint = vec3(1.0);
             vec3 direct_light_tint = vec3(1.0);
@@ -641,7 +662,7 @@ void main() {
             if (f_my_atmo_h > 0.0) {
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float H_scale = max(f_my_scale_height, 1e-3);
-                float mu = u_is_cloud_pass ? max(effective_NdotL, 0.0) : max(NdotL, 0.0);
+                float mu = u_is_cloud_pass ? max(effective_sun_cos, 0.0) : max(sun_cos, 0.0);
 
                 // Geometric relative air mass
                 float am = (sqrt(R_km*R_km*mu*mu + 2.0*R_km*H_scale + H_scale*H_scale) - R_km*mu) / H_scale;
@@ -809,9 +830,10 @@ void main() {
                 shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j], u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster);
             }
 
-            // === Ring shadow on planet surface ===
+            // === Ring shadow on planet surface / clouds ===
             // Only compute ring shadows if the fragment is lit by this star
-            if (NdotL > -sin_alpha) {
+            bool is_lit = u_is_cloud_pass ? (effective_sun_cos > -sin_alpha - 0.1) : (effective_sun_cos > -sin_alpha);
+            if (is_lit) {
                 uint processed_mask = 0u;
                 for (int k = 0; k < u_num_ring_planes; k++) {
                     if ((f_ring_mask & (1u << k)) == 0u) continue;
@@ -899,6 +921,13 @@ void main() {
 
             total_diffuse_color += star_color * incoming_light_tint * diffuse * shadow;
             total_specular_color += star_color * direct_light_tint * specular * shadow;
+
+            if (u_is_cloud_pass && f_my_atmo_h > 0.0) {
+                // Cloud decks receive diffuse ambient skylight scattered downwards/upwards by the atmosphere
+                float sun_elev = clamp(effective_sun_cos + 0.1, 0.0, 1.0);
+                vec3 atmo_sky_ambient = f_my_atmo_color * (0.08 * sun_elev);
+                total_diffuse_color += star_color * atmo_sky_ambient * shadow * falloff;
+            }
         }
 
         // === Moonshine / Planetshine ===
@@ -1029,38 +1058,9 @@ void main() {
         float planet_alpha = mesh_weight_planet;
 
         if (u_is_cloud_pass) {
-            float trans_view = 1.0;
-            float horizon_fade = 1.0;
-
-            if (f_my_atmo_h > 0.0) {
-                float R_km = max(f_radius * u_au_to_km, 1e-6);
-                float H_scale = max(f_my_scale_height, 1e-3);
-                // Same mean deck + per-species split as sun path for consistency.
-                float cloud_h_km = f_my_scale_height * 0.8;
-                float H_mie = max(f_my_mie_h, 0.5);
-
-                vec3 view_norm = is_inside ? -N : N;
-                float NdotV = max(dot(view_norm, V), 0.0);
-                float am_view = (sqrt(R_km * R_km * NdotV * NdotV + 2.0 * R_km * H_scale + H_scale * H_scale) - R_km * NdotV) / H_scale;
-
-                float d_cam_km = length(cam_to_center + P_rel) * u_au_to_km;
-                float path_fraction = clamp(d_cam_km / max(am_view * H_scale, 1e-3), 0.0, 1.0);
-
-                vec3 tau_mie_vert = max(f_my_mie_tau, vec3(0.0));
-                vec3 tau_rm_vert = max(max(f_my_atmo_tint, vec3(0.0)) - tau_mie_vert, vec3(0.0));
-                vec3 tau_vert_cloud = tau_rm_vert * exp(-cloud_h_km / H_scale)
-                                    + tau_mie_vert * exp(-cloud_h_km / H_mie);
-                vec3 tau_view = tau_vert_cloud * am_view * path_fraction;
-
-                // Photopic optical depth along view ray for natural perceptual fading
-                float tau_eff = dot(tau_view, vec3(0.2126, 0.7152, 0.0722));
-                trans_view = exp(-tau_eff);
-
-                // Smooth horizon falloff to prevent grazing edge aliasing
-                horizon_fade = smoothstep(0.0, 0.05, NdotV);
-            }
-
-            planet_alpha = cloud_frag_alpha * trans_view * horizon_fade * mesh_weight_planet;
+            float NdotV = max(dot(N, V), 0.0);
+            float limb_soften = smoothstep(0.0, 0.015, NdotV);
+            planet_alpha = cloud_frag_alpha * limb_soften * mesh_weight_planet;
         }
 
         out_color = vec4(final_color, planet_alpha);

@@ -983,6 +983,47 @@ def build_tree_order(parent_indices, num_bodies, positions=None):
         
     return tree_indices, tree_depths
 
+# ── Timeline recording density (auto-scaled so SPK export fits stay trustworthy) ──
+TIMELINE_SAMPLES_PER_ORBIT = 100     # Auto mode: samples per fastest osculating orbit
+TIMELINE_MAX_STEPS = 200000          # Hard cap on recorded steps
+TIMELINE_MEM_BUDGET_MB = 256.0       # Buffer cost ≈ 72 bytes per body per step (f8 raw + f4 pos/vel)
+
+
+def estimate_min_orbital_period(pos, vel, mass, parent_indices):
+    """
+    Estimate the shortest osculating orbital period (years) across all bodies,
+    using two-body specific orbital energy relative to each body's current parent.
+
+    Returns math.inf if no bound orbit is found (e.g. a purely hyperbolic system).
+    """
+    p_min = math.inf
+    n = len(mass)
+    for i in range(n):
+        pi = int(parent_indices[i])
+        if pi < 0 or pi == i or pi >= n:
+            continue
+        dx = pos[i, 0] - pos[pi, 0]
+        dy = pos[i, 1] - pos[pi, 1]
+        dz = pos[i, 2] - pos[pi, 2]
+        dvx = vel[i, 0] - vel[pi, 0]
+        dvy = vel[i, 1] - vel[pi, 1]
+        dvz = vel[i, 2] - vel[pi, 2]
+        r = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if r <= 0.0:
+            continue
+        v2 = dvx * dvx + dvy * dvy + dvz * dvz
+        mu = G * (mass[i] + mass[pi])
+        if mu <= 0.0:
+            continue
+        eps = 0.5 * v2 - mu / r          # specific orbital energy (AU^2 / yr^2)
+        if eps < 0.0:
+            a = -mu / (2.0 * eps)
+            period = 2.0 * math.pi * math.sqrt(a ** 3 / mu)
+            if period < p_min:
+                p_min = period
+    return p_min
+
+
 def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
     _timer_set = False
     try:
@@ -1513,7 +1554,23 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 time_ctrl["render_timeline"] = False
                 continue
                 
-            num_steps = 1000
+            # Auto-scale recording density to the fastest osculating orbit so that
+            # downstream consumers (timeline scrubbing, SPK Chebyshev export) stay
+            # well-sampled. time_ctrl["timeline_steps"] > 0 forces a manual count.
+            manual_steps = int(time_ctrl.get("timeline_steps", 0) or 0)
+            if manual_steps > 0:
+                num_steps = manual_steps
+            else:
+                p_min = estimate_min_orbital_period(
+                    sim.arr[:num_bodies, 0:3], sim.arr[:num_bodies, 3:6],
+                    sim.arr[:num_bodies, 9], current_parents)
+                if np.isfinite(p_min) and p_min > 1e-6:
+                    num_steps = int(np.ceil(abs(diff_t) / p_min * TIMELINE_SAMPLES_PER_ORBIT))
+                else:
+                    num_steps = 1000
+            max_steps = max(1000, min(TIMELINE_MAX_STEPS,
+                                      int(TIMELINE_MEM_BUDGET_MB * 1e6 / (72.0 * max(1, num_bodies)))))
+            num_steps = max(1000, min(num_steps, max_steps))
             step_dt = diff_t / num_steps
             
             tl_pos = np.zeros((num_steps, num_bodies, 3), dtype='f4')
@@ -1524,6 +1581,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
             with shared_state["lock"]:
                 shared_state["timeline_active"] = True
                 shared_state["timeline_progress"] = 0.0
+                shared_state["timeline_steps_total"] = num_steps
             
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
