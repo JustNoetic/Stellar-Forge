@@ -178,6 +178,8 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
         float z_peak = ozone_param.w;
         float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
 
+        float caster_r_km = max(beta * dist_km, 100.0);
+
         float req_bend = beta - gamma - alpha * 0.8;
         if (req_bend <= max_bend) {
             float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
@@ -188,7 +190,13 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
             vec3 tau_total = tau_R + tau_O3;
             vec3 atmo_transmittance = exp(-tau_total);
             float radial_defocus = 1.0 / (1.0 + (dist_km * max(req_bend, 1e-6)) / H_scale);
-            float ring_intensity = ((2.0 * H_scale) / max(alpha * dist_km, 1e-9)) * radial_defocus;
+
+            float f_focal_km = caster_r_km / max(max_bend, 1e-6);
+            float focal_ratio = clamp(dist_km / f_focal_km, 0.0, 1.0);
+            float off_axis_factor = clamp(alpha / max(1e-6, gamma), 0.0, 1.0);
+
+            float annular_factor = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
+            float ring_intensity = clamp(annular_factor * focal_ratio * off_axis_factor, 0.0, 1.0) * radial_defocus;
             float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
             float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
             float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);

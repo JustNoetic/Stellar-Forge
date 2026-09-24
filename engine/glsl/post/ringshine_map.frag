@@ -264,7 +264,10 @@ void main() {
         // displaced away from retro-reflection. Modulating the horizontal phase cosine smoothly
         // by (1.0 - 0.45 * shadow_fraction) accounts for this shift with guaranteed C_inf continuity (no vertical seam or boxy edge).
         float cos_phi_eff = cos(phi_center) * (1.0 - 0.45 * shadow_fraction);
-        float cos_theta_phase = ((norm_r - rho * cos_lat) * cos_sun_elev * cos_phi_eff + sin_sun_elev * (rho * sin_lat)) / d;
+        // On the lit side (same_hemi_t > 0.5), light bounces upwards back towards the sun (backscattering: negative vertical term).
+        // On the unlit side (same_hemi_t <= 0.5), light penetrates downwards through the ring slab (forward scattering: positive vertical term).
+        float vert_phase = (same_hemi_t > 0.5 ? -1.0 : 1.0) * sin_sun_elev * (rho * sin_lat);
+        float cos_theta_phase = ((norm_r - rho * cos_lat) * cos_sun_elev * cos_phi_eff + vert_phase) / d;
         cos_theta_phase = clamp(cos_theta_phase, -1.0, 1.0);
 
         float pf = 0.0;

@@ -170,7 +170,18 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
             // exponential atmosphere density gradient (d_theta/dz = -theta/H) dilutes flux by
             // 1 / (1 + D * theta / H), giving true 3D 1/D^2 energy conservation at large distances.
             float radial_defocus = 1.0 / (1.0 + (dist_km * max(req_bend, 1e-6)) / H_scale);
-            float ring_intensity = ((2.0 * H_scale) / max(alpha * dist_km, 1e-9)) * radial_defocus;
+
+            // Annular lens focusing requires rays from opposite limbs to reach the focal line (D >= f_focal = R / max_bend).
+            // In the near field (D < f_focal, e.g. close-in moons), rays have not converged.
+            float f_focal_km = caster_r_km / max(max_bend, 1e-6);
+            float focal_ratio = clamp(dist_km / f_focal_km, 0.0, 1.0);
+
+            // Full annular Einstein ring is only visible on-axis (gamma <= alpha). Off-axis observers
+            // (gamma > alpha) only see a local limb arc subtending fraction alpha / gamma.
+            float off_axis_factor = clamp(alpha / max(1e-6, gamma), 0.0, 1.0);
+
+            float annular_factor = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
+            float ring_intensity = clamp(annular_factor * focal_ratio * off_axis_factor, 0.0, 1.0) * radial_defocus;
             
             // Smooth surface grazing fade to zero at solid body boundary (h = 0, atmo_depth = 1)
             float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
@@ -410,7 +421,7 @@ void main() {
 
     vec3 P_scaled = P_rel + pole_n * (dot(P_rel, pole_n) * (f_scale * f_scale - 1.0));
     vec3 hit_normal = normalize(P_scaled);
-    if (is_inside && !u_is_cloud_pass) {
+    if (is_inside) {
         hit_normal = -hit_normal;
     }
     vec3 hit_local_pos = P_rel / max(1e-6, f_radius);

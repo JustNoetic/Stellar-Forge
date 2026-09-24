@@ -6065,6 +6065,8 @@ class App(InputHandlerMixin):
                 inst_idx = bi if not is_cmp else (num_bodies + bi)
                 self.single_cloud_body_buf.write(struct.pack('I', int(inst_idx)))
                 
+                self.hdr_resolve_fbo.use()
+                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
                 ctx.enable(moderngl.DEPTH_TEST)
@@ -6184,22 +6186,22 @@ class App(InputHandlerMixin):
 
                 if atmo_entry is not None and body_ring_groups:
                     if _body_needs_ring_clip(atmo_entry):
-                        execute_atmosphere_pass(1, [atmo_entry])
                         render_body_clouds(_bi, is_cmp=_is_c)
                         rendered_cloud_bodies.add(key)
+                        execute_atmosphere_pass(1, [atmo_entry])
                         for rg in body_ring_groups:
                             render_single_ring_group(rg, is_cmp=_is_c)
                         execute_atmosphere_pass(2, [atmo_entry])
                     else:
-                        execute_atmosphere_pass(0, [atmo_entry])
                         render_body_clouds(_bi, is_cmp=_is_c)
                         rendered_cloud_bodies.add(key)
+                        execute_atmosphere_pass(0, [atmo_entry])
                         for rg in body_ring_groups:
                             render_single_ring_group(rg, is_cmp=_is_c)
                 elif atmo_entry is not None:
-                    execute_atmosphere_pass(0, [atmo_entry])
                     render_body_clouds(_bi, is_cmp=_is_c)
                     rendered_cloud_bodies.add(key)
+                    execute_atmosphere_pass(0, [atmo_entry])
                 elif body_ring_groups:
                     render_body_clouds(_bi, is_cmp=_is_c)
                     rendered_cloud_bodies.add(key)
