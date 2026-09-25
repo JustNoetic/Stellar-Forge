@@ -125,6 +125,38 @@ def format_distance_au(dist_au, threshold_au=None, precision=5, show_unit=True):
         unit_str = " AU" if show_unit else ""
         return f"{dist_au:.{precision}f}{unit_str}"
 
+def format_altitude(alt_km, alt_au=None, threshold_au=None):
+    """Format altitude above a celestial body's surface with adaptive unit scaling and precision."""
+    if threshold_au is None:
+        threshold_au = DEFAULT_LY_THRESHOLD_AU
+    if alt_au is None:
+        alt_au = alt_km / AU_TO_KM
+
+    # Light-year threshold check
+    if threshold_au > 0 and abs(alt_au) >= threshold_au:
+        return format_distance_au(alt_au, threshold_au=threshold_au)
+
+    # Astronomical Units for interplanetary distances (> 0.1 AU)
+    if abs(alt_km) > 1.49597e7:
+        return format_distance_au(alt_au, threshold_au=threshold_au)
+
+    abs_km = abs(alt_km)
+    is_neg = alt_km < -1e-4
+
+    # Float rounding near zero (within 10 cm of surface)
+    if abs_km < 1e-4:
+        return "0.0 m"
+
+    sign = "-" if is_neg else ""
+    if abs_km < 1.0:
+        return f"{sign}{abs_km * 1000.0:.1f} m"
+    elif abs_km < 10.0:
+        return f"{sign}{abs_km:.2f} km"
+    elif abs_km < 1000.0:
+        return f"{sign}{abs_km:,.1f} km"
+    else:
+        return f"{sign}{abs_km:,.0f} km"
+
 def _get_local_time(dt_utc):
     try:
         dt_loc = dt_utc.astimezone()

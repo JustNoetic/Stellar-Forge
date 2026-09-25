@@ -578,7 +578,7 @@ vec3 get_transmittance_segment(
     float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
     eval_polar_winter(cam_local_sph + 0.5 * (s0 + s1) * ray_dir_sph, u_cur_solstice, has_rings, polar_haze_factor, dummy_boost);
 
-    const int K = 8;
+    const int K = 24;
     float ds = (s1 - s0) / float(K);
     vec3 tau = vec3(0.0);
 
@@ -626,8 +626,9 @@ void march_bounded_shadow_blackrack(
 
     float du_step_cs = 2.0 * ds * dr_ds_cs / max(ring_span, 1e-4);
     float du_step_ce = 2.0 * ds * dr_ds_ce / max(ring_span, 1e-4);
-    float lod_start = clamp(log2(max(1.0, max(du_step_cs, du_screen) * 4096.0)), 0.0, 3.0);
-    float lod_end = clamp(log2(max(1.0, max(du_step_ce, du_screen) * 4096.0)), 0.0, 3.0);
+    float lod_start = clamp(log2(max(1.0, max(du_step_cs, du_screen) * 4096.0)), 0.0, 8.0);
+    float lod_end = clamp(log2(max(1.0, max(du_step_ce, du_screen) * 4096.0)), 0.0, 8.0);
+    float eff_inv_sin_sun = min(inv_sin_sun, 5.0);
 
     for (int q = 0; q < steps; q++) {
         // Deterministic midpoint quadrature: zero jitter, zero temporal noise
@@ -681,7 +682,7 @@ void march_bounded_shadow_blackrack(
         if (u_q >= 0.0 && u_q <= 1.0) {
             float raw_a = textureLod(u_ring_shadow_tex, vec2(u_q, 0.5), lod).a;
             float tau_ring = -log(max(1e-4, 1.0 - raw_a));
-            ring_blocked = 1.0 - exp(-tau_ring * inv_sin_sun);
+            ring_blocked = 1.0 - exp(-tau_ring * eff_inv_sin_sun);
         }
 
         vec3 step_unshadowed = (inscatter_direct + inscatter_ms) * T_run * int_factor;
@@ -1346,7 +1347,7 @@ void main() {
             if (phi_ca < 0.0) phi_ca += 2.0 * PI;
             u_lut = phi_ca / (2.0 * PI);
 
-            is_ground = (r_ca <= u_planet_radius_km) || hits_surface;
+            is_ground = hits_surface || (u_screen_res.x <= 0.0 && r_ca <= u_planet_radius_km);
             if (is_ground) {
                 // Ground disk: r_ca in [0, R_planet]
                 float r_clamped = min(r_ca, u_planet_radius_km);
@@ -1663,33 +1664,35 @@ void main() {
         }
 
             if (has_shadow_interval) {
-                // Normalize this star's deficit against its OWN baked in-scatter
-                // slice: the subtraction can never eat another star's light.
+                // Deficit evaluation against this star's baked in-scatter slice:
+                // the subtraction can never eat another star's light or shine.
                 vec3 L_scatter_s = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
                 if (limb_faded) L_scatter_s *= limb_fade;
 
-                float chord_len = max(s_end - s_start, 1e-4);
-                float chord_coverage = clamp(total_shadow_len / chord_len, 0.0, 1.0);
+                if (u_atmo_shadow_method == 2) {
+                    // Method 2 (Blackrack / KSA): Direct physical deficit subtraction.
+                    // Clamped to L_scatter_s so a ring shadow cannot subtract more than
+                    // this star's total scattered light. Completely eliminates chord_coverage
+                    // blending and ratio normalization, removing concentric onion-shell banding.
+                    vec3 sub_val = min(delta_L, L_scatter_s);
+                    L_atmo = max(vec3(0.0), L_atmo - sub_val);
+                } else {
+                    // Methods 0 and 1: Station-Locked Slicing and Uniform Stochastic Raymarching
+                    float chord_len = max(s_end - s_start, 1e-4);
+                    float chord_coverage = clamp(total_shadow_len / chord_len, 0.0, 1.0);
 
-                vec3 shadow_factor = vec3(0.0);
-                if (dot(slice_total, vec3(1.0)) > 1e-6) {
-                    shadow_factor = clamp(delta_L / max(slice_total, vec3(1e-6)), vec3(0.0), vec3(1.0));
-                } else if (shadow_step_count > 0.0) {
-                    float avg_blocked = total_ring_blocked_accum / shadow_step_count;
-                    shadow_factor = vec3(clamp(avg_blocked, 0.0, 1.0));
+                    vec3 shadow_factor = vec3(0.0);
+                    if (dot(slice_total, vec3(1.0)) > 1e-6) {
+                        shadow_factor = clamp(delta_L / max(slice_total, vec3(1e-6)), vec3(0.0), vec3(1.0));
+                    } else if (shadow_step_count > 0.0) {
+                        float avg_blocked = total_ring_blocked_accum / shadow_step_count;
+                        shadow_factor = vec3(clamp(avg_blocked, 0.0, 1.0));
+                    }
+
+                    float blend = smoothstep(0.85, 0.98, chord_coverage);
+                    vec3 eff_slice = mix(slice_total, L_scatter_s, blend);
+                    L_atmo = max(vec3(0.0), L_atmo - eff_slice * shadow_factor);
                 }
-
-                // Smoothly blend from direct bounded subtraction (eff_slice = slice_total)
-                // to full slice normalization (eff_slice = L_scatter_s) ONLY when the atmospheric
-                // chord is nearly 100% inside the shadow interval (chord_coverage >= 0.85).
-                // For partially shadowed rays (e.g. looking toward the shadow boundary from outside
-                // in direct sunlight), eff_slice stays equal to slice_total so direct sunlight
-                // scattering along the unshadowed remainder of the ray is never deleted,
-                // eliminating chromatic edge fringes and the artificial blue boundary line.
-                float blend = smoothstep(0.85, 0.98, chord_coverage);
-
-                vec3 eff_slice = mix(slice_total, L_scatter_s, blend);
-                L_atmo = max(vec3(0.0), L_atmo - eff_slice * shadow_factor);
             }
 
             // Method 2 (Blackrack): Analytical bounding cylinder culling + raymarching for celestial eclipse casters (moons/planets)

@@ -297,8 +297,9 @@ spectral classification.
 
 ### 3.12 `engine/rendering/render_utils.py`
 - `hex_to_rgb`, `sample_gradient` — color helpers.
-- `format_time_speed(multiplier)` (~L26), `format_sim_time(t_years)` (~L47),
-  `sim_time_from_date(y,m,d,h,mn)` (~L98) — UI time strings.
+- `format_flight_speed(speed_au_s)`, `format_time_speed(multiplier)`, `format_distance_au(dist_au)`,
+  `format_altitude(alt_km, alt_au)`, `format_sim_time(t_years)`,
+  `sim_time_from_date(y,m,d,h,mn)` — UI formatting helpers.
 - `compute_ring_culling(...)` (~L121, `@njit`) — ring visibility.
 - `extract_frustum_planes(vp)` (~L174, `@njit`) — frustum planes from VP matrix.
 - `create_icosphere_mesh(subdivisions=4)` (~L189) — UV/ico sphere geometry.
@@ -392,8 +393,7 @@ spectral classification.
 - `__init__.py`: Master `render_ui` orchestrator coordinating all UI passes when `app.ui_visible` is True.
 - `menu_bar.py`: `render_main_menu_bar` — Systems switch/create/delete, Physics modes (IAS15, Keplerian, SPICE), View (Free Flight, Simple Orbit, FOV, UI toggles), Render (MSAA, HDR, Atmosphere, Refraction, Planetshine, Ringshine), Tools (Ephemeris, Comparison, Distance Units, Accumulation), Quick HUD (physics badge, F12 Screenshot button, Settings cog).
 - `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, and Jump in Time popup / timeline playback & scrubbing.
-- `outliner.py`: `render_system_outliner` — Left-anchored hierarchy tree with real-time substring search filter, inline + / - CRUD buttons, and comparison system tree.
-- `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Edit Mode (interactive editing of physical/stellar properties and osculating Keplerian orbital elements with reference frame selection, dynamic Roche limit checks, Darwin/Maclaurin oblateness auto-calculation, and real-time CRUD synchronization), Overview, Orbit, Atmosphere, Rings, and Cosmetics.
+- `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Edit Mode (interactive editing of physical/stellar properties and osculating Keplerian orbital elements with reference frame selection, dynamic Roche limit checks, Darwin/Maclaurin oblateness auto-calculation, and real-time CRUD synchronization), real-time camera Distance & Altitude readouts (accounting for oblate spheroid surface radius $R(\mathbf{u})$, flattening $f$, and axial spin pole), Overview, Orbit, Atmosphere, Rings, and Cosmetics.
   - Orbit gravitational-limit readouts: instantaneous Hill radius from live body/parent mass and separation (same approximation as hierarchy selection); fluid Roche distance from the parent's center for the selected body's mass/radius, with proposed edit values and periapsis warning. No limit readouts for barycenters or parentless bodies; the existing edit Apply restriction remains unchanged.
   - Stellar Overview exposes optimistic HZ bounds matching the overlay (`sqrt(lum/1.78)`, `sqrt(lum/0.32)`); Atmosphere exposes its existing equilibrium temperature and cached gas scale height/molar mass.
 

@@ -25,6 +25,7 @@ from engine.physics.atmosphere_physics import compute_mie_coefficients, GAS_PROP
 from engine.rendering.render_utils import (
     compute_surface_albedo,
     format_distance_au,
+    format_altitude,
     rebuild_ring_render_group,
     generate_ring_shadow_grad
 )
@@ -43,18 +44,33 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 def _ellipsoid_surface_radius(r_eq, f, pole, u):
-    """Compute local radius on an oblate spheroid in direction unit vector u."""
+    """Compute local radius on an oblate spheroid (semi-major r_eq, flattening f)
+    in direction vector u (pole = unit spin axis)."""
+    r_eq = float(r_eq)
+    f = float(f)
     if f <= 0.0 or r_eq <= 0.0:
         return r_eq
-    u = np.asarray(u, dtype='f8')
+    if f >= 1.0:
+        f = 0.9999
     pole = np.asarray(pole, dtype='f8')
+    p_len = np.linalg.norm(pole)
+    if p_len < 1e-12:
+        return r_eq
+    pole = pole / p_len
+
+    u = np.asarray(u, dtype='f8')
+    u_len = np.linalg.norm(u)
+    if u_len < 1e-12:
+        return r_eq * (1.0 - f)
+    u = u / u_len
+
+    b = r_eq * (1.0 - f)
     cos_phi = float(np.dot(u, pole))
     sin_phi_sq = max(0.0, 1.0 - cos_phi * cos_phi)
-    one_minus_f_sq = (1.0 - f) * (1.0 - f)
-    denom = sin_phi_sq + (cos_phi * cos_phi) / one_minus_f_sq
-    if denom <= 0.0:
-        return r_eq
-    return r_eq / math.sqrt(denom)
+    denom = b * b * sin_phi_sq + r_eq * r_eq * (cos_phi * cos_phi)
+    if denom < 1e-30:
+        return b
+    return (r_eq * b) / math.sqrt(denom)
 
 def compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo_bodies, cur_mass_snap):
     """Compute Geometric Albedo (A_g), Bond Albedo (A_b), Phase Integral (q), and Top-of-Atmosphere RGB reflectance."""
@@ -351,7 +367,8 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     target_pos = cur_subsys_pos_buf[insp_idx].copy() if inspect_bary else cur_pos_snap_render[insp_idx].copy()
     if insp_is_cmp:
         target_pos += np.array([app.comparison_offset_au, 0.0, 0.0], dtype='f8')
-    dist_to_center_km = np.linalg.norm(target_pos - cam_world_pos_f8) * 149597870.7
+    cam_rel = cam_world_pos_f8 - target_pos
+    dist_to_center_km = np.linalg.norm(cam_rel) * 149597870.7
     dist_to_center_au = dist_to_center_km / 149597870.7
     body_r_km = body_info.get('r', 0.0) * 696340.0
     body_mass = cur_mass_snap[insp_idx]
@@ -474,6 +491,54 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         imgui.text(f"Distance: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
     else:
         imgui.text(f"Distance: {dist_to_center_km:,.0f} km")
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Distance from the camera to the center of the body.")
+
+    if not inspect_bary and body_r_km > 0.0:
+        f_oblate = float(body_info.get("oblateness", 0.0))
+        if not insp_is_cmp and app.camera.get("edit_mode", False) and "edit_data" in app.camera:
+            ed = app.camera["edit_data"]
+            if "oblateness" in ed:
+                f_oblate = float(ed["oblateness"])
+        if f_oblate <= 0.0 and cur_visual_arr is not None and len(cur_visual_arr) > insp_idx:
+            f_oblate = float(cur_visual_arr[insp_idx, 8])
+        if f_oblate <= 0.0:
+            sp = body_info.get('star_props', {})
+            if sp and sp.get('r_eq') and sp.get('r_pole') and float(sp['r_eq']) > 0:
+                f_oblate = max(0.0, 1.0 - float(sp['r_pole']) / float(sp['r_eq']))
+
+        if cur_visual_arr is not None and len(cur_visual_arr) > insp_idx:
+            body_pole = cur_visual_arr[insp_idx, 5:8]
+        elif hasattr(app, "pole_n_arr") and app.pole_n_arr is not None and len(app.pole_n_arr) > insp_idx:
+            body_pole = app.pole_n_arr_cmp[insp_idx] if insp_is_cmp else app.pole_n_arr[insp_idx]
+        else:
+            pole_ra = body_info.get('pole_ra')
+            pole_dec = body_info.get('pole_dec')
+            if pole_ra is not None and pole_dec is not None:
+                p_ecl = pole_to_ecliptic(float(pole_ra), float(pole_dec))
+                body_pole = np.array([p_ecl[0], p_ecl[2], -p_ecl[1]], dtype='f8')
+            else:
+                body_pole = np.array([0.0, 1.0, 0.0], dtype='f8')
+
+        active_r_km = float(app.camera["edit_data"].get("radius", body_r_km)) if (not insp_is_cmp and app.camera.get("edit_mode", False) and "edit_data" in app.camera) else body_r_km
+        surf_r_km = _ellipsoid_surface_radius(active_r_km, f_oblate, body_pole, cam_rel)
+        alt_km = dist_to_center_km - surf_r_km
+        alt_au = alt_km / 149597870.7
+        imgui.text(f"Altitude: {format_altitude(alt_km, alt_au, threshold_au=thresh_au)}")
+        if imgui.is_item_hovered():
+            if f_oblate > 0.0:
+                r_pole_km = active_r_km * (1.0 - f_oblate)
+                imgui.set_tooltip(
+                    f"Camera altitude above the oblate spheroid surface along line of sight.\n"
+                    f"Local surface radius: {surf_r_km:,.1f} km (Flattening f = {f_oblate:.4f})\n"
+                    f"Equatorial: {active_r_km:,.1f} km | Polar: {r_pole_km:,.1f} km"
+                )
+            else:
+                imgui.set_tooltip(
+                    f"Camera altitude above the surface along line of sight.\n"
+                    f"Surface radius: {surf_r_km:,.1f} km"
+                )
+
 
     imgui.separator()
 
@@ -695,6 +760,13 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 f_oblate = float(body_info.get("oblateness", 0.0))
                 if f_oblate > 0.0:
                     imgui.text(f"  Oblateness (f): {f_oblate:.4f}")
+                    if imgui.is_item_hovered():
+                        r_pole_km = body_r_km * (1.0 - f_oblate)
+                        imgui.set_tooltip(
+                            f"Equatorial Radius: {body_r_km:,.1f} km\n"
+                            f"Polar Radius:      {r_pole_km:,.1f} km\n"
+                            f"Polar Flattening:  {body_r_km - r_pole_km:,.1f} km"
+                        )
 
             # Stellar details
             if not inspect_bary and ('star_props' in body_info or (not insp_is_cmp and app.camera.get("edit_mode", False) and app.camera.get("edit_data", {}).get("type") == "Star")):
