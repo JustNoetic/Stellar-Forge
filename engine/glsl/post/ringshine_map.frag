@@ -267,7 +267,10 @@ void main() {
         // On the lit side (same_hemi_t > 0.5), light bounces upwards back towards the sun (backscattering: negative vertical term).
         // On the unlit side (same_hemi_t <= 0.5), light penetrates downwards through the ring slab (forward scattering: positive vertical term).
         float vert_phase = (same_hemi_t > 0.5 ? -1.0 : 1.0) * sin_sun_elev * (rho * sin_lat);
-        float cos_theta_phase = ((norm_r - rho * cos_lat) * cos_sun_elev * cos_phi_eff + vert_phase) / d;
+        // Dominant scattering phase cosine cos(Theta) = -(L . V_ring_to_surf).
+        // Incident light propagates in direction -L; scattered light propagates in direction (P_surf - P_ring)/d.
+        // Horizontally, inward vector to planet is -(norm_r - rho*cos_lat), giving -(L . V)_xy = -(norm_r - rho*cos_lat) * cos_sun_elev * cos_phi_eff / d.
+        float cos_theta_phase = (-(norm_r - rho * cos_lat) * cos_sun_elev * cos_phi_eff + vert_phase) / d;
         cos_theta_phase = clamp(cos_theta_phase, -1.0, 1.0);
 
         float pf = 0.0;

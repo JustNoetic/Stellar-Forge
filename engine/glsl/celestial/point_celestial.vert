@@ -257,10 +257,10 @@ void main() {
         vec3 total_shadow = clamp(vec3(shadow_geom) + shadow_refr, 0.0, 1.0);
         surface_color = star_col * albedo * (star_irradiance * phase_func) * total_shadow;
 
-        // Secondary planetshine contribution if nearby
+        // Secondary planetshine contribution if nearby (gated by eclipse shadow)
         vec3 planetshine_color = f5.xyz;
         if (dot(planetshine_color, planetshine_color) > 1e-12) {
-            surface_color += planetshine_color * 0.5;
+            surface_color += planetshine_color * 0.5 * total_shadow;
         }
     }
 

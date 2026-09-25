@@ -458,8 +458,23 @@ def compute_planetshine_numba(
                 if planetshine_enabled and solid_angle >= 1e-8:
                     cos_a = cx * (-dir_to_caster_x) + cy * (-dir_to_caster_y) + cz * (-dir_to_caster_z)
                     cos_a = max(-1.0, min(1.0, cos_a))
-                    a = np.arccos(cos_a)
-                    phase = (np.sin(a) + (np.pi - a) * cos_a) / np.pi
+
+                    # Finite-distance geometric horizon cutoff:
+                    # An observer at distance `dist` from a spherical body of radius `r_j` only
+                    # sees a spherical cap of angular radius arccos(r_j / dist) < 90 deg.
+                    # The illuminated dayside rotates completely behind the limb when
+                    # cos_a <= -sqrt(1 - (r_j / dist)^2) == mu_cutoff. Inside this shadow/umbra
+                    # zone, the visible illuminated fraction is strictly 0.
+                    r_over_d = min(0.9999, r_j / max(dist, 1e-6))
+                    mu_cutoff = -math.sqrt(max(0.0, 1.0 - r_over_d * r_over_d))
+
+                    if cos_a <= mu_cutoff:
+                        phase = 0.0
+                    else:
+                        cos_a_eff = 2.0 * (cos_a - mu_cutoff) / max(1e-6, 1.0 - mu_cutoff) - 1.0
+                        cos_a_eff = max(-1.0, min(1.0, cos_a_eff))
+                        a_eff = math.acos(cos_a_eff)
+                        phase = (math.sin(a_eff) + (math.pi - a_eff) * cos_a_eff) / math.pi
                     
                     light_r = star_colors[s, 0] * phase * j_lit[j, s]
                     light_g = star_colors[s, 1] * phase * j_lit[j, s]
@@ -486,8 +501,8 @@ def compute_planetshine_numba(
                         # Unlit face: transmitted light through the ring slab
                         face_factor = r_unlit * math.exp(-tau_ring / mu_0)
                         
-                    # Scattering phase angle: angle between solar ray L and ray from planet to moon
-                    cos_theta = cx * u_moon_x + cy * u_moon_y + cz * u_moon_z
+                    # Scattering phase angle: angle between incident solar ray (-L) and scattered ray to moon (+u_moon)
+                    cos_theta = -(cx * u_moon_x + cy * u_moon_y + cz * u_moon_z)
                     cos_theta = max(-1.0, min(1.0, cos_theta))
                     
                     # Double Henyey-Greenstein particulate phase function (gf=0.436, gb=-0.657)

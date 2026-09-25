@@ -2151,7 +2151,7 @@ void main() {
                 float light_cos_theta_ps = dot(current_pos_sph, body_planetshine_dir) / sample_len;
                 float vis_fraction_ps = smoothstep(-cos_planet - 0.05, -cos_planet + 0.05, light_cos_theta_ps);
                 vec3 transmittance_to_ps = get_transmittance_precomputed(v_norm, light_cos_theta_ps);
-                vec3 ps_attenuation = current_transmittance * transmittance_to_ps * vis_fraction_ps;
+                vec3 ps_attenuation = current_transmittance * transmittance_to_ps * vis_fraction_ps * sample_shadow;
                 total_rayleigh_ps += rho_R * ps_attenuation * int_factor;
                 total_mie_ps      += rho_M * ps_attenuation * int_factor;
 

@@ -144,9 +144,9 @@ void main() {
     f_my_o3_layer = my_o3_layer;
 
     if (u_is_cloud_pass) {
-        // Mean optically-thick cloud deck near ~500 hPa (p/p0 ~ 0.45):
-        // z = H * ln(1/0.45) ~= 0.8H (~6.5 km for Earth), not a low 0.35H haze.
-        float cloud_h_km = f_my_scale_height * 0.8;
+        // Mean optically-thick tropospheric cloud deck near ~700-800 hPa:
+        // z ~= 0.35H (~3.0 km for Earth), representing the main cloud layer.
+        float cloud_h_km = f_my_scale_height * 0.35;
         float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
         in_radius += cloud_offset_au;
     }

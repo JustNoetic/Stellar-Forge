@@ -597,6 +597,7 @@ void main() {
 
         vec3 total_diffuse_color = vec3(0.0);
         vec3 total_specular_color = vec3(0.0);
+        vec3 primary_caster_shadow = vec3(1.0);
         vec3 V = normalize(-(cam_to_center + P_rel));
 
         for (int s = 0; s < u_num_stars; s++) {
@@ -627,9 +628,8 @@ void main() {
             float sun_cos = dot(sun_facing_norm, L);
             float effective_sun_cos = sun_cos;
             if (u_is_cloud_pass) {
-                // Mean cloud deck ~0.8H (~500 hPa); higher than the old 0.35H haze
-                // so the terminator delay sqrt(2*z/R) matches high clouds staying lit.
-                float cloud_h_km = f_my_scale_height * 0.8;
+                // Mean optically-thick tropospheric cloud deck ~0.35H (~3.0 km for Earth).
+                float cloud_h_km = f_my_scale_height * 0.35;
                 float R_km = max(f_radius * u_au_to_km, 1e-6);
                 float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
                 effective_sun_cos += term_offset;
@@ -646,10 +646,11 @@ void main() {
                     float forward_trans = pow(max(0.0, cos_trans), 4.0) * 0.35;
                     diffuse = top_illum * (0.50 + forward_trans);
                 } else {
-                    diffuse = clamp((effective_sun_cos + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+                    float sun_vis = clamp((effective_sun_cos + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
+                    diffuse = sun_vis;
                     // Subtle forward scattering ("silver lining") along the backlit crescent rim
                     float cos_forward = -dot(V, L);
-                    float silver_lining = pow(max(0.0, cos_forward), 6.0) * 0.35 * clamp(effective_sun_cos + 0.1, 0.0, 1.0);
+                    float silver_lining = pow(max(0.0, cos_forward), 6.0) * 0.35 * sun_vis;
                     diffuse += silver_lining;
                 }
             } else {
@@ -673,7 +674,7 @@ void main() {
                 vec3 tau_rm_vert = max(max(f_my_atmo_tint, vec3(0.0)) - tau_mie_vert, vec3(0.0));
 
                 if (u_is_cloud_pass) {
-                    float cloud_h_km = f_my_scale_height * 0.8;
+                    float cloud_h_km = f_my_scale_height * 0.35;
                     float H_mie = max(f_my_mie_h, 0.5);
                     tau_rm_vert *= exp(-cloud_h_km / H_scale);
                     // Mie haze is concentrated near the surface: at cloud altitude
@@ -717,9 +718,9 @@ void main() {
             }
 
             // === Ray-Traced Cloud Shadows on Surface ===
-            // Must use the same mean deck height as the cloud shell (0.8H).
+            // Must use the same mean deck height as the cloud shell (0.35H).
             if (!u_is_cloud_pass && f_tex_idx > 0.0 && has_clouds && f_my_scale_height > 0.0) {
-                float cloud_h_km = f_my_scale_height * 0.8;
+                float cloud_h_km = f_my_scale_height * 0.35;
                 float cloud_offset_au = cloud_h_km / max(1e-6, u_au_to_km);
                 float eff_r = max(f_radius, f_final_radius);
                 float R_cloud = eff_r + cloud_offset_au;
@@ -830,9 +831,13 @@ void main() {
                 shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j], u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster);
             }
 
+            if (s == 0) {
+                primary_caster_shadow = shadow;
+            }
+
             // === Ring shadow on planet surface / clouds ===
             // Only compute ring shadows if the fragment is lit by this star
-            bool is_lit = u_is_cloud_pass ? (effective_sun_cos > -sin_alpha - 0.1) : (effective_sun_cos > -sin_alpha);
+            bool is_lit = (effective_sun_cos > -sin_alpha);
             if (is_lit) {
                 uint processed_mask = 0u;
                 for (int k = 0; k < u_num_ring_planes; k++) {
@@ -924,7 +929,7 @@ void main() {
 
             if (u_is_cloud_pass && f_my_atmo_h > 0.0) {
                 // Cloud decks receive diffuse ambient skylight scattered downwards/upwards by the atmosphere
-                float sun_elev = clamp(effective_sun_cos + 0.1, 0.0, 1.0);
+                float sun_elev = clamp(effective_sun_cos, 0.0, 1.0);
                 vec3 atmo_sky_ambient = f_my_atmo_color * (0.08 * sun_elev);
                 total_diffuse_color += star_color * atmo_sky_ambient * shadow * falloff;
             }
@@ -934,7 +939,9 @@ void main() {
         vec3 bounce_light = vec3(0.0);
         if (dot(f_planetshine_color, f_planetshine_color) > 1e-12) {
             float NdotC = max(0.0, dot(N, f_planetshine_dir));
-            bounce_light = f_planetshine_color * NdotC;
+            // Gate bounce light by primary caster eclipse shadow so moonshine / planetshine
+            // does not unrealistically bleed into the eclipse umbra.
+            bounce_light = f_planetshine_color * NdotC * primary_caster_shadow;
         }
 
         // === Ringshine ===

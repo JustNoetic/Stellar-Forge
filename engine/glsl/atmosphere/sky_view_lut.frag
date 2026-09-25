@@ -577,6 +577,7 @@ void main() {
         float h_norm = clamp(altitude / max(1e-4, u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
         float ms_v = sqrt(h_norm);
 
+        vec3 caster_shadow_0 = vec3(1.0);
         for (int st = 0; st < n_stars; st++) {
             vec3 polar_rayleigh_boost_st = polar_rayleigh_boost0;
             if (st > 0) {
@@ -600,6 +601,9 @@ void main() {
                                                star_geo[st].z, star_geo[st].w,
                                                star_pole_obl[st].w, star_pole_obl[st].xyz,
                                                star_caster_mask[st]);
+            }
+            if (st == 0) {
+                caster_shadow_0 = shadow;
             }
             if (star_ring_mask[st] != 0u) {
                 shadow *= compute_external_ring_shadow(P_render, star_L_render[st],
@@ -630,7 +634,7 @@ void main() {
             float light_cos_ps = dot(Pn, ps_dir_n);
             float vis_ps = smoothstep(-cos_planet - 0.05, -cos_planet + 0.05, light_cos_ps);
             vec3 trans_to_ps = get_transmittance(r, light_cos_ps);
-            vec3 ps_attenuation = current_transmittance * trans_to_ps * vis_ps;
+            vec3 ps_attenuation = current_transmittance * trans_to_ps * vis_ps * caster_shadow_0;
             total_rayleigh_ps += rho_R * ps_attenuation * int_factor;
             total_mie_ps      += rho_M * ps_attenuation * int_factor;
             float ms_u_ps = 0.5 + 0.5 * sign(light_cos_ps) * sqrt(abs(light_cos_ps));
