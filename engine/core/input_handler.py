@@ -6,6 +6,7 @@ import glfw
 import imgui
 
 from engine.path_utils import get_external_path
+from engine.core.constants import MAX_FLIGHT_SPEED_AU_S
 
 class InputHandlerMixin:
     """Mixin class for GLFW input callbacks and graphics settings persistence."""
@@ -91,7 +92,7 @@ class InputHandlerMixin:
                 # Free Flight mode: scroll wheel changes flight velocity (Space Engine style, ~2x per notch).
                 speed = self.camera.get("flight_speed", 0.1)
                 speed *= (2.0 ** yoffset)
-                self.camera["flight_speed"] = max(1e-12, min(5.0, speed))
+                self.camera["flight_speed"] = max(1e-12, min(MAX_FLIGHT_SPEED_AU_S, speed))
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)

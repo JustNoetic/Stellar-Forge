@@ -72,7 +72,7 @@ Stellar-Forge supports two switchable camera control modes, selectable via the *
 ##### 2. Free Flight Mode (Space Engine Style)
 * **Left Mouse Button (Drag)**: Pivot the camera in place (free look).
 * **Right Mouse Button (Drag)**: Orbit the camera around the tracked body.
-* **Scroll Wheel**: Change flight velocity (~1.15×–2× per notch, capped at 5 AU/s).
+* **Scroll Wheel**: Change flight velocity (~1.15×–2× per notch, capped at 100 light-years/s).
 * **Left Mouse Button (Click)**: Select / pick a celestial body in the viewport.
 * **Left + Right Mouse Button (Drag)**: Approach / recede from the tracked body's surface (drag down = move closer, up = pull back).
 * **Shift + Scroll Wheel**: Adjust Field of View (FOV) ($1.0^\circ - 120.0^\circ$).

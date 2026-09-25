@@ -1,6 +1,7 @@
 import math
 import imgui
 from engine.rendering.render_utils import format_flight_speed
+from engine.core.constants import MAX_FLIGHT_SPEED_AU_S
 
 def render_viewport_hud(app, bodies_data):
     """Render minimal floating HUD over the 3D viewport (camera info pill)."""
@@ -24,7 +25,7 @@ def render_viewport_hud(app, bodies_data):
             imgui.same_line()
             imgui.push_item_width(120)
             speed_log = math.log10(max(speed_val, 1e-13))
-            changed, new_log = imgui.slider_float("##fly_quick", speed_log, -13.0, 0.7, "")
+            changed, new_log = imgui.slider_float("##fly_quick", speed_log, -13.0, math.log10(MAX_FLIGHT_SPEED_AU_S), "")
             if changed:
                 app.camera["flight_speed"] = 10 ** new_log
             imgui.pop_item_width()

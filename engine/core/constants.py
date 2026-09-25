@@ -19,6 +19,7 @@ LY_TO_AU = 63241.07708426963  # 1 Light Year in AU (9,460,730,472,580.8 km / 149
 AU_TO_LY = 1.0 / LY_TO_AU
 LY_TO_KM = LY_TO_AU * AU_TO_KM  # ~9,460,730,472,580.8 km
 DEFAULT_LY_THRESHOLD_AU = 0.1 * LY_TO_AU  # Default threshold distance (0.1 ly ~ 6,324.1 AU)
+MAX_FLIGHT_SPEED_AU_S = 100.0 * LY_TO_AU  # 100 light-years per second
 # Sky-View LUT Resolution Presets (Width, Height)
 SKY_VIEW_RESOLUTIONS = [(192, 108), (256, 256), (384, 216)]
 SKY_VIEW_RES_LABELS = ["Low (192x108)", "Medium (256x256)", "High (384x216)"]
