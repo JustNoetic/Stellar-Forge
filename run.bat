@@ -41,7 +41,11 @@ echo [Stellar-Forge] Checking dependencies...
 python -c "import sys, subprocess; pkgs={'numpy':'numpy','scipy':'scipy','moderngl':'moderngl','glfw':'glfw','pyrr':'pyrr','imgui':'imgui','numba':'numba','spiceypy':'spiceypy','requests':'requests','OpenGL':'PyOpenGL','PIL':'Pillow'}; missing=[p for m,p in pkgs.items() if subprocess.run([sys.executable,'-c',f'import {m}'], capture_output=True).returncode]; sys.exit(len(missing))" >nul 2>&1
 if !errorlevel! neq 0 (
     echo [Stellar-Forge] Missing dependencies detected. Installing...
-    python -c "import sys, subprocess; pkgs={'numpy':'numpy','scipy':'scipy','moderngl':'moderngl','glfw':'glfw','pyrr':'pyrr','imgui':'imgui','numba':'numba','spiceypy':'spiceypy','requests':'requests','OpenGL':'PyOpenGL','PIL':'Pillow'}; missing=[p for m,p in pkgs.items() if subprocess.run([sys.executable,'-c',f'import {m}'], capture_output=True).returncode]; subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + missing)"
+    if exist requirements.txt (
+        pip install -r requirements.txt
+    ) else (
+        python -c "import sys, subprocess; pkgs={'numpy':'numpy','scipy':'scipy','moderngl':'moderngl','glfw':'glfw','pyrr':'pyrr','imgui':'imgui','numba':'numba','spiceypy':'spiceypy','requests':'requests','OpenGL':'PyOpenGL','PIL':'Pillow'}; missing=[p for m,p in pkgs.items() if subprocess.run([sys.executable,'-c',f'import {m}'], capture_output=True).returncode]; subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + missing)"
+    )
     if !errorlevel! neq 0 (
         echo [Stellar-Forge] Failed to install dependencies.
         pause

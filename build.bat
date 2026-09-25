@@ -7,6 +7,7 @@ cd /d "%~dp0"
 :: ── Release version — update this before each release ──────────────────────
 set VERSION=1.0.0
 set ZIP_NAME=Stellar-Forge-v%VERSION%-Windows.zip
+set ZIP_PATH=dist\%ZIP_NAME%
 
 echo ===================================================
 echo   Stellar-Forge Build Script  (v%VERSION%)
@@ -98,16 +99,17 @@ if exist "dist\Stellar-Forge\imgui.ini" (
 )
 
 :: ── 7. Zip the staged folder ─────────────────────────────────────────────────
-echo [Build] Creating %ZIP_NAME%...
-if exist "%ZIP_NAME%" del "%ZIP_NAME%"
+echo [Build] Creating %ZIP_PATH%...
+if not exist dist mkdir dist
+if exist "%ZIP_PATH%" del "%ZIP_PATH%"
 
 powershell -NoProfile -Command ^
-  "Compress-Archive -Path 'dist\Stellar-Forge-release\*' -DestinationPath '%ZIP_NAME%' -CompressionLevel Optimal"
+  "Compress-Archive -Path 'dist\Stellar-Forge-release\*' -DestinationPath '%ZIP_PATH%' -CompressionLevel Optimal"
 
 if !errorlevel! neq 0 (
     echo [Build] WARNING: Zip creation failed. Staged folder is at %STAGE_DIR%\.
 ) else (
-    echo [Build] Zip ready: %ZIP_NAME%
+    echo [Build] Zip ready: %ZIP_PATH%
     rmdir /s /q "%STAGE_DIR%"
 )
 
@@ -116,10 +118,10 @@ echo.
 echo ===================================================
 echo   Build complete!
 echo   Full build : dist\Stellar-Forge\Stellar-Forge.exe
-echo   Release zip: %ZIP_NAME%  (no SPICE kernels)
+echo   Release zip: %ZIP_PATH%  (no SPICE kernels)
 echo ===================================================
 echo.
-echo To publish: upload %ZIP_NAME% to a GitHub Release.
+echo To publish: upload %ZIP_PATH% to a GitHub Release.
 echo Users need a GPU with OpenGL 3.3+ — no Python required.
 echo.
 pause

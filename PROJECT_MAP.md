@@ -401,15 +401,11 @@ spectral classification.
 - `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
 
 ### 3.15 `scripts/`
-- `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
 - `accuracy_test.py` — `get_parent_center(body_name, parent_name)`, `main()`. Runs 1-yr forward integration vs JPL Horizons, prints RTN km error table.
-- `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
-- `calibrate_moon_albedo.py` — calibrates a diffuse texture so its cos(latitude)-weighted mean *linear* reflectance matches a real-world albedo target (default 0.12, the Moon's actual surface reflectance). Applies the scale in linear space via an exact 256-entry sRGB LUT (`--path`, `--target`, `--quality`). Originals are backed up under `textures_originals/` before overwriting.
+- `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
 - `fetch_gaia.py` — fetches a magnitude-limited Gaia DR3 subset (24 RA bands, TAP sync) plus a Hipparcos bright-star supplement (V < 2.5; Gaia photometry is saturation-broken for these, e.g. Sirius A), propagated to the J2016.0 epoch. Writes `data/gaia/stars.bin` (32-byte records: ra/dec/plx/pmra/pmdec/rv/G/BP-RP, f4).
-- `ringshine_benchmark.py` — Monte Carlo validation & shader comparison benchmark for ringshine (brute-force radiative-transfer ground truth vs the dynamic irradiance map bake).
-- `test_skyview_terminator.py` — `main`. GPU regression for the shared terminator (`common/sun_terminator.glsl`): bakes the real transmittance/MS/Sky-View LUTs in a standalone GL 4.6 context with app.py's exact SSBO layout, then checks quarter-phase limb twilight arcs brighten for a 14.3-deg stellar disc and a 5.7-deg refraction bend while day/night limb controls stay fixed; also compile-smokes atmo.vert+atmo.frag.
-- `test_gaia.py` — synthetic bake tests (frame transforms, proper-motion packing, intensity formula, vectorized blackbody RGB) + real-catalog checks (Alpha Cen/Proxima distance, Sirius photometry, Barnard's star drift, pack timing < 5 ms).
-- `test_spice.py` — minimal SPICE loader sanity check.
+- `fetch_artemis2_kernel.py` — fetches Artemis II trajectory state vectors from JPL Horizons and encodes them into a standard NAIF Type 9 SPK kernel (`data/kernels/artemis2.bsp`).
+- `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
 
 ---
 

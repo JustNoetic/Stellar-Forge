@@ -22,6 +22,7 @@ share/python-wheels/
 MANIFEST
 *.manifest
 *.spec
+!stellar_forge.spec
 pip-log.txt
 pip-delete-this-directory.txt
 htmlcov/
@@ -95,3 +96,5 @@ main_error.txt
 screenshits/
 screenshots/
 data/graphics_settings.json
+*.zip
+demos/
