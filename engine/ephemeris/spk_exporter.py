@@ -36,9 +36,12 @@ import spiceypy as spice
 
 from engine.core.constants import AU_TO_KM, SECONDS_PER_YEAR
 from engine.path_utils import get_external_path
+from engine.ephemeris.spice_manager import SpiceManager, SPICE_LOCK, get_spice_manager
 
 # App-wide display epoch: sim t=0 is shown as 2026-01-01 12:00 (see render_utils.format_sim_time)
 DISPLAY_EPOCH_DT = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+# Analytical ET (seconds past J2000 TDB) for 2026-01-01 12:00:00 UTC (9497 days + 69.184s)
+ANALYTICAL_2026_EPOCH_ET = 820540869.184
 
 SPK_FRAME = "ECLIPJ2000"
 SPK_CENTER_ID = 0                 # Solar System Barycenter (flat, barycenter-absolute)
@@ -64,12 +67,11 @@ def assign_spice_ids(body_names):
     """
     Map body names to NAIF IDs. Bodies matching a known SpiceManager.SPICE_BODIES name
     reuse the real NAIF ID (e.g. 'Earth' -> 399, 'Sun' -> 10). Unknown/fictional bodies
-    get unique negative IDs starting at FICTIONAL_ID_START, skipping any ID already in use.
+    or duplicate occurrences get unique negative IDs starting at FICTIONAL_ID_START,
+    skipping any ID already in use.
 
     Returns a list[int] parallel to body_names.
     """
-    from engine.ephemeris.spice_manager import SpiceManager
-
     name_to_id = {}
     for sp_id, info in SpiceManager.SPICE_BODIES.items():
         nm = info.get("name")
@@ -81,7 +83,7 @@ def assign_spice_ids(body_names):
     next_fictional = FICTIONAL_ID_START
     for name in body_names:
         sp_id = name_to_id.get(str(name).strip().upper())
-        if sp_id is None:
+        if sp_id is None or sp_id in ids:
             while next_fictional in used or next_fictional in ids:
                 next_fictional -= 1
             sp_id = next_fictional
@@ -94,25 +96,27 @@ def resolve_display_epoch_et(spice_manager=None):
     """
     Resolve the ET (seconds past J2000 TDB) of the app's display epoch (2026-01-01 12:00 UTC).
     Uses the already-loaded kernel pool when possible; otherwise furnishes just the
-    leapseconds kernel if it exists on disk. Falls back to 0.0 (J2000 anchor).
+    leapseconds kernel if it exists on disk. Falls back to ANALYTICAL_2026_EPOCH_ET
+    (820540869.184 s) to maintain the exact 2026 epoch anchor even without downloaded kernels.
     """
     try:
         if spice_manager is not None and getattr(spice_manager, "kernels_loaded", False):
             et = spice_manager.datetime_to_et(DISPLAY_EPOCH_DT)
-            if et:
+            if et is not None and et != 0.0:
                 return float(et)
     except Exception:
         pass
 
     try:
-        from engine.ephemeris.spice_manager import SpiceManager
-        tls_path = os.path.join(SpiceManager.KERNEL_DIR, "naif0012.tls")
-        if os.path.exists(tls_path):
-            spice.furnsh(tls_path)
-            return float(spice.str2et(DISPLAY_EPOCH_DT.strftime("%Y-%m-%dT%H:%M:%S")))
+        mgr = get_spice_manager() or SpiceManager()
+        tls_path = mgr.find_kernel_path("naif0012.tls")
+        if tls_path and os.path.exists(tls_path):
+            with SPICE_LOCK:
+                spice.furnsh(tls_path)
+                return float(spice.str2et(DISPLAY_EPOCH_DT.strftime("%Y-%m-%dT%H:%M:%S")))
     except Exception as e:
-        print(f"[SPK] Could not resolve display epoch ET ({e}); anchoring sim t=0 to J2000.")
-    return 0.0
+        print(f"[SPK] Could not resolve display epoch ET ({e}); anchoring sim t=0 to analytical 2026 epoch.")
+    return ANALYTICAL_2026_EPOCH_ET
 
 
 def _chebyshev_fit_records(epochs_s, pos_km, vel_kms, degree, tol_km):
@@ -139,19 +143,23 @@ def _chebyshev_fit_records(epochs_s, pos_km, vel_kms, degree, tol_km):
     t1 = float(epochs_s[-1])
     n_samp = len(epochs_s)
     recsize = 3 * (degree + 1)
+    duration_s = max(t1 - t0, 1e-6)
 
-    # Granule sizing: per-axis the stacked LS has 2*n_samples equations against
-    # (degree+1) coefficients. Start at ~42 samples/granule (~6x overdetermined) and
-    # double on tolerance failure; the cap keeps >= ~2.3x overdetermination to avoid
-    # the near-square regime where high-degree fits oscillate between nodes.
-    n_int = max(2, min(int(np.ceil(n_samp / 42.0)), CHEB_MAX_INTERVALS))
+    # Granule sizing: per-axis stacked LS has 2*n_samples equations against (degree+1)
+    # coefficients. Start with a physical baseline (~32 days per granule, matching JPL DE-series
+    # conventions) rather than scaling with sample count, and double adaptively until tol_km
+    # is met. n_cap maintains >= ~2.3x overdetermination on average.
     n_cap = max(2, min(int(n_samp / 16.0), CHEB_MAX_INTERVALS))
+    base_int = max(2, int(np.ceil(duration_s / (32.0 * 86400.0))))
+    n_int = max(2, min(base_int, n_cap))
 
     while True:
         intlen = (t1 - t0) / n_int
         half = 0.5 * intlen
         cdata = np.zeros((n_int, recsize))
         max_resid = 0.0
+        has_sparse_interval = False
+
         for j in range(n_int):
             a = t0 + j * intlen
             b = a + intlen
@@ -161,14 +169,50 @@ def _chebyshev_fit_records(epochs_s, pos_km, vel_kms, degree, tol_km):
                 m = (epochs_s >= a - 1e-6) & (epochs_s < b)
             t_ = epochs_s[m]
             p_ = pos_km[m]
-            if len(t_) == 0:
-                continue
             v_ = vel_kms[m]
-            tau = (2.0 * t_ - (a + b)) / (b - a)
+
+            min_pts = max(2, (degree + 1) // 2)
+            if len(t_) < min_pts:
+                has_sparse_interval = True
+                # Interpolate anchor points via cubic Hermite from surrounding samples
+                # to prevent all-zero records or underdetermined fits in data gaps
+                idx_before = np.where(epochs_s <= a)[0]
+                idx_after = np.where(epochs_s >= b)[0]
+                i_a = idx_before[-1] if len(idx_before) > 0 else 0
+                i_b = idx_after[0] if len(idx_after) > 0 else len(epochs_s) - 1
+
+                t_a_s, t_b_s = epochs_s[i_a], epochs_s[i_b]
+                p_a, p_b = pos_km[i_a], pos_km[i_b]
+                v_a, v_b = vel_kms[i_a], vel_kms[i_b]
+                dt_span = max(t_b_s - t_a_s, 1e-6)
+
+                k_nodes = np.arange(1, degree + 2)
+                tau_synth = np.cos((2 * k_nodes - 1) * np.pi / (2 * (degree + 1)))
+                t_synth = 0.5 * (b - a) * tau_synth + 0.5 * (a + b)
+
+                s = np.clip((t_synth - t_a_s) / dt_span, 0.0, 1.0)
+                s2 = s * s
+                s3 = s2 * s
+                h00 = 2.0 * s3 - 3.0 * s2 + 1.0
+                h10 = s3 - 2.0 * s2 + s
+                h01 = -2.0 * s3 + 3.0 * s2
+                h11 = s3 - s2
+
+                p_ = (h00[:, None] * p_a + h10[:, None] * dt_span * v_a +
+                      h01[:, None] * p_b + h11[:, None] * dt_span * v_b)
+                dh00 = (6.0 * s2 - 6.0 * s) / dt_span
+                dh10 = 3.0 * s2 - 4.0 * s + 1.0
+                dh01 = (-6.0 * s2 + 6.0 * s) / dt_span
+                dh11 = 3.0 * s2 - 2.0 * s
+                v_ = (dh00[:, None] * p_a + dh10[:, None] * v_a +
+                      dh01[:, None] * p_b + dh11[:, None] * v_b)
+                tau = tau_synth
+            else:
+                tau = (2.0 * t_ - (a + b)) / (b - a)
 
             # Chebyshev basis T_k(tau) and its tau-derivative via three-term recurrences
-            A = np.empty((len(t_), degree + 1))
-            D = np.zeros((len(t_), degree + 1))
+            A = np.empty((len(tau), degree + 1))
+            D = np.zeros((len(tau), degree + 1))
             A[:, 0] = 1.0
             if degree >= 1:
                 A[:, 1] = tau
@@ -190,9 +234,11 @@ def _chebyshev_fit_records(epochs_s, pos_km, vel_kms, degree, tol_km):
             rec[2 * (degree + 1):] = coef[:, 2]
 
         best = (cdata, intlen, n_int, max_resid)
-        if max_resid <= tol_km or n_int >= n_cap:
+        if (max_resid <= tol_km and not has_sparse_interval) or n_int >= n_cap:
             return best
-        n_int = min(n_int * 2, n_cap)
+        if n_int * 2 > n_cap:
+            return best
+        n_int = n_int * 2
 
 
 def _probe_chebyshev_vs_hermite(epochs_s, pos_km, vel_kms, cdata, intlen_s, degree,
@@ -309,29 +355,42 @@ def export_timeline_spk(filepath, timeline_raw, timeline_times, body_names, body
         if num_steps < 2:
             return False, "Fewer than 2 distinct epochs in timeline buffer", None
 
-    # Uniform decimation to max_states (always keep first & last)
-    stride = max(1, int(np.ceil(num_steps / max(2, max_states))))
-    sel = np.unique(np.concatenate((np.arange(0, num_steps, stride), [num_steps - 1])))
-    times = times[sel]
-    raw = raw[sel]
-    num_states = len(times)
+    # Decimation strategy:
+    # - Type 13 (Hermite): decimate states if num_steps > max_states to avoid giant files.
+    # - Type 2 (Chebyshev): keep all states for the least-squares fit (cap at 200,000 only
+    #   to avoid lstsq memory blowup), since Chebyshev output file size depends only on
+    #   intervals and degree, not on the input sample count.
+    if spk_type == SPK_TYPE_HERMITE:
+        stride = max(1, int(np.ceil(num_steps / max(2, max_states))))
+        sel = np.unique(np.concatenate((np.arange(0, num_steps, stride), [num_steps - 1])))
+        times = times[sel]
+        raw = raw[sel]
+        num_states = len(times)
+    else:
+        if num_steps > 200000:
+            stride = max(1, int(np.ceil(num_steps / 200000)))
+            sel = np.unique(np.concatenate((np.arange(0, num_steps, stride), [num_steps - 1])))
+            times = times[sel]
+            raw = raw[sel]
+        num_states = len(times)
+
+    if spk_type == SPK_TYPE_CHEBYSHEV:
+        degree = int(cheb_degree)
+        while degree > 3 and num_states < 6 * (degree + 1):
+            degree -= 1
+        if num_states < 2 * (degree + 1):
+            # Auto-fallback to Type 13 Hermite for tiny timelines rather than erroring
+            spk_type = SPK_TYPE_HERMITE
+            degree = 3 if num_states >= 2 else 1
 
     if spk_type == SPK_TYPE_HERMITE:
-        # Hermite degree must be odd with n >= (degree + 1) / 2
+        degree = int(degree)
         while degree > 1 and num_states < (degree + 1) // 2:
             degree -= 2
         if degree % 2 == 0:
             degree -= 1
         degree = max(1, degree)
-    elif spk_type == SPK_TYPE_CHEBYSHEV:
-        degree = int(cheb_degree)
-        # Need enough samples per interval to keep the fit overdetermined
-        while degree > 3 and num_states < 6 * (degree + 1):
-            degree -= 1
-        if num_states < 2 * (degree + 1):
-            return False, (f"Too few states ({num_states}) for a degree-{degree} Chebyshev fit; "
-                           f"use spk_type={SPK_TYPE_HERMITE} (Hermite) for tiny timelines"), None
-    else:
+    elif spk_type != SPK_TYPE_CHEBYSHEV:
         return False, f"Unsupported spk_type {spk_type} (use {SPK_TYPE_CHEBYSHEV} or {SPK_TYPE_HERMITE})", None
 
     # Unit conversion: AU -> km, AU/yr -> km/s
@@ -348,78 +407,81 @@ def export_timeline_spk(filepath, timeline_raw, timeline_times, body_names, body
             pass
 
     handle = None
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        handle = spice.spkopn(temp_path, "STELLAR_FORGE_TIMELINE", 0)
-        fit_stats = []
-        for i in range(num_bodies):
-            segid = _sanitize_segid(body_names[i])
-            if spk_type == SPK_TYPE_HERMITE:
-                states = raw[:, i, :] * scale
-                spice.spkw13(
-                    handle,
-                    int(body_ids[i]),           # Target body
-                    SPK_CENTER_ID,              # Center: system barycenter (flat layout)
-                    frame,
-                    float(epochs[0]),
-                    float(epochs[-1]),
-                    segid,
-                    int(degree),
-                    num_states,
-                    states,
-                    epochs,
-                )
-                fit_stats.append(None)
-            else:
-                pos_km = raw[:, i, 0:3] * AU_TO_KM
-                vel_kms = raw[:, i, 3:6] * vel_scale
-                cdata, intlen_s, n_int, resid = _chebyshev_fit_records(
-                    epochs, pos_km, vel_kms, int(degree), float(cheb_tol_km))
-                probe_err = _probe_chebyshev_vs_hermite(
-                    epochs, pos_km, vel_kms, cdata, intlen_s, int(degree))
-                spice.spkw02(
-                    handle,
-                    int(body_ids[i]),
-                    SPK_CENTER_ID,
-                    frame,
-                    float(epochs[0]),
-                    float(epochs[-1]),
-                    segid,
-                    float(intlen_s),
-                    int(n_int),
-                    int(degree),
-                    cdata.reshape(-1),
-                    float(epochs[0]),           # btime: begin of first logical record
-                )
-                fit_stats.append({"intervals": int(n_int),
-                                  "interval_seconds": float(intlen_s),
-                                  "max_fit_residual_km": float(resid),
-                                  "probe_max_error_km": float(probe_err)})
-            if progress_callback:
-                progress_callback((i + 1) / num_bodies, f"Encoded {body_names[i]}")
-        spice.spkcls(handle)
-        handle = None
+    with SPICE_LOCK:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+            handle = spice.spkopn(temp_path, "STELLAR_FORGE_TIMELINE", 0)
+            fit_stats = []
+            for i in range(num_bodies):
+                segid = _sanitize_segid(body_names[i])
+                if spk_type == SPK_TYPE_HERMITE:
+                    states = raw[:, i, :] * scale
+                    spice.spkw13(
+                        handle,
+                        int(body_ids[i]),           # Target body
+                        SPK_CENTER_ID,              # Center: system barycenter (flat layout)
+                        frame,
+                        float(epochs[0]),
+                        float(epochs[-1]),
+                        segid,
+                        int(degree),
+                        num_states,
+                        states,
+                        epochs,
+                    )
+                    fit_stats.append(None)
+                else:
+                    pos_km = raw[:, i, 0:3] * AU_TO_KM
+                    vel_kms = raw[:, i, 3:6] * vel_scale
+                    cdata, intlen_s, n_int, resid = _chebyshev_fit_records(
+                        epochs, pos_km, vel_kms, int(degree), float(cheb_tol_km))
+                    probe_err = _probe_chebyshev_vs_hermite(
+                        epochs, pos_km, vel_kms, cdata, intlen_s, int(degree))
+                    spice.spkw02(
+                        handle,
+                        int(body_ids[i]),
+                        SPK_CENTER_ID,
+                        frame,
+                        float(epochs[0]),
+                        float(epochs[-1]),
+                        segid,
+                        float(intlen_s),
+                        int(n_int),
+                        int(degree),
+                        cdata.reshape(-1),
+                        float(epochs[0]),           # btime: begin of first logical record
+                    )
+                    fit_stats.append({"intervals": int(n_int),
+                                      "interval_seconds": float(intlen_s),
+                                      "max_fit_residual_km": float(resid),
+                                      "probe_max_error_km": float(probe_err)})
+                if progress_callback:
+                    progress_callback((i + 1) / num_bodies, f"Encoded {body_names[i]}")
+            spice.spkcls(handle)
+            handle = None
 
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except OSError:
-                pass
-        os.replace(temp_path, filepath)
-    except Exception as e:
-        if handle is not None:
-            try:
-                spice.spkcls(handle)
-            except Exception:
-                pass
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        return False, f"Failed to encode SPK kernel: {e}", None
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+            os.replace(temp_path, filepath)
+        except Exception as e:
+            if handle is not None:
+                try:
+                    spice.spkcls(handle)
+                except Exception:
+                    pass
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            return False, f"Failed to encode SPK kernel: {e}", None
 
     # JSON sidecar: epoch anchor + ID mapping (for future re-import / replay)
+    start_utc_dt = DISPLAY_EPOCH_DT + datetime.timedelta(seconds=float(times[0]) * SECONDS_PER_YEAR)
+    end_utc_dt = DISPLAY_EPOCH_DT + datetime.timedelta(seconds=float(times[-1]) * SECONDS_PER_YEAR)
     sidecar = {
         "generator": "Stellar-Forge spk_exporter",
         "spk_type": int(spk_type),
@@ -430,6 +492,8 @@ def export_timeline_spk(filepath, timeline_raw, timeline_times, body_names, body
         "sim_time_relation": "et = epoch_et + sim_t_years * SECONDS_PER_YEAR",
         "states_per_body": int(num_states),
         "time_span_years": [float(times[0]), float(times[-1])],
+        "time_span_et": [float(epochs[0]), float(epochs[-1])],
+        "time_span_utc": [start_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), end_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")],
         "bodies": [{"name": str(n), "spice_id": int(i)} for n, i in zip(body_names, body_ids)],
     }
     if spk_type == SPK_TYPE_HERMITE:
@@ -497,9 +561,9 @@ def export_timeline_spk_async(app, bodies_data):
 
     sys_name = re.sub(r'[\\/:*?"<>|]+', "_", getattr(app, "active_system_name", "system")).strip() or "system"
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    exports_dir = get_external_path("exports")
-    os.makedirs(exports_dir, exist_ok=True)
-    filepath = os.path.join(exports_dir, f"{sys_name}_timeline_{stamp}.bsp")
+    ephem_dir = get_external_path("exports", "ephemeris", sys_name)
+    os.makedirs(ephem_dir, exist_ok=True)
+    filepath = os.path.join(ephem_dir, f"{sys_name}_timeline_{stamp}.bsp")
 
     app._spk_exporting = True
     app._screenshot_toast = ("Exporting SPK kernel...", time.time())
@@ -511,7 +575,8 @@ def export_timeline_spk_async(app, bodies_data):
                 metadata={"system_name": getattr(app, "active_system_name", "system")},
             )
             if ok:
-                app._screenshot_toast = (f"Saved: exports/{os.path.basename(out)} ({msg})", time.time())
+                display_rel = f"exports/ephemeris/{sys_name}/{os.path.basename(out)}"
+                app._screenshot_toast = (f"Saved: {display_rel} ({msg})", time.time())
             else:
                 app._screenshot_toast = (f"SPK export failed: {msg}", time.time())
         except Exception as e:

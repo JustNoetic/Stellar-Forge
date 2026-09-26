@@ -1226,10 +1226,14 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                 
                 if "ephemeris_enter" in switch_req:
                     shared_state["ephemeris_enter"] = switch_req["ephemeris_enter"]
+                if "generic_ephemeris" in switch_req:
+                    shared_state["generic_ephemeris"] = switch_req["generic_ephemeris"]
                 if "ephemeris_lines" in switch_req:
                     shared_state["ephemeris_orbit_lines"] = switch_req["ephemeris_lines"]
                 if "ephemeris_exit" in switch_req:
                     shared_state["ephemeris_exit"] = switch_req["ephemeris_exit"]
+                    if switch_req["ephemeris_exit"]:
+                        shared_state["generic_ephemeris"] = False
                 
             was_keplerian = False
             kepler_entry_sim_copy = None

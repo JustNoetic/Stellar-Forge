@@ -328,7 +328,7 @@ Stellar-Forge includes a rich, multi-tabbed **Body Inspector** window allowing r
 ### System Comparison & Timeline
 - **System Comparison**: A toggle spawns a second `Simulation` (`sim_cmp`) backed by its own `shared_state_cmp`. Both systems render into the same viewport with independent time multipliers; the inspector exposes a **System Comparison** collapsing header to switch which side is being inspected/tracked.
 - **Timeline Recording & Scrubbing**: While a comparison is active (or standalone), the engine can record the primary system's per-step `(pos, vel)` into a `timeline_pos` / `timeline_vel` buffer. A top-bar **Timeline Navigation** control then supports Play/Pause playback, a scrubber slider, and a configurable playback speed — letting you replay long integrations or close encounters frame-by-frame. Recording density is **auto-scaled to the fastest orbit in the system** (~100 samples/orbit by default, overridable via a resolution selector in the Render Timeline modal) so that exports stay well-sampled even for century-spanning captures.
-- **Timeline → SPICE Kernel Export**: From the timeline scrubber, an **Export .bsp** button encodes the recorded full-precision trajectory (including GR precession and J2/J4 effects) into a standard NASA NAIF **Type 2 Chebyshev SPK kernel** (`exports/<System>_timeline_<timestamp>.bsp`) — the same polynomial representation JPL uses for the DE planetary ephemerides, with tolerance-driven interval refinement and a built-in under-sampling detector (Chebyshev-vs-Hermite midpoint probe) that warns if the recording was too sparse. A JSON sidecar records the epoch anchor, fit residuals, probe errors, and body→NAIF ID mapping — usable in any SPICE-compatible tool.
+- **Timeline → SPICE Kernel Export**: From the timeline scrubber, an **Export .bsp** button encodes the recorded full-precision trajectory (including GR precession and J2/J4 effects) into a standard NASA NAIF **Type 2 Chebyshev SPK kernel** (`exports/ephemeris/<System>/<System>_timeline_<timestamp>.bsp`) — the same polynomial representation JPL uses for the DE planetary ephemerides, with tolerance-driven interval refinement and a built-in under-sampling detector (Chebyshev-vs-Hermite midpoint probe) that warns if the recording was too sparse. A JSON sidecar records the epoch anchor, fit residuals, probe errors, and body→NAIF ID mapping — usable in any SPICE-compatible tool.
 
 ### System & Body Editor
 - **Create New System**: A modal wizard (`show_create_system`) derives a host star from `StarCalculator.forge` (mass/metallicity/age/rotation/inclination) and calls `SystemManager.create_new_system_from_props` to write a new preset under `data/systems/`.
@@ -460,8 +460,14 @@ To update system initial states with live NASA JPL Horizons ephemerides:
 python scripts/fetch_horizons.py
 ```
 
-### NAIF SPICE Kernels
-The engine automatically downloads essential kernels (`de440s.bsp`, `pck00010.tpc`, `naif0012.tls`) into `data/kernels/` when switching to Ephemeris Mode via the UI, with progress shown in the **Ephemeris Setup** modal. Additional planetary satellite kernels (e.g. `jup348.bsp`, `sat455.bsp`, `nep104.bsp`, `ura111.bsp`, `plu060.bsp`, `mar099s.bsp`, `codes_300ast_20100725.bsp`) can be selected and downloaded directly from the same modal. Ephemeris states can be **exported to an N-Body system JSON** ("Export to N-Body System") for offline integration with the IAS15 or Keplerian engines.
+### NAIF SPICE Kernels & Generic Ephemeris Viewer
+- **Automatic Kernel Setup**: The engine automatically downloads essential kernels (`de440s.bsp`, `pck00010.tpc`, `naif0012.tls`) into `data/kernels/` when switching to Ephemeris Mode via the UI, with progress shown in the **Ephemeris Setup** modal. Additional satellite kernels can be toggled on demand.
+- **Timeline Export to SPICE (.bsp)**: Rendered timelines can be encoded directly into official NASA SPICE Chebyshev (Type 2) or Hermite (Type 13) SPK kernels (`.bsp` + `.bsp.json` sidecar) via the **Export .bsp** button in the Time Transport HUD. Exported files are cleanly organized under `exports/ephemeris/<system_name>/`.
+- **Generic SPICE BSP Viewer & Playback**: Any `.bsp` file can be opened directly via **Tools → Import Ephemeris Kernel (.bsp)...** (or **Systems → Import Ephemeris Kernel (.bsp)...**). The viewer:
+  - Scans both `exports/ephemeris/` and `data/kernels/`, or accepts arbitrary file paths.
+  - Automatically inspects the kernel: detects target NAIF IDs, resolves names, determines reference centers, and parses UTC time boundaries.
+  - Generates 3D trajectory polylines directly from SPICE (`spkgeo`) — rendering accurate mission and orbital tracks without requiring mass or Keplerian calculations.
+  - Enables smooth real-time 3D playback, time scrubbing, camera tracking (press `F`), and exact UTC date display.
 
 ---
 

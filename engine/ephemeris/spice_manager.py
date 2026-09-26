@@ -1,10 +1,17 @@
 import os
+import json
 import urllib.request
 import spiceypy as spice
 import numpy as np
 import threading
 
 from engine.path_utils import get_external_path
+
+SPICE_LOCK = threading.Lock()
+
+def get_spice_manager():
+    """Returns the active SpiceManager instance if one exists."""
+    return getattr(SpiceManager, "_instance", None)
 
 class SpiceManager:
     """
@@ -13,6 +20,8 @@ class SpiceManager:
     """
     
     KERNEL_DIR = get_external_path("data", "kernels")
+    DEFAULT_KERNEL_DIR = get_external_path("data", "kernels", "default")
+    ADDITIONAL_KERNEL_DIR = get_external_path("data", "kernels", "additional")
     
     # Essential NAIF kernels for a basic Solar System ephemeris
     DEFAULT_KERNELS = {
@@ -33,15 +42,13 @@ class SpiceManager:
         "nep104.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep104.bsp",
         "nep105.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep105.bsp",
         "plu060.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/plu060.bsp",
-        "mar099s.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp",
-        "artemis2.bsp": "HORIZONS_API"
+        "mar099s.bsp": "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp"
     }
     
     KERNEL_DESCRIPTIONS = {
         "naif0012.tls": "Leapseconds (Required)",
         "pck00010.tpc": "Planetary Constants (Required)",
         "de440s.bsp": "Planetary Ephemeris (Required)",
-        "artemis2.bsp": "Artemis II Lunar Flyby (Orion) [144KB]",
         "jup347.bsp": "Irregular Jupiter Moons (879MB)",
         "jup348.bsp": "Irregular Jupiter Moons (57MB)",
         "jup349.bsp": "Irregular Jupiter Moons (93MB)",
@@ -80,6 +87,17 @@ class SpiceManager:
             "is_spacecraft": True,
             "mission_start_utc": "2026-04-02 02:00:00",
             "mission_end_utc": "2026-04-10 23:50:00"
+        },
+        -82: {
+            "name": "Cassini",
+            "type": "Spacecraft",
+            "color": "#e0a040",
+            "radius_km": 0.010,
+            "mass_kg": 5712.0,
+            "parentId": "Saturn",
+            "is_spacecraft": True,
+            "mission_start_utc": "2004-07-01 14:00:00",
+            "mission_end_utc": "2017-09-15 09:58:00"
         },
         499: {"name": "Mars", "type": "Planet", "color": "#c1440e", "radius_km": 3389.5, "mass_kg": 6.4171e23},
         401: {"name": "Phobos", "type": "Moon", "color": "#a0a0a0", "radius_km": 11.26, "mass_kg": 1.0659e16},
@@ -133,8 +151,12 @@ class SpiceManager:
     SEC_TO_YR = 86400.0 * 365.25
 
     def __init__(self):
+        SpiceManager._instance = self
         self._ensure_dirs()
         self.kernels_loaded = False
+        self.active_epoch_et = None
+        self.active_ephem_et_range = None
+        self.active_ephem_bsp = None
         self.download_progress = 0.0
         self.download_status = ""
         self.is_downloading = False
@@ -178,8 +200,7 @@ class SpiceManager:
                 with open(self.settings_path, 'r') as f:
                     saved = json.load(f)
                     for k, v in saved.items():
-                        if k in self.enabled_kernels:
-                            self.enabled_kernels[k] = v
+                        self.enabled_kernels[k] = v
                 self.settings_initialized = True
             except:
                 pass
@@ -196,6 +217,81 @@ class SpiceManager:
 
     def _ensure_dirs(self):
         os.makedirs(self.KERNEL_DIR, exist_ok=True)
+        os.makedirs(self.DEFAULT_KERNEL_DIR, exist_ok=True)
+        os.makedirs(self.ADDITIONAL_KERNEL_DIR, exist_ok=True)
+
+    def find_kernel_path(self, filename):
+        """
+        Locates a kernel file by checking:
+        1. data/kernels/default/<filename>
+        2. data/kernels/additional/<filename>
+        3. data/kernels/<filename>
+        Returns the absolute path if found, or None.
+        """
+        candidates = [
+            os.path.join(self.DEFAULT_KERNEL_DIR, filename),
+            os.path.join(self.ADDITIONAL_KERNEL_DIR, filename),
+            os.path.join(self.KERNEL_DIR, filename)
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return os.path.abspath(c)
+        return None
+
+    def list_additional_kernels(self):
+        """
+        Scans data/kernels/additional/ and data/kernels/ for any .bsp files
+        not in DEFAULT_KERNELS.
+        Returns a list of dicts: [{'name': fname, 'path': full_p, 'size_kb': size_kb, 'enabled': bool}].
+        """
+        results = []
+        seen = set()
+
+        search_dirs = [self.ADDITIONAL_KERNEL_DIR, self.KERNEL_DIR]
+        for d in search_dirs:
+            if not os.path.exists(d):
+                continue
+            for item in sorted(os.listdir(d)):
+                full_p = os.path.join(d, item)
+                if not os.path.isfile(full_p):
+                    continue
+                if not item.lower().endswith(".bsp"):
+                    continue
+                if item in self.DEFAULT_KERNELS:
+                    continue
+                if item.endswith(".part"):
+                    continue
+                if item in seen:
+                    continue
+                seen.add(item)
+                size_kb = os.path.getsize(full_p) / 1024.0
+                results.append({
+                    "name": item,
+                    "path": os.path.abspath(full_p),
+                    "size_kb": size_kb,
+                    "enabled": self.enabled_kernels.get(item, False)
+                })
+        return results
+
+    def add_additional_kernel(self, source_path, copy_file=True):
+        """
+        Adds an external .bsp kernel file into data/kernels/additional/ and marks it as enabled.
+        Returns the destination path.
+        """
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Kernel file not found: {source_path}")
+        
+        fname = os.path.basename(source_path)
+        dest_path = os.path.join(self.ADDITIONAL_KERNEL_DIR, fname)
+        
+        if copy_file and os.path.abspath(source_path) != os.path.abspath(dest_path):
+            import shutil
+            shutil.copy2(source_path, dest_path)
+            
+        self.enabled_kernels[fname] = True
+        self.save_settings()
+        self.kernels_loaded = False
+        return dest_path
 
     def check_missing_kernels(self):
         """Returns a list of kernel filenames that need to be downloaded."""
@@ -203,8 +299,8 @@ class SpiceManager:
         for filename in self.DEFAULT_KERNELS.keys():
             if not self.enabled_kernels.get(filename, False):
                 continue
-            path = os.path.join(self.KERNEL_DIR, filename)
-            if not os.path.exists(path):
+            path = self.find_kernel_path(filename)
+            if not path or not os.path.exists(path):
                 missing.append(filename)
         return missing
 
@@ -241,7 +337,7 @@ class SpiceManager:
                     break
                     
                 url = self.DEFAULT_KERNELS[filename]
-                path = os.path.join(self.KERNEL_DIR, filename)
+                path = os.path.join(self.DEFAULT_KERNEL_DIR, filename)
                 part_path = path + ".part"
                 self.current_download_file = filename
                 self.download_status = f"Downloading {filename} ({i+1}/{total_files})..."
@@ -345,54 +441,85 @@ class SpiceManager:
         threading.Thread(target=_download_thread, daemon=True).start()
 
     def load_kernels(self, force=False):
-        """Furnsh all available kernels in the KERNEL_DIR."""
+        """Furnsh all available enabled kernels across default, additional, and root kernel dirs."""
         if self.kernels_loaded and not force:
             return
             
-        try:
-            # Clear any previously loaded kernels
-            spice.kclear()
-            
-            for k_name in self.DEFAULT_KERNELS.keys():
-                if not self.enabled_kernels.get(k_name, False):
-                    continue
-                k_path = os.path.join(self.KERNEL_DIR, k_name)
-                if os.path.exists(k_path):
-                    spice.furnsh(k_path)
-            self.kernels_loaded = True
-            
-            # Discover bodies that aren't hardcoded
-            self._discover_bodies()
+        with SPICE_LOCK:
+            try:
+                # Clear any previously loaded kernels
+                spice.kclear()
                 
-        except Exception as e:
-            print(f"[SPICE] Error loading kernels: {e}")
-            self.kernels_loaded = False
+                loaded_paths = set()
+
+                # 1. Load enabled default kernels
+                for k_name in self.DEFAULT_KERNELS.keys():
+                    if not self.enabled_kernels.get(k_name, False):
+                        continue
+                    k_path = self.find_kernel_path(k_name)
+                    if k_path and os.path.exists(k_path) and k_path not in loaded_paths:
+                        spice.furnsh(k_path)
+                        loaded_paths.add(k_path)
+                
+                # 2. Load enabled additional kernels
+                for k_name, is_enabled in self.enabled_kernels.items():
+                    if not is_enabled or k_name in self.DEFAULT_KERNELS:
+                        continue
+                    k_path = self.find_kernel_path(k_name)
+                    if k_path and os.path.exists(k_path) and k_path not in loaded_paths:
+                        spice.furnsh(k_path)
+                        loaded_paths.add(k_path)
+
+                self.kernels_loaded = True
+                
+                # Discover bodies that aren't hardcoded
+                self._discover_bodies()
+                    
+            except Exception as e:
+                print(f"[SPICE] Error loading kernels: {e}")
+                self.kernels_loaded = False
 
     def _discover_bodies(self):
         """Scans all loaded SPK kernels and adds any missing bodies to SPICE_BODIES."""
         if not self.kernels_loaded:
             return
             
-        for k_name in self.DEFAULT_KERNELS.keys():
-            if not self.enabled_kernels.get(k_name, False):
+        scanned_paths = set()
+        kernels_to_scan = []
+        for k_name, is_enabled in self.enabled_kernels.items():
+            if not is_enabled:
                 continue
             if not k_name.endswith('.bsp'):
                 continue
+            k_path = self.find_kernel_path(k_name)
+            if k_path and os.path.exists(k_path) and k_path not in scanned_paths:
+                kernels_to_scan.append((k_name, k_path))
+                scanned_paths.add(k_path)
                 
-            k_path = os.path.join(self.KERNEL_DIR, k_name)
-            if not os.path.exists(k_path):
-                continue
-                
+        for k_name, k_path in kernels_to_scan:
             try:
                 cell = spice.spkobj(k_path)
                 for spid in cell:
                     # Skip inner barycenters and outer CoMs from being added as separate bodies
-                    if spid in self.SPICE_BODIES or spid in [1, 2, 3, 4, 599, 699, 799, 899, 999]:
+                    if spid in [1, 2, 3, 4, 599, 699, 799, 899, 999]:
+                        continue
+                        
+                    # If already in SPICE_BODIES, ensure mission range is populated if spacecraft
+                    if spid in self.SPICE_BODIES:
+                        if self.SPICE_BODIES[spid].get("is_spacecraft") and "mission_start_utc" not in self.SPICE_BODIES[spid]:
+                            try:
+                                cov = spice.spkcov(k_path, spid)
+                                if len(cov) >= 2:
+                                    self.SPICE_BODIES[spid]["mission_start_utc"] = spice.et2utc(cov[0], 'ISOC', 0)
+                                    self.SPICE_BODIES[spid]["mission_end_utc"] = spice.et2utc(cov[1], 'ISOC', 0)
+                            except Exception:
+                                pass
                         continue
                         
                     try:
                         name = spice.bodc2n(spid)
-                    except:
+                        name = name.title() if name.isupper() else name
+                    except Exception:
                         if spid < 0:
                             name = f"Spacecraft ({spid})"
                         else:
@@ -402,26 +529,70 @@ class SpiceManager:
                             elif prefix == '7': name = f"Uranian Moon ({spid})"
                             elif prefix == '8': name = f"Neptunian Moon ({spid})"
                             else: name = f"Asteroid ({spid})"
+
+                    mission_start = None
+                    mission_end = None
+                    try:
+                        cov = spice.spkcov(k_path, spid)
+                        if len(cov) >= 2:
+                            mission_start = spice.et2utc(cov[0], 'ISOC', 0)
+                            mission_end = spice.et2utc(cov[1], 'ISOC', 0)
+                    except Exception:
+                        pass
+
+                    parent_name = "Sun"
+                    if spid < 0 and mission_start:
+                        # Auto-detect parent body from proximity at mission start
+                        try:
+                            start_et = spice.str2et(mission_start)
+                            st_body, _ = spice.spkgeo(spid, start_et, 'ECLIPJ2000', 0)
+                            pos_b = np.array(st_body[:3])
+                            best_p = "Sun"
+                            min_d = float("inf")
+                            for pid, pname in [(399, "Earth"), (6, "Saturn"), (5, "Jupiter"), (499, "Mars"), (7, "Uranus"), (8, "Neptune")]:
+                                try:
+                                    st_p, _ = spice.spkgeo(pid, start_et, 'ECLIPJ2000', 0)
+                                    d = np.linalg.norm(pos_b - np.array(st_p[:3]))
+                                    if d < 5e7 and d < min_d:  # within ~0.33 AU
+                                        min_d = d
+                                        best_p = pname
+                                except Exception:
+                                    pass
+                            parent_name = best_p
+                        except Exception:
+                            pass
                         
-                    self.SPICE_BODIES[spid] = {
+                    body_entry = {
                         "name": name,
                         "type": "Spacecraft" if spid < 0 else "Moon",
-                        "color": "#00ffff" if spid < 0 else "#a0a0a0",
+                        "color": "#79c0ff" if spid < 0 else "#a0a0a0",
                         "radius_km": 0.010 if spid < 0 else 10.0,
                         "mass_kg": 26000.0 if spid < 0 else 1e15,
-                        "is_spacecraft": (spid < 0)
+                        "is_spacecraft": (spid < 0),
+                        "parentId": parent_name
                     }
+                    if mission_start:
+                        body_entry["mission_start_utc"] = mission_start
+                        body_entry["mission_end_utc"] = mission_end
+                        
+                    self.SPICE_BODIES[spid] = body_entry
             except Exception as e:
-                print(f"Error discovering bodies in {k_name}: {e}")
+                print(f"[SPICE] Error discovering bodies in {k_name}: {e}")
 
     def datetime_to_et(self, dt):
-        """Convert a Python datetime to SPICE Ephemeris Time (ET)."""
+        """Convert a Python datetime or ISO string to SPICE Ephemeris Time (ET)."""
         if not self.kernels_loaded:
             return 0.0
+        if isinstance(dt, str):
+            try:
+                return float(spice.str2et(dt))
+            except Exception as e:
+                print(f"[SPICE] Error parsing time string {dt}: {e}")
+                return 0.0
         # Convert datetime to ISO string compatible with SPICE
         iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
         try:
-            return spice.str2et(iso_str)
+            return float(spice.str2et(iso_str))
         except Exception as e:
             print(f"[SPICE] Error parsing time {iso_str}: {e}")
             return 0.0
@@ -434,19 +605,20 @@ class SpiceManager:
         if not self.kernels_loaded:
             return None
             
-        try:
-            # SPICE spkgeo returns (state, light_time). State is [x, y, z, vx, vy, vz] in km and km/s.
-            # Reference frame 'ECLIPJ2000', observer is Solar System Barycenter (0).
-            state, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', 0)
-        except Exception as e:
-            # Fallback to barycenter for planets if specific body fails (e.g. Mars 499 kernel expires)
-            if body_id > 100 and body_id < 1000 and body_id % 100 == 99:
-                try:
-                    state, _ = spice.spkgeo(body_id // 100, et, 'ECLIPJ2000', 0)
-                except:
+        with SPICE_LOCK:
+            try:
+                # SPICE spkgeo returns (state, light_time). State is [x, y, z, vx, vy, vz] in km and km/s.
+                # Reference frame 'ECLIPJ2000', observer is Solar System Barycenter (0).
+                state, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', 0)
+            except Exception as e:
+                # Fallback to barycenter for planets if specific body fails (e.g. Mars 499 kernel expires)
+                if body_id > 100 and body_id < 1000 and body_id % 100 == 99:
+                    try:
+                        state, _ = spice.spkgeo(body_id // 100, et, 'ECLIPJ2000', 0)
+                    except:
+                        return None
+                else:
                     return None
-            else:
-                return None
         
         # SPICE standard frame is J2000 (equatorial), but we requested ECLIPJ2000. 
         # If the application uses ecliptic or a different mapping (like y-up),
@@ -499,6 +671,9 @@ class SpiceManager:
         """Precomputes a list of SPICE IDs for a list of bodies_data dicts."""
         mapping = []
         for body in bodies_data:
+            if "spice_id" in body and body["spice_id"] is not None:
+                mapping.append(int(body["spice_id"]))
+                continue
             b_name = body["name"]
             found_id = None
             for sp_id, info in self.SPICE_BODIES.items():
@@ -534,33 +709,34 @@ class SpiceManager:
         if valid_out is not None:
             max_idx = min(max_idx, valid_out.shape[0])
             
-        for idx in range(max_idx):
-            sp_id = mapping[idx]
-            if sp_id is not None:
-                try:
-                    state, _ = spice.spkgeo(sp_id, et, 'ECLIPJ2000', 0)
-                except:
-                    # Fallback to barycenter if needed (e.g. Mars 499 fails past 2050)
-                    if sp_id > 100 and sp_id < 1000 and sp_id % 100 == 99:
-                        try:
-                            state, _ = spice.spkgeo(sp_id // 100, et, 'ECLIPJ2000', 0)
-                        except:
+        with SPICE_LOCK:
+            for idx in range(max_idx):
+                sp_id = mapping[idx]
+                if sp_id is not None:
+                    try:
+                        state, _ = spice.spkgeo(sp_id, et, 'ECLIPJ2000', 0)
+                    except:
+                        # Fallback to barycenter if needed (e.g. Mars 499 fails past 2050)
+                        if sp_id > 100 and sp_id < 1000 and sp_id % 100 == 99:
+                            try:
+                                state, _ = spice.spkgeo(sp_id // 100, et, 'ECLIPJ2000', 0)
+                            except:
+                                if valid_out is not None: valid_out[idx] = False
+                                continue
+                        else:
                             if valid_out is not None: valid_out[idx] = False
                             continue
-                    else:
-                        if valid_out is not None: valid_out[idx] = False
-                        continue
-                
-                if valid_out is not None:
-                    valid_out[idx] = True
-                
-                # Swap coordinates: X=x, Y=z, Z=-y
-                pos_out[idx, 0] = state[0] * km_to_au
-                pos_out[idx, 1] = state[2] * km_to_au
-                pos_out[idx, 2] = -state[1] * km_to_au
-                vel_out[idx, 0] = state[3] * km_to_au * sec_to_yr
-                vel_out[idx, 1] = state[5] * km_to_au * sec_to_yr
-                vel_out[idx, 2] = -state[4] * km_to_au * sec_to_yr
+                    
+                    if valid_out is not None:
+                        valid_out[idx] = True
+                    
+                    # Swap coordinates: X=x, Y=z, Z=-y
+                    pos_out[idx, 0] = state[0] * km_to_au
+                    pos_out[idx, 1] = state[2] * km_to_au
+                    pos_out[idx, 2] = -state[1] * km_to_au
+                    vel_out[idx, 0] = state[3] * km_to_au * sec_to_yr
+                    vel_out[idx, 1] = state[5] * km_to_au * sec_to_yr
+                    vel_out[idx, 2] = -state[4] * km_to_au * sec_to_yr
 
     def _get_body_properties(self, body_id, fallback_mass_kg, fallback_radius_km):
         """Extracts exact GM and radius from SPICE PCK kernels if available."""
@@ -664,6 +840,7 @@ class SpiceManager:
                         pos_rel = matching_state["state"]["pos"]
                         vel_rel = matching_state["state"]["vel"]
                                 
+                    body_copy["spice_id"] = matching_id
                     body_copy["sv"] = {
                         "x": pos_rel[0], "y": pos_rel[1], "z": pos_rel[2],
                         "vx": vel_rel[0], "vy": vel_rel[1], "vz": vel_rel[2]
@@ -679,6 +856,7 @@ class SpiceManager:
                 bodies_data.append({
                     "name": sun_data["info"]["name"],
                     "type": sun_data["info"]["type"],
+                    "spice_id": 10,
                     "m": m_sun,
                     "r": r_sun,
                     "color": sun_data["info"]["color"],
@@ -725,6 +903,7 @@ class SpiceManager:
                 body_dict = {
                     "name": data["info"]["name"],
                     "type": data["info"]["type"],
+                    "spice_id": body_id,
                     "m": m_sun,
                     "r": r_sun,
                     "color": data["info"]["color"],
@@ -746,6 +925,7 @@ class SpiceManager:
             bodies_data.append({
                 "name": sun_data["info"]["name"],
                 "type": sun_data["info"]["type"],
+                "spice_id": 10,
                 "m": m_sun,
                 "r": r_sun,
                 "color": sun_data["info"]["color"],
@@ -791,6 +971,7 @@ class SpiceManager:
             body_dict = {
                 "name": data["info"]["name"],
                 "type": data["info"]["type"],
+                "spice_id": body_id,
                 "m": m_sun,
                 "r": r_sun,
                 "color": data["info"]["color"],
@@ -806,30 +987,436 @@ class SpiceManager:
             
         return bodies_data
 
-    def get_trajectory_polyline(self, body_id=-1024, observer_id=399, num_samples=1000):
+    def get_trajectory_polyline(self, body_id=-1024, observer_id=None, num_samples=1000):
         """
-        Samples the 3D trajectory of a body relative to an observer (e.g. Earth 399)
-        across its mission duration. Returns an (N, 3) float32 numpy array in engine render frame:
+        Samples the 3D trajectory of a body relative to an observer across its mission duration.
+        Returns an (N, 3) float32 numpy array in engine render frame:
         X = x * KM_TO_AU, Y = z * KM_TO_AU, Z = -y * KM_TO_AU.
         """
         if not self.kernels_loaded:
             return None
         info = self.SPICE_BODIES.get(body_id)
-        if not info or "mission_start_utc" not in info:
+        if not info:
             return None
-        try:
-            et_start = spice.str2et(info["mission_start_utc"])
-            et_end = spice.str2et(info["mission_end_utc"])
-            et_samples = np.linspace(et_start, et_end, num_samples)
-            points = np.empty((num_samples, 3), dtype=np.float32)
-            km_to_au = float(self.KM_TO_AU)
-            for i, et in enumerate(et_samples):
-                st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', observer_id)
-                # Engine render frame swap: X=x, Y=z, Z=-y
-                points[i, 0] = float(st[0] * km_to_au)
-                points[i, 1] = float(st[2] * km_to_au)
-                points[i, 2] = float(-st[1] * km_to_au)
-            return points
-        except Exception as e:
-            print(f"[SPICE] Failed to sample trajectory polyline for {body_id}: {e}")
+        with SPICE_LOCK:
+            try:
+                if "mission_start_utc" in info and "mission_end_utc" in info:
+                    et_start = spice.str2et(info["mission_start_utc"])
+                    et_end = spice.str2et(info["mission_end_utc"])
+                else:
+                    found_cov = None
+                    for k_name, is_en in self.enabled_kernels.items():
+                        if is_en and k_name.endswith('.bsp'):
+                            kp = self.find_kernel_path(k_name)
+                            if kp and os.path.exists(kp):
+                                try:
+                                    cov = spice.spkcov(kp, body_id)
+                                    if len(cov) >= 2:
+                                        found_cov = (float(cov[0]), float(cov[-1]))
+                                        break
+                                except Exception:
+                                    pass
+                    if not found_cov:
+                        return None
+                    et_start, et_end = found_cov
+
+                if observer_id is None:
+                    parent_name = info.get("parentId", "Sun")
+                    name_to_id = {"Earth": 399, "Moon": 301, "Mars": 499, "Jupiter": 5, "Saturn": 6, "Uranus": 7, "Neptune": 8, "Sun": 0}
+                    observer_id = name_to_id.get(parent_name, 0)
+
+                et_samples = np.linspace(et_start, et_end, num_samples)
+                points = np.empty((num_samples, 3), dtype=np.float32)
+                km_to_au = float(self.KM_TO_AU)
+                for i, et in enumerate(et_samples):
+                    try:
+                        st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', observer_id)
+                    except Exception:
+                        try:
+                            st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', 0)
+                        except Exception:
+                            st = np.zeros(6)
+                    # Engine render frame swap: X=x, Y=z, Z=-y
+                    points[i, 0] = float(st[0] * km_to_au)
+                    points[i, 1] = float(st[2] * km_to_au)
+                    points[i, 2] = float(-st[1] * km_to_au)
+                return points
+            except Exception as e:
+                print(f"[SPICE] Failed to sample trajectory polyline for {body_id}: {e}")
+                return None
+
+    def list_available_bsp_files(self):
+        """
+        Discovers all available .bsp files in exports/ephemeris/ and data/kernels/.
+        Returns a list of dicts: {"path": abs_path, "name": display_name, "category": category, "size_kb": size_kb}.
+        """
+        results = []
+        seen = set()
+
+        # 1. Check exports/ephemeris directory
+        exp_dir = get_external_path("exports", "ephemeris")
+        if os.path.exists(exp_dir):
+            for root, _, files in os.walk(exp_dir):
+                for f in files:
+                    if f.lower().endswith(".bsp"):
+                        full_p = os.path.abspath(os.path.join(root, f))
+                        if full_p not in seen:
+                            seen.add(full_p)
+                            rel = os.path.relpath(full_p, exp_dir)
+                            size_kb = os.path.getsize(full_p) / 1024.0
+                            results.append({
+                                "path": full_p,
+                                "name": rel,
+                                "category": "Exported Ephemeris",
+                                "size_kb": size_kb
+                            })
+
+        # 2. Check data/kernels directories (additional, default, and root)
+        search_dirs = [
+            (self.ADDITIONAL_KERNEL_DIR, "Additional Kernels"),
+            (self.DEFAULT_KERNEL_DIR, "Default Kernels"),
+            (self.KERNEL_DIR, "Kernel Library")
+        ]
+        for k_dir, cat_name in search_dirs:
+            if os.path.exists(k_dir):
+                for f in sorted(os.listdir(k_dir)):
+                    full_p = os.path.abspath(os.path.join(k_dir, f))
+                    if os.path.isfile(full_p) and f.lower().endswith(".bsp"):
+                        if full_p not in seen:
+                            seen.add(full_p)
+                            size_kb = os.path.getsize(full_p) / 1024.0
+                            desc = self.KERNEL_DESCRIPTIONS.get(f, f)
+                            results.append({
+                                "path": full_p,
+                                "name": f"{f} ({desc})" if desc != f else f,
+                                "category": cat_name,
+                                "size_kb": size_kb
+                            })
+
+        return results
+
+    def inspect_bsp(self, bsp_path):
+        """
+        Inspects an arbitrary SPK kernel (.bsp) without permanently altering engine state.
+        Returns a dictionary with detected bodies, time coverage, center IDs, and sidecar info.
+        """
+        if not bsp_path or not os.path.isfile(bsp_path):
             return None
+
+        PALETTE = [
+            "#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff",
+            "#39c5cf", "#f0883e", "#56d364", "#79c0ff", "#e3b341",
+            "#ff7b72", "#d2a8ff", "#2ea043", "#a5d6ff", "#ffab70"
+        ]
+
+        tls_path = os.path.join(self.KERNEL_DIR, "naif0012.tls")
+        with SPICE_LOCK:
+            if os.path.isfile(tls_path):
+                try:
+                    spice.furnsh(tls_path)
+                except Exception:
+                    pass
+            try:
+                spice.furnsh(bsp_path)
+            except Exception as e:
+                print(f"[SPICE] Failed to furnsh {bsp_path}: {e}")
+                return None
+
+            try:
+                obj_ids_cell = spice.spkobj(bsp_path)
+                body_ids = [int(x) for x in obj_ids_cell]
+
+                center_map = {}
+                cov_map = {}
+
+                # Inspect segments using DAF routines
+                try:
+                    handle = spice.dafopr(bsp_path)
+                    spice.dafbfs(handle)
+                    while spice.daffna():
+                        res = spice.dafgs()
+                        body, center, frame, type_id, b_epoch, e_epoch, first_addr, last_addr = spice.spkuds(res[:5])
+                        body = int(body)
+                        center = int(center)
+                        if body not in center_map:
+                            center_map[body] = center
+                        if body not in cov_map:
+                            cov_map[body] = [float(b_epoch), float(e_epoch)]
+                        else:
+                            cov_map[body][0] = min(cov_map[body][0], float(b_epoch))
+                            cov_map[body][1] = max(cov_map[body][1], float(e_epoch))
+                    spice.dafcls(handle)
+                except Exception as e:
+                    print(f"[SPICE] DAF segment inspection fallback: {e}")
+
+                for bid in body_ids:
+                    if bid not in cov_map:
+                        try:
+                            cov = spice.spkcov(bsp_path, bid)
+                            if len(cov) >= 2:
+                                cov_map[bid] = [float(cov[0]), float(cov[-1])]
+                        except Exception:
+                            cov_map[bid] = [0.0, 0.0]
+                    if bid not in center_map:
+                        center_map[bid] = 0
+
+                # Check sidecar JSON
+                sidecar_path = bsp_path + ".json"
+                sidecar = None
+                if os.path.isfile(sidecar_path):
+                    try:
+                        with open(sidecar_path, "r", encoding="utf-8") as f:
+                            sidecar = json.load(f)
+                    except Exception:
+                        pass
+
+                # Preserve logical body ordering
+                if sidecar and "bodies" in sidecar:
+                    ordered_ids = []
+                    for sb in sidecar["bodies"]:
+                        sbid = sb.get("spice_id")
+                        if sbid in body_ids and sbid not in ordered_ids:
+                            ordered_ids.append(sbid)
+                    for bid in body_ids:
+                        if bid not in ordered_ids:
+                            ordered_ids.append(bid)
+                    body_ids = ordered_ids
+                else:
+                    body_ids = sorted(body_ids, key=lambda x: (1 if x < 0 else 0, x))
+
+                bodies = []
+                min_et = float("inf")
+                max_et = float("-inf")
+
+                for idx, bid in enumerate(body_ids):
+                    b_cov = cov_map.get(bid, [0.0, 0.0])
+                    min_et = min(min_et, b_cov[0])
+                    max_et = max(max_et, b_cov[1])
+
+                    b_name = None
+                    b_color = None
+                    if sidecar and "bodies" in sidecar:
+                        for sb in sidecar["bodies"]:
+                            if sb.get("spice_id") == bid:
+                                b_name = sb.get("name")
+                                if "color" in sb:
+                                    b_color = sb["color"]
+                                break
+
+                    if not b_name:
+                        if bid in self.SPICE_BODIES:
+                            b_name = self.SPICE_BODIES[bid]["name"]
+                            b_color = self.SPICE_BODIES[bid].get("color")
+
+                    if not b_name:
+                        try:
+                            raw_n = spice.bodc2n(bid)
+                            if raw_n:
+                                b_name = raw_n.title().replace("_", " ")
+                        except Exception:
+                            pass
+
+                    if not b_name:
+                        b_name = f"Spacecraft ({bid})" if bid < 0 else f"Object {bid}"
+
+                    if not b_color:
+                        b_color = PALETTE[idx % len(PALETTE)]
+
+                    cid = center_map.get(bid, 0)
+                    c_name = "Solar System Barycenter" if cid == 0 else f"Object {cid}"
+                    if cid in self.SPICE_BODIES:
+                        c_name = self.SPICE_BODIES[cid]["name"]
+                    else:
+                        try:
+                            c_name_raw = spice.bodc2n(cid)
+                            if c_name_raw:
+                                c_name = c_name_raw.title().replace("_", " ")
+                        except Exception:
+                            pass
+
+                    try:
+                        b_start_utc = spice.et2utc(b_cov[0], 'C', 0)
+                        b_end_utc = spice.et2utc(b_cov[1], 'C', 0)
+                    except Exception:
+                        b_start_utc = f"{b_cov[0]:.0f}s ET"
+                        b_end_utc = f"{b_cov[1]:.0f}s ET"
+
+                    bodies.append({
+                        "id": bid,
+                        "name": b_name,
+                        "center_id": cid,
+                        "center_name": c_name,
+                        "color": b_color,
+                        "et_range": b_cov,
+                        "utc_start": b_start_utc,
+                        "utc_end": b_end_utc
+                    })
+
+                if min_et == float("inf"):
+                    min_et = 0.0
+                    max_et = 1.0
+
+                try:
+                    utc_min = spice.et2utc(min_et, 'C', 0)
+                    utc_max = spice.et2utc(max_et, 'C', 0)
+                except Exception:
+                    utc_min = f"{min_et:.0f}s ET"
+                    utc_max = f"{max_et:.0f}s ET"
+
+                duration_days = (max_et - min_et) / 86400.0
+
+                return {
+                    "filepath": os.path.abspath(bsp_path),
+                    "filename": os.path.basename(bsp_path),
+                    "body_ids": body_ids,
+                    "bodies": bodies,
+                    "et_range": [min_et, max_et],
+                    "utc_range": [utc_min, utc_max],
+                    "duration_days": duration_days,
+                    "sidecar": sidecar
+                }
+            except Exception as e:
+                print(f"[SPICE] Error inspecting {bsp_path}: {e}")
+                return None
+
+    def build_generic_bsp_system(self, bsp_path, num_samples=1000):
+        """
+        Loads an arbitrary SPK kernel (.bsp), samples trajectories for all bodies,
+        and constructs a bodies_data bundle for playback in the engine.
+        """
+        info = self.inspect_bsp(bsp_path)
+        if not info or not info["bodies"]:
+            return None
+
+        sidecar = info.get("sidecar")
+        if sidecar and "epoch_et_seconds_past_j2000" in sidecar:
+            epoch_et = float(sidecar["epoch_et_seconds_past_j2000"])
+        else:
+            epoch_et = float(info["et_range"][0])
+
+        if sidecar and "time_span_years" in sidecar:
+            time_span_years = [float(sidecar["time_span_years"][0]), float(sidecar["time_span_years"][1])]
+            start_sim_t = time_span_years[0]
+        else:
+            start_sim_t = 0.0
+            span_sec = max(1.0, info["et_range"][1] - info["et_range"][0])
+            time_span_years = [0.0, span_sec / (86400.0 * 365.25)]
+
+        km_to_au = float(self.KM_TO_AU)
+        sec_to_yr = float(self.SEC_TO_YR)
+
+        bodies_data = []
+        trajectories = []
+
+        def _hex_to_rgb(h):
+            if not isinstance(h, str):
+                return [0.7, 0.8, 1.0]
+            h = h.lstrip('#')
+            if len(h) == 6:
+                try:
+                    return [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+                except ValueError:
+                    pass
+            return [0.7, 0.8, 1.0]
+
+        with SPICE_LOCK:
+            try:
+                spice.furnsh(bsp_path)
+                self.kernels_loaded = True
+            except Exception as e:
+                print(f"[SPICE] Notice furnshing {bsp_path}: {e}")
+
+            for body in info["bodies"]:
+                bid = body["id"]
+                cid = body.get("center_id", 0)
+                b_cov = body["et_range"]
+
+                # Sample trajectory polyline
+                b_start = b_cov[0]
+                b_end = b_cov[1]
+                if b_start == b_end:
+                    et_samples = np.array([b_start, b_start + 1.0])
+                else:
+                    et_samples = np.linspace(b_start, b_end, max(2, num_samples))
+
+                pts = np.empty((len(et_samples), 3), dtype=np.float32)
+                sample_observer = cid
+
+                # Check if sample_observer can be queried, fallback to 0 if needed
+                for i, et in enumerate(et_samples):
+                    try:
+                        st, _ = spice.spkgeo(bid, et, 'ECLIPJ2000', sample_observer)
+                    except Exception:
+                        try:
+                            st, _ = spice.spkgeo(bid, et, 'ECLIPJ2000', 0)
+                            sample_observer = 0
+                        except Exception:
+                            st = np.zeros(6)
+                    # Render frame swap: X=x, Y=z, Z=-y
+                    pts[i, 0] = float(st[0] * km_to_au)
+                    pts[i, 1] = float(st[2] * km_to_au)
+                    pts[i, 2] = float(-st[1] * km_to_au)
+
+                # Initial state at start_sim_t
+                init_et = epoch_et + start_sim_t * (86400.0 * 365.25)
+                init_et = max(b_start, min(b_end, init_et))
+
+                try:
+                    st0, _ = spice.spkgeo(bid, init_et, 'ECLIPJ2000', 0)
+                except Exception:
+                    try:
+                        st0, _ = spice.spkgeo(bid, init_et, 'ECLIPJ2000', sample_observer)
+                    except Exception:
+                        st0 = np.zeros(6)
+
+                # Convert to engine physics frame (AU and AU/year)
+                pos0 = [float(st0[0] * km_to_au), float(st0[1] * km_to_au), float(st0[2] * km_to_au)]
+                vel0 = [float(st0[3] * km_to_au * sec_to_yr), float(st0[4] * km_to_au * sec_to_yr), float(st0[5] * km_to_au * sec_to_yr)]
+
+                b_type = "Spacecraft" if bid < 0 else ("Star" if bid == 10 else "Planet")
+                radius = 0.001 if bid < 0 else (0.02 if bid == 10 else 0.005)
+
+                b_dict = {
+                    "name": body["name"],
+                    "type": b_type,
+                    "spice_id": bid,
+                    "center_id": sample_observer,
+                    "m": 0.0,
+                    "r": radius,
+                    "color": body["color"],
+                    "is_spacecraft": (bid < 0),
+                    "sv": {
+                        "x": pos0[0], "y": pos0[1], "z": pos0[2],
+                        "vx": vel0[0], "vy": vel0[1], "vz": vel0[2]
+                    }
+                }
+                bodies_data.append(b_dict)
+
+                trajectories.append({
+                    "name": body["name"],
+                    "spice_id": bid,
+                    "center_id": sample_observer,
+                    "color": _hex_to_rgb(body["color"]),
+                    "points": pts
+                })
+
+        # Build simple hierarchy links
+        id_to_name = {b["spice_id"]: b["name"] for b in bodies_data}
+        for b in bodies_data:
+            cid = b["center_id"]
+            if cid != 0 and cid in id_to_name and id_to_name[cid] != b["name"]:
+                b["parentId"] = id_to_name[cid]
+
+        base_stem = os.path.splitext(info["filename"])[0]
+        display_name = f"Ephemeris: {base_stem}"
+
+        return {
+            "display_name": display_name,
+            "bsp_path": os.path.abspath(bsp_path),
+            "bodies_data": bodies_data,
+            "trajectories": trajectories,
+            "epoch_et": epoch_et,
+            "et_range": info["et_range"],
+            "time_span_years": time_span_years,
+            "start_sim_t": start_sim_t
+        }

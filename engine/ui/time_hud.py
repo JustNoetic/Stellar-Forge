@@ -113,7 +113,7 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
             if imgui.button("Export .bsp"):
                 export_timeline_spk_async(app, bodies_data)
             if imgui.is_item_hovered():
-                imgui.set_tooltip("Encode the recorded timeline as a NASA SPICE\nChebyshev (Type 2) SPK kernel (.bsp) in the exports/ folder.")
+                imgui.set_tooltip("Encode the recorded timeline as a NASA SPICE\nChebyshev (Type 2) SPK kernel (.bsp) in exports/ephemeris/<system>/.")
 
         imgui.end()
         return

@@ -172,11 +172,14 @@ def _get_local_time(dt_utc):
 def format_sim_time(t_years):
     # Try spiceypy first if ephemeris mode is active
     try:
-        from app import _mgr
+        from engine.ephemeris.spice_manager import get_spice_manager
+        _mgr = get_spice_manager()
         if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
             import spiceypy as spice
-            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-            et_epoch = _mgr.datetime_to_et(epoch_dt)
+            et_epoch = getattr(_mgr, "active_epoch_et", None)
+            if et_epoch is None:
+                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                et_epoch = _mgr.datetime_to_et(epoch_dt)
             et = et_epoch + t_years * 365.25 * 86400.0
             utc_str = spice.et2utc(et, 'C', 0)
             dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
@@ -224,11 +227,14 @@ def format_sim_time(t_years):
 def format_sim_time_utc(t_years):
     # Try spiceypy first if ephemeris mode is active
     try:
-        from app import _mgr
+        from engine.ephemeris.spice_manager import get_spice_manager
+        _mgr = get_spice_manager()
         if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
             import spiceypy as spice
-            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-            et_epoch = _mgr.datetime_to_et(epoch_dt)
+            et_epoch = getattr(_mgr, "active_epoch_et", None)
+            if et_epoch is None:
+                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                et_epoch = _mgr.datetime_to_et(epoch_dt)
             et = et_epoch + t_years * 365.25 * 86400.0
             utc_str = spice.et2utc(et, 'C', 0)
             dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
@@ -270,6 +276,22 @@ def format_sim_time_utc(t_years):
 
 
 def sim_time_from_date(y, m, d, h=0, mn=0, s=0, is_utc=True):
+    try:
+        from engine.ephemeris.spice_manager import get_spice_manager
+        _mgr = get_spice_manager()
+        if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
+            et_epoch = getattr(_mgr, "active_epoch_et", None)
+            if et_epoch is not None:
+                if is_utc:
+                    dt = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s), tzinfo=datetime.timezone.utc)
+                else:
+                    dt_loc = datetime.datetime(int(y), int(m), int(d), int(h), int(mn), int(s))
+                    dt = dt_loc.astimezone(datetime.timezone.utc)
+                target_et = _mgr.datetime_to_et(dt)
+                return (target_et - et_epoch) / (365.25 * 86400.0)
+    except:
+        pass
+
     if 1 <= y <= 9999:
         try:
             epoch = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)

@@ -1184,6 +1184,9 @@ class App(InputHandlerMixin):
         self.sys_mgr = sys_mgr = SystemManager()
         self.sys_mgr_spice = sys_mgr_spice = SpiceManager()
         self.get_cached_atmosphere_properties = get_cached_atmosphere_properties
+        self.is_generic_ephemeris = False
+        self._generic_ephem_trajectories = []
+        self._show_bsp_import_modal = False
         ephemeris_mode_active = False
         keplerian_mode_active = False
         active_system_name = SystemManager.SOLAR_SYSTEM_NAME
@@ -2601,16 +2604,22 @@ class App(InputHandlerMixin):
                 if saved_snap is not None:
                     sys_mgr.store_snapshot(old_name, saved_snap)
     
+                is_generic_ephem = self.shared_state.get("generic_ephemeris", False)
                 # Update active system name
                 if is_ephem_enter:
                     ephemeris_mode_active = True
-                    active_system_name = "Ephemeris Mode"
+                    active_system_name = new_info.get("switch_req_name") or ("Ephemeris Viewer" if is_generic_ephem else "Ephemeris Mode")
+                    self.active_system_name = active_system_name
                     self.shared_state["ephemeris_mode"] = True
+                    self.is_generic_ephemeris = bool(is_generic_ephem)
                     keplerian_mode_active = False
                     self.shared_state["keplerian_mode"] = False
                     self._artemis_polyline_loaded = False
                 elif is_ephem_exit:
                     ephemeris_mode_active = False
+                    self.is_generic_ephemeris = False
+                    self._generic_ephem_trajectories = []
+                    sys_mgr_spice.active_epoch_et = None
                     target_sys = new_info.get("switch_req_name") or getattr(self, "switch_req_name", None) or switch_req_name
                     active_system_name = target_sys
                     switch_req_name = target_sys
@@ -2624,6 +2633,9 @@ class App(InputHandlerMixin):
                         self.shared_state["keplerian_mode"] = True
                         self.shared_state["keplerian_reextract"] = True
                 else:
+                    self.is_generic_ephemeris = False
+                    self._generic_ephem_trajectories = []
+                    sys_mgr_spice.active_epoch_et = None
                     target_sys = new_info.get("switch_req_name") or getattr(self, "switch_req_name", None) or switch_req_name
                     active_system_name = target_sys
                     switch_req_name = target_sys
@@ -3466,8 +3478,10 @@ class App(InputHandlerMixin):
             cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz = format_sim_time(display_t)
     
             if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
-                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-                et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
+                if et_epoch is None:
+                    epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                    et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
                 et = et_epoch + display_t * 365.25 * 86400.0
                 
                 if (getattr(self, "_ephem_mapping_ver", None) != id(bodies_data) or 
@@ -4359,22 +4373,55 @@ class App(InputHandlerMixin):
                             if bodies_data[bi].get("is_spacecraft", False) or bodies_data[bi].get("type") == "Spacecraft":
                                 parent_snap_render[bi] = -1
 
-                    n_orbits = compute_all_orbits_batch(
-                        pos_snap_render, vel_snap_render, mass_snap, parent_snap_render,
-                        subsys_pos_buf, subsys_vel_buf, subsys_mass_buf,
-                        visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels,
-                        np.zeros(3, dtype='f8'))
-                    last_orbit_pos_snap = pos_snap_render.copy()
+                    if getattr(self, "is_generic_ephemeris", False):
+                        n_orbits = 0
+                    else:
+                        n_orbits = compute_all_orbits_batch(
+                            pos_snap_render, vel_snap_render, mass_snap, parent_snap_render,
+                            subsys_pos_buf, subsys_vel_buf, subsys_mass_buf,
+                            visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels,
+                            np.zeros(3, dtype='f8'))
+                        last_orbit_pos_snap = pos_snap_render.copy()
 
-                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded and not getattr(self, "_artemis_polyline_loaded", False):
-                        if -1024 in getattr(self, "_ephem_mapping", []):
-                            pts = sys_mgr_spice.get_trajectory_polyline(-1024, observer_id=399, num_samples=1000)
-                            if pts is not None:
-                                if vbo_ephem_orbits.size < pts.nbytes:
-                                    vbo_ephem_orbits.orphan(pts.nbytes)
-                                vbo_ephem_orbits.write(pts.tobytes())
-                                self._artemis_polyline_len = len(pts)
-                                self._artemis_polyline_loaded = True
+                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded and not getattr(self, "_ephem_trajectories_loaded", False):
+                        self._ephem_spacecraft_trajectories = []
+                        mapping = getattr(self, "_ephem_mapping", [])
+                        for bi, b in enumerate(bodies_data):
+                            if b.get("is_spacecraft", False) or b.get("type") == "Spacecraft":
+                                sp_id = b.get("spice_id")
+                                if sp_id is None and bi < len(mapping):
+                                    sp_id = mapping[bi]
+                                if sp_id is None:
+                                    continue
+                                
+                                p_idx = None
+                                p_spice_id = 0
+                                p_name = b.get("parentId")
+                                if p_name:
+                                    for pbi, pb in enumerate(bodies_data):
+                                        if pb.get("name") == p_name:
+                                            p_idx = pbi
+                                            p_spice_id = pb.get("spice_id", 0)
+                                            break
+                                
+                                pts = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=1000)
+                                if pts is not None and len(pts) >= 2:
+                                    vbo = ctx.buffer(pts.tobytes())
+                                    vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f', 'in_pos')])
+                                    col = b.get("color", "#00ffff")
+                                    if isinstance(col, str):
+                                        col_rgb = hex_to_rgb(col)
+                                    else:
+                                        col_rgb = tuple(col[:3])
+                                    self._ephem_spacecraft_trajectories.append({
+                                        "name": b.get("name", "Spacecraft"),
+                                        "vbo": vbo,
+                                        "vao": vao,
+                                        "count": len(pts),
+                                        "color": col_rgb,
+                                        "parent_idx": p_idx
+                                    })
+                        self._ephem_trajectories_loaded = True
                     
                     if n_orbits > 0:
                         valid_orbits = orbit_data_buf[:n_orbits]
@@ -5025,29 +5072,50 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
-                if ephemeris_mode_active and getattr(self, "_artemis_polyline_len", 0) > 0:
-                    earth_idx = None
-                    for bi, b in enumerate(bodies_data):
-                        if b.get("name") == "Earth":
-                            earth_idx = bi
-                            break
-                    if earth_idx is not None and earth_idx < num_bodies:
-                        earth_pos = pos_snap_render[earth_idx].astype('f4')
-                        if 'projection' in prog_ephem_orbits:
-                            prog_ephem_orbits['projection'].write(projection)
-                        if 'view_rot' in prog_ephem_orbits:
-                            prog_ephem_orbits['view_rot'].write(view_rot)
-                        if 'u_cam_pos_double' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                if getattr(self, "is_generic_ephemeris", False) and getattr(self, "_generic_ephem_trajectories", None):
+                    if 'projection' in prog_ephem_orbits:
+                        prog_ephem_orbits['projection'].write(projection)
+                    if 'view_rot' in prog_ephem_orbits:
+                        prog_ephem_orbits['view_rot'].write(view_rot)
+                    if 'u_cam_pos_double' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    if 'u_far' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_far'].value = far
+                    if 'u_depth_C' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_depth_C'].value = depth_C
+
+                    for traj in self._generic_ephem_trajectories:
+                        c_pos = (0.0, 0.0, 0.0)
+                        c_idx = traj.get("center_idx")
+                        if c_idx is not None and 0 <= c_idx < num_bodies:
+                            c_pos = tuple(pos_snap_render[c_idx].astype('f4'))
                         if 'u_bary_pos' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_bary_pos'].value = tuple(earth_pos)
+                            prog_ephem_orbits['u_bary_pos'].value = c_pos
                         if 'u_color' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_color'].value = (0.0, 1.0, 1.0)
-                        if 'u_far' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_far'].value = far
-                        if 'u_depth_C' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_depth_C'].value = depth_C
-                        vao_ephem_orbits.render(moderngl.LINE_STRIP, vertices=self._artemis_polyline_len)
+                            prog_ephem_orbits['u_color'].value = tuple(traj["color"][:3])
+                        traj["vao"].render(moderngl.LINE_STRIP, vertices=traj["count"])
+                elif ephemeris_mode_active and getattr(self, "_ephem_spacecraft_trajectories", None):
+                    if 'projection' in prog_ephem_orbits:
+                        prog_ephem_orbits['projection'].write(projection)
+                    if 'view_rot' in prog_ephem_orbits:
+                        prog_ephem_orbits['view_rot'].write(view_rot)
+                    if 'u_cam_pos_double' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                    if 'u_far' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_far'].value = far
+                    if 'u_depth_C' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_depth_C'].value = depth_C
+
+                    for traj in self._ephem_spacecraft_trajectories:
+                        p_pos = (0.0, 0.0, 0.0)
+                        p_idx = traj.get("parent_idx")
+                        if p_idx is not None and 0 <= p_idx < num_bodies:
+                            p_pos = tuple(pos_snap_render[p_idx].astype('f4'))
+                        if 'u_bary_pos' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_bary_pos'].value = p_pos
+                        if 'u_color' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_color'].value = tuple(traj["color"][:3])
+                        traj["vao"].render(moderngl.LINE_STRIP, vertices=traj["count"])
 
                 if self.comparison_enabled and self.n_orbits_cmp > 0:
                     orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -5105,8 +5173,9 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
 
-            has_artemis_orbit = ephemeris_mode_active and getattr(self, "_artemis_polyline_len", 0) > 0
-            if show_orbits and (n_orbits > 0 or has_artemis_orbit or (self.comparison_enabled and self.n_orbits_cmp > 0)):
+            has_spacecraft_orbits = ephemeris_mode_active and len(getattr(self, "_ephem_spacecraft_trajectories", [])) > 0
+            has_generic_orbits = getattr(self, "is_generic_ephemeris", False) and len(getattr(self, "_generic_ephem_trajectories", [])) > 0
+            if show_orbits and (n_orbits > 0 or has_spacecraft_orbits or has_generic_orbits or (self.comparison_enabled and self.n_orbits_cmp > 0)):
                 if self.orbit_msaa_fbo is not None:
                     # Orbit lines get their own MSAA buffer; the resolved result is
                     # blended back over the (non-MSAA) scene afterwards.
@@ -6394,13 +6463,67 @@ class App(InputHandlerMixin):
                 with self.shared_state_cmp["lock"]:
                     self.shared_state_cmp["system_switch_request"] = req
 
+            def _trigger_generic_ephem(bsp_path):
+                bndl_raw = sys_mgr_spice.build_generic_bsp_system(bsp_path, num_samples=1000)
+                if not bndl_raw or not bndl_raw.get("bodies_data"):
+                    print(f"[Ephemeris] Failed to build generic ephemeris system from {bsp_path}")
+                    return
+
+                # Build ModernGL VBOs & VAOs for trajectories on render thread
+                self._generic_ephem_trajectories = []
+                for traj in bndl_raw["trajectories"]:
+                    pts = traj["points"]
+                    if len(pts) >= 2:
+                        vbo = ctx.buffer(pts.tobytes())
+                        vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f', 'in_pos')])
+                        c_idx = None
+                        if traj["center_id"] != 0:
+                            for bi, b in enumerate(bndl_raw["bodies_data"]):
+                                if b.get("spice_id") == traj["center_id"]:
+                                    c_idx = bi
+                                    break
+                        self._generic_ephem_trajectories.append({
+                            "name": traj["name"],
+                            "vbo": vbo,
+                            "vao": vao,
+                            "count": len(pts),
+                            "color": tuple(traj["color"]),
+                            "center_idx": c_idx
+                        })
+
+                sys_mgr_spice.active_epoch_et = bndl_raw["epoch_et"]
+                sys_mgr_spice.active_ephem_et_range = bndl_raw["et_range"]
+                sys_mgr_spice.active_ephem_bsp = bsp_path
+                self._ephem_mapping_ver = None
+                self._ephem_mapping_len = 0
+
+                new_bndl = load_system_from_data(bndl_raw["bodies_data"])
+                req = {
+                    "old_bodies_data": bodies_data,
+                    "old_visual_data": visual_data,
+                    "old_atmo_bodies": atmo_bodies,
+                    "old_ring_bodies": ring_bodies,
+                    "old_star_idx": star_idx,
+                    "new_bundle": new_bndl,
+                    "switch_req_name": bndl_raw["display_name"],
+                    "ephemeris_enter": True,
+                    "generic_ephemeris": True,
+                    "preserve_state": True,
+                    "preserve_t": bndl_raw.get("start_sim_t", 0.0),
+                    "preserve_paused": True,
+                    "preserve_speed": 1.0
+                }
+                with self.shared_state["lock"]:
+                    self.shared_state["system_switch_request"] = req
+
             switch_triggers = {
                 "switch_system": _trigger_system_switch,
                 "ephem_switch": _trigger_ephem_switch,
                 "ephem_exit": _trigger_ephem_exit,
                 "ephem_export": _trigger_ephem_export,
                 "cmp_switch": _trigger_cmp_switch,
-                "load_system": load_system_from_data
+                "load_system": load_system_from_data,
+                "open_generic_ephem": _trigger_generic_ephem
             }
 
             self.active_system_name = active_system_name

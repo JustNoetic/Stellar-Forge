@@ -66,7 +66,7 @@ Stellar-Forge/
 │   ├── gaia/                   # GAIA star catalog binary (stars.bin) + fetch logs
 │   ├── system.json             # Active default system
 │   ├── systems/<Name>/{meta.json,system.json}   # System presets (Solar System, Achernar, Ephemeris Mode)
-│   ├── kernels/                # Downloaded SPICE kernels (.bsp/.tpc/.tls)
+│   ├── kernels/                # SPICE kernels: default/ (core & planetary), additional/ (missions & custom)
 │   ├── ephemeris_settings.json # SPICE playback dates & active kernel list
 │   ├── graphics_settings.json  # Persistent graphics/quality settings
 │   └── horizons_cache.json     # Cache for JPL Horizons REST queries
@@ -222,40 +222,47 @@ spectral classification.
 
 ### 3.8 `engine/ephemeris/spice_manager.py` (735 lines)
 - `SpiceManager` (~L7):
-  - `__init__()` (~L120) — loads `ephemeris_settings.json`, ensures `data/kernels/`.
+  - `__init__()` (~L120) — loads `ephemeris_settings.json`, ensures `data/kernels/{default,additional}/`.
   - `cancel_download()`, `_cleanup_partial_downloads()`.
   - `_load_settings()`, `save_settings()`, `_ensure_dirs()`.
-  - `check_missing_kernels()` (~L185) — compares settings vs on-disk.
-  - `download_kernels_async(on_complete)` (~L196) — threaded download with progress hook.
-  - `load_kernels(force=False)` (~L308) — `spiceypy.furnsh`.
-  - `_discover_bodies()` (~L332) — enumerate SPICE IDs.
+  - `find_kernel_path(filename)` — searches `default/`, `additional/`, and root `data/kernels/`.
+  - `list_additional_kernels()` — auto-discovers extra BSPs in `additional/` and `kernels/`.
+  - `add_additional_kernel(path)` — imports external BSP into `data/kernels/additional/` and marks enabled.
+  - `check_missing_kernels()` (~L185) — compares default settings vs on-disk.
+  - `download_kernels_async(on_complete)` (~L196) — threaded download with progress hook into `default/`.
+  - `load_kernels(force=False)` (~L308) — `spiceypy.furnsh` for all enabled default and additional kernels.
+  - `_discover_bodies()` (~L332) — enumerates SPICE IDs, auto-detects spacecraft mission start/end epochs and parents.
   - `datetime_to_et(dt)` (~L374), `get_body_state(body_id, et)` (~L386),
     `get_all_states(et)` (~L422).
-  - `get_body_mapping(bodies_data, test_et)` (~L446) — match JSON bodies → SPICE IDs.
+  - `get_body_mapping(bodies_data, test_et)` (~L446) — match JSON bodies → SPICE IDs (supports direct `"spice_id"`).
   - `populate_states_fast(et, mapping, pos_out, vel_out, valid_out)` (~L473) — batch state query.
   - `_get_body_properties(body_id, fallback_mass_kg, fallback_radius_km)` (~L513).
   - `build_ephemeris_system(et, template_bodies)` (~L559) — assembles bodies_data for Ephemeris Mode.
+  - `get_trajectory_polyline(body_id, observer_id)` — samples 3D trajectory polyline for any spacecraft.
+  - `list_available_bsp_files()` — discovers `.bsp` files across `exports/ephemeris/`, `additional/`, `default/`, and `kernels/`.
+  - `inspect_bsp(bsp_path)` — inspects arbitrary `.bsp` kernels (DAF segment coverage, target NAIF IDs, reference centers, sidecar JSON, UTC range).
+  - `build_generic_bsp_system(bsp_path, num_samples=1000)` — samples 3D trajectory polylines (`spkgeo`) and generates engine `bodies_data` bundle for arbitrary BSP playback.
 
-**Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build.
+**Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build, generic BSP viewer.
 
 ### 3.8a `engine/ephemeris/spk_exporter.py`
 - `assign_spice_ids(body_names)` — map names → NAIF IDs (real IDs from `SpiceManager.SPICE_BODIES`,
   fictional bodies get unique negatives from `FICTIONAL_ID_START = -100000`).
 - `resolve_display_epoch_et(spice_manager)` — ET of the display epoch (2026-01-01 12:00 UTC);
-  falls back to J2000 (0.0) if no leapseconds kernel is available.
+  falls back to analytical 2026 epoch ET (820540869.184 s) if no leapseconds kernel is available.
 - `export_timeline_spk(filepath, timeline_raw, timeline_times, body_names, ..., spk_type=)` — encodes
   `shared_state["timeline_raw"]` (f8 physics frame, AU / AU·yr⁻¹) as per-body SPK segments,
   center = 0 (flat barycenter-absolute), frame `ECLIPJ2000` (physics frame == ECLIPJ2000 axes;
   no rotation). **Type 2 (default):** per-interval Chebyshev least-squares fits using
   position AND velocity rows (`_chebyshev_fit_records`, degree 13, tolerance-driven
-  interval doubling between ~6x and ~2.3x LS overdetermination, `CHEB_TOL_KM`);
-  `_probe_chebyshev_vs_hermite` cross-checks the fit against cubic Hermite at sample
-  midpoints to detect under-sampled input (warning surfaced in the export message).
-  **Type 13:** Hermite discrete states (pos+vel). Uniform decimation via `max_states`;
-  writes a `<file>.bsp.json` sidecar (epoch anchor, fit residuals, probe errors, ID
-  mapping) for re-import.
+  interval doubling, `CHEB_TOL_KM`); `_probe_chebyshev_vs_hermite` cross-checks the fit
+  against cubic Hermite at sample midpoints to detect under-sampled input (warning surfaced
+  in the export message). **Type 13:** Hermite discrete states (pos+vel). Decimation applies
+  to Type 13 via `max_states`; auto-fallback to Type 13 on tiny timelines. Writes `<file>.bsp.json`
+  sidecar (epoch anchor, UTC/ET time span, fit residuals, probe errors, ID mapping) for re-import.
 - `export_timeline_spk_async(app, bodies_data)` — UI entry: lock-guarded snapshot of
-  `timeline_raw`/`timeline_times`, background writer thread, toast via `app._screenshot_toast`.
+  `timeline_raw`/`timeline_times`, background writer thread, outputs to `exports/ephemeris/<System>/`,
+  toast via `app._screenshot_toast`.
 
 **Edit when:** changing SPK export format, sampling/decimation, ID scheme, or epoch anchor.
 
@@ -398,7 +405,7 @@ spectral classification.
   - Orbit gravitational-limit readouts: instantaneous Hill radius from live body/parent mass and separation (same approximation as hierarchy selection); fluid Roche distance from the parent's center for the selected body's mass/radius, with proposed edit values and periapsis warning. No limit readouts for barycenters or parentless bodies; the existing edit Apply restriction remains unchanged.
   - Stellar Overview exposes optimistic HZ bounds matching the overlay (`sqrt(lum/1.78)`, `sqrt(lum/0.32)`); Atmosphere exposes its existing equilibrium temperature and cached gas scale height/molar mass.
 
-- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric quality mode 0–3, Mode 3 Sky-View LUT Resolution combo [Low 192×108, Medium 256×256, High 384×216], Mode 3 Shadow Method combo [Station-Locked Slicing vs Uniform Stochastic Raymarching], dynamic slider [Shadow Slicing Cells 2–32 vs Shadow Ray Steps 4–64], Stochastic Raymarching noise toggle, Noise Type combo [IGN vs STBN], atmospheric refraction, and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, and SPICE Downloader.
+- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric quality mode 0–3, Mode 3 Sky-View LUT Resolution combo [Low 192×108, Medium 256×256, High 384×216], Mode 3 Shadow Method combo [Station-Locked Slicing vs Uniform Stochastic Raymarching], dynamic slider [Shadow Slicing Cells 2–32 vs Shadow Ray Steps 4–64], Stochastic Raymarching noise toggle, Noise Type combo [IGN vs STBN], atmospheric refraction, and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, SPICE Downloader, and Import Ephemeris Kernel (.bsp).
 - `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
 
 ### 3.15 `scripts/`
@@ -406,6 +413,8 @@ spectral classification.
 - `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
 - `fetch_gaia.py` — fetches a magnitude-limited Gaia DR3 subset (24 RA bands, TAP sync) plus a Hipparcos bright-star supplement (V < 2.5; Gaia photometry is saturation-broken for these, e.g. Sirius A), propagated to the J2016.0 epoch. Writes `data/gaia/stars.bin` (32-byte records: ra/dec/plx/pmra/pmdec/rv/G/BP-RP, f4).
 - `fetch_artemis2_kernel.py` — fetches Artemis II trajectory state vectors from JPL Horizons and encodes them into a standard NAIF Type 9 SPK kernel (`data/kernels/artemis2.bsp`).
+- `test_spk_export.py` — comprehensive unit and round-trip validation tests for timeline SPK kernel export (Type 2 Chebyshev and Type 13 Hermite).
+- `test_bsp_viewer.py` — unit and integration tests for generic BSP inspection, trajectory polyline generation, fast state evaluation, and time round-trips.
 - `perf_test.py` — `class PerfTracker` (~L40), `patch_function(module, name, tracker, label)` (~L113), `main()`. Activated via `STELLAR_FORGE_PERF=1`; `--gpu` adds per-pass GL timer queries (env `STELLAR_FORGE_GPU_PERF=1`, instrumented passes via `_perf_gpu_begin/_end/_flush` in `app.py`) and `--target-body NAME` parks the camera on a body (default `Saturn` when `--gpu`).
 
 ---

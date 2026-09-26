@@ -37,6 +37,10 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                 "age_pct": 46.0,
             }
 
+        if imgui.menu_item("Import Ephemeris Kernel (.bsp)...")[0]:
+            app._show_bsp_import_modal = True
+            app._bsp_refresh_needed = True
+
         if active_system_name != SystemManager.SOLAR_SYSTEM_NAME:
             imgui.separator()
             imgui.push_style_color(imgui.COLOR_TEXT, 1.0, 0.4, 0.4)
@@ -271,6 +275,10 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                 jd = app.camera.setdefault("jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
                 jd[0], jd[1], jd[2] = cur_y, cur_m, cur_d
                 jd[3], jd[4], jd[5] = cur_h, cur_mn, cur_s
+
+        if imgui.menu_item("Import Ephemeris Kernel (.bsp)...")[0]:
+            app._show_bsp_import_modal = True
+            app._bsp_refresh_needed = True
 
         if imgui.menu_item("SPICE Ephemeris Kernel Settings...")[0]:
             app._show_ephem_setup_modal = True

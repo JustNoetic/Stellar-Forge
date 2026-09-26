@@ -579,12 +579,64 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 if k_name not in app.sys_mgr_spice.DEFAULT_KERNELS:
                     continue
                 desc = app.sys_mgr_spice.KERNEL_DESCRIPTIONS.get(k_name, k_name)
-                if os.path.exists(os.path.join(app.sys_mgr_spice.KERNEL_DIR, k_name)):
+                if app.sys_mgr_spice.find_kernel_path(k_name):
                     desc += " [Downloaded]"
                 is_enabled = app.sys_mgr_spice.enabled_kernels.get(k_name, False)
                 changed_k, new_val = imgui.checkbox(desc, is_enabled)
                 if changed_k:
                     app.sys_mgr_spice.enabled_kernels[k_name] = new_val
+
+        # ── Additional Kernels (Auto-detected from data/kernels/additional/ and data/kernels/) ──
+        imgui.separator()
+        imgui.text_colored("--- Additional Kernels (Missions & Custom) ---", 0.7, 0.9, 1.0)
+        imgui.text_colored("Placed in data/kernels/additional/", 0.6, 0.8, 0.6)
+
+        additional_kernels = app.sys_mgr_spice.list_additional_kernels()
+        if additional_kernels:
+            for ak in additional_kernels:
+                k_name = ak["name"]
+                is_enabled = app.sys_mgr_spice.enabled_kernels.get(k_name, False)
+                label = f"{k_name} ({ak['size_kb']:.1f} KB)"
+                changed_ak, new_val = imgui.checkbox(label, is_enabled)
+                if changed_ak:
+                    app.sys_mgr_spice.enabled_kernels[k_name] = new_val
+        else:
+            imgui.text_disabled("No additional kernels found in data/kernels/additional/.")
+
+        # In-modal Import / Add BSP feature
+        if imgui.tree_node("Import / Add External BSP to Ephemeris Mode..."):
+            imgui.text("Enter path to an external .bsp kernel file:")
+            changed_p, new_p = imgui.input_text("BSP File Path", getattr(app, "_ephem_add_bsp_path", ""), 512)
+            if changed_p:
+                app._ephem_add_bsp_path = new_p
+
+            target_p = getattr(app, "_ephem_add_bsp_path", "").strip()
+            can_add = bool(target_p and os.path.isfile(target_p) and target_p.lower().endswith(".bsp"))
+            
+            if can_add:
+                if getattr(app, "_ephem_add_inspected_path", "") != target_p:
+                    app._ephem_add_inspected_data = app.sys_mgr_spice.inspect_bsp(target_p)
+                    app._ephem_add_inspected_path = target_p
+                
+                info = getattr(app, "_ephem_add_inspected_data", None)
+                if info and info.get("bodies"):
+                    b_names = [f"{b['name']} (ID {b['id']})" for b in info["bodies"][:3]]
+                    if len(info["bodies"]) > 3:
+                        b_names.append(f"... +{len(info['bodies']) - 3} more")
+                    imgui.text_colored(f"Targets: {', '.join(b_names)}", 0.4, 0.85, 1.0)
+                    imgui.text(f"Span: {info['utc_range'][0]} to {info['utc_range'][1]} ({info['duration_days']:.1f} days)")
+
+                if imgui.button("  Add to Additional Kernels  "):
+                    try:
+                        app.sys_mgr_spice.add_additional_kernel(target_p)
+                        app._ephem_add_bsp_path = ""
+                        app._ephem_add_inspected_path = ""
+                        app._ephem_add_inspected_data = None
+                    except Exception as e:
+                        print(f"[Ephemeris Setup] Failed to add kernel: {e}")
+            else:
+                imgui.text_disabled("Specify a valid .bsp file path to preview and import.")
+            imgui.tree_pop()
 
         imgui.separator()
         if app.shared_state.get("ephemeris_mode", False):
@@ -644,6 +696,126 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
         else:
             app._show_ephem_download_modal = False
             imgui.close_current_popup()
+        imgui.end_popup()
+
+    # ── 5b. Import Ephemeris Kernel (.bsp) Modal ──
+    if getattr(app, "_show_bsp_import_modal", False):
+        imgui.open_popup("Import Ephemeris Kernel (.bsp)")
+
+    if imgui.begin_popup_modal("Import Ephemeris Kernel (.bsp)", flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+        imgui.text_colored("SPICE Ephemeris Viewer & Playback", 0.4, 0.85, 1.0)
+        imgui.text("Select or specify a NASA SPICE SPK kernel (.bsp) to inspect and play back:")
+        imgui.separator()
+
+        # Initialize modal state if needed
+        if not hasattr(app, "_bsp_available_files") or getattr(app, "_bsp_refresh_needed", True):
+            app._bsp_available_files = app.sys_mgr_spice.list_available_bsp_files()
+            app._bsp_refresh_needed = False
+            app._bsp_selected_idx = 0 if app._bsp_available_files else -1
+            app._bsp_custom_path = ""
+            app._bsp_inspected_data = None
+            app._bsp_inspected_path = ""
+
+        # Available file options
+        file_items = [f"[{f['category']}] {f['name']} ({f['size_kb']:.1f} KB)" for f in app._bsp_available_files]
+        file_items.append("Custom File Path...")
+
+        cur_idx = getattr(app, "_bsp_selected_idx", 0)
+        if cur_idx < 0 or cur_idx >= len(file_items):
+            cur_idx = 0
+
+        changed_f, new_idx = imgui.combo("Select Kernel", cur_idx, file_items)
+        if changed_f:
+            app._bsp_selected_idx = new_idx
+
+        imgui.same_line()
+        if imgui.button("Refresh"):
+            app._bsp_available_files = app.sys_mgr_spice.list_available_bsp_files()
+            app._bsp_refresh_needed = False
+            if app._bsp_selected_idx >= len(app._bsp_available_files):
+                app._bsp_selected_idx = 0 if app._bsp_available_files else -1
+
+        # Determine target path
+        is_custom = (app._bsp_selected_idx == len(app._bsp_available_files)) or (not app._bsp_available_files)
+        if is_custom:
+            changed_p, new_p = imgui.input_text("File Path", getattr(app, "_bsp_custom_path", ""), 512)
+            if changed_p:
+                app._bsp_custom_path = new_p
+            target_path = getattr(app, "_bsp_custom_path", "").strip()
+        else:
+            target_path = app._bsp_available_files[app._bsp_selected_idx]["path"]
+
+        # Run inspect_bsp if path changed or not inspected yet
+        if target_path and os.path.isfile(target_path):
+            if getattr(app, "_bsp_inspected_path", "") != target_path:
+                app._bsp_inspected_data = app.sys_mgr_spice.inspect_bsp(target_path)
+                app._bsp_inspected_path = target_path
+        else:
+            app._bsp_inspected_data = None
+            app._bsp_inspected_path = ""
+
+        imgui.separator()
+
+        info = getattr(app, "_bsp_inspected_data", None)
+        if info:
+            # Metadata display
+            sidecar = info.get("sidecar")
+            fmt_desc = "Standard NASA SPICE SPK"
+            if sidecar:
+                spk_t = sidecar.get("spk_type", 2)
+                if spk_t == 2:
+                    deg = sidecar.get("chebyshev", {}).get("degree", 13)
+                    fmt_desc = f"Type 2 Chebyshev (Degree {deg}) [Stellar-Forge Export]"
+                elif spk_t == 13:
+                    deg = sidecar.get("hermite_degree", 5)
+                    fmt_desc = f"Type 13 Hermite (Degree {deg}) [Stellar-Forge Export]"
+
+            imgui.text_colored("Kernel Info:", 0.8, 0.9, 1.0)
+            imgui.text(f"File: {info['filename']}  ({fmt_desc})")
+            imgui.text(f"Time Span (UTC): {info['utc_range'][0]}  ->  {info['utc_range'][1]}")
+            imgui.text(f"Duration: {info['duration_days']:.1f} days ({info['duration_days'] / 365.25:.2f} years)")
+            
+            imgui.separator()
+            imgui.text_colored(f"Detected Bodies ({len(info['bodies'])}):", 0.8, 0.9, 1.0)
+
+            # Child window for body list
+            imgui.begin_child("BodiesList###bsp_bodies", 580, 160, border=True)
+            for b in info["bodies"]:
+                c_hex = b.get("color", "#ffffff")
+                try:
+                    h = c_hex.lstrip("#")
+                    cr, cg, cb = [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+                except Exception:
+                    cr, cg, cb = 0.7, 0.85, 1.0
+
+                imgui.text_colored(" * ", cr, cg, cb)
+                imgui.same_line()
+                imgui.text_colored(f"{b['name']}", 1.0, 1.0, 1.0)
+                imgui.same_line()
+                imgui.text_colored(f"(NAIF ID: {b['id']})", 0.65, 0.75, 0.85)
+                imgui.same_line()
+                imgui.text_colored(f"Ref: {b['center_name']} ({b['center_id']})", 0.55, 0.65, 0.75)
+                imgui.same_line()
+                imgui.text(f"[{b['utc_start']} - {b['utc_end']}]")
+            imgui.end_child()
+
+            imgui.separator()
+            if imgui.button("  Open Ephemeris Playback  ", width=220):
+                app._show_bsp_import_modal = False
+                imgui.close_current_popup()
+                if "open_generic_ephem" in switch_triggers:
+                    switch_triggers["open_generic_ephem"](info["filepath"])
+            imgui.same_line()
+        else:
+            if target_path:
+                imgui.text_colored(f"File not found or unreadable: {target_path}", 1.0, 0.4, 0.4)
+            else:
+                imgui.text_colored("Select or specify a valid .bsp file above.", 0.7, 0.7, 0.7)
+
+        if imgui.button("Cancel"):
+            app._show_bsp_import_modal = False
+            imgui.close_current_popup()
+
         imgui.end_popup()
 
     # ── 6. Jump to Date / Render Timeline Modal ──
