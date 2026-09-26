@@ -870,7 +870,7 @@ def compute_all_orbits_batch(pos, vel, mass, parent_indices,
     return n_orbits
 
 @njit(cache=True, nogil=True)
-def _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_star_mask):
+def _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_star_mask, fixed_parent_mask):
     """Numba-jitted core: recompute parents based on Hill sphere containment.
     No O(N²) memory allocation — distances computed inline as needed."""
     new_parents = current_parents.copy()
@@ -904,7 +904,7 @@ def _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_st
             r_hill_array[j] = dist_j_parent * (masses[j] / (3.0 * masses[j_parent])) ** (1.0 / 3.0)
     
     for i in range(num_bodies):
-        if i == root_idx or is_star_mask[i]:
+        if i == root_idx or is_star_mask[i] or fixed_parent_mask[i]:
             continue
         
         best_parent = root_idx
@@ -930,7 +930,7 @@ def _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_st
     
     return new_parents
 
-def update_hierarchy(sim, num_bodies, current_parents, is_star_mask):
+def update_hierarchy(sim, num_bodies, current_parents, is_star_mask, fixed_parent_mask=None):
     """Recompute parent_indices based on Hill sphere containment.
     
     Uses hysteresis: enter at < 0.9 * r_Hill, exit at > 1.0 * r_Hill
@@ -939,8 +939,10 @@ def update_hierarchy(sim, num_bodies, current_parents, is_star_mask):
     arr = sim.arr[:num_bodies]
     positions = np.ascontiguousarray(arr[:, 0:3])
     masses = arr[:, 9].copy()
+    if fixed_parent_mask is None:
+        fixed_parent_mask = np.zeros(num_bodies, dtype=np.bool_)
     
-    return _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_star_mask)
+    return _update_hierarchy_core(positions, masses, current_parents, num_bodies, is_star_mask, fixed_parent_mask)
 
 def build_tree_order(parent_indices, num_bodies, positions=None):
     """Return (tree_indices, tree_depths) numpy arrays in depth-first tree-traversal order."""
@@ -948,7 +950,7 @@ def build_tree_order(parent_indices, num_bodies, positions=None):
     roots = []
     for i in range(num_bodies):
         pi = int(parent_indices[i])
-        if pi == -1:
+        if pi == -1 or pi >= num_bodies or pi == i:
             roots.append(i)
         else:
             children[pi].append(i)
@@ -965,7 +967,7 @@ def build_tree_order(parent_indices, num_bodies, positions=None):
             return
         visited.add(node)
         result.append((node, depth))
-        for child in children[node]:
+        for child in children.get(node, []):
             dfs(child, depth + 1)
     
     for root in roots:
@@ -975,11 +977,9 @@ def build_tree_order(parent_indices, num_bodies, positions=None):
     tree_depths = np.array([r[1] for r in result], dtype=np.int32)
     
     if len(tree_indices) < num_bodies:
-        missing = set(range(num_bodies)) - set(tree_indices)
-        for m in missing:
-            parent_indices[m] = -1
-        tree_indices = np.append(tree_indices, list(missing))
-        tree_depths = np.append(tree_depths, [0] * len(missing))
+        missing = [m for m in range(num_bodies) if m not in visited]
+        tree_indices = np.append(tree_indices, np.array(missing, dtype=np.int32))
+        tree_depths = np.append(tree_depths, np.zeros(len(missing), dtype=np.int32))
         
     return tree_indices, tree_depths
 
@@ -1736,30 +1736,34 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                                 "idx": loser
                             })
             
-            frame_count += 1
-            if frame_count % 30 == 0:
-                with shared_state["lock"]:
-                    is_star_mask = shared_state.get("is_star_mask")
-                    if is_star_mask is None:
-                        is_star_mask = np.zeros(num_bodies, dtype=np.bool_)
-                new_parents = update_hierarchy(sim, num_bodies, current_parents, is_star_mask)
-                positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
-                new_tree_indices, new_tree_depths = build_tree_order(new_parents, num_bodies, positions)
-                
-                with shared_state["lock"]:
-                    changed = False
-                    if not np.array_equal(new_parents, shared_state["parent_indices"]):
-                        changed = True
-                    elif not np.array_equal(new_tree_indices, shared_state["tree_indices"]):
-                        changed = True
-                        
-                    if changed:
-                        current_parents = new_parents
-                        shared_state["parent_indices"][:] = new_parents
-                        shared_state["tree_indices"] = new_tree_indices
-                        shared_state["tree_depths"] = new_tree_depths
-                        shared_state["hierarchy_version"] += 1
-                        shared_state["rebuild_flag"] = True
+            if not shared_state.get("ephemeris_mode", False) and not shared_state.get("generic_ephemeris", False):
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    with shared_state["lock"]:
+                        is_star_mask = shared_state.get("is_star_mask")
+                        if is_star_mask is None:
+                            is_star_mask = np.zeros(num_bodies, dtype=np.bool_)
+                        fixed_parent_mask = shared_state.get("fixed_parent_mask")
+                    new_parents = update_hierarchy(sim, num_bodies, current_parents, is_star_mask, fixed_parent_mask)
+                    positions = np.array([[p.x, p.y, p.z] for p in sim.particles[:num_bodies]])
+                    new_tree_indices, new_tree_depths = build_tree_order(new_parents, num_bodies, positions)
+                    
+                    with shared_state["lock"]:
+                        changed = False
+                        if not np.array_equal(new_parents, shared_state["parent_indices"]):
+                            changed = True
+                        elif not np.array_equal(new_tree_indices, shared_state["tree_indices"]):
+                            changed = True
+                            
+                        if changed:
+                            current_parents = new_parents
+                            tree_indices = new_tree_indices
+                            tree_depths = new_tree_depths
+                            shared_state["parent_indices"][:] = new_parents
+                            shared_state["tree_indices"] = new_tree_indices
+                            shared_state["tree_depths"] = new_tree_depths
+                            shared_state["hierarchy_version"] += 1
+                            shared_state["rebuild_flag"] = True
             
             local_pos = np.empty((num_bodies, 3), dtype=np.float64)
             local_vel = np.empty((num_bodies, 3), dtype=np.float64)
@@ -1898,13 +1902,14 @@ def load_system_from_data(bodies_data_raw):
                 sv = body['sv']
                 try:
                     primary = sim.particles[parent_name]
+                    px, py, pz = primary.x, primary.y, primary.z
+                    pvx, pvy, pvz = primary.vx, primary.vy, primary.vz
                 except KeyError:
-                    available = [p.hash for p in sim.particles if hasattr(p, 'hash') and p.hash is not None]
-                    print(f"[Error] Missing parent '{parent_name}' for body '{name}'. Available: {available}")
-                    raise
+                    px, py, pz = 0.0, 0.0, 0.0
+                    pvx, pvy, pvz = 0.0, 0.0, 0.0
                 sim.add(m=mass,
-                        x=primary.x + sv['x'], y=primary.y + sv['y'], z=primary.z + sv['z'],
-                        vx=primary.vx + sv['vx'], vy=primary.vy + sv['vy'], vz=primary.vz + sv['vz'],
+                        x=px + sv['x'], y=py + sv['y'], z=pz + sv['z'],
+                        vx=pvx + sv['vx'], vy=pvy + sv['vy'], vz=pvz + sv['vz'],
                         hash=name)
             elif body.get('orbitRef') == 'equatorial':
                 parent_body_data = next((b for b in bodies_data if b['name'] == parent_name), None)
@@ -2009,11 +2014,14 @@ def load_system_from_data(bodies_data_raw):
 
     # ── Parent indices ──
     parent_indices = np.full(num_bodies, -1, dtype=np.int32)
+    fixed_parent_mask = np.zeros(num_bodies, dtype=np.bool_)
     for i, body in enumerate(bodies_data):
         if body.get('type') == 'Star':
             parent_indices[i] = -1
-        elif 'parentId' in body:
-            parent_indices[i] = name_to_idx[body['parentId']]
+        elif 'parentId' in body and body['parentId']:
+            parent_indices[i] = name_to_idx.get(body['parentId'], -1)
+        if body.get('is_spacecraft') or body.get('type') == 'Spacecraft':
+            fixed_parent_mask[i] = True
 
     print(f"[System] Loaded {num_bodies} bodies")
 
@@ -2025,6 +2033,7 @@ def load_system_from_data(bodies_data_raw):
         "name_to_idx": name_to_idx,
         "visual_data": visual_data,
         "parent_indices": parent_indices,
+        "fixed_parent_mask": fixed_parent_mask,
         "pole_dirs": pole_dirs,
         "ring_bodies": ring_bodies,
         "oblate_physics_list": oblate_physics_list,

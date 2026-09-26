@@ -534,6 +534,11 @@ class App(InputHandlerMixin):
             "show_orbits": True,
             "orbit_fade_dir_idx": 0,
             "orbit_min_alpha": 0.3,
+            "ephem_orbit_points": 5000,
+            "ephem_orbit_mode": 0,
+            "ephem_trail_days": 30.0,
+            "ephem_lead_days": 10.0,
+            "ephem_hide_outside": True,
             "show_habitable_zone": False,
             "planetshine_enabled": True,
             "ringshine_enabled": True,
@@ -628,6 +633,7 @@ class App(InputHandlerMixin):
         self.sky_view_height = 108
         self.sky_view_baked_key = None
         self.star_catalog = None
+        self._ephem_trajectories_pts_count = 0
         self.prev_atmo_exposure = 1.0
         self.prev_atmo_body_offsets = {}
         self.prev_atmo_body_offsets_cmp = {}
@@ -755,6 +761,11 @@ class App(InputHandlerMixin):
                 "star_intensity": self.camera.get("star_intensity", 1.0),
                 "orbit_fade_dir_idx": self.camera.get("orbit_fade_dir_idx", 0),
                 "orbit_min_alpha": self.camera.get("orbit_min_alpha", 0.3),
+                "ephem_orbit_points": self.camera.get("ephem_orbit_points", 5000),
+                "ephem_orbit_mode": self.camera.get("ephem_orbit_mode", 0),
+                "ephem_trail_days": self.camera.get("ephem_trail_days", 30.0),
+                "ephem_lead_days": self.camera.get("ephem_lead_days", 10.0),
+                "ephem_hide_outside": self.camera.get("ephem_hide_outside", True),
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
                 "planetshine_enabled": self.camera.get("planetshine_enabled", True),
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
@@ -1418,7 +1429,12 @@ class App(InputHandlerMixin):
             
         parent_indices = bundle["parent_indices"].copy()
         is_star_mask = np.array([b.get('type') == 'Star' for b in bodies_data], dtype=np.bool_)
-        parent_indices = update_hierarchy(sim, num_bodies, parent_indices, is_star_mask)
+        fixed_parent_mask = bundle.get("fixed_parent_mask")
+        if fixed_parent_mask is None:
+            fixed_parent_mask = np.array([b.get('is_spacecraft', False) or (b.get('type') == 'Spacecraft') for b in bodies_data], dtype=np.bool_)
+        self.shared_state["fixed_parent_mask"] = fixed_parent_mask
+        if not ephemeris_mode_active and not getattr(self, "is_generic_ephemeris", False):
+            parent_indices = update_hierarchy(sim, num_bodies, parent_indices, is_star_mask, fixed_parent_mask)
         init_positions = _init_arr[:, 0:3]
         tree_indices_init, tree_depths_init = build_tree_order(parent_indices, num_bodies, init_positions)
         self.shared_state["parent_indices"][:] = parent_indices
@@ -1484,7 +1500,11 @@ class App(InputHandlerMixin):
         
         parent_indices_cmp = bundle_cmp["parent_indices"].copy()
         is_star_mask_cmp = np.array([b.get('type') == 'Star' for b in bodies_data_cmp], dtype=np.bool_)
-        parent_indices_cmp = update_hierarchy(sim_cmp, num_bodies_cmp, parent_indices_cmp, is_star_mask_cmp)
+        fixed_parent_mask_cmp = bundle_cmp.get("fixed_parent_mask")
+        if fixed_parent_mask_cmp is None:
+            fixed_parent_mask_cmp = np.array([b.get('is_spacecraft', False) or (b.get('type') == 'Spacecraft') for b in bodies_data_cmp], dtype=np.bool_)
+        self.shared_state_cmp["fixed_parent_mask"] = fixed_parent_mask_cmp
+        parent_indices_cmp = update_hierarchy(sim_cmp, num_bodies_cmp, parent_indices_cmp, is_star_mask_cmp, fixed_parent_mask_cmp)
         init_positions_cmp = _init_arr_cmp[:, 0:3]
         tree_indices_init_cmp, tree_depths_init_cmp = build_tree_order(parent_indices_cmp, num_bodies_cmp, init_positions_cmp)
         self.shared_state_cmp["parent_indices"][:] = parent_indices_cmp
@@ -1656,6 +1676,8 @@ class App(InputHandlerMixin):
         prog_orbit_compute = ctx.compute_shader(orbit_compute_shader)
     
         prog_ephem_orbits = ctx.program(vertex_shader=ephem_orbit_vertex_shader, fragment_shader=ephem_orbit_fragment_shader)
+        if 'u_scene_depth' in prog_ephem_orbits:
+            prog_ephem_orbits['u_scene_depth'].value = 9
     
         prog_rings = ctx.program(vertex_shader=ring_vertex_shader, fragment_shader=ring_fragment_shader)
         if 'u_ring_texture' in prog_rings:
@@ -2248,8 +2270,8 @@ class App(InputHandlerMixin):
         uniform_orbit_far = prog_gpu_orbits['u_far']
         uniform_orbit_depth_C = prog_gpu_orbits['u_depth_C']
     
-        vbo_ephem_orbits = ctx.buffer(reserve=1000 * 12)
-        vao_ephem_orbits = ctx.vertex_array(prog_ephem_orbits, [(vbo_ephem_orbits, '3f', 'in_pos')])
+        vbo_ephem_orbits = ctx.buffer(reserve=5000 * 16)
+        vao_ephem_orbits = ctx.vertex_array(prog_ephem_orbits, [(vbo_ephem_orbits, '3f 1f', 'in_pos', 'in_time')])
     
         uniform_ring_centers = prog_spheres['u_ring_center']
         uniform_ring_normals = prog_spheres['u_ring_normal']
@@ -2635,6 +2657,7 @@ class App(InputHandlerMixin):
                 else:
                     self.is_generic_ephemeris = False
                     self._generic_ephem_trajectories = []
+                    self._ephem_trajectories_loaded = False
                     sys_mgr_spice.active_epoch_et = None
                     target_sys = new_info.get("switch_req_name") or getattr(self, "switch_req_name", None) or switch_req_name
                     active_system_name = target_sys
@@ -4383,9 +4406,33 @@ class App(InputHandlerMixin):
                             np.zeros(3, dtype='f8'))
                         last_orbit_pos_snap = pos_snap_render.copy()
 
-                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded and not getattr(self, "_ephem_trajectories_loaded", False):
+                    ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
+                    fade_mode = int(self.camera.get("ephem_orbit_mode", 0))
+                    trail_sec = float(self.camera.get("ephem_trail_days", 30.0)) * 86400.0
+                    lead_sec = float(self.camera.get("ephem_lead_days", 10.0)) * 86400.0
+                    need_reload_ephem = (
+                        not getattr(self, "_ephem_trajectories_loaded", False) or
+                        getattr(self, "_ephem_trajectories_pts_count", 0) != ephem_pts_count
+                    )
+                    if sys_mgr_spice.kernels_loaded and need_reload_ephem:
+                        if hasattr(self, "_ephem_spacecraft_trajectories"):
+                            for t in self._ephem_spacecraft_trajectories:
+                                try:
+                                    t["vbo"].release()
+                                    t["vao"].release()
+                                except Exception:
+                                    pass
                         self._ephem_spacecraft_trajectories = []
                         mapping = getattr(self, "_ephem_mapping", [])
+                        
+                        init_et = 0.0
+                        if ephemeris_mode_active:
+                            et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
+                            if et_epoch is None:
+                                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                                et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                            init_et = et_epoch + display_t * 365.25 * 86400.0
+
                         for bi, b in enumerate(bodies_data):
                             if b.get("is_spacecraft", False) or b.get("type") == "Spacecraft":
                                 sp_id = b.get("spice_id")
@@ -4404,24 +4451,45 @@ class App(InputHandlerMixin):
                                             p_spice_id = pb.get("spice_id", 0)
                                             break
                                 
-                                pts = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=1000)
-                                if pts is not None and len(pts) >= 2:
-                                    vbo = ctx.buffer(pts.tobytes())
-                                    vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f', 'in_pos')])
-                                    col = b.get("color", "#00ffff")
-                                    if isinstance(col, str):
-                                        col_rgb = hex_to_rgb(col)
-                                    else:
-                                        col_rgb = tuple(col[:3])
-                                    self._ephem_spacecraft_trajectories.append({
-                                        "name": b.get("name", "Spacecraft"),
-                                        "vbo": vbo,
-                                        "vao": vao,
-                                        "count": len(pts),
-                                        "color": col_rgb,
-                                        "parent_idx": p_idx
-                                    })
+                                buf_trail = trail_sec * 2.0
+                                buf_lead = lead_sec * 2.0
+                                samp_start = (init_et - buf_trail) if fade_mode == 0 else None
+                                samp_end = (init_et + buf_lead) if fade_mode == 0 else None
+                                res = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=ephem_pts_count, return_times=True, et_start=samp_start, et_end=samp_end)
+                                if res is None and fade_mode == 0:
+                                    res = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=ephem_pts_count, return_times=True)
+                                if res is not None:
+                                    pts, times, et_cov = res
+                                    if len(pts) >= 2:
+                                        pts_4d = np.column_stack((pts, times)).astype(np.float32)
+                                        vbo = ctx.buffer(pts_4d.tobytes())
+                                        vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f 1f', 'in_pos', 'in_time')])
+                                        col = b.get("color", "#00ffff")
+                                        if isinstance(col, str):
+                                            col_rgb = hex_to_rgb(col)
+                                        else:
+                                            col_rgb = tuple(col[:3])
+                                        self._ephem_spacecraft_trajectories.append({
+                                            "name": b.get("name", "Spacecraft"),
+                                            "vbo": vbo,
+                                            "vao": vao,
+                                            "count": len(pts),
+                                            "color": col_rgb,
+                                            "parent_idx": p_idx,
+                                            "spice_id": sp_id,
+                                            "observer_id": p_spice_id,
+                                            "et_start": float(et_cov[0]),
+                                            "et_end": float(et_cov[1]),
+                                            "last_sample_center": init_et,
+                                            "last_fade_mode": fade_mode,
+                                            "last_pts_count": ephem_pts_count,
+                                            "last_trail_sec": trail_sec,
+                                            "last_lead_sec": lead_sec,
+                                            "last_resample_wall_time": time.time(),
+                                            "future": None
+                                        })
                         self._ephem_trajectories_loaded = True
+                        self._ephem_trajectories_pts_count = ephem_pts_count
                     
                     if n_orbits > 0:
                         valid_orbits = orbit_data_buf[:n_orbits]
@@ -5072,7 +5140,16 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
-                if getattr(self, "is_generic_ephemeris", False) and getattr(self, "_generic_ephem_trajectories", None):
+                render_ephem_trajs = None
+                is_gen = getattr(self, "is_generic_ephemeris", False) and getattr(self, "_generic_ephem_trajectories", None)
+                is_spc = getattr(self, "_ephem_spacecraft_trajectories", None) and len(self._ephem_spacecraft_trajectories) > 0
+                center_key = "center_idx" if is_gen else "parent_idx"
+                if is_gen:
+                    render_ephem_trajs = self._generic_ephem_trajectories
+                elif is_spc:
+                    render_ephem_trajs = self._ephem_spacecraft_trajectories
+
+                if render_ephem_trajs:
                     if 'projection' in prog_ephem_orbits:
                         prog_ephem_orbits['projection'].write(projection)
                     if 'view_rot' in prog_ephem_orbits:
@@ -5084,37 +5161,135 @@ class App(InputHandlerMixin):
                     if 'u_depth_C' in prog_ephem_orbits:
                         prog_ephem_orbits['u_depth_C'].value = depth_C
 
-                    for traj in self._generic_ephem_trajectories:
-                        c_pos = (0.0, 0.0, 0.0)
-                        c_idx = traj.get("center_idx")
+                    # Current simulation ET
+                    cur_et = 0.0
+                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
+                        et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
+                        if et_epoch is None:
+                            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                            et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                        cur_et = et_epoch + display_t * 365.25 * 86400.0
+                    elif getattr(self, "is_generic_ephemeris", False):
+                        et_epoch = getattr(sys_mgr_spice, "active_epoch_et", 0.0)
+                        cur_et = et_epoch + display_t * 365.25 * 86400.0
+
+                    trail_sec = float(self.camera.get("ephem_trail_days", 30.0)) * 86400.0
+                    lead_sec = float(self.camera.get("ephem_lead_days", 10.0)) * 86400.0
+                    fade_mode = int(self.camera.get("ephem_orbit_mode", 0))
+                    hide_outside = 1 if self.camera.get("ephem_hide_outside", True) else 0
+                    ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
+
+                    if 'u_current_et' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_current_et'].value = float(cur_et)
+                    if 'u_trail_sec' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_trail_sec'].value = float(trail_sec)
+                    if 'u_lead_sec' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_lead_sec'].value = float(lead_sec)
+                    if 'u_fade_mode' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_fade_mode'].value = int(fade_mode)
+                    if 'u_hide_outside' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_hide_outside'].value = int(hide_outside)
+
+                    now_wall = time.time()
+                    for traj in render_ephem_trajs:
+                        sp_id = traj.get("spice_id")
+                        obs_id = traj.get("observer_id", 0)
+                        et_start = traj.get("et_start", -1e20)
+                        et_end = traj.get("et_end", 1e20)
+
+                        is_outside = (et_start < et_end) and (cur_et < et_start or cur_et > et_end)
+                        if is_outside and hide_outside:
+                            continue
+
+                        def _update_traj_vbo(t_obj, s_start, s_end, f_mode):
+                            try:
+                                res = sys_mgr_spice.get_trajectory_polyline(
+                                    sp_id, observer_id=obs_id, num_samples=ephem_pts_count,
+                                    return_times=True, et_start=s_start, et_end=s_end
+                                )
+                                if res is not None:
+                                    pts, times, _ = res
+                                    if len(pts) >= 2:
+                                        pts_4d = np.column_stack((pts, times)).astype(np.float32)
+                                        raw_b = pts_4d.tobytes()
+                                        if t_obj.get("count") == len(pts):
+                                            t_obj["vbo"].write(raw_b)
+                                        else:
+                                            try:
+                                                t_obj["vbo"].release()
+                                                t_obj["vao"].release()
+                                            except Exception:
+                                                pass
+                                            t_obj["vbo"] = ctx.buffer(raw_b)
+                                            t_obj["vao"] = ctx.vertex_array(prog_ephem_orbits, [(t_obj["vbo"], '3f 1f', 'in_pos', 'in_time')])
+                                            t_obj["count"] = len(pts)
+                                        t_obj["last_sample_center"] = cur_et
+                                        t_obj["last_fade_mode"] = f_mode
+                                        t_obj["last_pts_count"] = ephem_pts_count
+                                        t_obj["last_trail_sec"] = trail_sec
+                                        t_obj["last_lead_sec"] = lead_sec
+                                        t_obj["last_resample_wall_time"] = now_wall
+                            except Exception as e:
+                                print(f"[Ephem] Polyline resample error: {e}")
+
+                        # Dynamic sliding window / full mission sampling
+                        if fade_mode == 0:
+                            # 2x buffered window margin to minimize resample frequency
+                            buf_trail = trail_sec * 2.0
+                            buf_lead = lead_sec * 2.0
+                            samp_start = max(et_start, cur_et - buf_trail) if et_start < et_end else (cur_et - buf_trail)
+                            samp_end = min(et_end, cur_et + buf_lead) if et_start < et_end else (cur_et + buf_lead)
+
+                            if samp_start >= samp_end:
+                                continue
+
+                            needs_resample = False
+                            if traj.get("last_fade_mode") != 0:
+                                needs_resample = True
+                            elif traj.get("last_pts_count") != ephem_pts_count:
+                                needs_resample = True
+                            elif traj.get("last_trail_sec") != trail_sec or traj.get("last_lead_sec") != lead_sec:
+                                needs_resample = True
+                            elif traj.get("last_sample_center") is None:
+                                needs_resample = True
+                            else:
+                                shift = cur_et - traj["last_sample_center"]
+                                if shift > 0.4 * lead_sec or shift < -0.4 * trail_sec:
+                                    if now_wall - traj.get("last_resample_wall_time", 0.0) >= 0.08:
+                                        needs_resample = True
+
+                            if needs_resample and sp_id is not None:
+                                _update_traj_vbo(traj, samp_start, samp_end, 0)
+                        elif fade_mode == 1:
+                            needs_resample = False
+                            if traj.get("last_fade_mode") != 1:
+                                needs_resample = True
+                            elif traj.get("last_pts_count") != ephem_pts_count:
+                                needs_resample = True
+                            elif traj.get("last_sample_center") is None:
+                                needs_resample = True
+
+                            if needs_resample and sp_id is not None:
+                                _update_traj_vbo(traj, None, None, 1)
+
+                        if traj.get("count", 0) < 2:
+                            continue
+
+                        c_pos_cam = np.zeros(3, dtype=np.float32)
+                        c_idx = traj.get(center_key)
                         if c_idx is not None and 0 <= c_idx < num_bodies:
-                            c_pos = tuple(pos_snap_render[c_idx].astype('f4'))
-                        if 'u_bary_pos' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_bary_pos'].value = c_pos
-                        if 'u_color' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_color'].value = tuple(traj["color"][:3])
-                        traj["vao"].render(moderngl.LINE_STRIP, vertices=traj["count"])
-                elif ephemeris_mode_active and getattr(self, "_ephem_spacecraft_trajectories", None):
-                    if 'projection' in prog_ephem_orbits:
-                        prog_ephem_orbits['projection'].write(projection)
-                    if 'view_rot' in prog_ephem_orbits:
-                        prog_ephem_orbits['view_rot'].write(view_rot)
-                    if 'u_cam_pos_double' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    if 'u_far' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_far'].value = far
-                    if 'u_depth_C' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_depth_C'].value = depth_C
+                            c_pos_cam = (pos_snap_render[c_idx] - cam_world_pos_f8).astype(np.float32)
+                        else:
+                            c_pos_cam = (-cam_world_pos_f8).astype(np.float32)
 
-                    for traj in self._ephem_spacecraft_trajectories:
-                        p_pos = (0.0, 0.0, 0.0)
-                        p_idx = traj.get("parent_idx")
-                        if p_idx is not None and 0 <= p_idx < num_bodies:
-                            p_pos = tuple(pos_snap_render[p_idx].astype('f4'))
-                        if 'u_bary_pos' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_bary_pos'].value = p_pos
+                        if 'u_bary_rel_cam' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_bary_rel_cam'].value = tuple(c_pos_cam)
                         if 'u_color' in prog_ephem_orbits:
                             prog_ephem_orbits['u_color'].value = tuple(traj["color"][:3])
+                        if 'u_mission_start_et' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_mission_start_et'].value = float(traj.get("et_start", -1e20))
+                        if 'u_mission_end_et' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_mission_end_et'].value = float(traj.get("et_end", 1e20))
                         traj["vao"].render(moderngl.LINE_STRIP, vertices=traj["count"])
 
                 if self.comparison_enabled and self.n_orbits_cmp > 0:
@@ -5173,7 +5348,7 @@ class App(InputHandlerMixin):
                         prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
                         vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
 
-            has_spacecraft_orbits = ephemeris_mode_active and len(getattr(self, "_ephem_spacecraft_trajectories", [])) > 0
+            has_spacecraft_orbits = len(getattr(self, "_ephem_spacecraft_trajectories", [])) > 0
             has_generic_orbits = getattr(self, "is_generic_ephemeris", False) and len(getattr(self, "_generic_ephem_trajectories", [])) > 0
             if show_orbits and (n_orbits > 0 or has_spacecraft_orbits or has_generic_orbits or (self.comparison_enabled and self.n_orbits_cmp > 0)):
                 if self.orbit_msaa_fbo is not None:
@@ -5185,6 +5360,8 @@ class App(InputHandlerMixin):
                     if self.depth_texture:
                         self.depth_texture.use(location=9)
                     prog_gpu_orbits['u_manual_occlusion'].value = 1
+                    if 'u_manual_occlusion' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_manual_occlusion'].value = 1
                     draw_orbits()
                     ctx.copy_framebuffer(self.orbit_resolve_fbo, self.orbit_msaa_fbo)
                     self.hdr_resolve_fbo.use()
@@ -5196,6 +5373,8 @@ class App(InputHandlerMixin):
                     ctx.enable(moderngl.DEPTH_TEST)
                 else:
                     prog_gpu_orbits['u_manual_occlusion'].value = 0
+                    if 'u_manual_occlusion' in prog_ephem_orbits:
+                        prog_ephem_orbits['u_manual_occlusion'].value = 0
                     draw_orbits()
             _perf_gpu_end(_gq)
 
@@ -6464,31 +6643,56 @@ class App(InputHandlerMixin):
                     self.shared_state_cmp["system_switch_request"] = req
 
             def _trigger_generic_ephem(bsp_path):
-                bndl_raw = sys_mgr_spice.build_generic_bsp_system(bsp_path, num_samples=1000)
+                ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
+                bndl_raw = sys_mgr_spice.build_generic_bsp_system(bsp_path, num_samples=ephem_pts_count)
                 if not bndl_raw or not bndl_raw.get("bodies_data"):
                     print(f"[Ephemeris] Failed to build generic ephemeris system from {bsp_path}")
                     return
 
                 # Build ModernGL VBOs & VAOs for trajectories on render thread
+                if hasattr(self, "_generic_ephem_trajectories"):
+                    for t in self._generic_ephem_trajectories:
+                        try:
+                            t["vbo"].release()
+                            t["vao"].release()
+                        except Exception:
+                            pass
                 self._generic_ephem_trajectories = []
                 for traj in bndl_raw["trajectories"]:
                     pts = traj["points"]
+                    times = traj.get("times")
+                    if times is not None and len(times) == len(pts):
+                        pts_vbo_data = np.column_stack((pts, times)).astype(np.float32)
+                    else:
+                        pts_vbo_data = np.column_stack((pts, np.zeros(len(pts), dtype=np.float32))).astype(np.float32)
                     if len(pts) >= 2:
-                        vbo = ctx.buffer(pts.tobytes())
-                        vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f', 'in_pos')])
+                        vbo = ctx.buffer(pts_vbo_data.tobytes())
+                        vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f 1f', 'in_pos', 'in_time')])
                         c_idx = None
                         if traj["center_id"] != 0:
                             for bi, b in enumerate(bndl_raw["bodies_data"]):
                                 if b.get("spice_id") == traj["center_id"]:
                                     c_idx = bi
                                     break
+                        et_cov = traj.get("et_range", [0.0, 0.0])
                         self._generic_ephem_trajectories.append({
                             "name": traj["name"],
                             "vbo": vbo,
                             "vao": vao,
                             "count": len(pts),
                             "color": tuple(traj["color"]),
-                            "center_idx": c_idx
+                            "center_idx": c_idx,
+                            "spice_id": traj.get("spice_id"),
+                            "observer_id": traj.get("center_id", 0),
+                            "et_start": float(et_cov[0]),
+                            "et_end": float(et_cov[1]),
+                            "last_sample_center": bndl_raw["epoch_et"],
+                            "last_fade_mode": -1,
+                            "last_pts_count": ephem_pts_count,
+                            "last_trail_sec": None,
+                            "last_lead_sec": None,
+                            "last_resample_wall_time": 0.0,
+                            "future": None
                         })
 
                 sys_mgr_spice.active_epoch_et = bndl_raw["epoch_et"]

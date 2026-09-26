@@ -238,10 +238,10 @@ spectral classification.
   - `populate_states_fast(et, mapping, pos_out, vel_out, valid_out)` (~L473) — batch state query.
   - `_get_body_properties(body_id, fallback_mass_kg, fallback_radius_km)` (~L513).
   - `build_ephemeris_system(et, template_bodies)` (~L559) — assembles bodies_data for Ephemeris Mode.
-  - `get_trajectory_polyline(body_id, observer_id)` — samples 3D trajectory polyline for any spacecraft.
+  - `get_trajectory_polyline(body_id, observer_id, num_samples, return_times, et_start, et_end)` — samples 3D trajectory polyline with adaptive arc-length & curvature spacing (full mission or sliding window) and optional timestamps.
   - `list_available_bsp_files()` — discovers `.bsp` files across `exports/ephemeris/`, `additional/`, `default/`, and `kernels/`.
   - `inspect_bsp(bsp_path)` — inspects arbitrary `.bsp` kernels (DAF segment coverage, target NAIF IDs, reference centers, sidecar JSON, UTC range).
-  - `build_generic_bsp_system(bsp_path, num_samples=1000)` — samples 3D trajectory polylines (`spkgeo`) and generates engine `bodies_data` bundle for arbitrary BSP playback.
+  - `build_generic_bsp_system(bsp_path, num_samples)` — samples 3D trajectory polylines with adaptive arc-length spacing and timestamps for arbitrary BSP playback.
 
 **Edit when:** SPICE kernel handling, ephemeris playback, body mapping, Ephemeris Mode system build, generic BSP viewer.
 

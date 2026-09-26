@@ -172,7 +172,7 @@ def _get_local_time(dt_utc):
 def format_sim_time(t_years):
     # Try spiceypy first if ephemeris mode is active
     try:
-        from engine.ephemeris.spice_manager import get_spice_manager
+        from engine.ephemeris.spice_manager import get_spice_manager, SPICE_LOCK
         _mgr = get_spice_manager()
         if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
             import spiceypy as spice
@@ -181,7 +181,8 @@ def format_sim_time(t_years):
                 epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
                 et_epoch = _mgr.datetime_to_et(epoch_dt)
             et = et_epoch + t_years * 365.25 * 86400.0
-            utc_str = spice.et2utc(et, 'C', 0)
+            with SPICE_LOCK:
+                utc_str = spice.et2utc(et, 'C', 0)
             dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
             return _get_local_time(dt_utc)
     except:
@@ -227,7 +228,7 @@ def format_sim_time(t_years):
 def format_sim_time_utc(t_years):
     # Try spiceypy first if ephemeris mode is active
     try:
-        from engine.ephemeris.spice_manager import get_spice_manager
+        from engine.ephemeris.spice_manager import get_spice_manager, SPICE_LOCK
         _mgr = get_spice_manager()
         if _mgr is not None and getattr(_mgr, 'kernels_loaded', False):
             import spiceypy as spice
@@ -236,7 +237,8 @@ def format_sim_time_utc(t_years):
                 epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
                 et_epoch = _mgr.datetime_to_et(epoch_dt)
             et = et_epoch + t_years * 365.25 * 86400.0
-            utc_str = spice.et2utc(et, 'C', 0)
+            with SPICE_LOCK:
+                utc_str = spice.et2utc(et, 'C', 0)
             dt_utc = datetime.datetime.strptime(utc_str, "%Y %b %d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
             return dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second, "UTC"
     except:

@@ -234,6 +234,47 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     app.camera["orbit_min_alpha"] = orbit_min_alpha
                     settings_changed = True
 
+                imgui.spacing()
+                imgui.text_colored("Spacecraft / Ephemeris Orbits", 0.4, 0.8, 1.0)
+
+                ephem_pts = int(app.camera.get("ephem_orbit_points", 5000))
+                changed_ep, ephem_pts = imgui.slider_int("Ephemeris Points", ephem_pts, 500, 20000)
+                if changed_ep:
+                    app.camera["ephem_orbit_points"] = ephem_pts
+                    settings_changed = True
+                    app._ephem_trajectories_loaded = False
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Total sampling points along the trajectory polyline.\nHigher values yield smoother curves around periapsis.")
+
+                traj_mode = int(app.camera.get("ephem_orbit_mode", 0))
+                changed_tm, traj_mode = imgui.combo("Trajectory Display", traj_mode, ["Sliding Window (Fade)", "Full Mission Polyline"])
+                if changed_tm:
+                    app.camera["ephem_orbit_mode"] = traj_mode
+                    settings_changed = True
+
+                if traj_mode == 0:
+                    trail_days = float(app.camera.get("ephem_trail_days", 30.0))
+                    changed_td, trail_days = imgui.slider_float("Trail Duration", trail_days, 1.0, 365.0, "%.1f days")
+                    if changed_td:
+                        app.camera["ephem_trail_days"] = trail_days
+                        settings_changed = True
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("How many days into the past the spacecraft trail extends with a smooth fade.")
+
+                    lead_days = float(app.camera.get("ephem_lead_days", 10.0))
+                    changed_ld, lead_days = imgui.slider_float("Lead Duration", lead_days, 0.0, 90.0, "%.1f days")
+                    if changed_ld:
+                        app.camera["ephem_lead_days"] = lead_days
+                        settings_changed = True
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("How many days into the future the predicted trajectory extends.")
+
+                changed_ho, app.camera["ephem_hide_outside"] = imgui.checkbox("Hide Outside Mission Timeline", app.camera.get("ephem_hide_outside", True))
+                if changed_ho:
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Automatically hides the spacecraft orbit when the current simulation date is before launch or after mission end.")
+
             # Habitable Zones
             changed_hz, app.camera["show_habitable_zone"] = imgui.checkbox("Show Habitable Zones", app.camera.get("show_habitable_zone", False))
             if changed_hz: settings_changed = True
@@ -646,7 +687,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 app._show_ephem_setup_modal = False
                 app._show_ephem_download_modal = True
                 imgui.close_current_popup()
-                app.sys_mgr_spice.download_kernels_async(on_complete=lambda: app.sys_mgr_spice.load_kernels(force=True))
+                trigger_ephem_switch()
         else:
             if imgui.button("Save & Switch to Ephemeris Mode"):
                 app.sys_mgr_spice.save_settings()

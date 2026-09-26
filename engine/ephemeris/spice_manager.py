@@ -7,7 +7,7 @@ import threading
 
 from engine.path_utils import get_external_path
 
-SPICE_LOCK = threading.Lock()
+SPICE_LOCK = threading.RLock()
 
 def get_spice_manager():
     """Returns the active SpiceManager instance if one exists."""
@@ -181,17 +181,18 @@ class SpiceManager:
         self._cleanup_partial_downloads()
 
     def _cleanup_partial_downloads(self):
-        """Removes all .part files in kernel directory."""
-        if os.path.exists(self.KERNEL_DIR):
-            try:
-                for f in os.listdir(self.KERNEL_DIR):
-                    if f.endswith('.part'):
-                        try:
-                            os.remove(os.path.join(self.KERNEL_DIR, f))
-                        except Exception as e:
-                            print(f"[SPICE] Failed to delete temporary file {f}: {e}")
-            except Exception:
-                pass
+        """Removes all .part files in kernel directories."""
+        for d in [self.DEFAULT_KERNEL_DIR, self.ADDITIONAL_KERNEL_DIR, self.KERNEL_DIR]:
+            if os.path.exists(d):
+                try:
+                    for f in os.listdir(d):
+                        if f.endswith('.part'):
+                            try:
+                                os.remove(os.path.join(d, f))
+                            except Exception as e:
+                                print(f"[SPICE] Failed to delete temporary file {f}: {e}")
+                except Exception:
+                    pass
 
     def _load_settings(self):
         if os.path.exists(self.settings_path):
@@ -352,7 +353,7 @@ class SpiceManager:
                                 raise InterruptedError("Download cancelled by user.")
                             self.download_progress = (i + frac) / total_files
                             self.download_status = f"Artemis II: {msg}"
-                        ok, msg, _ = generate_artemis2_spk(output_dir=self.KERNEL_DIR, progress_callback=_artemis_hook)
+                        ok, msg, _ = generate_artemis2_spk(output_dir=self.ADDITIONAL_KERNEL_DIR, progress_callback=_artemis_hook)
                         if not ok:
                             raise RuntimeError(msg)
                     except Exception as e:
@@ -447,6 +448,11 @@ class SpiceManager:
             
         with SPICE_LOCK:
             try:
+                # Reset CSPICE error status and traceback stack
+                try:
+                    spice.reset()
+                except Exception:
+                    pass
                 # Clear any previously loaded kernels
                 spice.kclear()
                 
@@ -583,19 +589,20 @@ class SpiceManager:
         """Convert a Python datetime or ISO string to SPICE Ephemeris Time (ET)."""
         if not self.kernels_loaded:
             return 0.0
-        if isinstance(dt, str):
+        with SPICE_LOCK:
+            if isinstance(dt, str):
+                try:
+                    return float(spice.str2et(dt))
+                except Exception as e:
+                    print(f"[SPICE] Error parsing time string {dt}: {e}")
+                    return 0.0
+            # Convert datetime to ISO string compatible with SPICE
+            iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
             try:
-                return float(spice.str2et(dt))
+                return float(spice.str2et(iso_str))
             except Exception as e:
-                print(f"[SPICE] Error parsing time string {dt}: {e}")
+                print(f"[SPICE] Error parsing time {iso_str}: {e}")
                 return 0.0
-        # Convert datetime to ISO string compatible with SPICE
-        iso_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
-        try:
-            return float(spice.str2et(iso_str))
-        except Exception as e:
-            print(f"[SPICE] Error parsing time {iso_str}: {e}")
-            return 0.0
 
     def get_body_state(self, body_id, et):
         """
@@ -651,19 +658,23 @@ class SpiceManager:
             if not state:
                 state = self.get_body_state(body_id, et)
                 
+            sample_et = et
             # If body is a spacecraft with a finite mission window and et is outside that window,
             # query its state at mission start so build_ephemeris_system has an initial state.
             if not state and body_info.get("is_spacecraft") and "mission_start_utc" in body_info:
                 try:
                     start_et = spice.str2et(body_info["mission_start_utc"]) + 600.0
                     state = self.get_body_state(body_id, start_et)
+                    if state:
+                        sample_et = start_et
                 except Exception:
                     pass
 
             if state:
                 states[actual_id] = {
                     "info": body_info,
-                    "state": state
+                    "state": state,
+                    "sample_et": sample_et
                 }
         return states
 
@@ -869,32 +880,42 @@ class SpiceManager:
                 if body_id == 10 or data["info"]["name"].upper() in template_names:
                     continue
                     
+                is_planet = (body_id in [1, 2, 3, 4, 5, 6, 7, 8, 9] or (100 < body_id < 1000 and body_id % 100 == 99))
                 parent_id = 10
                 parent_name = "Sun"
-                if body_id > 100 and body_id < 1000:
-                    planet_id = body_id // 100
-                    if planet_id == 3: planet_id = 399
-                    
-                    # Check if CoM is loaded instead of Barycenter
-                    com_id = planet_id * 100 + 99
-                    if com_id in states:
-                        planet_id = com_id
-                        
-                    if planet_id in states:
-                        parent_id = planet_id
-                        parent_name = states[planet_id]["info"]["name"]
-                elif data["info"].get("parentId"):
+                if data["info"].get("parentId"):
                     p_name = data["info"]["parentId"]
                     parent_name = p_name
                     for sp_id, pdata in states.items():
                         if pdata["info"]["name"].upper() == p_name.upper():
                             parent_id = sp_id
                             break
+                elif not is_planet and 100 < body_id < 1000:
+                    planet_id = body_id // 100
+                    if planet_id == 3: planet_id = 399
+                    com_id = planet_id * 100 + 99
+                    if planet_id in states:
+                        parent_id = planet_id
+                        parent_name = states[planet_id]["info"]["name"]
+                    elif com_id in states:
+                        parent_id = com_id
+                        parent_name = states[com_id]["info"]["name"]
                 
                 parent_state = states.get(parent_id)
+                sample_t = data.get("sample_et", et)
                 if parent_state and body_id != 10:
-                    pos_rel = data["state"]["pos"] - parent_state["state"]["pos"]
-                    vel_rel = data["state"]["vel"] - parent_state["state"]["vel"]
+                    if abs(sample_t - et) > 1.0 and parent_id != 10:
+                        # Spacecraft sampled at mission start: evaluate parent at that same epoch
+                        p_st = self.get_body_state(parent_id, sample_t)
+                        if p_st:
+                            pos_rel = data["state"]["pos"] - p_st["pos"]
+                            vel_rel = data["state"]["vel"] - p_st["vel"]
+                        else:
+                            pos_rel = data["state"]["pos"] - parent_state["state"]["pos"]
+                            vel_rel = data["state"]["vel"] - parent_state["state"]["vel"]
+                    else:
+                        pos_rel = data["state"]["pos"] - parent_state["state"]["pos"]
+                        vel_rel = data["state"]["vel"] - parent_state["state"]["vel"]
                 else:
                     pos_rel = data["state"]["pos"]
                     vel_rel = data["state"]["vel"]
@@ -915,6 +936,10 @@ class SpiceManager:
                 }
                 if data["info"].get("is_spacecraft"):
                     body_dict["is_spacecraft"] = True
+                if "mission_start_utc" in data["info"]:
+                    body_dict["mission_start_utc"] = data["info"]["mission_start_utc"]
+                if "mission_end_utc" in data["info"]:
+                    body_dict["mission_end_utc"] = data["info"]["mission_end_utc"]
                 bodies_data.append(body_dict)
             return bodies_data
 
@@ -937,32 +962,41 @@ class SpiceManager:
             if body_id == 10:
                 continue
                 
+            is_planet = (body_id in [1, 2, 3, 4, 5, 6, 7, 8, 9] or (100 < body_id < 1000 and body_id % 100 == 99))
             parent_id = 10
             parent_name = "Sun"
-            if body_id > 100 and body_id < 1000:
-                planet_id = body_id // 100
-                if planet_id == 3: planet_id = 399 # Earth
-                
-                # Check if CoM is loaded instead of Barycenter
-                com_id = planet_id * 100 + 99
-                if com_id in states:
-                    planet_id = com_id
-                    
-                if planet_id in states:
-                    parent_id = planet_id
-                    parent_name = states[planet_id]["info"]["name"]
-            elif data["info"].get("parentId"):
+            if data["info"].get("parentId"):
                 p_name = data["info"]["parentId"]
                 parent_name = p_name
                 for sp_id, pdata in states.items():
                     if pdata["info"]["name"].upper() == p_name.upper():
                         parent_id = sp_id
                         break
+            elif not is_planet and 100 < body_id < 1000:
+                planet_id = body_id // 100
+                if planet_id == 3: planet_id = 399 # Earth
+                com_id = planet_id * 100 + 99
+                if planet_id in states:
+                    parent_id = planet_id
+                    parent_name = states[planet_id]["info"]["name"]
+                elif com_id in states:
+                    parent_id = com_id
+                    parent_name = states[com_id]["info"]["name"]
             
             parent_state = states.get(parent_id)
+            sample_t = data.get("sample_et", et)
             if parent_state and body_id != 10:
-                pos_rel = data["state"]["pos"] - parent_state["state"]["pos"]
-                vel_rel = data["state"]["vel"] - parent_state["state"]["vel"]
+                if abs(sample_t - et) > 1.0 and parent_id != 10:
+                    p_st = self.get_body_state(parent_id, sample_t)
+                    if p_st:
+                        pos_rel = data["state"]["pos"] - p_st["pos"]
+                        vel_rel = data["state"]["vel"] - p_st["vel"]
+                    else:
+                        pos_rel = data["state"]["pos"] - parent_state["state"]["pos"]
+                        vel_rel = data["state"]["vel"] - parent_state["state"]["vel"]
+                else:
+                    pos_rel = data["state"]["pos"] - parent_state["state"]["pos"]
+                    vel_rel = data["state"]["vel"] - parent_state["state"]["vel"]
             else:
                 pos_rel = data["state"]["pos"]
                 vel_rel = data["state"]["vel"]
@@ -983,26 +1017,84 @@ class SpiceManager:
             }
             if data["info"].get("is_spacecraft"):
                 body_dict["is_spacecraft"] = True
+            if "mission_start_utc" in data["info"]:
+                body_dict["mission_start_utc"] = data["info"]["mission_start_utc"]
+            if "mission_end_utc" in data["info"]:
+                body_dict["mission_end_utc"] = data["info"]["mission_end_utc"]
             bodies_data.append(body_dict)
             
         return bodies_data
 
-    def get_trajectory_polyline(self, body_id=-1024, observer_id=None, num_samples=1000):
+    def _sample_adaptive_et(self, body_id, observer_id, et_start, et_end, num_samples):
         """
-        Samples the 3D trajectory of a body relative to an observer across its mission duration.
-        Returns an (N, 3) float32 numpy array in engine render frame:
+        Computes sampling timestamps spaced adaptively by arc length and orbital curvature.
+        Prevents over-clustering at apoapsis and eliminates coarse polygon chords at periapsis.
+        """
+        if et_start >= et_end or num_samples <= 2:
+            return np.linspace(et_start, et_end, max(2, num_samples))
+
+        pilot_n = min(80, max(24, num_samples // 30))
+        pilot_et = np.linspace(et_start, et_end, pilot_n)
+        pilot_pts = np.empty((pilot_n, 3), dtype=np.float64)
+
+        with SPICE_LOCK:
+            for i, et in enumerate(pilot_et):
+                try:
+                    st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', observer_id)
+                except Exception:
+                    try:
+                        st, _ = spice.spkgeo(body_id, et, 'ECLIPJ2000', 0)
+                    except Exception:
+                        st = np.zeros(6)
+                pilot_pts[i, 0] = st[0]
+                pilot_pts[i, 1] = st[1]
+                pilot_pts[i, 2] = st[2]
+
+        diffs = np.diff(pilot_pts, axis=0)
+        dists = np.linalg.norm(diffs, axis=1)
+
+        r_mags = np.linalg.norm(pilot_pts[:-1], axis=1)
+        median_r = float(np.median(r_mags))
+        if median_r > 1.0:
+            dtheta = dists / np.maximum(r_mags, 1e-3)
+            weights = dists + dtheta * (median_r * 0.5)
+        else:
+            weights = dists
+
+        min_w = float(weights.mean()) * 0.05 if len(weights) > 0 else 1.0
+        weights = np.maximum(weights, max(1e-9, min_w))
+
+        cum_w = np.insert(np.cumsum(weights), 0, 0.0)
+        total_w = cum_w[-1]
+
+        if total_w > 1e-6:
+            target_w = np.linspace(0.0, total_w, num_samples)
+            et_samples = np.interp(target_w, cum_w, pilot_et)
+        else:
+            et_samples = np.linspace(et_start, et_end, num_samples)
+
+        return et_samples
+
+    def get_trajectory_polyline(self, body_id=-1024, observer_id=None, num_samples=5000, return_times=False, et_start=None, et_end=None):
+        """
+        Samples the 3D trajectory of a body relative to an observer.
+        If et_start and et_end are specified, samples across that specific window (clamped to mission coverage).
+        Otherwise samples across the body's entire mission coverage.
+        Uses arc-length and curvature adaptive spacing to ensure smooth curves.
+        Returns (N, 3) float32 numpy array in engine render frame:
         X = x * KM_TO_AU, Y = z * KM_TO_AU, Z = -y * KM_TO_AU.
+        If return_times is True, returns (points, et_samples, (cov_start, cov_end)).
         """
         if not self.kernels_loaded:
             return None
         info = self.SPICE_BODIES.get(body_id)
-        if not info:
-            return None
         with SPICE_LOCK:
             try:
-                if "mission_start_utc" in info and "mission_end_utc" in info:
-                    et_start = spice.str2et(info["mission_start_utc"])
-                    et_end = spice.str2et(info["mission_end_utc"])
+                cov_start = None
+                cov_end = None
+                if info and "mission_start_utc" in info and "mission_end_utc" in info:
+                    cov_start = spice.str2et(info["mission_start_utc"])
+                    cov_end = spice.str2et(info["mission_end_utc"])
                 else:
                     found_cov = None
                     for k_name, is_en in self.enabled_kernels.items():
@@ -1016,16 +1108,32 @@ class SpiceManager:
                                         break
                                 except Exception:
                                     pass
-                    if not found_cov:
-                        return None
-                    et_start, et_end = found_cov
+                    if not found_cov and getattr(self, "active_ephem_bsp", None):
+                        absp = self.active_ephem_bsp
+                        if os.path.isfile(absp):
+                            try:
+                                cov = spice.spkcov(absp, body_id)
+                                if len(cov) >= 2:
+                                    found_cov = (float(cov[0]), float(cov[-1]))
+                            except Exception:
+                                pass
+                    if found_cov:
+                        cov_start, cov_end = found_cov
+
+                if cov_start is None or cov_end is None:
+                    return None
+
+                sample_start = cov_start if et_start is None else max(cov_start, float(et_start))
+                sample_end = cov_end if et_end is None else min(cov_end, float(et_end))
+                if sample_start >= sample_end:
+                    return None
 
                 if observer_id is None:
-                    parent_name = info.get("parentId", "Sun")
+                    parent_name = info.get("parentId", "Sun") if info else "Sun"
                     name_to_id = {"Earth": 399, "Moon": 301, "Mars": 499, "Jupiter": 5, "Saturn": 6, "Uranus": 7, "Neptune": 8, "Sun": 0}
                     observer_id = name_to_id.get(parent_name, 0)
 
-                et_samples = np.linspace(et_start, et_end, num_samples)
+                et_samples = self._sample_adaptive_et(body_id, observer_id, sample_start, sample_end, num_samples)
                 points = np.empty((num_samples, 3), dtype=np.float32)
                 km_to_au = float(self.KM_TO_AU)
                 for i, et in enumerate(et_samples):
@@ -1040,6 +1148,9 @@ class SpiceManager:
                     points[i, 0] = float(st[0] * km_to_au)
                     points[i, 1] = float(st[2] * km_to_au)
                     points[i, 2] = float(-st[1] * km_to_au)
+
+                if return_times:
+                    return points, et_samples, (cov_start, cov_end)
                 return points
             except Exception as e:
                 print(f"[SPICE] Failed to sample trajectory polyline for {body_id}: {e}")
@@ -1279,9 +1390,9 @@ class SpiceManager:
                 print(f"[SPICE] Error inspecting {bsp_path}: {e}")
                 return None
 
-    def build_generic_bsp_system(self, bsp_path, num_samples=1000):
+    def build_generic_bsp_system(self, bsp_path, num_samples=5000):
         """
-        Loads an arbitrary SPK kernel (.bsp), samples trajectories for all bodies,
+        Loads an arbitrary SPK kernel (.bsp), samples trajectories for all bodies using adaptive spacing,
         and constructs a bodies_data bundle for playback in the engine.
         """
         info = self.inspect_bsp(bsp_path)
@@ -1334,13 +1445,13 @@ class SpiceManager:
                 # Sample trajectory polyline
                 b_start = b_cov[0]
                 b_end = b_cov[1]
+                sample_observer = cid
                 if b_start == b_end:
                     et_samples = np.array([b_start, b_start + 1.0])
                 else:
-                    et_samples = np.linspace(b_start, b_end, max(2, num_samples))
+                    et_samples = self._sample_adaptive_et(bid, sample_observer, b_start, b_end, max(2, num_samples))
 
                 pts = np.empty((len(et_samples), 3), dtype=np.float32)
-                sample_observer = cid
 
                 # Check if sample_observer can be queried, fallback to 0 if needed
                 for i, et in enumerate(et_samples):
@@ -1397,15 +1508,26 @@ class SpiceManager:
                     "spice_id": bid,
                     "center_id": sample_observer,
                     "color": _hex_to_rgb(body["color"]),
-                    "points": pts
+                    "points": pts,
+                    "times": et_samples,
+                    "et_range": b_cov
                 })
 
         # Build simple hierarchy links
         id_to_name = {b["spice_id"]: b["name"] for b in bodies_data}
         for b in bodies_data:
-            cid = b["center_id"]
-            if cid != 0 and cid in id_to_name and id_to_name[cid] != b["name"]:
-                b["parentId"] = id_to_name[cid]
+            cid = b.get("center_id", 0)
+            if "parentId" not in b:
+                if cid != 0 and cid in id_to_name and id_to_name[cid] != b["name"]:
+                    b["parentId"] = id_to_name[cid]
+                elif b.get("spice_id") in self.SPICE_BODIES and self.SPICE_BODIES[b["spice_id"]].get("parentId"):
+                    b["parentId"] = self.SPICE_BODIES[b["spice_id"]]["parentId"]
+                elif cid != 0:
+                    try:
+                        c_name = spice.bodc2n(cid)
+                        b["parentId"] = c_name.title() if c_name.isupper() else c_name
+                    except Exception:
+                        pass
 
         base_stem = os.path.splitext(info["filename"])[0]
         display_name = f"Ephemeris: {base_stem}"
