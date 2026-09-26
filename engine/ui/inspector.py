@@ -1,4 +1,6 @@
 import math
+import time
+import copy
 import os
 import json
 import numpy as np
@@ -30,7 +32,8 @@ from engine.rendering.render_utils import (
     generate_ring_shadow_grad
 )
 from engine.rendering.planetshine import get_cached_atmosphere_properties
-from engine.rendering.texture_baker import bake_and_export_ring_textures
+from engine.rendering.texture_baker import bake_and_export_ring_textures, apply_procedural_ring_to_body
+from engine.rendering.ring_generator import RING_PRESETS
 from engine.ephemeris.system_manager import SystemManager
 
 class NumpyEncoder(json.JSONEncoder):
@@ -147,6 +150,98 @@ def compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo
         A_b = float(np.clip(q * A_g, 0.0, 1.0))
 
     return A_g, A_b, q, p_rgb
+
+def _save_system_cosmetics(app, bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name):
+    """Save cosmetic properties (color, atmosphere, rings) of the system directly to system.json."""
+    is_hidden_combo = (hasattr(app, 'window') and glfw.get_key(app.window, glfw.KEY_BACKSLASH) == glfw.PRESS)
+    def fmt(val, dec=5): return round(float(val), dec)
+
+    if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+        if is_hidden_combo:
+            system_file = "data/system.json"
+            target_label = "master data/system.json"
+        else:
+            system_file = app.sys_mgr._system_json_path(active_system_name)
+            target_label = "Solar System working copy"
+    else:
+        system_file = app.sys_mgr._system_json_path(active_system_name)
+        target_label = f"system '{active_system_name}'"
+
+    try:
+        if os.path.isfile(system_file):
+            with open(system_file, "r") as f:
+                sys_data = json.load(f)
+        else:
+            sys_data = [copy.deepcopy(b) for b in bodies_data]
+
+        for s_body in sys_data:
+            name = s_body.get("name")
+            b_idx = None
+            for i_b, b in enumerate(bodies_data):
+                if b.get("name") == name:
+                    b_idx = i_b
+                    break
+
+            if b_idx is not None:
+                c = visual_arr[b_idx, 0:3]
+                hex_col = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+                s_body["color"] = hex_col
+                bodies_data[b_idx]["color"] = hex_col
+
+                atmo_it = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
+                if atmo_it:
+                    atmo_dict = {
+                        "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
+                        "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
+                        "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
+                        "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
+                    }
+                    if "beta_mie" in atmo_it:
+                        atmo_dict["beta_mie"] = float(atmo_it["beta_mie"])
+                    if "h_mie" in atmo_it:
+                        atmo_dict["h_mie"] = float(atmo_it["h_mie"])
+                    s_body["atmosphere"] = atmo_dict
+                    bodies_data[b_idx]["atmosphere"] = atmo_dict
+
+                ring_segs = [r for r in ring_precomputed if r['body_idx'] == b_idx]
+                if ring_segs:
+                    s_body["rings"] = []
+                    body_r_au = (bodies_data[b_idx].get('r', 0.0) * 696340.0) / 1.495978707e8
+                    for r in ring_segs:
+                        rc = r.get('raw_color', [1.0, 1.0, 1.0])
+                        r_hex = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
+                        s_body["rings"].append({
+                            "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
+                            "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
+                            "color": r_hex,
+                            "opacity": fmt(r['opacity']),
+                            "scatter": fmt(r['scatter']),
+                            "asymmetry": fmt(r['asymmetry']),
+                            "backscatter": fmt(r['backscatter']),
+                            "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
+                        })
+                    bodies_data[b_idx]["rings"] = s_body["rings"]
+                    has_tex_layer = any(r.get('is_textured', False) for r in ring_segs)
+                    if has_tex_layer:
+                        tex_r = next(r for r in ring_segs if r.get('is_textured', False))
+                        s_body["ring_texture_inner"] = fmt(tex_r['inner_r'] / body_r_au)
+                        s_body["ring_texture_outer"] = fmt(tex_r['outer_r'] / body_r_au)
+                        bodies_data[b_idx]["ring_texture_inner"] = s_body["ring_texture_inner"]
+                        bodies_data[b_idx]["ring_texture_outer"] = s_body["ring_texture_outer"]
+
+        os.makedirs(os.path.dirname(system_file), exist_ok=True)
+        with open(system_file, "w") as f:
+            json.dump(sys_data, f, indent=2, cls=NumpyEncoder)
+        if active_system_name != SystemManager.SOLAR_SYSTEM_NAME or not is_hidden_combo:
+            app.sys_mgr.save_meta(active_system_name, sys_data)
+
+        msg = f"Saved cosmetics directly to {target_label}!"
+        print(f"[Cosmetics] {msg}")
+        app._screenshot_toast = (msg, time.time())
+    except Exception as e:
+        err_msg = f"Error saving cosmetics: {e}"
+        print(f"[Cosmetics] {err_msg}")
+        app._screenshot_toast = (err_msg, time.time())
 
 def _apply_body_edits(app, insp_idx, body_info, parent_idx, cur_mass_snap, cur_pos_snap_render, cur_vel_snap_render, visual_arr):
     """Package and dispatch edited physical and orbital properties to physics thread and system JSON."""
@@ -1182,11 +1277,159 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         'temperature': 288.15,
                         'composition': {"N2": 0.78, "O2": 0.21}
                     }
+            if not insp_is_cmp:
+                imgui.separator()
+                if imgui.button("Save Atmosphere Changes", width=-1):
+                    _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
             imgui.end_tab_item()
 
         # ── Tab 4: Rings ──
         if not inspect_bary and imgui.begin_tab_item("Rings")[0]:
             rings = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
+
+            # ── Procedural Ring Generator (SpaceEngine Style) ──
+            proc_open, _ = imgui.collapsing_header("Procedural Ring Generator (SpaceEngine Style)##proc_hdr", flags=imgui.TREE_NODE_DEFAULT_OPEN if not rings else 0)
+            if proc_open:
+                imgui.text_colored("Synthesize 1D multi-octave fBm ring textures & resonance gaps", 0.5, 0.8, 1.0)
+                imgui.spacing()
+
+                proc_state = app.camera.setdefault("proc_ring_state", {
+                    "preset_idx": 0,
+                    "seed": 42,
+                    "band_count": 4,
+                    "gap_count": 3,
+                    "striation_freq": 160.0,
+                    "contrast": 1.7,
+                    "base_density": 2.2,
+                    "core_boost": 2.5,
+                    "inner_mult": 1.20,
+                    "outer_mult": 2.30,
+                    "tint": [1.0, 1.0, 1.0],
+                    "opacity": 1.0,
+                })
+
+                preset_names = list(RING_PRESETS.keys())
+                cur_preset_idx = min(proc_state.get("preset_idx", 0), len(preset_names) - 1)
+                
+                changed_p, new_p_idx = imgui.combo("Ring Preset##proc", cur_preset_idx, preset_names)
+                if changed_p:
+                    proc_state["preset_idx"] = new_p_idx
+                    p_name = preset_names[new_p_idx]
+                    p_cfg = RING_PRESETS[p_name]
+                    proc_state["band_count"] = p_cfg["band_count"]
+                    proc_state["gap_count"] = p_cfg["gap_count"]
+                    proc_state["striation_freq"] = p_cfg["striation_freq"]
+                    proc_state["contrast"] = p_cfg["contrast"]
+                    proc_state["base_density"] = p_cfg["base_density"]
+                    proc_state["core_boost"] = p_cfg.get("core_boost", 2.5)
+                    proc_state["inner_mult"] = p_cfg["inner_radius_ratio"]
+                    proc_state["outer_mult"] = p_cfg["outer_radius_ratio"]
+                    proc_state["opacity"] = p_cfg["opacity"]
+
+                # Seed & Randomize
+                imgui.push_item_width(imgui.get_content_region_available_width() - 85)
+                changed_seed, new_seed = imgui.drag_int("Seed##proc", proc_state.get("seed", 42), 1.0, 0, 999999)
+                if changed_seed:
+                    proc_state["seed"] = new_seed
+                imgui.pop_item_width()
+                imgui.same_line()
+                if imgui.button("Random##proc", width=75):
+                    proc_state["seed"] = int(np.random.randint(1, 999999))
+
+                # Sliders
+                changed_b, new_b = imgui.slider_int("Bands##proc", proc_state.get("band_count", 4), 1, 8)
+                if changed_b: proc_state["band_count"] = new_b
+
+                changed_g, new_g = imgui.slider_int("Gaps##proc", proc_state.get("gap_count", 3), 0, 6)
+                if changed_g: proc_state["gap_count"] = new_g
+
+                changed_sf, new_sf = imgui.slider_float("Striations##proc", proc_state.get("striation_freq", 160.0), 20.0, 300.0, "%.0f")
+                if changed_sf: proc_state["striation_freq"] = new_sf
+
+                changed_ct, new_ct = imgui.slider_float("Sharpness##proc", proc_state.get("contrast", 1.7), 0.5, 3.5, "%.2f")
+                if changed_ct: proc_state["contrast"] = new_ct
+
+                changed_bd, new_bd = imgui.slider_float("Density (Tau)##proc", proc_state.get("base_density", 2.2), 0.05, 8.0, "%.2f")
+                if changed_bd: proc_state["base_density"] = new_bd
+
+                changed_cb, new_cb = imgui.slider_float("Core Opacity##proc", proc_state.get("core_boost", 2.5), 0.5, 5.0, "%.2f")
+                if changed_cb: proc_state["core_boost"] = new_cb
+
+                changed_in_m, new_in_m = imgui.slider_float("Inner (Req)##proc", proc_state.get("inner_mult", 1.20), 1.05, 4.0, "%.2f")
+                if changed_in_m: proc_state["inner_mult"] = new_in_m
+
+                min_out = proc_state.get("inner_mult", 1.20) + 0.05
+                changed_out_m, new_out_m = imgui.slider_float("Outer (Req)##proc", max(min_out, proc_state.get("outer_mult", 2.30)), min_out, 8.0, "%.2f")
+                if changed_out_m: proc_state["outer_mult"] = new_out_m
+
+                changed_col, new_col = imgui.color_edit3("Tint Color##proc", *proc_state.get("tint", [1.0, 1.0, 1.0]))
+                if changed_col: proc_state["tint"] = list(new_col)
+
+                changed_op_p, new_op_p = imgui.slider_float("Opacity##proc", proc_state.get("opacity", 1.0), 0.05, 1.0, "%.2f")
+                if changed_op_p: proc_state["opacity"] = new_op_p
+
+                imgui.spacing()
+                
+                # Buttons
+                if imgui.button("Generate & Apply Rings##proc", width=-1):
+                    custom_params = {
+                        'band_count': proc_state["band_count"],
+                        'gap_count': proc_state["gap_count"],
+                        'striation_freq': proc_state["striation_freq"],
+                        'contrast': proc_state["contrast"],
+                        'base_density': proc_state["base_density"],
+                        'core_boost': proc_state.get("core_boost", 2.5),
+                        'inner_radius_ratio': proc_state["inner_mult"],
+                        'outer_radius_ratio': proc_state["outer_mult"],
+                        'tint_color': tuple(proc_state["tint"]),
+                        'opacity': proc_state["opacity"]
+                    }
+                    selected_preset = preset_names[proc_state["preset_idx"]]
+                    apply_procedural_ring_to_body(
+                        app, insp_idx, preset=selected_preset,
+                        seed=proc_state["seed"], custom_params=custom_params,
+                        bake_to_disk=False,
+                        bodies_data=cur_bodies_data,
+                        visual_arr=visual_arr,
+                        ring_precomputed=ring_precomputed,
+                        ring_render_groups=ring_render_groups,
+                        ring_gradient_tex=ring_gradient_tex,
+                        prog_rings=prog_rings,
+                        ctx=ctx
+                    )
+
+                if imgui.button("Bake & Save to System Disk##proc", width=-1):
+                    custom_params = {
+                        'band_count': proc_state["band_count"],
+                        'gap_count': proc_state["gap_count"],
+                        'striation_freq': proc_state["striation_freq"],
+                        'contrast': proc_state["contrast"],
+                        'base_density': proc_state["base_density"],
+                        'core_boost': proc_state.get("core_boost", 2.5),
+                        'inner_radius_ratio': proc_state["inner_mult"],
+                        'outer_radius_ratio': proc_state["outer_mult"],
+                        'tint_color': tuple(proc_state["tint"]),
+                        'opacity': proc_state["opacity"]
+                    }
+                    selected_preset = preset_names[proc_state["preset_idx"]]
+                    apply_procedural_ring_to_body(
+                        app, insp_idx, preset=selected_preset,
+                        seed=proc_state["seed"], custom_params=custom_params,
+                        bake_to_disk=True,
+                        bodies_data=cur_bodies_data,
+                        visual_arr=visual_arr,
+                        ring_precomputed=ring_precomputed,
+                        ring_render_groups=ring_render_groups,
+                        ring_gradient_tex=ring_gradient_tex,
+                        prog_rings=prog_rings,
+                        ctx=ctx
+                    )
+                    _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
+
+                imgui.separator()
+
+            if rings:
+                imgui.text_colored("Active Ring Layers", 1.0, 0.85, 0.4)
 
             for i, ring_item in enumerate(rings):
                 is_tex_layer = ring_item.get('is_textured', False)
@@ -1326,6 +1569,10 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         'row_idx': len(ring_precomputed)
                     })
                     app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+            if not insp_is_cmp and rings:
+                imgui.separator()
+                if imgui.button("Save Ring Changes", width=-1):
+                    _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
             imgui.end_tab_item()
 
         # ── Tab 5: Cosmetics ──
@@ -1364,100 +1611,53 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
             imgui.separator()
             if not insp_is_cmp:
-                if imgui.button("Export Body Cosmetics", width=-1):
-                    is_hidden_combo = (hasattr(app, 'window') and glfw.get_key(app.window, glfw.KEY_BACKSLASH) == glfw.PRESS)
-                    def fmt(val, dec=5): return round(float(val), dec)
-
-                    if is_hidden_combo:
-                        if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
-                            system_file = "data/system.json"
-                        else:
-                            system_file = app.sys_mgr._system_json_path(active_system_name)
-                        try:
-                            with open(system_file, "r") as f:
-                                sys_data = json.load(f)
-
-                            for s_body in sys_data:
-                                name = s_body.get("name")
-                                b_idx = None
-                                for i_b, b in enumerate(bodies_data):
-                                    if b.get("name") == name:
-                                        b_idx = i_b
-                                        break
-
-                                if b_idx is not None:
-                                    c = visual_arr[b_idx, 0:3]
-                                    s_body["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
-
-                                    atmo_it = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
-                                    if atmo_it:
-                                        s_body["atmosphere"] = {
-                                            "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
-                                            "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
-                                            "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                                            "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
-                                        }
-
-                                    ring_segs = [r for r in ring_precomputed if r['body_idx'] == b_idx]
-                                    if ring_segs:
-                                        s_body["rings"] = []
-                                        body_r_au = (bodies_data[b_idx].get('r', 0.0) * 696340.0) / 1.495978707e8
-                                        for r in ring_segs:
-                                            rc = r.get('raw_color', [1.0, 1.0, 1.0])
-                                            hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
-                                            s_body["rings"].append({
-                                                "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
-                                                "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
-                                                "color": hex_col,
-                                                "opacity": fmt(r['opacity']),
-                                                "scatter": fmt(r['scatter']),
-                                                "asymmetry": fmt(r['asymmetry']),
-                                                "backscatter": fmt(r['backscatter']),
-                                                "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
-                                            })
-
-                            with open(system_file, "w") as f:
-                                json.dump(sys_data, f, indent=2, cls=NumpyEncoder)
-                            print(f"[Cosmetics] Secret Combo: Exported entire system cosmetics directly to {system_file}!")
-                        except Exception as e:
-                            print(f"Error updating system.json: {e}")
+                if imgui.button("Save Body Cosmetics", width=-1):
+                    _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
+                if imgui.is_item_hovered():
+                    if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                        imgui.set_tooltip("Saves cosmetics (color, atmosphere, rings) to the Solar System working copy.\nHold '\\' (backslash) + click to save directly to master data/system.json.")
                     else:
-                        exp = {}
-                        c = visual_arr[insp_idx, 0:3]
-                        exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+                        imgui.set_tooltip(f"Saves cosmetics (color, atmosphere, rings) directly to data/systems/{active_system_name}/system.json.")
 
-                        atmo_it = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
-                        if atmo_it:
-                            exp["atmosphere"] = {
-                                "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
-                                "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
-                                "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                                "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
-                            }
+                if imgui.button(f"Export {body_info['name']} to JSON (exports/)##exp_single", width=-1):
+                    def fmt(val, dec=5): return round(float(val), dec)
+                    exp = {}
+                    c = visual_arr[insp_idx, 0:3]
+                    exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
 
-                        ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
-                        if ring_segs:
-                            exp["rings"] = []
-                            body_r_au = (body_info.get('r', 0.0) * 696340.0) / 1.495978707e8
-                            for r in ring_segs:
-                                rc = r.get('raw_color', [1.0, 1.0, 1.0])
-                                hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
-                                exp["rings"].append({
-                                    "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
-                                    "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
-                                    "color": hex_col,
-                                    "opacity": fmt(r['opacity']),
-                                    "scatter": fmt(r['scatter']),
-                                    "asymmetry": fmt(r['asymmetry']),
-                                    "backscatter": fmt(r['backscatter']),
-                                    "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
-                                })
+                    atmo_it = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                    if atmo_it:
+                        exp["atmosphere"] = {
+                            "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
+                            "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
+                            "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
+                            "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
+                        }
 
-                        os.makedirs("exports", exist_ok=True)
-                        filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
-                        with open(filename, 'w') as f:
-                            json.dump(exp, f, indent=4, cls=NumpyEncoder)
-                        print(f"[Cosmetics] Exported cosmetics to {filename}")
+                    ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
+                    if ring_segs:
+                        exp["rings"] = []
+                        body_r_au = (body_info.get('r', 0.0) * 696340.0) / 1.495978707e8
+                        for r in ring_segs:
+                            rc = r.get('raw_color', [1.0, 1.0, 1.0])
+                            hex_col = '#%02x%02x%02x' % (min(255, max(0, int(rc[0]*255))), min(255, max(0, int(rc[1]*255))), min(255, max(0, int(rc[2]*255))))
+                            exp["rings"].append({
+                                "inner": fmt(r['inner_r'] / body_r_au) if body_r_au > 0 else 1.0,
+                                "outer": fmt(r['outer_r'] / body_r_au) if body_r_au > 0 else 2.0,
+                                "color": hex_col,
+                                "opacity": fmt(r['opacity']),
+                                "scatter": fmt(r['scatter']),
+                                "asymmetry": fmt(r['asymmetry']),
+                                "backscatter": fmt(r['backscatter']),
+                                "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
+                            })
+
+                    os.makedirs("exports", exist_ok=True)
+                    filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
+                    with open(filename, 'w') as f:
+                        json.dump(exp, f, indent=4, cls=NumpyEncoder)
+                    print(f"[Cosmetics] Exported cosmetics to {filename}")
+                    app._screenshot_toast = (f"Exported to {filename}", time.time())
             imgui.end_tab_item()
 
         imgui.end_tab_bar()

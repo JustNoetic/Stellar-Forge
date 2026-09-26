@@ -1240,6 +1240,10 @@ class App(InputHandlerMixin):
         has_j2 = bundle["has_j2"]
         has_gr = bundle["has_gr"]
         phys_star_idx = bundle["phys_star_idx"]
+        self.bodies_data = bodies_data
+        self.visual_data = visual_data
+        self.atmo_bodies = atmo_bodies
+        self.ring_bodies = ring_bodies
 
         # Perf harness hook: track a named body at a close orbit so the GPU
         # has real work (atmosphere + rings + ringshine fill the viewport).
@@ -2607,7 +2611,11 @@ class App(InputHandlerMixin):
                     self._artemis_polyline_loaded = False
                 elif is_ephem_exit:
                     ephemeris_mode_active = False
-                    active_system_name = switch_req_name
+                    target_sys = new_info.get("switch_req_name") or getattr(self, "switch_req_name", None) or switch_req_name
+                    active_system_name = target_sys
+                    switch_req_name = target_sys
+                    self.switch_req_name = target_sys
+                    self.active_system_name = target_sys
                     self.shared_state["ephemeris_mode"] = False
                     self._artemis_polyline_loaded = False
                     self._artemis_polyline_len = 0
@@ -2616,7 +2624,11 @@ class App(InputHandlerMixin):
                         self.shared_state["keplerian_mode"] = True
                         self.shared_state["keplerian_reextract"] = True
                 else:
-                    active_system_name = switch_req_name
+                    target_sys = new_info.get("switch_req_name") or getattr(self, "switch_req_name", None) or switch_req_name
+                    active_system_name = target_sys
+                    switch_req_name = target_sys
+                    self.switch_req_name = target_sys
+                    self.active_system_name = target_sys
     
                 # Rebuild ALL render-side state from new system info
                 bodies_data = new_info["bodies_data"]
@@ -2625,6 +2637,10 @@ class App(InputHandlerMixin):
                 ring_bodies = new_info["ring_bodies"]
                 num_bodies = new_info["num_bodies"]
                 star_idx = new_info["star_idx"]
+                self.bodies_data = bodies_data
+                self.visual_data = visual_data
+                self.atmo_bodies = atmo_bodies
+                self.ring_bodies = ring_bodies
     
                 visual_arr = np.array(visual_data, dtype='f4')
                 body_radii = np.array([v[3] for v in visual_data], dtype='f4')
@@ -3221,6 +3237,7 @@ class App(InputHandlerMixin):
 
     
                     sys_mgr.save_system_data(active_system_name, bodies_data)
+                    sys_mgr.save_meta(active_system_name, bodies_data)
                     self.shared_state["crud_completed"].clear()
                     self.shared_state["rebuild_flag"] = False
                     cached_hierarchy_ver = -1

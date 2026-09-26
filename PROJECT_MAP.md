@@ -39,7 +39,8 @@ Stellar-Forge/
 │   │   ├── render_utils.py     # Mesh/geometry/frustum helpers + time formatting
 │   │   ├── imgui_renderer.py   # ModernGL + ImGui GLFW render bridge
 │   │   ├── planetshine.py      # Planetshine & JIT rotation angle calculations
-│   │   ├── texture_baker.py    # Procedural ring HSBA baking & texture exporter
+│   │   ├── ring_generator.py   # Procedural ring texture synthesis (SpaceEngine style 1D fBm & resonance gaps)
+│   │   ├── texture_baker.py    # Procedural ring baking & texture exporter (apply_procedural_ring_to_body)
 │   │   ├── shader_loader.py    # GLSL shader loader with in-memory caching
 │   │   ├── shaders.py          # Shader re-exports & uniform bindings
 │   │   └── post_shaders.py     # Post-processing shader re-exports (Bloom, HDR)
@@ -554,7 +555,8 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change bloom/tonemap/Accumulation shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
 | Change planetshine & moon ringshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
-| Change ring texture baking | `engine/rendering/texture_baker.py` | `bake_and_export_ring_textures` |
+| Change procedural ring generation / presets | `engine/rendering/ring_generator.py` | `generate_procedural_ring_profile`, `RING_PRESETS` |
+| Change ring texture baking & application | `engine/rendering/texture_baker.py` | `apply_procedural_ring_to_body`, `bake_and_export_ring_textures` |
 | Change ringshine irradiance map / shadow CDF | `engine/glsl/post/ringshine_map.frag`, `engine/app.py` (`build_ringshine_lut`) | `build_ringshine_lut` |
 | Validate ringshine accuracy vs Monte Carlo | `scripts/ringshine_benchmark.py` | `main` |
 | Change GLFW input callbacks & settings persistence | `engine/core/input_handler.py`, `engine/app.py` | `InputHandlerMixin`, `App` callbacks & movement mode |

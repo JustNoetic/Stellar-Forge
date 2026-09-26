@@ -1120,6 +1120,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                         "phys_star_idx": restore_snap.phys_star_idx,
                         "star_idx": restore_snap.star_idx,
                         "num_bodies": restore_snap.num_bodies,
+                        "switch_req_name": switch_req.get("switch_req_name"),
                     }
                     time_ctrl["multiplier"] = restore_snap.time_multiplier
                     time_ctrl["paused"] = restore_snap.was_paused
@@ -1141,6 +1142,7 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     "phys_star_idx": new_bundle["phys_star_idx"],
                     "star_idx": new_bundle["star_idx"],
                     "num_bodies": new_bundle["num_bodies"],
+                    "switch_req_name": switch_req.get("switch_req_name"),
                 }
                 
                 if switch_req.get("preserve_state"):

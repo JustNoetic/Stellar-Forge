@@ -1,3 +1,4 @@
+import random
 import imgui
 from engine.ephemeris.system_manager import SystemManager
 
@@ -60,7 +61,10 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
             "radius": 1737.0 if is_moon else 6371.0,
             "color": [0.7, 0.7, 0.7] if is_moon else [0.2, 0.5, 0.8],
             "a": 384400.0 if is_moon else 1.0,
-            "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
+            "e": 0.0, "inc": 0.0,
+            "Omega": round(random.uniform(0.0, 360.0), 3),
+            "omega": round(random.uniform(0.0, 360.0), 3),
+            "M": round(random.uniform(0.0, 360.0), 3),
             "rotation_period": 24.0,
             "axial_tilt": 0.0,
             "tidally_locked": is_moon,
@@ -152,7 +156,10 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
                     "radius": 1737.0 if is_moon else 6371.0,
                     "color": [0.7, 0.7, 0.7] if is_moon else [0.2, 0.5, 0.8],
                     "a": 384400.0 if is_moon else 1.0,
-                    "e": 0.0, "inc": 0.0, "Omega": 0.0, "omega": 0.0, "M": 0.0,
+                    "e": 0.0, "inc": 0.0,
+                    "Omega": round(random.uniform(0.0, 360.0), 3),
+                    "omega": round(random.uniform(0.0, 360.0), 3),
+                    "M": round(random.uniform(0.0, 360.0), 3),
                     "rotation_period": 24.0,
                     "axial_tilt": 0.0,
                     "tidally_locked": is_moon,

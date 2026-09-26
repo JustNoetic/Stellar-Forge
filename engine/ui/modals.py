@@ -1,4 +1,5 @@
 import math
+import random
 import datetime
 import os
 import numpy as np
@@ -12,6 +13,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
     """Render all popup dialogs and modal windows."""
     load_system_from_data = switch_triggers["load_system"]
     trigger_ephem_switch = switch_triggers["ephem_switch"]
+    trigger_system_switch = switch_triggers["switch_system"]
 
     # ── 1. Graphics & Quality Settings Modal ──
     if app.camera.get("show_settings_modal", False):
@@ -390,6 +392,19 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             # ── Orbital Elements ──
             imgui.separator()
             imgui.text_colored("Orbital Elements", 1.0, 0.85, 0.4)
+            imgui.same_line(spacing=15)
+            if imgui.small_button("Randomize Angles##rnd_angles"):
+                ad["Omega"] = round(random.uniform(0.0, 360.0), 3)
+                ad["omega"] = round(random.uniform(0.0, 360.0), 3)
+                ad["M"] = round(random.uniform(0.0, 360.0), 3)
+
+            if "Omega" not in ad or ad["Omega"] is None:
+                ad["Omega"] = round(random.uniform(0.0, 360.0), 3)
+            if "omega" not in ad or ad["omega"] is None:
+                ad["omega"] = round(random.uniform(0.0, 360.0), 3)
+            if "M" not in ad or ad["M"] is None:
+                ad["M"] = round(random.uniform(0.0, 360.0), 3)
+
             _, ad["frame"] = imgui.combo("Reference Frame", ad["frame"], ["Ecliptic", "Equatorial"])
 
             if is_moon:
@@ -534,19 +549,8 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                         "rot_frac": 0.0,
                         "inclination": 0.0
                     }
-                    new_bodies = app.sys_mgr.create_new_system_from_props(sys_name, star_name_c, sprops)
-                    new_bndl = load_system_from_data(new_bodies)
-                    app.switch_req_name = sys_name
-                    req = {
-                        "old_bodies_data": bodies_data,
-                        "old_visual_data": visual_data,
-                        "old_atmo_bodies": atmo_bodies,
-                        "old_ring_bodies": ring_bodies,
-                        "old_star_idx": star_idx,
-                        "new_bundle": new_bndl,
-                    }
-                    with app.shared_state["lock"]:
-                        app.shared_state["system_switch_request"] = req
+                    app.sys_mgr.create_new_system_from_props(sys_name, star_name_c, sprops)
+                    trigger_system_switch(sys_name)
                     app.camera["show_create_system"] = False
         imgui.end()
 
