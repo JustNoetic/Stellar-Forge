@@ -284,7 +284,6 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
 
 void main() {
     if (f_clip_z <= 0.0) discard;
-    gl_FragDepth = log2(max(1e-6, u_depth_C * f_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
 
     vec3 cam_to_host = u_host_planet_pos - u_camera_pos;
     vec3 view_ray = normalize(f_local_pos + cam_to_host);
@@ -341,6 +340,11 @@ void main() {
 
     vec3 hit_local = O_local + ray_dir * t_local;  // body-local hit, ring-radius scale
     vec3 hit_pos = hit_local + u_host_planet_pos;  // world-space, for depth/clip only
+
+    vec4 clip_pos = projection * view * vec4(hit_pos, 1.0);
+    float hit_clip_z = clip_pos.w;
+    if (hit_clip_z <= 0.0) discard;
+    gl_FragDepth = log2(max(1e-6, u_depth_C * hit_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
 
     if (u_clip_mode != 0) {
         float d = dot(hit_local, -cam_to_host);
@@ -669,7 +673,7 @@ void main() {
 
     vec3 total_planetshine = vec3(0.0);
     if (u_host_planet_radius > 0.0) {
-        vec3 frag_to_host = -f_local_pos;
+        vec3 frag_to_host = -hit_local;
         float dist_host_sq = dot(frag_to_host, frag_to_host);
         float dist_host = sqrt(dist_host_sq);
 
