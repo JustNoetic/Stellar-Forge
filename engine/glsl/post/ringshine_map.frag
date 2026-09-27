@@ -212,12 +212,13 @@ void main() {
         float tau_phys = -log(max(1e-4, 1.0 - alpha_phys));
 
         float frac_mid = clamp((r_mid - inner_r) / max(1e-5, outer_r - inner_r), 0.0, 1.0);
-        vec4 props = texture(u_ring_props, vec2(frac_mid, (float(k) + 0.5) / 4.0));
+        vec4 props = texture(u_ring_props, vec2(frac_mid, (float(2 * k) + 0.5) / 8.0));
+        vec4 props_extra = texture(u_ring_props, vec2(frac_mid, (float(2 * k + 1) + 0.5) / 8.0));
         float layer_asym = props.r;
         float layer_backasym = props.g;
         float layer_scatter = props.b;
-        bool plane_is_textured = (props.a >= 50.0);
-        float layer_unlit = plane_is_textured ? (props.a - 100.0) : props.a;
+        float layer_unlit = props.a;
+        bool plane_is_textured = (props_extra.r > 0.5);
 
         float norm_r = r_mid / max(1e-5, host_radius);
 
@@ -282,8 +283,10 @@ void main() {
             float pf_fwd = CornetteShanksPhaseFunction(layer_asym, cos_theta_phase);
             float pf_back = CornetteShanksPhaseFunction(layer_backasym, cos_theta_phase);
             float bal = clamp(layer_scatter, 0.0, 1.0);
-            pf = mix(pf_back, pf_fwd, bal);
-            ms_weight = 1.0 - bal;
+            float w_fwd = mix(0.10, 0.90, bal);
+            float w_back = 1.0 - w_fwd;
+            pf = w_back * pf_back + w_fwd * pf_fwd;
+            ms_weight = clamp(1.0 - bal * 0.7, 0.1, 1.0);
         }
 
         // Single scattering (no opposition surge: ring elements at opposition are inside the planet's shadow)

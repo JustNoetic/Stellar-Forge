@@ -94,7 +94,7 @@ def test_gpu_terrain_rendering_pipeline():
     vao = ctx.vertex_array(prog_terrain, [(vbo, '3f', 'in_position')], index_buffer=ibo)
 
     # Patch SSBO
-    patch_buf = np.zeros((4, 20), dtype=np.float32)
+    patch_buf = np.zeros((4, 24), dtype=np.float32)
     for i in range(4):
         patch_buf[i, 0:4] = [-1.0, -1.0, 1.0, 1.0]
         patch_buf[i, 4:8] = [1.0, 0.0, 0.0, 10.0]
@@ -103,13 +103,33 @@ def test_gpu_terrain_rendering_pipeline():
         patch_buf[i, 15] = 0.0
         patch_buf[i, 16:19] = [0.0, 1.0, 0.0]
         patch_buf[i, 19] = 0.0
+        patch_buf[i, 20] = 0.0
 
     ssbo = ctx.buffer(patch_buf.tobytes())
     ssbo.bind_to_storage_buffer(binding=4)
 
+    # AllInstances SSBO (binding 2)
+    inst_buf = ctx.buffer(reserve=1024)
+    inst_buf.bind_to_storage_buffer(binding=2)
+
     # SceneData UBO (binding 1)
     ubo = ctx.buffer(reserve=7328)
     ubo.bind_to_uniform_block(1)
+
+    # Textures (0: ring gradient, 8: ringshine map, 14: tile array)
+    tex_grad = ctx.texture((16, 16), 4)
+    tex_grad.use(location=0)
+    tex_shine = ctx.texture((16, 16), 4)
+    tex_shine.use(location=8)
+    tex_array = ctx.texture_array((64, 64, 4), 4)
+    tex_array.use(location=14)
+
+    if 'u_tile_array' in prog_terrain:
+        prog_terrain['u_tile_array'].value = 14
+    if 'u_ring_gradients' in prog_terrain:
+        prog_terrain['u_ring_gradients'].value = 0
+    if 'u_ringshine_map' in prog_terrain:
+        prog_terrain['u_ringshine_map'].value = 8
 
     # Test rendering offscreen
     fbo = ctx.framebuffer(

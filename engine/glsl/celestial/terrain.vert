@@ -25,12 +25,17 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_ozone_vert[MAX_CASTERS];
 };
 
+layout(std430, binding = 2) readonly buffer AllInstances {
+    vec4 instances[];
+};
+
 struct TerrainPatchInstance {
     vec4 u_range;      // x=min_u, y=min_v, z=max_u, w=max_v in [-1, 1]
     vec4 u_uv_trans;   // x=uv_scale, y=uv_offset_x, z=uv_offset_y, w=skirt_depth_km
     vec4 u_meta;       // x=face_idx, y=lod_level, z=tile_slot, w=radius_km
     vec4 u_body_pos;   // xyz=body_center_au, w=oblateness
     vec4 u_pole;       // xyz=pole_dir, w=rotation_angle
+    vec4 u_extra;      // x=body_idx, yzw=unused
 };
 
 layout(std430, binding = 4) readonly buffer TerrainPatchBuffer {
@@ -55,6 +60,13 @@ flat out float f_scale_height;
 flat out vec3 f_o3_tau;
 flat out vec2 f_o3_layer;
 flat out float f_radius_km;
+
+flat out uvec2 f_caster_mask;
+flat out uint f_ring_mask;
+flat out vec3 f_planetshine_dir;
+flat out vec3 f_planetshine_color;
+flat out vec3 f_body_center;
+out vec3 f_rel_pos;
 
 #define PI 3.14159265358979323846
 
@@ -160,6 +172,20 @@ void main() {
     f_o3_tau = o3_tau;
     f_o3_layer = o3_layer;
     f_radius_km = t_inst.u_meta.w;
+
+    // Unpack instance information for this body from AllInstances
+    uint inst_idx = uint(max(0.0, t_inst.u_extra.x + 0.5));
+    vec4 f3 = instances[inst_idx * 7 + 3];
+    vec4 f4 = instances[inst_idx * 7 + 4];
+    vec4 f5 = instances[inst_idx * 7 + 5];
+
+    f_caster_mask = uvec2(floatBitsToUint(f3.y), floatBitsToUint(f3.z));
+    f_ring_mask = floatBitsToUint(f3.w);
+    f_planetshine_dir = f4.xyz;
+    f_planetshine_color = vec3(f4.w, f5.x, f5.y);
+
+    f_body_center = t_inst.u_body_pos.xyz;
+    f_rel_pos = p_world_km * u_km_to_au;
 
     gl_Position = projection * view * vec4(p_world, 1.0);
     f_clip_z = gl_Position.w;

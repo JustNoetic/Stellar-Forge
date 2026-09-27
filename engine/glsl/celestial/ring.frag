@@ -533,12 +533,18 @@ void main() {
             float pf_backward = CornetteShanksPhaseFunction(f_backscatter, cos_theta);
             // f_scatter controls forward/backward balance (0 = backward dominant, 1 = forward dominant)
             float balance = clamp(f_scatter, 0.0, 1.0);
-            float phaseFunc = mix(pf_backward, pf_forward, balance);
+            // Two-lobed mixture: never completely extinguish the backscattering or forward-scattering lobe
+            // (prevents lit side from going pitch black when balance is high)
+            float w_fwd = mix(0.10, 0.90, balance);
+            float w_back = 1.0 - w_fwd;
+            float phaseFunc = w_back * pf_backward + w_fwd * pf_forward;
+
             float unlit_mult = onLitSide ? 1.0 : f_unlit_factor;
             single_scatter_s = scatteredLight * phaseFunc * unlit_mult;
             
-            // Isotropic multiple scattering only applies to backscattering chunks, not pure forward-scattering dust
-            ms_s = onLitSide ? (AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * (1.0 - balance) * unlit_mult) : 0.0;
+            // Isotropic multiple scattering applies to backscattering chunks with optical depth
+            float ms_chunk_weight = clamp(1.0 - balance * 0.7, 0.1, 1.0);
+            ms_s = onLitSide ? (AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * ms_chunk_weight * unlit_mult) : 0.0;
 
             // Opposition surge: brightening at low phase angles on single scattering (lit side only)
             if (onLitSide) {

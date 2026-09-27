@@ -672,6 +672,7 @@ def bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, s
     n_segs = len(segment_inners)
     combined = np.zeros((res, 4), dtype=np.float32)
     combined_props = np.zeros((res, 4), dtype=np.float32)
+    combined_props_extra = np.zeros((res, 4), dtype=np.float32)
     
     for i in range(res):
         r = tex_radii[i]
@@ -685,6 +686,7 @@ def bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, s
         existing_back = np.float32(-0.3)
         existing_scat = np.float32(1.0)
         existing_unlit = np.float32(1.0)
+        existing_istex = np.float32(0.0)
         
         for j in range(n_segs):
             inner = segment_inners[j]
@@ -725,6 +727,7 @@ def bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, s
                     existing_back = (existing_back * existing_alpha + segment_props[j, 1] * seg_alpha) / total_alpha
                     existing_scat = (existing_scat * existing_alpha + segment_props[j, 2] * seg_alpha) / total_alpha
                     existing_unlit = (existing_unlit * existing_alpha + segment_props[j, 3] * seg_alpha) / total_alpha
+                    existing_istex = (existing_istex * existing_alpha + segment_props[j, 4] * seg_alpha) / total_alpha
                 else:
                     existing_r = r_val
                     existing_g = g_val
@@ -733,6 +736,7 @@ def bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, s
                     existing_back = segment_props[j, 1]
                     existing_scat = segment_props[j, 2]
                     existing_unlit = segment_props[j, 3]
+                    existing_istex = segment_props[j, 4]
                     
                 existing_alpha = new_alpha
                 
@@ -746,7 +750,9 @@ def bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, s
         combined_props[i, 2] = existing_scat
         combined_props[i, 3] = existing_unlit
         
-    return combined, combined_props
+        combined_props_extra[i, 0] = existing_istex
+        
+    return combined, combined_props, combined_props_extra
 
 
 def bake_unified_shadow_profile(body_rings, min_r, max_r, res=4096):
@@ -758,16 +764,15 @@ def bake_unified_shadow_profile(body_rings, min_r, max_r, res=4096):
     
     # Build 3D array of shadow_grads and 2D array of scattering properties
     segment_shadow_grads = np.zeros((n, res, 4), dtype=np.float32)
-    segment_props = np.zeros((n, 4), dtype=np.float32)
+    segment_props = np.zeros((n, 5), dtype=np.float32)
     for j, ring in enumerate(body_rings):
         segment_shadow_grads[j] = ring['shadow_grad']
         asym = float(ring.get('asymmetry', 0.7))
         back = float(ring.get('backscatter', -0.3))
         scat = float(ring.get('scatter', 1.0))
-        is_tex = bool(ring.get('is_textured', False))
+        is_tex = 1.0 if bool(ring.get('is_textured', False)) else 0.0
         unlit = float(ring.get('unlit_factor', 1.0))
-        unlit_encoded = unlit + (100.0 if is_tex else 0.0)
-        segment_props[j] = [asym, back, scat, unlit_encoded]
+        segment_props[j] = [asym, back, scat, unlit, is_tex]
         
     return bake_unified_shadow_profile_jit(tex_radii, segment_inners, segment_outers, segment_opacities, segment_shadow_grads, segment_props)
 
@@ -848,12 +853,12 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
     body_indices = {bi: i for i, bi in enumerate(rings_by_body.keys())}
     
     ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
-    ring_props_data = np.zeros((4, 4096, 4), dtype='f4')
+    ring_props_data = np.zeros((8, 4096, 4), dtype='f4')
     # Default untextured scattering properties
-    ring_props_data[:, :, 0] = 0.7
-    ring_props_data[:, :, 1] = -0.3
-    ring_props_data[:, :, 2] = 1.0
-    ring_props_data[:, :, 3] = 1.0
+    ring_props_data[0::2, :, 0] = 0.7
+    ring_props_data[0::2, :, 1] = -0.3
+    ring_props_data[0::2, :, 2] = 1.0
+    ring_props_data[0::2, :, 3] = 1.0
     
     # 1. Bake unified shadow profile for each body into rows 0 to len(body_indices)-1
     for bi, unified_idx in body_indices.items():
@@ -864,9 +869,10 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
         if body_rings:
             min_r = min(r['inner_r'] for r in body_rings)
             max_r = max(r['outer_r'] for r in body_rings)
-            combined_shadow, combined_props = bake_unified_shadow_profile(body_rings, min_r, max_r)
+            combined_shadow, combined_props, combined_props_extra = bake_unified_shadow_profile(body_rings, min_r, max_r)
             ring_gradient_data[unified_idx, :, :] = combined_shadow
-            ring_props_data[unified_idx, :, :] = combined_props
+            ring_props_data[unified_idx * 2, :, :] = combined_props
+            ring_props_data[unified_idx * 2 + 1, :, :] = combined_props_extra
             
     # 2. Copy individual segment profiles into rows 4 to 15
     for j, ring in enumerate(ring_precomputed):

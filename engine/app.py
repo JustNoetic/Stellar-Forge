@@ -2113,7 +2113,7 @@ class App(InputHandlerMixin):
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
-        ring_props_tex = ctx.texture((4096, 4), 4, dtype='f4')
+        ring_props_tex = ctx.texture((4096, 8), 4, dtype='f4')
         ring_props_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_props_tex.repeat_x = False
         ring_props_tex.repeat_y = False
@@ -2283,8 +2283,14 @@ class App(InputHandlerMixin):
         self.prog_terrain = ctx.program(vertex_shader=terrain_vertex_shader, fragment_shader=terrain_fragment_shader)
         if 'u_tile_array' in self.prog_terrain:
             self.prog_terrain['u_tile_array'].value = 14
+        if 'u_ring_gradients' in self.prog_terrain:
+            self.prog_terrain['u_ring_gradients'].value = 0
+        if 'u_ringshine_map' in self.prog_terrain:
+            self.prog_terrain['u_ringshine_map'].value = 8
         if 'u_km_to_au' in self.prog_terrain:
             self.prog_terrain['u_km_to_au'].value = float(1.0 / 149597870.7)
+        if 'u_au_to_km' in self.prog_terrain:
+            self.prog_terrain['u_au_to_km'].value = float(149597870.7)
         if 'u_is_cloud_pass' in self.prog_terrain:
             self.prog_terrain['u_is_cloud_pass'].value = False
         if 'u_cloud_altitude_km' in self.prog_terrain:
@@ -2300,11 +2306,11 @@ class App(InputHandlerMixin):
             index_buffer=self.ibo_terrain_grid
         )
         MAX_TERRAIN_PATCHES = 4096
-        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
+        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 96)
         terrain_patch_ssbo = self.terrain_patch_ssbo
-        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
-        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
-        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
+        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 24), dtype=np.float32)
+        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 96)
+        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 24), dtype=np.float32)
         self.terrain_current_raw_patches = None
         self.terrain_current_body_name = None
         self.terrain_current_body_idx = -1
@@ -2376,6 +2382,14 @@ class App(InputHandlerMixin):
             prog_spheres['u_ringshine_cdf_lut'].value = 7
         if 'u_ringshine_map' in prog_spheres:
             prog_spheres['u_ringshine_map'].value = 8
+
+        self.uniform_terrain_ring_centers = self.prog_terrain.get('u_ring_center', None)
+        self.uniform_terrain_ring_normals = self.prog_terrain.get('u_ring_normal', None)
+        self.uniform_terrain_ring_params = self.prog_terrain.get('u_ring_params', None)
+        self.uniform_terrain_ring_coplanar_mask = self.prog_terrain.get('u_ring_coplanar_mask', None)
+        self.uniform_terrain_caster_max_bend = self.prog_terrain.get('u_caster_max_bend', None)
+        self.uniform_terrain_num_ring_planes = self.prog_terrain.get('u_num_ring_planes', None)
+        self.uniform_terrain_au_to_km = self.prog_terrain.get('u_au_to_km', None)
     
         star_idx = 0
         for i, b in enumerate(bodies_data):
@@ -4974,6 +4988,10 @@ class App(InputHandlerMixin):
             uniform_screen_height.value = self.fb_height
             uniform_fov_factor.value = fov_factor
             uniform_num_ring_planes.value = n_ring_planes
+            if getattr(self, 'uniform_terrain_num_ring_planes', None) is not None:
+                self.uniform_terrain_num_ring_planes.value = n_ring_planes
+            if getattr(self, 'uniform_terrain_au_to_km', None) is not None:
+                self.uniform_terrain_au_to_km.value = 149597870.7
             if 'u_camera_pos' in prog_spheres:
                 prog_spheres['u_camera_pos'].value = tuple(cam_pos)
             if 'u_camera_pos' in prog_point_celestial:
@@ -4984,6 +5002,8 @@ class App(InputHandlerMixin):
                 prog_point_celestial['fov_factor'].value = float(fov_factor)
             if uniform_caster_max_bend is not None:
                 uniform_caster_max_bend.write(caster_max_bend_buf)
+            if getattr(self, 'uniform_terrain_caster_max_bend', None) is not None:
+                self.uniform_terrain_caster_max_bend.write(caster_max_bend_buf)
             if uniform_caster_mie is not None:
                 try:
                     uniform_caster_mie.write(caster_mie_buf)
@@ -5001,6 +5021,14 @@ class App(InputHandlerMixin):
                     uniform_ring_5colors.write(ring_5colors_buf)
                 if uniform_ring_coplanar_mask is not None:
                     uniform_ring_coplanar_mask.write(ring_coplanar_mask_buf)
+                if getattr(self, 'uniform_terrain_ring_centers', None) is not None:
+                    self.uniform_terrain_ring_centers.write(ring_centers_buf)
+                if getattr(self, 'uniform_terrain_ring_normals', None) is not None:
+                    self.uniform_terrain_ring_normals.write(ring_normals_buf)
+                if getattr(self, 'uniform_terrain_ring_params', None) is not None:
+                    self.uniform_terrain_ring_params.write(ring_params_buf)
+                if getattr(self, 'uniform_terrain_ring_coplanar_mask', None) is not None:
+                    self.uniform_terrain_ring_coplanar_mask.write(ring_coplanar_mask_buf)
             
             view_rot = view.copy()
             view_rot[3, 0:3] = 0.0
@@ -5084,7 +5112,7 @@ class App(InputHandlerMixin):
             rs_band_count = int(self.camera.get("ringshine_band_count", 100))
             rs_oblate = bool(self.camera.get("ringshine_oblate_enabled", True))
             
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view, self.prog_terrain):
                 if prog is None: continue
                 u = prog.get('u_exposure', None)
                 if u is not None: u.value = exposure
@@ -5338,6 +5366,7 @@ class App(InputHandlerMixin):
                         self.terrain_patch_staging[st:en, 15] = obl
                         self.terrain_patch_staging[st:en, 16:19] = pole_n
                         self.terrain_patch_staging[st:en, 19] = rot_angle
+                        self.terrain_patch_staging[st:en, 20] = float(b_i)
 
                         # Batched tile residency lookup: resolve each unique
                         # tile once instead of one Python call per patch.
@@ -5365,7 +5394,10 @@ class App(InputHandlerMixin):
 
                     terrain_patch_ssbo.write(self.terrain_patch_staging[:total_patches_rendered].tobytes())
                     terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
+                    all_instances_buffer.bind_to_storage_buffer(binding=2)
 
+                    ring_gradient_tex.use(location=0)
+                    self.ringshine_map_tex.use(location=8)
                     self.terrain_streamer.use(location=14)
                     if 'u_camera_pos' in self.prog_terrain:
                         self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
@@ -6704,7 +6736,10 @@ class App(InputHandlerMixin):
 
                             self.terrain_cloud_ssbo.write(self.terrain_cloud_staging[:num_p].tobytes())
                             self.terrain_cloud_ssbo.bind_to_storage_buffer(binding=4)
+                            all_instances_buffer.bind_to_storage_buffer(binding=2)
 
+                            ring_gradient_tex.use(location=0)
+                            self.ringshine_map_tex.use(location=8)
                             self.terrain_streamer.use(location=14)
                             if 'u_is_cloud_pass' in self.prog_terrain:
                                 self.prog_terrain['u_is_cloud_pass'].value = True

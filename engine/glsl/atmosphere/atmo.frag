@@ -2215,9 +2215,15 @@ void main() {
             vec3 P_dir = normalize(mid_pos);
             vec3 L_dir = L_mid;
 
+            vec3 sun_pos_local_0 = (0 < 4) ? u_star_pos_local[0].xyz : ((u_stars_pos_radius[0].xyz - planet_center_render) * u_au_to_km);
+            vec3 L0 = (length(sun_pos_local_0) > 1e-6) ? normalize(sun_pos_local_0) : vec3(0.0, 1.0, 0.0);
+
             for (int j = 0; j < u_num_ring_planes; j++) {
                 if ((u_ring_mask & (1u << j)) == 0u) continue;
                 vec3 ring_normal = u_ring_normal[j];
+                float sun_elev_0 = dot(L0, ring_normal);
+                float sun_elev_s = dot(L_dir, ring_normal);
+                float rel_hemi = (sun_elev_s * sun_elev_0 >= 0.0) ? 1.0 : -1.0;
 
                 vec3 antiL = -L_dir;
                 vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
@@ -2238,7 +2244,7 @@ void main() {
                 float x_prime = phi_center / PI;
                 float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                float y_prime = frag_elevation;
+                float y_prime = frag_elevation * rel_hemi;
                 float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
                 vec2 map_uv = vec2(phi_uv, (float(j) + elev_uv) / 16.0);
