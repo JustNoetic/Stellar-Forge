@@ -4458,13 +4458,14 @@ class App(InputHandlerMixin):
                 if tiles_dir_cache is None:
                     tiles_dir_cache = self._terrain_tiles_dir_cache = {}
 
+                prev_active_terrain_indices = getattr(self, "_prev_active_terrain_indices", set())
                 for b_i in cand_indices:
                     b_pos = all_instances[b_i, 0:3]
                     b_r = all_instances[b_i, 6]
                     d_cam = float(np.linalg.norm(b_pos - cam_pos))
                     apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
-                    # Activate terrain quadtree whenever apparent_px >= 32.0
-                    min_px_thresh = 32.0
+                    # Hysteresis: 24.0 px if body was active in previous frame, 36.0 px if newly activating
+                    min_px_thresh = 24.0 if b_i in prev_active_terrain_indices else 36.0
                     if apparent_px < min_px_thresh:
                         continue
 
@@ -4481,6 +4482,8 @@ class App(InputHandlerMixin):
                         active_terrain_bodies.append((b_i, b_name))
                         if len(active_terrain_bodies) >= max_terrain_bodies:
                             break
+
+                self._prev_active_terrain_indices = {tb[0] for tb in active_terrain_bodies}
 
             active_terrain_body_idx = -1
             active_terrain_body_name = None
@@ -5220,7 +5223,7 @@ class App(InputHandlerMixin):
                 grav_lens_spin = float(grav_lens_params['spin'])
                 grav_lens_pole = tuple(float(x) for x in grav_lens_params['pole'])
 
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_starfield, prog_culling_compute, getattr(self, 'prog_hz', None)):
+            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_starfield, prog_culling_compute, getattr(self, 'prog_hz', None), getattr(self, 'prog_terrain', None)):
                 if prog is not None:
                     if 'u_refract_center' in prog:
                         prog['u_refract_center'].value = refract_center
@@ -5339,20 +5342,63 @@ class App(InputHandlerMixin):
                     D_world = frustum_planes[:, 3].astype(np.float64)
                     N_local = N_world @ R_mat.T
                     D_local = AU_TO_KM * (np.dot(N_world, b_pos.astype(np.float64)) + D_world)
+
+                    # Widen side frustum planes ONLY if line of sight to body passes through refracting atmosphere or gravitational lens
+                    d_cam_body_km = float(np.linalg.norm(cam_pos - b_pos)) * AU_TO_KM
+                    dist_cb_au = float(np.linalg.norm(b_pos - cam_pos))
+                    ray_dir = (b_pos - cam_pos) / max(1e-9, dist_cb_au)
+
+                    if refract_max_bend > 1e-6 and not (np.linalg.norm(b_pos - refract_center) < 1e-7):
+                        v_cr = np.array(refract_center) - cam_pos
+                        t_cr = float(np.dot(v_cr, ray_dir))
+                        if 0.0 < t_cr < dist_cb_au:
+                            d_perp_km = float(np.linalg.norm(v_cr - t_cr * ray_dir)) * AU_TO_KM
+                            if d_perp_km < (refract_radius_km + 15.0 * refract_scale_height):
+                                D_local[:4] += (d_cam_body_km * math.tan(refract_max_bend) * 1.5)
+
+                    if grav_lens_enabled and grav_lens_rs > 1e-6 and not (np.linalg.norm(b_pos - grav_lens_center) < 1e-7):
+                        v_gl = np.array(grav_lens_center) - cam_pos
+                        t_gl = float(np.dot(v_gl, ray_dir))
+                        if 0.0 < t_gl < dist_cb_au:
+                            d_perp_gl_km = float(np.linalg.norm(v_gl - t_gl * ray_dir)) * AU_TO_KM
+                            if d_perp_gl_km < max(grav_lens_radius * 20.0, grav_lens_rs * 100.0):
+                                D_local[:4] += (d_cam_body_km * 0.15)
+
                     local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float32)
 
                     obl = float(all_instances[b_i, 12])
+                    body_max_lod = max_d
+                    if d_cam_body_km > b_r_km * 2.0:
+                        max_disk_lod = self.terrain_streamer.get_max_lod(b_name, "diffuse")
+                        if max_disk_lod >= 0:
+                            body_max_lod = min(max_d, max_disk_lod)
+
                     raw_patches = p_quadtree.traverse_raw(
                         cam_pos_local,
                         fov_deg=float(self.camera["fov"]),
                         screen_height=float(self.fb_height),
-                        max_lod=max_d,
+                        max_lod=body_max_lod,
                         split_factor=split_fac,
                         obl=obl,
                         max_patches=rem_budget,
                         frustum_planes=local_frustum_planes
                     )
                     num_p = len(raw_patches)
+
+                    if num_p == 0 and rem_budget > 0:
+                        # Fallback: if frustum culling rejected all patches but the sphere is on-screen,
+                        # traverse without frustum planes at LOD 0 to ensure the body never disappears.
+                        raw_patches = p_quadtree.traverse_raw(
+                            cam_pos_local,
+                            fov_deg=float(self.camera["fov"]),
+                            screen_height=float(self.fb_height),
+                            max_lod=0,
+                            split_factor=split_fac,
+                            obl=obl,
+                            max_patches=min(rem_budget, 6),
+                            frustum_planes=None
+                        )
+                        num_p = len(raw_patches)
 
                     if num_p > 0:
                         st = total_patches_rendered

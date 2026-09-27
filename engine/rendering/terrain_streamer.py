@@ -20,7 +20,7 @@ class TerrainTileStreamer:
     """
     Manages a ModernGL TextureArray containing cached planet tiles.
     """
-    def __init__(self, ctx, tiles_base_dir="data/tiles", pool_capacity=256, tile_size=512):
+    def __init__(self, ctx, tiles_base_dir="data/tiles", pool_capacity=512, tile_size=512):
         self.ctx = ctx
         self.tiles_base_dir = tiles_base_dir
         self.pool_capacity = pool_capacity
@@ -186,6 +186,16 @@ class TerrainTileStreamer:
         self.in_flight_requests.add(key)
         self.request_queue.put(key)
 
+    def get_max_lod(self, body_name: str, map_type: str = "diffuse") -> int:
+        """Return the maximum LOD available on disk across all 6 faces for a body."""
+        b_name = body_name.lower()
+        max_lod = -1
+        for face in range(6):
+            lod = self.max_available_lods.get((b_name, map_type, face), -1)
+            if lod > max_lod:
+                max_lod = lod
+        return max_lod
+
     def get_tile_slot_or_fallback(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int):
         """
         Returns:
@@ -341,6 +351,11 @@ class TerrainTileStreamer:
 
                 if best_slot == -1:
                     continue  # All slots locked
+
+                # Protect active resident tiles from being evicted in recent frames
+                # to prevent VRAM pool thrashing and high/low LOD rapid flickering.
+                if oldest_frame >= self.current_frame - 2:
+                    continue
 
                 slot = best_slot
                 # Evict old occupant

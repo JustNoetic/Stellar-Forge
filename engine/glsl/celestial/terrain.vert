@@ -45,6 +45,9 @@ layout(std430, binding = 4) readonly buffer TerrainPatchBuffer {
 uniform float u_km_to_au; // 1.0 / 149597870.7
 uniform bool u_is_cloud_pass;
 uniform float u_cloud_altitude_km;
+uniform vec3 u_camera_pos;
+
+#include "common/refraction.glsl"
 
 out vec3 f_world_pos;
 out vec3 f_normal;
@@ -139,6 +142,81 @@ void main() {
 
     // Convert km to world AU and add body center
     vec3 p_world = t_inst.u_body_pos.xyz + p_world_km * u_km_to_au;
+
+    // Apply atmospheric refraction and gravitational lensing
+    bool is_refract_host = (length(t_inst.u_body_pos.xyz - u_refract_center) < 1e-7);
+    if (!is_refract_host) {
+        // Background celestial body viewed through a foreground atmosphere or black hole
+        p_world = apply_refraction(p_world, u_camera_pos);
+    } else {
+        if (u_refract_max_bend > 1e-6) {
+            // Terrestrial Refraction for host planet ground/clouds (horizon extension)
+            vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
+            float r_cam = length(C_km);
+
+            vec3 pole_n_refr = length(t_inst.u_pole.xyz) > 1e-4 ? normalize(t_inst.u_pole.xyz) : vec3(0.0, 1.0, 0.0);
+            float f_scale_refr = (obl > 0.0 && obl < 0.99) ? (1.0 / (1.0 - obl)) : 1.0;
+            vec3 C_scaled = C_km + pole_n_refr * (dot(C_km, pole_n_refr) * (f_scale_refr * f_scale_refr - 1.0));
+            vec3 local_up = normalize(C_scaled);
+
+            float local_refract_radius = u_refract_radius;
+            if (obl > 0.001 && obl < 0.99) {
+                vec3 P_dir = r_cam > 1e-6 ? (C_km / r_cam) : vec3(0.0, 1.0, 0.0);
+                float cos_t = abs(dot(P_dir, pole_n_refr));
+                float k = 1.0 / (1.0 - obl);
+                float denom = sqrt(max(1e-6, 1.0 + (k * k - 1.0) * cos_t * cos_t));
+                local_refract_radius = u_refract_radius / denom;
+            }
+
+            float h = r_cam - local_refract_radius;
+            if (h < u_refract_scale_height * 15.0) {
+                float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
+                float k_refr = u_refract_max_bend * 0.5 * sqrt((2.0 * local_refract_radius) / max(1e-4, 3.141592653589793 * u_refract_scale_height));
+                float h_eff = max(h, 0.002);
+                float theta_dip_eff = sqrt(2.0 * h_eff / local_refract_radius);
+                float max_terr_alpha = clamp(0.5 * k_refr * density * theta_dip_eff, 0.0, 0.05);
+
+                if (max_terr_alpha > 1e-7) {
+                    vec3 view_vec = p_world - u_camera_pos;
+                    float d_v = length(view_vec);
+                    if (d_v > 1e-7) {
+                        vec3 view_ray = view_vec / d_v;
+                        float mu = dot(view_ray, local_up);
+                        float mu_horiz = -sqrt(max(0.0, 2.0 * max(h, 0.0) / local_refract_radius));
+                        float delta_mu = sqrt(2.0 * u_refract_scale_height / local_refract_radius);
+                        float x = (mu - mu_horiz) / max(1e-6, delta_mu);
+                        float alpha = max_terr_alpha * exp(-x * x);
+
+                        if (alpha > 1e-7) {
+                            vec3 u_dir = local_up - view_ray * mu;
+                            float u_len = length(u_dir);
+                            if (u_len > 1e-5) {
+                                u_dir /= u_len;
+                                vec3 app_ray = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
+                                p_world = u_camera_pos + app_ray * d_v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Gravitational lensing for host planet if orbiting near a black hole
+        if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && length(t_inst.u_body_pos.xyz - u_grav_lens_center) > 1e-7) {
+            vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
+            vec3 P_km = (p_world - u_grav_lens_center) * u_au_to_km;
+            vec3 true_vec = P_km - C_km;
+            float d_km = length(true_vec);
+            if (d_km > 1e-5) {
+                vec3 V = true_vec / d_km;
+                bool is_shadow = false;
+                vec3 V_app = apply_gravitational_deflection(C_km, V, d_km, is_shadow);
+                if (!is_shadow) {
+                    p_world = u_camera_pos + V_app * (d_km / u_au_to_km);
+                }
+            }
+        }
+    }
 
     f_world_pos = p_world;
     f_normal = n_world;

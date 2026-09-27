@@ -123,10 +123,34 @@ if _HAS_NUMBA:
         eff_dist = max(radius_km + 1e-4, cs_dist)
         horizon_angle = math.acos(min(1.0, radius_km / eff_dist))
         
+        # Sort root faces by alignment with camera direction so that the face pointing
+        # most directly at the camera is pushed last and popped FIRST (LIFO).
+        # This guarantees front-facing patches always get top priority and never starve.
+        face_order = np.array([0, 1, 2, 3, 4, 5], dtype=np.int32)
+        face_dots = np.empty(6, dtype=np.float32)
+        for f in range(6):
+            if f == 0:    fnx, fny, fnz = 1.0, 0.0, 0.0
+            elif f == 1:  fnx, fny, fnz = -1.0, 0.0, 0.0
+            elif f == 2:  fnx, fny, fnz = 0.0, 1.0, 0.0
+            elif f == 3:  fnx, fny, fnz = 0.0, -1.0, 0.0
+            elif f == 4:  fnx, fny, fnz = 0.0, 0.0, 1.0
+            else:         fnx, fny, fnz = 0.0, 0.0, -1.0
+            face_dots[f] = fnx * cs_dx + fny * cs_dy + fnz * cs_dz
+
+        # Insertion sort ascending (smallest dot pushed first, largest pushed last)
+        for i in range(1, 6):
+            key_f = face_order[i]
+            key_dot = face_dots[key_f]
+            j = i - 1
+            while j >= 0 and face_dots[face_order[j]] > key_dot:
+                face_order[j + 1] = face_order[j]
+                j -= 1
+            face_order[j + 1] = key_f
+
         stack = np.empty((512, 4), dtype=np.int32)
         s_ptr = 0
-        for f in range(6):
-            stack[s_ptr, 0] = f
+        for f_idx in range(6):
+            stack[s_ptr, 0] = face_order[f_idx]
             stack[s_ptr, 1] = 0
             stack[s_ptr, 2] = 0
             stack[s_ptr, 3] = 0
@@ -195,15 +219,14 @@ if _HAS_NUMBA:
             dist_to_surface = max(0.01, dist_to_center - radius)
             screen_size = (radius * screen_height) / (dist_to_surface * 2.0 * tan_half_fov)
             
-            if screen_size > threshold_px and lod < max_lod:
+            if screen_size > threshold_px and lod < max_lod and (s_ptr + 4 < 512):
                 nl = lod + 1
                 bx = x * 2
                 by = y * 2
-                if s_ptr + 4 < 512:
-                    stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx;   stack[s_ptr, 3] = by;   s_ptr += 1
-                    stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx+1; stack[s_ptr, 3] = by;   s_ptr += 1
-                    stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx;   stack[s_ptr, 3] = by+1; s_ptr += 1
-                    stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx+1; stack[s_ptr, 3] = by+1; s_ptr += 1
+                stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx;   stack[s_ptr, 3] = by;   s_ptr += 1
+                stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx+1; stack[s_ptr, 3] = by;   s_ptr += 1
+                stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx;   stack[s_ptr, 3] = by+1; s_ptr += 1
+                stack[s_ptr, 0] = face; stack[s_ptr, 1] = nl; stack[s_ptr, 2] = bx+1; stack[s_ptr, 3] = by+1; s_ptr += 1
             else:
                 if count < max_patches:
                     out[count, 0] = min_u
@@ -415,7 +438,8 @@ class PlanetQuadtree:
                 p.radius = radius
                 active_leaves.append(p)
 
-        for f in range(6):
+        face_order = sorted(range(6), key=lambda f: float(np.dot(_cube_to_sphere_scalar(f, 0.0, 0.0), cs_dir)), reverse=True)
+        for f in face_order:
             _evaluate_node(f, 0, 0, 0)
 
         return active_leaves
