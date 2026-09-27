@@ -25,7 +25,7 @@ def pole_to_ecliptic(pole_ra_deg, pole_dec_deg):
     z = math.sin(dec)
     cos_e, sin_e = math.cos(OBLIQUITY), math.sin(OBLIQUITY)
     pole = np.array([x, y * cos_e + z * sin_e, -y * sin_e + z * cos_e])
-    n = np.linalg.norm(pole)
+    n = fast_norm(pole)
     return pole / n if n > 0 else np.array([0., 0., 1.])
 
 @njit(cache=True)

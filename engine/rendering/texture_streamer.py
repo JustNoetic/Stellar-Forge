@@ -256,10 +256,20 @@ class TextureStreamer:
             idx = self.name_to_idx[name_lower]
             result = {'name_lower': name_lower, 'idx': idx, 'maps': {}}
 
+            MAX_HIGH_RES_DIM = 8192
+
+            def _cap(im):
+                if im.width > MAX_HIGH_RES_DIM or im.height > (MAX_HIGH_RES_DIM // 2):
+                    scale = min(MAX_HIGH_RES_DIM / im.width, (MAX_HIGH_RES_DIM // 2) / im.height)
+                    nw = max(1, int(im.width * scale))
+                    nh = max(1, int(im.height * scale))
+                    return im.resize((nw, nh), Image.Resampling.LANCZOS)
+                return im
+
             # High-res Diffuse
             if paths['diffuse'] and os.path.exists(paths['diffuse']):
                 try:
-                    img_d = Image.open(paths['diffuse']).convert('RGBA')
+                    img_d = _cap(Image.open(paths['diffuse']).convert('RGBA'))
                     result['maps']['diffuse'] = (img_d.size, img_d.tobytes(), 4)
                 except Exception as e:
                     print(f"[TextureStreamer] Error decoding high-res diffuse for {name_lower}: {e}")
@@ -267,7 +277,7 @@ class TextureStreamer:
             # High-res Normal
             if paths['normal'] and os.path.exists(paths['normal']):
                 try:
-                    img_n = Image.open(paths['normal']).convert('RGBA')
+                    img_n = _cap(Image.open(paths['normal']).convert('RGBA'))
                     result['maps']['normal'] = (img_n.size, img_n.tobytes(), 4)
                 except Exception as e:
                     print(f"[TextureStreamer] Error decoding high-res normal for {name_lower}: {e}")
@@ -275,7 +285,7 @@ class TextureStreamer:
             # High-res Specular
             if paths['specular'] and os.path.exists(paths['specular']):
                 try:
-                    img_s = Image.open(paths['specular']).convert('L')
+                    img_s = _cap(Image.open(paths['specular']).convert('L'))
                     result['maps']['specular'] = (img_s.size, img_s.tobytes(), 1)
                 except Exception as e:
                     print(f"[TextureStreamer] Error decoding high-res specular for {name_lower}: {e}")
@@ -283,7 +293,7 @@ class TextureStreamer:
             # High-res Clouds
             if paths['clouds'] and os.path.exists(paths['clouds']):
                 try:
-                    img_c = _prepare_cloud_image(Image.open(paths['clouds']))
+                    img_c = _cap(_prepare_cloud_image(Image.open(paths['clouds'])))
                     result['maps']['clouds'] = (img_c.size, img_c.tobytes(), 4)
                 except Exception as e:
                     print(f"[TextureStreamer] Error decoding high-res clouds for {name_lower}: {e}")

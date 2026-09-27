@@ -148,6 +148,9 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         _, app.show_outliner = imgui.checkbox("System Outliner Panel", getattr(app, "show_outliner", True))
         _, app.show_inspector = imgui.checkbox("Body Inspector Panel", getattr(app, "show_inspector", True))
         _, app.show_time_hud = imgui.checkbox("Time Transport HUD", getattr(app, "show_time_hud", True))
+        changed_stc, app.camera["show_triangle_count"] = imgui.checkbox("Geometry Statistics (Triangle Count)", app.camera.get("show_triangle_count", False))
+        if changed_stc:
+            app.save_settings()
 
         imgui.separator()
         if imgui.menu_item("Toggle Full UI (H)")[0]:

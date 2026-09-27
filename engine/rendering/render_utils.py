@@ -454,6 +454,65 @@ def create_icosphere_mesh(subdivisions=4):
     i_arr = np.array(faces, dtype='i4').ravel()
     return v_arr.ravel(), i_arr
 
+def create_terrain_grid_patch(res=32):
+    """
+    Create a static flat patch grid in [0, 1]x[0, 1] with perimeter skirt vertices.
+    Vertex layout: (u, v, skirt_flag)
+      skirt_flag = 0.0 for main surface
+      skirt_flag = 1.0 for perimeter skirt (extruded downward)
+    Returns:
+      verts: np.ndarray (float32, shape (N, 3))
+      indices: np.ndarray (uint32, shape (M,))
+    """
+    u = np.linspace(0.0, 1.0, res + 1, dtype=np.float32)
+    v = np.linspace(0.0, 1.0, res + 1, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+
+    main_verts = np.stack([uu.ravel(), vv.ravel(), np.zeros_like(uu.ravel())], axis=-1)
+
+    indices = []
+    w = res + 1
+    for j in range(res):
+        for i in range(res):
+            p0 = j * w + i
+            p1 = p0 + 1
+            p2 = (j + 1) * w + i
+            p3 = p2 + 1
+            indices.extend([p0, p2, p1, p1, p2, p3])
+
+    skirt_verts = []
+    curr_idx = len(main_verts)
+
+    def add_skirt_wall(edge_indices):
+        nonlocal curr_idx
+        for k in range(len(edge_indices) - 1):
+            i0 = edge_indices[k]
+            i1 = edge_indices[k + 1]
+            u0, v0 = main_verts[i0, 0], main_verts[i0, 1]
+            u1, v1 = main_verts[i1, 0], main_verts[i1, 1]
+
+            s0 = curr_idx
+            s1 = curr_idx + 1
+            curr_idx += 2
+
+            skirt_verts.append([u0, v0, 1.0])
+            skirt_verts.append([u1, v1, 1.0])
+
+            indices.extend([i0, s0, i1, i1, s0, s1])
+
+    # Bottom edge (j=0, i: 0 -> res)
+    add_skirt_wall([0 * w + i for i in range(res + 1)])
+    # Right edge (i=res, j: 0 -> res)
+    add_skirt_wall([j * w + res for j in range(res + 1)])
+    # Top edge (j=res, i: res -> 0)
+    add_skirt_wall([res * w + i for i in range(res, -1, -1)])
+    # Left edge (i=0, j: res -> 0)
+    add_skirt_wall([j * w + 0 for j in range(res, -1, -1)])
+
+    all_verts = np.vstack([main_verts, np.array(skirt_verts, dtype=np.float32)])
+    return all_verts.astype(np.float32), np.array(indices, dtype=np.uint32)
+
+
 def apply_hsba_np(arr_rgba, hue_shift, saturation, brightness, opacity_mult=1.0, alpha_boost=1.0):
     out = arr_rgba.copy()
     rgb = out[..., :3]

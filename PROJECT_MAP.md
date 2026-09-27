@@ -36,7 +36,9 @@ Stellar-Forge/
 │   │   ├── atmosphere_physics.py # Rayleigh/Mie/absorption coefficients, scale heights
 │   │   └── star_calc.py        # StarCalculator: stellar evolution, HR classification, HZ bounds
 │   ├── rendering/              # Graphics pipeline, shader management, Planetshine & baking
-│   │   ├── render_utils.py     # Mesh/geometry/frustum helpers + time formatting
+│   │   ├── render_utils.py     # Mesh/geometry/frustum helpers + time formatting + create_terrain_grid_patch
+│   │   ├── terrain_quadtree.py # Spherified cube quadtree LOD with tangent-warped grid & oblate culling (Numba)
+│   │   ├── terrain_streamer.py # Asynchronous tiled Texture2DArray virtual streamer with ancestor fallback
 │   │   ├── imgui_renderer.py   # ModernGL + ImGui GLFW render bridge
 │   │   ├── planetshine.py      # Planetshine & JIT rotation angle calculations
 │   │   ├── ring_generator.py   # Procedural ring texture synthesis (SpaceEngine style 1D fBm & resonance gaps)
@@ -51,18 +53,19 @@ Stellar-Forge/
 │   │   ├── outliner.py         # Left System Outliner hierarchy panel with search filter
 │   │   ├── inspector.py        # Right Tabbed Body Inspector (Physical, Orbit, Atmo, Rings, Cosmetics)
 │   │   ├── modals.py           # Centralized dialogs (Graphics settings, Add Body, Create System, Ephemeris setup)
-│   │   └── viewport_hud.py     # Viewport floating HUD pill & toasts
+│   │   └── viewport_hud.py     # Viewport floating HUD pill & toasts + Geometry Statistics overlay
 │   ├── ephemeris/              # Astronomical data & JPL Horizons/SPICE integration
 │   │   ├── system_manager.py   # System I/O, SystemSnapshot, derive_star_properties
 │   │   ├── spice_manager.py    # SpiceManager: kernel download/load, SPICE state queries
 │   │   └── spk_exporter.py     # Timeline -> Type 2/13 SPK (.bsp) export + async UI glue
 │   └── glsl/                   # Dedicated GLSL shader source files
 │       ├── compute/            # Frustum culling & orbit compute shaders (.comp)
-│       ├── celestial/          # Sphere, orbit, ring, HZ shaders (.vert, .frag)
+│       ├── celestial/          # Sphere, terrain/cloud quadtree, orbit, ring, HZ shaders (.vert, .frag)
 │       ├── atmosphere/         # Raymarching, Sky-View LUT & analytical slicing shaders (.vert, .frag)
 │       ├── common/             # Shared GLSL includes (refraction.glsl, sun_terminator.glsl)
 │       └── post/               # Bloom, composite, accumulation & ringshine shaders (.vert, .frag)
 ├── data/
+│   ├── tiles/                  # Spherified cube quadtree tile pyramids ({body}/{layer}/{lod}/{x}_{y}.jpg)
 │   ├── gaia/                   # GAIA star catalog binary (stars.bin) + fetch logs
 │   ├── system.json             # Active default system
 │   ├── systems/<Name>/{meta.json,system.json}   # System presets (Solar System, Achernar, Ephemeris Mode)
@@ -71,6 +74,9 @@ Stellar-Forge/
 │   ├── graphics_settings.json  # Persistent graphics/quality settings
 │   └── horizons_cache.json     # Cache for JPL Horizons REST queries
 ├── scripts/
+│   ├── bake_planet_tiles.py    # Reproject equirectangular planet maps into cubemap quadtree tile pyramids
+│   ├── test_terrain_lod.py     # Automated regression test for quadtree traversal, fallback & streamer
+│   ├── test_terrain_alignment.py # Alignment & distortion verification between quadtree and sphere proxies
 │   ├── fetch_horizons.py       # Query JPL Horizons REST → update system JSON state vectors
 │   ├── fetch_gaia.py           # Fetch Gaia DR3 (+Hipparcos bright supplement) → data/gaia/stars.bin
 │   ├── test_gaia.py            # GAIA starfield sanity checks (synthetic bake + real catalog)
@@ -282,6 +288,7 @@ spectral classification.
 - `engine/rendering/shaders.py`: Dynamically re-exports loaded GLSL shaders:
   - `culling_compute_shader` (`glsl/compute/culling.comp`) — GPU frustum/occlusion culling compute.
   - `sphere_vertex_shader` / `sphere_fragment_shader` (`glsl/celestial/sphere.*`) — PBR planet/star spheres (with ray refraction `compute_refraction_angle` & vertex bounding expansion). Fully-subpixel fragments (f_subpixel_factor > 0.999) are discarded so the 3 px min-size-clamped mesh never writes phantom depth over the subpixel star sprite (transit black-out fix).
+  - `terrain_vertex_shader` / `terrain_fragment_shader` (`glsl/celestial/terrain.*`) — Spherified cube quadtree patch shaders for planetary terrain and cloud shells. Supports tangent warping ($x' = \tan(u\pi/4)$), oblate spheroid coordinates ($P \cdot (1, 1-f, 1)$ with axial tilt and spin), border skirt extrusion (`skirt_depth`), logarithmic depth (`gl_FragDepth`), physical Lambert cosine law with stellar disc penumbra, Rozenberg curved air mass ($am$), direct atmospheric beam extinction ($\exp(-\tau_{\text{direct}})$) with ozone absorption, diffuse skylight dome, cloud shell mode (`u_is_cloud_pass` with two-sided orbit/ground lighting and semi-transparency alpha extraction), and false-color LOD tier debug visualization (`u_debug_tiles`).
   - `orbit_compute_shader` (`glsl/compute/orbit.comp`), `orbit_*` (`glsl/celestial/orbit.*`).
   - `ephem_orbit_*` (`glsl/celestial/ephem_orbit.*`).
   - `ring_*` (`glsl/celestial/ring.*`) — Planetary ring rendering with analytical ray-plane intersection, multi-caster shadow cones with penumbra and Danjon atmospheric tint, planetshine, dynamic vertex bounding mesh expansion in `ring.vert` for atmospheric refraction and gravitational lensing (preventing outer-edge clipping), and accurate hit-point logarithmic depth writing (`gl_FragDepth` from `hit_pos`); `hz_*` (`glsl/celestial/hz.*`).
@@ -303,6 +310,25 @@ spectral classification.
 
 **Edit when:** bloom, tonemapping, exposure, accumulation, ringshine dynamic bake map.
 
+### 3.11b `engine/rendering/terrain_quadtree.py` — Spherified Cube Quadtree LOD (SpaceEngine Style)
+- `cube_to_sphere_point(face, u, v)`: maps normalized cube face $(u, v) \in [-1, 1]$ to unit sphere with tangent warping ($x' = \tan(u\pi/4), y' = \tan(v\pi/4)$) to eliminate cube corner area distortion.
+- `_traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum)`: `@njit(fastmath=True)` traversal kernel evaluating Screen Space Error (SSE) against node bounding spheres, with exact 6-plane view frustum culling in planet local space (preventing low-FOV triangle explosion) and horizon culling in normalized spheroid-to-sphere space $(x, y / (1 - f), z)$ eliminating backside leaks on oblate bodies. Returns packed `(N, 9)` float32 array `[min_u, min_v, max_u, max_v, face, lod, x, y, radius]`. Zero per-frame Python memory allocations.
+- `QuadtreePatch`: container for patch bounds, face index, LOD level, and bounding radius.
+- `PlanetQuadtree`: manages the 6 root cube faces, radius updates, and LOD traversal (`traverse_raw` / `traverse`).
+
+**Edit when:** changing quadtree subdivision metric (SSE / screen size), tangent warping formula, oblate horizon culling, or quadtree traversal.
+
+### 3.11c `engine/rendering/terrain_streamer.py` — Virtual Tiled Texture Streaming
+- `TerrainTileStreamer(ctx, tiles_base_dir="data/tiles", pool_capacity=256, tile_size=512)`:
+  - Manages a ModernGL `Texture2DArray` pool (256 slices of $512 \times 512$ RGBA8) for virtual texture streaming.
+  - Multi-layer support (`"diffuse"` and `"clouds"`). Preloads LOD 0 root slices into locked slots on startup.
+  - Background worker thread (`_worker_loop`) asynchronously reads `.jpg` / `.png` tiles from disk and queues GPU uploads.
+  - `_read_tile_from_disk(path, map_type)`: extracts grayscale luminance into alpha channel `(255, 255, 255, Luminance)` for cloud textures, ensuring smooth semi-transparency.
+  - `get_tile_slot_or_fallback(body_name, map_type, face, lod, x, y)`: returns resident slot index. If the tile is still in flight, traverses up ancestors in $\mathcal{O}(\text{LOD})$ to return the nearest loaded parent slot with exact UV sub-rect scale and offsets `(slot_id, uv_scale, off_x, off_y)`.
+  - `process_uploads(max_per_frame=4)`: transfers loaded byte buffers to GPU Texture2DArray slices via `texture_array.write()`.
+
+**Edit when:** changing texture array pool size / tile resolution, disk caching / tile directory layout, async streaming queues, or cloud transparency extraction.
+
 ### 3.12 `engine/rendering/render_utils.py`
 - `hex_to_rgb`, `sample_gradient` — color helpers.
 - `format_flight_speed(speed_au_s)`, `format_time_speed(multiplier)`, `format_distance_au(dist_au)`,
@@ -311,11 +337,12 @@ spectral classification.
 - `compute_ring_culling(...)` (~L121, `@njit`) — ring visibility.
 - `extract_frustum_planes(vp)` (~L174, `@njit`) — frustum planes from VP matrix.
 - `create_icosphere_mesh(subdivisions=4)` (~L189) — UV/ico sphere geometry.
+- `create_terrain_grid_patch(res=32)` (~L457) — generates a flat patch grid in $[0, 1] \times [0, 1]$ with perimeter skirt vertices (`skirt_flag = 1.0`) extruded downward for seamless LOD stitching.
 - `generate_ring_shadow_grad(...)` (~L242), `generate_ring_geometry(pole_render, min_r, max_r)` (~L259).
 - `rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)` (~L301).
 - `build_ringshine_3d_lut_numba(...)` — Precomputes 3D Form-Factor LUT $(256 \times 256 \times 16)$ covering oblateness $f \in [0.0, 0.3]$ via parallel Numba JIT.
 
-**Edit when:** mesh generation, ring geometry, 3D ringshine form-factor LUT, frustum culling math, time formatting.
+**Edit when:** mesh generation, terrain patch grid & skirts, ring geometry, 3D ringshine form-factor LUT, frustum culling math, time formatting.
 
 ### 3.12b `engine/rendering/star_catalog.py` — GAIA starfield layer (render-only)
 - `StarCatalog` (~L40) — loads `data/gaia/stars.bin` (from `scripts/fetch_gaia.py`):
@@ -378,20 +405,20 @@ spectral classification.
       - System/comparison state snapshot from `shared_state` under lock (~L2359).
       - Camera matrix, tracking, hierarchy refresh (~L2400–2660).
       - `compute_planetshine_numba` → planetshine dirs/colors into instance buffer (~L2819).
-      - GPU culling compute dispatch (`prog_culling_compute.run`) (~L2877).
+      - GPU culling compute dispatch (`prog_culling_compute.run`) (~L2877); sets `u_terrain_body_idx` so sphere proxy pass skips the active terrain body.
       - Orbit polyline compute + draw (~L2880–3264).
       - Sphere PBR draw (LOD: lo/hi/ultra via indirect draw cmds).
-      - Orbit polyline compute + draw.
+      - **Terrain Quadtree LOD pass (Pass 1b)** (~L5200): when `terrain_lod_enabled` is active, selects visible candidate bodies with tiles (up to 4 simultaneous bodies), transforms camera and view frustum planes into each body's local rotation frame with oblateness, runs `PlanetQuadtree.traverse_raw` with 6-plane local frustum culling, stages patches into a shared SSBO, queries `TerrainTileStreamer.get_tile_slot_or_fallback` for diffuse tiles and ancestor UV transforms, and renders instanced terrain patches for all active bodies in a single `vao_terrain.render()` draw call.
       - `render_atmosphere_pass(clip_mode)` — two-pass with dual-source blending (behind/in front of rings); Mode 3 bakes dynamic Sky-View LUT (selectable resolution: Low 192×108, Medium 256×256, High 384×216; `prog_sky_view` into `sky_view_fbo`, texture unit 12) aligned with parent planet axial tilt.
       - Rings render, Habitable Zones, second atmosphere pass.
-      - Dynamic Cloud Layer pass (~L4994) — rendered over the atmosphere with physical view-transmittance fading so the volumetric atmosphere is preserved behind semi-transparent clouds while distant clouds naturally dissolve into horizon haze.
+      - Dynamic Cloud Layer pass (`render_body_clouds`) (~L6588) — when Terrain LOD is enabled, renders clouds using the Quadtree LOD shell offset at $R + h_{\text{cloud}}$ with `clouds` layer virtual tiles and two-sided lighting; otherwise falls back to uniform sphere proxy shell.
       - Modular Dear ImGui UI ('Orion UI'): delegated to `engine.ui.render_ui(...)`:
-        - Top Menu Bar: Systems, Physics, View, Render, Tools, Quick Actions (screenshot & settings)
+        - Top Menu Bar: Systems, Physics, View, Render (Terrain LOD, MSAA, HDR, Atmosphere), Tools, Quick Actions (screenshot & settings)
         - System Outliner (Left Panel): hierarchy tree, quick search filter, body add/delete buttons
         - Body Inspector (Right Panel): tabbed layout (Overview, Orbit, Atmosphere, Rings, Cosmetics)
         - Time Transport HUD (Bottom Bar): playback transport, speed slider, UTC date/time, Jump in Time popup, timeline scrubber
-        - Centralized Modals: Graphics & Quality settings, Add Body, Create System, Ephemeris setup/download
-        - Viewport HUD: minimal floating camera info pill
+        - Centralized Modals: Graphics & Quality settings (Terrain Quadtree LOD, Debug Tiles, Patch Resolution, Atmosphere quality), Add Body, Create System, Ephemeris setup/download
+        - Viewport HUD: minimal floating camera info pill + floating Geometry Statistics overlay (`show_triangle_count`)
       - Accumulation resolve, post-accum orbits/HZ, bloom + composite.
   11. Teardown: stop physics thread, release GL objects, save settings, GLFW destroy.
 
@@ -399,16 +426,19 @@ spectral classification.
 
 ### 3.14 `engine/ui/` — Modular Dear ImGui Interface ('Orion UI')
 - `__init__.py`: Master `render_ui` orchestrator coordinating all UI passes when `app.ui_visible` is True.
-- `menu_bar.py`: `render_main_menu_bar` — Systems switch/create/delete, Physics modes (IAS15, Keplerian, SPICE), View (Free Flight, Simple Orbit, FOV, UI toggles), Render (MSAA, HDR, Atmosphere, Refraction, Planetshine, Ringshine), Tools (Ephemeris, Comparison, Distance Units, Accumulation), Quick HUD (physics badge, F12 Screenshot button, Settings cog).
+- `menu_bar.py`: `render_main_menu_bar` — Systems switch/create/delete, Physics modes (IAS15, Keplerian, SPICE), View (Free Flight, Simple Orbit, FOV, UI toggles, Triangle Count), Render (Terrain LOD, Debug Tiles, MSAA, HDR, Atmosphere, Refraction, Planetshine, Ringshine), Tools (Ephemeris, Comparison, Distance Units, Accumulation), Quick HUD (physics badge, F12 Screenshot button, Settings cog).
 - `time_hud.py`: `render_time_hud` — Centered floating transport bar with Play/Pause, Forward/Backward, formatted speed readout & logarithmic slider, 1x reset, UTC date display, and Jump in Time popup / timeline playback & scrubbing.
 - `inspector.py`: `render_body_inspector` — Right-anchored tabbed inspector with Edit Mode (interactive editing of physical/stellar properties and osculating Keplerian orbital elements with reference frame selection, dynamic Roche limit checks, Darwin/Maclaurin oblateness auto-calculation, and real-time CRUD synchronization), real-time camera Distance & Altitude readouts (accounting for oblate spheroid surface radius $R(\mathbf{u})$, flattening $f$, and axial spin pole), Overview, Orbit, Atmosphere, Rings, and Cosmetics.
   - Orbit gravitational-limit readouts: instantaneous Hill radius from live body/parent mass and separation (same approximation as hierarchy selection); fluid Roche distance from the parent's center for the selected body's mass/radius, with proposed edit values and periapsis warning. No limit readouts for barycenters or parentless bodies; the existing edit Apply restriction remains unchanged.
   - Stellar Overview exposes optimistic HZ bounds matching the overlay (`sqrt(lum/1.78)`, `sqrt(lum/0.32)`); Atmosphere exposes its existing equilibrium temperature and cached gas scale height/molar mass.
 
-- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. atmospheric quality mode 0–3, Mode 3 Sky-View LUT Resolution combo [Low 192×108, Medium 256×256, High 384×216], Mode 3 Shadow Method combo [Station-Locked Slicing vs Uniform Stochastic Raymarching], dynamic slider [Shadow Slicing Cells 2–32 vs Shadow Ray Steps 4–64], Stochastic Raymarching noise toggle, Noise Type combo [IGN vs STBN], atmospheric refraction, and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, SPICE Downloader, and Import Ephemeris Kernel (.bsp).
-- `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill.
+- `modals.py`: `render_modals` — Centralized modal dialogs for Graphics & Quality Settings (incl. Terrain Quadtree LOD toggle, Debug Tiles toggle, Dynamic Patch Resolution combo [8x8, 16x16, 32x32, 64x64], atmospheric quality mode 0–3, Mode 3 Sky-View LUT Resolution combo [Low 192×108, Medium 256×256, High 384×216], Mode 3 Shadow Method combo [Station-Locked Slicing vs Uniform Stochastic Raymarching], dynamic slider [Shadow Slicing Cells 2–32 vs Shadow Ray Steps 4–64], Stochastic Raymarching noise toggle, Noise Type combo [IGN vs STBN], atmospheric refraction, and gravitational-lensing toggle/strength), Add Orbiting Body, Create New Star System, Ephemeris Kernel Setup, SPICE Downloader, and Import Ephemeris Kernel (.bsp).
+- `viewport_hud.py`: `render_viewport_hud` — Viewport floating camera mode & flight speed indicator pill, plus floating **Geometry Statistics / Triangle Count Overlay** (`show_triangle_count`) displaying real-time rendered triangle counts (Total, Terrain with active patch count & grid resolution, Spheres) and framerate.
 
 ### 3.15 `scripts/`
+- `bake_planet_tiles.py` — High-performance offline tool to reproject equirectangular planetary maps (diffuse, clouds, normal) into tangent-warped spherified cube quadtree tile pyramids (`data/tiles/<body_name>/<map_type>/<face>/<lod>/<x>_<y>.jpg`). Supports `--all` (batch bake all Solar System bodies), `--no-clouds`, `--body`, `--input`, `--map-type`, `--max-lod`, `--tile-size`, and `--out-dir`.
+- `test_terrain_lod.py` — Automated regression test validating spherified cube quadtree LOD traversal, oblate horizon culling, ancestor fallback UV calculations, and multi-layer virtual streaming.
+- `test_terrain_alignment.py` — Alignment and distortion verification comparing quadtree vertex positions against analytical oblate spheroid surface points.
 - `accuracy_test.py` — `get_parent_center(body_name, parent_name)`, `main()`. Runs 1-yr forward integration vs JPL Horizons, prints RTN km error table.
 - `fetch_horizons.py` — `get_parent_center`, `_load_cache`/`_save_cache`, `query_horizons(body_id, center, start_time, stop_time)`, `parse_state_vector(response_text)`, `main()`. Writes `data/horizons_cache.json` + updates system JSON.
 - `fetch_gaia.py` — fetches a magnitude-limited Gaia DR3 subset (24 RA bands, TAP sync) plus a Hipparcos bright-star supplement (V < 2.5; Gaia photometry is saturation-broken for these, e.g. Sirius A), propagated to the J2016.0 epoch. Writes `data/gaia/stars.bin` (32-byte records: ra/dec/plx/pmra/pmdec/rv/G/BP-RP, f4).
@@ -477,9 +507,11 @@ per frame:
   prog_culling_compute.run() → writes indirect draw cmd buffer + visibility
   if show_orbits: prog_orbit_compute.run() / ephemeris orbit draw
   draw spheres (LOD indirect): prog_spheres with eclipse LUT, planetshine, ringshine uniforms
+  draw terrain LOD (Pass 1b): prog_terrain instanced quadtree patches with tiled virtual texture streaming
   render_atmosphere_pass(1)  [behind rings]   ─┐
   draw rings (prog_rings)                       ├─ two-pass atmo/ring ordering
   draw habitable zones (prog_hz)                │
+  draw cloud LOD shell (prog_terrain clouds)    │
   render_atmosphere_pass(2)  [in front]        ─┘
   ImGui: top bar, system menu, mode radio, inspector, modals
   TAA resolve (taa_resolve_shader_fs) when enabled
@@ -563,6 +595,13 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Validate lensing math on GPU | `scripts/test_lensing_math.py` | `main` |
 | Change bloom/tonemap/Accumulation shaders | `engine/glsl/post/` | GLSL files loaded via `engine/rendering/post_shaders.py` |
 | Change mesh/ring geometry, frustum culling | `engine/rendering/render_utils.py` | — |
+| Change terrain patch mesh & skirts | `engine/rendering/render_utils.py` | `create_terrain_grid_patch` |
+| Change terrain quadtree LOD & oblate culling | `engine/rendering/terrain_quadtree.py` | `PlanetQuadtree`, `_traverse_quadtree_jit` |
+| Change terrain virtual texture streaming & fallback | `engine/rendering/terrain_streamer.py` | `TerrainTileStreamer`, `get_tile_slot_or_fallback` |
+| Change terrain/cloud quadtree shaders | `engine/glsl/celestial/terrain.vert`, `engine/glsl/celestial/terrain.frag` | GLSL shader source |
+| Change terrain patch resolution & triangle statistics HUD | `engine/ui/modals.py`, `engine/ui/viewport_hud.py` | `terrain_patch_res`, `show_triangle_count` |
+| Bake planet tile pyramids offline | `scripts/bake_planet_tiles.py` | `main` |
+| Validate terrain LOD traversal & alignment | `scripts/test_terrain_lod.py`, `scripts/test_terrain_alignment.py` | `main` |
 | Change planetshine & moon ringshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
 | Change procedural ring generation / presets | `engine/rendering/ring_generator.py` | `generate_procedural_ring_profile`, `RING_PRESETS` |
 | Change ring texture baking & application | `engine/rendering/texture_baker.py` | `apply_procedural_ring_to_body`, `bake_and_export_ring_textures` |

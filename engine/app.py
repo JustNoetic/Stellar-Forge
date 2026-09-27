@@ -352,6 +352,8 @@ from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
+from engine.rendering.terrain_quadtree import PlanetQuadtree
+from engine.rendering.terrain_streamer import TerrainTileStreamer
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 from engine.ui import render_ui
 
@@ -566,6 +568,7 @@ class App(InputHandlerMixin):
             "photo_accum_target": 0,
             "screenshot_accum_target": 16,
             "movement_mode": 0,
+            "terrain_patch_res": 32,
         }
         self.time_ctrl = {
             "multiplier": 1.0,
@@ -776,6 +779,12 @@ class App(InputHandlerMixin):
                 "flight_speed": self.camera.get("flight_speed", 0.1),
                 "shadow_caster_budget": self.camera.get("shadow_caster_budget", 32),
                 "tex_stream_threshold_px": self.camera.get("tex_stream_threshold_px", 500.0),
+                "terrain_lod_enabled": self.camera.get("terrain_lod_enabled", False),
+                "terrain_debug_tiles": self.camera.get("terrain_debug_tiles", False),
+                "terrain_lod_split_factor": self.camera.get("terrain_lod_split_factor", 1.0),
+                "terrain_max_depth": self.camera.get("terrain_max_depth", 6),
+                "terrain_patch_res": self.camera.get("terrain_patch_res", 32),
+                "show_triangle_count": self.camera.get("show_triangle_count", False),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
                 "horizon_align": self.camera.get("horizon_align", True),
                 "photo_accum_enabled": self.camera.get("photo_accum_enabled", False),
@@ -791,6 +800,41 @@ class App(InputHandlerMixin):
                 json.dump(saved, f, indent=4)
         except Exception as e:
             print(f"Failed to save settings: {e}")
+
+    def rebuild_terrain_grid_patch(self, res: int):
+        """
+        Rebuilds the terrain patch mesh with a new grid resolution (res x res)
+        and rebinds the vertex array object without restarting the application.
+        """
+        res = int(max(4, min(128, res)))
+        self.camera["terrain_patch_res"] = res
+        if not hasattr(self, 'ctx') or self.ctx is None or not hasattr(self, 'prog_terrain') or self.prog_terrain is None:
+            return
+        grid_verts, grid_idx = create_terrain_grid_patch(res=res)
+        if hasattr(self, 'vbo_terrain_grid') and self.vbo_terrain_grid:
+            try:
+                self.vbo_terrain_grid.release()
+            except Exception:
+                pass
+        if hasattr(self, 'ibo_terrain_grid') and self.ibo_terrain_grid:
+            try:
+                self.ibo_terrain_grid.release()
+            except Exception:
+                pass
+        if hasattr(self, 'vao_terrain') and self.vao_terrain:
+            try:
+                self.vao_terrain.release()
+            except Exception:
+                pass
+        self.vbo_terrain_grid = self.ctx.buffer(grid_verts.tobytes())
+        self.ibo_terrain_grid = self.ctx.buffer(grid_idx.tobytes())
+        self.vao_terrain = self.ctx.vertex_array(
+            self.prog_terrain,
+            [(self.vbo_terrain_grid, '3f', 'in_position')],
+            index_buffer=self.ibo_terrain_grid
+        )
+        self.terrain_triangles_per_patch = len(grid_idx) // 3
+        self.save_settings()
 
     def resize_sky_view_lut(self, width, height):
         if self.sky_view_width == width and self.sky_view_height == height and self.sky_view_fbo is not None:
@@ -2234,6 +2278,47 @@ class App(InputHandlerMixin):
             [(vbo_ultra, '3f 3f', 'in_position', 'in_normal')],
             index_buffer=ibo_ultra
         )
+
+        # Terrain Quadtree LOD pipeline (SpaceEngine style)
+        self.prog_terrain = ctx.program(vertex_shader=terrain_vertex_shader, fragment_shader=terrain_fragment_shader)
+        if 'u_tile_array' in self.prog_terrain:
+            self.prog_terrain['u_tile_array'].value = 14
+        if 'u_km_to_au' in self.prog_terrain:
+            self.prog_terrain['u_km_to_au'].value = float(1.0 / 149597870.7)
+        if 'u_is_cloud_pass' in self.prog_terrain:
+            self.prog_terrain['u_is_cloud_pass'].value = False
+        if 'u_cloud_altitude_km' in self.prog_terrain:
+            self.prog_terrain['u_cloud_altitude_km'].value = 0.0
+
+        patch_res = int(self.camera.get("terrain_patch_res", 32))
+        grid_verts, grid_idx = create_terrain_grid_patch(res=patch_res)
+        self.vbo_terrain_grid = ctx.buffer(grid_verts.tobytes())
+        self.ibo_terrain_grid = ctx.buffer(grid_idx.tobytes())
+        self.vao_terrain = ctx.vertex_array(
+            self.prog_terrain,
+            [(self.vbo_terrain_grid, '3f', 'in_position')],
+            index_buffer=self.ibo_terrain_grid
+        )
+        MAX_TERRAIN_PATCHES = 4096
+        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
+        terrain_patch_ssbo = self.terrain_patch_ssbo
+        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
+        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
+        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
+        self.terrain_current_raw_patches = None
+        self.terrain_current_body_name = None
+        self.terrain_current_body_idx = -1
+        self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=256, tile_size=512)
+        self.planet_quadtrees = {}
+        self.terrain_last_patch_count = 0
+        self.terrain_last_triangle_count = 0
+        self.sphere_last_triangle_count = 0
+        self.total_last_triangle_count = 0
+        self.terrain_triangles_per_patch = len(grid_idx) // 3
+        self.sphere_lo_triangles = len(mesh_lo_idx) // 3
+        self.sphere_hi_triangles = len(mesh_hi_idx) // 3
+        self.sphere_ultra_triangles = len(mesh_ultra_idx) // 3
+
         self.single_cloud_body_buf = ctx.buffer(reserve=4)
     
         vao_atmo = ctx.vertex_array(
@@ -4123,12 +4208,23 @@ class App(InputHandlerMixin):
                 is_tracked = (self.camera.get("tracking_idx") == b_i and not self.camera.get("tracking_is_cmp", False))
                 
                 if (apparent_px >= stream_thresh_px or is_tracked) and self.active_res_level.get(t_slice) != 'high':
+                    # If Terrain LOD is active and this body has baked tiles, skip legacy 21.6K monolithic load to prevent stutter
+                    if self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
+                        body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name_lower)
+                        if os.path.isdir(body_tiles_dir):
+                            continue
                     self.texture_streamer.request_high_res(b_name_lower)
 
             # Process any completed high-res decoded textures from background worker
             decoded_results = self.texture_streamer.poll_results(max_items=2)
             for res in decoded_results:
                 r_idx = res['idx']
+                b_name_lower = res.get('name_lower', '')
+                if self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
+                    body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name_lower)
+                    if os.path.isdir(body_tiles_dir):
+                        self.active_res_level[r_idx] = 'high'
+                        continue
                 r_slot = r_idx - 1
                 maps = res['maps']
                 if not maps:
@@ -4318,6 +4414,54 @@ class App(InputHandlerMixin):
                 else:
                     tracking_idx_uni = self.camera["tracking_idx"]
             prog_culling_compute['u_tracking_idx'].value = tracking_idx_uni
+
+            # Identify active bodies for terrain Quadtree LOD
+            active_terrain_bodies = []
+            terrain_enabled = bool(self.camera.get("terrain_lod_enabled", False))
+
+            if terrain_enabled and getattr(self, 'terrain_streamer', None) is not None:
+                self.terrain_streamer.process_uploads(max_per_frame=4)
+                cand_indices = []
+                if tracking_idx_uni >= 0 and tracking_idx_uni < total_render_bodies:
+                    cand_indices.append(tracking_idx_uni)
+                insp_idx = self.camera.get("inspected_idx", -1)
+                if insp_idx is not None and 0 <= insp_idx < total_render_bodies and insp_idx not in cand_indices:
+                    cand_indices.append(insp_idx)
+                for b_i in range(total_render_bodies):
+                    if b_i not in cand_indices:
+                        cand_indices.append(b_i)
+
+                fov_fac = float(1.0 / math.tan(math.radians(max(0.001, self.camera["fov"]) / 2.0)))
+                max_terrain_bodies = 4
+                for b_i in cand_indices:
+                    b_name = bodies_data[b_i]["name"].lower() if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]["name"].lower()
+                    body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name)
+                    if os.path.isdir(body_tiles_dir):
+                        b_pos = all_instances[b_i, 0:3]
+                        b_r = all_instances[b_i, 6]
+                        d_cam = float(np.linalg.norm(b_pos - cam_pos))
+                        apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
+                        # Activate terrain quadtree whenever apparent_px >= 32.0
+                        min_px_thresh = 32.0
+                        if apparent_px >= min_px_thresh:
+                            r_cull = b_r * (1.5 if d_cam > b_r else 5.0)
+                            if is_sphere_in_frustum(b_pos, r_cull, frustum_planes):
+                                active_terrain_bodies.append((b_i, b_name))
+                                if len(active_terrain_bodies) >= max_terrain_bodies:
+                                    break
+
+            active_terrain_body_idx = active_terrain_bodies[0][0] if active_terrain_bodies else -1
+            active_terrain_body_name = active_terrain_bodies[0][1] if active_terrain_bodies else None
+            active_terrain_body_indices = [tb[0] for tb in active_terrain_bodies]
+
+            if 'u_terrain_body_idx' in prog_culling_compute:
+                prog_culling_compute['u_terrain_body_idx'].value = active_terrain_body_idx
+            if 'u_num_terrain_bodies' in prog_culling_compute:
+                prog_culling_compute['u_num_terrain_bodies'].value = len(active_terrain_body_indices)
+            if 'u_terrain_body_indices' in prog_culling_compute:
+                indices_padded = active_terrain_body_indices[:16] + [0] * max(0, 16 - len(active_terrain_body_indices))
+                prog_culling_compute['u_terrain_body_indices'].value = tuple(indices_padded)
+
             if 'u_camera_pos' in prog_culling_compute:
                 prog_culling_compute['u_camera_pos'].value = tuple(cam_pos)
             if 'u_screen_height' in prog_culling_compute:
@@ -5065,12 +5209,174 @@ class App(InputHandlerMixin):
             vis_lo_buffer.bind_to_storage_buffer(binding=3)
             vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
 
+            # Pass 1b: Terrain Quadtree LOD (SpaceEngine style) - Multi-Body with Local Frustum Culling
+            self.terrain_active_body_patches = {}
+            total_patches_rendered = 0
+
+            if active_terrain_bodies and getattr(self, 'terrain_streamer', None) is not None:
+                patch_res = int(self.camera.get("terrain_patch_res", 32))
+                res_scale = max(0.6, patch_res / 32.0)
+                split_fac = float(self.camera.get("terrain_lod_split_factor", 1.0)) * res_scale
+                max_d = int(self.camera.get("terrain_max_depth", 6))
+                AU_TO_KM = 149597870.7
+
+                for b_i, b_name in active_terrain_bodies:
+                    rem_budget = MAX_TERRAIN_PATCHES - total_patches_rendered
+                    if rem_budget <= 0:
+                        break
+
+                    b_r_au = float(all_instances[b_i, 6])
+                    b_r_km = b_r_au * AU_TO_KM
+                    if b_i not in self.planet_quadtrees:
+                        self.planet_quadtrees[b_i] = PlanetQuadtree(b_r_km)
+                    p_quadtree = self.planet_quadtrees[b_i]
+                    p_quadtree.update_radius(b_r_km)
+
+                    b_pos = all_instances[b_i, 0:3]
+                    cam_rel_au = cam_pos - b_pos
+                    cam_rel_km = cam_rel_au * AU_TO_KM
+
+                    pole = all_instances[b_i, 9:12]
+                    pole_norm = float(np.linalg.norm(pole))
+                    pole_n = (pole / max(1e-6, pole_norm)).astype(np.float32)
+                    ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                    if abs(float(np.dot(pole_n, ref))) > 0.999:
+                        ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                    tangent = np.cross(pole_n, ref)
+                    tangent /= max(1e-6, float(np.linalg.norm(tangent)))
+                    bitangent = np.cross(pole_n, tangent)
+                    b_norm = float(np.linalg.norm(bitangent))
+                    if b_norm > 0:
+                        bitangent /= b_norm
+
+                    p_local_x = float(np.dot(cam_rel_km, tangent))
+                    p_local_y = float(np.dot(cam_rel_km, pole_n))
+                    p_local_z = float(np.dot(cam_rel_km, bitangent))
+
+                    rot_angle = float(all_instances[b_i, 25])
+                    s_r = math.sin(-rot_angle)
+                    c_r = math.cos(-rot_angle)
+                    cam_pos_local = np.array([
+                        p_local_x * c_r - p_local_z * s_r,
+                        p_local_y,
+                        p_local_x * s_r + p_local_z * c_r
+                    ], dtype=np.float32)
+
+                    # Transform world frustum planes into planet local space (km)
+                    R_rot = np.array([
+                        [c_r, 0.0, -s_r],
+                        [0.0, 1.0,  0.0],
+                        [s_r, 0.0,  c_r]
+                    ], dtype=np.float64)
+                    R_frame = np.vstack([tangent, pole_n, bitangent]).astype(np.float64)
+                    R_mat = R_rot @ R_frame # (3, 3)
+
+                    N_world = frustum_planes[:, :3].astype(np.float64)
+                    D_world = frustum_planes[:, 3].astype(np.float64)
+                    N_local = N_world @ R_mat.T
+                    D_local = AU_TO_KM * (np.dot(N_world, b_pos.astype(np.float64)) + D_world)
+                    local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float32)
+
+                    obl = float(all_instances[b_i, 12])
+                    raw_patches = p_quadtree.traverse_raw(
+                        cam_pos_local,
+                        fov_deg=float(self.camera["fov"]),
+                        screen_height=float(self.fb_height),
+                        max_lod=max_d,
+                        split_factor=split_fac,
+                        obl=obl,
+                        max_patches=rem_budget,
+                        frustum_planes=local_frustum_planes
+                    )
+                    num_p = len(raw_patches)
+
+                    if num_p > 0:
+                        st = total_patches_rendered
+                        en = st + num_p
+                        self.terrain_patch_staging[st:en, 0:4] = raw_patches[:, 0:4]
+                        self.terrain_patch_staging[st:en, 7] = raw_patches[:, 8] * 0.05
+                        self.terrain_patch_staging[st:en, 8] = raw_patches[:, 4]
+                        self.terrain_patch_staging[st:en, 9] = raw_patches[:, 5]
+                        self.terrain_patch_staging[st:en, 11] = b_r_km
+                        self.terrain_patch_staging[st:en, 12:15] = b_pos
+                        self.terrain_patch_staging[st:en, 15] = obl
+                        self.terrain_patch_staging[st:en, 16:19] = pole_n
+                        self.terrain_patch_staging[st:en, 19] = rot_angle
+
+                        for ip in range(num_p):
+                            face = int(raw_patches[ip, 4])
+                            lod = int(raw_patches[ip, 5])
+                            x = int(raw_patches[ip, 6])
+                            y = int(raw_patches[ip, 7])
+                            slot_id, uv_scale, off_x, off_y = self.terrain_streamer.get_tile_slot_or_fallback(
+                                b_name, "diffuse", face, lod, x, y
+                            )
+                            self.terrain_patch_staging[st + ip, 4] = uv_scale
+                            self.terrain_patch_staging[st + ip, 5] = off_x
+                            self.terrain_patch_staging[st + ip, 6] = off_y
+                            self.terrain_patch_staging[st + ip, 10] = float(slot_id)
+
+                        self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
+                        total_patches_rendered += num_p
+
+                self.terrain_last_patch_count = total_patches_rendered
+                self.terrain_last_triangle_count = total_patches_rendered * self.terrain_triangles_per_patch
+
+                if total_patches_rendered > 0:
+                    first_b_i = active_terrain_bodies[0][0]
+                    self.terrain_current_raw_patches = self.terrain_active_body_patches.get(first_b_i, (None,))[0]
+                    self.terrain_current_body_name = active_terrain_bodies[0][1]
+                    self.terrain_current_body_idx = first_b_i
+
+                    terrain_patch_ssbo.write(self.terrain_patch_staging[:total_patches_rendered].tobytes())
+                    terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
+
+                    self.terrain_streamer.use(location=14)
+                    if 'u_camera_pos' in self.prog_terrain:
+                        self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                    if 'u_is_cloud_pass' in self.prog_terrain:
+                        self.prog_terrain['u_is_cloud_pass'].value = False
+                    if 'u_debug_tiles' in self.prog_terrain:
+                        self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
+                    if 'u_hdr_enabled' in self.prog_terrain:
+                        self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
+                    if 'u_exposure' in self.prog_terrain:
+                        self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+
+                    self.vao_terrain.render(moderngl.TRIANGLES, instances=total_patches_rendered)
+                else:
+                    self.terrain_current_raw_patches = None
+                    self.terrain_current_body_name = None
+                    self.terrain_current_body_idx = -1
+            else:
+                self.terrain_current_raw_patches = None
+                self.terrain_current_body_name = None
+                self.terrain_current_body_idx = -1
+                self.terrain_last_patch_count = 0
+                self.terrain_last_triangle_count = 0
+
+
             # Pass 2: Dedicated Subpixel / Point Light Pass (apparent_px < 2.5)
             # Tests depth against scene, blends light, does not write depth
             ctx.depth_mask = False
             vis_point_buffer.bind_to_storage_buffer(binding=3)
             vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
             _perf_gpu_end(_gq)
+
+            if self.camera.get("show_triangle_count", False) or self.camera.get("show_settings_modal", False):
+                try:
+                    raw_cmds = np.frombuffer(draw_cmds_buffer.read(), dtype=np.uint32).reshape((4, 5))
+                    self.sphere_last_triangle_count = int(
+                        raw_cmds[1, 1] * self.sphere_lo_triangles +
+                        raw_cmds[2, 1] * self.sphere_hi_triangles +
+                        raw_cmds[3, 1] * self.sphere_ultra_triangles +
+                        raw_cmds[0, 1] * 2
+                    )
+                except Exception:
+                    self.sphere_last_triangle_count = 0
+            else:
+                self.sphere_last_triangle_count = 0
+            self.total_last_triangle_count = self.sphere_last_triangle_count + self.terrain_last_triangle_count
 
             ctx.disable(moderngl.BLEND)
             ctx.disable(moderngl.CULL_FACE)
@@ -6325,12 +6631,77 @@ class App(InputHandlerMixin):
                     has_cloud = True
                 elif bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
                     has_cloud = True
+                elif hasattr(self, 'terrain_streamer') and self.terrain_streamer:
+                    b_clouds_dir = os.path.join(self.terrain_streamer.tiles_base_dir, bname, "clouds")
+                    if os.path.isdir(b_clouds_dir):
+                        has_cloud = True
                 self._clouds_exist_cache[bname] = has_cloud
                 return has_cloud
 
             def render_body_clouds(bi, is_cmp=False):
                 if not _body_has_clouds(bi, is_cmp=is_cmp):
                     return
+
+                # If this body has active terrain LOD patches, render clouds using the high-performance Quadtree LOD shell
+                body_terrain_info = self.terrain_active_body_patches.get(bi) if (not is_cmp and hasattr(self, 'terrain_active_body_patches')) else None
+                if (body_terrain_info is not None and getattr(self, 'terrain_streamer', None) is not None):
+                    raw_p, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st_idx, num_p = body_terrain_info
+                    if num_p > 0:
+                        cloud_staged_count = 0
+                        for ip in range(num_p):
+                            face = int(raw_p[ip, 4])
+                            lod = int(raw_p[ip, 5])
+                            x = int(raw_p[ip, 6])
+                            y = int(raw_p[ip, 7])
+                            slot_id, uv_scale, off_x, off_y = self.terrain_streamer.get_tile_slot_or_fallback(
+                                b_name, "clouds", face, lod, x, y
+                            )
+                            self.terrain_cloud_staging[ip] = self.terrain_patch_staging[st_idx + ip]
+                            self.terrain_cloud_staging[ip, 4] = uv_scale
+                            self.terrain_cloud_staging[ip, 5] = off_x
+                            self.terrain_cloud_staging[ip, 6] = off_y
+                            self.terrain_cloud_staging[ip, 10] = float(slot_id)
+                            if slot_id >= 0:
+                                cloud_staged_count += 1
+
+                    if cloud_staged_count > 0:
+                        self.hdr_resolve_fbo.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.enable(moderngl.BLEND)
+                        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                        ctx.enable(moderngl.DEPTH_TEST)
+                        ctx.depth_func = '<='
+                        ctx.disable(moderngl.CULL_FACE)
+                        ctx.depth_mask = False
+
+                        self.terrain_cloud_ssbo.write(self.terrain_cloud_staging[:num_p].tobytes())
+                        self.terrain_cloud_ssbo.bind_to_storage_buffer(binding=4)
+
+                        self.terrain_streamer.use(location=14)
+                        if 'u_is_cloud_pass' in self.prog_terrain:
+                            self.prog_terrain['u_is_cloud_pass'].value = True
+                        if 'u_cloud_altitude_km' in self.prog_terrain:
+                            cloud_alt = float(visual_arr[bi, 12] * 0.35) if visual_arr.shape[1] > 12 and visual_arr[bi, 12] > 0 else 3.5
+                            self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
+                        if 'u_camera_pos' in self.prog_terrain:
+                            self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                        if 'u_debug_tiles' in self.prog_terrain:
+                            self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
+                        if 'u_hdr_enabled' in self.prog_terrain:
+                            self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
+                        if 'u_exposure' in self.prog_terrain:
+                            self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+
+                        self.vao_terrain.render(moderngl.TRIANGLES, instances=num_p)
+
+                        if 'u_is_cloud_pass' in self.prog_terrain:
+                            self.prog_terrain['u_is_cloud_pass'].value = False
+
+                        self.terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
+                        ctx.depth_mask = True
+                        ctx.depth_func = '<'
+                        return
+
                 inst_idx = bi if not is_cmp else (num_bodies + bi)
                 self.single_cloud_body_buf.write(struct.pack('I', int(inst_idx)))
                 
@@ -7036,6 +7407,7 @@ class App(InputHandlerMixin):
         physics_thread.join(timeout=1.0)
         physics_thread_cmp.join(timeout=1.0)
         self.save_settings()
+        if getattr(self, 'terrain_streamer', None): self.terrain_streamer.shutdown()
         if getattr(self, 'conv_tmp_tex', None): self.conv_tmp_tex.release()
         if getattr(self, 'conv_ker_fft_tex', None): self.conv_ker_fft_tex.release()
         if getattr(self, 'conv_img_fft_tex', None): self.conv_img_fft_tex.release()

@@ -38,6 +38,9 @@ uniform vec3 u_ring_normals[16];
 uniform float u_ring_outer_radii[16];
 
 uniform int u_tracking_idx;
+uniform int u_terrain_body_idx;
+uniform int u_num_terrain_bodies;
+uniform int u_terrain_body_indices[16];
 uniform vec3 u_camera_pos;
 uniform float u_screen_height;
 uniform float u_fov_factor;
@@ -220,6 +223,15 @@ void main() {
         }
 
         if (visible) {
+            if (u_terrain_body_idx >= 0 && int(idx) == u_terrain_body_idx) {
+                return;
+            }
+            for (int tb = 0; tb < u_num_terrain_bodies; tb++) {
+                if (int(idx) == u_terrain_body_indices[tb]) {
+                    return;
+                }
+            }
+
             bool is_ultra = is_tracked || (apparent_px >= u_lod_thresh_ultra);
             bool is_hi = !is_ultra && ((apparent_px >= u_lod_thresh_hi) || (is_star && apparent_px >= 2.0) || is_bh_lens_host);
             bool is_lo = !is_ultra && !is_hi && (apparent_px >= 2.0);

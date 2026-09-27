@@ -328,6 +328,70 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 app.camera["tex_stream_threshold_px"] = stream_thresh
                 settings_changed = True
 
+            # Planetary Terrain & Surface LOD (SpaceEngine Style)
+            imgui.separator()
+            imgui.text_colored("Planetary Terrain & Surface LOD (SpaceEngine Style)", 0.4, 0.8, 1.0)
+
+            changed_tlod, app.camera["terrain_lod_enabled"] = imgui.checkbox("Enable Terrain Quadtree LOD", app.camera.get("terrain_lod_enabled", False))
+            if changed_tlod: settings_changed = True
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Toggle between legacy monolithic sphere rendering and SpaceEngine-style\nSpherified Cube Quadtree LOD with tiled virtual texture streaming.")
+
+            if app.camera.get("terrain_lod_enabled", False):
+                imgui.indent()
+                changed_dt, app.camera["terrain_debug_tiles"] = imgui.checkbox("Debug Terrain Tiles", app.camera.get("terrain_debug_tiles", False))
+                if changed_dt: settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Highlight active quadtree patch borders and false-color each patch by its LOD level.")
+
+                split_factor = float(app.camera.get("terrain_lod_split_factor", 1.0))
+                changed_sf, split_factor = imgui.slider_float("LOD Split Sensitivity", split_factor, 0.5, 3.0, "%.2fx")
+                if changed_sf:
+                    app.camera["terrain_lod_split_factor"] = split_factor
+                    settings_changed = True
+
+                max_depth = int(app.camera.get("terrain_max_depth", 6))
+                changed_md, max_depth = imgui.slider_int("Max LOD Depth", max_depth, 0, 8)
+                if changed_md:
+                    app.camera["terrain_max_depth"] = max_depth
+                    settings_changed = True
+
+                res_options = [8, 16, 24, 32, 48, 64]
+                res_labels = [
+                    "8x8 (192 tris/patch - Low/Fast)",
+                    "16x16 (640 tris/patch - Medium)",
+                    "24x24 (1,344 tris/patch - Balanced)",
+                    "32x32 (2,304 tris/patch - High/Default)",
+                    "48x48 (4,992 tris/patch - Very High)",
+                    "64x64 (8,704 tris/patch - Ultra/Dense)"
+                ]
+                current_res = int(app.camera.get("terrain_patch_res", 32))
+                current_idx = res_options.index(current_res) if current_res in res_options else 3
+                changed_res, new_idx = imgui.combo("Patch Grid Resolution", current_idx, res_labels)
+                if changed_res:
+                    sel_res = res_options[new_idx]
+                    if hasattr(app, "rebuild_terrain_grid_patch"):
+                        app.rebuild_terrain_grid_patch(sel_res)
+                    else:
+                        app.camera["terrain_patch_res"] = sel_res
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Set the vertex grid density and triangle count for each quadtree patch.\nLower resolution dramatically increases framerate when many patches are visible.\nHigher resolution gives smoother planet curvature and elevation detail.")
+
+                changed_stc, app.camera["show_triangle_count"] = imgui.checkbox("Show Triangle Count (HUD Overlay)", app.camera.get("show_triangle_count", False))
+                if changed_stc: settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Display live on-screen viewport HUD overlay with rendered triangle counts for terrain, celestial bodies, and current FPS.")
+
+                if getattr(app, 'terrain_streamer', None) is not None:
+                    res_cnt = len(app.terrain_streamer.resident_tiles)
+                    cap = app.terrain_streamer.pool_capacity
+                    p_cnt = getattr(app, 'terrain_last_patch_count', 0)
+                    t_cnt = getattr(app, 'terrain_last_triangle_count', 0)
+                    imgui.text_disabled(f"Resident Tiles: {res_cnt} / {cap} ({(res_cnt/cap)*100:.0f}%) | Patches: {p_cnt:,} | Tris: {t_cnt:,}")
+                imgui.unindent()
+
+
             if settings_changed:
                 app.save_settings()
 

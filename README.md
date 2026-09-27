@@ -103,10 +103,13 @@ Stellar-Forge supports two switchable camera control modes, selectable via the *
   - [Relativistic & Oblate Gravity](#relativistic--oblate-gravity)
   - [JPL Horizons Benchmark Results](#jpl-horizons-benchmark-results)
 - [Graphics & Rendering Pipeline](#-graphics--rendering-pipeline)
+  - [Planetary Terrain & Cloud Quadtree LOD (SpaceEngine Style)](#planetary-terrain--cloud-quadtree-lod-spaceengine-style)
   - [Eclipse Shadows & Oblate Star Support](#eclipse-shadows--oblate-star-support)
-  - [Physically Based Atmospheric Scattering](#physically-based-atmospheric-scattering)
+  - [Physically Based Atmospheric Scattering & Refraction](#physically-based-atmospheric-scattering--refraction)
+  - [Dynamic Cloud Rendering](#dynamic-cloud-rendering)
   - [Planetary Rings, Planetshine & Ringshine](#planetary-rings-planetshine--ringshine)
-  - [HDR, Bloom & Temporal Anti-Aliasing](#hdr-bloom--temporal-anti-aliasing)
+  - [Gravitational Lensing & Black Hole Shadows](#gravitational-lensing--black-hole-shadows)
+  - [HDR, Bloom & Orbit MSAA](#hdr-bloom--orbit-msaa)
 - [Simulation Modes](#-simulation-modes)
 - [Comprehensive Inspector & Controls](#-comprehensive-inspector--controls)
   - [System Comparison & Timeline](#system-comparison--timeline)
@@ -124,6 +127,7 @@ Stellar-Forge supports two switchable camera control modes, selectable via the *
 - **🚀 High-Performance N-Body Integrator**: Implements the **IAS15** (15th-order adaptive step-size integrator by Rein & Spiegel), compiled to machine code via Numba (`@njit(nogil=True)`), enabling ultra-fast simulations outside Python's Global Interpreter Lock (GIL).
 - **🪐 Analytical Keplerian Propagation**: $\mathcal{O}(N)$ hierarchical propagation mode utilizing Jacobi coordinates and top-down subsystem barycentric placement to completely eliminate circular dependencies and barycentric wobble. Includes $J_2$, GR, and third-body vector precession.
 - **🌌 General Relativity & Zonal Harmonics**: Accurately simulates 1PN (post-Newtonian) Schwarzschild relativistic precession around compact objects and $J_2 / J_4$ oblate gravitational harmonics for fast-rotating giant stars and planets.
+- **🏔️ SpaceEngine-Style Planetary Terrain & Cloud Quadtree LOD**: Continuous Level of Detail (LOD) for planetary surfaces and clouds based on spherified cube quadtrees with tangent-warped grid coordinates ($x' = \tan(u \pi / 4)$) and perimeter skirt stitching. Backed by an asynchronous tiled virtual texture streaming engine (`TerrainTileStreamer`) with hierarchical ancestor fallback, normalized spheroid-to-sphere horizon culling for oblate bodies, physically accurate ground atmospheric light extinction (zero-ambient nightside, Rozenberg curved-atmosphere air mass, Rayleigh/Mie/Ozone extinction, diffuse daylight skylight), dynamic cloud LOD shells with semi-transparency extraction and two-sided lighting, switchable patch grid resolutions (8x8 to 64x64), and a real-time Geometry Statistics HUD.
 - **🌑 Eclipse Shadows & Oblate Star Geometry**: Precomputed eclipse Look-Up Tables (LUTs) casting realistic umbra and penumbra shadows across planet surfaces, atmospheres, and rings, including geometric projection support for oblate stars.
 - **🔬 JPL Horizons Accuracy Suite**: Includes automated verification benchmarks (`accuracy_test.py`) that compare 1-year numerical integrations directly against NASA JPL Horizons ground-truth state vectors.
 - **🛠️ Comprehensive Body Inspector**: In-depth GUI panel displaying real-time physical properties, osculating Keplerian orbital elements, atmospheric composition, effective thermal equilibrium, spectral type classifications, and dynamic property sliders.
@@ -236,6 +240,80 @@ python scripts/accuracy_test.py
 ---
 
 ## 🎨 Graphics & Rendering Pipeline
+
+### Planetary Terrain & Cloud Quadtree LOD (SpaceEngine Style)
+
+Stellar-Forge incorporates a continuous Level of Detail (LOD) planetary terrain and cloud rendering engine inspired by SpaceEngine. It allows seamless, artifact-free camera flight from deep interplanetary orbit down to planetary ground level with constant VRAM usage:
+
+1. **Spherified Cube Quadtree Architecture**:
+   - Decomposes celestial bodies into six root cube faces ($+X, -X, +Y, -Y, +Z, -Z$) subdivided hierarchically based on camera distance, screen height, field of view, and Screen Space Error (SSE).
+   - **Tangent-Corrected Distortion Warping**: Direct cube-to-sphere normalization results in severe area distortion, compressing cube corners by $\sim 3\times$ relative to face centers. Stellar-Forge applies tangent coordinate warping to maintain uniform texel and polygon density across the entire sphere:
+     $$x' = \tan\left(u \cdot \frac{\pi}{4}\right), \quad y' = \tan\left(v \cdot \frac{\pi}{4}\right), \quad \mathbf{P}_{\text{cube}} = \frac{(x', y', 1)}{\sqrt{x'^2 + y'^2 + 1}}$$
+   - **Perimeter Skirt Stitching**: To eliminate cracks, gaps, and T-junction seams between adjacent quadtree patches of disparate LOD levels, each patch mesh includes border skirt vertices (`skirt_flag = 1.0`) extruded radially inward by a depth proportional to the patch's radius:
+     $$P_{\text{skirt}} = P_{\text{surface}} - \hat{\mathbf{n}} \cdot d_{\text{skirt}}$$
+     Skirts are automatically bypassed for cloud shells to prevent vertical opacity artifacts.
+   - **Dynamic Patch Grid Resolution**: Switchable at runtime via the Graphics & Quality modal:
+     - `8x8` grid: 192 triangles per patch (lightweight for broad terrain coverage).
+     - `16x16` grid: 768 triangles per patch (balanced).
+     - `32x32` grid: 3,072 triangles per patch (default, crisp curvature).
+     - `64x64` grid: 8,704 triangles per patch (ultra-dense geometric detail).
+
+2. **Oblate Horizon & View Frustum Culling**:
+   - Rotational flattening (e.g. Saturn with $f = 0.098$ or rapid rotators with $f > 0.2$) causes naive spherical horizon tests to prematurely cull equatorial nodes or leak backside patches at the poles.
+   - Stellar-Forge maps camera positions and patch bounding spheres into **normalized spheroid-to-sphere coordinates**:
+     $$\mathbf{C}_{\text{sphere}} = \left(C_x, \, \frac{C_y}{1 - f}, \, C_z\right)$$
+     In this transformed metric space, the oblate body is an exact unit sphere, enabling exact analytical horizon culling ($\theta_{\text{cull}} = \theta_{\text{horizon}} + \arcsin(R_{\text{patch}} / R_{\text{planet}})$). This completely prevents backside polygon leaks and ensures seamless LOD subdivision across all latitudes.
+   - **Local 6-Plane View Frustum Culling**: Quadtree traversal incorporates analytical bounding sphere testing against camera frustum planes dynamically transformed into the planet's local rotated frame. Nodes outside the view cone are pruned immediately at root and low LODs, slashing rendered patches and triangle counts by $>99\%$ during narrow/low FOV (telescope view) and preventing off-screen triangle blowup.
+   - Traversal is compiled with Numba (`_traverse_quadtree_jit`), evaluating the full planetary tree in $< 0.1\text{ ms}$ on CPU with zero per-frame Python memory allocations. Supports simultaneous multi-body terrain and cloud quadtree rendering in a single instanced draw call.
+
+3. **Asynchronous Tiled Texture Streaming (`TerrainTileStreamer`)**:
+   - Fixed VRAM budget backed by a dedicated ModernGL `Texture2DArray` pool (256 slices of $512 \times 512$ RGBA8).
+   - Multi-layer support (`"diffuse"` and `"clouds"`).
+   - Dedicated background I/O worker thread loads tiles asynchronously from disk (`data/tiles/<body_name>/<layer>/<lod>/<x>_<y>.jpg`), preventing frame stutter.
+   - **Hierarchical Ancestor Fallback**: If a requested high-resolution LOD tile is still streaming from disk, the streamer queries the quadtree hierarchy in $\mathcal{O}(\text{LOD})$ for the nearest loaded ancestor tile, dynamically calculating sub-rect UV transformations:
+     $$\text{UV}_{\text{sample}} = \text{UV}_{\text{patch}} \cdot \text{scale} + \text{offset}$$
+     This guarantees zero black/gray placeholder flashes or texture pop-in during aggressive camera flight.
+
+4. **Atmospheric Ground Light Extinction & Zero-Ambient Nightside**:
+   - **Strict Zero-Ambient Nightside**: Ground surfaces have zero artificial ambient light (`vec3(0.03)` ambient floor removed), ensuring unlit nighttime hemispheres and eclipse shadows evaluate to pitch black ($0.0$).
+   - **Lambertian Law with Stellar Disc Penumbra**: Evaluates the angular diameter of the host star ($\sin\alpha = R_{\text{star}} / D_{\text{star}}$), smoothly feathering illumination across the planetary terminator.
+   - **Rozenberg Curved-Atmosphere Air Mass**:
+     $$am(\mu) = \frac{\sqrt{R_{\text{planet}}^2 \mu^2 + 2 R_{\text{planet}} H + H^2} - R_{\text{planet}} \mu}{H}, \quad \mu = \max(\cos\theta_{\text{sun}}, 0.0)$$
+   - **Direct Beam Extinction**: Simulates spectral Rayleigh scattering, aerosol Mie scattering, and stratospheric Ozone (Chappuis band) absorption:
+     $$\mathbf{T}_{\text{direct}} = \exp\left(-\left(\boldsymbol{\tau}_{\text{Rayleigh}} + \boldsymbol{\tau}_{\text{Mie}} + \boldsymbol{\tau}_{\text{Ozone}}\right) \cdot am\right)$$
+   - **Diffuse Skylight Dome**: Models downward diffuse daylight scattered onto terrain from the overlying atmosphere dome:
+     $$\mathbf{E}_{\text{skylight}} = \left(\mathbf{1} - \exp(-\boldsymbol{\tau} \cdot am)\right) \cdot \frac{\max(0, \mu)}{\mathbf{1} + 0.75 \boldsymbol{\tau}}$$
+
+5. **Dynamic Cloud Quadtree LOD Shells**:
+   - When Terrain LOD is active, planetary clouds render as an independent spherified cube quadtree shell at altitude $R_{\text{planet}} + h_{\text{cloud}}$ (scaled dynamically by atmospheric scale height $H$).
+   - **Luminance-to-Alpha Extraction**: Automatically parses RGB/grayscale JPEG cloud textures into an alpha channel `(255, 255, 255, Luminance)`, preserving semi-transparency for cloud structures and clearing cloudless skies.
+   - **Two-Sided Illumination**:
+     - *Orbital View (Exterior)*: Computes forward Mie scattering ("silver lining") along the backlit crescent rim:
+       $$I_{\text{forward}} = (\max(0, -\mathbf{V} \cdot \mathbf{L}))^6 \cdot 0.35 \cdot \text{vis}_{\text{sun}}$$
+     - *Surface View (Interior looking up)*: Evaluates diffuse forward transmission through the cloud deck:
+       $$I_{\text{underside}} = \text{illum}_{\text{top}} \cdot \left(0.50 + 0.35 (\max(0, -\mathbf{V} \cdot \mathbf{L}))^4\right)$$
+   - Direct sunlight extinction through the upper atmosphere and smooth horizon limb softening.
+
+6. **UI Controls & Real-Time Geometry Statistics HUD**:
+   - **Graphics Settings Modal**:
+     - *Enable Terrain Quadtree LOD*: Toggle switch between uniform sphere proxy meshes and the adaptive quadtree LOD engine.
+     - *Debug Terrain Tiles*: Visualizes active quadtree patches with color-coded LOD tier tints (Red = LOD 0, Orange = LOD 1, Yellow = LOD 2, Green = LOD 3, Cyan = LOD 4, Blue = LOD 5, Purple = LOD 6) and yellow tile boundary wireframes.
+     - *Patch Grid Resolution*: Dynamically sets mesh resolution between 8x8, 16x16, 32x32, and 64x64.
+   - **Geometry Statistics HUD Window** (`show_triangle_count`): Displays real-time counts of Total Rendered Triangles, Terrain Triangles, Active Patch Counts, Sphere Mesh Triangles, and framerate.
+
+7. **Offline Tile Pyramid Baker CLI (`scripts/bake_planet_tiles.py`)**:
+   - High-performance offline tool to reproject equirectangular planetary maps into tangent-warped cubemap quadtree pyramids:
+     ```bash
+     # Batch bake all Solar System bodies (diffuse + clouds) up to LOD 3
+     python scripts/bake_planet_tiles.py --all --max-lod 3
+
+     # Bake single planet diffuse surface tiles up to LOD 4 (8192x8192 per face)
+     python scripts/bake_planet_tiles.py --body Earth --map-type diffuse --max-lod 4
+
+     # Bake Earth cloud tiles up to LOD 3 (4096x4096 per face)
+     python scripts/bake_planet_tiles.py --body Earth --map-type clouds --max-lod 3
+     ```
+   - Slices tiles into `data/tiles/<body_name>/<map_type>/<face>/<lod>/<x>_<y>.jpg`.
 
 ### Eclipse Shadows & Oblate Star Support
 - **Precomputed Eclipse LUT (`u_eclipse_lut`)**: Generates high-precision light attenuation lookup tables bound across spherical planet shaders (`prog_spheres`), rings (`prog_rings`), and atmosphere raymarchers (`prog_atmo`).
@@ -398,8 +476,10 @@ Stellar-Forge/
 │   │   ├── kepler_analytical.py # Analytical Keplerian Jacobi propagation kernel
 │   │   ├── atmosphere_physics.py# Physical atmosphere parameters & gas composition table
 │   │   └── star_calc.py        # Stellar evolution, HR classification & HZ bounds
-│   ├── rendering/               # ModernGL render pass pipelines, planetshine, texture baking & shaders
+│   ├── rendering/               # ModernGL render pass pipelines, terrain LOD, planetshine, baking & shaders
 │   │   ├── render_utils.py
+│   │   ├── terrain_quadtree.py  # Spherified cube quadtree LOD with tangent-warped grid & oblate culling
+│   │   ├── terrain_streamer.py  # Asynchronous tiled Texture2DArray virtual streaming with ancestor fallback
 │   │   ├── imgui_renderer.py
 │   │   ├── planetshine.py
 │   │   ├── texture_baker.py
@@ -412,19 +492,23 @@ Stellar-Forge/
 │   └── glsl/                    # Dedicated GLSL shader source code (.vert, .frag, .comp)
 │       ├── common/              # Shared includes (refraction, sun terminator, caster eclipse shadow)
 │       ├── compute/
-│       ├── celestial/
+│       ├── celestial/           # Sphere, terrain/cloud quadtree, ring, orbit, HZ shaders
 │       ├── atmosphere/
 │       └── post/
 ├── data/                        # Simulation data & system presets
+│   ├── tiles/                   # Spherified cube quadtree tile pyramids ({body}/{layer}/{lod}/{x}_{y}.jpg)
 │   ├── systems/                 # System JSON profiles (Solar System, Achernar, Ephemeris Mode, ...)
 │   │   └── <Name>/{meta.json, system.json}
 │   ├── kernels/                 # Storage for downloaded NAIF SPICE kernels (.bsp/.tpc/.tls)
 │   ├── system.json              # Active default planetary system data
 │   ├── ephemeris_settings.json  # Configuration for SPICE playback dates & active kernels
-│   ├── graphics_settings.json   # Persistent graphics/quality settings (exposure, bloom, accumulation, MSAA, atmo quality)
+│   ├── graphics_settings.json   # Persistent graphics/quality settings (exposure, bloom, terrain LOD, atmo quality)
 │   └── horizons_cache.json      # Cache file for fetched JPL Horizons API queries
 ├── textures/                    # Planet diffuse / normal / specular + ring textures (loaded at startup)
-├── scripts/                     # Utility and verification scripts
+├── scripts/                     # Utility, baking and verification scripts
+│   ├── bake_planet_tiles.py     # Reproject equirectangular planet maps into cubemap quadtree tile pyramids
+│   ├── test_terrain_lod.py      # Automated regression test for quadtree traversal, fallback & streamer
+│   ├── test_terrain_alignment.py# Alignment & distortion verification between quadtree and sphere proxies
 │   ├── accuracy_test.py         # Physics solver validation against JPL Horizons ground truth
 │   ├── fetch_horizons.py        # Fetch J2000 state vectors directly from JPL Horizons REST API
 │   ├── fetch_gaia.py            # Download Gaia DR3 star catalog and bake data/gaia/stars.bin

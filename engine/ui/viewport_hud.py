@@ -37,3 +37,43 @@ def render_viewport_hud(app, bodies_data):
             imgui.text(f"Tracking: {track_name}")
 
         imgui.end()
+
+    # ── Geometry Statistics / Triangle Count Overlay ──
+    if app.camera.get("show_triangle_count", False):
+        total_tris = getattr(app, "total_last_triangle_count", 0)
+        terrain_tris = getattr(app, "terrain_last_triangle_count", 0)
+        sphere_tris = getattr(app, "sphere_last_triangle_count", 0)
+        patches = getattr(app, "terrain_last_patch_count", 0)
+
+        x_pos = 12
+        y_pos = 100 if not getattr(app, "show_outliner", True) else 36
+        if getattr(app, "show_outliner", True):
+            x_pos = 285
+
+        imgui.set_next_window_position(x_pos, y_pos, imgui.FIRST_USE_EVER)
+        flags = imgui.WINDOW_NO_RESIZE | imgui.WINDOW_ALWAYS_AUTO_RESIZE
+        expanded, opened = imgui.begin("Geometry Statistics###geom_stats", True, flags)
+        if not opened:
+            app.camera["show_triangle_count"] = False
+            app.save_settings()
+        elif expanded:
+            imgui.text_colored("Rendered Triangles", 0.4, 0.8, 1.0)
+            imgui.separator()
+            imgui.text(f"Total:   {total_tris:,}")
+            if terrain_tris > 0 or app.camera.get("terrain_lod_enabled", False):
+                p_res = int(app.camera.get("terrain_patch_res", 32))
+                imgui.text_colored(f"Terrain: {terrain_tris:,}", 0.3, 1.0, 0.5)
+                imgui.same_line()
+                imgui.text_disabled(f"({patches:,} patches @ {p_res}x{p_res})")
+            if sphere_tris > 0:
+                imgui.text(f"Spheres: {sphere_tris:,}")
+
+            io = imgui.get_io()
+            fps = io.framerate
+            ms = 1000.0 / max(1.0, fps)
+            color_fps = (0.3, 1.0, 0.4) if fps >= 55.0 else ((1.0, 0.8, 0.2) if fps >= 30.0 else (1.0, 0.3, 0.3))
+            imgui.separator()
+            imgui.text_colored(f"{fps:.1f} FPS", *color_fps)
+            imgui.same_line()
+            imgui.text_disabled(f"({ms:.1f} ms)")
+        imgui.end()
