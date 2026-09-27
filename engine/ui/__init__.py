@@ -46,8 +46,6 @@ def render_ui(
 ):
     """Main orchestrator for rendering all ImGui interface layers in Stellar-Forge."""
     if not getattr(app, "ui_visible", True):
-        # Even when UI is hidden, render active screenshot toast notifications
-        render_viewport_hud(app, bodies_data)
         return
 
     active_system_name = getattr(app, "active_system_name", "Solar System")

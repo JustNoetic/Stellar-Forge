@@ -43,6 +43,7 @@ Stellar-Forge/
 │   │   ├── planetshine.py      # Planetshine & JIT rotation angle calculations
 │   │   ├── ring_generator.py   # Procedural ring texture synthesis (SpaceEngine style 1D fBm & resonance gaps)
 │   │   ├── texture_baker.py    # Procedural ring baking & texture exporter (apply_procedural_ring_to_body)
+│   │   ├── texture_manager.py  # Interactive texture preview, drag-and-drop, hot reloading & async tile baking
 │   │   ├── shader_loader.py    # GLSL shader loader with in-memory caching
 │   │   ├── shaders.py          # Shader re-exports & uniform bindings
 │   │   └── post_shaders.py     # Post-processing shader re-exports (Bloom, HDR)
@@ -88,7 +89,8 @@ Stellar-Forge/
 │   ├── test_spice.py           # Quick SPICE kernel loader validation
 │   ├── test_spk_export.py      # Timeline → .bsp export round-trip vs analytic ground truth
 │   ├── ringshine_benchmark.py  # Ground-truth Monte Carlo validator for ringshine radiative transfer
-│   └── benchmark_ringshine_oblateness.py # Thesis benchmark & validation of host planet oblateness in ringshine
+│   ├── benchmark_ringshine_oblateness.py # Thesis benchmark & validation of host planet oblateness in ringshine
+│   └── test_texture_manager.py # Unit & regression tests for texture staging, hot reloading & tile baking
 ├── textures/                   # Planet/ring textures (loaded by app.py at startup)
 ├── exports/                    # Exported cosmetic JSON per body
 ├── dist/                       # PyInstaller output (generated; not committed to git)
@@ -609,6 +611,7 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 | Change planetshine & moon ringshine CPU precompute | `engine/rendering/planetshine.py` | `compute_planetshine_numba` |
 | Change procedural ring generation / presets | `engine/rendering/ring_generator.py` | `generate_procedural_ring_profile`, `RING_PRESETS` |
 | Change ring texture baking & application | `engine/rendering/texture_baker.py` | `apply_procedural_ring_to_body`, `bake_and_export_ring_textures` |
+| Manage body textures / hot reloading & tile baking | `engine/rendering/texture_manager.py`, `engine/ui/inspector.py` | `render_texture_management_ui`, `hot_reload_body_texture` |
 | Change ringshine irradiance map / shadow CDF | `engine/glsl/post/ringshine_map.frag`, `engine/app.py` (`build_ringshine_lut`) | `build_ringshine_lut` |
 | Validate ringshine accuracy vs Monte Carlo | `scripts/ringshine_benchmark.py` | `main` |
 | Change GLFW input callbacks & settings persistence | `engine/core/input_handler.py`, `engine/app.py` | `InputHandlerMixin`, `App` callbacks & movement mode |

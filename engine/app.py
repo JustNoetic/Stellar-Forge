@@ -579,6 +579,13 @@ class App(InputHandlerMixin):
         self._screenshot_capturing = False
         self._screenshot_saving = False
 
+        # Texture management & drag and drop
+        self._dropped_files = None
+        self._pending_import_path = None
+        self._file_dialog_open = False
+        self._texture_staging = {}
+        self._texture_bake_state = {}
+
         # Post-Processing FBOs
         self.hdr_resolve_fbo = None
         self.hdr_resolve_tex = None
@@ -972,6 +979,12 @@ class App(InputHandlerMixin):
     
     def key_callback(self, window, key, scancode, action, mods):
         if self.impl: self.impl.keyboard_callback(window, key, scancode, action, mods)
+
+        # H key: toggle UI visibility (unless typing into a text input)
+        if key == glfw.KEY_H and action == glfw.PRESS and not imgui.get_io().want_text_input:
+            self.ui_visible = not getattr(self, "ui_visible", True)
+            return
+
         if imgui.get_io().want_capture_keyboard: return
         
         # WASD: track held state for free-flight / surface walking
@@ -1629,7 +1642,8 @@ class App(InputHandlerMixin):
         if not window:
             glfw.terminate()
             raise Exception("GLFW failed to create window. Your GPU may not support OpenGL 4.6.")
-    
+        self.window = window
+
         glfw.make_context_current(window)
         glfw.swap_interval(0)
         ctx = moderngl.create_context()
@@ -1687,6 +1701,7 @@ class App(InputHandlerMixin):
         glfw.set_window_size_callback(window, self.resize_callback)
         glfw.set_key_callback(window, self.key_callback)
         glfw.set_char_callback(window, self.char_callback)
+        glfw.set_drop_callback(window, self.drop_callback)
     
     
     

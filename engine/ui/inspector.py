@@ -34,7 +34,9 @@ from engine.rendering.render_utils import (
 from engine.rendering.planetshine import get_cached_atmosphere_properties
 from engine.rendering.texture_baker import bake_and_export_ring_textures, apply_procedural_ring_to_body
 from engine.rendering.ring_generator import RING_PRESETS
+from engine.rendering.texture_manager import render_texture_management_ui
 from engine.ephemeris.system_manager import SystemManager
+from engine.path_utils import get_external_path
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -152,20 +154,16 @@ def compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo
     return A_g, A_b, q, p_rgb
 
 def _save_system_cosmetics(app, bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name):
-    """Save cosmetic properties (color, atmosphere, rings) of the system directly to system.json."""
-    is_hidden_combo = (hasattr(app, 'window') and glfw.get_key(app.window, glfw.KEY_BACKSLASH) == glfw.PRESS)
+    """Save cosmetic properties (color, atmosphere, rings, textures) of the system directly to system.json."""
     def fmt(val, dec=5): return round(float(val), dec)
 
-    if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
-        if is_hidden_combo:
-            system_file = "data/system.json"
-            target_label = "master data/system.json"
-        else:
-            system_file = app.sys_mgr._system_json_path(active_system_name)
-            target_label = "Solar System working copy"
+    is_solar = (active_system_name == SystemManager.SOLAR_SYSTEM_NAME)
+    if is_solar:
+        system_file = get_external_path("data", "system.json")
+        target_label = "master data/system.json"
     else:
         system_file = app.sys_mgr._system_json_path(active_system_name)
-        target_label = f"system '{active_system_name}'"
+        target_label = f"data/systems/{active_system_name}/system.json"
 
     try:
         if os.path.isfile(system_file):
@@ -188,20 +186,41 @@ def _save_system_cosmetics(app, bodies_data, visual_arr, atmo_bodies, ring_preco
                 s_body["color"] = hex_col
                 bodies_data[b_idx]["color"] = hex_col
 
+                for tex_prop in ("texture", "clouds", "specular", "normal"):
+                    if tex_prop in bodies_data[b_idx] and bodies_data[b_idx][tex_prop]:
+                        tex_path = bodies_data[b_idx][tex_prop]
+                        try:
+                            rel_p = os.path.relpath(tex_path, get_external_path()).replace("\\", "/")
+                            if not rel_p.startswith(".."):
+                                tex_path = rel_p
+                        except Exception:
+                            pass
+                        s_body[tex_prop] = tex_path
+
                 atmo_it = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
                 if atmo_it:
                     atmo_dict = {
-                        "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
+                        "surface_pressure": float(atmo_it.get("surface_pressure", 1.0)),
                         "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
                         "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                        "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
+                        "height": float(fmt(atmo_it.get("height", atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"]), 2))
                     }
                     if "beta_mie" in atmo_it:
                         atmo_dict["beta_mie"] = float(atmo_it["beta_mie"])
-                    if "h_mie" in atmo_it:
+                    if "h_mie" in atmo_dict:
                         atmo_dict["h_mie"] = float(atmo_it["h_mie"])
+                    elif "h_mie" in atmo_it:
+                        atmo_dict["h_mie"] = float(atmo_it["h_mie"])
+                    if "mie_g" in atmo_it:
+                        atmo_dict["mie_g"] = float(atmo_it["mie_g"])
+                    if "intensity" in atmo_it:
+                        atmo_dict["intensity"] = float(atmo_it["intensity"])
                     s_body["atmosphere"] = atmo_dict
                     bodies_data[b_idx]["atmosphere"] = atmo_dict
+                else:
+                    s_body.pop("atmosphere", None)
+                    if b_idx < len(bodies_data):
+                        bodies_data[b_idx].pop("atmosphere", None)
 
                 ring_segs = [r for r in ring_precomputed if r['body_idx'] == b_idx]
                 if ring_segs:
@@ -228,11 +247,34 @@ def _save_system_cosmetics(app, bodies_data, visual_arr, atmo_bodies, ring_preco
                         s_body["ring_texture_outer"] = fmt(tex_r['outer_r'] / body_r_au)
                         bodies_data[b_idx]["ring_texture_inner"] = s_body["ring_texture_inner"]
                         bodies_data[b_idx]["ring_texture_outer"] = s_body["ring_texture_outer"]
+                    else:
+                        s_body.pop("ring_texture_inner", None)
+                        s_body.pop("ring_texture_outer", None)
+                        bodies_data[b_idx].pop("ring_texture_inner", None)
+                        bodies_data[b_idx].pop("ring_texture_outer", None)
+                else:
+                    s_body.pop("rings", None)
+                    s_body.pop("ring_texture_inner", None)
+                    s_body.pop("ring_texture_outer", None)
+                    if b_idx < len(bodies_data):
+                        bodies_data[b_idx].pop("rings", None)
+                        bodies_data[b_idx].pop("ring_texture_inner", None)
+                        bodies_data[b_idx].pop("ring_texture_outer", None)
 
         os.makedirs(os.path.dirname(system_file), exist_ok=True)
         with open(system_file, "w") as f:
             json.dump(sys_data, f, indent=2, cls=NumpyEncoder)
-        if active_system_name != SystemManager.SOLAR_SYSTEM_NAME or not is_hidden_combo:
+
+        # If on Solar System, also synchronize working copy in data/systems/Solar System/ if it exists
+        if is_solar:
+            working_copy = app.sys_mgr._system_json_path(active_system_name)
+            if os.path.isfile(working_copy):
+                try:
+                    with open(working_copy, "w") as f:
+                        json.dump(sys_data, f, indent=2, cls=NumpyEncoder)
+                except Exception:
+                    pass
+        else:
             app.sys_mgr.save_meta(active_system_name, sys_data)
 
         msg = f"Saved cosmetics directly to {target_label}!"
@@ -1250,9 +1292,16 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
                 imgui.separator()
                 if imgui.button("Remove Atmosphere", width=-1):
+                    if 'lut_tex' in atmo_item:
+                        try:
+                            atmo_item['lut_tex'].release()
+                        except Exception:
+                            pass
                     cur_atmo_bodies.remove(atmo_item)
                     if 'atmosphere' in body_info:
                         del body_info['atmosphere']
+                    if insp_idx < len(cur_bodies_data) and 'atmosphere' in cur_bodies_data[insp_idx]:
+                        del cur_bodies_data[insp_idx]['atmosphere']
             else:
                 imgui.text_colored("No Atmosphere Present", 0.6, 0.6, 0.6)
                 if imgui.button("Add Atmosphere", width=-1):
@@ -1277,10 +1326,18 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         'temperature': 288.15,
                         'composition': {"N2": 0.78, "O2": 0.21}
                     }
+                    if insp_idx < len(cur_bodies_data):
+                        cur_bodies_data[insp_idx]['atmosphere'] = body_info['atmosphere']
             if not insp_is_cmp:
                 imgui.separator()
-                if imgui.button("Save Atmosphere Changes", width=-1):
+                btn_lbl = "Save Atmosphere Changes (Master)" if active_system_name == SystemManager.SOLAR_SYSTEM_NAME else "Save Atmosphere Changes"
+                if imgui.button(btn_lbl, width=-1):
                     _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
+                if imgui.is_item_hovered():
+                    if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                        imgui.set_tooltip("Saves atmosphere changes directly to master data/system.json.")
+                    else:
+                        imgui.set_tooltip(f"Saves atmosphere changes directly to data/systems/{active_system_name}/system.json.")
             imgui.end_tab_item()
 
         # ── Tab 4: Rings ──
@@ -1569,16 +1626,32 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         'row_idx': len(ring_precomputed)
                     })
                     app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
-            if not insp_is_cmp and rings:
+            if not insp_is_cmp:
                 imgui.separator()
-                if imgui.button("Save Ring Changes", width=-1):
+                btn_lbl = "Save Ring Changes (Master)" if active_system_name == SystemManager.SOLAR_SYSTEM_NAME else "Save Ring Changes"
+                if imgui.button(btn_lbl, width=-1):
                     _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
+                if imgui.is_item_hovered():
+                    if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
+                        imgui.set_tooltip("Saves ring changes directly to master data/system.json.")
+                    else:
+                        imgui.set_tooltip(f"Saves ring changes directly to data/systems/{active_system_name}/system.json.")
             imgui.end_tab_item()
 
         # ── Tab 5: Cosmetics ──
         if not inspect_bary and imgui.begin_tab_item("Cosmetics")[0]:
-            imgui.text_colored("Cosmetics & Surface Color", 1.0, 0.85, 0.4)
+            imgui.text_colored("Cosmetics & Surface Texture", 1.0, 0.85, 0.4)
             imgui.separator()
+
+            # Interactive Texture Preview & Management
+            render_texture_management_ui(
+                app, ctx, insp_idx, body_info, visual_arr,
+                active_system_name, cur_bodies_data, atmo_bodies,
+                ring_precomputed, insp_is_cmp
+            )
+
+            imgui.separator()
+
 
             # Convert linear albedo to sRGB for the color picker
             if insp_is_cmp:
@@ -1611,28 +1684,43 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
             imgui.separator()
             if not insp_is_cmp:
-                if imgui.button("Save Body Cosmetics", width=-1):
+                btn_label = "Save to Master Cosmetics" if active_system_name == SystemManager.SOLAR_SYSTEM_NAME else "Save System Cosmetics"
+                if imgui.button(btn_label, width=-1):
                     _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
                 if imgui.is_item_hovered():
                     if active_system_name == SystemManager.SOLAR_SYSTEM_NAME:
-                        imgui.set_tooltip("Saves cosmetics (color, atmosphere, rings) to the Solar System working copy.\nHold '\\' (backslash) + click to save directly to master data/system.json.")
+                        imgui.set_tooltip("Saves cosmetics (color, atmosphere, rings, textures) directly to master data/system.json.")
                     else:
-                        imgui.set_tooltip(f"Saves cosmetics (color, atmosphere, rings) directly to data/systems/{active_system_name}/system.json.")
+                        imgui.set_tooltip(f"Saves cosmetics (color, atmosphere, rings, textures) directly to data/systems/{active_system_name}/system.json.")
 
                 if imgui.button(f"Export {body_info['name']} to JSON (exports/)##exp_single", width=-1):
                     def fmt(val, dec=5): return round(float(val), dec)
-                    exp = {}
+                    exp = {"name": body_info['name']}
                     c = visual_arr[insp_idx, 0:3]
                     exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
+                    for tex_prop in ("texture", "clouds", "specular", "normal"):
+                        if tex_prop in body_info and body_info[tex_prop]:
+                            exp[tex_prop] = body_info[tex_prop]
 
-                    atmo_it = next((a for a in atmo_bodies if a['body_idx'] == insp_idx), None)
+                    cur_atmo_list = app.atmo_bodies_cmp if insp_is_cmp else atmo_bodies
+                    atmo_it = next((a for a in cur_atmo_list if a['body_idx'] == insp_idx), None)
                     if atmo_it:
                         exp["atmosphere"] = {
-                            "surface_pressure": float(fmt(atmo_it.get("surface_pressure", 1.0), 3)),
+                            "surface_pressure": float(atmo_it.get("surface_pressure", 1.0)),
                             "temperature": float(fmt(atmo_it.get("temperature", 288.15), 2)),
                             "composition": atmo_it.get("composition", {"N2": 0.78, "O2": 0.21, "Ar": 0.01}),
-                            "height": float(fmt(atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"], 2))
+                            "height": float(fmt(atmo_it.get("height", atmo_it["atmo_radius_km"] - atmo_it["planet_radius_km"]), 2))
                         }
+                        if "beta_mie" in atmo_it:
+                            exp["atmosphere"]["beta_mie"] = float(atmo_it["beta_mie"])
+                        if "h_mie" in atmo_it:
+                            exp["atmosphere"]["h_mie"] = float(atmo_it["h_mie"])
+                        if "mie_g" in atmo_it:
+                            exp["atmosphere"]["mie_g"] = float(atmo_it["mie_g"])
+                        if "intensity" in atmo_it:
+                            exp["atmosphere"]["intensity"] = float(atmo_it["intensity"])
+                    elif "atmosphere" in body_info and body_info["atmosphere"]:
+                        exp["atmosphere"] = copy.deepcopy(body_info["atmosphere"])
 
                     ring_segs = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
                     if ring_segs:
@@ -1651,9 +1739,15 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                                 "backscatter": fmt(r['backscatter']),
                                 "gradient": [{"p": fmt(g['p']), "a": fmt(g['a'])} for g in r.get('gradient', [])]
                             })
+                        has_tex_layer = any(r.get('is_textured', False) for r in ring_segs)
+                        if has_tex_layer:
+                            tex_r = next(r for r in ring_segs if r.get('is_textured', False))
+                            exp["ring_texture_inner"] = fmt(tex_r['inner_r'] / body_r_au)
+                            exp["ring_texture_outer"] = fmt(tex_r['outer_r'] / body_r_au)
 
-                    os.makedirs("exports", exist_ok=True)
-                    filename = os.path.join("exports", f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
+                    exp_dir = get_external_path("exports")
+                    os.makedirs(exp_dir, exist_ok=True)
+                    filename = os.path.join(exp_dir, f"{body_info['name'].replace(' ', '_').lower()}_cosmetics.json")
                     with open(filename, 'w') as f:
                         json.dump(exp, f, indent=4, cls=NumpyEncoder)
                     print(f"[Cosmetics] Exported cosmetics to {filename}")

@@ -164,6 +164,12 @@ class InputHandlerMixin:
     
     def key_callback(self, window, key, scancode, action, mods):
         if self.impl: self.impl.keyboard_callback(window, key, scancode, action, mods)
+
+        # H key: toggle UI visibility (unless typing into a text input)
+        if key == glfw.KEY_H and action == glfw.PRESS and not imgui.get_io().want_text_input:
+            self.ui_visible = not getattr(self, "ui_visible", True)
+            return
+
         if imgui.get_io().want_capture_keyboard: return
     
         # WASD: track held state for free-flight / surface walking
@@ -189,8 +195,6 @@ class InputHandlerMixin:
             elif key == glfw.KEY_EQUAL:
                 multiplier = 2.0 if (mods & glfw.MOD_SHIFT) else 1.1
                 self.camera["exposure"] *= multiplier
-            elif key == glfw.KEY_H and action == glfw.PRESS:
-                self.ui_visible = not getattr(self, "ui_visible", True)
             elif key == glfw.KEY_F12 and action == glfw.PRESS:
                 if not self._screenshot_capturing and not self._screenshot_saving:
                     _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]
@@ -201,6 +205,14 @@ class InputHandlerMixin:
         if self.impl: self.impl.resize_callback(window, width, height)
         self.window_width, self.window_height = max(1, width), max(1, height)
         self.fb_width, self.fb_height = glfw.get_framebuffer_size(window)
+
+    def drop_callback(self, window, paths):
+        """GLFW drag-and-drop callback for files dropped onto the window."""
+        if not paths:
+            return
+        mx, my = glfw.get_cursor_pos(window)
+        self._dropped_files = (paths, (mx, my))
+
 
 def _camera_align_up(up_world):
     """Return the 3x3 rotation R that maps the local +Y axis onto unit `up_world`."""
