@@ -38,8 +38,8 @@ uniform vec3 u_ring_normals[16];
 uniform float u_ring_outer_radii[16];
 
 uniform int u_tracking_idx;
-uniform int u_terrain_body_idx;
-uniform int u_num_terrain_bodies;
+uniform int u_terrain_body_idx = -1;
+uniform int u_num_terrain_bodies = 0;
 uniform int u_terrain_body_indices[16];
 uniform vec3 u_camera_pos;
 uniform float u_screen_height;

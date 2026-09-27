@@ -2319,6 +2319,12 @@ class App(InputHandlerMixin):
         self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=256, tile_size=512)
         self.planet_quadtrees = {}
         self._cull_terrain_suppression_on = False
+        if 'u_terrain_body_idx' in prog_culling_compute:
+            prog_culling_compute['u_terrain_body_idx'].value = -1
+        if 'u_num_terrain_bodies' in prog_culling_compute:
+            prog_culling_compute['u_num_terrain_bodies'].value = 0
+        if 'u_terrain_body_indices' in prog_culling_compute:
+            prog_culling_compute['u_terrain_body_indices'].value = tuple([0] * 16)
         self.terrain_last_patch_count = 0
         self.terrain_last_triangle_count = 0
         self.sphere_last_triangle_count = 0
@@ -6932,24 +6938,74 @@ class App(InputHandlerMixin):
                 atmo_entry = atmos_by_key.get(key)
                 body_ring_groups = rings_by_key.get(key, [])
 
+                # Determine if camera is below the cloud shell (ground / low-altitude observer)
+                _b_pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                _inst_idx = _bi if not _is_c else (num_bodies + _bi)
+                _cam_rel_au = cam_pos - _b_pos
+                _cam_d_km = math.sqrt(float(_cam_rel_au[0]**2 + _cam_rel_au[1]**2 + _cam_rel_au[2]**2)) * 149597870.7
+                _b_r_au = float(self.body_radii_cmp[_bi] if _is_c else body_radii[_bi]) if _bi < (len(self.body_radii_cmp) if _is_c else len(body_radii)) else 0.0
+                _b_r_km = _b_r_au * 149597870.7
+                _varr = visual_arr_cmp if _is_c and hasattr(self, 'visual_arr_cmp') else visual_arr
+                _c_alt_km = float(_varr[_bi, 12] * 0.35) if _varr.shape[1] > 12 and _varr[_bi, 12] > 0 else 3.5
+
+                _obl = float(all_instances[_inst_idx, 12]) if (hasattr(self, 'all_instances') and _inst_idx < len(all_instances)) else 0.0
+                if _obl > 0.0 and _cam_d_km > 1e-6:
+                    _pole = all_instances[_inst_idx, 9:12] if (hasattr(self, 'all_instances') and _inst_idx < len(all_instances)) else np.array([0.0, 1.0, 0.0])
+                    _p_len = math.sqrt(float(_pole[0]**2 + _pole[1]**2 + _pole[2]**2))
+                    if _p_len > 1e-6:
+                        _pn = _pole / _p_len
+                        _un = _cam_rel_au / max(1e-12, (_cam_d_km / 149597870.7))
+                        _cos_phi = float(np.dot(_un, _pn))
+                        _sin_phi_sq = max(0.0, 1.0 - _cos_phi * _cos_phi)
+                        _b_km = _b_r_km * (1.0 - _obl)
+                        _denom = _b_km * _b_km * _sin_phi_sq + _b_r_km * _b_r_km * (_cos_phi * _cos_phi)
+                        _local_r_km = (_b_r_km * _b_km) / math.sqrt(max(1e-12, _denom))
+                    else:
+                        _local_r_km = _b_r_km
+                else:
+                    _local_r_km = _b_r_km
+
+                _alt_km = _cam_d_km - _local_r_km
+                is_below_clouds = _alt_km < _c_alt_km
+
                 if atmo_entry is not None and body_ring_groups:
                     if _body_needs_ring_clip(atmo_entry):
+                        if is_below_clouds:
+                            execute_atmosphere_pass(1, [atmo_entry])
+                            for rg in body_ring_groups:
+                                render_single_ring_group(rg, is_cmp=_is_c)
+                            execute_atmosphere_pass(2, [atmo_entry])
+                            render_body_clouds(_bi, is_cmp=_is_c)
+                            rendered_cloud_bodies.add(key)
+                        else:
+                            render_body_clouds(_bi, is_cmp=_is_c)
+                            rendered_cloud_bodies.add(key)
+                            execute_atmosphere_pass(1, [atmo_entry])
+                            for rg in body_ring_groups:
+                                render_single_ring_group(rg, is_cmp=_is_c)
+                            execute_atmosphere_pass(2, [atmo_entry])
+                    else:
+                        if is_below_clouds:
+                            execute_atmosphere_pass(0, [atmo_entry])
+                            for rg in body_ring_groups:
+                                render_single_ring_group(rg, is_cmp=_is_c)
+                            render_body_clouds(_bi, is_cmp=_is_c)
+                            rendered_cloud_bodies.add(key)
+                        else:
+                            render_body_clouds(_bi, is_cmp=_is_c)
+                            rendered_cloud_bodies.add(key)
+                            execute_atmosphere_pass(0, [atmo_entry])
+                            for rg in body_ring_groups:
+                                render_single_ring_group(rg, is_cmp=_is_c)
+                elif atmo_entry is not None:
+                    if is_below_clouds:
+                        execute_atmosphere_pass(0, [atmo_entry])
                         render_body_clouds(_bi, is_cmp=_is_c)
                         rendered_cloud_bodies.add(key)
-                        execute_atmosphere_pass(1, [atmo_entry])
-                        for rg in body_ring_groups:
-                            render_single_ring_group(rg, is_cmp=_is_c)
-                        execute_atmosphere_pass(2, [atmo_entry])
                     else:
                         render_body_clouds(_bi, is_cmp=_is_c)
                         rendered_cloud_bodies.add(key)
                         execute_atmosphere_pass(0, [atmo_entry])
-                        for rg in body_ring_groups:
-                            render_single_ring_group(rg, is_cmp=_is_c)
-                elif atmo_entry is not None:
-                    render_body_clouds(_bi, is_cmp=_is_c)
-                    rendered_cloud_bodies.add(key)
-                    execute_atmosphere_pass(0, [atmo_entry])
                 elif body_ring_groups:
                     render_body_clouds(_bi, is_cmp=_is_c)
                     rendered_cloud_bodies.add(key)

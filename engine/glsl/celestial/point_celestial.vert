@@ -49,6 +49,22 @@ flat out vec3 f_surface_color;
 
 #define PI 3.14159265358979323846
 
+float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_vec) {
+    if (r_minor < 1e-6 || r_eq < 1e-6) return r_eq;
+    float perp_len = length(perp_vec);
+    if (perp_len < 1e-6) return r_eq;
+    float PdotL = dot(pole, L);
+    vec3 P_proj = pole - L * PdotL;
+    float P_proj_len = length(P_proj);
+    if (P_proj_len < 1e-6) return r_eq;
+    vec3 P_dir = P_proj / P_proj_len;
+    float y = dot(perp_vec, P_dir);
+    float x = length(perp_vec - y * P_dir);
+    float denom = sqrt((x / r_eq) * (x / r_eq) + (y / r_minor) * (y / r_minor));
+    if (denom < 1e-6) return r_eq;
+    return perp_len / denom;
+}
+
 void main() {
     uint inst_idx = vis_indices[gl_InstanceID];
     vec4 f0 = instances[inst_idx * 7 + 0];
@@ -144,7 +160,16 @@ void main() {
                 // are bit-identical copies from the same CPU buffer).
                 if (dc < 1e-6 || dc >= dist_star_raw) continue;
                 if (distance(u_casters[j].xyz, in_offset) < 1e-7) continue;
-                float b_ang = u_casters[j].w / dc;         // occluder angular radius
+
+                float caster_r = u_casters[j].w;
+                float caster_r_minor = u_caster_poles_obl[j].w;
+                vec3 perp_vec = crel - dot(crel, star_dir) * star_dir;
+                if (caster_r_minor > 1e-6 && caster_r_minor < caster_r - 1e-5) {
+                    vec3 pole = u_caster_poles_obl[j].xyz;
+                    caster_r = get_oblate_radius(caster_r, caster_r_minor, pole, star_dir, perp_vec);
+                }
+
+                float b_ang = caster_r / dc;         // occluder angular radius
                 float cos_d = clamp(dot(star_dir, crel / dc), -1.0, 1.0);
                 float d_ang = acos(cos_d);                 // center separation
                 if (d_ang >= a_ang + b_ang) continue;      // no overlap
@@ -213,6 +238,11 @@ void main() {
             float inv_tc = 1.0 / t_c;
             float gamma = sqrt(perp_sq) * inv_tc;
             float caster_r = u_casters[j].w;
+            float caster_r_minor = u_caster_poles_obl[j].w;
+            if (caster_r_minor > 1e-6 && caster_r_minor < caster_r - 1e-5) {
+                vec3 perp_vec = to_caster - t_c * L_dir;
+                caster_r = get_oblate_radius(caster_r, caster_r_minor, u_caster_poles_obl[j].xyz, L_dir, perp_vec);
+            }
             float beta = caster_r * inv_tc;
             float alpha = star_r / dist_star;
             float theta_b = in_radius * inv_tc;

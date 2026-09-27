@@ -264,7 +264,7 @@ void main() {
     f_caster_mask = uvec2(floatBitsToUint(f3.y), floatBitsToUint(f3.z));
     f_ring_mask = floatBitsToUint(f3.w);
     f_planetshine_dir = f4.xyz;
-    f_planetshine_color = vec3(f4.w, f5.x, f5.y);
+    f_planetshine_color = f5.xyz;
 
     f_body_center = body_pos;
     f_rel_pos = p_world_km * u_km_to_au;

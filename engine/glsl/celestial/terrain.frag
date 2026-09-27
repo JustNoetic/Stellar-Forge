@@ -190,7 +190,9 @@ void main() {
             float cloud_h_km = max(0.5, f_scale_height * 0.35);
             float R_km = max(f_radius_km, 1e-3);
             float term_offset = sqrt(max(0.0, 2.0 * cloud_h_km / R_km));
-            float effective_sun_cos = dot(cloud_norm, L) + term_offset;
+            // Solar illumination always strikes the outer (top) surface of the cloud deck
+            float sun_cos = dot(N, L);
+            float effective_sun_cos = sun_cos + term_offset;
 
             float diffuse = 0.0;
             if (is_underside) {
@@ -381,8 +383,9 @@ void main() {
         // === Moonshine / Planetshine on Clouds ===
         vec3 bounce_light = vec3(0.0);
         if (dot(f_planetshine_color, f_planetshine_color) > 1e-12) {
-            float NdotC = max(0.0, dot(cloud_norm, f_planetshine_dir));
-            bounce_light = f_planetshine_color * NdotC * primary_caster_shadow;
+            float NdotC = max(0.0, dot(N, f_planetshine_dir));
+            float ps_trans = is_underside ? 0.50 : 1.0;
+            bounce_light = f_planetshine_color * (NdotC * ps_trans) * primary_caster_shadow;
         }
 
         // === Ringshine on Clouds ===
