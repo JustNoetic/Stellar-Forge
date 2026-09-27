@@ -2310,6 +2310,7 @@ class App(InputHandlerMixin):
         self.terrain_current_body_idx = -1
         self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=256, tile_size=512)
         self.planet_quadtrees = {}
+        self._cull_terrain_suppression_on = False
         self.terrain_last_patch_count = 0
         self.terrain_last_triangle_count = 0
         self.sphere_last_triangle_count = 0
@@ -4420,6 +4421,7 @@ class App(InputHandlerMixin):
             terrain_enabled = bool(self.camera.get("terrain_lod_enabled", False))
 
             if terrain_enabled and getattr(self, 'terrain_streamer', None) is not None:
+                self.terrain_streamer.begin_frame()
                 self.terrain_streamer.process_uploads(max_per_frame=4)
                 cand_indices = []
                 if tracking_idx_uni >= 0 and tracking_idx_uni < total_render_bodies:
@@ -4433,34 +4435,68 @@ class App(InputHandlerMixin):
 
                 fov_fac = float(1.0 / math.tan(math.radians(max(0.001, self.camera["fov"]) / 2.0)))
                 max_terrain_bodies = 4
+
+                # Apparent-size test first (cheap numpy), tiles-dir existence
+                # cached once per body — os.path.isdir() per body per frame is a
+                # syscall storm on the render thread.
+                tiles_base = self.terrain_streamer.tiles_base_dir
+                tiles_dir_cache = getattr(self, "_terrain_tiles_dir_cache", None)
+                if tiles_dir_cache is None:
+                    tiles_dir_cache = self._terrain_tiles_dir_cache = {}
+
                 for b_i in cand_indices:
+                    b_pos = all_instances[b_i, 0:3]
+                    b_r = all_instances[b_i, 6]
+                    d_cam = float(np.linalg.norm(b_pos - cam_pos))
+                    apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
+                    # Activate terrain quadtree whenever apparent_px >= 32.0
+                    min_px_thresh = 32.0
+                    if apparent_px < min_px_thresh:
+                        continue
+
                     b_name = bodies_data[b_i]["name"].lower() if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]["name"].lower()
-                    body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name)
-                    if os.path.isdir(body_tiles_dir):
-                        b_pos = all_instances[b_i, 0:3]
-                        b_r = all_instances[b_i, 6]
-                        d_cam = float(np.linalg.norm(b_pos - cam_pos))
-                        apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
-                        # Activate terrain quadtree whenever apparent_px >= 32.0
-                        min_px_thresh = 32.0
-                        if apparent_px >= min_px_thresh:
-                            r_cull = b_r * (1.5 if d_cam > b_r else 5.0)
-                            if is_sphere_in_frustum(b_pos, r_cull, frustum_planes):
-                                active_terrain_bodies.append((b_i, b_name))
-                                if len(active_terrain_bodies) >= max_terrain_bodies:
-                                    break
+                    has_tiles = tiles_dir_cache.get(b_i)
+                    if has_tiles is None:
+                        has_tiles = os.path.isdir(os.path.join(tiles_base, b_name))
+                        tiles_dir_cache[b_i] = has_tiles
+                    if not has_tiles:
+                        continue
 
-            active_terrain_body_idx = active_terrain_bodies[0][0] if active_terrain_bodies else -1
-            active_terrain_body_name = active_terrain_bodies[0][1] if active_terrain_bodies else None
-            active_terrain_body_indices = [tb[0] for tb in active_terrain_bodies]
+                    r_cull = b_r * (1.5 if d_cam > b_r else 5.0)
+                    if is_sphere_in_frustum(b_pos, r_cull, frustum_planes):
+                        active_terrain_bodies.append((b_i, b_name))
+                        if len(active_terrain_bodies) >= max_terrain_bodies:
+                            break
 
-            if 'u_terrain_body_idx' in prog_culling_compute:
-                prog_culling_compute['u_terrain_body_idx'].value = active_terrain_body_idx
-            if 'u_num_terrain_bodies' in prog_culling_compute:
-                prog_culling_compute['u_num_terrain_bodies'].value = len(active_terrain_body_indices)
-            if 'u_terrain_body_indices' in prog_culling_compute:
-                indices_padded = active_terrain_body_indices[:16] + [0] * max(0, 16 - len(active_terrain_body_indices))
-                prog_culling_compute['u_terrain_body_indices'].value = tuple(indices_padded)
+            active_terrain_body_idx = -1
+            active_terrain_body_name = None
+            active_terrain_body_indices = []
+
+            if active_terrain_bodies:
+                active_terrain_body_idx = active_terrain_bodies[0][0]
+                active_terrain_body_name = active_terrain_bodies[0][1]
+                active_terrain_body_indices = [tb[0] for tb in active_terrain_bodies]
+                self._cull_terrain_suppression_on = True
+
+                if 'u_terrain_body_idx' in prog_culling_compute:
+                    prog_culling_compute['u_terrain_body_idx'].value = active_terrain_body_idx
+                if 'u_num_terrain_bodies' in prog_culling_compute:
+                    prog_culling_compute['u_num_terrain_bodies'].value = len(active_terrain_body_indices)
+                if 'u_terrain_body_indices' in prog_culling_compute:
+                    indices_padded = active_terrain_body_indices[:16] + [0] * max(0, 16 - len(active_terrain_body_indices))
+                    prog_culling_compute['u_terrain_body_indices'].value = tuple(indices_padded)
+            else:
+                # Keep the culling compute shader's terrain suppression off when
+                # no terrain body is active — but only write the uniforms when
+                # the enabled-state changed, instead of per frame.
+                if self._cull_terrain_suppression_on:
+                    self._cull_terrain_suppression_on = False
+                    if 'u_terrain_body_idx' in prog_culling_compute:
+                        prog_culling_compute['u_terrain_body_idx'].value = -1
+                    if 'u_num_terrain_bodies' in prog_culling_compute:
+                        prog_culling_compute['u_num_terrain_bodies'].value = 0
+                    if 'u_terrain_body_indices' in prog_culling_compute:
+                        prog_culling_compute['u_terrain_body_indices'].value = tuple([0] * 16)
 
             if 'u_camera_pos' in prog_culling_compute:
                 prog_culling_compute['u_camera_pos'].value = tuple(cam_pos)
@@ -5303,18 +5339,17 @@ class App(InputHandlerMixin):
                         self.terrain_patch_staging[st:en, 16:19] = pole_n
                         self.terrain_patch_staging[st:en, 19] = rot_angle
 
-                        for ip in range(num_p):
-                            face = int(raw_patches[ip, 4])
-                            lod = int(raw_patches[ip, 5])
-                            x = int(raw_patches[ip, 6])
-                            y = int(raw_patches[ip, 7])
-                            slot_id, uv_scale, off_x, off_y = self.terrain_streamer.get_tile_slot_or_fallback(
-                                b_name, "diffuse", face, lod, x, y
-                            )
-                            self.terrain_patch_staging[st + ip, 4] = uv_scale
-                            self.terrain_patch_staging[st + ip, 5] = off_x
-                            self.terrain_patch_staging[st + ip, 6] = off_y
-                            self.terrain_patch_staging[st + ip, 10] = float(slot_id)
+                        # Batched tile residency lookup: resolve each unique
+                        # tile once instead of one Python call per patch.
+                        slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch(
+                            b_name, "diffuse",
+                            raw_patches[:, 4], raw_patches[:, 5],
+                            raw_patches[:, 6], raw_patches[:, 7]
+                        )
+                        self.terrain_patch_staging[st:en, 4] = uvs
+                        self.terrain_patch_staging[st:en, 5] = ox_arr
+                        self.terrain_patch_staging[st:en, 6] = oy_arr
+                        self.terrain_patch_staging[st:en, 10] = slots
 
                         self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
                         total_patches_rendered += num_p
@@ -5363,7 +5398,9 @@ class App(InputHandlerMixin):
             vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
             _perf_gpu_end(_gq)
 
-            if self.camera.get("show_triangle_count", False) or self.camera.get("show_settings_modal", False):
+            # GPU draw-command readback is a full pipeline sync; only pay it
+            # while the triangle HUD is shown — never with the settings modal.
+            if self.camera.get("show_triangle_count", False):
                 try:
                     raw_cmds = np.frombuffer(draw_cmds_buffer.read(), dtype=np.uint32).reshape((4, 5))
                     self.sphere_last_triangle_count = int(
@@ -5377,10 +5414,6 @@ class App(InputHandlerMixin):
             else:
                 self.sphere_last_triangle_count = 0
             self.total_last_triangle_count = self.sphere_last_triangle_count + self.terrain_last_triangle_count
-
-            ctx.disable(moderngl.BLEND)
-            ctx.disable(moderngl.CULL_FACE)
-
 
             # --- Pass 2: Orbit Lines ---
             ctx.enable(moderngl.BLEND)
@@ -6648,59 +6681,54 @@ class App(InputHandlerMixin):
                     raw_p, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st_idx, num_p = body_terrain_info
                     if num_p > 0:
                         cloud_staged_count = 0
-                        for ip in range(num_p):
-                            face = int(raw_p[ip, 4])
-                            lod = int(raw_p[ip, 5])
-                            x = int(raw_p[ip, 6])
-                            y = int(raw_p[ip, 7])
-                            slot_id, uv_scale, off_x, off_y = self.terrain_streamer.get_tile_slot_or_fallback(
-                                b_name, "clouds", face, lod, x, y
-                            )
-                            self.terrain_cloud_staging[ip] = self.terrain_patch_staging[st_idx + ip]
-                            self.terrain_cloud_staging[ip, 4] = uv_scale
-                            self.terrain_cloud_staging[ip, 5] = off_x
-                            self.terrain_cloud_staging[ip, 6] = off_y
-                            self.terrain_cloud_staging[ip, 10] = float(slot_id)
-                            if slot_id >= 0:
-                                cloud_staged_count += 1
+                        slot_arr, uvc, c_ox, c_oy = self.terrain_streamer.resolve_tiles_batch(
+                            b_name, "clouds",
+                            raw_p[:, 4], raw_p[:, 5], raw_p[:, 6], raw_p[:, 7]
+                        )
+                        self.terrain_cloud_staging[:num_p] = self.terrain_patch_staging[st_idx:st_idx + num_p]
+                        self.terrain_cloud_staging[:num_p, 4] = uvc
+                        self.terrain_cloud_staging[:num_p, 5] = c_ox
+                        self.terrain_cloud_staging[:num_p, 6] = c_oy
+                        self.terrain_cloud_staging[:num_p, 10] = slot_arr
+                        cloud_staged_count = int(np.count_nonzero(slot_arr >= 0.0))
 
-                    if cloud_staged_count > 0:
-                        self.hdr_resolve_fbo.use()
-                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                        ctx.enable(moderngl.BLEND)
-                        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                        ctx.enable(moderngl.DEPTH_TEST)
-                        ctx.depth_func = '<='
-                        ctx.disable(moderngl.CULL_FACE)
-                        ctx.depth_mask = False
+                        if cloud_staged_count > 0:
+                            self.hdr_resolve_fbo.use()
+                            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                            ctx.enable(moderngl.BLEND)
+                            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                            ctx.enable(moderngl.DEPTH_TEST)
+                            ctx.depth_func = '<='
+                            ctx.disable(moderngl.CULL_FACE)
+                            ctx.depth_mask = False
 
-                        self.terrain_cloud_ssbo.write(self.terrain_cloud_staging[:num_p].tobytes())
-                        self.terrain_cloud_ssbo.bind_to_storage_buffer(binding=4)
+                            self.terrain_cloud_ssbo.write(self.terrain_cloud_staging[:num_p].tobytes())
+                            self.terrain_cloud_ssbo.bind_to_storage_buffer(binding=4)
 
-                        self.terrain_streamer.use(location=14)
-                        if 'u_is_cloud_pass' in self.prog_terrain:
-                            self.prog_terrain['u_is_cloud_pass'].value = True
-                        if 'u_cloud_altitude_km' in self.prog_terrain:
-                            cloud_alt = float(visual_arr[bi, 12] * 0.35) if visual_arr.shape[1] > 12 and visual_arr[bi, 12] > 0 else 3.5
-                            self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
-                        if 'u_camera_pos' in self.prog_terrain:
-                            self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
-                        if 'u_debug_tiles' in self.prog_terrain:
-                            self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
-                        if 'u_hdr_enabled' in self.prog_terrain:
-                            self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
-                        if 'u_exposure' in self.prog_terrain:
-                            self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+                            self.terrain_streamer.use(location=14)
+                            if 'u_is_cloud_pass' in self.prog_terrain:
+                                self.prog_terrain['u_is_cloud_pass'].value = True
+                            if 'u_cloud_altitude_km' in self.prog_terrain:
+                                cloud_alt = float(visual_arr[bi, 12] * 0.35) if visual_arr.shape[1] > 12 and visual_arr[bi, 12] > 0 else 3.5
+                                self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
+                            if 'u_camera_pos' in self.prog_terrain:
+                                self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                            if 'u_debug_tiles' in self.prog_terrain:
+                                self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
+                            if 'u_hdr_enabled' in self.prog_terrain:
+                                self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
+                            if 'u_exposure' in self.prog_terrain:
+                                self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
 
-                        self.vao_terrain.render(moderngl.TRIANGLES, instances=num_p)
+                            self.vao_terrain.render(moderngl.TRIANGLES, instances=num_p)
 
-                        if 'u_is_cloud_pass' in self.prog_terrain:
-                            self.prog_terrain['u_is_cloud_pass'].value = False
+                            if 'u_is_cloud_pass' in self.prog_terrain:
+                                self.prog_terrain['u_is_cloud_pass'].value = False
 
-                        self.terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
-                        ctx.depth_mask = True
-                        ctx.depth_func = '<'
-                        return
+                            self.terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
+                            ctx.depth_mask = True
+                            ctx.depth_func = '<'
+                            return
 
                 inst_idx = bi if not is_cmp else (num_bodies + bi)
                 self.single_cloud_body_buf.write(struct.pack('I', int(inst_idx)))

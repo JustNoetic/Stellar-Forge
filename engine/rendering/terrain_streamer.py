@@ -60,6 +60,9 @@ class TerrainTileStreamer:
         self.missing_tiles = set()
         self.max_available_lods = {}
 
+        # Resolution memo: map_type -> {(b_name, face, lod, x, y): (slot, uv_scale, ox, oy)}
+        # invalidated wholesale on any residency change (upload/evict).
+        self._resolve_memo = {}
         # Initialize default slot 0 with neutral gray
         default_tile = np.full((self.tile_size, self.tile_size, 4), 128, dtype=np.uint8)
         default_tile[..., 3] = 255
@@ -153,6 +156,18 @@ class TerrainTileStreamer:
             if raw_bytes:
                 self.upload_queue.put((key, raw_bytes))
             else:
+                # Tile absent on disk: request the nearest on-disk ancestor so
+                # a resident parent exists for hierarchical UV fallback instead
+                # of churning re-requests for the missing key every frame.
+                b_name, map_type, face, lod, x, y = key
+                max_d = self.max_available_lods.get((b_name, map_type, face), -1)
+                min_lod = min(lod - 1, max_d) if max_d >= 0 else lod - 1
+                if min_lod >= 0:
+                    shift = lod - min_lod
+                    anc_key = (b_name, map_type, face, min_lod, x >> shift, y >> shift)
+                    if anc_key not in self.resident_tiles and anc_key not in self.missing_tiles and anc_key not in self.in_flight_requests:
+                        self.in_flight_requests.add(anc_key)
+                        self.request_queue.put(anc_key)
                 self.missing_tiles.add(key)
             self.in_flight_requests.discard(key)
 
@@ -178,14 +193,40 @@ class TerrainTileStreamer:
         If the requested tile is resident, returns (slot_idx, 1.0, 0.0, 0.0).
         If not resident, triggers background streaming and returns the closest resident ancestor.
         """
+        slot, uv_scale, off_x, off_y = self._resolve_single(body_name, map_type, face, lod, x, y)
+        if slot >= 0:
+            self.slot_last_used[slot] = self.current_frame
+        return slot, uv_scale, off_x, off_y
+
+    def _resolve_single(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int):
+        """
+        Single-tile residency probe with hierarchical ancestor fallback.
+        Results are memoized until residency changes (upload/evict invalidate
+        the memo); a memo hit does not touch LRU timestamps — callers stamp.
+        """
         b_name = body_name.lower()
+        cache = self._resolve_memo.get(map_type)
+        if cache is None:
+            cache = self._resolve_memo[map_type] = {}
+        key = (b_name, face, lod, x, y)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
+        result = self._resolve_uncached(b_name, map_type, face, lod, x, y)
+        cache[key] = result
+        return result
+
+    def _resolve_uncached(self, b_name: str, map_type: str, face: int, lod: int, x: int, y: int):
+        """
+        Single-tile residency probe with hierarchical ancestor fallback.
+        """
         max_d = self.max_available_lods.get((b_name, map_type, face), -1)
 
         # 1. Exact match
         key = (b_name, map_type, face, lod, x, y)
-        if key in self.resident_tiles:
-            slot = self.resident_tiles[key]
-            self.slot_last_used[slot] = self.current_frame
+        slot = self.resident_tiles.get(key)
+        if slot is not None:
             return slot, 1.0, 0.0, 0.0
 
         # 2. Check if the clamped highest available tile (max_d) is resident
@@ -194,13 +235,10 @@ class TerrainTileStreamer:
             eff_x = x >> k_clamp
             eff_y = y >> k_clamp
             eff_key = (b_name, map_type, face, max_d, eff_x, eff_y)
-            if eff_key in self.resident_tiles:
-                slot = self.resident_tiles[eff_key]
-                self.slot_last_used[slot] = self.current_frame
+            slot = self.resident_tiles.get(eff_key)
+            if slot is not None:
                 uv_scale = 1.0 / (1 << k_clamp)
-                offset_x = (x & ((1 << k_clamp) - 1)) * uv_scale
-                offset_y = (y & ((1 << k_clamp) - 1)) * uv_scale
-                return slot, uv_scale, offset_x, offset_y
+                return slot, uv_scale, (x & ((1 << k_clamp) - 1)) * uv_scale, (y & ((1 << k_clamp) - 1)) * uv_scale
 
             # Trigger streaming of the best available tile if not already requested
             if eff_key not in self.missing_tiles and eff_key not in self.in_flight_requests:
@@ -211,24 +249,59 @@ class TerrainTileStreamer:
                 self.request_tile(b_name, map_type, face, lod, x, y)
 
         # 3. Ancestor fallback (nearest resident parent)
-        for k in range(1, lod + 1):
-            anc_lod = lod - k
-            anc_x = x >> k
-            anc_y = y >> k
+        anc_lod = lod - 1
+        anc_x = x
+        anc_y = y
+        while anc_lod >= 0:
+            anc_x >>= 1
+            anc_y >>= 1
             anc_key = (b_name, map_type, face, anc_lod, anc_x, anc_y)
-            if anc_key in self.resident_tiles:
-                slot = self.resident_tiles[anc_key]
-                self.slot_last_used[slot] = self.current_frame
-
+            slot = self.resident_tiles.get(anc_key)
+            if slot is not None:
+                k = lod - anc_lod
                 uv_scale = 1.0 / (1 << k)
-                offset_x = (x & ((1 << k) - 1)) * uv_scale
-                offset_y = (y & ((1 << k) - 1)) * uv_scale
-                return slot, uv_scale, offset_x, offset_y
+                return slot, uv_scale, (x & ((1 << k) - 1)) * uv_scale, (y & ((1 << k) - 1)) * uv_scale
+            anc_lod -= 1
 
         # 4. Default fallback (slot 0 for diffuse, -1 for clouds to avoid opaque fallback blocks)
         if map_type == 'clouds':
             return -1, 1.0, 0.0, 0.0
         return 0, 1.0, 0.0, 0.0
+
+    def resolve_tiles_batch(self, body_name: str, map_type: str, faces, lods, xs, ys):
+        """
+        Batch replacement for per-patch get_tile_slot_or_fallback() calls.
+
+        faces/lods/xs/ys are per-patch integer tile coordinates. Returns float32
+        arrays (slots, uv_scales, offset_x, offset_y) with identical residency
+        and ancestor-fallback semantics. Duplicate tiles are resolved once via
+        the cross-frame resolution memo; LRU stamps are written once per slot.
+        """
+        faces_i = np.asarray(faces, dtype=np.int64)
+        lods_i = np.asarray(lods, dtype=np.int64)
+        xs_i = np.asarray(xs, dtype=np.int64)
+        ys_i = np.asarray(ys, dtype=np.int64)
+        n = faces_i.shape[0]
+
+        slots = np.empty(n, dtype=np.float32)
+        uv_scales = np.empty(n, dtype=np.float32)
+        off_x = np.empty(n, dtype=np.float32)
+        off_y = np.empty(n, dtype=np.float32)
+
+        resolve = self._resolve_single
+        frame = self.current_frame
+        stamped = set()
+        for i in range(n):
+            s, u, ox, oy = resolve(body_name, map_type,
+                                   int(faces_i[i]), int(lods_i[i]), int(xs_i[i]), int(ys_i[i]))
+            slots[i] = s
+            uv_scales[i] = u
+            off_x[i] = ox
+            off_y[i] = oy
+            if s >= 0 and s not in stamped:
+                stamped.add(s)
+                self.slot_last_used[s] = frame
+        return slots, uv_scales, off_x, off_y
 
     def upload_tile_to_slot(self, slot_idx: int, raw_bytes: bytes):
         """Upload raw RGBA tile bytes to the specified layer of Texture2DArray."""
@@ -237,9 +310,12 @@ class TerrainTileStreamer:
             viewport=(0, 0, slot_idx, self.tile_size, self.tile_size, 1)
         )
 
+    def begin_frame(self):
+        """Advances the frame counter used for LRU timestamps. Call once per render frame."""
+        self.current_frame += 1
+
     def process_uploads(self, max_per_frame: int = 4):
         """Called every frame on the main OpenGL render thread to flush completed decodes."""
-        self.current_frame += 1
 
         for _ in range(max_per_frame):
             try:
@@ -272,12 +348,17 @@ class TerrainTileStreamer:
                     old_key = self.slot_to_key[slot]
                     if old_key in self.resident_tiles:
                         del self.resident_tiles[old_key]
+                    # Any memoized resolution that referenced the evicted
+                    # slot is now stale — drop the whole memo (cheap, safe).
+                    self._resolve_memo.clear()
 
             # Upload to GPU
             self.upload_tile_to_slot(slot, raw_bytes)
             self.resident_tiles[key] = slot
             self.slot_to_key[slot] = key
             self.slot_last_used[slot] = self.current_frame
+            # New residency invalidates memoized fallbacks for this subtree.
+            self._resolve_memo.clear()
 
     def use(self, location: int = 14):
         """Bind the texture array to a texture unit."""

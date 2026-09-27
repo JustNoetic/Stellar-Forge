@@ -60,11 +60,10 @@ def render_viewport_hud(app, bodies_data):
             imgui.text_colored("Rendered Triangles", 0.4, 0.8, 1.0)
             imgui.separator()
             imgui.text(f"Total:   {total_tris:,}")
-            if terrain_tris > 0 or app.camera.get("terrain_lod_enabled", False):
-                p_res = int(app.camera.get("terrain_patch_res", 32))
-                imgui.text_colored(f"Terrain: {terrain_tris:,}", 0.3, 1.0, 0.5)
-                imgui.same_line()
-                imgui.text_disabled(f"({patches:,} patches @ {p_res}x{p_res})")
+            p_res = int(app.camera.get("terrain_patch_res", 32))
+            imgui.text_colored(f"Terrain: {terrain_tris:,}", 0.3, 1.0, 0.5)
+            imgui.same_line()
+            imgui.text_disabled(f"({patches:,} patches @ {p_res}x{p_res})")
             if sphere_tris > 0:
                 imgui.text(f"Spheres: {sphere_tris:,}")
 
