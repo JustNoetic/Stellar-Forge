@@ -143,9 +143,14 @@ def test_gpu_terrain_rendering_pipeline():
     if 'u_exposure' in prog_terrain:
         prog_terrain['u_exposure'].value = 1.0
 
-    # Draw instanced
+    # Draw instanced (direct)
     vao.render(moderngl.TRIANGLES, instances=4)
-    print("    Offscreen terrain render pass completed without OpenGL errors!")
+
+    # Draw instanced (indirect via DrawElementsIndirectCommand)
+    cmd_data = np.array([len(grid_idx), 4, 0, 0, 0], dtype=np.uint32)
+    cmd_buf = ctx.buffer(cmd_data.tobytes())
+    vao.render_indirect(cmd_buf, moderngl.TRIANGLES)
+    print("    Offscreen terrain render pass (direct & indirect) completed without OpenGL errors!")
 
 
 def test_quadtree_frustum_culling_and_low_fov():

@@ -264,11 +264,13 @@ Stellar-Forge incorporates a continuous Level of Detail (LOD) planetary terrain 
      $$\mathbf{C}_{\text{sphere}} = \left(C_x, \, \frac{C_y}{1 - f}, \, C_z\right)$$
      In this transformed metric space, the oblate body is an exact unit sphere, enabling exact analytical horizon culling ($\theta_{\text{cull}} = \theta_{\text{horizon}} + \arcsin(R_{\text{patch}} / R_{\text{planet}})$). This completely prevents backside polygon leaks and ensures seamless LOD subdivision across all latitudes.
    - **Local 6-Plane View Frustum Culling**: Quadtree traversal incorporates analytical bounding sphere testing against camera frustum planes dynamically transformed into the planet's local rotated frame. Nodes outside the view cone are pruned immediately at root and low LODs, slashing rendered patches and triangle counts by $>99\%$ during narrow/low FOV (telescope view) and preventing off-screen triangle blowup.
-   - Traversal is compiled with Numba (`_traverse_quadtree_jit`), evaluating the full planetary tree in $< 0.1\text{ ms}$ on CPU with zero per-frame Python memory allocations. Supports simultaneous multi-body terrain and cloud quadtree rendering in a single instanced draw call.
+   - Traversal and patch staging are compiled with Numba (`_traverse_quadtree_jit`, `pack_terrain_patches_jit`, `pack_cloud_patches_jit`), evaluating the full planetary tree in $< 0.1\text{ ms}$ on CPU with zero per-frame Python memory allocations and staging into a streamlined 48-byte SSBO layout. Dispatched via zero-overhead GPU indirect draw commands (`DrawElementsIndirectCommand`), supporting simultaneous multi-body terrain and cloud quadtree rendering.
 
 3. **Asynchronous Tiled Texture Streaming (`TerrainTileStreamer`)**:
    - Fixed VRAM budget backed by a dedicated ModernGL `Texture2DArray` pool (256 slices of $512 \times 512$ RGBA8).
    - Multi-layer support (`"diffuse"` and `"clouds"`).
+   - Directory listing cache (`_dir_file_cache`) and in-flight request deduplication eliminate redundant disk I/O and GIL contention during flight.
+   - Vectorized batch residency lookup (`resolve_tiles_batch`) with targeted per-face sub-caching amortizes tile residency queries.
    - Dedicated background I/O worker thread loads tiles asynchronously from disk (`data/tiles/<body_name>/<layer>/<lod>/<x>_<y>.jpg`), preventing frame stutter.
    - **Hierarchical Ancestor Fallback**: If a requested high-resolution LOD tile is still streaming from disk, the streamer queries the quadtree hierarchy in $\mathcal{O}(\text{LOD})$ for the nearest loaded ancestor tile, dynamically calculating sub-rect UV transformations:
      $$\text{UV}_{\text{sample}} = \text{UV}_{\text{patch}} \cdot \text{scale} + \text{offset}$$

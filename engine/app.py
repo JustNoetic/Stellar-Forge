@@ -2311,6 +2311,8 @@ class App(InputHandlerMixin):
         self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 12), dtype=np.float32)
         self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 48)
         self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 12), dtype=np.float32)
+        self.terrain_draw_cmds_buf = ctx.buffer(reserve=20)
+        self.terrain_cloud_draw_cmds_buf = ctx.buffer(reserve=20)
         self.terrain_current_raw_patches = None
         self.terrain_current_body_name = None
         self.terrain_current_body_idx = -1
@@ -5445,7 +5447,9 @@ class App(InputHandlerMixin):
                     if 'u_exposure' in self.prog_terrain:
                         self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
 
-                    self.vao_terrain.render(moderngl.TRIANGLES, instances=total_patches_rendered)
+                    cmd_arr = np.array([self.terrain_triangles_per_patch * 3, total_patches_rendered, 0, 0, 0], dtype=np.uint32)
+                    self.terrain_draw_cmds_buf.write(cmd_arr.tobytes())
+                    self.vao_terrain.render_indirect(self.terrain_draw_cmds_buf, moderngl.TRIANGLES)
                 else:
                     self.terrain_current_raw_patches = None
                     self.terrain_current_body_name = None
@@ -6794,7 +6798,9 @@ class App(InputHandlerMixin):
                             if 'u_exposure' in self.prog_terrain:
                                 self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
 
-                            self.vao_terrain.render(moderngl.TRIANGLES, instances=num_p)
+                            cloud_cmd_arr = np.array([self.terrain_triangles_per_patch * 3, num_p, 0, 0, 0], dtype=np.uint32)
+                            self.terrain_cloud_draw_cmds_buf.write(cloud_cmd_arr.tobytes())
+                            self.vao_terrain.render_indirect(self.terrain_cloud_draw_cmds_buf, moderngl.TRIANGLES)
 
                             if 'u_is_cloud_pass' in self.prog_terrain:
                                 self.prog_terrain['u_is_cloud_pass'].value = False

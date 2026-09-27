@@ -313,21 +313,25 @@ spectral classification.
 ### 3.11b `engine/rendering/terrain_quadtree.py` — Spherified Cube Quadtree LOD (SpaceEngine Style)
 - `cube_to_sphere_point(face, u, v)`: maps normalized cube face $(u, v) \in [-1, 1]$ to unit sphere with tangent warping ($x' = \tan(u\pi/4), y' = \tan(v\pi/4)$) to eliminate cube corner area distortion.
 - `_traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum)`: `@njit(fastmath=True)` traversal kernel evaluating Screen Space Error (SSE) against node bounding spheres, with exact 6-plane view frustum culling in planet local space (preventing low-FOV triangle explosion) and horizon culling in normalized spheroid-to-sphere space $(x, y / (1 - f), z)$ eliminating backside leaks on oblate bodies. Returns packed `(N, 9)` float32 array `[min_u, min_v, max_u, max_v, face, lod, x, y, radius]`. Zero per-frame Python memory allocations.
+- `pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx)`: `@njit(fastmath=True)` kernel packing 12 floats per patch (48 bytes: `u_range`, `u_uv_trans`, `u_meta`) directly into the staging SSBO in a single contiguous pass, de-duplicating body matrices/rotations into `AllInstances`.
+- `pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr)`: `@njit(fastmath=True)` kernel copying terrain base parameters and stamping cloud-layer slot/UV transform offsets.
 - `QuadtreePatch`: container for patch bounds, face index, LOD level, and bounding radius.
 - `PlanetQuadtree`: manages the 6 root cube faces, radius updates, and LOD traversal (`traverse_raw` / `traverse`).
 
-**Edit when:** changing quadtree subdivision metric (SSE / screen size), tangent warping formula, oblate horizon culling, or quadtree traversal.
+**Edit when:** changing quadtree subdivision metric (SSE / screen size), tangent warping formula, oblate horizon culling, JIT packing kernels, or quadtree traversal.
 
 ### 3.11c `engine/rendering/terrain_streamer.py` — Virtual Tiled Texture Streaming
 - `TerrainTileStreamer(ctx, tiles_base_dir="data/tiles", pool_capacity=256, tile_size=512)`:
   - Manages a ModernGL `Texture2DArray` pool (256 slices of $512 \times 512$ RGBA8) for virtual texture streaming.
   - Multi-layer support (`"diffuse"` and `"clouds"`). Preloads LOD 0 root slices into locked slots on startup.
-  - Background worker thread (`_worker_loop`) asynchronously reads `.jpg` / `.png` tiles from disk and queues GPU uploads.
-  - `_read_tile_from_disk(path, map_type)`: extracts grayscale luminance into alpha channel `(255, 255, 255, Luminance)` for cloud textures, ensuring smooth semi-transparency.
+  - Directory listing cache `_dir_file_cache` eliminating redundant `os.stat` filesystem calls when discovering available LODs.
+  - Background worker thread (`_worker_loop`) asynchronously reads `.jpg` / `.png` tiles from disk and queues GPU uploads with proper in-flight request deduplication.
+  - `_read_tile_from_disk(path, map_type)`: bilinear downsampling fallback and extracts grayscale luminance into alpha channel `(255, 255, 255, Luminance)` for cloud textures, ensuring smooth semi-transparency.
   - `get_tile_slot_or_fallback(body_name, map_type, face, lod, x, y)`: returns resident slot index. If the tile is still in flight, traverses up ancestors in $\mathcal{O}(\text{LOD})$ to return the nearest loaded parent slot with exact UV sub-rect scale and offsets `(slot_id, uv_scale, off_x, off_y)`.
-  - `process_uploads(max_per_frame=4)`: transfers loaded byte buffers to GPU Texture2DArray slices via `texture_array.write()`.
+  - `resolve_tiles_batch(...)`: vectorized batch residency lookup with per-face memoized sub-caches (`_resolve_memo`), amortizing tile residency lookups across all patches.
+  - `process_uploads(max_per_frame=4)`: transfers loaded byte buffers to GPU Texture2DArray slices via `texture_array.write()`, with targeted per-face cache invalidation.
 
-**Edit when:** changing texture array pool size / tile resolution, disk caching / tile directory layout, async streaming queues, or cloud transparency extraction.
+**Edit when:** changing texture array pool size / tile resolution, disk caching / tile directory layout, async streaming queues, batch tile resolution, or cloud transparency extraction.
 
 ### 3.12 `engine/rendering/render_utils.py`
 - `hex_to_rgb`, `sample_gradient` — color helpers.
@@ -408,10 +412,10 @@ spectral classification.
       - GPU culling compute dispatch (`prog_culling_compute.run`) (~L2877); sets `u_terrain_body_idx` so sphere proxy pass skips the active terrain body.
       - Orbit polyline compute + draw (~L2880–3264).
       - Sphere PBR draw (LOD: lo/hi/ultra via indirect draw cmds).
-      - **Terrain Quadtree LOD pass (Pass 1b)** (~L5200): when `terrain_lod_enabled` is active, selects visible candidate bodies with tiles (up to 4 simultaneous bodies), transforms camera and view frustum planes into each body's local rotation frame with oblateness, runs `PlanetQuadtree.traverse_raw` with 6-plane local frustum culling, stages patches into a shared SSBO, queries `TerrainTileStreamer.get_tile_slot_or_fallback` for diffuse tiles and ancestor UV transforms, and renders instanced terrain patches for all active bodies in a single `vao_terrain.render()` draw call.
+      - **Terrain Quadtree LOD pass (Pass 1b)** (~L5200): when `terrain_lod_enabled` is active, selects visible candidate bodies with tiles (up to 4 simultaneous bodies), transforms camera and view frustum planes into each body's local rotation frame with oblateness, runs `PlanetQuadtree.traverse_raw` with 6-plane local frustum culling, stages patches via `pack_terrain_patches_jit` into a streamlined 48-byte SSBO (binding 4), queries `TerrainTileStreamer.resolve_tiles_batch` for diffuse tiles and ancestor UV transforms, and renders instanced terrain patches via zero-overhead GPU indirect draw command (`vao_terrain.render_indirect(terrain_draw_cmds_buf)`).
       - `render_atmosphere_pass(clip_mode)` — two-pass with dual-source blending (behind/in front of rings); Mode 3 bakes dynamic Sky-View LUT (selectable resolution: Low 192×108, Medium 256×256, High 384×216; `prog_sky_view` into `sky_view_fbo`, texture unit 12) aligned with parent planet axial tilt.
       - Rings render, Habitable Zones, second atmosphere pass.
-      - Dynamic Cloud Layer pass (`render_body_clouds`) (~L6588) — when Terrain LOD is enabled, renders clouds using the Quadtree LOD shell offset at $R + h_{\text{cloud}}$ with `clouds` layer virtual tiles and two-sided lighting; otherwise falls back to uniform sphere proxy shell.
+      - Dynamic Cloud Layer pass (`render_body_clouds`) (~L6588) — when Terrain LOD is enabled, renders clouds using the Quadtree LOD shell offset at $R + h_{\text{cloud}}$ with `clouds` layer virtual tiles and two-sided lighting via indirect draw (`vao_terrain.render_indirect(terrain_cloud_draw_cmds_buf)`); otherwise falls back to uniform sphere proxy shell.
       - Modular Dear ImGui UI ('Orion UI'): delegated to `engine.ui.render_ui(...)`:
         - Top Menu Bar: Systems, Physics, View, Render (Terrain LOD, MSAA, HDR, Atmosphere), Tools, Quick Actions (screenshot & settings)
         - System Outliner (Left Panel): hierarchy tree, quick search filter, body add/delete buttons
