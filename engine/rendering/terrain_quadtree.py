@@ -98,7 +98,7 @@ if _HAS_NUMBA:
         return vx * inv_len, vy * inv_len, vz * inv_len
 
     @njit(fastmath=True)
-    def _traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum):
+    def _traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum, cloud_alt_km, refract_bend):
         out = np.empty((max_patches, 9), dtype=np.float32)
         count = 0
         
@@ -120,8 +120,17 @@ if _HAS_NUMBA:
         cs_dz = cs_z * inv_cs_dist
 
         # Horizon angle from sphere center in scaled space
+        # Elevated cloud shells and atmospheric refraction extend the geometric horizon beyond solid ground:
         eff_dist = max(radius_km + 1e-4, cs_dist)
-        horizon_angle = math.acos(min(1.0, radius_km / eff_dist))
+        surf_horizon_angle = math.acos(min(1.0, radius_km / eff_dist))
+        horizon_angle = surf_horizon_angle
+        if cloud_alt_km > 0.0:
+            cloud_r = radius_km + cloud_alt_km
+            cloud_horizon_offset = math.acos(min(1.0, radius_km / max(1e-6, cloud_r)))
+            horizon_angle += cloud_horizon_offset
+        if refract_bend > 1e-6:
+            refract_offset = min(0.05, refract_bend * 0.5)
+            horizon_angle += refract_offset
         
         # Sort root faces by alignment with camera direction so that the face pointing
         # most directly at the camera is pushed last and popped FIRST (LIFO).
@@ -188,9 +197,11 @@ if _HAS_NUMBA:
             d3 = math.sqrt((p3x*radius_km - cx)**2 + (p3y*(1.0 - obl)*radius_km - cy)**2 + (p3z*radius_km - cz)**2)
             radius = max(max(d0, d1), max(d2, d3)) * 1.05
             
+            eff_radius = radius + max(0.0, cloud_alt_km)
+            
             # Precise horizon culling in spheroid-normalized space
             node_dot = cnx * cs_dx + cny * cs_dy + cnz * cs_dz
-            angular_radius = min(1.0, radius * inv_radius)
+            angular_radius = min(1.0, eff_radius * inv_radius)
             cull_angle = horizon_angle + math.asin(angular_radius)
             if cull_angle < math.pi and node_dot < math.cos(cull_angle):
                 continue
@@ -202,11 +213,11 @@ if _HAS_NUMBA:
                 dz_c = cz - cam_z
                 dist_cam_sq = dx_c * dx_c + dy_c * dy_c + dz_c * dz_c
                 # Only test frustum planes if camera is outside the patch bounding sphere
-                if dist_cam_sq > radius * radius:
+                if dist_cam_sq > eff_radius * eff_radius:
                     in_frustum = True
                     for p_i in range(6):
                         d_plane = cx * frustum_planes[p_i, 0] + cy * frustum_planes[p_i, 1] + cz * frustum_planes[p_i, 2] + frustum_planes[p_i, 3]
-                        if d_plane < -radius:
+                        if d_plane < -eff_radius:
                             in_frustum = False
                             break
                     if not in_frustum:
@@ -276,7 +287,7 @@ if _HAS_NUMBA:
         _traverse_quadtree_jit(
             np.array([0.0, 0.0, 1000.0], dtype=np.float32),
             500.0, 0.0, 1080.0, 0.4142, 120.0, 1, 64,
-            np.zeros((6, 4), dtype=np.float32), False
+            np.zeros((6, 4), dtype=np.float32), False, 0.0
         )
         _dummy_raw = np.zeros((1, 9), dtype=np.float32)
         _dummy_f = np.zeros(1, dtype=np.float32)
@@ -328,7 +339,7 @@ class PlanetQuadtree:
                 for f in range(6)
             ]
 
-    def traverse_raw(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, max_patches: int = 4096, frustum_planes: np.ndarray = None) -> np.ndarray:
+    def traverse_raw(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, max_patches: int = 4096, frustum_planes: np.ndarray = None, cloud_alt_km: float = 0.0, refract_bend: float = 0.0) -> np.ndarray:
         """
         Fast JIT-accelerated traversal returning raw (N, 9) float32 array:
         [min_u, min_v, max_u, max_v, face, lod, x, y, radius].
@@ -353,10 +364,10 @@ class PlanetQuadtree:
             planes_f = np.zeros((6, 4), dtype=np.float32)
 
         if _HAS_NUMBA:
-            return _traverse_quadtree_jit(cam_f, float(self.radius_km), float(obl), float(screen_height), float(tan_half_fov), float(threshold_px), int(max_lod), int(max_patches), planes_f, has_frustum)
+            return _traverse_quadtree_jit(cam_f, float(self.radius_km), float(obl), float(screen_height), float(tan_half_fov), float(threshold_px), int(max_lod), int(max_patches), planes_f, has_frustum, float(cloud_alt_km), float(refract_bend))
 
         # Fallback pure-python traversal
-        patches = self.traverse(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes)
+        patches = self.traverse(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes, cloud_alt_km=cloud_alt_km, refract_bend=refract_bend)
         out = np.empty((len(patches), 9), dtype=np.float32)
         for i, p in enumerate(patches):
             out[i, 0] = p.min_u
@@ -370,13 +381,13 @@ class PlanetQuadtree:
             out[i, 8] = p.radius
         return out
 
-    def traverse(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, frustum_planes: np.ndarray = None):
+    def traverse(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, frustum_planes: np.ndarray = None, cloud_alt_km: float = 0.0, refract_bend: float = 0.0):
         """
         Traverses the quadtree from root patches and returns a list of active leaf QuadtreePatch objects.
         cam_pos_local_km: 3D camera position relative to planet center in the planet's local rotated frame (km).
         """
         if _HAS_NUMBA:
-            raw = self.traverse_raw(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes)
+            raw = self.traverse_raw(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes, cloud_alt_km=cloud_alt_km, refract_bend=refract_bend)
             patches = []
             for i in range(len(raw)):
                 p = QuadtreePatch.__new__(QuadtreePatch)
@@ -419,7 +430,15 @@ class PlanetQuadtree:
         cs_dist = float(np.linalg.norm(cs_pos))
         cs_dir = cs_pos / max(1e-6, cs_dist)
         eff_dist = max(self.radius_km + 1e-4, cs_dist)
-        horizon_angle = math.acos(min(1.0, self.radius_km / eff_dist))
+        surf_horizon_angle = math.acos(min(1.0, self.radius_km / eff_dist))
+        horizon_angle = surf_horizon_angle
+        if cloud_alt_km > 0.0:
+            cloud_r = self.radius_km + cloud_alt_km
+            cloud_horizon_offset = math.acos(min(1.0, self.radius_km / max(1e-6, cloud_r)))
+            horizon_angle += cloud_horizon_offset
+        if refract_bend > 1e-6:
+            refract_offset = min(0.05, refract_bend * 0.5)
+            horizon_angle += refract_offset
 
         active_leaves = []
 
@@ -444,8 +463,9 @@ class PlanetQuadtree:
             dists = [np.linalg.norm(np.array([c[0]*self.radius_km, c[1]*(1.0-obl)*self.radius_km, c[2]*self.radius_km]) - c_center) for c in corners]
             radius = float(max(dists) * 1.05)
 
+            eff_radius = radius + max(0.0, cloud_alt_km)
             node_dot = float(np.dot(c_dir, cs_dir))
-            angular_radius = min(1.0, radius * inv_radius)
+            angular_radius = min(1.0, eff_radius * inv_radius)
             cull_angle = horizon_angle + math.asin(angular_radius)
             if cull_angle < math.pi and node_dot < math.cos(cull_angle):
                 return
@@ -454,11 +474,11 @@ class PlanetQuadtree:
                 dx_c = c_center[0] - cam_pos_local_km[0]
                 dy_c = c_center[1] - cam_pos_local_km[1]
                 dz_c = c_center[2] - cam_pos_local_km[2]
-                if (dx_c*dx_c + dy_c*dy_c + dz_c*dz_c) > radius * radius:
+                if (dx_c*dx_c + dy_c*dy_c + dz_c*dz_c) > eff_radius * eff_radius:
                     in_f = True
                     for p_i in range(6):
                         d_p = c_center[0]*planes_f[p_i, 0] + c_center[1]*planes_f[p_i, 1] + c_center[2]*planes_f[p_i, 2] + planes_f[p_i, 3]
-                        if d_p < -radius:
+                        if d_p < -eff_radius:
                             in_f = False
                             break
                     if not in_f:

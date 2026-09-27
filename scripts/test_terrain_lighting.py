@@ -39,16 +39,11 @@ def test_terrain_lighting_and_shadows():
     ibo = ctx.buffer(grid_idx.tobytes())
     vao = ctx.vertex_array(prog_terrain, [(vbo, '3f', 'in_position')], index_buffer=ibo)
 
-    # Patch SSBO (24 floats per patch)
-    patch_buf = np.zeros((1, 24), dtype=np.float32)
-    patch_buf[0, 0:4] = [-0.1, -0.1, 0.1, 0.1] # Small face patch near +X
-    patch_buf[0, 4:8] = [1.0, 0.0, 0.0, 0.0]
-    patch_buf[0, 8:12] = [0.0, 0.0, 0.0, 6371.0] # Earth-size body at origin
-    patch_buf[0, 12:15] = [0.0, 0.0, 0.0]        # Center at (0,0,0) AU
-    patch_buf[0, 15] = 0.0                      # No oblateness
-    patch_buf[0, 16:19] = [0.0, 1.0, 0.0]       # Pole +Y
-    patch_buf[0, 19] = 0.0                      # Rot 0
-    patch_buf[0, 20] = 0.0                      # body_idx = 0
+    # Patch SSBO (12 floats per patch: u_range, u_uv_trans, u_meta)
+    patch_buf = np.zeros((1, 12), dtype=np.float32)
+    patch_buf[0, 0:4] = [-0.1, -0.1, 0.1, 0.1] # u_range: Small face patch
+    patch_buf[0, 4:8] = [1.0, 0.0, 0.0, 0.0]   # u_uv_trans: uv_scale=1.0, uv_offset=(0,0), skirt_depth=0
+    patch_buf[0, 8:12] = [5.0, 0.0, 0.0, 0.0]  # u_meta: face_idx=5 (+X in world with pole +Y), lod=0, tile_slot=0, body_idx=0
 
     ssbo = ctx.buffer(patch_buf.tobytes())
     ssbo.bind_to_storage_buffer(binding=4)
@@ -57,7 +52,8 @@ def test_terrain_lighting_and_shadows():
     inst_buf_data = np.zeros((1, 28), dtype=np.float32)
     inst_buf_data[0, 0:3] = [0.0, 0.0, 0.0]     # pos
     inst_buf_data[0, 6] = 6371.0 / 149597870.7  # radius in AU
-    inst_buf_data[0, 16:19] = [0.0, 1.0, 0.0]   # planetshine_dir (+Y)
+    inst_buf_data[0, 9:12] = [0.0, 1.0, 0.0]    # pole (+Y)
+    inst_buf_data[0, 16:19] = [1.0, 0.0, 0.0]   # planetshine_dir (+X)
     inst_buf_data[0, 20:23] = [0.5, 0.8, 1.0]   # planetshine_color (soft cyan bounce light)
     
     # Enable caster 0 (mask_lo = 1u) and ring 0 (r_mask = 1u)
@@ -84,6 +80,10 @@ def test_terrain_lighting_and_shadows():
     ubo_staging[36:40] = [1.0, 0.0, 0.0, 0.00465]
     # Star 0 color = (1.0, 1.0, 1.0), lum = 1.0
     ubo_staging[100:104] = [1.0, 1.0, 1.0, 1.0]
+    # Star 0 pole = +Y, oblateness = 0
+    ubo_staging[164:168] = [0.0, 1.0, 0.0, 0.0]
+    # Star 0 pole color = (1.0, 1.0, 1.0), lum = 1.0
+    ubo_staging[228:232] = [1.0, 1.0, 1.0, 1.0]
 
     # far = 1000.0, depth_C = 0.1
     ubo_staging[292] = 1000.0
@@ -123,6 +123,10 @@ def test_terrain_lighting_and_shadows():
     prog_terrain['u_exposure'].value = 1.0
     prog_terrain['u_debug_tiles'].value = False
 
+    r_coplanar = np.zeros(16, dtype=np.uint32)
+    r_coplanar[0] = 1
+    prog_terrain['u_ring_coplanar_mask'].write(r_coplanar.tobytes())
+
     # 1. Test Baseline Direct Light (No Shadows, Planetshine or Ringshine)
     prog_terrain['u_planetshine_enabled'].value = False
     prog_terrain['u_ringshine_enabled'].value = False
@@ -146,8 +150,8 @@ def test_terrain_lighting_and_shadows():
     # the fragment should be in deep eclipse umbra!
     # Update caster position to eclipse the patch center
     print("--> Testing Caster Eclipse Shadow (Umbra)...")
-    ubo_data[664:668] = np.int32(1).tobytes() # 1 caster
-    ubo.write(ubo_data.tobytes())
+    ubo_staging[294:295].view(np.int32)[0] = 1 # 1 caster
+    ubo.write(ubo_staging.tobytes())
 
     ctx.clear(0.0, 0.0, 0.0, 1.0)
     vao.render(moderngl.TRIANGLES, instances=1)
@@ -162,6 +166,9 @@ def test_terrain_lighting_and_shadows():
 
     # 3. Test Planetshine / Moonshine
     print("--> Testing Planetshine/Moonshine secondary illumination...")
+    # Disable caster eclipse so secondary bounce light is not occluded by host umbra
+    ubo_staging[294:295].view(np.int32)[0] = 0 # 0 casters
+    ubo.write(ubo_staging.tobytes())
     prog_terrain['u_planetshine_enabled'].value = True
     ctx.clear(0.0, 0.0, 0.0, 1.0)
     vao.render(moderngl.TRIANGLES, instances=1)
@@ -176,9 +183,15 @@ def test_terrain_lighting_and_shadows():
     print("--> Testing Host Planet Ringshine...")
     prog_terrain['u_ringshine_enabled'].value = True
     prog_terrain['u_num_ring_planes'].value = 1
-    prog_terrain['u_ring_center'].write(np.array([[0.0, 0.0, 0.0]], dtype=np.float32).tobytes())
-    prog_terrain['u_ring_normal'].write(np.array([[0.0, 1.0, 0.0]], dtype=np.float32).tobytes())
-    prog_terrain['u_ring_params'].write(np.array([[0.0001, 0.001, 1.0, 0.0]], dtype=np.float32).tobytes())
+    r_centers = np.zeros((16, 3), dtype='f4')
+    r_normals = np.zeros((16, 3), dtype='f4')
+    r_normals[0] = [0.0, 1.0, 0.0]
+    r_params = np.zeros((16, 4), dtype='f4')
+    r_params[0] = [0.0001, 0.001, 1.0, 0.0]
+
+    prog_terrain['u_ring_center'].write(r_centers.tobytes())
+    prog_terrain['u_ring_normal'].write(r_normals.tobytes())
+    prog_terrain['u_ring_params'].write(r_params.tobytes())
 
     ctx.clear(0.0, 0.0, 0.0, 1.0)
     vao.render(moderngl.TRIANGLES, instances=1)
@@ -191,19 +204,20 @@ def test_terrain_lighting_and_shadows():
 
     # 5. Test Ring Shadow
     print("--> Testing Circumplanetary Ring Shadows...")
-    # Move caster away so no caster eclipse
-    ubo_data[664:668] = np.int32(0).tobytes() # 0 casters
-    ubo.write(ubo_data.tobytes())
     prog_terrain['u_planetshine_enabled'].value = False
     prog_terrain['u_ringshine_enabled'].value = False
 
     # Setup ring plane that intersects the sun-planet ray
     prog_terrain['u_num_ring_planes'].value = 1
-    # Place ring plane at x = 0.5 AU perpendicular to X axis
-    prog_terrain['u_ring_center'].write(np.array([[0.5, 0.0, 0.0]], dtype=np.float32).tobytes())
-    prog_terrain['u_ring_normal'].write(np.array([[1.0, 0.0, 0.0]], dtype=np.float32).tobytes())
-    # Inner = 0.0, outer = 0.1 AU (intercepts ray at d = 0), opacity = 1.0
-    prog_terrain['u_ring_params'].write(np.array([[0.0, 0.1, 1.0, 0.0]], dtype=np.float32).tobytes())
+    # Place ring plane at x = 0.5 AU with offset so star ray passes cleanly inside ring
+    r_centers[0] = [0.5, 0.05, 0.0]
+    r_normals[0] = [1.0, 0.0, 0.0]
+    # Inner = 0.0, outer = 0.1 AU (intercepts ray at d = 0.05), opacity = 1.0
+    r_params[0] = [0.0, 0.1, 1.0, 0.0]
+
+    prog_terrain['u_ring_center'].write(r_centers.tobytes())
+    prog_terrain['u_ring_normal'].write(r_normals.tobytes())
+    prog_terrain['u_ring_params'].write(r_params.tobytes())
 
     ctx.clear(0.0, 0.0, 0.0, 1.0)
     vao.render(moderngl.TRIANGLES, instances=1)

@@ -16,7 +16,7 @@ import numpy as np
 import ctypes
 import struct
 
-from engine.core.constants import MAX_FLIGHT_SPEED_AU_S
+from engine.core.constants import MAX_FLIGHT_SPEED_AU_S, AU_TO_KM
 import json
 
 class NumpyEncoder(json.JSONEncoder):
@@ -5284,6 +5284,31 @@ class App(InputHandlerMixin):
             vis_lo_buffer.bind_to_storage_buffer(binding=3)
             vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
 
+            # Helper to check if a body has a cloud layer texture
+            def _body_has_clouds(bi, is_cmp=False):
+                if 'u_is_cloud_pass' not in prog_spheres or getattr(self, 'body_textures_ssbo', None) is None:
+                    return False
+                bdata = bodies_data_cmp if is_cmp else bodies_data
+                if bi >= len(bdata):
+                    return False
+                bname = bdata[bi].get('name', '').lower()
+                cached = self._clouds_exist_cache.get(bname)
+                if cached is not None:
+                    return cached
+                manifest_entry = getattr(self.texture_streamer, 'file_manifest', {}).get(bname, {}) if hasattr(self, 'texture_streamer') and self.texture_streamer else {}
+                c_path = manifest_entry.get('clouds')
+                has_cloud = False
+                if c_path and os.path.exists(c_path):
+                    has_cloud = True
+                elif bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
+                    has_cloud = True
+                elif hasattr(self, 'terrain_streamer') and self.terrain_streamer:
+                    b_clouds_dir = os.path.join(self.terrain_streamer.tiles_base_dir, bname, "clouds")
+                    if os.path.isdir(b_clouds_dir):
+                        has_cloud = True
+                self._clouds_exist_cache[bname] = has_cloud
+                return has_cloud
+
             # Pass 1b: Terrain Quadtree LOD (SpaceEngine style) - Multi-Body with Local Frustum Culling
             self.terrain_active_body_patches = {}
             total_patches_rendered = 0
@@ -5293,7 +5318,6 @@ class App(InputHandlerMixin):
                 res_scale = max(0.6, patch_res / 32.0)
                 split_fac = float(self.camera.get("terrain_lod_split_factor", 1.0)) * res_scale
                 max_d = int(self.camera.get("terrain_max_depth", 6))
-                AU_TO_KM = 149597870.7
 
                 for b_i, b_name in active_terrain_bodies:
                     rem_budget = MAX_TERRAIN_PATCHES - total_patches_rendered
@@ -5359,16 +5383,18 @@ class App(InputHandlerMixin):
                     if refract_max_bend > 1e-6 and not (np.linalg.norm(b_pos - refract_center) < 1e-7):
                         v_cr = np.array(refract_center) - cam_pos
                         t_cr = float(np.dot(v_cr, ray_dir))
-                        if 0.0 < t_cr < dist_cb_au:
-                            d_perp_km = float(np.linalg.norm(v_cr - t_cr * ray_dir)) * AU_TO_KM
+                        if t_cr < dist_cb_au:
+                            t_fwd = max(0.0, t_cr)
+                            d_perp_km = float(np.linalg.norm(v_cr - t_fwd * ray_dir)) * AU_TO_KM
                             if d_perp_km < (refract_radius_km + 15.0 * refract_scale_height):
                                 D_local[:4] += (d_cam_body_km * math.tan(refract_max_bend) * 1.5)
 
                     if grav_lens_enabled and grav_lens_rs > 1e-6 and not (np.linalg.norm(b_pos - grav_lens_center) < 1e-7):
                         v_gl = np.array(grav_lens_center) - cam_pos
                         t_gl = float(np.dot(v_gl, ray_dir))
-                        if 0.0 < t_gl < dist_cb_au:
-                            d_perp_gl_km = float(np.linalg.norm(v_gl - t_gl * ray_dir)) * AU_TO_KM
+                        if t_gl < dist_cb_au:
+                            t_fwd_gl = max(0.0, t_gl)
+                            d_perp_gl_km = float(np.linalg.norm(v_gl - t_fwd_gl * ray_dir)) * AU_TO_KM
                             if d_perp_gl_km < max(grav_lens_radius * 20.0, grav_lens_rs * 100.0):
                                 D_local[:4] += (d_cam_body_km * 0.15)
 
@@ -5381,6 +5407,13 @@ class App(InputHandlerMixin):
                         if max_disk_lod >= 0:
                             body_max_lod = min(max_d, max_disk_lod)
 
+                    b_cloud_alt_km = 0.0
+                    if _body_has_clouds(b_i, is_cmp=False):
+                        _c_varr = visual_arr
+                        b_cloud_alt_km = float(_c_varr[b_i, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[b_i, 12] > 0 else 3.5
+
+                    body_refract_bend = refract_max_bend if (np.linalg.norm(b_pos - refract_center) < 1e-7) else 0.0
+
                     raw_patches = p_quadtree.traverse_raw(
                         cam_pos_local,
                         fov_deg=float(self.camera["fov"]),
@@ -5389,7 +5422,9 @@ class App(InputHandlerMixin):
                         split_factor=split_fac,
                         obl=obl,
                         max_patches=rem_budget,
-                        frustum_planes=local_frustum_planes
+                        frustum_planes=local_frustum_planes,
+                        cloud_alt_km=b_cloud_alt_km,
+                        refract_bend=body_refract_bend
                     )
                     num_p = len(raw_patches)
 
@@ -5404,7 +5439,9 @@ class App(InputHandlerMixin):
                             split_factor=split_fac,
                             obl=obl,
                             max_patches=min(rem_budget, 6),
-                            frustum_planes=None
+                            frustum_planes=None,
+                            cloud_alt_km=b_cloud_alt_km,
+                            refract_bend=body_refract_bend
                         )
                         num_p = len(raw_patches)
 
@@ -5851,8 +5888,6 @@ class App(InputHandlerMixin):
                 if 'u_exposure' in cur_prog: cur_prog['u_exposure'].value = float(self.camera.get("exposure", 1.0))
                 if 'u_prev_view_proj' in cur_prog and getattr(self, "prev_atmo_view_proj", None) is not None:
                     cur_prog['u_prev_view_proj'].write(self.prev_atmo_view_proj)
-
-                AU_TO_KM = 149597870.7
             
                 if 'u_num_ring_planes' in cur_prog: cur_prog['u_num_ring_planes'].value = n_ring_planes
                 if n_ring_planes > 0:
@@ -6728,31 +6763,6 @@ class App(InputHandlerMixin):
                 ctx.depth_mask = True
                 ctx.disable(moderngl.BLEND)
 
-            # Helper to check if a body has a cloud layer texture
-            def _body_has_clouds(bi, is_cmp=False):
-                if 'u_is_cloud_pass' not in prog_spheres or getattr(self, 'body_textures_ssbo', None) is None:
-                    return False
-                bdata = bodies_data_cmp if is_cmp else bodies_data
-                if bi >= len(bdata):
-                    return False
-                bname = bdata[bi].get('name', '').lower()
-                cached = self._clouds_exist_cache.get(bname)
-                if cached is not None:
-                    return cached
-                manifest_entry = getattr(self.texture_streamer, 'file_manifest', {}).get(bname, {}) if hasattr(self, 'texture_streamer') and self.texture_streamer else {}
-                c_path = manifest_entry.get('clouds')
-                has_cloud = False
-                if c_path and os.path.exists(c_path):
-                    has_cloud = True
-                elif bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
-                    has_cloud = True
-                elif hasattr(self, 'terrain_streamer') and self.terrain_streamer:
-                    b_clouds_dir = os.path.join(self.terrain_streamer.tiles_base_dir, bname, "clouds")
-                    if os.path.isdir(b_clouds_dir):
-                        has_cloud = True
-                self._clouds_exist_cache[bname] = has_cloud
-                return has_cloud
-
             def render_body_clouds(bi, is_cmp=False):
                 if not _body_has_clouds(bi, is_cmp=is_cmp):
                     return
@@ -6793,7 +6803,8 @@ class App(InputHandlerMixin):
                             if 'u_is_cloud_pass' in self.prog_terrain:
                                 self.prog_terrain['u_is_cloud_pass'].value = True
                             if 'u_cloud_altitude_km' in self.prog_terrain:
-                                cloud_alt = float(visual_arr[bi, 12] * 0.35) if visual_arr.shape[1] > 12 and visual_arr[bi, 12] > 0 else 3.5
+                                _c_varr = self.visual_arr_cmp if is_cmp and hasattr(self, 'visual_arr_cmp') else visual_arr
+                                cloud_alt = float(_c_varr[bi, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[bi, 12] > 0 else 3.5
                                 self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
                             if 'u_camera_pos' in self.prog_terrain:
                                 self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
@@ -6948,25 +6959,10 @@ class App(InputHandlerMixin):
                 _varr = visual_arr_cmp if _is_c and hasattr(self, 'visual_arr_cmp') else visual_arr
                 _c_alt_km = float(_varr[_bi, 12] * 0.35) if _varr.shape[1] > 12 and _varr[_bi, 12] > 0 else 3.5
 
-                _obl = float(all_instances[_inst_idx, 12]) if (hasattr(self, 'all_instances') and _inst_idx < len(all_instances)) else 0.0
-                if _obl > 0.0 and _cam_d_km > 1e-6:
-                    _pole = all_instances[_inst_idx, 9:12] if (hasattr(self, 'all_instances') and _inst_idx < len(all_instances)) else np.array([0.0, 1.0, 0.0])
-                    _p_len = math.sqrt(float(_pole[0]**2 + _pole[1]**2 + _pole[2]**2))
-                    if _p_len > 1e-6:
-                        _pn = _pole / _p_len
-                        _un = _cam_rel_au / max(1e-12, (_cam_d_km / 149597870.7))
-                        _cos_phi = float(np.dot(_un, _pn))
-                        _sin_phi_sq = max(0.0, 1.0 - _cos_phi * _cos_phi)
-                        _b_km = _b_r_km * (1.0 - _obl)
-                        _denom = _b_km * _b_km * _sin_phi_sq + _b_r_km * _b_r_km * (_cos_phi * _cos_phi)
-                        _local_r_km = (_b_r_km * _b_km) / math.sqrt(max(1e-12, _denom))
-                    else:
-                        _local_r_km = _b_r_km
-                else:
-                    _local_r_km = _b_r_km
-
-                _alt_km = _cam_d_km - _local_r_km
-                is_below_clouds = _alt_km < _c_alt_km
+                _obl = float(_varr[_bi, 8]) if _varr.shape[1] > 8 else 0.0
+                _pole = _varr[_bi, 5:8] if _varr.shape[1] >= 8 else np.array([0.0, 1.0, 0.0])
+                _cloud_r_km = _ellipsoid_surface_radius(_b_r_km + _c_alt_km, _obl, _pole, _cam_rel_au)
+                is_below_clouds = _cam_d_km < _cloud_r_km
 
                 if atmo_entry is not None and body_ring_groups:
                     if _body_needs_ring_clip(atmo_entry):

@@ -119,7 +119,7 @@ void main() {
     
     // Position depth at the body's front surface so it doesn't fail depth testing against its own 3D mesh
     // when cross-fading in the transition zone. Must match clamped mesh size!
-    float clamped_min_px = 3.0;
+    float clamped_min_px = 2.0;
     float depth_radius = in_radius;
     if (apparent_px > 1e-6 && apparent_px < clamped_min_px) {
         depth_radius = in_radius * (clamped_min_px / apparent_px);

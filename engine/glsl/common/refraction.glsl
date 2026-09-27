@@ -207,7 +207,8 @@ float compute_refraction_angle(vec3 C, vec3 V, float d) {
         float delta_cam = u_refract_max_bend * exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
         if (delta_cam <= 1e-9) return 0.0;
         float k = Rc / (2.0 * max(1e-4, u_refract_scale_height));
-        float bend = 0.5 * delta_cam * refract_erfcx(sqrt(k) * sin_e);
+        float cos_e = sqrt(max(0.0, 1.0 - sin_e * sin_e));
+        float bend = 0.5 * delta_cam * refract_erfcx(sqrt(k) * sin_e) * cos_e;
         // Object-side cutoff: only the bend accumulated between the camera
         // and the object at distance d. E_d ~ 1 for anything beyond a few
         // sigma_cam (every rendered body and all catalog stars).
@@ -296,7 +297,9 @@ vec3 solve_refraction_apparent(vec3 C, vec3 V, float d, out bool is_occluded) {
     vec3 u_dir = C - V * dot(C, V);
     float u_len = length(u_dir);
     if (u_len <= 1e-5) {
-        is_occluded = true;
+        if (dot(C, V) < 0.0) {
+            is_occluded = true;
+        }
         return V;
     }
     u_dir /= u_len;
@@ -377,7 +380,7 @@ vec3 apply_refraction(vec3 world_pos, vec3 cam_pos) {
             vec3 V = true_vec / d_km;
             bool is_occluded = false;
             vec3 V_app = solve_refraction_apparent(C_km, V, d_km, is_occluded);
-            if (!is_occluded) result = cam_pos + V_app * (d_km / u_au_to_km);
+            result = cam_pos + V_app * (d_km / u_au_to_km);
         }
     }
 

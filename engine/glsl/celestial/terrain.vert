@@ -190,19 +190,28 @@ void main() {
                     vec3 view_vec = p_world - u_camera_pos;
                     float d_v = length(view_vec);
                     if (d_v > 1e-7) {
+                        float d_v_km = d_v * u_au_to_km;
                         vec3 view_ray = view_vec / d_v;
                         float mu = dot(view_ray, local_up);
-                        float mu_horiz = -sqrt(max(0.0, 2.0 * max(h, 0.0) / local_refract_radius));
-                        float delta_mu = sqrt(2.0 * u_refract_scale_height / local_refract_radius);
-                        float x = (mu - mu_horiz) / max(1e-6, delta_mu);
-                        float alpha = max_terr_alpha * exp(-x * x);
+
+                        // Physical geodetic terrestrial refraction: deflection scales with line-of-sight distance d_v
+                        // across terrain, smoothly saturating at the horizon dip angle max_terr_alpha:
+                        float alpha_dist = 0.5 * k_refr * density * (d_v_km / max(1e-4, local_refract_radius));
+                        float alpha = min(alpha_dist, max_terr_alpha);
+
+                        // For sightlines above horizontal (mu > 0), fade smoothly towards zenith:
+                        if (mu > 0.0) {
+                            float cos_e = sqrt(max(0.0, 1.0 - mu * mu));
+                            alpha *= cos_e;
+                        }
 
                         if (alpha > 1e-7) {
                             vec3 u_dir = local_up - view_ray * mu;
                             float u_len = length(u_dir);
                             if (u_len > 1e-5) {
                                 u_dir /= u_len;
-                                vec3 app_ray = normalize(view_ray * cos(alpha) - u_dir * sin(alpha));
+                                // Rotate view_ray towards local_up (lifting apparent position of terrain upward):
+                                vec3 app_ray = normalize(view_ray * cos(alpha) + u_dir * sin(alpha));
                                 p_world = u_camera_pos + app_ray * d_v;
                             }
                         }

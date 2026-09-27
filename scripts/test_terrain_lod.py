@@ -181,15 +181,231 @@ def test_quadtree_frustum_culling_and_low_fov():
     print("    Frustum culling successfully pruned off-screen quadtree nodes! (PASSED)")
 
 
+def test_cloud_horizon_culling_and_oblateness():
+    print("--> Testing cloud horizon culling and oblate altitude...")
+    from engine.app import _ellipsoid_surface_radius
+
+    # 1. Oblate planet altitude test (Saturn parameters)
+    r_eq_km = 60268.0
+    f_obl = 0.09796
+    pole = np.array([0.0, 1.0, 0.0])
+    c_alt_km = 30.0
+
+    # Camera at 58,000 km along polar axis (3,600 km above polar surface)
+    cam_pos_polar = np.array([0.0, 58000.0, 0.0])
+    cam_d_km = float(np.linalg.norm(cam_pos_polar))
+    cloud_r_km = _ellipsoid_surface_radius(r_eq_km + c_alt_km, f_obl, pole, cam_pos_polar)
+    is_below_clouds = cam_d_km < cloud_r_km
+
+    # Polar surface radius is r_eq * (1 - f) ~ 54,364 km; cloud is at ~54,391 km
+    assert not is_below_clouds, f"Polar observer at 58,000 km should be ABOVE clouds (cloud_r = {cloud_r_km:.1f} km)"
+    print(f"    Polar observer at 58,000 km: cloud_r={cloud_r_km:.1f} km, is_below_clouds={is_below_clouds} (PASSED)")
+
+    # Ground observer at 54,370 km (below polar clouds at 54,391 km)
+    cam_pos_ground = np.array([0.0, 54370.0, 0.0])
+    cam_d_ground = float(np.linalg.norm(cam_pos_ground))
+    is_below_ground = cam_d_ground < cloud_r_km
+    assert is_below_ground, "Observer below polar cloud deck must evaluate is_below_clouds=True"
+    print(f"    Ground observer at 54,370 km: is_below_clouds={is_below_ground} (PASSED)")
+
+    # 2. Cloud horizon extension test in quadtree traversal
+    # Earth radius with exaggerated cloud shell to verify patch retention past limb
+    r_earth = 6371.0
+    q = PlanetQuadtree(radius_km=r_earth, max_lod=3, split_factor=1.0)
+    cam_space = np.array([0.0, 0.0, 8000.0], dtype=np.float32)
+
+    patches_ground_only = q.traverse_raw(cam_space, fov_deg=60.0, screen_height=1080.0, max_lod=3, cloud_alt_km=0.0)
+    patches_with_clouds = q.traverse_raw(cam_space, fov_deg=60.0, screen_height=1080.0, max_lod=3, cloud_alt_km=200.0)
+
+    print(f"    Patches without clouds: {len(patches_ground_only)}, with 200 km clouds: {len(patches_with_clouds)}")
+    assert len(patches_with_clouds) >= len(patches_ground_only), "Cloud shell must retain more or equal patches around limb"
+    print("    Cloud horizon culling successfully extends quadtree coverage past limb! (PASSED)")
+
+
+def test_terrain_refraction_ground_to_ground_and_space():
+    print("--> Testing Terrain LOD Refraction (Ground-to-Ground & Ground-to-Space)...")
+    ctx = moderngl.create_context(standalone=True)
+
+    prog_terrain = ctx.program(
+        vertex_shader=terrain_vertex_shader,
+        fragment_shader=terrain_fragment_shader
+    )
+    assert prog_terrain is not None, "Failed to compile prog_terrain"
+
+    R_km = 6371.0
+    H_km = 8.5
+    delta_n = 0.00029
+    max_bend = 2.0 * delta_n * np.sqrt((np.pi * R_km) / (2.0 * H_km))
+
+    # 1. Test Quadtree Horizon Extension via Atmospheric Refraction
+    q = PlanetQuadtree(radius_km=R_km, max_lod=3, split_factor=1.0)
+    # Observer right at Earth's surface (altitude 2m = 0.002 km)
+    cam_ground = np.array([0.0, 0.0, R_km + 0.002], dtype=np.float32)
+    patches_geom = q.traverse_raw(cam_ground, fov_deg=60.0, screen_height=1080.0, max_lod=3, refract_bend=0.0)
+    patches_refr = q.traverse_raw(cam_ground, fov_deg=60.0, screen_height=1080.0, max_lod=3, refract_bend=max_bend)
+    print(f"    Ground horizon patches: geom={len(patches_geom)}, refract-extended={len(patches_refr)}")
+    assert len(patches_refr) >= len(patches_geom), "Atmospheric refraction must retain patches beyond geometric horizon"
+
+    # 2. Test Ground-to-Ground Refraction in Vertex Shader
+    # Verify that distant terrain vertices are lifted UPWARDS (+ local_up), not depressed downwards (- local_up)
+    compute_src = """
+    #version 430 core
+    layout(local_size_x = 1) in;
+
+    uniform vec3 u_camera_pos;
+    uniform vec3 u_refract_center;
+    uniform float u_refract_radius;
+    uniform float u_refract_scale_height;
+    uniform float u_refract_max_bend;
+    uniform float u_au_to_km;
+
+    uniform vec3 in_p_world;
+    uniform vec3 in_body_pos;
+
+    layout(std430, binding = 0) buffer OutBuf {
+        vec3 out_p_world;
+        float out_lift_km;
+    };
+
+    void main() {
+        vec3 p_world = in_p_world;
+        bool is_refract_host = (length(in_body_pos - u_refract_center) < 1e-7);
+
+        if (is_refract_host && u_refract_max_bend > 1e-6) {
+            vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
+            float r_cam = length(C_km);
+            vec3 local_up = normalize(C_km);
+            float local_refract_radius = u_refract_radius;
+            float h = r_cam - local_refract_radius;
+
+            if (h < u_refract_scale_height * 15.0) {
+                float density = exp(-max(h, 0.0) / max(1e-4, u_refract_scale_height));
+                float k_refr = u_refract_max_bend * 0.5 * sqrt((2.0 * local_refract_radius) / max(1e-4, 3.141592653589793 * u_refract_scale_height));
+                float h_eff = max(h, 0.002);
+                float theta_dip_eff = sqrt(2.0 * h_eff / local_refract_radius);
+                float max_terr_alpha = clamp(0.5 * k_refr * density * theta_dip_eff, 0.0, 0.05);
+
+                vec3 view_vec = p_world - u_camera_pos;
+                float d_v = length(view_vec);
+                if (d_v > 1e-7) {
+                    float d_v_km = d_v * u_au_to_km;
+                    vec3 view_ray = view_vec / d_v;
+                    float mu = dot(view_ray, local_up);
+
+                    float alpha_dist = 0.5 * k_refr * density * (d_v_km / max(1e-4, local_refract_radius));
+                    float alpha = min(alpha_dist, max_terr_alpha);
+                    if (mu > 0.0) {
+                        float cos_e = sqrt(max(0.0, 1.0 - mu * mu));
+                        alpha *= cos_e;
+                    }
+
+                    if (alpha > 1e-7) {
+                        vec3 u_dir = local_up - view_ray * mu;
+                        float u_len = length(u_dir);
+                        if (u_len > 1e-5) {
+                            u_dir /= u_len;
+                            vec3 app_ray = normalize(view_ray * cos(alpha) + u_dir * sin(alpha));
+                            p_world = u_camera_pos + app_ray * d_v;
+                        }
+                    }
+                }
+            }
+        }
+
+        out_p_world = p_world;
+        vec3 local_up = normalize((u_camera_pos - u_refract_center) * u_au_to_km);
+        out_lift_km = dot(p_world - in_p_world, local_up) * u_au_to_km;
+    }
+    """
+    comp_prog = ctx.compute_shader(compute_src)
+    ssbo = ctx.buffer(reserve=32)
+    ssbo.bind_to_storage_buffer(0)
+
+    AU_TO_KM = 149597870.7
+    comp_prog['u_camera_pos'].value = (0.0, (R_km + 0.002) / AU_TO_KM, 0.0)
+    comp_prog['u_refract_center'].value = (0.0, 0.0, 0.0)
+    comp_prog['u_refract_radius'].value = R_km
+    comp_prog['u_refract_scale_height'].value = H_km
+    comp_prog['u_refract_max_bend'].value = max_bend
+    comp_prog['u_au_to_km'].value = AU_TO_KM
+    comp_prog['in_body_pos'].value = (0.0, 0.0, 0.0)
+
+    # Distant terrain point 20 km away on the horizon
+    d_km = 20.0
+    theta = d_km / R_km
+    p_terr_km = np.array([R_km * np.sin(theta), R_km * np.cos(theta), 0.0])
+    comp_prog['in_p_world'].value = tuple(p_terr_km / AU_TO_KM)
+
+    comp_prog.run()
+    res = np.frombuffer(ssbo.read(), dtype=np.float32)
+    lift_meters = res[3] * 1000.0
+    print(f"    Ground-to-ground terrain lift at 20 km: {lift_meters:+.4f} m (Must be > 0)")
+    assert lift_meters > 0.0, f"Terrestrial refraction must lift terrain upward, but got {lift_meters} m"
+
+    # 3. Test Ground-to-Space Refraction at Zenith
+    # Verify that an object overhead (zenith) is NOT falsely flagged as occluded and has 0 deflection
+    refr_glsl = open(os.path.join(ROOT_DIR, "engine", "glsl", "common", "refraction.glsl")).read()
+    zenith_src = """
+    #version 430 core
+    layout(local_size_x = 1) in;
+    SHARED_REFRACTION
+
+    layout(std430, binding = 0) buffer OutBuf {
+        vec3 out_v_app;
+        float out_is_occ;
+        float out_lift_arcmin;
+    };
+
+    uniform vec3 t_C_km;
+    uniform vec3 t_V;
+    uniform float t_d_km;
+
+    void main() {
+        bool is_occ = false;
+        vec3 V_app = solve_refraction_apparent(t_C_km, t_V, t_d_km, is_occ);
+        float lift = acos(clamp(dot(t_V, V_app), -1.0, 1.0)) * (180.0 * 60.0 / 3.141592653589793);
+        out_v_app = V_app;
+        out_is_occ = is_occ ? 1.0 : 0.0;
+        out_lift_arcmin = lift;
+    }
+    """.replace("SHARED_REFRACTION", refr_glsl)
+
+    zenith_prog = ctx.compute_shader(zenith_src)
+    zenith_prog['u_refract_radius'].value = R_km
+    zenith_prog['u_refract_scale_height'].value = H_km
+    zenith_prog['u_refract_max_bend'].value = max_bend
+    zenith_prog['u_refract_pole'].value = (0.0, 1.0, 0.0)
+    zenith_prog['u_refract_oblateness'].value = 0.0
+    zenith_prog['t_C_km'].value = (0.0, R_km + 0.002, 0.0)
+    zenith_prog['t_V'].value = (0.0, 1.0, 0.0) # Zenith (directly overhead)
+    zenith_prog['t_d_km'].value = 384400.0
+
+    zenith_ssbo = ctx.buffer(reserve=32)
+    zenith_ssbo.bind_to_storage_buffer(0)
+    zenith_prog.run()
+
+    z_res = np.frombuffer(zenith_ssbo.read(), dtype=np.float32)
+    is_occ = bool(z_res[3] > 0.5)
+    z_lift = z_res[4]
+    print(f"    Ground-to-space zenith lift: {z_lift:.4f}', occluded: {is_occ}")
+    assert not is_occ, "Overhead celestial body at zenith must NOT be occluded"
+    assert z_lift < 0.01, f"Overhead celestial body at zenith must have near-zero deflection, got {z_lift}'"
+
+    print("    Terrain LOD Refraction tests (Ground-to-Ground & Ground-to-Space) PASSED!")
+
+
 def main():
     print("=== Running Terrain Quadtree LOD & Tiled Streaming Tests ===")
     test_cube_to_sphere_continuity()
     test_quadtree_subdivision()
     test_quadtree_frustum_culling_and_low_fov()
+    test_cloud_horizon_culling_and_oblateness()
     test_tiled_streamer_and_fallback()
     test_gpu_terrain_rendering_pipeline()
+    test_terrain_refraction_ground_to_ground_and_space()
     print("=== All Terrain LOD Tests PASSED Successfully! ===")
 
 
 if __name__ == "__main__":
     main()
+

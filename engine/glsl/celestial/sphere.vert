@@ -177,7 +177,7 @@ void main() {
     float final_radius = in_radius;
     float brightness_scale = 1.0;
 
-    f_clamped_min_px = 3.0;
+    f_clamped_min_px = 2.0;
     if (apparent_px > 1e-6 && apparent_px < f_clamped_min_px) {
         final_radius = in_radius * (f_clamped_min_px / apparent_px);
     }
