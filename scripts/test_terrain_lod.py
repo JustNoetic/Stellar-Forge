@@ -93,23 +93,21 @@ def test_gpu_terrain_rendering_pipeline():
     ibo = ctx.buffer(grid_idx.tobytes())
     vao = ctx.vertex_array(prog_terrain, [(vbo, '3f', 'in_position')], index_buffer=ibo)
 
-    # Patch SSBO
-    patch_buf = np.zeros((4, 24), dtype=np.float32)
+    # Patch SSBO (12 floats per patch: range[4], uv_trans[4], meta[4])
+    patch_buf = np.zeros((4, 12), dtype=np.float32)
     for i in range(4):
         patch_buf[i, 0:4] = [-1.0, -1.0, 1.0, 1.0]
         patch_buf[i, 4:8] = [1.0, 0.0, 0.0, 10.0]
-        patch_buf[i, 8:12] = [float(i), 0.0, 0.0, 1737.4]
-        patch_buf[i, 12:15] = [0.0, 0.0, 0.0]
-        patch_buf[i, 15] = 0.0
-        patch_buf[i, 16:19] = [0.0, 1.0, 0.0]
-        patch_buf[i, 19] = 0.0
-        patch_buf[i, 20] = 0.0
+        patch_buf[i, 8:12] = [float(i), 0.0, 0.0, 0.0]
 
     ssbo = ctx.buffer(patch_buf.tobytes())
     ssbo.bind_to_storage_buffer(binding=4)
 
-    # AllInstances SSBO (binding 2)
-    inst_buf = ctx.buffer(reserve=1024)
+    # AllInstances SSBO (binding 2) - mock 1 body
+    inst_data = np.zeros((1, 28), dtype=np.float32)
+    inst_data[0, 6] = 1737.4 / 149597870.7  # radius in AU
+    inst_data[0, 10] = 1.0  # pole Y
+    inst_buf = ctx.buffer(inst_data.tobytes())
     inst_buf.bind_to_storage_buffer(binding=2)
 
     # SceneData UBO (binding 1)

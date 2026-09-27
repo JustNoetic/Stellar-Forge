@@ -242,6 +242,35 @@ if _HAS_NUMBA:
                     
         return out[:count]
 
+    @njit(fastmath=True)
+    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+        n = raw_patches.shape[0]
+        for i in range(n):
+            idx = st + i
+            staging[idx, 0] = raw_patches[i, 0]
+            staging[idx, 1] = raw_patches[i, 1]
+            staging[idx, 2] = raw_patches[i, 2]
+            staging[idx, 3] = raw_patches[i, 3]
+            staging[idx, 4] = uvs[i]
+            staging[idx, 5] = ox_arr[i]
+            staging[idx, 6] = oy_arr[i]
+            staging[idx, 7] = raw_patches[i, 8] * 0.05
+            staging[idx, 8] = raw_patches[i, 4]
+            staging[idx, 9] = raw_patches[i, 5]
+            staging[idx, 10] = slots[i]
+            staging[idx, 11] = body_idx
+
+    @njit(fastmath=True)
+    def pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr):
+        for i in range(num_p):
+            src_idx = st_idx + i
+            for c in range(12):
+                cloud_staging[i, c] = terrain_staging[src_idx, c]
+            cloud_staging[i, 4] = uvc[i]
+            cloud_staging[i, 5] = c_ox[i]
+            cloud_staging[i, 6] = c_oy[i]
+            cloud_staging[i, 10] = slot_arr[i]
+
     # Warmup Numba JIT at import time to prevent first-frame runtime stutter
     try:
         _traverse_quadtree_jit(
@@ -249,8 +278,33 @@ if _HAS_NUMBA:
             500.0, 0.0, 1080.0, 0.4142, 120.0, 1, 64,
             np.zeros((6, 4), dtype=np.float32), False
         )
+        _dummy_raw = np.zeros((1, 9), dtype=np.float32)
+        _dummy_f = np.zeros(1, dtype=np.float32)
+        _dummy_staging = np.zeros((1, 12), dtype=np.float32)
+        pack_terrain_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0)
+        _dummy_cloud = np.zeros((1, 12), dtype=np.float32)
+        pack_cloud_patches_jit(_dummy_cloud, _dummy_staging, 0, 1, _dummy_f, _dummy_f, _dummy_f, _dummy_f)
     except Exception:
         pass
+else:
+    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+        n = raw_patches.shape[0]
+        staging[st:st+n, 0:4] = raw_patches[:, 0:4]
+        staging[st:st+n, 4] = uvs
+        staging[st:st+n, 5] = ox_arr
+        staging[st:st+n, 6] = oy_arr
+        staging[st:st+n, 7] = raw_patches[:, 8] * 0.05
+        staging[st:st+n, 8] = raw_patches[:, 4]
+        staging[st:st+n, 9] = raw_patches[:, 5]
+        staging[st:st+n, 10] = slots
+        staging[st:st+n, 11] = body_idx
+
+    def pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr):
+        cloud_staging[:num_p] = terrain_staging[st_idx:st_idx + num_p]
+        cloud_staging[:num_p, 4] = uvc
+        cloud_staging[:num_p, 5] = c_ox
+        cloud_staging[:num_p, 6] = c_oy
+        cloud_staging[:num_p, 10] = slot_arr
 
 
 class PlanetQuadtree:

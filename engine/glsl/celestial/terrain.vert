@@ -32,10 +32,7 @@ layout(std430, binding = 2) readonly buffer AllInstances {
 struct TerrainPatchInstance {
     vec4 u_range;      // x=min_u, y=min_v, z=max_u, w=max_v in [-1, 1]
     vec4 u_uv_trans;   // x=uv_scale, y=uv_offset_x, z=uv_offset_y, w=skirt_depth_km
-    vec4 u_meta;       // x=face_idx, y=lod_level, z=tile_slot, w=radius_km
-    vec4 u_body_pos;   // xyz=body_center_au, w=oblateness
-    vec4 u_pole;       // xyz=pole_dir, w=rotation_angle
-    vec4 u_extra;      // x=body_idx, yzw=unused
+    vec4 u_meta;       // x=face_idx, y=lod_level, z=tile_slot, w=body_idx
 };
 
 layout(std430, binding = 4) readonly buffer TerrainPatchBuffer {
@@ -76,6 +73,23 @@ out vec3 f_rel_pos;
 void main() {
     TerrainPatchInstance t_inst = u_patches[gl_InstanceID];
 
+    // Unpack instance information for this body from AllInstances
+    uint inst_idx = uint(max(0.0, t_inst.u_meta.w + 0.5));
+    vec4 f0 = instances[inst_idx * 7 + 0];
+    vec4 f1 = instances[inst_idx * 7 + 1];
+    vec4 f2 = instances[inst_idx * 7 + 2];
+    vec4 f3 = instances[inst_idx * 7 + 3];
+    vec4 f4 = instances[inst_idx * 7 + 4];
+    vec4 f5 = instances[inst_idx * 7 + 5];
+    vec4 f6 = instances[inst_idx * 7 + 6];
+
+    vec3 body_pos = f0.xyz;
+    float r_au = f1.z;
+    float r_km = r_au * (1.0 / max(1e-12, u_km_to_au));
+    vec3 pole = normalize(f2.yzw);
+    float obl = clamp(f3.x, 0.0, 0.8);
+    float rot_angle = f6.y;
+
     // Local patch cube coordinate in [-1, 1]
     float u_local = mix(t_inst.u_range.x, t_inst.u_range.z, in_position.x);
     float v_local = mix(t_inst.u_range.y, t_inst.u_range.w, in_position.y);
@@ -97,9 +111,7 @@ void main() {
     vec3 n_sphere = normalize(v);
 
     // Oblate spheroid shape in body local frame (Y is polar axis)
-    float obl = clamp(t_inst.u_body_pos.w, 0.0, 0.8);
     vec3 p_ellip = vec3(n_sphere.x, n_sphere.y * (1.0 - obl), n_sphere.z);
-    float r_km = t_inst.u_meta.w;
     if (u_is_cloud_pass) {
         r_km += max(0.1, u_cloud_altitude_km);
     }
@@ -112,7 +124,6 @@ void main() {
     }
 
     // Apply planet spin rotation from texture frame back to body local frame
-    float rot_angle = t_inst.u_pole.w;
     float s_rot = sin(rot_angle);
     float c_rot = cos(rot_angle);
     vec3 p_local_body = vec3(
@@ -129,7 +140,6 @@ void main() {
     ));
 
     // Rotate from planet frame to world frame using pole (matching sphere basis)
-    vec3 pole = normalize(t_inst.u_pole.xyz);
     vec3 ref = vec3(0.0, 1.0, 0.0);
     if (abs(dot(pole, ref)) > 0.999) {
         ref = vec3(1.0, 0.0, 0.0);
@@ -141,10 +151,10 @@ void main() {
     vec3 n_world = normalize(n_local_body.x * tangent + n_local_body.y * pole + n_local_body.z * bitangent);
 
     // Convert km to world AU and add body center
-    vec3 p_world = t_inst.u_body_pos.xyz + p_world_km * u_km_to_au;
+    vec3 p_world = body_pos + p_world_km * u_km_to_au;
 
     // Apply atmospheric refraction and gravitational lensing
-    bool is_refract_host = (length(t_inst.u_body_pos.xyz - u_refract_center) < 1e-7);
+    bool is_refract_host = (length(body_pos - u_refract_center) < 1e-7);
     if (!is_refract_host) {
         // Background celestial body viewed through a foreground atmosphere or black hole
         p_world = apply_refraction(p_world, u_camera_pos);
@@ -154,7 +164,7 @@ void main() {
             vec3 C_km = (u_camera_pos - u_refract_center) * u_au_to_km;
             float r_cam = length(C_km);
 
-            vec3 pole_n_refr = length(t_inst.u_pole.xyz) > 1e-4 ? normalize(t_inst.u_pole.xyz) : vec3(0.0, 1.0, 0.0);
+            vec3 pole_n_refr = pole;
             float f_scale_refr = (obl > 0.0 && obl < 0.99) ? (1.0 / (1.0 - obl)) : 1.0;
             vec3 C_scaled = C_km + pole_n_refr * (dot(C_km, pole_n_refr) * (f_scale_refr * f_scale_refr - 1.0));
             vec3 local_up = normalize(C_scaled);
@@ -202,7 +212,7 @@ void main() {
         }
 
         // Gravitational lensing for host planet if orbiting near a black hole
-        if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && length(t_inst.u_body_pos.xyz - u_grav_lens_center) > 1e-7) {
+        if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && length(body_pos - u_grav_lens_center) > 1e-7) {
             vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
             vec3 P_km = (p_world - u_grav_lens_center) * u_au_to_km;
             vec3 true_vec = P_km - C_km;
@@ -235,7 +245,7 @@ void main() {
     vec3 o3_tau = vec3(0.0);
     vec2 o3_layer = vec2(0.0, 6.0);
     for (int j = 0; j < u_num_casters; j++) {
-        if (distance(u_casters[j].xyz, t_inst.u_body_pos.xyz) < 1e-6) {
+        if (distance(u_casters[j].xyz, body_pos) < 1e-6) {
             atmo_tint = u_caster_atmos[j].xyz;
             atmo_h = u_caster_atmos[j].w;
             scale_height = u_caster_colors[j].w;
@@ -249,20 +259,14 @@ void main() {
     f_scale_height = scale_height;
     f_o3_tau = o3_tau;
     f_o3_layer = o3_layer;
-    f_radius_km = t_inst.u_meta.w;
-
-    // Unpack instance information for this body from AllInstances
-    uint inst_idx = uint(max(0.0, t_inst.u_extra.x + 0.5));
-    vec4 f3 = instances[inst_idx * 7 + 3];
-    vec4 f4 = instances[inst_idx * 7 + 4];
-    vec4 f5 = instances[inst_idx * 7 + 5];
+    f_radius_km = r_km;
 
     f_caster_mask = uvec2(floatBitsToUint(f3.y), floatBitsToUint(f3.z));
     f_ring_mask = floatBitsToUint(f3.w);
     f_planetshine_dir = f4.xyz;
     f_planetshine_color = vec3(f4.w, f5.x, f5.y);
 
-    f_body_center = t_inst.u_body_pos.xyz;
+    f_body_center = body_pos;
     f_rel_pos = p_world_km * u_km_to_au;
 
     gl_Position = projection * view * vec4(p_world, 1.0);

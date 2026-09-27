@@ -352,7 +352,7 @@ from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
-from engine.rendering.terrain_quadtree import PlanetQuadtree
+from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches_jit, pack_cloud_patches_jit
 from engine.rendering.terrain_streamer import TerrainTileStreamer
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 from engine.ui import render_ui
@@ -2306,11 +2306,11 @@ class App(InputHandlerMixin):
             index_buffer=self.ibo_terrain_grid
         )
         MAX_TERRAIN_PATCHES = 4096
-        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 96)
+        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 48)
         terrain_patch_ssbo = self.terrain_patch_ssbo
-        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 24), dtype=np.float32)
-        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 96)
-        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 24), dtype=np.float32)
+        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 12), dtype=np.float32)
+        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 48)
+        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 12), dtype=np.float32)
         self.terrain_current_raw_patches = None
         self.terrain_current_body_name = None
         self.terrain_current_body_idx = -1
@@ -5403,17 +5403,6 @@ class App(InputHandlerMixin):
                     if num_p > 0:
                         st = total_patches_rendered
                         en = st + num_p
-                        self.terrain_patch_staging[st:en, 0:4] = raw_patches[:, 0:4]
-                        self.terrain_patch_staging[st:en, 7] = raw_patches[:, 8] * 0.05
-                        self.terrain_patch_staging[st:en, 8] = raw_patches[:, 4]
-                        self.terrain_patch_staging[st:en, 9] = raw_patches[:, 5]
-                        self.terrain_patch_staging[st:en, 11] = b_r_km
-                        self.terrain_patch_staging[st:en, 12:15] = b_pos
-                        self.terrain_patch_staging[st:en, 15] = obl
-                        self.terrain_patch_staging[st:en, 16:19] = pole_n
-                        self.terrain_patch_staging[st:en, 19] = rot_angle
-                        self.terrain_patch_staging[st:en, 20] = float(b_i)
-
                         # Batched tile residency lookup: resolve each unique
                         # tile once instead of one Python call per patch.
                         slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch(
@@ -5421,10 +5410,10 @@ class App(InputHandlerMixin):
                             raw_patches[:, 4], raw_patches[:, 5],
                             raw_patches[:, 6], raw_patches[:, 7]
                         )
-                        self.terrain_patch_staging[st:en, 4] = uvs
-                        self.terrain_patch_staging[st:en, 5] = ox_arr
-                        self.terrain_patch_staging[st:en, 6] = oy_arr
-                        self.terrain_patch_staging[st:en, 10] = slots
+                        pack_terrain_patches_jit(
+                            self.terrain_patch_staging, st, raw_patches,
+                            uvs, ox_arr, oy_arr, slots, float(b_i)
+                        )
 
                         self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
                         total_patches_rendered += num_p
@@ -5477,18 +5466,23 @@ class App(InputHandlerMixin):
             _perf_gpu_end(_gq)
 
             # GPU draw-command readback is a full pipeline sync; only pay it
-            # while the triangle HUD is shown — never with the settings modal.
+            # while the triangle HUD is shown — throttled to every 15 frames (~4-10 Hz)
+            # so it never stalls the pipeline on every frame.
             if self.camera.get("show_triangle_count", False):
-                try:
-                    raw_cmds = np.frombuffer(draw_cmds_buffer.read(), dtype=np.uint32).reshape((4, 5))
-                    self.sphere_last_triangle_count = int(
-                        raw_cmds[1, 1] * self.sphere_lo_triangles +
-                        raw_cmds[2, 1] * self.sphere_hi_triangles +
-                        raw_cmds[3, 1] * self.sphere_ultra_triangles +
-                        raw_cmds[0, 1] * 2
-                    )
-                except Exception:
-                    self.sphere_last_triangle_count = 0
+                if not hasattr(self, '_tri_count_frame_counter'):
+                    self._tri_count_frame_counter = 0
+                self._tri_count_frame_counter += 1
+                if self._tri_count_frame_counter % 15 == 0:
+                    try:
+                        raw_cmds = np.frombuffer(draw_cmds_buffer.read(), dtype=np.uint32).reshape((4, 5))
+                        self.sphere_last_triangle_count = int(
+                            raw_cmds[1, 1] * self.sphere_lo_triangles +
+                            raw_cmds[2, 1] * self.sphere_hi_triangles +
+                            raw_cmds[3, 1] * self.sphere_ultra_triangles +
+                            raw_cmds[0, 1] * 2
+                        )
+                    except Exception:
+                        self.sphere_last_triangle_count = 0
             else:
                 self.sphere_last_triangle_count = 0
             self.total_last_triangle_count = self.sphere_last_triangle_count + self.terrain_last_triangle_count
@@ -6763,11 +6757,10 @@ class App(InputHandlerMixin):
                             b_name, "clouds",
                             raw_p[:, 4], raw_p[:, 5], raw_p[:, 6], raw_p[:, 7]
                         )
-                        self.terrain_cloud_staging[:num_p] = self.terrain_patch_staging[st_idx:st_idx + num_p]
-                        self.terrain_cloud_staging[:num_p, 4] = uvc
-                        self.terrain_cloud_staging[:num_p, 5] = c_ox
-                        self.terrain_cloud_staging[:num_p, 6] = c_oy
-                        self.terrain_cloud_staging[:num_p, 10] = slot_arr
+                        pack_cloud_patches_jit(
+                            self.terrain_cloud_staging, self.terrain_patch_staging,
+                            st_idx, num_p, uvc, c_ox, c_oy, slot_arr
+                        )
                         cloud_staged_count = int(np.count_nonzero(slot_arr >= 0.0))
 
                         if cloud_staged_count > 0:
