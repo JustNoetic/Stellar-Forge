@@ -53,6 +53,7 @@ class TerrainTileStreamer:
         # Background worker thread & queues
         self.request_queue = queue.Queue()
         self.upload_queue = queue.Queue()
+        self.reload_queue = queue.Queue()
         self.in_flight_requests = set()
         self._shutdown_event = threading.Event()
 
@@ -103,11 +104,13 @@ class TerrainTileStreamer:
                             max_lod = max(max_lod, int(lod_s))
                     self.max_available_lods[(body_name.lower(), map_type, face)] = max_lod
 
-            for m_type in ("diffuse", "clouds"):
+            for m_type in ("diffuse", "clouds", "height"):
                 body_m_dir = os.path.join(b_dir, m_type)
                 if os.path.isdir(body_m_dir):
                     for face in range(6):
                         key = (body_name.lower(), m_type, face, 0, 0, 0)
+                        if key in self.resident_tiles:
+                            continue
                         raw_bytes = self._read_tile_from_disk(*key)
                         if raw_bytes and self.free_slots:
                             slot = self.free_slots.pop(0)
@@ -128,7 +131,7 @@ class TerrainTileStreamer:
                 files = set()
             self._dir_file_cache[dir_path] = files
 
-        for ext in (".jpg", ".png", ".webp", ".jpeg"):
+        for ext in ((".png",) if map_type == 'height' else (".jpg", ".png", ".webp", ".jpeg")):
             fn = base_name + ext
             if fn in files:
                 return os.path.join(dir_path, fn)
@@ -147,6 +150,12 @@ class TerrainTileStreamer:
                     img_l = img.convert('L')
                     white = Image.new('L', img_l.size, 255)
                     img_rgba = Image.merge('RGBA', (white, white, white, img_l))
+            elif map_type == 'height':
+                # Single-channel grayscale elevation: replicate luminance into RGB,
+                # opaque alpha. Consumers sample .r as normalized elevation in [0, 1].
+                img_l = img.convert('L')
+                opaque = Image.new('L', img_l.size, 255)
+                img_rgba = Image.merge('RGBA', (img_l, img_l, img_l, opaque))
             else:
                 img_rgba = img.convert('RGBA')
 
@@ -288,8 +297,9 @@ class TerrainTileStreamer:
                 return slot, uv_scale, (x & ((1 << k) - 1)) * uv_scale, (y & ((1 << k) - 1)) * uv_scale
             anc_lod -= 1
 
-        # 4. Default fallback (slot 0 for diffuse, -1 for clouds to avoid opaque fallback blocks)
-        if map_type == 'clouds':
+        # 4. Default fallback (slot 0 for diffuse; -1 for clouds/height to avoid
+        #    opaque fallback blocks and wrong-layer displacement)
+        if map_type in ('clouds', 'height'):
             return -1, 1.0, 0.0, 0.0
         return 0, 1.0, 0.0, 0.0
 
@@ -333,6 +343,62 @@ class TerrainTileStreamer:
                 slot_last_used[s] = frame
         return slots, uv_scales, off_x, off_y
 
+    def resolve_tiles_batch_multi(self, body_name, map_types, faces, lods, xs, ys):
+        """
+        Vectorized batch over patches spanning several map types in one call.
+
+        Coordinates (faces/lods/xs/ys) are shared across map types; returns four
+        python lists of float32 arrays (slots, uv_scales, off_x, off_y), one
+        entry per map_type in map_types, in the same order. Residency,
+        ancestor-fallback and memo semantics match resolve_tiles_batch.
+        """
+        if not hasattr(faces, '__len__') or len(faces) == 0:
+            empty = np.empty(0, dtype=np.float32)
+            n_mt = len(map_types)
+            return ([empty.copy() for _ in range(n_mt)],
+                    [empty.copy() for _ in range(n_mt)],
+                    [empty.copy() for _ in range(n_mt)],
+                    [empty.copy() for _ in range(n_mt)])
+
+        faces_l = faces.astype(np.int32).tolist() if isinstance(faces, np.ndarray) else [int(f) for f in faces]
+        lods_l = lods.astype(np.int32).tolist() if isinstance(lods, np.ndarray) else [int(l) for l in lods]
+        xs_l = xs.astype(np.int32).tolist() if isinstance(xs, np.ndarray) else [int(x) for x in xs]
+        ys_l = ys.astype(np.int32).tolist() if isinstance(ys, np.ndarray) else [int(y) for y in ys]
+        n = len(faces_l)
+
+        slots_list = []
+        uv_scales_list = []
+        off_x_list = []
+        off_y_list = []
+
+        resolve = self._resolve_single
+        b_name = body_name.lower()
+        frame = self.current_frame
+        slot_last_used = self.slot_last_used
+
+        for map_type in map_types:
+            slots = np.empty(n, dtype=np.float32)
+            uv_scales = np.empty(n, dtype=np.float32)
+            off_x = np.empty(n, dtype=np.float32)
+            off_y = np.empty(n, dtype=np.float32)
+            stamped = set()
+
+            for i in range(n):
+                s, u, ox, oy = resolve(b_name, map_type, faces_l[i], lods_l[i], xs_l[i], ys_l[i])
+                slots[i] = s
+                uv_scales[i] = u
+                off_x[i] = ox
+                off_y[i] = oy
+                if s >= 0 and s not in stamped:
+                    stamped.add(s)
+                    slot_last_used[s] = frame
+
+            slots_list.append(slots)
+            uv_scales_list.append(uv_scales)
+            off_x_list.append(off_x)
+            off_y_list.append(off_y)
+        return slots_list, uv_scales_list, off_x_list, off_y_list
+
     def upload_tile_to_slot(self, slot_idx: int, raw_bytes: bytes):
         """Upload raw RGBA tile bytes to the specified layer of Texture2DArray."""
         self.texture_array.write(
@@ -346,6 +412,31 @@ class TerrainTileStreamer:
 
     def process_uploads(self, max_per_frame: int = 4):
         """Called every frame on the main OpenGL render thread to flush completed decodes."""
+        reloads = set()
+        while not self.reload_queue.empty():
+            reloads.add(self.reload_queue.get_nowait())
+        if reloads:
+            # Rare edit/bake transition: drain the decoder before invalidating so
+            # an old in-flight tile cannot reappear after a replacement/deletion.
+            self._shutdown_event.set()
+            self.worker_thread.join()
+            self.request_queue = queue.Queue()
+            self.upload_queue = queue.Queue()
+            self.in_flight_requests.clear()
+            for key, slot in list(self.resident_tiles.items()):
+                if (key[0], key[1]) in reloads or (key[0], None) in reloads:
+                    del self.resident_tiles[key]
+                    self.slot_to_key.pop(slot, None)
+                    self.locked_slots.discard(slot)
+                    self.free_slots.append(slot)
+            self._dir_file_cache.clear()
+            self.missing_tiles.clear()
+            self._resolve_memo.clear()
+            self.max_available_lods.clear()
+            self._preload_root_tiles()
+            self._shutdown_event.clear()
+            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.worker_thread.start()
 
         for _ in range(max_per_frame):
             try:
@@ -399,6 +490,10 @@ class TerrainTileStreamer:
     def use(self, location: int = 14):
         """Bind the texture array to a texture unit."""
         self.texture_array.use(location=location)
+
+    def reload_layer(self, body_name, map_type=None):
+        """Schedule replacement/deletion refresh; safe to call from bake workers."""
+        self.reload_queue.put((body_name.lower(), map_type))
 
     def shutdown(self):
         self._shutdown_event.set()

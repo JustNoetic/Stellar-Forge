@@ -39,12 +39,13 @@ def test_terrain_lighting_and_shadows():
     ibo = ctx.buffer(grid_idx.tobytes())
     vao = ctx.vertex_array(prog_terrain, [(vbo, '3f', 'in_position')], index_buffer=ibo)
 
-    # Patch SSBO (12 floats per patch: u_range, u_uv_trans, u_meta)
-    patch_buf = np.zeros((1, 12), dtype=np.float32)
+    # Patch SSBO (20 floats per patch (80 bytes): u_range, u_uv_trans, u_meta)
+    patch_buf = np.zeros((1, 20), dtype=np.float32)
     patch_buf[0, 0:4] = [-0.1, -0.1, 0.1, 0.1] # u_range: Small face patch
     patch_buf[0, 4:8] = [1.0, 0.0, 0.0, 0.0]   # u_uv_trans: uv_scale=1.0, uv_offset=(0,0), skirt_depth=0
     patch_buf[0, 8:12] = [5.0, 0.0, 0.0, 0.0]  # u_meta: face_idx=5 (+X in world with pole +Y), lod=0, tile_slot=0, body_idx=0
 
+    patch_buf[:, 12] = -1.0  # Height disabled for existing regression cases
     ssbo = ctx.buffer(patch_buf.tobytes())
     ssbo.bind_to_storage_buffer(binding=4)
 

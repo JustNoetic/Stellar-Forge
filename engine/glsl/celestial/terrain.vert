@@ -33,6 +33,8 @@ struct TerrainPatchInstance {
     vec4 u_range;      // x=min_u, y=min_v, z=max_u, w=max_v in [-1, 1]
     vec4 u_uv_trans;   // x=uv_scale, y=uv_offset_x, z=uv_offset_y, w=skirt_depth_km
     vec4 u_meta;       // x=face_idx, y=lod_level, z=tile_slot, w=body_idx
+    vec4 u_height;     // slot (-1 disables), independent UV scale and offset
+    vec4 u_hrange;     // minimum elevation (km), elevation span (km), padding
 };
 
 layout(std430, binding = 4) readonly buffer TerrainPatchBuffer {
@@ -41,6 +43,7 @@ layout(std430, binding = 4) readonly buffer TerrainPatchBuffer {
 
 uniform float u_km_to_au; // 1.0 / 149597870.7
 uniform bool u_is_cloud_pass;
+uniform sampler2DArray u_tile_array;
 uniform float u_cloud_altitude_km;
 uniform vec3 u_camera_pos;
 
@@ -48,6 +51,10 @@ uniform vec3 u_camera_pos;
 
 out vec3 f_world_pos;
 out vec3 f_normal;
+out vec3 f_tan_u;
+out vec3 f_tan_v;
+out vec2 f_height_uv;
+flat out vec3 f_height_meta; // slot, patch-to-tile UV scale, elevation span (km)
 out vec2 f_tile_uv;
 out vec2 f_local_uv;
 flat out float f_tile_slot;
@@ -69,6 +76,18 @@ flat out vec3 f_body_center;
 out vec3 f_rel_pos;
 
 #define PI 3.14159265358979323846
+
+vec3 base_surface(int face, vec2 uv, float obl) {
+    vec2 p = tan(uv * (PI * 0.25));
+    vec3 v;
+    if (face == 0)      v = vec3(1.0, -p.y, -p.x);
+    else if (face == 1) v = vec3(-1.0, -p.y, p.x);
+    else if (face == 2) v = vec3(p.x, 1.0, p.y);
+    else if (face == 3) v = vec3(p.x, -1.0, -p.y);
+    else if (face == 4) v = vec3(p.x, -p.y, 1.0);
+    else               v = vec3(-p.x, -p.y, -1.0);
+    return normalize(v) * vec3(1.0, 1.0 - obl, 1.0);
+}
 
 void main() {
     TerrainPatchInstance t_inst = u_patches[gl_InstanceID];
@@ -116,10 +135,19 @@ void main() {
         r_km += max(0.1, u_cloud_altitude_km);
     }
     vec3 p_local_km = p_ellip * r_km;
+    bool height_active = !u_is_cloud_pass && t_inst.u_height.x >= 0.0;
+    f_height_uv = in_position.xy * t_inst.u_height.y + t_inst.u_height.zw;
+    f_height_meta = vec3(height_active ? t_inst.u_height.x : -1.0,
+                         t_inst.u_height.y, t_inst.u_hrange.y);
+    if (height_active) {
+        float e = textureLod(u_tile_array, vec3(f_height_uv, t_inst.u_height.x), 0.0).r;
+        p_local_km += normalize(p_ellip) * (t_inst.u_hrange.x + e * t_inst.u_hrange.y);
+    }
 
     // Boundary skirt extrusion (only for ground terrain, never for clouds)
     if (!u_is_cloud_pass && in_position.z > 0.5) {
         float skirt_depth = t_inst.u_uv_trans.w;
+        if (height_active) skirt_depth += t_inst.u_hrange.y;
         p_local_km -= normalize(p_ellip) * skirt_depth;
     }
 
@@ -149,6 +177,28 @@ void main() {
 
     vec3 p_world_km = p_local_body.x * tangent + p_local_body.y * pole + p_local_body.z * bitangent;
     vec3 n_world = normalize(n_local_body.x * tangent + n_local_body.y * pole + n_local_body.z * bitangent);
+
+    f_tan_u = vec3(0.0);
+    f_tan_v = vec3(0.0);
+    if (height_active) {
+        // Derivatives in km per PATCH UV unit, from the undisplaced surface.
+        // Keep their lengths: normalizing them would destroy physical slope scale.
+        const float step_uv = 1e-3;
+        vec2 uv = vec2(u_local, v_local);
+        vec2 extent = t_inst.u_range.zw - t_inst.u_range.xy;
+        vec3 pu = (base_surface(face, uv + vec2(step_uv, 0.0), obl)
+                 - base_surface(face, uv - vec2(step_uv, 0.0), obl)) * (r_km * extent.x / (2.0 * step_uv));
+        vec3 pv = (base_surface(face, uv + vec2(0.0, step_uv), obl)
+                 - base_surface(face, uv - vec2(0.0, step_uv), obl)) * (r_km * extent.y / (2.0 * step_uv));
+        vec3 base_n = normalize(vec3(n_sphere.x, n_sphere.y / max(1e-4, 1.0 - obl), n_sphere.z));
+        pu -= base_n * dot(pu, base_n);
+        pv -= base_n * dot(pv, base_n);
+        // Preserve +u/+v derivative directions; orient the final cross in frag.
+        mat3 spin = mat3(c_rot, 0.0, s_rot, 0.0, 1.0, 0.0, -s_rot, 0.0, c_rot);
+        mat3 frame = mat3(tangent, pole, bitangent);
+        f_tan_u = frame * spin * pu;
+        f_tan_v = frame * spin * pv;
+    }
 
     // Convert km to world AU and add body center
     vec3 p_world = body_pos + p_world_km * u_km_to_au;

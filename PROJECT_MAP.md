@@ -314,8 +314,8 @@ spectral classification.
 
 ### 3.11b `engine/rendering/terrain_quadtree.py` — Spherified Cube Quadtree LOD (SpaceEngine Style)
 - `cube_to_sphere_point(face, u, v)`: maps normalized cube face $(u, v) \in [-1, 1]$ to unit sphere with tangent warping ($x' = \tan(u\pi/4), y' = \tan(v\pi/4)$) to eliminate cube corner area distortion.
-- `_traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum, refract_bend)`: `@njit(fastmath=True)` traversal kernel evaluating Screen Space Error (SSE) against node bounding spheres, with exact 6-plane view frustum culling in planet local space (preventing low-FOV triangle explosion), terrestrial atmospheric refraction horizon extension (`refract_offset = min(0.05, refract_bend * 0.5)`), and oblate horizon culling in normalized spheroid-to-sphere space $(x, y / (1 - f), z)$ eliminating backside leaks on oblate bodies. Returns packed `(N, 9)` float32 array `[min_u, min_v, max_u, max_v, face, lod, x, y, radius]`. Zero per-frame Python memory allocations.
-- `pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx)`: `@njit(fastmath=True)` kernel packing 12 floats per patch (48 bytes: `u_range`, `u_uv_trans`, `u_meta`) directly into the staging SSBO in a single contiguous pass, de-duplicating body matrices/rotations into `AllInstances`.
+- `_traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum, cloud_alt_km, refract_bend, height_max_km)`: `@njit(fastmath=True)` traversal kernel evaluating Screen Space Error (SSE) against node bounding spheres, with exact 6-plane view frustum culling in planet local space (preventing low-FOV triangle explosion), terrestrial atmospheric refraction horizon extension (`refract_offset = min(0.05, refract_bend * 0.5)`), and oblate horizon culling in normalized spheroid-to-sphere space $(x, y / (1 - f), z)$ eliminating backside leaks on oblate bodies. Returns packed `(N, 9)` float32 array `[min_u, min_v, max_u, max_v, face, lod, x, y, radius]`. Zero per-frame Python memory allocations.
+- `pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km)`: `@njit(fastmath=True)` kernel packing 20 floats per patch (80 bytes: `u_range`, `u_uv_trans`, `u_meta`, `u_height`, `u_hrange`) directly into the staging SSBO in a single contiguous pass, de-duplicating body matrices/rotations into `AllInstances`.
 - `pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr)`: `@njit(fastmath=True)` kernel copying terrain base parameters and stamping cloud-layer slot/UV transform offsets.
 - `QuadtreePatch`: container for patch bounds, face index, LOD level, and bounding radius.
 - `PlanetQuadtree`: manages the 6 root cube faces, radius updates, and LOD traversal (`traverse_raw` / `traverse`).
@@ -325,11 +325,13 @@ spectral classification.
 ### 3.11c `engine/rendering/terrain_streamer.py` — Virtual Tiled Texture Streaming
 - `TerrainTileStreamer(ctx, tiles_base_dir="data/tiles", pool_capacity=256, tile_size=512)`:
   - Manages a ModernGL `Texture2DArray` pool (256 slices of $512 \times 512$ RGBA8) for virtual texture streaming.
-  - Multi-layer support (`"diffuse"` and `"clouds"`). Preloads LOD 0 root slices into locked slots on startup.
+  - Multi-layer support (`"diffuse"`, `"clouds"`, and lossless PNG `"height"`). Preloads LOD 0 root slices into locked slots on startup.
   - Directory listing cache `_dir_file_cache` eliminating redundant `os.stat` filesystem calls when discovering available LODs.
   - Background worker thread (`_worker_loop`) asynchronously reads `.jpg` / `.png` tiles from disk and queues GPU uploads with proper in-flight request deduplication.
   - `_read_tile_from_disk(path, map_type)`: bilinear downsampling fallback and extracts grayscale luminance into alpha channel `(255, 255, 255, Luminance)` for cloud textures, ensuring smooth semi-transparency.
   - `get_tile_slot_or_fallback(body_name, map_type, face, lod, x, y)`: returns resident slot index. If the tile is still in flight, traverses up ancestors in $\mathcal{O}(\text{LOD})$ to return the nearest loaded parent slot with exact UV sub-rect scale and offsets `(slot_id, uv_scale, off_x, off_y)`.
+  - `resolve_tiles_batch_multi(body_name, map_types, faces, lods, xs, ys)`: resolves independent per-layer slots and ancestor UV transforms in one batch. Missing height returns slot -1.
+  - `reload_layer(body_name, map_type=None)`: queues render-thread cache invalidation and root reload after edits, rejecting old in-flight decodes.
   - `resolve_tiles_batch(...)`: vectorized batch residency lookup with per-face memoized sub-caches (`_resolve_memo`), amortizing tile residency lookups across all patches.
   - `process_uploads(max_per_frame=4)`: transfers loaded byte buffers to GPU Texture2DArray slices via `texture_array.write()`, with targeted per-face cache invalidation.
 
@@ -414,7 +416,7 @@ spectral classification.
       - GPU culling compute dispatch (`prog_culling_compute.run`) (~L2877); sets `u_terrain_body_idx` so sphere proxy pass skips the active terrain body.
       - Orbit polyline compute + draw (~L2880–3264).
       - Sphere PBR draw (LOD: lo/hi/ultra via indirect draw cmds).
-      - **Terrain Quadtree LOD pass (Pass 1b)** (~L5200): when `terrain_lod_enabled` is active, selects visible candidate bodies with tiles (up to 4 simultaneous bodies), transforms camera and view frustum planes into each body's local rotation frame with oblateness, runs `PlanetQuadtree.traverse_raw` with 6-plane local frustum culling, stages patches via `pack_terrain_patches_jit` into a streamlined 48-byte SSBO (binding 4), queries `TerrainTileStreamer.resolve_tiles_batch` for diffuse tiles and ancestor UV transforms, and renders instanced terrain patches via zero-overhead GPU indirect draw command (`vao_terrain.render_indirect(terrain_draw_cmds_buf)`).
+      - **Terrain Quadtree LOD pass (Pass 1b)** (~L5200): when `terrain_lod_enabled` is active, selects visible candidate bodies with tiles (up to 4 simultaneous bodies), transforms camera and view frustum planes into each body's local rotation frame with oblateness, runs `PlanetQuadtree.traverse_raw` with 6-plane local frustum culling, stages patches via `pack_terrain_patches_jit` into a streamlined 80-byte SSBO (binding 4), queries `TerrainTileStreamer.resolve_tiles_batch_multi` for diffuse/height tiles and independent ancestor UV transforms, and renders instanced terrain patches via zero-overhead GPU indirect draw command (`vao_terrain.render_indirect(terrain_draw_cmds_buf)`).
       - `render_atmosphere_pass(clip_mode)` — two-pass with dual-source blending (behind/in front of rings); Mode 3 bakes dynamic Sky-View LUT (selectable resolution: Low 192×108, Medium 256×256, High 384×216; `prog_sky_view` into `sky_view_fbo`, texture unit 12) aligned with parent planet axial tilt.
       - Rings render, Habitable Zones, second atmosphere pass.
       - Dynamic Cloud Layer pass (`render_body_clouds`) (~L6588) — when Terrain LOD is enabled, renders clouds using the Quadtree LOD shell offset at $R + h_{\text{cloud}}$ with `clouds` layer virtual tiles and two-sided lighting via indirect draw (`vao_terrain.render_indirect(terrain_cloud_draw_cmds_buf)`); otherwise falls back to uniform sphere proxy shell.
@@ -657,3 +659,9 @@ Per-body row of floats fed to `prog_spheres` / `prog_culling_compute`. Fields in
 
 *Last updated against the source tree at the time of writing. Line numbers are approximate and
 will drift — search by symbol name for precision.*
+
+### Heightmap terrain
+
+The quadtree terrain path streams grayscale PNG elevation tiles from `data/tiles/<body>/height/<face>/<lod>/<x>_<y>.png` in the shared diffuse/cloud/height texture array. Each body may set `"height_range_km": [min_km, max_km]` in system JSON (default `[0.0, 8.848]`); normalized red-channel values map linearly to that range. Height has independent ancestor-fallback UVs, radial vertex displacement and per-pixel relief normals. Missing height tiles and cloud shells never displace. Bounds include maximum absolute elevation, and skirts include the elevation span. The body instance buffer remains 28 floats.
+
+Bake with `python scripts/bake_planet_tiles.py --body Earth --map-type height --max-lod 2 --tile-size 512`. Height imports are available in Inspector > Cosmetics > Height; Apply bakes terrain tiles asynchronously.

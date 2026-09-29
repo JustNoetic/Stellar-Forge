@@ -93,13 +93,14 @@ def test_gpu_terrain_rendering_pipeline():
     ibo = ctx.buffer(grid_idx.tobytes())
     vao = ctx.vertex_array(prog_terrain, [(vbo, '3f', 'in_position')], index_buffer=ibo)
 
-    # Patch SSBO (12 floats per patch: range[4], uv_trans[4], meta[4])
-    patch_buf = np.zeros((4, 12), dtype=np.float32)
+    # Patch SSBO (20 floats per patch (80 bytes): range[4], uv_trans[4], meta[4])
+    patch_buf = np.zeros((4, 20), dtype=np.float32)
     for i in range(4):
         patch_buf[i, 0:4] = [-1.0, -1.0, 1.0, 1.0]
         patch_buf[i, 4:8] = [1.0, 0.0, 0.0, 10.0]
         patch_buf[i, 8:12] = [float(i), 0.0, 0.0, 0.0]
 
+    patch_buf[:, 12] = -1.0  # Height disabled for existing regression cases
     ssbo = ctx.buffer(patch_buf.tobytes())
     ssbo.bind_to_storage_buffer(binding=4)
 

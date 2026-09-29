@@ -264,7 +264,7 @@ Stellar-Forge incorporates a continuous Level of Detail (LOD) planetary terrain 
      $$\mathbf{C}_{\text{sphere}} = \left(C_x, \, \frac{C_y}{1 - f}, \, C_z\right)$$
      In this transformed metric space, the oblate body is an exact unit sphere, enabling exact analytical horizon culling ($\theta_{\text{cull}} = \theta_{\text{horizon}} + \arcsin(R_{\text{patch}} / R_{\text{planet}})$). This completely prevents backside polygon leaks and ensures seamless LOD subdivision across all latitudes.
    - **Local 6-Plane View Frustum Culling**: Quadtree traversal incorporates analytical bounding sphere testing against camera frustum planes dynamically transformed into the planet's local rotated frame. Nodes outside the view cone are pruned immediately at root and low LODs, slashing rendered patches and triangle counts by $>99\%$ during narrow/low FOV (telescope view) and preventing off-screen triangle blowup.
-   - Traversal and patch staging are compiled with Numba (`_traverse_quadtree_jit`, `pack_terrain_patches_jit`, `pack_cloud_patches_jit`), evaluating the full planetary tree in $< 0.1\text{ ms}$ on CPU with zero per-frame Python memory allocations and staging into a streamlined 48-byte SSBO layout. Dispatched via zero-overhead GPU indirect draw commands (`DrawElementsIndirectCommand`), supporting simultaneous multi-body terrain and cloud quadtree rendering.
+   - Traversal and patch staging are compiled with Numba (`_traverse_quadtree_jit`, `pack_terrain_patches_jit`, `pack_cloud_patches_jit`), evaluating the full planetary tree in $< 0.1\text{ ms}$ on CPU with zero per-frame Python memory allocations and staging into a streamlined 80-byte SSBO layout. Dispatched via zero-overhead GPU indirect draw commands (`DrawElementsIndirectCommand`), supporting simultaneous multi-body terrain and cloud quadtree rendering.
 
 3. **Asynchronous Tiled Texture Streaming (`TerrainTileStreamer`)**:
    - Fixed VRAM budget backed by a dedicated ModernGL `Texture2DArray` pool (256 slices of $512 \times 512$ RGBA8).
@@ -563,3 +563,9 @@ python scripts/fetch_horizons.py
 ## 📜 License
 
 Distributed under the MIT License. See `LICENSE` for more information.
+
+### Heightmap terrain
+
+The quadtree terrain path streams grayscale PNG elevation tiles from `data/tiles/<body>/height/<face>/<lod>/<x>_<y>.png` in the shared diffuse/cloud/height texture array. Each body may set `"height_range_km": [min_km, max_km]` in system JSON (default `[0.0, 8.848]`); normalized red-channel values map linearly to that range. Height has independent ancestor-fallback UVs, radial vertex displacement and per-pixel relief normals. Missing height tiles and cloud shells never displace. Bounds include maximum absolute elevation, and skirts include the elevation span. The body instance buffer remains 28 floats.
+
+Bake with `python scripts/bake_planet_tiles.py --body Earth --map-type height --max-lod 2 --tile-size 512`. Height imports are available in Inspector > Cosmetics > Height; Apply bakes terrain tiles asynchronously.

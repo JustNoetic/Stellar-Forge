@@ -2322,11 +2322,11 @@ class App(InputHandlerMixin):
             index_buffer=self.ibo_terrain_grid
         )
         MAX_TERRAIN_PATCHES = 4096
-        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 48)
+        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
         terrain_patch_ssbo = self.terrain_patch_ssbo
-        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 12), dtype=np.float32)
-        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 48)
-        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 12), dtype=np.float32)
+        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
+        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
+        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
         self.terrain_draw_cmds_buf = ctx.buffer(reserve=20)
         self.terrain_cloud_draw_cmds_buf = ctx.buffer(reserve=20)
         self.terrain_current_raw_patches = None
@@ -5422,9 +5422,18 @@ class App(InputHandlerMixin):
                     local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float32)
 
                     obl = float(all_instances[b_i, 12])
+                    terrain_body_data = bodies_data[b_i] if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]
+                    elev_min_km, elev_max_km = terrain_body_data.get("height_range_km", [0.0, 8.848])
+                    elev_min_km, elev_max_km = float(elev_min_km), float(elev_max_km)
+                    if not (math.isfinite(elev_min_km) and math.isfinite(elev_max_km) and elev_max_km >= elev_min_km):
+                        elev_min_km, elev_max_km = 0.0, 8.848
+                    elev_span_km = elev_max_km - elev_min_km
+                    has_height = self.terrain_streamer.get_max_lod(b_name, "height") >= 0
+                    height_max_km = max(abs(elev_min_km), abs(elev_max_km)) if has_height else 0.0
                     body_max_lod = max_d
                     if d_cam_body_km > b_r_km * 2.0:
-                        max_disk_lod = self.terrain_streamer.get_max_lod(b_name, "diffuse")
+                        max_disk_lod = max(self.terrain_streamer.get_max_lod(b_name, "diffuse"),
+                                           self.terrain_streamer.get_max_lod(b_name, "height"))
                         if max_disk_lod >= 0:
                             body_max_lod = min(max_d, max_disk_lod)
 
@@ -5445,7 +5454,7 @@ class App(InputHandlerMixin):
                         max_patches=rem_budget,
                         frustum_planes=local_frustum_planes,
                         cloud_alt_km=b_cloud_alt_km,
-                        refract_bend=body_refract_bend
+                        refract_bend=body_refract_bend, height_max_km=height_max_km
                     )
                     num_p = len(raw_patches)
 
@@ -5462,7 +5471,7 @@ class App(InputHandlerMixin):
                             max_patches=min(rem_budget, 6),
                             frustum_planes=None,
                             cloud_alt_km=b_cloud_alt_km,
-                            refract_bend=body_refract_bend
+                            refract_bend=body_refract_bend, height_max_km=height_max_km
                         )
                         num_p = len(raw_patches)
 
@@ -5471,14 +5480,15 @@ class App(InputHandlerMixin):
                         en = st + num_p
                         # Batched tile residency lookup: resolve each unique
                         # tile once instead of one Python call per patch.
-                        slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch(
-                            b_name, "diffuse",
+                        slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch_multi(
+                            b_name, ["diffuse", "height"],
                             raw_patches[:, 4], raw_patches[:, 5],
                             raw_patches[:, 6], raw_patches[:, 7]
                         )
                         pack_terrain_patches_jit(
                             self.terrain_patch_staging, st, raw_patches,
-                            uvs, ox_arr, oy_arr, slots, float(b_i)
+                            uvs[0], ox_arr[0], oy_arr[0], slots[0], float(b_i),
+                            uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km
                         )
 
                         self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)

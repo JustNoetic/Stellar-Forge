@@ -89,7 +89,7 @@ class TextureStreamer:
                 base_names = set()
                 for f in files:
                     name = os.path.splitext(os.path.basename(f))[0]
-                    if any(name.endswith(s) for s in ["_ring", "_rings", "_normal", "_specular", "_clouds", "_cloud", "_front", "_back"]):
+                    if any(name.endswith(s) for s in ["_ring", "_rings", "_normal", "_specular", "_clouds", "_cloud", "_front", "_back", "_heightmap"]):
                         continue
                     base_names.add(name)
                 

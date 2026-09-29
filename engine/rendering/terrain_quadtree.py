@@ -98,7 +98,7 @@ if _HAS_NUMBA:
         return vx * inv_len, vy * inv_len, vz * inv_len
 
     @njit(fastmath=True)
-    def _traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum, cloud_alt_km, refract_bend):
+    def _traverse_quadtree_jit(cam_pos, radius_km, obl, screen_height, tan_half_fov, threshold_px, max_lod, max_patches, frustum_planes, has_frustum, cloud_alt_km, refract_bend, height_max_km):
         out = np.empty((max_patches, 9), dtype=np.float32)
         count = 0
         
@@ -197,7 +197,7 @@ if _HAS_NUMBA:
             d3 = math.sqrt((p3x*radius_km - cx)**2 + (p3y*(1.0 - obl)*radius_km - cy)**2 + (p3z*radius_km - cz)**2)
             radius = max(max(d0, d1), max(d2, d3)) * 1.05
             
-            eff_radius = radius + max(0.0, cloud_alt_km)
+            eff_radius = radius + max(0.0, cloud_alt_km) + max(0.0, height_max_km)
             
             # Precise horizon culling in spheroid-normalized space
             node_dot = cnx * cs_dx + cny * cs_dy + cnz * cs_dz
@@ -227,7 +227,7 @@ if _HAS_NUMBA:
             dy = cy - cam_y
             dz = cz - cam_z
             dist_to_center = math.sqrt(dx*dx + dy*dy + dz*dz)
-            dist_to_surface = max(0.01, dist_to_center - radius)
+            dist_to_surface = max(0.01, dist_to_center - radius - max(0.0, height_max_km))
             screen_size = (radius * screen_height) / (dist_to_surface * 2.0 * tan_half_fov)
             
             if screen_size > threshold_px and lod < max_lod and (s_ptr + 4 < 512):
@@ -254,7 +254,7 @@ if _HAS_NUMBA:
         return out[:count]
 
     @njit(fastmath=True)
-    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km):
         n = raw_patches.shape[0]
         for i in range(n):
             idx = st + i
@@ -270,35 +270,45 @@ if _HAS_NUMBA:
             staging[idx, 9] = raw_patches[i, 5]
             staging[idx, 10] = slots[i]
             staging[idx, 11] = body_idx
+            staging[idx, 12] = h_slots[i]
+            staging[idx, 13] = h_uvs[i]
+            staging[idx, 14] = h_ox[i]
+            staging[idx, 15] = h_oy[i]
+            staging[idx, 16] = elev_min_km
+            staging[idx, 17] = elev_span_km
+            staging[idx, 18] = 0.0
+            staging[idx, 19] = 0.0
 
     @njit(fastmath=True)
     def pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr):
         for i in range(num_p):
             src_idx = st_idx + i
-            for c in range(12):
+            for c in range(20):
                 cloud_staging[i, c] = terrain_staging[src_idx, c]
             cloud_staging[i, 4] = uvc[i]
             cloud_staging[i, 5] = c_ox[i]
             cloud_staging[i, 6] = c_oy[i]
             cloud_staging[i, 10] = slot_arr[i]
+            # Cloud shells radiate from the base radius: disable height displacement
+            cloud_staging[i, 12] = -1.0
 
     # Warmup Numba JIT at import time to prevent first-frame runtime stutter
     try:
         _traverse_quadtree_jit(
             np.array([0.0, 0.0, 1000.0], dtype=np.float32),
             500.0, 0.0, 1080.0, 0.4142, 120.0, 1, 64,
-            np.zeros((6, 4), dtype=np.float32), False, 0.0
+            np.zeros((6, 4), dtype=np.float32), False, 0.0, 0.0, 0.0
         )
         _dummy_raw = np.zeros((1, 9), dtype=np.float32)
         _dummy_f = np.zeros(1, dtype=np.float32)
-        _dummy_staging = np.zeros((1, 12), dtype=np.float32)
-        pack_terrain_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0)
-        _dummy_cloud = np.zeros((1, 12), dtype=np.float32)
+        _dummy_staging = np.zeros((1, 20), dtype=np.float32)
+        pack_terrain_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, 0.0)
+        _dummy_cloud = np.zeros((1, 20), dtype=np.float32)
         pack_cloud_patches_jit(_dummy_cloud, _dummy_staging, 0, 1, _dummy_f, _dummy_f, _dummy_f, _dummy_f)
     except Exception:
         pass
 else:
-    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km):
         n = raw_patches.shape[0]
         staging[st:st+n, 0:4] = raw_patches[:, 0:4]
         staging[st:st+n, 4] = uvs
@@ -309,6 +319,14 @@ else:
         staging[st:st+n, 9] = raw_patches[:, 5]
         staging[st:st+n, 10] = slots
         staging[st:st+n, 11] = body_idx
+        staging[st:st+n, 12] = h_slots
+        staging[st:st+n, 13] = h_uvs
+        staging[st:st+n, 14] = h_ox
+        staging[st:st+n, 15] = h_oy
+        staging[st:st+n, 16] = elev_min_km
+        staging[st:st+n, 17] = elev_span_km
+        staging[st:st+n, 18] = 0.0
+        staging[st:st+n, 19] = 0.0
 
     def pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr):
         cloud_staging[:num_p] = terrain_staging[st_idx:st_idx + num_p]
@@ -316,6 +334,8 @@ else:
         cloud_staging[:num_p, 5] = c_ox
         cloud_staging[:num_p, 6] = c_oy
         cloud_staging[:num_p, 10] = slot_arr
+        # Cloud shells radiate from the base radius: disable height displacement
+        cloud_staging[:num_p, 12] = -1.0
 
 
 class PlanetQuadtree:
@@ -339,7 +359,7 @@ class PlanetQuadtree:
                 for f in range(6)
             ]
 
-    def traverse_raw(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, max_patches: int = 4096, frustum_planes: np.ndarray = None, cloud_alt_km: float = 0.0, refract_bend: float = 0.0) -> np.ndarray:
+    def traverse_raw(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, max_patches: int = 4096, frustum_planes: np.ndarray = None, cloud_alt_km: float = 0.0, refract_bend: float = 0.0, height_max_km: float = 0.0) -> np.ndarray:
         """
         Fast JIT-accelerated traversal returning raw (N, 9) float32 array:
         [min_u, min_v, max_u, max_v, face, lod, x, y, radius].
@@ -364,10 +384,10 @@ class PlanetQuadtree:
             planes_f = np.zeros((6, 4), dtype=np.float32)
 
         if _HAS_NUMBA:
-            return _traverse_quadtree_jit(cam_f, float(self.radius_km), float(obl), float(screen_height), float(tan_half_fov), float(threshold_px), int(max_lod), int(max_patches), planes_f, has_frustum, float(cloud_alt_km), float(refract_bend))
+            return _traverse_quadtree_jit(cam_f, float(self.radius_km), float(obl), float(screen_height), float(tan_half_fov), float(threshold_px), int(max_lod), int(max_patches), planes_f, has_frustum, float(cloud_alt_km), float(refract_bend), float(height_max_km))
 
         # Fallback pure-python traversal
-        patches = self.traverse(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes, cloud_alt_km=cloud_alt_km, refract_bend=refract_bend)
+        patches = self.traverse(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes, cloud_alt_km=cloud_alt_km, refract_bend=refract_bend, height_max_km=height_max_km)
         out = np.empty((len(patches), 9), dtype=np.float32)
         for i, p in enumerate(patches):
             out[i, 0] = p.min_u
@@ -381,13 +401,13 @@ class PlanetQuadtree:
             out[i, 8] = p.radius
         return out
 
-    def traverse(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, frustum_planes: np.ndarray = None, cloud_alt_km: float = 0.0, refract_bend: float = 0.0):
+    def traverse(self, cam_pos_local_km: np.ndarray, fov_deg: float, screen_height: float, max_lod: int = None, split_factor: float = None, obl: float = 0.0, frustum_planes: np.ndarray = None, cloud_alt_km: float = 0.0, refract_bend: float = 0.0, height_max_km: float = 0.0):
         """
         Traverses the quadtree from root patches and returns a list of active leaf QuadtreePatch objects.
         cam_pos_local_km: 3D camera position relative to planet center in the planet's local rotated frame (km).
         """
         if _HAS_NUMBA:
-            raw = self.traverse_raw(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes, cloud_alt_km=cloud_alt_km, refract_bend=refract_bend)
+            raw = self.traverse_raw(cam_pos_local_km, fov_deg, screen_height, max_lod, split_factor, obl, frustum_planes=frustum_planes, cloud_alt_km=cloud_alt_km, refract_bend=refract_bend, height_max_km=height_max_km)
             patches = []
             for i in range(len(raw)):
                 p = QuadtreePatch.__new__(QuadtreePatch)
@@ -463,7 +483,7 @@ class PlanetQuadtree:
             dists = [np.linalg.norm(np.array([c[0]*self.radius_km, c[1]*(1.0-obl)*self.radius_km, c[2]*self.radius_km]) - c_center) for c in corners]
             radius = float(max(dists) * 1.05)
 
-            eff_radius = radius + max(0.0, cloud_alt_km)
+            eff_radius = radius + max(0.0, cloud_alt_km) + max(0.0, height_max_km)
             node_dot = float(np.dot(c_dir, cs_dir))
             angular_radius = min(1.0, eff_radius * inv_radius)
             cull_angle = horizon_angle + math.asin(angular_radius)
@@ -485,7 +505,7 @@ class PlanetQuadtree:
                         return
 
             dist_to_center = float(np.linalg.norm(c_center - cam_pos_local_km))
-            dist_to_surface = max(0.01, dist_to_center - radius)
+            dist_to_surface = max(0.01, dist_to_center - radius - max(0.0, height_max_km))
 
             screen_size = (radius * screen_height) / (dist_to_surface * 2.0 * tan_half_fov)
 
@@ -512,7 +532,7 @@ class PlanetQuadtree:
                 p.radius = radius
                 active_leaves.append(p)
 
-        face_order = sorted(range(6), key=lambda f: float(np.dot(_cube_to_sphere_scalar(f, 0.0, 0.0), cs_dir)), reverse=True)
+        face_order = sorted(range(6), key=lambda f: float(np.dot(cube_to_sphere_point(f, 0.0, 0.0), cs_dir)), reverse=True)
         for f in face_order:
             _evaluate_node(f, 0, 0, 0)
 

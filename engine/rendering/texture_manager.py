@@ -63,6 +63,14 @@ TEXTURE_LAYERS = {
         'can_bake': False,
         'fallback_label': 'No Normal / Heightmap Loaded',
     },
+    'height': {
+        'label': 'Heightmap',
+        'filename_suffix': '_heightmap',
+        'ssbo_offset': None,
+        'bake_map_type': 'height',
+        'can_bake': True,
+        'fallback_label': 'No Heightmap Loaded',
+    },
 }
 
 def is_grayscale_image(img):
@@ -112,6 +120,9 @@ def prepare_layer_image(img, layer_key, bump_strength=2.0):
         return img.convert('RGBA')
     elif layer_key == 'specular':
         # Single channel luminance or grayscale
+        return img.convert('L')
+    elif layer_key == 'height':
+        # Grayscale elevation, preserved exactly (NOT convertible to a normal map)
         return img.convert('L')
     else:
         # Diffuse surface
@@ -249,11 +260,7 @@ def start_bake_async(app, body_name, src_path, map_type='diffuse', max_lod=3, on
 
             # Invalidate terrain streamer caches so new tiles stream immediately
             if hasattr(app, 'terrain_streamer') and app.terrain_streamer is not None:
-                app.terrain_streamer._dir_file_cache.clear()
-                app.terrain_streamer.missing_tiles.clear()
-                app.terrain_streamer._resolve_memo.clear()
-                if hasattr(app.terrain_streamer, '_preload_root_tiles'):
-                    app.terrain_streamer._preload_root_tiles()
+                app.terrain_streamer.reload_layer(body_name, map_type)
 
             if hasattr(app, '_terrain_tiles_dir_cache') and app._terrain_tiles_dir_cache is not None:
                 app._terrain_tiles_dir_cache.clear()
@@ -291,6 +298,19 @@ def hot_reload_body_texture(app, ctx, body_name, file_path, layer_key='diffuse',
     except Exception as e:
         print(f"[TextureManager] Error opening texture file '{file_path}': {e}")
         return False
+    if layer_key == 'height':
+        if not hasattr(app, '_height_previews'):
+            app._height_previews = {}
+        old = app._height_previews.pop(name_lower, None)
+        registry = getattr(getattr(getattr(app, 'impl', None), 'renderer', None), 'textures', {})
+        if old is not None:
+            registry.pop(old.glo, None)
+            old.release()
+        preview = raw_img.convert('L').resize((1024, 512), Image.Resampling.BILINEAR).convert('RGBA')
+        tex = ctx.texture(preview.size, 4, preview.tobytes())
+        app._height_previews[name_lower] = tex
+        registry[tex.glo] = tex
+        return True
     img = prepare_layer_image(raw_img, layer_key, bump_strength=bump_strength)
 
     # For diffuse, compute spherical latitude-weighted mean linear color
@@ -459,7 +479,8 @@ def _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve
         'diffuse': ('',),
         'clouds': ('_clouds', '_cloud'),
         'specular': ('_specular', '_spec'),
-        'normal': ('_normal', '_bump', '_nm')
+        'normal': ('_normal', '_bump', '_nm'),
+        'height': ('_heightmap',)
     }
     target_suffixes = layer_suffixes.get(layer_key, ('',))
 
@@ -467,7 +488,8 @@ def _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve
         'diffuse': {'diffuse', 'albedo', 'color', 'map'},
         'clouds': {'clouds', 'cloud'},
         'specular': {'specular', 'spec', 'diffuse_specular', 'specular_map'},
-        'normal': {'normal', 'bump', 'diffuse_normal', 'nm'}
+        'normal': {'normal', 'bump', 'diffuse_normal', 'nm'},
+        'height': {'height', 'heightmap'}
     }.get(layer_key, set())
 
     deleted_any = False
@@ -494,7 +516,7 @@ def _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve
                 if layer_key == 'diffuse':
                     has_other_suffix = any(
                         stem_lower.endswith(sfx)
-                        for sfx in ('_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_ring', '_rings', '_front', '_back')
+                        for sfx in ('_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_heightmap', '_ring', '_rings', '_front', '_back')
                     )
                     if not has_other_suffix and (stem_lower == name_lower or stem_lower in generic_names):
                         matched = True
@@ -533,7 +555,7 @@ def _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve
                 if layer_key == 'diffuse':
                     has_other_suffix = any(
                         stem_lower.endswith(sfx)
-                        for sfx in ('_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_ring', '_rings', '_front', '_back')
+                        for sfx in ('_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_heightmap', '_ring', '_rings', '_front', '_back')
                     )
                     if not has_other_suffix and stem_lower == name_lower:
                         matched = True
@@ -591,7 +613,7 @@ def apply_staged_texture(app, ctx, body_name, staged_path, layer_key, active_sys
     staging_key = f"{name_lower}_{layer_key}"
     staged = getattr(app, '_texture_staging', {}).get(staging_key, {})
 
-    if staged.get('was_heightmap'):
+    if layer_key == 'height' or staged.get('was_heightmap'):
         dest_file = os.path.join(dest_dir, f"{body_name}{suffix}.png")
     else:
         dest_file = os.path.join(dest_dir, f"{body_name}{suffix}{ext}")
@@ -604,7 +626,11 @@ def apply_staged_texture(app, ctx, body_name, staged_path, layer_key, active_sys
 
     # 3. Save converted normal map or copy staged file to dest_file
     try:
-        if staged.get('was_heightmap'):
+        if layer_key == 'height':
+            with Image.open(staged_path) as source:
+                height_img = source.convert('L')
+            height_img.save(dest_file, 'PNG')
+        elif staged.get('was_heightmap'):
             raw_img = Image.open(staged_path)
             norm_img = heightmap_to_normal_map(raw_img, strength=bump_strength)
             norm_img.save(dest_file, "PNG")
@@ -629,6 +655,8 @@ def apply_staged_texture(app, ctx, body_name, staged_path, layer_key, active_sys
         bodies_data[insp_idx][json_prop] = dest_file
 
     discard_staged_texture(app, body_name, layer_key=layer_key)
+    if layer_key == 'height':
+        start_bake_async(app, body_name, dest_file, map_type='height')
     layer_lbl = TEXTURE_LAYERS[layer_key]['label']
     app._screenshot_toast = (f"{layer_lbl} applied & hot-reloaded for {body_name}!", time.time())
     return True
@@ -657,7 +685,7 @@ def bake_and_apply_staged_texture(app, ctx, body_name, staged_path, layer_key, a
     staging_key = f"{name_lower}_{layer_key}"
     staged = getattr(app, '_texture_staging', {}).get(staging_key, {})
 
-    if staged.get('was_heightmap'):
+    if layer_key == 'height' or staged.get('was_heightmap'):
         dest_file = os.path.join(dest_dir, f"{body_name}{suffix}.png")
     else:
         dest_file = os.path.join(dest_dir, f"{body_name}{suffix}{ext}")
@@ -670,7 +698,11 @@ def bake_and_apply_staged_texture(app, ctx, body_name, staged_path, layer_key, a
 
     # 3. Save converted normal map or copy staged file to dest_file
     try:
-        if staged.get('was_heightmap'):
+        if layer_key == 'height':
+            with Image.open(staged_path) as source:
+                height_img = source.convert('L')
+            height_img.save(dest_file, 'PNG')
+        elif staged.get('was_heightmap'):
             raw_img = Image.open(staged_path)
             norm_img = heightmap_to_normal_map(raw_img, strength=bump_strength)
             norm_img.save(dest_file, "PNG")
@@ -718,16 +750,19 @@ def delete_body_layer_texture(app, ctx, body_name, layer_key, active_system_name
     # 1. Discard any staged texture for this layer
     discard_staged_texture(app, body_name, layer_key=layer_key)
 
+    if layer_key == 'height':
+        tex = getattr(app, '_height_previews', {}).pop(name_lower, None)
+        if tex is not None:
+            registry = getattr(getattr(getattr(app, 'impl', None), 'renderer', None), 'textures', {})
+            registry.pop(tex.glo, None)
+            tex.release()
+
     # 2. Delete files and baked tiles on disk
     _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve_file=None)
 
     # 3. Invalidate terrain streamer caches
     if hasattr(app, 'terrain_streamer') and app.terrain_streamer is not None:
-        app.terrain_streamer._dir_file_cache.clear()
-        app.terrain_streamer.missing_tiles.clear()
-        app.terrain_streamer._resolve_memo.clear()
-        if hasattr(app.terrain_streamer, '_preload_root_tiles'):
-            app.terrain_streamer._preload_root_tiles()
+        app.terrain_streamer.reload_layer(body_name, layer_key)
     if hasattr(app, '_terrain_tiles_dir_cache') and app._terrain_tiles_dir_cache is not None:
         app._terrain_tiles_dir_cache.clear()
 
@@ -746,7 +781,7 @@ def delete_body_layer_texture(app, ctx, body_name, layer_key, active_system_name
 
     # 5. GPU textures and SSBO
     idx = getattr(app, 'texture_slices', {}).get(name_lower)
-    if idx:
+    if idx and layer_key != 'height':
         slot = idx - 1
         m_offset = TEXTURE_LAYERS[layer_key]['ssbo_offset']
 
@@ -833,6 +868,12 @@ def delete_body_all_textures(app, ctx, body_name, active_system_name, bodies_dat
         if hasattr(app, '_texture_bake_state') and bake_key in app._texture_bake_state:
             app._texture_bake_state[bake_key] = {'status': 'idle', 'msg': ''}
 
+    height_preview = getattr(app, '_height_previews', {}).pop(name_lower, None)
+    if height_preview is not None:
+        registry = getattr(getattr(getattr(app, 'impl', None), 'renderer', None), 'textures', {})
+        registry.pop(height_preview.glo, None)
+        height_preview.release()
+
     # 2. Delete all textures on disk for this body
     dirs_to_remove = [
         os.path.join(get_external_path("textures"), active_system_name, body_name),
@@ -850,7 +891,7 @@ def delete_body_all_textures(app, ctx, body_name, active_system_name, bodies_dat
     root_tex = get_external_path("textures")
     if os.path.isdir(root_tex):
         valid_exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
-        all_sfxs = ('', '_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm')
+        all_sfxs = ('', '_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_heightmap')
         try:
             for fname in os.listdir(root_tex):
                 fpath = os.path.join(root_tex, fname)
@@ -883,11 +924,7 @@ def delete_body_all_textures(app, ctx, body_name, active_system_name, bodies_dat
 
     # 4. Invalidate terrain streamer caches
     if hasattr(app, 'terrain_streamer') and app.terrain_streamer is not None:
-        app.terrain_streamer._dir_file_cache.clear()
-        app.terrain_streamer.missing_tiles.clear()
-        app.terrain_streamer._resolve_memo.clear()
-        if hasattr(app.terrain_streamer, '_preload_root_tiles'):
-            app.terrain_streamer._preload_root_tiles()
+        app.terrain_streamer.reload_layer(body_name)
     if hasattr(app, '_terrain_tiles_dir_cache') and app._terrain_tiles_dir_cache is not None:
         app._terrain_tiles_dir_cache.clear()
 
@@ -933,7 +970,7 @@ def delete_body_all_textures(app, ctx, body_name, active_system_name, bodies_dat
             app.tex_idx_arr_cmp = _build_tex_idx_arr(app.bodies_data_cmp, app.texture_slices)
 
     # 7. Remove properties from bodies_data
-    for prop in ('texture', 'diffuse', 'clouds', 'specular', 'normal'):
+    for prop in ('texture', 'diffuse', 'clouds', 'specular', 'normal', 'height'):
         if insp_idx < len(bodies_data):
             bodies_data[insp_idx].pop(prop, None)
 
@@ -952,6 +989,8 @@ def delete_body_all_textures(app, ctx, body_name, active_system_name, bodies_dat
 
 def _has_layer_texture(app, name_lower, layer_key, body_name=None):
     """Check if a body has a texture loaded, staged, in manifest, or on disk."""
+    if layer_key == 'height' and name_lower in getattr(app, '_height_previews', {}):
+        return True
     staging_key = f"{name_lower}_{layer_key}"
     staged = getattr(app, '_texture_staging', {}).get(staging_key)
     if staged and staged.get('is_staged'):
@@ -1023,7 +1062,7 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
     avail_w = imgui.get_content_region_available_width()
 
     # ── 1. Texture Layer Selector Sub-Tabs ──
-    btn_w = int((avail_w - 15) / 4)
+    btn_w = int((avail_w - 32) / len(TEXTURE_LAYERS))
     for layer_k, layer_meta in TEXTURE_LAYERS.items():
         is_active = (cur_layer == layer_k)
         has_tex = _has_layer_texture(app, name_lower, layer_k)
@@ -1041,7 +1080,8 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
             'diffuse': f"Surface{dot}",
             'clouds': f"Clouds{dot}",
             'specular': f"Specular{dot}",
-            'normal': f"Normal{dot}"
+            'normal': f"Normal{dot}",
+            'height': f"Height{dot}"
         }
         tab_label = f"{short_names[layer_k]}##tab_{layer_k}"
         if imgui.button(tab_label, width=btn_w):
@@ -1049,7 +1089,7 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
             cur_layer = layer_k
 
         imgui.pop_style_color(2)
-        if layer_k != 'normal':
+        if layer_k != 'height':
             imgui.same_line()
 
     imgui.spacing()
@@ -1085,6 +1125,16 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
     tex_glo = None
     is_texture_loaded = False
     is_staged = False
+
+    if cur_layer == 'height' and not staged:
+        if name_lower not in getattr(app, '_height_previews', {}):
+            source = body_info.get('height') or os.path.join(get_external_path('textures'), active_system_name, body_name, body_name + '_heightmap.png')
+            if os.path.isfile(source):
+                hot_reload_body_texture(app, ctx, body_name, source, layer_key='height')
+        height_preview = getattr(app, '_height_previews', {}).get(name_lower)
+        if height_preview is not None:
+            tex_glo = height_preview.glo
+            is_texture_loaded = True
 
     if staged and staged.get('is_staged'):
         tex_glo = staged['preview_tex'].glo
@@ -1275,7 +1325,8 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
             apply_staged_texture(app, ctx, body_name, staged['path'], cur_layer, active_system_name, cur_bodies_data, insp_idx, visual_arr, atmo_bodies, ring_precomputed, bump_strength=bump_str)
         imgui.pop_style_color()
         if imgui.is_item_hovered():
-            imgui.set_tooltip(f"Copy texture to textures/{active_system_name}/{body_name}/ and reload on the fly without baking")
+            imgui.set_tooltip("Save heightmap and bake terrain tiles" if cur_layer == 'height' else
+                              f"Copy texture to textures/{active_system_name}/{body_name}/ and reload on the fly without baking")
         imgui.same_line()
 
         if can_bake:
@@ -1312,6 +1363,8 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
                         if not d_path:
                             json_prop = 'texture' if cur_layer == 'diffuse' else cur_layer
                             d_path = body_info.get(json_prop)
+                        if not d_path and cur_layer == 'height':
+                            d_path = os.path.join(get_external_path('textures'), active_system_name, body_name, body_name + '_heightmap.png')
                         if d_path and os.path.exists(d_path):
                             start_bake_async(app, body_name, d_path, map_type=TEXTURE_LAYERS[cur_layer]['bake_map_type'])
                         else:

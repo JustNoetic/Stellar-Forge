@@ -88,7 +88,7 @@ def reproject_face(src_img, face, face_size):
     return Image.fromarray(face_arr)
 
 
-def slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size=512, fmt="jpg"):
+def slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size=512, fmt="jpg", resample=Image.Resampling.LANCZOS):
     """
     Given a master face image, generates the quadtree pyramid tiles for lod in 0..max_lod.
     """
@@ -105,7 +105,7 @@ def slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size=
         if target_face_dim == face_img.width:
             lod_face_img = face_img
         else:
-            lod_face_img = face_img.resize((target_face_dim, target_face_dim), Image.Resampling.LANCZOS)
+            lod_face_img = face_img.resize((target_face_dim, target_face_dim), resample)
 
         for ty in range(num_tiles_axis):
             for tx in range(num_tiles_axis):
@@ -122,6 +122,9 @@ def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=51
     t_start = time.perf_counter()
     print(f"[{body_name}] Loading source image: {src_path}...")
     src_img = Image.open(src_path)
+    # Elevation uses 8-bit luminance and lossless PNG (no color-space conversion).
+    if map_type.lower() == "height":
+        src_img = src_img.convert("L")
     src_w, src_h = src_img.size
     print(f"[{body_name}] Source resolution: {src_w} x {src_h} ({src_img.mode})")
 
@@ -133,7 +136,7 @@ def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=51
     os.makedirs(body_out_dir, exist_ok=True)
 
     face_names = ["+X (Right)", "-X (Left)", "+Y (North)", "-Y (South)", "+Z (Front)", "-Z (Back)"]
-    fmt = "png" if (src_img.mode == "RGBA" or "normal" in map_type.lower()) else "jpg"
+    fmt = "png" if (src_img.mode == "RGBA" or "normal" in map_type.lower() or "height" in map_type.lower()) else "jpg"
 
     for face_idx in range(6):
         t0 = time.perf_counter()
@@ -141,7 +144,10 @@ def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=51
         face_img = reproject_face(src_img, face_idx, master_face_size)
 
         out_face_dir = os.path.join(body_out_dir, str(face_idx))
-        slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size, fmt=fmt)
+        # Grayscale DEMs overshoot with Lanczos (halo ringing along slope breaks);
+        # bilinear keeps the downsampled elevation field clean and monotonic.
+        resample = Image.Resampling.BILINEAR if "height" in map_type.lower() else Image.Resampling.LANCZOS
+        slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size, fmt=fmt, resample=resample)
         dt = time.perf_counter() - t0
         print(f"[{body_name}] Face {face_idx} completed in {dt:.2f} s")
 
@@ -149,9 +155,9 @@ def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=51
     print(f"[{body_name}] All 6 faces baked successfully to {body_out_dir} in {total_time:.2f} s!")
 
 
-def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="textures/Solar System", include_clouds=True):
+def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="textures/Solar System", include_clouds=True, include_heights=True):
     """
-    Scans textures/Solar System/ and batch bakes all available planetary maps (diffuse and clouds).
+    Scans textures/Solar System/ and batch bakes all available planetary maps (diffuse, clouds, heightmaps).
     """
     ss_dir = os.path.join(ROOT_DIR, solar_system_dir)
     if not os.path.exists(ss_dir):
@@ -199,14 +205,33 @@ def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="
                 print(f"==================================================")
                 bake_planet(body, cloud_path, map_type="clouds", max_lod=max_lod, tile_size=tile_size, out_base=out_base)
 
+        # 3. Heightmap (elevation) layer
+        if include_heights:
+            height_candidates = [
+                os.path.join(b_dir, f"{body}_heightmap.png"),
+                os.path.join(b_dir, f"{body}_heightmap.jpg"),
+            ]
+            height_path = None
+            for cand in height_candidates:
+                if os.path.exists(cand):
+                    height_path = cand
+                    break
+
+            if height_path:
+                print(f"\n==================================================")
+                print(f"[{body}] Batch baking heightmap ({os.path.basename(height_path)})...")
+                print(f"==================================================")
+                bake_planet(body, height_path, map_type="height", max_lod=max_lod, tile_size=tile_size, out_base=out_base)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Bake equirectangular planet maps to cubemap quadtree tiles.")
     parser.add_argument("--all", action="store_true", help="Batch bake all bodies found in textures/Solar System/")
     parser.add_argument("--no-clouds", action="store_true", help="Skip cloud maps when running with --all")
+    parser.add_argument("--no-height", action="store_true", help="Skip heightmap layers when running with --all")
     parser.add_argument("--body", type=str, default="Moon", help="Body name (e.g. Moon, Earth)")
     parser.add_argument("--input", type=str, default=None, help="Path to input equirectangular texture")
-    parser.add_argument("--map-type", type=str, default="diffuse", help="Map type: diffuse, normal, specular, clouds")
+    parser.add_argument("--map-type", type=str, default="diffuse", help="Map type: diffuse, normal, specular, clouds, height")
     parser.add_argument("--max-lod", type=int, default=3, help="Max LOD level (e.g. 2, 3, 4)")
     parser.add_argument("--tile-size", type=int, default=512, help="Tile resolution in pixels")
     parser.add_argument("--out-dir", type=str, default="data/tiles", help="Base output directory")
@@ -214,19 +239,27 @@ def main():
     args = parser.parse_args()
 
     if args.all:
-        bake_all(max_lod=args.max_lod, tile_size=args.tile_size, out_base=args.out_dir, include_clouds=not args.no_clouds)
+        bake_all(max_lod=args.max_lod, tile_size=args.tile_size, out_base=args.out_dir, include_clouds=not args.no_clouds, include_heights=not args.no_height)
         return
 
     input_path = args.input
     if not input_path:
         # Default lookup in textures/Solar System/{body}/
-        cand1 = os.path.join(ROOT_DIR, "textures", "Solar System", args.body, f"{args.body}.jpg")
-        cand2 = os.path.join(ROOT_DIR, "textures", "Solar System", args.body, f"{args.body}.png")
-        if os.path.exists(cand1):
-            input_path = cand1
-        elif os.path.exists(cand2):
-            input_path = cand2
+        if args.map_type.lower() == "height":
+            cand_list = [
+                os.path.join(ROOT_DIR, "textures", "Solar System", args.body, f"{args.body}_heightmap.png"),
+                os.path.join(ROOT_DIR, "textures", "Solar System", args.body, f"{args.body}_heightmap.jpg"),
+            ]
         else:
+            cand_list = [
+                os.path.join(ROOT_DIR, "textures", "Solar System", args.body, f"{args.body}.jpg"),
+                os.path.join(ROOT_DIR, "textures", "Solar System", args.body, f"{args.body}.png"),
+            ]
+        for cand in cand_list:
+            if os.path.exists(cand):
+                input_path = cand
+                break
+        if not input_path:
             raise FileNotFoundError(f"Could not find texture for body {args.body} in textures/Solar System/")
 
     bake_planet(args.body, input_path, map_type=args.map_type, max_lod=args.max_lod, tile_size=args.tile_size, out_base=args.out_dir)
