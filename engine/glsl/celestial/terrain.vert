@@ -51,10 +51,8 @@ uniform vec3 u_camera_pos;
 
 out vec3 f_world_pos;
 out vec3 f_normal;
-out vec3 f_tan_u;
-out vec3 f_tan_v;
-out vec2 f_height_uv;
-flat out vec3 f_height_meta; // slot, patch-to-tile UV scale, elevation span (km)
+out vec3 f_patch_pos_km;
+flat out float f_height_slot;
 out vec2 f_tile_uv;
 out vec2 f_local_uv;
 flat out float f_tile_slot;
@@ -136,11 +134,10 @@ void main() {
     }
     vec3 p_local_km = p_ellip * r_km;
     bool height_active = !u_is_cloud_pass && t_inst.u_height.x >= 0.0;
-    f_height_uv = in_position.xy * t_inst.u_height.y + t_inst.u_height.zw;
-    f_height_meta = vec3(height_active ? t_inst.u_height.x : -1.0,
-                         t_inst.u_height.y, t_inst.u_hrange.y);
+    vec2 height_uv = in_position.xy * t_inst.u_height.y + t_inst.u_height.zw;
+    f_height_slot = height_active ? t_inst.u_height.x : -1.0;
     if (height_active) {
-        float e = textureLod(u_tile_array, vec3(f_height_uv, t_inst.u_height.x), 0.0).r;
+        float e = textureLod(u_tile_array, vec3(height_uv, t_inst.u_height.x), 0.0).r;
         p_local_km += normalize(p_ellip) * (t_inst.u_hrange.x + e * t_inst.u_hrange.y);
     }
 
@@ -178,26 +175,21 @@ void main() {
     vec3 p_world_km = p_local_body.x * tangent + p_local_body.y * pole + p_local_body.z * bitangent;
     vec3 n_world = normalize(n_local_body.x * tangent + n_local_body.y * pole + n_local_body.z * bitangent);
 
-    f_tan_u = vec3(0.0);
-    f_tan_v = vec3(0.0);
+    f_patch_pos_km = vec3(0.0);
     if (height_active) {
-        // Derivatives in km per PATCH UV unit, from the undisplaced surface.
-        // Keep their lengths: normalizing them would destroy physical slope scale.
-        const float step_uv = 1e-3;
-        vec2 uv = vec2(u_local, v_local);
-        vec2 extent = t_inst.u_range.zw - t_inst.u_range.xy;
-        vec3 pu = (base_surface(face, uv + vec2(step_uv, 0.0), obl)
-                 - base_surface(face, uv - vec2(step_uv, 0.0), obl)) * (r_km * extent.x / (2.0 * step_uv));
-        vec3 pv = (base_surface(face, uv + vec2(0.0, step_uv), obl)
-                 - base_surface(face, uv - vec2(0.0, step_uv), obl)) * (r_km * extent.y / (2.0 * step_uv));
-        vec3 base_n = normalize(vec3(n_sphere.x, n_sphere.y / max(1e-4, 1.0 - obl), n_sphere.z));
-        pu -= base_n * dot(pu, base_n);
-        pv -= base_n * dot(pv, base_n);
-        // Preserve +u/+v derivative directions; orient the final cross in frag.
-        mat3 spin = mat3(c_rot, 0.0, s_rot, 0.0, 1.0, 0.0, -s_rot, 0.0, c_rot);
-        mat3 frame = mat3(tangent, pole, bitangent);
-        f_tan_u = frame * spin * pu;
-        f_tan_v = frame * spin * pv;
+        // Subtract the same displaced patch-center anchor at EVERY vertex,
+        // before interpolation. Body-relative positions still contain the full
+        // planet radius, whose rounding noise overwhelms ground-level derivatives.
+        vec2 center_uv = (t_inst.u_range.xy + t_inst.u_range.zw) * 0.5;
+        vec3 center_surface = base_surface(face, center_uv, obl);
+        vec2 center_height_uv = vec2(0.5) * t_inst.u_height.y + t_inst.u_height.zw;
+        float center_e = textureLod(u_tile_array, vec3(center_height_uv, t_inst.u_height.x), 0.0).r;
+        vec3 anchor = center_surface * r_km
+                    + normalize(center_surface) * (t_inst.u_hrange.x + center_e * t_inst.u_hrange.y);
+        vec3 offset = p_local_km - anchor;
+        vec3 offset_body = vec3(offset.x * c_rot - offset.z * s_rot,
+                               offset.y, offset.x * s_rot + offset.z * c_rot);
+        f_patch_pos_km = offset_body.x * tangent + offset_body.y * pole + offset_body.z * bitangent;
     }
 
     // Convert km to world AU and add body center

@@ -137,6 +137,7 @@ uniform bool u_ringshine_enabled;
 uniform int u_ringshine_band_count;
 uniform sampler2D u_depth_texture;
 uniform vec2 u_screen_res;
+uniform bool u_terrain_depth_enabled;
 
 uniform sampler2D u_sky_view_lut;
 uniform sampler2D u_sky_view_trans_lut;
@@ -810,6 +811,41 @@ float map_t_to_s(float t, float s_start, float s_end, float s_min, float p) {
     }
 }
 
+// TERRAIN_DEPTH_ENDPOINT_BEGIN
+void resolveTerrainDepthEndpoint(
+    float s_depth, float s_start, vec2 s_atmo,
+    vec3 cam_local_sph, vec3 ray_dir_sph,
+    float atmo_radius_km, float analytical_surface_s,
+    bool terrain_depth_enabled,
+    inout float s_end, inout bool hits_surface,
+    out bool terrain_depth_override)
+{
+    terrain_depth_override = false;
+    vec3 depth_pos_sph = cam_local_sph + s_depth * ray_dir_sph;
+    float depth_radius_sph = length(depth_pos_sph);
+    float depth_shell_margin = max(0.01, atmo_radius_km * 1e-5);
+    bool depth_in_local_atmo =
+        s_depth >= s_start - depth_shell_margin &&
+        s_depth <= s_atmo.y + depth_shell_margin &&
+        depth_radius_sph <= atmo_radius_km + depth_shell_margin;
+    if (!depth_in_local_atmo) return;
+
+    float depth_surface_s = clamp(s_depth, s_start, s_atmo.y);
+    float terrain_delta = abs(depth_surface_s - analytical_surface_s);
+    bool displaced_terrain_hit = terrain_depth_enabled && terrain_delta > 0.001;
+
+    // Raised terrain naturally shortens the current endpoint. For terrain
+    // below the reference ellipsoid, replace the analytical endpoint only
+    // when no nearer ring/caster already clipped it.
+    bool no_nearer_occluder = s_end >= analytical_surface_s - depth_shell_margin;
+    if (depth_surface_s < s_end || (displaced_terrain_hit && no_nearer_occluder)) {
+        s_end = depth_surface_s;
+        hits_surface = true;
+        terrain_depth_override = displaced_terrain_hit;
+    }
+}
+// TERRAIN_DEPTH_ENDPOINT_END
+
 void main() {
     if (f_clip_z < 0.0) discard;
     
@@ -1072,6 +1108,8 @@ void main() {
         s_end = s_planet.x;
         hits_surface = true;
     }
+    float analytical_surface_s = s_end;
+    bool terrain_depth_override = false;
 
     vec3 frag_local = cam_local;
 
@@ -1165,17 +1203,13 @@ void main() {
                 float s_depth = (scene_clip_z * u_au_to_km) / cos_angle;
                 s_depth -= ray_shift_au * u_au_to_km; // Convert from camera-relative to O_local_km relative
 
-                // Only clamp and mark surface hit if the depth belongs to a local object within the planet's atmospheric envelope.
-                // Celestial objects (Sun at 1 AU, distant stars, other bodies) are far beyond max_local_ground_s
-                // and must NOT clamp s_end or set hits_surface, allowing atmospheric sunset extinction to apply.
-                float max_local_ground_s = length(cam_local_sph) + u_atmo_radius_km + 100.0;
-                if (s_depth <= max_local_ground_s) {
-                    float error_margin = dist_to_center * 2500.0;
-                    if (s_depth < s_end - error_margin) {
-                        s_end = s_depth;
-                        hits_surface = true;
-                    }
-                }
+                // The analytical ellipsoid is only a fallback for pixels without
+                // local opaque depth. Terrain can lie on either side of it.
+                resolveTerrainDepthEndpoint(
+                    s_depth, s_start, s_atmo, cam_local_sph, ray_dir_sph,
+                    u_atmo_radius_km, analytical_surface_s,
+                    u_terrain_depth_enabled, s_end, hits_surface,
+                    terrain_depth_override);
             }
         }
     }
@@ -1263,7 +1297,10 @@ void main() {
     vec3 scattered = vec3(0.0);
     vec3 final_transmittance = vec3(1.0);
 
-    if (u_atmo_quality == 3) {
+    bool use_sky_view_lut = (u_atmo_quality == 3) && !terrain_depth_override;
+    int raymarch_quality = (u_atmo_quality == 3) ? 2 : u_atmo_quality;
+
+    if (use_sky_view_lut) {
         // Multi-pass ring clipping: Pass 1 (clip_mode == 1) renders behind the rings.
         // If clip_mode == 2, discard for pixels where rings exist in front to avoid duplicate draw blowout.
         if (u_atmo_clip_mode == 2 && closest_s_ring < s_end) {
@@ -1805,13 +1842,13 @@ void main() {
         float sr_start = star_radius / max(dist_mid_star, 1e-6);
         vec3 O = frag_local / u_au_to_km + planet_center_render;
         vec3 V = ray_dir; // Fix dimensional error: ray_dir is unit vector in km space
-        if (u_atmo_quality > 0) {
-            if (u_atmo_quality == 1) {
+        if (raymarch_quality > 0) {
+            if (raymarch_quality == 1) {
                 global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
                 end_eclipse_shadow = global_eclipse_shadow;
             }
 
-            if (u_atmo_quality == 2) {
+            if (raymarch_quality == 2) {
                 ring_count = 0;
                 uint processed_mask = 0u;
                 if (u_num_ring_planes > 0) {
@@ -2065,7 +2102,7 @@ void main() {
             vec3 transmittance_to_sun = (vis_fraction > 1e-4) ? get_transmittance_precomputed(v_norm, effective_cos) : vec3(0.0);
 
             vec3 sample_shadow = global_eclipse_shadow;
-            if (u_atmo_quality == 2 && !skip_volumetric_shadow) {
+            if (raymarch_quality == 2 && !skip_volumetric_shadow) {
                 sample_shadow = vec3(1.0);
 
                 if (ring_count > 0) {
@@ -2273,7 +2310,7 @@ void main() {
         scattered *= u_exposure;
     }
 
-    if (u_atmo_quality != 3 && u_temporal_accum && u_history_valid) {
+    if (!use_sky_view_lut && u_temporal_accum && u_history_valid) {
         float d_repr_km;
         if (hits_surface) {
             d_repr_km = max(s_end, 0.001);

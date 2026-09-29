@@ -1,4 +1,4 @@
-"""Height terrain regression: actual GPU displacement/fragment slopes and tile lifecycle."""
+"""Height terrain regression: GPU displacement/triangle normals and tile lifecycle."""
 import os
 import sys
 import tempfile
@@ -20,7 +20,7 @@ from engine.rendering import texture_manager as tm
 def test_gpu(ctx):
     # Capture the production vertex shader's relative position in km.
     prog = ctx.program(vertex_shader=terrain_vertex_shader,
-                       varyings=['f_rel_pos', 'f_normal', 'f_tan_u', 'f_tan_v'])
+                       varyings=['f_rel_pos', 'f_normal'])
     patch = np.zeros((1, 20), 'f4')
     patch[0, :4] = [-0.2, -0.2, 0.2, 0.2]
     patch[0, 4] = 1
@@ -39,14 +39,14 @@ def test_gpu(ctx):
     vertex = np.array([[0.5, 0.5, 0], [0.5, 0.5, 1]], 'f4')
     vb = ctx.buffer(vertex.tobytes())
     vao = ctx.vertex_array(prog, [(vb, '3f', 'in_position')])
-    out = ctx.buffer(reserve=2 * 12 * 4)
+    out = ctx.buffer(reserve=2 * 6 * 4)
     fbo = ctx.simple_framebuffer((4, 4)); fbo.use()
 
     def capture(slot, cloud=False):
         patch[0, 12] = slot; pb.write(patch.tobytes())
         prog['u_is_cloud_pass'] = cloud
         vao.transform(out, mode=moderngl.POINTS, vertices=2)
-        return np.frombuffer(out.read(), 'f4').reshape(2, 12).copy()
+        return np.frombuffer(out.read(), 'f4').reshape(2, 6).copy()
 
     elevation = -2 + (128 / 255) * 10
     for face in range(6):
@@ -66,48 +66,107 @@ def test_gpu(ctx):
     radial = base[0, :3] / np.linalg.norm(base[0, :3])
     np.testing.assert_allclose(raised[0, :3], base[0, :3] + radial * elevation, atol=2e-5)
 
-    # Test actual fragment normal code, with controlled derivatives and a ramp.
+    # Execute the shipped fragment normal block on two different triangle planes.
+    # Their physical slopes must win over the smooth reference normal, including
+    # perspective interpolation, reversed winding, and tiny AU-scale derivatives.
     normal_code = terrain_fragment_shader.split('    vec3 N = normalize(f_normal);', 1)[1].split('    vec3 V =', 1)[0]
     frag = '''#version 460
-uniform sampler2DArray u_tile_array;
 uniform bool u_is_cloud_pass;
-uniform vec3 f_height_meta;
-uniform vec3 f_tan_u;
-uniform vec3 f_tan_v;
+uniform float f_height_slot;
 uniform vec3 f_normal;
-uniform vec2 f_height_uv;
+in vec3 f_patch_pos_km;
 out vec4 color;
 void main() { vec3 N = normalize(f_normal);
 ''' + normal_code + '\ncolor = vec4(N, 1.0); }'
     vsrc = '''#version 460
-void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }'''
+in vec3 in_surface;
+uniform float position_scale;
+uniform bool reverse_surface;
+out vec3 f_patch_pos_km;
+void main() {
+    f_patch_pos_km = in_surface * position_scale;
+    vec2 screen = in_surface.xy;
+    if (reverse_surface) screen.x = -screen.x;
+    float w = 1.0 + in_surface.z * 0.2;
+    gl_Position = vec4(screen * w, 0.0, w);
+}'''
     fp = ctx.program(vertex_shader=vsrc, fragment_shader=frag)
-    fv = ctx.vertex_array(fp, [])
-    color = ctx.texture((1, 1), 4, dtype='f4'); fb = ctx.framebuffer([color]); fb.use()
-    ramp = np.zeros((32, 32, 4), 'u1'); ramp[..., :3] = np.arange(32)[None, :, None] * 8; ramp[..., 3] = 255
-    tex.write(ramp.tobytes()); tex.use(14)
-    fp['u_tile_array'] = 14
-    fp['f_normal'] = (0, 0, 1); fp['f_tan_u'] = (100, 0, 0); fp['f_tan_v'] = (0, 100, 0)
-    fp['f_height_uv'] = (0.5, 0.5); fp['f_height_meta'] = (0, 1, 10)
+    surface = np.array([[-1, -1, -0.65], [1, -1, 0.15], [-1, 1, -0.15],
+                        [1, -1, 0.15], [1, 1, -0.15], [-1, 1, -0.15]], 'f4')
+    surface_buffer = ctx.buffer(surface.tobytes())
+    fv = ctx.vertex_array(fp, [(surface_buffer, '3f', 'in_surface')])
+    color = ctx.texture((32, 32), 4, dtype='f4'); fb = ctx.framebuffer([color]); fb.use()
+    fp['f_normal'] = (0, 0, 1); fp['f_height_slot'] = 0
 
-    def normal():
-        fv.render(vertices=3)
-        return np.frombuffer(color.read(), 'f4')[:3]
+    def normals():
+        fb.clear()
+        fv.render(vertices=6)
+        return np.frombuffer(color.read(), 'f4').reshape(32, 32, 4)[..., :3]
 
-    expected = np.array([-10 * 8 * 32 / 255 / 100, 0, 1])
-    expected /= np.linalg.norm(expected)
-    np.testing.assert_allclose(normal(), expected, atol=2e-6)
-    # A child using half an ancestor's UV extent also has half its physical extent.
-    fp['f_height_meta'] = (0, 0.5, 10); fp['f_tan_u'] = (50, 0, 0); fp['f_tan_v'] = (0, 50, 0)
-    np.testing.assert_allclose(normal(), expected, atol=2e-6)
-    fp['f_height_uv'] = (1, 1)
-    np.testing.assert_allclose(normal(), expected, atol=2e-6)
+    expected = []
+    for tri in surface.reshape(2, 3, 3):
+        face = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+        expected.append(face / np.linalg.norm(face))
+    yy, xx = np.mgrid[:32, :32]
+    # Exclude shared-edge helper lanes from the flatness comparison.
+    for scale in (1.0, 1.0 / 149597870.7, 1e-12):
+        fp['position_scale'] = scale
+        for reverse in (False, True):
+            fp['reverse_surface'] = reverse
+            actual = normals()
+            screen_x = 31 - xx if reverse else xx
+            for mask, face in ((screen_x + yy < 25, expected[0]),
+                               (screen_x + yy > 38, expected[1])):
+                np.testing.assert_allclose(actual[mask], np.broadcast_to(face, actual[mask].shape), atol=2e-5)
     fp['u_is_cloud_pass'] = True
-    np.testing.assert_array_equal(normal(), [0, 0, 1])
-    fp['u_is_cloud_pass'] = False; fp['f_height_meta'] = (-1, 1, 10)
-    np.testing.assert_array_equal(normal(), [0, 0, 1])
-    print('Fragment height relief, ancestor scale, edge slopes, and disabled normals passed')
+    np.testing.assert_array_equal(normals(), np.broadcast_to([0, 0, 1], (32, 32, 3)))
+    fp['u_is_cloud_pass'] = False; fp['f_height_slot'] = -1
+    np.testing.assert_array_equal(normals(), np.broadcast_to([0, 0, 1], (32, 32, 3)))
+    # Degenerate physical positions must fall back to a finite reference normal.
+    fp['f_height_slot'] = 0; fp['position_scale'] = 0
+    np.testing.assert_array_equal(normals(), np.broadcast_to([0, 0, 1], (32, 32, 3)))
+    print('Triangle normals, perspective, winding, AU scale, clouds and fallback passed')
+
+    # Reproduce the close-up case with the PRODUCTION vertex calculation:
+    # a meter-scale triangle on an Earth-sized spheroid filling the screen.
+    # The earlier test had no planet-radius offset and missed interpolation noise.
+    ground_vertex = terrain_vertex_shader.replace(
+        'gl_Position = projection * view * vec4(p_world, 1.0);',
+        'float w = 1.0 + in_position.x * 0.5;\n'
+        '    gl_Position = vec4((in_position.xy * 4.0 - 1.0) * w, 0.0, w);'
+    ).replace('gl_Position.z *= gl_Position.w;', 'gl_Position.z = 0.0;')
+    ground_frag = frag.replace('uniform vec3 f_normal;', 'in vec3 f_normal;').replace(
+        'uniform float f_height_slot;', 'flat in float f_height_slot;')
+    ground = ctx.program(vertex_shader=ground_vertex, fragment_shader=ground_frag,
+                         varyings=['f_patch_pos_km', 'f_normal'])
+    patch[0, :4] = [0.15, 0.25, 0.1500002, 0.2500002]
+    patch[0, 12] = 0
+    pb.write(patch.tobytes())
+    body[:3] = [10, 20, 30]
+    body[6] = 6371 / 149597870.7
+    bb.write(body.tobytes())
+    ground['u_km_to_au'] = 1 / 149597870.7
+    ground['u_tile_array'] = 14
+    tex.use(14)
+    gv = ctx.buffer(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], 'f4').tobytes())
+    ga = ctx.vertex_array(ground, [(gv, '3f', 'in_position')])
+    captured = ctx.buffer(reserve=3 * 6 * 4)
+    ground_color = ctx.texture((128, 128), 4, dtype='f4')
+    ground_fb = ctx.framebuffer([ground_color]); ground_fb.use()
+    for face in range(6):
+        patch[0, 8] = face; pb.write(patch.tobytes())
+        ga.transform(captured, mode=moderngl.POINTS, vertices=3)
+        positions = np.frombuffer(captured.read(), 'f4').reshape(3, 6).astype('f8')
+        expected_face = np.cross(positions[1, :3] - positions[0, :3],
+                                 positions[2, :3] - positions[0, :3])
+        expected_face /= np.linalg.norm(expected_face)
+        if np.dot(expected_face, positions[0, 3:]) < 0:
+            expected_face *= -1
+        ground_fb.clear(); ga.render(vertices=3)
+        actual = np.frombuffer(ground_color.read(), 'f4').reshape(128, 128, 4)
+        np.testing.assert_allclose(actual[..., :3],
+                                   np.broadcast_to(expected_face, (128, 128, 3)), atol=2e-3)
+    print('Meter-scale close-up on six Earth-sized oblate faces stays uniform')
 
 
 def test_streaming(ctx):

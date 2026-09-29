@@ -1,10 +1,8 @@
 #version 460 core
 in vec3 f_world_pos;
 in vec3 f_normal;
-in vec3 f_tan_u;
-in vec3 f_tan_v;
-in vec2 f_height_uv;
-flat in vec3 f_height_meta;
+in vec3 f_patch_pos_km;
+flat in float f_height_slot;
 in vec2 f_tile_uv;
 in vec2 f_local_uv;
 flat in float f_tile_slot;
@@ -148,19 +146,19 @@ void main() {
     vec4 tex_sample = texture(u_tile_array, tile_coord);
 
     vec3 N = normalize(f_normal);
-    if (!u_is_cloud_pass && f_height_meta.x >= 0.0) {
-        vec2 texel = 1.0 / vec2(textureSize(u_tile_array, 0).xy);
-        vec2 uv = clamp(f_height_uv, texel * 0.5, 1.0 - texel * 0.5);
-        // Backward differences at the far edge avoid sampling clamped duplicates.
-        vec2 delta = texel * mix(vec2(1.0), vec2(-1.0), greaterThan(uv + texel, 1.0 - texel * 0.5));
-        float e = textureLod(u_tile_array, vec3(uv, f_height_meta.x), 0.0).r;
-        float eu = textureLod(u_tile_array, vec3(uv + vec2(delta.x, 0.0), f_height_meta.x), 0.0).r;
-        float ev = textureLod(u_tile_array, vec3(uv + vec2(0.0, delta.y), f_height_meta.x), 0.0).r;
-        vec2 patch_step = delta / max(f_height_meta.y, 1e-8);
-        vec3 su = f_tan_u * patch_step.x + N * ((eu - e) * f_height_meta.z);
-        vec3 sv = f_tan_v * patch_step.y + N * ((ev - e) * f_height_meta.z);
-        vec3 relief = normalize(cross(su, sv));
-        N = dot(relief, N) < 0.0 ? -relief : relief;
+    if (!u_is_cloud_pass && f_height_slot >= 0.0) {
+        // Match the physical triangle before refraction/lensing. Patch-relative
+        // km positions keep sub-pixel differences precise near the ground;
+        // subtracting the anchor here, AFTER interpolation, would be too late.
+        vec3 dx = dFdx(f_patch_pos_km);
+        vec3 dy = dFdy(f_patch_pos_km);
+        if (dot(dx, dx) > 0.0 && dot(dy, dy) > 0.0) {
+            vec3 face = cross(normalize(dx), normalize(dy));
+            if (dot(face, face) > 1e-12) {
+                face = normalize(face);
+                N = dot(face, N) < 0.0 ? -face : face;
+            }
+        }
     }
     vec3 V = normalize(u_camera_pos - f_world_pos);
 

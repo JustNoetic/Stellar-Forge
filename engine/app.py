@@ -5959,6 +5959,8 @@ class App(InputHandlerMixin):
                         body_pos_rel = pos_rel_all[bi]
                         body_idx_in_unified = bi
                         prev_offset = self.prev_atmo_body_offsets.get(bi, body_pos_rel)
+                    if 'u_terrain_depth_enabled' in cur_prog:
+                        cur_prog['u_terrain_depth_enabled'].value = body_idx_in_unified in active_terrain_body_indices
                     if 'u_prev_body_offset' in cur_prog:
                         cur_prog['u_prev_body_offset'].write(prev_offset.astype('f4'))
     

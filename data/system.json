@@ -134,6 +134,7 @@
     "W0": 280.8205,
     "J2": 0.00108,
     "oblateness": 0.00335,
+    "height_range_km": [-10.984, 8.848],
     "atmosphere": {
       "surface_pressure": 1.0,
       "temperature": 287.86,
