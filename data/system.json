@@ -993,7 +993,7 @@
   {
     "name": "Uranus",
     "type": "Ice Giant",
-    "color": "#cffafe",
+    "color": "#06243c",
     "parentId": "Sun",
     "m": 4.365793681585408e-05,
     "r": 0.0364,
@@ -1010,28 +1010,28 @@
     "W0": 202.4,
     "rings": [
       {
-        "inner": 1.6,
+        "inner": 1.67535,
         "outer": 1.7,
-        "color": "#78716c",
-        "opacity": 0.4,
-        "scatter": 2.5,
-        "asymmetry": 0.7,
-        "backscatter": -0.3,
+        "color": "#8e8e8e",
+        "opacity": 0.08,
+        "scatter": 0.13,
+        "asymmetry": 0.165,
+        "backscatter": 0.72,
         "gradient": []
       }
     ],
     "atmosphere": {
       "surface_pressure": 1.0,
-      "temperature": 76.0,
+      "temperature": 72.36,
       "composition": {
         "H2": 0.825,
         "He": 0.152,
         "CH4": 0.023
       },
       "height": 356.21,
-      "beta_mie": 0.00012,
-      "h_mie": 60.0,
-      "mie_g": 0.88,
+      "beta_mie": 9.899999618530272e-06,
+      "h_mie": 10.399999618530273,
+      "mie_g": 0.7319999933242798,
       "intensity": 1.0
     },
     "sv": {
@@ -1187,7 +1187,7 @@
   {
     "name": "Neptune",
     "type": "Ice Giant",
-    "color": "#b1dff7",
+    "color": "#1b3e78",
     "parentId": "Sun",
     "m": 5.1503084171114494e-05,
     "r": 0.0353,
@@ -1205,7 +1205,7 @@
     "W0": 253.2,
     "atmosphere": {
       "surface_pressure": 1.0,
-      "temperature": 72.0,
+      "temperature": 57.03,
       "composition": {
         "H2": 0.8,
         "He": 0.19,
@@ -1214,7 +1214,7 @@
       "height": 273.05,
       "beta_mie": 5e-06,
       "h_mie": 8.0,
-      "mie_g": 0.8,
+      "mie_g": 0.6970000267028809,
       "intensity": 1.0
     },
     "sv": {

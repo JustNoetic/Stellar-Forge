@@ -196,6 +196,8 @@ def _save_system_cosmetics(app, bodies_data, visual_arr, atmo_bodies, ring_preco
                         except Exception:
                             pass
                         s_body[tex_prop] = tex_path
+                    else:
+                        s_body.pop(tex_prop, None)
 
                 atmo_it = next((a for a in atmo_bodies if a['body_idx'] == b_idx), None)
                 if atmo_it:

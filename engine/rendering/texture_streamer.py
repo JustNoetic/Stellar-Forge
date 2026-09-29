@@ -312,6 +312,37 @@ class TextureStreamer:
                 break
         return results
 
+    def flush_results(self):
+        """Drain all pending decode results from the queue. Returns count drained."""
+        count = 0
+        while True:
+            try:
+                res = self.result_queue.get_nowait()
+                count += 1
+            except queue.Empty:
+                break
+        return count
+
+    def cancel_in_progress(self, name_lower):
+        """Cancel any in-flight high-res decode for *name_lower* and drain its result.
+        Prevents a stale decode from overwriting a just-hot-reloaded texture."""
+        self.in_progress.discard((name_lower, 'high'))
+        # Drain any already-queued result for this body; stale results for other
+        # bodies are harmless (they carry the correct idx) but a stale result for
+        # this body would clobber the hot-reloaded texture on the next poll.
+        drained = []
+        while True:
+            try:
+                res = self.result_queue.get_nowait()
+                if res.get('name_lower') == name_lower:
+                    continue  # discard
+                drained.append(res)
+            except queue.Empty:
+                break
+        for res in drained:
+            self.result_queue.put(res)
+        return
+
     def shutdown(self):
         self._shutdown_event.set()
         if self.worker_thread.is_alive():

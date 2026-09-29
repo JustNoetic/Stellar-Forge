@@ -1373,6 +1373,7 @@ class App(InputHandlerMixin):
         self.texture_streamer = TextureStreamer(textures_dir, fallback_size=(1024, 512))
         self.texture_slices = self.texture_streamer.name_to_idx
         self.texture_mean_colors = self.texture_streamer.texture_mean_colors
+        self._texture_slice_counter = max(self.texture_streamer.name_to_idx.values(), default=0)
 
         # Ring texture loading
         if os.path.exists(textures_dir):
@@ -4487,8 +4488,13 @@ class App(InputHandlerMixin):
                     b_r = all_instances[b_i, 6]
                     d_cam = float(np.linalg.norm(b_pos - cam_pos))
                     apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
-                    # Hysteresis: 24.0 px if body was active in previous frame, 36.0 px if newly activating
-                    min_px_thresh = 24.0 if b_i in prev_active_terrain_indices else 36.0
+                    # Hysteresis: keep terrain LOD active until the body shrinks below
+                    # the GPU's lo-mesh threshold (apparent_px < 2.0 in culling.comp),
+                    # so the terrain pass renders the surface all the way down to the
+                    # point-light transition — the icosphere proxy never shows.
+                    # Minimal 1px hysteresis prevents quadtree-traversal thrashing
+                    # at the subpixel boundary without showing the icosphere.
+                    min_px_thresh = 2.0 if b_i in prev_active_terrain_indices else 3.0
                     if apparent_px < min_px_thresh:
                         continue
 

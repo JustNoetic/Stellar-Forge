@@ -282,8 +282,15 @@ def hot_reload_body_texture(app, ctx, body_name, file_path, layer_key='diffuse',
     - Writes the 64-bit bindless handle into BodyTextures SSBO (binding 10)
     - Updates instance texture indices for immediate frame update
     """
+    if not file_path or not os.path.isfile(file_path):
+        print(f"[TextureManager] Cannot hot reload: file '{file_path}' does not exist.")
+        return False
     name_lower = body_name.lower()
-    raw_img = Image.open(file_path)
+    try:
+        raw_img = Image.open(file_path)
+    except Exception as e:
+        print(f"[TextureManager] Error opening texture file '{file_path}': {e}")
+        return False
     img = prepare_layer_image(raw_img, layer_key, bump_strength=bump_strength)
 
     # For diffuse, compute spherical latitude-weighted mean linear color
@@ -315,7 +322,19 @@ def hot_reload_body_texture(app, ctx, body_name, file_path, layer_key='diffuse',
         app.texture_slices = {}
 
     if name_lower not in app.texture_slices:
-        new_idx = len(app.texture_slices) + 1
+        # Use a monotonically-increasing counter to avoid index collisions when
+        # bodies have been deleted (len()+1 reuses freed slots, corrupting
+        # other bodies' SSBO handles).
+        if hasattr(app, '_texture_slice_counter'):
+            new_idx = app._texture_slice_counter + 1
+        else:
+            new_idx = len(app.texture_slices) + 1
+            # Initialise counter above any pre-existing streamer indices
+            if hasattr(app, 'texture_streamer') and app.texture_streamer is not None:
+                app._texture_slice_counter = max(new_idx, max(app.texture_streamer.name_to_idx.values(), default=0))
+            else:
+                app._texture_slice_counter = new_idx
+        app._texture_slice_counter = max(app._texture_slice_counter, new_idx)
         app.texture_slices[name_lower] = new_idx
         if hasattr(app, 'texture_streamer') and app.texture_streamer is not None:
             app.texture_streamer.name_to_idx[name_lower] = new_idx
@@ -393,6 +412,15 @@ def hot_reload_body_texture(app, ctx, body_name, file_path, layer_key='diffuse',
     app.body_textures_ssbo_data[slot, m_offset] = [lo, hi]
     app.body_textures_ssbo.write(app.body_textures_ssbo_data.tobytes())
 
+    # Mark this body as 'high' so the per-frame streamer doesn't overwrite
+    # our hot-reloaded texture with a stale/low-res decode. Also cancel any
+    # in-flight decode for this body so a queued stale result can't clobber it.
+    if hasattr(app, 'active_res_level'):
+        app.active_res_level[idx] = 'high'
+    if hasattr(app, 'texture_streamer') and app.texture_streamer is not None:
+        if hasattr(app.texture_streamer, 'cancel_in_progress'):
+            app.texture_streamer.cancel_in_progress(name_lower)
+
     # Rebuild tex_idx_arr
     app.tex_idx_arr = _build_tex_idx_arr(app.bodies_data, app.texture_slices)
     if hasattr(app, 'tex_idx_arr_cmp') and getattr(app, 'bodies_data_cmp', None):
@@ -400,40 +428,199 @@ def hot_reload_body_texture(app, ctx, body_name, file_path, layer_key='diffuse',
 
     print(f"[TextureManager] Successfully hot-reloaded {layer_key} for {body_name} (slot {slot}, handle 0x{handle_64:016X})")
 
+def _is_same_path(p1, p2):
+    """Robust path equality check accounting for Windows case insensitivity and path format."""
+    if not p1 or not p2:
+        return False
+    try:
+        if os.path.exists(p1) and os.path.exists(p2):
+            return os.path.samefile(p1, p2)
+    except Exception:
+        pass
+    try:
+        return os.path.normcase(os.path.abspath(p1)) == os.path.normcase(os.path.abspath(p2))
+    except Exception:
+        return False
+
+def _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve_file=None):
+    """
+    Remove existing texture files and baked tiles on disk for a specific layer before replacement or upon deletion.
+    Preserves `preserve_file` if specified.
+    """
+    name_lower = body_name.lower()
+
+    # Check system folder and generic body folder
+    dirs_to_check = [
+        os.path.join(get_external_path("textures"), active_system_name, body_name),
+        os.path.join(get_external_path("textures"), body_name),
+    ]
+
+    layer_suffixes = {
+        'diffuse': ('',),
+        'clouds': ('_clouds', '_cloud'),
+        'specular': ('_specular', '_spec'),
+        'normal': ('_normal', '_bump', '_nm')
+    }
+    target_suffixes = layer_suffixes.get(layer_key, ('',))
+
+    generic_names = {
+        'diffuse': {'diffuse', 'albedo', 'color', 'map'},
+        'clouds': {'clouds', 'cloud'},
+        'specular': {'specular', 'spec', 'diffuse_specular', 'specular_map'},
+        'normal': {'normal', 'bump', 'diffuse_normal', 'nm'}
+    }.get(layer_key, set())
+
+    deleted_any = False
+    valid_exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
+
+    for folder in dirs_to_check:
+        if not os.path.isdir(folder):
+            continue
+        try:
+            for fname in os.listdir(folder):
+                fpath = os.path.join(folder, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                if preserve_file and _is_same_path(fpath, preserve_file):
+                    continue
+
+                stem, ext = os.path.splitext(fname)
+                stem_lower = stem.lower()
+                ext_lower = ext.lower()
+                if ext_lower not in valid_exts:
+                    continue
+
+                matched = False
+                if layer_key == 'diffuse':
+                    has_other_suffix = any(
+                        stem_lower.endswith(sfx)
+                        for sfx in ('_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_ring', '_rings', '_front', '_back')
+                    )
+                    if not has_other_suffix and (stem_lower == name_lower or stem_lower in generic_names):
+                        matched = True
+                else:
+                    for sfx in target_suffixes:
+                        if stem_lower == f"{name_lower}{sfx}" or stem_lower in generic_names:
+                            matched = True
+                            break
+
+                if matched:
+                    try:
+                        os.remove(fpath)
+                        deleted_any = True
+                        print(f"[TextureManager] Cleaned up {layer_key} texture file: {fpath}")
+                    except Exception as e:
+                        print(f"[TextureManager] Error removing file {fpath}: {e}")
+        except Exception as e:
+            print(f"[TextureManager] Error scanning folder {folder}: {e}")
+
+    # Check root textures folder for exact body layer matches (e.g. textures/Earth_clouds.png)
+    root_tex = get_external_path("textures")
+    if os.path.isdir(root_tex):
+        try:
+            for fname in os.listdir(root_tex):
+                fpath = os.path.join(root_tex, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                if preserve_file and _is_same_path(fpath, preserve_file):
+                    continue
+                stem, ext = os.path.splitext(fname)
+                stem_lower = stem.lower()
+                if ext.lower() not in valid_exts:
+                    continue
+
+                matched = False
+                if layer_key == 'diffuse':
+                    has_other_suffix = any(
+                        stem_lower.endswith(sfx)
+                        for sfx in ('_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm', '_ring', '_rings', '_front', '_back')
+                    )
+                    if not has_other_suffix and stem_lower == name_lower:
+                        matched = True
+                else:
+                    for sfx in target_suffixes:
+                        if stem_lower == f"{name_lower}{sfx}":
+                            matched = True
+                            break
+                if matched:
+                    try:
+                        os.remove(fpath)
+                        deleted_any = True
+                        print(f"[TextureManager] Cleaned up root texture file: {fpath}")
+                    except Exception as e:
+                        print(f"[TextureManager] Error removing root file {fpath}: {e}")
+        except Exception:
+            pass
+
+    # Baked tiles for this layer
+    bake_map = TEXTURE_LAYERS.get(layer_key, {}).get('bake_map_type')
+    if bake_map:
+        for b_cand in (body_name, name_lower):
+            tile_dir = os.path.join(get_external_path("data", "tiles"), b_cand, bake_map)
+            if os.path.isdir(tile_dir):
+                try:
+                    shutil.rmtree(tile_dir, ignore_errors=True)
+                    deleted_any = True
+                    print(f"[TextureManager] Removed baked tile pyramid: {tile_dir}")
+                except Exception as e:
+                    print(f"[TextureManager] Error removing tile directory {tile_dir}: {e}")
+
+    return deleted_any
+
 def apply_staged_texture(app, ctx, body_name, staged_path, layer_key, active_system_name, bodies_data, insp_idx, visual_arr, atmo_bodies, ring_precomputed, bump_strength=2.0):
     """
     Apply imported texture for the given layer:
-    1. Copies texture to textures/<system_name>/<planet_name>/<planet_name><suffix>.<ext>
-    2. Hot reloads texture on the fly
-    3. Clears staged preview state for this layer
+    1. Cleans up existing texture files & tiles for this layer (replacement cleanup)
+    2. Copies texture to textures/<system_name>/<planet_name>/<planet_name><suffix>.<ext>
+    3. Hot reloads texture on the fly
+    4. Clears staged preview state for this layer
     """
+    if not staged_path or not os.path.isfile(staged_path):
+        app._screenshot_toast = (f"Staged file '{staged_path}' does not exist on disk!", time.time())
+        print(f"[TextureManager] Error: Staged file '{staged_path}' not found.")
+        return False
+
     dest_dir = os.path.join(get_external_path("textures"), active_system_name, body_name)
-    os.makedirs(dest_dir, exist_ok=True)
+    suffix = TEXTURE_LAYERS[layer_key]['filename_suffix']
 
     ext = os.path.splitext(staged_path)[1].lower()
     if not ext or ext not in ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp'):
         ext = '.jpg'
 
-    suffix = TEXTURE_LAYERS[layer_key]['filename_suffix']
-    dest_file = os.path.join(dest_dir, f"{body_name}{suffix}{ext}")
-
-    # For normal maps converted from heightmaps, save the generated normal map
     name_lower = body_name.lower()
     staging_key = f"{name_lower}_{layer_key}"
     staged = getattr(app, '_texture_staging', {}).get(staging_key, {})
 
+    if staged.get('was_heightmap'):
+        dest_file = os.path.join(dest_dir, f"{body_name}{suffix}.png")
+    else:
+        dest_file = os.path.join(dest_dir, f"{body_name}{suffix}{ext}")
+
+    # 1. Clean up existing old texture files & tiles (preserving staged_path if it's already in dest_dir)
+    _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve_file=staged_path)
+
+    # 2. Ensure destination directory exists after cleanup
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # 3. Save converted normal map or copy staged file to dest_file
     try:
         if staged.get('was_heightmap'):
             raw_img = Image.open(staged_path)
             norm_img = heightmap_to_normal_map(raw_img, strength=bump_strength)
-            dest_file = os.path.join(dest_dir, f"{body_name}{suffix}.png")
             norm_img.save(dest_file, "PNG")
             print(f"[TextureManager] Saved converted normal map to '{dest_file}'")
-        elif os.path.abspath(staged_path) != os.path.abspath(dest_file):
+        elif not _is_same_path(staged_path, dest_file):
             shutil.copy2(staged_path, dest_file)
             print(f"[TextureManager] Copied '{staged_path}' to '{dest_file}'")
     except Exception as e:
-        print(f"[TextureManager] Error saving {layer_key} file: {e}")
+        print(f"[TextureManager] Error saving/copying {layer_key} file: {e}")
+        app._screenshot_toast = (f"Failed to copy file: {e}", time.time())
+        return False
+
+    if not os.path.isfile(dest_file):
+        app._screenshot_toast = (f"Texture file '{dest_file}' could not be created!", time.time())
+        print(f"[TextureManager] Error: dest_file '{dest_file}' does not exist after copy.")
+        return False
 
     hot_reload_body_texture(app, ctx, body_name, dest_file, layer_key=layer_key, bump_strength=bump_strength)
 
@@ -444,27 +631,62 @@ def apply_staged_texture(app, ctx, body_name, staged_path, layer_key, active_sys
     discard_staged_texture(app, body_name, layer_key=layer_key)
     layer_lbl = TEXTURE_LAYERS[layer_key]['label']
     app._screenshot_toast = (f"{layer_lbl} applied & hot-reloaded for {body_name}!", time.time())
+    return True
 
 def bake_and_apply_staged_texture(app, ctx, body_name, staged_path, layer_key, active_system_name, bodies_data, insp_idx, visual_arr, atmo_bodies, ring_precomputed, bump_strength=2.0):
     """
-    Bake tiles and apply texture for the given layer (diffuse or clouds).
+    Bake tiles and apply texture for the given layer (diffuse or clouds):
+    1. Cleans up existing texture files & tiles for this layer (replacement cleanup)
+    2. Copies texture to textures/<system_name>/<planet_name>/<planet_name><suffix>.<ext>
+    3. Hot reloads texture on the fly
+    4. Bakes tile pyramid asynchronously
     """
+    if not staged_path or not os.path.isfile(staged_path):
+        app._screenshot_toast = (f"Staged file '{staged_path}' does not exist on disk!", time.time())
+        print(f"[TextureManager] Error: Staged file '{staged_path}' not found.")
+        return False
+
     dest_dir = os.path.join(get_external_path("textures"), active_system_name, body_name)
-    os.makedirs(dest_dir, exist_ok=True)
+    suffix = TEXTURE_LAYERS[layer_key]['filename_suffix']
 
     ext = os.path.splitext(staged_path)[1].lower()
     if not ext or ext not in ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp'):
         ext = '.jpg'
 
-    suffix = TEXTURE_LAYERS[layer_key]['filename_suffix']
-    dest_file = os.path.join(dest_dir, f"{body_name}{suffix}{ext}")
+    name_lower = body_name.lower()
+    staging_key = f"{name_lower}_{layer_key}"
+    staged = getattr(app, '_texture_staging', {}).get(staging_key, {})
 
+    if staged.get('was_heightmap'):
+        dest_file = os.path.join(dest_dir, f"{body_name}{suffix}.png")
+    else:
+        dest_file = os.path.join(dest_dir, f"{body_name}{suffix}{ext}")
+
+    # 1. Clean up existing old texture files & tiles (preserving staged_path if it's already in dest_dir)
+    _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve_file=staged_path)
+
+    # 2. Ensure destination directory exists after cleanup
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # 3. Save converted normal map or copy staged file to dest_file
     try:
-        if os.path.abspath(staged_path) != os.path.abspath(dest_file):
+        if staged.get('was_heightmap'):
+            raw_img = Image.open(staged_path)
+            norm_img = heightmap_to_normal_map(raw_img, strength=bump_strength)
+            norm_img.save(dest_file, "PNG")
+            print(f"[TextureManager] Saved converted normal map to '{dest_file}'")
+        elif not _is_same_path(staged_path, dest_file):
             shutil.copy2(staged_path, dest_file)
             print(f"[TextureManager] Copied '{staged_path}' to '{dest_file}'")
     except Exception as e:
         print(f"[TextureManager] Error copying texture file: {e}")
+        app._screenshot_toast = (f"Failed to copy file: {e}", time.time())
+        return False
+
+    if not os.path.isfile(dest_file):
+        app._screenshot_toast = (f"Texture file '{dest_file}' could not be created!", time.time())
+        print(f"[TextureManager] Error: dest_file '{dest_file}' does not exist after copy.")
+        return False
 
     hot_reload_body_texture(app, ctx, body_name, dest_file, layer_key=layer_key, bump_strength=bump_strength)
 
@@ -478,9 +700,258 @@ def bake_and_apply_staged_texture(app, ctx, body_name, staged_path, layer_key, a
     start_bake_async(app, body_name, dest_file, map_type=map_type)
     layer_lbl = TEXTURE_LAYERS[layer_key]['label']
     app._screenshot_toast = (f"{layer_lbl} applied! Baking quadtree tiles for {body_name}...", time.time())
+    return True
 
-def _has_layer_texture(app, name_lower, layer_key):
-    """Check if a body has a texture loaded or staged for the given layer."""
+def delete_body_layer_texture(app, ctx, body_name, layer_key, active_system_name, bodies_data, insp_idx, insp_is_cmp=False):
+    """
+    Permanently delete the selected texture layer for a body:
+    1. Removes layer texture file(s) from textures/
+    2. Removes baked cubemap tiles from data/tiles/<body_name>/<map_type>/
+    3. Invalidates terrain streamer caches
+    4. Unbinds and releases resident GPU texture
+    5. Clears SSBO 64-bit handle to uvec2(0, 0)
+    6. Removes layer reference from bodies_data and file_manifest
+    7. Discards any active staged preview
+    """
+    name_lower = body_name.lower()
+
+    # 1. Discard any staged texture for this layer
+    discard_staged_texture(app, body_name, layer_key=layer_key)
+
+    # 2. Delete files and baked tiles on disk
+    _cleanup_layer_disk_files(body_name, layer_key, active_system_name, preserve_file=None)
+
+    # 3. Invalidate terrain streamer caches
+    if hasattr(app, 'terrain_streamer') and app.terrain_streamer is not None:
+        app.terrain_streamer._dir_file_cache.clear()
+        app.terrain_streamer.missing_tiles.clear()
+        app.terrain_streamer._resolve_memo.clear()
+        if hasattr(app.terrain_streamer, '_preload_root_tiles'):
+            app.terrain_streamer._preload_root_tiles()
+    if hasattr(app, '_terrain_tiles_dir_cache') and app._terrain_tiles_dir_cache is not None:
+        app._terrain_tiles_dir_cache.clear()
+
+    # 4. Clean up texture streamer manifest & colors
+    if hasattr(app, 'texture_streamer') and app.texture_streamer is not None:
+        if name_lower in app.texture_streamer.file_manifest:
+            app.texture_streamer.file_manifest[name_lower][layer_key] = None
+        if layer_key == 'diffuse':
+            app.texture_streamer.texture_mean_colors.pop(name_lower, None)
+
+    if layer_key == 'diffuse' and hasattr(app, 'texture_mean_colors'):
+        app.texture_mean_colors.pop(name_lower, None)
+
+    if layer_key == 'clouds' and hasattr(app, '_clouds_exist_cache'):
+        app._clouds_exist_cache.pop(name_lower, None)
+
+    # 5. GPU textures and SSBO
+    idx = getattr(app, 'texture_slices', {}).get(name_lower)
+    if idx:
+        slot = idx - 1
+        m_offset = TEXTURE_LAYERS[layer_key]['ssbo_offset']
+
+        # Zero out SSBO handle
+        if hasattr(app, 'body_textures_ssbo_data') and slot < len(app.body_textures_ssbo_data):
+            app.body_textures_ssbo_data[slot, m_offset] = [0, 0]
+            if hasattr(app, 'body_textures_ssbo') and app.body_textures_ssbo is not None:
+                app.body_textures_ssbo.write(app.body_textures_ssbo_data.tobytes())
+
+        # Release resident GPU texture
+        tex_dict = getattr(app, 'gpu_body_textures', {}).get(idx, {})
+        if layer_key in tex_dict and tex_dict[layer_key] is not None:
+            try:
+                old_tex = tex_dict.pop(layer_key)
+                if hasattr(app, 'impl') and hasattr(app.impl, 'renderer') and hasattr(app.impl.renderer, 'textures'):
+                    app.impl.renderer.textures.pop(old_tex.glo, None)
+                old_tex.release()
+            except Exception:
+                pass
+
+        # Check if this body has any remaining active layer textures
+        remaining_layers = any(tex is not None for tex in tex_dict.values())
+        if not remaining_layers:
+            m_entry = getattr(app.texture_streamer, 'file_manifest', {}).get(name_lower, {}) if hasattr(app, 'texture_streamer') and app.texture_streamer else {}
+            has_manifest_file = any(m_entry.get(k) is not None for k in TEXTURE_LAYERS)
+            if not has_manifest_file:
+                app.gpu_body_textures.pop(idx, None)
+                app.texture_slices.pop(name_lower, None)
+                if hasattr(app, 'texture_streamer') and app.texture_streamer:
+                    app.texture_streamer.name_to_idx.pop(name_lower, None)
+                    app.texture_streamer.idx_to_name.pop(idx, None)
+                app.tex_idx_arr = _build_tex_idx_arr(app.bodies_data, app.texture_slices)
+                if hasattr(app, 'tex_idx_arr_cmp') and getattr(app, 'bodies_data_cmp', None):
+                    app.tex_idx_arr_cmp = _build_tex_idx_arr(app.bodies_data_cmp, app.texture_slices)
+
+    # 6. Remove property from bodies_data
+    json_prop = 'texture' if layer_key == 'diffuse' else layer_key
+    if insp_idx < len(bodies_data):
+        bodies_data[insp_idx].pop(json_prop, None)
+        if layer_key == 'diffuse':
+            bodies_data[insp_idx].pop('diffuse', None)
+
+    if hasattr(app, 'bodies_data'):
+        for b in app.bodies_data:
+            if b.get('name', '').lower() == name_lower:
+                b.pop(json_prop, None)
+                if layer_key == 'diffuse':
+                    b.pop('diffuse', None)
+
+    if hasattr(app, 'bodies_data_cmp') and app.bodies_data_cmp:
+        for b in app.bodies_data_cmp:
+            if b.get('name', '').lower() == name_lower:
+                b.pop(json_prop, None)
+                if layer_key == 'diffuse':
+                    b.pop('diffuse', None)
+
+    # 7. Reset bake state
+    bake_key = f"{name_lower}_{layer_key}"
+    if hasattr(app, '_texture_bake_state') and bake_key in app._texture_bake_state:
+        app._texture_bake_state[bake_key] = {'status': 'idle', 'msg': ''}
+
+    layer_lbl = TEXTURE_LAYERS[layer_key]['label']
+    app._screenshot_toast = (f"Deleted {layer_lbl} texture & tiles for {body_name}!", time.time())
+    print(f"[TextureManager] Deleted {layer_key} texture and baked tiles for {body_name}")
+
+def delete_body_all_textures(app, ctx, body_name, active_system_name, bodies_data, insp_idx, insp_is_cmp=False):
+    """
+    Permanently delete ALL texture layers and baked tiles for a celestial body:
+    1. Discards all staged layers
+    2. Deletes textures/<system>/<body_name> and fallback textures/<body_name>
+    3. Deletes data/tiles/<body_name>/
+    4. Invalidates terrain streamer caches
+    5. Clears SSBO 64-bit handles for all 4 slots to uvec2(0, 0)
+    6. Releases all GPU resident textures
+    7. Removes from texture_slices, manifest, and bodies_data
+    8. Updates tex_idx_arr
+    """
+    name_lower = body_name.lower()
+
+    # 1. Discard all staged textures
+    for lk in TEXTURE_LAYERS:
+        discard_staged_texture(app, body_name, layer_key=lk)
+        bake_key = f"{name_lower}_{lk}"
+        if hasattr(app, '_texture_bake_state') and bake_key in app._texture_bake_state:
+            app._texture_bake_state[bake_key] = {'status': 'idle', 'msg': ''}
+
+    # 2. Delete all textures on disk for this body
+    dirs_to_remove = [
+        os.path.join(get_external_path("textures"), active_system_name, body_name),
+        os.path.join(get_external_path("textures"), body_name),
+    ]
+    for d in dirs_to_remove:
+        if os.path.isdir(d):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"[TextureManager] Removed texture directory: {d}")
+            except Exception as e:
+                print(f"[TextureManager] Error removing texture directory {d}: {e}")
+
+    # Also clean up loose files in root textures/
+    root_tex = get_external_path("textures")
+    if os.path.isdir(root_tex):
+        valid_exts = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
+        all_sfxs = ('', '_clouds', '_cloud', '_specular', '_spec', '_normal', '_bump', '_nm')
+        try:
+            for fname in os.listdir(root_tex):
+                fpath = os.path.join(root_tex, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                stem, ext = os.path.splitext(fname)
+                if ext.lower() not in valid_exts:
+                    continue
+                stem_lower = stem.lower()
+                for sfx in all_sfxs:
+                    if stem_lower == f"{name_lower}{sfx}":
+                        try:
+                            os.remove(fpath)
+                            print(f"[TextureManager] Removed loose texture file: {fpath}")
+                        except Exception:
+                            pass
+                        break
+        except Exception:
+            pass
+
+    # 3. Delete baked tiles
+    for b_cand in (body_name, name_lower):
+        tile_dir = os.path.join(get_external_path("data", "tiles"), b_cand)
+        if os.path.isdir(tile_dir):
+            try:
+                shutil.rmtree(tile_dir, ignore_errors=True)
+                print(f"[TextureManager] Removed tile directory: {tile_dir}")
+            except Exception as e:
+                print(f"[TextureManager] Error removing tile directory {tile_dir}: {e}")
+
+    # 4. Invalidate terrain streamer caches
+    if hasattr(app, 'terrain_streamer') and app.terrain_streamer is not None:
+        app.terrain_streamer._dir_file_cache.clear()
+        app.terrain_streamer.missing_tiles.clear()
+        app.terrain_streamer._resolve_memo.clear()
+        if hasattr(app.terrain_streamer, '_preload_root_tiles'):
+            app.terrain_streamer._preload_root_tiles()
+    if hasattr(app, '_terrain_tiles_dir_cache') and app._terrain_tiles_dir_cache is not None:
+        app._terrain_tiles_dir_cache.clear()
+
+    # 5. Clean up texture streamer manifest & colors
+    if hasattr(app, 'texture_streamer') and app.texture_streamer is not None:
+        app.texture_streamer.file_manifest.pop(name_lower, None)
+        app.texture_streamer.texture_mean_colors.pop(name_lower, None)
+
+    if hasattr(app, 'texture_mean_colors'):
+        app.texture_mean_colors.pop(name_lower, None)
+
+    if hasattr(app, '_clouds_exist_cache'):
+        app._clouds_exist_cache.pop(name_lower, None)
+
+    # 6. GPU textures and SSBO
+    idx = getattr(app, 'texture_slices', {}).pop(name_lower, None)
+    if idx:
+        slot = idx - 1
+        # Zero out all 4 offsets in SSBO
+        if hasattr(app, 'body_textures_ssbo_data') and slot < len(app.body_textures_ssbo_data):
+            for off in range(4):
+                app.body_textures_ssbo_data[slot, off] = [0, 0]
+            if hasattr(app, 'body_textures_ssbo') and app.body_textures_ssbo is not None:
+                app.body_textures_ssbo.write(app.body_textures_ssbo_data.tobytes())
+
+        # Release resident GPU textures
+        tex_dict = getattr(app, 'gpu_body_textures', {}).pop(idx, {})
+        for layer_k, tex in tex_dict.items():
+            if tex is not None:
+                if hasattr(app, 'impl') and hasattr(app.impl, 'renderer') and hasattr(app.impl.renderer, 'textures'):
+                    app.impl.renderer.textures.pop(tex.glo, None)
+                try:
+                    tex.release()
+                except Exception:
+                    pass
+
+        if hasattr(app, 'texture_streamer') and app.texture_streamer:
+            app.texture_streamer.name_to_idx.pop(name_lower, None)
+            app.texture_streamer.idx_to_name.pop(idx, None)
+
+        app.tex_idx_arr = _build_tex_idx_arr(app.bodies_data, app.texture_slices)
+        if hasattr(app, 'tex_idx_arr_cmp') and getattr(app, 'bodies_data_cmp', None):
+            app.tex_idx_arr_cmp = _build_tex_idx_arr(app.bodies_data_cmp, app.texture_slices)
+
+    # 7. Remove properties from bodies_data
+    for prop in ('texture', 'diffuse', 'clouds', 'specular', 'normal'):
+        if insp_idx < len(bodies_data):
+            bodies_data[insp_idx].pop(prop, None)
+
+        if hasattr(app, 'bodies_data'):
+            for b in app.bodies_data:
+                if b.get('name', '').lower() == name_lower:
+                    b.pop(prop, None)
+
+        if hasattr(app, 'bodies_data_cmp') and app.bodies_data_cmp:
+            for b in app.bodies_data_cmp:
+                if b.get('name', '').lower() == name_lower:
+                    b.pop(prop, None)
+
+    app._screenshot_toast = (f"Deleted all textures and tiles for {body_name}!", time.time())
+    print(f"[TextureManager] Successfully deleted all textures and tiles for {body_name}")
+
+def _has_layer_texture(app, name_lower, layer_key, body_name=None):
+    """Check if a body has a texture loaded, staged, in manifest, or on disk."""
     staging_key = f"{name_lower}_{layer_key}"
     staged = getattr(app, '_texture_staging', {}).get(staging_key)
     if staged and staged.get('is_staged'):
@@ -497,6 +968,31 @@ def _has_layer_texture(app, name_lower, layer_key):
         if p and os.path.exists(p):
             return True
 
+    # Check tiles
+    bake_map = TEXTURE_LAYERS.get(layer_key, {}).get('bake_map_type')
+    if bake_map:
+        cands = [name_lower]
+        if body_name:
+            cands.append(body_name)
+        for b_cand in cands:
+            tile_dir = os.path.join(get_external_path("data", "tiles"), b_cand, bake_map)
+            if os.path.isdir(tile_dir):
+                return True
+
+    return False
+
+def _has_any_texture(app, name_lower, body_name=None):
+    """Check if a body has any texture (surface, clouds, specular, normal) or tiles."""
+    for lk in TEXTURE_LAYERS:
+        if _has_layer_texture(app, name_lower, lk, body_name=body_name):
+            return True
+    cands = [name_lower]
+    if body_name:
+        cands.append(body_name)
+    for b_cand in cands:
+        tile_dir = os.path.join(get_external_path("data", "tiles"), b_cand)
+        if os.path.isdir(tile_dir):
+            return True
     return False
 
 def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, active_system_name, cur_bodies_data, atmo_bodies, ring_precomputed, insp_is_cmp):
@@ -614,9 +1110,20 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
     picker_x = p_max[0] - picker_w - 6
     picker_y = p_max[1] - picker_h - 6
 
+    trash_w, trash_h = 24, 22
+    trash_x = p_min[0] + 6
+    trash_y = p_max[1] - trash_h - 6
+
     io = imgui.get_io()
     mx, my = io.mouse_pos
     is_picker_hovered = (picker_x <= mx <= picker_x + picker_w and picker_y <= my <= picker_y + picker_h)
+    is_trash_hovered = (trash_x <= mx <= trash_x + trash_w and trash_y <= my <= trash_y + trash_h)
+
+    has_layer_content = (
+        is_texture_loaded
+        or is_staged
+        or _has_layer_texture(app, name_lower, cur_layer, body_name=body_name)
+    )
 
     if is_texture_loaded and tex_glo is not None:
         # ── Render Loaded Texture Preview ──
@@ -628,11 +1135,6 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
             # Staged badge
             draw_list.add_rect_filled(p_min[0] + 6, p_min[1] + 6, p_min[0] + 115, p_min[1] + 24, imgui.color_convert_float4_to_u32(0.1, 0.5, 0.8, 0.85), rounding=3.0)
             draw_list.add_text(p_min[0] + 10, p_min[1] + 8, imgui.color_convert_float4_to_u32(1.0, 1.0, 1.0, 1.0), "STAGED (Preview)")
-
-        if is_box_hovered:
-            imgui.set_tooltip(f"Click directly to open file explorer or drag & drop an image to replace {TEXTURE_LAYERS[cur_layer]['label']}")
-        if is_box_clicked:
-            open_texture_file_dialog(app, layer_key=cur_layer)
 
     else:
         # ── Render Fallback Fill when texture not loaded ──
@@ -685,11 +1187,50 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
                     if 'lut_tex' in atmo_item:
                         atmo_item['lut_tex'].release()
                         del atmo_item['lut_tex']
-            if is_picker_hovered:
-                imgui.set_tooltip("Base Color Picker\nClick to customize surface color")
 
-        # Clicking map directly opens file explorer
-        if is_box_clicked and not (cur_layer == 'diffuse' and is_picker_hovered):
+    # Trash can symbol on bottom left of preview box
+    if has_layer_content:
+        if is_trash_hovered:
+            trash_bg = imgui.color_convert_float4_to_u32(0.85, 0.2, 0.2, 0.9)
+            trash_border = imgui.color_convert_float4_to_u32(1.0, 0.4, 0.4, 1.0)
+            trash_icon = imgui.color_convert_float4_to_u32(1.0, 1.0, 1.0, 1.0)
+        else:
+            trash_bg = imgui.color_convert_float4_to_u32(0.12, 0.12, 0.15, 0.75)
+            trash_border = imgui.color_convert_float4_to_u32(0.55, 0.25, 0.25, 0.8)
+            trash_icon = imgui.color_convert_float4_to_u32(0.9, 0.55, 0.55, 0.9)
+
+        draw_list.add_rect_filled(trash_x, trash_y, trash_x + trash_w, trash_y + trash_h, trash_bg, rounding=3.0)
+        draw_list.add_rect(trash_x, trash_y, trash_x + trash_w, trash_y + trash_h, trash_border, rounding=3.0, thickness=1.0)
+
+        # Vector trash can symbol centered at (trash_x + 12, trash_y + 11)
+        tc_x = trash_x + 12.0
+        tc_y = trash_y + 11.0
+        # Top lid handle
+        draw_list.add_line(tc_x - 2.5, tc_y - 6.0, tc_x + 2.5, tc_y - 6.0, trash_icon, 1.5)
+        # Lid horizontal bar
+        draw_list.add_line(tc_x - 5.5, tc_y - 4.0, tc_x + 5.5, tc_y - 4.0, trash_icon, 1.5)
+        # Can body rectangle
+        draw_list.add_rect(tc_x - 4.5, tc_y - 2.0, tc_x + 4.5, tc_y + 6.0, trash_icon, rounding=1.0, thickness=1.2)
+        # Vertical slats inside can
+        draw_list.add_line(tc_x - 1.5, tc_y - 0.5, tc_x - 1.5, tc_y + 4.5, trash_icon, 1.0)
+        draw_list.add_line(tc_x + 1.5, tc_y - 0.5, tc_x + 1.5, tc_y + 4.5, trash_icon, 1.0)
+
+    # Tooltips for preview box
+    if is_trash_hovered and has_layer_content:
+        imgui.set_tooltip(f"Delete {TEXTURE_LAYERS[cur_layer]['label']} Texture & Tiles\nClick to permanently remove from disk, tiles, and memory.")
+    elif cur_layer == 'diffuse' and is_picker_hovered:
+        imgui.set_tooltip("Base Color Picker\nClick to customize surface color")
+    elif is_box_hovered:
+        action_str = "replace" if is_texture_loaded else "load"
+        imgui.set_tooltip(f"Click directly to open file explorer or drag & drop an image to {action_str} {TEXTURE_LAYERS[cur_layer]['label']}")
+
+    # Click handling for preview box
+    if is_box_clicked:
+        if is_trash_hovered and has_layer_content:
+            imgui.open_popup(f"Delete Layer Texture?###del_layer_modal_{insp_idx}")
+        elif cur_layer == 'diffuse' and is_picker_hovered:
+            pass
+        else:
             open_texture_file_dialog(app, layer_key=cur_layer)
 
     # ── 3. Controls Below the Map ──
@@ -790,3 +1331,85 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
         imgui.text_colored(f"✓ Quadtree {cur_layer} tiles baked to data/tiles/!", 0.3, 1.0, 0.4)
     elif b_status == 'error':
         imgui.text_colored(f"✗ Bake error: {bake_state.get('msg')}", 1.0, 0.3, 0.3)
+
+    # ── 4. Big Delete All Textures Button ──
+    imgui.spacing()
+    imgui.separator()
+    imgui.spacing()
+
+    has_any_tex = _has_any_texture(app, name_lower, body_name=body_name)
+
+    if has_any_tex:
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.65, 0.18, 0.18)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.85, 0.25, 0.25)
+        imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, 0.50, 0.12, 0.12)
+        imgui.push_style_color(imgui.COLOR_TEXT, 1.0, 1.0, 1.0)
+    else:
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.22, 0.22, 0.25)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.22, 0.22, 0.25)
+        imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, 0.22, 0.22, 0.25)
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.50, 0.50, 0.50)
+
+    if imgui.button(f"Delete All Textures ({body_name})###btn_del_all_{insp_idx}", width=-1):
+        if has_any_tex:
+            imgui.open_popup(f"Delete All Textures?###del_all_modal_{insp_idx}")
+
+    imgui.pop_style_color(4)
+
+    if imgui.is_item_hovered():
+        if has_any_tex:
+            imgui.set_tooltip(f"Permanently delete all texture maps (Surface, Clouds, Specular, Normal) and all baked tiles for {body_name}")
+        else:
+            imgui.set_tooltip(f"No textures or baked tiles to delete for {body_name}")
+
+    # ── 5. Confirmation Modals ──
+    modal_single_id = f"Delete Layer Texture?###del_layer_modal_{insp_idx}"
+    if imgui.begin_popup_modal(modal_single_id, flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+        imgui.text_colored(f"Are you sure you want to delete the {TEXTURE_LAYERS[cur_layer]['label']} texture for {body_name}?", 1.0, 0.8, 0.35)
+        imgui.spacing()
+        imgui.text("This will permanently remove:")
+        imgui.bullet_text(f"Texture files for this layer on disk")
+        if TEXTURE_LAYERS[cur_layer]['can_bake']:
+            imgui.bullet_text(f"Baked cubemap tiles from data/tiles/{body_name}/{TEXTURE_LAYERS[cur_layer]['bake_map_type']}/")
+        imgui.bullet_text("Unload texture from GPU memory and reset shaders")
+        imgui.spacing()
+        imgui.separator()
+        imgui.spacing()
+
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.8, 0.2, 0.2)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.95, 0.3, 0.3)
+        if imgui.button(f"Yes, Delete {TEXTURE_LAYERS[cur_layer]['label']}", width=210):
+            delete_body_layer_texture(app, ctx, body_name, cur_layer, active_system_name, cur_bodies_data, insp_idx, insp_is_cmp)
+            imgui.close_current_popup()
+        imgui.pop_style_color(2)
+
+        imgui.same_line()
+        if imgui.button("Cancel", width=90):
+            imgui.close_current_popup()
+
+        imgui.end_popup()
+
+    modal_all_id = f"Delete All Textures?###del_all_modal_{insp_idx}"
+    if imgui.begin_popup_modal(modal_all_id, flags=imgui.WINDOW_ALWAYS_AUTO_RESIZE)[0]:
+        imgui.text_colored(f"⚠️ PERMANENT ACTION: Delete ALL textures for {body_name}?", 1.0, 0.35, 0.35)
+        imgui.spacing()
+        imgui.text("This will permanently remove:")
+        imgui.bullet_text(f"ALL texture maps (Surface, Clouds, Specular, Normal) from textures/")
+        imgui.bullet_text(f"ALL baked tiles from data/tiles/{body_name}/")
+        imgui.bullet_text("Unload all textures from GPU memory and reset shader slots")
+        imgui.spacing()
+        imgui.separator()
+        imgui.spacing()
+
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.85, 0.15, 0.15)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 1.0, 0.25, 0.25)
+        if imgui.button("Yes, Delete ALL Textures", width=210):
+            delete_body_all_textures(app, ctx, body_name, active_system_name, cur_bodies_data, insp_idx, insp_is_cmp)
+            imgui.close_current_popup()
+        imgui.pop_style_color(2)
+
+        imgui.same_line()
+        if imgui.button("Cancel", width=90):
+            imgui.close_current_popup()
+
+        imgui.end_popup()
