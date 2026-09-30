@@ -30,31 +30,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 app.camera["atmo_quality"] = min(3, atmo_quality)
                 settings_changed = True
 
-            if atmo_quality > 0:
-                atmo_res = float(app.camera.get("atmo_resolution", 1.0))
-                changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")
-                if changed_res:
-                    app.camera["atmo_resolution"] = atmo_res
-                    settings_changed = True
-
-                if atmo_res < 0.999:
-                    vrs_threshold = float(app.camera.get("atmo_vrs_threshold_px", 100.0))
-                    changed_vrs, vrs_threshold = imgui.slider_float("VRS Low-Res Threshold (px)", vrs_threshold, 10.0, 1000.0, "%.1f")
-                    if changed_vrs:
-                        app.camera["atmo_vrs_threshold_px"] = vrs_threshold
-                        settings_changed = True
-
             if atmo_quality == 3:
-                terrain_steps = int(app.camera.get("atmo_steps_max", 32))
-                changed_ts, terrain_steps = imgui.slider_int("Terrain Ray Steps", terrain_steps, 4, 128)
-                if changed_ts:
-                    app.camera["atmo_steps_max"] = terrain_steps
-                    settings_changed = True
-                aerial_steps = int(app.camera.get("atmo_aerial_shadow_steps", 32))
-                changed_as, aerial_steps = imgui.slider_int("Terrain Shadow Steps", aerial_steps, 16, 128)
-                if changed_as:
-                    app.camera["atmo_aerial_shadow_steps"] = aerial_steps
-                    settings_changed = True
                 sky_view_res = int(app.camera.get("atmo_sky_view_res", 0))
                 sky_view_res_idx = min(len(SKY_VIEW_RES_LABELS) - 1, max(0, sky_view_res))
                 changed_svr, new_svr_idx = imgui.combo("Sky-View LUT Resolution", sky_view_res_idx, SKY_VIEW_RES_LABELS)
@@ -106,6 +82,19 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 elif shadow_method_idx == 2:
                     imgui.text_colored("Deterministic midpoint quadrature with bounded cylinder culling (Blackrack / KSA).", 0.6, 0.8, 1.0)
             elif atmo_quality > 0:
+                atmo_res = float(app.camera.get("atmo_resolution", 1.0))
+                changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")
+                if changed_res:
+                    app.camera["atmo_resolution"] = atmo_res
+                    settings_changed = True
+
+                if atmo_res < 0.999:
+                    vrs_threshold = float(app.camera.get("atmo_vrs_threshold_px", 100.0))
+                    changed_vrs, vrs_threshold = imgui.slider_float("VRS Low-Res Threshold (px)", vrs_threshold, 10.0, 1000.0, "%.1f")
+                    if changed_vrs:
+                        app.camera["atmo_vrs_threshold_px"] = vrs_threshold
+                        settings_changed = True
+
                 max_steps = app.camera.get("atmo_steps_max", 32)
                 changed_steps, max_steps = imgui.slider_int("Max Ray Steps", max_steps, 4, 128)
                 if changed_steps:

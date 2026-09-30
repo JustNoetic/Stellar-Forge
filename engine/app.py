@@ -526,7 +526,6 @@ class App(InputHandlerMixin):
             "atmo_slicing_steps": 8,
             "atmo_shadow_method": 1,
             "atmo_shadow_steps": 24,
-            "atmo_aerial_shadow_steps": 32,
             "atmo_noise_type": 0,
             "atmo_sky_view_steps": 24,
             "atmo_sky_view_res": 0,
@@ -643,7 +642,6 @@ class App(InputHandlerMixin):
         self.sky_view_width = 192
         self.sky_view_height = 108
         self.sky_view_baked_key = None
-        self.aerial_volume = None
         self.star_catalog = None
         self._ephem_trajectories_pts_count = 0
         self.prev_atmo_exposure = 1.0
@@ -750,7 +748,6 @@ class App(InputHandlerMixin):
                 "atmo_slicing_steps": self.camera.get("atmo_slicing_steps", 8),
                 "atmo_shadow_method": self.camera.get("atmo_shadow_method", 1),
                 "atmo_shadow_steps": self.camera.get("atmo_shadow_steps", 24),
-                "atmo_aerial_shadow_steps": self.camera.get("atmo_aerial_shadow_steps", 32),
                 "atmo_noise_type": self.camera.get("atmo_noise_type", 0),
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
@@ -1797,11 +1794,6 @@ class App(InputHandlerMixin):
         if 'u_ringshine_map' in self.prog_sky_view:
             self.prog_sky_view['u_ringshine_map'].value = 8
         self.resize_sky_view_lut(self.sky_view_width, self.sky_view_height)
-        from engine.rendering.aerial_volume import AerialPerspectiveVolume
-        self.aerial_volume = AerialPerspectiveVolume(ctx)
-        for p in (prog_atmo, prog_atmo_lowres):
-            p['u_aerial_scatter_lut'].value = 20
-            p['u_aerial_trans_lut'].value = 21
 
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
         self.prog_bloom_up = ctx.program(vertex_shader=bloom_upsample_shader_vs, fragment_shader=bloom_upsample_shader_fs)
@@ -2150,9 +2142,6 @@ class App(InputHandlerMixin):
         ring_shadow_tex.build_mipmaps()
         ring_gradient_tex.shadow_tex = ring_shadow_tex
         self.ring_shadow_tex = ring_shadow_tex
-        from engine.rendering.ring_opacity import RingOpacityBounds
-        self.ring_opacity_bounds = RingOpacityBounds(ctx)
-        ring_gradient_tex.opacity_bounds = self.ring_opacity_bounds
         self.body_ring_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
 
 
@@ -5092,17 +5081,7 @@ class App(InputHandlerMixin):
             ringshine_lut_tex.use(location=6)
             ringshine_cdf_tex.use(location=7)
 
-            # Irradiance depends on ring profiles, geometry, and sunlight, not
-            # the observer. Keep a stationary map across frames and invalidate
-            # it on edits (including texture hot reloads via atlas_version).
-            ring_oblateness = tuple(float(b.get('oblateness', b.get('f', 0.0)))
-                                    for b in bodies_data + (self.bodies_data_cmp if self.comparison_enabled else []))
-            ringshine_key = (n_ring_planes, ring_sun_dirs_buf.tobytes(), ring_normals_buf.tobytes(),
-                             ring_params_buf.tobytes(), getattr(ring_gradient_tex, 'atlas_version', 0),
-                             ring_oblateness, int(self.camera.get("ringshine_band_count", 100)),
-                             bool(self.camera.get("ringshine_oblate_enabled", True)))
-            if (self.camera.get("ringshine_enabled", True) and n_ring_planes > 0
-                    and getattr(self, '_ringshine_map_key', None) != ringshine_key):
+            if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
                 self.ringshine_map_fbo.use()
                 ctx.viewport = (0, 0, 128, 1040)
                 if 'u_sun_dir' in self.prog_ringshine_map:
@@ -5151,7 +5130,6 @@ class App(InputHandlerMixin):
                 _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
                 self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
                 _perf_gpu_end(_gq)
-                self._ringshine_map_key = ringshine_key
 
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 self.hdr_resolve_fbo.use()
@@ -5909,9 +5887,6 @@ class App(InputHandlerMixin):
                 if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
                 if 'u_atmo_shadow_method' in cur_prog:
                     cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
-                cur_prog['u_aerial_shadow_steps'].value = (128 if getattr(self, '_screenshot_capturing', False)
-                    else int(self.camera.get("atmo_aerial_shadow_steps", 32)))
-                self.ring_opacity_bounds.bind(cur_prog)
                 if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
                     shadow_method = int(self.camera.get("atmo_shadow_method", 1))
                     if shadow_method in (1, 2):
@@ -5984,10 +5959,6 @@ class App(InputHandlerMixin):
                         body_pos_rel = pos_rel_all[bi]
                         body_idx_in_unified = bi
                         prev_offset = self.prev_atmo_body_offsets.get(bi, body_pos_rel)
-                    terrain_depth_active = body_idx_in_unified in active_terrain_body_indices
-                    cur_prog['u_aerial_volume_enabled'].value = False
-                    if 'u_terrain_depth_enabled' in cur_prog:
-                        cur_prog['u_terrain_depth_enabled'].value = body_idx_in_unified in active_terrain_body_indices
                     if 'u_prev_body_offset' in cur_prog:
                         cur_prog['u_prev_body_offset'].write(prev_offset.astype('f4'))
     
@@ -6299,26 +6270,7 @@ class App(InputHandlerMixin):
                         if self.sky_view_width != _target_w or self.sky_view_height != _target_h:
                             self.resize_sky_view_lut(_target_w, _target_h)
 
-                        # Deterministic LUTs have no frame/noise dependency.
-                        # Include every lighting input and exclude only the
-                        # changing stochastic frame counter in the SSBO.
-                        lighting_data = self.atmo_staging.copy()
-                        lighting_data[31] = 0.0
-                        cam_rel_km = (cam_pos - body_pos_rel) * AU_TO_KM
-                        h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
-                        cam_sph_km = cam_rel_km + h_pole * (f_scale - 1.0) * _p_pole_norm
-                        lighting_key = (
-                            body_idx_in_unified, cam_sph_km.astype('f4').tobytes(), lighting_data.tobytes(),
-                            ubo_staging[32:292].tobytes(), all_instances[body_idx_in_unified, 12:24].tobytes(),
-                            n_ring_planes, ring_centers_buf.tobytes(), ring_normals_buf.tobytes(),
-                            ring_params_buf.tobytes(), ring_coplanar_mask_buf.tobytes(),
-                            getattr(ring_gradient_tex, 'atlas_version', 0),
-                            getattr(self, '_ringshine_map_key', None) if rs_enabled else None,
-                            ps_enabled, rs_enabled, getattr(atmo.get('lut_tex'), 'glo', None),
-                            getattr(atmo.get('lut_multi_scatter'), 'glo', None))
-                        current_bake_key = (lighting_key,
-                            int(self.camera.get("atmo_sky_view_steps", 24)),
-                            int(self.camera.get("atmo_shadow_method", 1)))
+                        current_bake_key = (self.frame_counter, body_idx_in_unified)
                         if self.sky_view_baked_key != current_bake_key:
                             cam_rel_au = cam_pos - body_pos_rel
                             cam_rel_km = cam_rel_au * AU_TO_KM
@@ -6366,24 +6318,6 @@ class App(InputHandlerMixin):
 
                             self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
                             self.sky_view_baked_key = current_bake_key
-
-                        # Terrain uses an unshadowed altitude volume. Shadowed
-                        # finite rays are refined per pixel in the atmosphere pass.
-                        if terrain_depth_active:
-                            terrain_data = self.bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
-                            min_height = float(terrain_data.get("height_range_km", [0.0, 8.848])[0])
-                            if not math.isfinite(min_height): min_height = 0.0
-                            min_radius = max(0.001, float(atmo['planet_radius_km']) + min(0.0, min_height) * f_scale - 0.01)
-                            cam_rel_km = (cam_pos - body_pos_rel) * AU_TO_KM
-                            h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
-                            cam_sph_km = cam_rel_km + h_pole * (f_scale - 1.0) * _p_pole_norm
-                            self.aerial_volume.bake(
-                                (lighting_key, inv_proj_bytes, inv_view_bytes, min_radius), cam_sph_km, _star0_s_dir_sph,
-                                inv_proj_bytes, inv_view_bytes,
-                                n_ring_planes, ring_normals_buf,
-                                ps_enabled, rs_enabled,
-                                (min(float(np.linalg.norm(cam_sph_km)), float(atmo['atmo_radius_km'])), min_radius))
-                            self.aerial_volume.bind(cur_prog)
 
                         # Restore framebuffer and raster state for atmosphere polyhedron rendering
                         if is_lowres:
@@ -6495,7 +6429,7 @@ class App(InputHandlerMixin):
                     isinstance(self.atmo_lowres_fbo, dict) and 
                     self.atmo_lowres_fbo.get(clip_mode, [None])[0] is not None
                 )
-                use_vrs = (atmo_res < 0.999 or (temporal_accum and atmo_quality != 3)) and has_atmo_fbos
+                use_vrs = (atmo_res < 0.999 or temporal_accum) and has_atmo_fbos and (atmo_quality != 3)
                 
                 pending_lowres_atmos = []
                 
@@ -7674,8 +7608,6 @@ class App(InputHandlerMixin):
         for _t in getattr(self, 'sky_view_star_tex', []):
             if _t: _t.release()
         if getattr(self, 'sky_view_fbo', None): self.sky_view_fbo.release()
-        if self.aerial_volume is not None: self.aerial_volume.release()
-        if getattr(self, 'ring_opacity_bounds', None): self.ring_opacity_bounds.release()
         self.impl.shutdown()
         glfw.terminate()
     
