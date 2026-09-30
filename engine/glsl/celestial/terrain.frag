@@ -209,6 +209,7 @@ void main() {
             // Solar illumination always strikes the outer (top) surface of the cloud deck
             float sun_cos = dot(N, L);
             float effective_sun_cos = sun_cos + term_offset;
+            if (effective_sun_cos <= -sin_alpha) continue;
 
             float diffuse = 0.0;
             if (is_underside) {
@@ -536,6 +537,7 @@ void main() {
 
         // Physical Lambert cosine law with penumbra transition
         float sun_cos = dot(N, L);
+        if (sun_cos <= -sin_alpha) continue;
         float diffuse = clamp((sun_cos + sin_alpha) / (1.0 + sin_alpha), 0.0, 1.0);
 
         vec3 incoming_light_tint = vec3(1.0);

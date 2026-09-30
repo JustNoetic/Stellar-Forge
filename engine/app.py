@@ -4444,6 +4444,7 @@ class App(InputHandlerMixin):
             if n_casters_fixed > 0:
                 c_idx_arr[:n_casters_fixed] = caster_indices[:n_casters_fixed]
             prog_culling_compute['u_caster_indices'].write(c_idx_arr.tobytes())
+            self.caster_idx_map = {int(caster_indices[i_c]): i_c for i_c in range(n_casters_fixed)} if n_casters_fixed > 0 else {}
             
             prog_culling_compute['u_frustum_planes'].write(frustum_planes.astype(np.float32).tobytes())
                 
@@ -4473,6 +4474,11 @@ class App(InputHandlerMixin):
                 cand_indices = []
                 if tracking_idx_uni >= 0 and tracking_idx_uni < total_render_bodies:
                     cand_indices.append(tracking_idx_uni)
+                    # Preload low/intermediate LOD 2 tiles for the active tracked body so zooming in/out never encounters missing parent tiles
+                    if getattr(self, '_last_preloaded_lod2_body', None) != tracking_idx_uni:
+                        self._last_preloaded_lod2_body = tracking_idx_uni
+                        t_b_name = bodies_data[tracking_idx_uni]["name"].lower() if tracking_idx_uni < num_bodies else self.bodies_data_cmp[tracking_idx_uni - num_bodies]["name"].lower()
+                        self.terrain_streamer.preload_body_lod(t_b_name, map_types=("diffuse", "clouds"), target_lod=2)
                 insp_idx = self.camera.get("inspected_idx", -1)
                 if insp_idx is not None and 0 <= insp_idx < total_render_bodies and insp_idx not in cand_indices:
                     cand_indices.append(insp_idx)
@@ -5491,6 +5497,7 @@ class App(InputHandlerMixin):
                     if num_p > 0:
                         st = total_patches_rendered
                         en = st + num_p
+                        b_caster_idx = float(self.caster_idx_map.get(b_i, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
                         # Batched tile residency lookup: resolve each unique
                         # tile once instead of one Python call per patch.
                         slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch_multi(
@@ -5498,10 +5505,70 @@ class App(InputHandlerMixin):
                             raw_patches[:, 4], raw_patches[:, 5],
                             raw_patches[:, 6], raw_patches[:, 7]
                         )
+
+                        # Deferred Quadtree Collapse Grace Period:
+                        # If a patch merged but its parent tile is still loading from disk (uvs[0] < 0.999),
+                        # and previous frame had its 4 resident child patches, retain the child patches for a
+                        # brief grace period (up to 25 frames / ~0.4s) so the user never sees blurry intermediate fallback.
+                        prev_info = self.terrain_active_body_patches.get(b_i)
+                        if prev_info is not None and prev_info[0] is not None:
+                            prev_raw_p = prev_info[0]
+                            patches_to_replace = []
+                            for p_idx in range(num_p):
+                                if uvs[0][p_idx] < 0.999:
+                                    pf = int(raw_patches[p_idx, 4])
+                                    plod = int(raw_patches[p_idx, 5])
+                                    px = int(raw_patches[p_idx, 6])
+                                    py = int(raw_patches[p_idx, 7])
+                                    if (b_name, "diffuse", pf, plod, px, py) in self.terrain_streamer.in_flight_requests:
+                                        c_mask = (prev_raw_p[:, 4] == pf) & (prev_raw_p[:, 5] == plod + 1) & (prev_raw_p[:, 6].astype(np.int32) >> 1 == px) & (prev_raw_p[:, 7].astype(np.int32) >> 1 == py)
+                                        if np.count_nonzero(c_mask) == 4:
+                                            patches_to_replace.append((p_idx, prev_raw_p[c_mask]))
+
+                            if patches_to_replace:
+                                grace_dict = getattr(self, '_terrain_merge_grace_frames', None)
+                                if grace_dict is None:
+                                    grace_dict = self._terrain_merge_grace_frames = {}
+
+                                new_p_list = []
+                                for p_idx in range(num_p):
+                                    pf = int(raw_patches[p_idx, 4])
+                                    plod = int(raw_patches[p_idx, 5])
+                                    px = int(raw_patches[p_idx, 6])
+                                    py = int(raw_patches[p_idx, 7])
+                                    p_key = (b_name, pf, plod, px, py)
+                                    replace_children = None
+                                    for r_idx, c_patches in patches_to_replace:
+                                        if r_idx == p_idx:
+                                            replace_children = c_patches
+                                            break
+
+                                    if replace_children is not None:
+                                        g_count = grace_dict.get(p_key, 0)
+                                        if g_count < 25:
+                                            grace_dict[p_key] = g_count + 1
+                                            new_p_list.append(replace_children)
+                                            continue
+                                        else:
+                                            grace_dict.pop(p_key, None)
+                                    else:
+                                        grace_dict.pop(p_key, None)
+
+                                    new_p_list.append(raw_patches[p_idx:p_idx+1])
+
+                                raw_patches = np.vstack(new_p_list)
+                                num_p = len(raw_patches)
+                                slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch_multi(
+                                    b_name, ["diffuse", "height"],
+                                    raw_patches[:, 4], raw_patches[:, 5],
+                                    raw_patches[:, 6], raw_patches[:, 7]
+                                )
+
                         pack_terrain_patches_jit(
                             self.terrain_patch_staging, st, raw_patches,
                             uvs[0], ox_arr[0], oy_arr[0], slots[0], float(b_i),
-                            uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km
+                            uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km,
+                            b_caster_idx
                         )
 
                         self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
@@ -6871,9 +6938,11 @@ class App(InputHandlerMixin):
                     if num_p > 0:
                         cloud_staged_count = int(np.count_nonzero(c_slots >= 0.0))
                         if cloud_staged_count > 0:
+                            bi_caster_idx = float(self.caster_idx_map.get(bi, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
                             pack_cloud_patches_jit(
                                 self.terrain_cloud_staging, 0,
-                                cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi)
+                                cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi),
+                                bi_caster_idx
                             )
                             self.hdr_resolve_fbo.use()
                             ctx.viewport = (0, 0, self.fb_width, self.fb_height)

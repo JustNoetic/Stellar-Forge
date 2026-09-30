@@ -78,6 +78,45 @@ def test_tiled_streamer_and_fallback():
     streamer.shutdown()
 
 
+def test_depth_weighted_eviction_and_lod1_retention():
+    print("--> Testing Depth-Weighted LRU Eviction & LOD 1 Retention...")
+    ctx = moderngl.create_context(standalone=True)
+    streamer = TerrainTileStreamer(ctx, tiles_base_dir="data/tiles", pool_capacity=256, tile_size=512)
+
+    # 1. Verify LOD 0 and LOD 1 are resident and locked on startup
+    assert streamer.is_tile_resident("Moon", "diffuse", 0, 0, 0, 0), "Moon LOD 0 tile must be resident"
+    assert streamer.is_tile_resident("Moon", "diffuse", 0, 1, 0, 0), "Moon LOD 1 tile must be resident"
+    slot_0, uv_0, _, _ = streamer.get_tile_slot_or_fallback("Moon", "diffuse", 0, 0, 0, 0)
+    slot_1, uv_1, _, _ = streamer.get_tile_slot_or_fallback("Moon", "diffuse", 0, 1, 0, 0)
+    assert uv_0 == 1.0, f"LOD 0 should be exact match, got {uv_0}"
+    assert uv_1 == 1.0, f"LOD 1 should be exact match, got {uv_1}"
+    print(f"    Moon LOD 0 slot: {slot_0}, Moon LOD 1 slot: {slot_1} (LOD 1 Resident!)")
+
+    # 2. Test fallback from LOD 2 to LOD 1 (must be uv_scale = 0.5, NOT 0.25!)
+    slot_l2, uv_l2, ox, oy = streamer.get_tile_slot_or_fallback("Moon", "diffuse", 0, 2, 0, 0)
+    print(f"    LOD 2 query fallback: slot={slot_l2}, uv_scale={uv_l2} (Expected 0.5 for LOD 1 fallback)")
+    assert uv_l2 == 0.5, f"Expected fallback to LOD 1 (uv_scale 0.5), got {uv_l2}"
+
+    # 3. Test Depth-Weighted Eviction:
+    streamer.free_slots.clear()
+    dummy_data = b'\x00' * (512 * 512 * 4)
+    streamer.resident_tiles[("test", "diffuse", 0, 5, 0, 0)] = 50
+    streamer.slot_to_key[50] = ("test", "diffuse", 0, 5, 0, 0)
+    streamer.slot_last_used[50] = streamer.current_frame - 10
+
+    streamer.resident_tiles[("test", "diffuse", 0, 2, 0, 0)] = 51
+    streamer.slot_to_key[51] = ("test", "diffuse", 0, 2, 0, 0)
+    streamer.slot_last_used[51] = streamer.current_frame - 15  # Older timestamp, but lower LOD (2 vs 5)
+
+    streamer.upload_queue.put((("test", "diffuse", 0, 3, 9, 9), dummy_data))
+    streamer.process_uploads(max_per_frame=1)
+
+    assert ("test", "diffuse", 0, 2, 0, 0) in streamer.resident_tiles, "LOD 2 tile must be protected from eviction!"
+    print("    Depth-weighted eviction successfully evicted LOD 5 leaf tile while retaining LOD 2 parent tile! (PASSED)")
+
+    streamer.shutdown()
+
+
 def test_gpu_terrain_rendering_pipeline():
     print("--> Testing GPU terrain shader and instanced rendering...")
     ctx = moderngl.create_context(standalone=True)
@@ -101,6 +140,7 @@ def test_gpu_terrain_rendering_pipeline():
         patch_buf[i, 8:12] = [float(i), 0.0, 0.0, 0.0]
 
     patch_buf[:, 12] = -1.0  # Height disabled for existing regression cases
+    patch_buf[:, 18] = 0.0   # Explicit caster index for O(1) atmosphere lookup
     ssbo = ctx.buffer(patch_buf.tobytes())
     ssbo.bind_to_storage_buffer(binding=4)
 
@@ -448,6 +488,7 @@ def main():
     test_cloud_horizon_culling_and_oblateness()
     test_decoupled_cloud_quadtree()
     test_tiled_streamer_and_fallback()
+    test_depth_weighted_eviction_and_lod1_retention()
     test_gpu_terrain_rendering_pipeline()
     test_terrain_refraction_ground_to_ground_and_space()
     print("=== All Terrain LOD Tests PASSED Successfully! ===")

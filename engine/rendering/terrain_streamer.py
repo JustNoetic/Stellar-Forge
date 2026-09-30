@@ -81,7 +81,7 @@ class TerrainTileStreamer:
         self._preload_root_tiles()
 
     def _preload_root_tiles(self):
-        """Pre-load LOD 0 root tiles for all available bodies on startup and record max LODs."""
+        """Pre-load LOD 0 and LOD 1 tiles for all available bodies on startup and record max LODs."""
         if not os.path.exists(self.tiles_base_dir):
             return
 
@@ -104,20 +104,47 @@ class TerrainTileStreamer:
                             max_lod = max(max_lod, int(lod_s))
                     self.max_available_lods[(body_name.lower(), map_type, face)] = max_lod
 
+        max_locked = max(6, self.pool_capacity // 2)
+
+        # Pass 1: Preload and lock LOD 0 root tiles for all available bodies (priority bodies first)
+        all_bodies = sorted(os.listdir(self.tiles_base_dir), key=lambda b: (0 if b.lower() in ("earth", "moon", "mars") else 1, b))
+        for body_name in all_bodies:
+            b_dir = os.path.join(self.tiles_base_dir, body_name)
+            if not os.path.isdir(b_dir):
+                continue
             for m_type in ("diffuse", "clouds", "height"):
                 body_m_dir = os.path.join(b_dir, m_type)
                 if os.path.isdir(body_m_dir):
                     for face in range(6):
                         key = (body_name.lower(), m_type, face, 0, 0, 0)
-                        if key in self.resident_tiles:
-                            continue
-                        raw_bytes = self._read_tile_from_disk(*key)
-                        if raw_bytes and self.free_slots:
-                            slot = self.free_slots.pop(0)
-                            self.upload_tile_to_slot(slot, raw_bytes)
-                            self.resident_tiles[key] = slot
-                            self.slot_to_key[slot] = key
-                            self.locked_slots.add(slot)
+                        if key not in self.resident_tiles:
+                            raw_bytes = self._read_tile_from_disk(*key)
+                            if raw_bytes and self.free_slots and len(self.locked_slots) < max_locked:
+                                slot = self.free_slots.pop(0)
+                                self.upload_tile_to_slot(slot, raw_bytes)
+                                self.resident_tiles[key] = slot
+                                self.slot_to_key[slot] = key
+                                self.locked_slots.add(slot)
+
+        # Pass 2: Preload and lock LOD 1 for major priority bodies (Earth, Moon) if locked budget allows
+        priority_bodies = ("moon", "earth", "mars")
+        for b_name in priority_bodies:
+            for m_type in ("diffuse", "clouds"):
+                body_m_dir = os.path.join(self.tiles_base_dir, b_name, m_type)
+                if not os.path.isdir(body_m_dir):
+                    continue
+                for face in range(6):
+                    for x in range(2):
+                        for y in range(2):
+                            key = (b_name.lower(), m_type, face, 1, x, y)
+                            if key not in self.resident_tiles:
+                                raw_bytes = self._read_tile_from_disk(*key)
+                                if raw_bytes and self.free_slots and len(self.locked_slots) < max_locked:
+                                    slot = self.free_slots.pop(0)
+                                    self.upload_tile_to_slot(slot, raw_bytes)
+                                    self.resident_tiles[key] = slot
+                                    self.slot_to_key[slot] = key
+                                    self.locked_slots.add(slot)
 
     def _find_tile_path(self, body_name, map_type, face, lod, x, y):
         dir_path = os.path.join(self.tiles_base_dir, body_name, map_type, str(face), str(lod))
@@ -218,6 +245,34 @@ class TerrainTileStreamer:
             if lod > max_lod:
                 max_lod = lod
         return max_lod
+
+    def is_tile_resident(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int) -> bool:
+        """Returns True if the exact tile or clamped available tile is already resident in GPU VRAM."""
+        b_name = body_name.lower()
+        max_d = self.max_available_lods.get((b_name, map_type, face), -1)
+        if max_d >= 0 and lod > max_d:
+            k = lod - max_d
+            lod = max_d
+            x = x >> k
+            y = y >> k
+        return (b_name, map_type, face, lod, x, y) in self.resident_tiles
+
+    def preload_body_lod(self, body_name: str, map_types=("diffuse", "clouds"), target_lod: int = 2):
+        """
+        Request background streaming of low/intermediate LOD tiles up to target_lod for the active body.
+        These tiles are loaded with high depth-weighted retention to avoid zoom-out blur.
+        """
+        b_name = body_name.lower()
+        for m_type in map_types:
+            for face in range(6):
+                max_d = self.max_available_lods.get((b_name, m_type, face), -1)
+                eff_lod = min(target_lod, max_d) if max_d >= 0 else target_lod
+                if eff_lod < 0:
+                    continue
+                num_tiles = 1 << eff_lod
+                for x in range(num_tiles):
+                    for y in range(num_tiles):
+                        self.request_tile(b_name, m_type, face, eff_lod, x, y)
 
     def get_tile_slot_or_fallback(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int):
         """
@@ -438,6 +493,7 @@ class TerrainTileStreamer:
             self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker_thread.start()
 
+        uploaded_count = 0
         for _ in range(max_per_frame):
             try:
                 key, raw_bytes = self.upload_queue.get_nowait()
@@ -450,24 +506,32 @@ class TerrainTileStreamer:
             if key in self.resident_tiles:
                 continue
 
-            # Pick slot: free slot if available, else LRU eviction
+            # Pick slot: free slot if available, else depth-weighted LRU eviction
             if self.free_slots:
                 slot = self.free_slots.pop(0)
             else:
-                # Find least recently used unlocked slot
+                # Find least recently used unlocked slot with depth-weighted retention.
+                # Lower-LOD parent tiles (LOD 1, 2, 3) get retention bonuses so leaf
+                # tiles are evicted first, preserving parent continuity when zooming out.
                 best_slot = -1
-                oldest_frame = float('inf')
+                lowest_score = float('inf')
                 for s in range(self.pool_capacity):
-                    if s not in self.locked_slots and self.slot_last_used[s] < oldest_frame:
-                        oldest_frame = self.slot_last_used[s]
-                        best_slot = s
+                    if s not in self.locked_slots:
+                        old_k = self.slot_to_key.get(s)
+                        lod_level = old_k[3] if old_k is not None else 0
+                        # 250 frames (~4.2 seconds) of eviction retention per lower LOD level:
+                        depth_bonus = max(0, 8 - lod_level) * 250
+                        score = self.slot_last_used[s] + depth_bonus
+                        if score < lowest_score:
+                            lowest_score = score
+                            best_slot = s
 
                 if best_slot == -1:
                     continue  # All slots locked
 
                 # Protect active resident tiles from being evicted in recent frames
                 # to prevent VRAM pool thrashing and high/low LOD rapid flickering.
-                if oldest_frame >= self.current_frame - 2:
+                if self.slot_last_used[best_slot] >= self.current_frame - 2:
                     continue
 
                 slot = best_slot
@@ -486,6 +550,9 @@ class TerrainTileStreamer:
             self.slot_last_used[slot] = self.current_frame
             # Targeted invalidation: only drop memo for this tile's face
             self._resolve_memo.pop((key[0], key[1], key[2]), None)
+            uploaded_count += 1
+
+        return uploaded_count
 
     def use(self, location: int = 14):
         """Bind the texture array to a texture unit."""

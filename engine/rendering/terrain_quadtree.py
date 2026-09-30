@@ -254,7 +254,7 @@ if _HAS_NUMBA:
         return out[:count]
 
     @njit(fastmath=True)
-    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km):
+    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km, caster_idx=-1.0):
         n = raw_patches.shape[0]
         for i in range(n):
             idx = st + i
@@ -276,11 +276,11 @@ if _HAS_NUMBA:
             staging[idx, 15] = h_oy[i]
             staging[idx, 16] = elev_min_km
             staging[idx, 17] = elev_span_km
-            staging[idx, 18] = 0.0
+            staging[idx, 18] = caster_idx
             staging[idx, 19] = 0.0
 
     @njit(fastmath=True)
-    def pack_cloud_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+    def pack_cloud_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, caster_idx=-1.0):
         n = raw_patches.shape[0]
         for i in range(n):
             idx = st + i
@@ -302,7 +302,7 @@ if _HAS_NUMBA:
             staging[idx, 15] = 0.0
             staging[idx, 16] = 0.0
             staging[idx, 17] = 0.0
-            staging[idx, 18] = 0.0
+            staging[idx, 18] = caster_idx
             staging[idx, 19] = 0.0
 
     # Warmup Numba JIT at import time to prevent first-frame runtime stutter
@@ -315,12 +315,12 @@ if _HAS_NUMBA:
         _dummy_raw = np.zeros((1, 9), dtype=np.float32)
         _dummy_f = np.zeros(1, dtype=np.float32)
         _dummy_staging = np.zeros((1, 20), dtype=np.float32)
-        pack_terrain_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, 0.0)
-        pack_cloud_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0)
+        pack_terrain_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, 0.0, -1.0)
+        pack_cloud_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, -1.0)
     except Exception:
         pass
 else:
-    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km):
+    def pack_terrain_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, h_uvs, h_ox, h_oy, h_slots, elev_min_km, elev_span_km, caster_idx=-1.0):
         n = raw_patches.shape[0]
         staging[st:st+n, 0:4] = raw_patches[:, 0:4]
         staging[st:st+n, 4] = uvs
@@ -337,10 +337,10 @@ else:
         staging[st:st+n, 15] = h_oy
         staging[st:st+n, 16] = elev_min_km
         staging[st:st+n, 17] = elev_span_km
-        staging[st:st+n, 18] = 0.0
+        staging[st:st+n, 18] = caster_idx
         staging[st:st+n, 19] = 0.0
 
-    def pack_cloud_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+    def pack_cloud_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx, caster_idx=-1.0):
         n = raw_patches.shape[0]
         staging[st:st+n, 0:4] = raw_patches[:, 0:4]
         staging[st:st+n, 4] = uvs
@@ -352,7 +352,9 @@ else:
         staging[st:st+n, 10] = slots
         staging[st:st+n, 11] = body_idx
         staging[st:st+n, 12] = -1.0
-        staging[st:st+n, 13:20] = 0.0
+        staging[st:st+n, 13:18] = 0.0
+        staging[st:st+n, 18] = caster_idx
+        staging[st:st+n, 19] = 0.0
 
 
 class PlanetQuadtree:

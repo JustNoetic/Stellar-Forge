@@ -289,13 +289,21 @@ void main() {
     f_tile_slot = t_inst.u_meta.z;
     f_lod_level = t_inst.u_meta.y;
 
-    // Match atmospheric parameters from SceneData for this body
+    // Match atmospheric parameters from SceneData for this body (O(1) direct lookup)
     vec3 atmo_tint = vec3(0.0);
     float atmo_h = 0.0;
     float scale_height = 0.0;
     vec3 o3_tau = vec3(0.0);
     vec2 o3_layer = vec2(0.0, 6.0);
-    for (int j = 0; j < u_num_casters; j++) {
+    int c_idx = int(t_inst.u_hrange.z + 0.5);
+    if (c_idx >= 0 && c_idx < u_num_casters) {
+        atmo_tint = u_caster_atmos[c_idx].xyz;
+        atmo_h = u_caster_atmos[c_idx].w;
+        scale_height = u_caster_colors[c_idx].w;
+        o3_tau = u_caster_ozone_vert[c_idx].xyz;
+        o3_layer = vec2(u_caster_ozone[c_idx].w, max(u_caster_ozone_vert[c_idx].w, 0.1));
+    } else {
+        for (int j = 0; j < u_num_casters; j++) {
         if (distance(u_casters[j].xyz, body_pos) < 1e-6) {
             atmo_tint = u_caster_atmos[j].xyz;
             atmo_h = u_caster_atmos[j].w;
@@ -303,6 +311,7 @@ void main() {
             o3_tau = u_caster_ozone_vert[j].xyz;
             o3_layer = vec2(u_caster_ozone[j].w, max(u_caster_ozone_vert[j].w, 0.1));
             break;
+        }
         }
     }
     f_atmo_tint = atmo_tint;
