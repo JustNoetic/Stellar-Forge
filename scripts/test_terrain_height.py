@@ -195,7 +195,7 @@ def test_streaming(ctx):
             for pack in [pack_terrain_patches_jit, getattr(pack_terrain_patches_jit, 'py_func', pack_terrain_patches_jit)]:
                 pack(staging, 0, raw_patches, scales[0], ox[0], oy[0], slots[0], 3., scales[1], ox[1], oy[1], slots[1], -2., 10.)
                 np.testing.assert_array_equal(staging[0, 13:18], [0.25, 0.25, 0.25, -2, 10])
-            cloud = staging.copy(); pack_cloud_patches_jit(cloud, staging, 0, 1, scales[0], ox[0], oy[0], slots[0])
+            cloud = np.zeros((1, 20), 'f4'); pack_cloud_patches_jit(cloud, 0, raw_patches, scales[0], ox[0], oy[0], slots[0], 3.)
             assert cloud[0, 12] == -1 and staging[0, 12] >= 0
             save('height', 200); streamer.reload_layer('Earth', 'height'); streamer.process_uploads()
             slot, *_ = streamer.get_tile_slot_or_fallback('Earth', 'height', 0, 0, 0, 0)
@@ -261,7 +261,7 @@ def test_cpu_fallback():
                                         values, values, values, values, -2., 10.)
         assert np.all(staging[:, 16:18] == [-2, 10])
         cloud = np.zeros_like(staging)
-        module.pack_cloud_patches_jit(cloud, staging, 0, 2, values, values, values, values)
+        module.pack_cloud_patches_jit(cloud, 0, raw, values, values, values, values, 2.)
         assert np.all(cloud[:, 12] == -1)
     assert results[0] == results[1]
     print('JIT/no-Numba traversal agree; elevated bounds and both packing paths passed')

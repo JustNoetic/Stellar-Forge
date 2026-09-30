@@ -531,6 +531,8 @@ class App(InputHandlerMixin):
             "atmo_sky_view_res": 0,
             "atmo_enabled": True,
             "clouds_enabled": True,
+            "cloud_max_depth": 3,
+            "cloud_lod_split_factor": 1.0,
             "refraction_enabled": True,
             "grav_lensing_enabled": True,
             "grav_lensing_multiplier": 1.0,
@@ -754,6 +756,8 @@ class App(InputHandlerMixin):
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "clouds_enabled": self.camera.get("clouds_enabled", True),
+                "cloud_max_depth": self.camera.get("cloud_max_depth", 3),
+                "cloud_lod_split_factor": self.camera.get("cloud_lod_split_factor", 1.0),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_mode": self.camera.get("bloom_mode", 2),
                 "conv_bloom_intensity": self.camera.get("conv_bloom_intensity", 0.5),
@@ -2336,6 +2340,9 @@ class App(InputHandlerMixin):
         self.terrain_current_body_idx = -1
         self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=256, tile_size=512)
         self.planet_quadtrees = {}
+        self.planet_cloud_quadtrees = {}
+        self.terrain_active_cloud_patches = {}
+        self.terrain_last_cloud_patch_count = 0
         self._cull_terrain_suppression_on = False
         if 'u_terrain_body_idx' in prog_culling_compute:
             prog_culling_compute['u_terrain_body_idx'].value = -1
@@ -5336,6 +5343,8 @@ class App(InputHandlerMixin):
 
             # Pass 1b: Terrain Quadtree LOD (SpaceEngine style) - Multi-Body with Local Frustum Culling
             self.terrain_active_body_patches = {}
+            self.terrain_active_cloud_patches = {}
+            self.terrain_last_cloud_patch_count = 0
             total_patches_rendered = 0
 
             if active_terrain_bodies and getattr(self, 'terrain_streamer', None) is not None:
@@ -5457,7 +5466,7 @@ class App(InputHandlerMixin):
                         obl=obl,
                         max_patches=rem_budget,
                         frustum_planes=local_frustum_planes,
-                        cloud_alt_km=b_cloud_alt_km,
+                        cloud_alt_km=0.0,
                         refract_bend=body_refract_bend, height_max_km=height_max_km
                     )
                     num_p = len(raw_patches)
@@ -5474,7 +5483,7 @@ class App(InputHandlerMixin):
                             obl=obl,
                             max_patches=min(rem_budget, 6),
                             frustum_planes=None,
-                            cloud_alt_km=b_cloud_alt_km,
+                            cloud_alt_km=0.0,
                             refract_bend=body_refract_bend, height_max_km=height_max_km
                         )
                         num_p = len(raw_patches)
@@ -5498,8 +5507,61 @@ class App(InputHandlerMixin):
                         self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
                         total_patches_rendered += num_p
 
+                    # Decoupled Cloud Quadtree LOD Traversal
+                    if _body_has_clouds(b_i, is_cmp=False) and bool(self.camera.get("clouds_enabled", True)):
+                        max_cloud_disk_lod = self.terrain_streamer.get_max_lod(b_name, "clouds")
+                        if max_cloud_disk_lod >= 0:
+                            cloud_max_d = int(self.camera.get("cloud_max_depth", 3))
+                            cloud_split_fac = float(self.camera.get("cloud_lod_split_factor", 1.0)) * res_scale
+                            cloud_target_lod = min(cloud_max_d, max_cloud_disk_lod)
+                            cloud_r_km = b_r_km + b_cloud_alt_km
+
+                            if b_i not in self.planet_cloud_quadtrees:
+                                self.planet_cloud_quadtrees[b_i] = PlanetQuadtree(cloud_r_km)
+                            p_cloud_quadtree = self.planet_cloud_quadtrees[b_i]
+                            p_cloud_quadtree.update_radius(cloud_r_km)
+
+                            cloud_raw_patches = p_cloud_quadtree.traverse_raw(
+                                cam_pos_local,
+                                fov_deg=float(self.camera["fov"]),
+                                screen_height=float(self.fb_height),
+                                max_lod=cloud_target_lod,
+                                split_factor=cloud_split_fac,
+                                obl=obl,
+                                max_patches=MAX_TERRAIN_PATCHES,
+                                frustum_planes=local_frustum_planes,
+                                cloud_alt_km=0.0,
+                                refract_bend=body_refract_bend,
+                                height_max_km=0.0
+                            )
+                            num_cloud_p = len(cloud_raw_patches)
+                            if num_cloud_p == 0:
+                                cloud_raw_patches = p_cloud_quadtree.traverse_raw(
+                                    cam_pos_local,
+                                    fov_deg=float(self.camera["fov"]),
+                                    screen_height=float(self.fb_height),
+                                    max_lod=0,
+                                    split_factor=cloud_split_fac,
+                                    obl=obl,
+                                    max_patches=6,
+                                    frustum_planes=None,
+                                    cloud_alt_km=0.0,
+                                    refract_bend=body_refract_bend,
+                                    height_max_km=0.0
+                                )
+                                num_cloud_p = len(cloud_raw_patches)
+
+                            if num_cloud_p > 0:
+                                c_slots, c_uvs, c_ox, c_oy = self.terrain_streamer.resolve_tiles_batch(
+                                    b_name, "clouds",
+                                    cloud_raw_patches[:, 4], cloud_raw_patches[:, 5],
+                                    cloud_raw_patches[:, 6], cloud_raw_patches[:, 7]
+                                )
+                                self.terrain_active_cloud_patches[b_i] = (cloud_raw_patches, c_slots, c_uvs, c_ox, c_oy, num_cloud_p)
+
                 self.terrain_last_patch_count = total_patches_rendered
-                self.terrain_last_triangle_count = total_patches_rendered * self.terrain_triangles_per_patch
+                self.terrain_last_cloud_patch_count = sum(info[5] for info in self.terrain_active_cloud_patches.values())
+                self.terrain_last_triangle_count = (total_patches_rendered + self.terrain_last_cloud_patch_count) * self.terrain_triangles_per_patch
 
                 if total_patches_rendered > 0:
                     first_b_i = active_terrain_bodies[0][0]
@@ -6802,23 +6864,17 @@ class App(InputHandlerMixin):
                 if not _body_has_clouds(bi, is_cmp=is_cmp):
                     return
 
-                # If this body has active terrain LOD patches, render clouds using the high-performance Quadtree LOD shell
-                body_terrain_info = self.terrain_active_body_patches.get(bi) if (not is_cmp and hasattr(self, 'terrain_active_body_patches')) else None
-                if (body_terrain_info is not None and getattr(self, 'terrain_streamer', None) is not None):
-                    raw_p, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st_idx, num_p = body_terrain_info
+                # If this body has active terrain LOD cloud patches, render clouds using the high-performance Quadtree LOD shell
+                body_cloud_info = self.terrain_active_cloud_patches.get(bi) if (not is_cmp and hasattr(self, 'terrain_active_cloud_patches')) else None
+                if (body_cloud_info is not None and getattr(self, 'terrain_streamer', None) is not None):
+                    cloud_raw_p, c_slots, c_uvs, c_ox, c_oy, num_p = body_cloud_info
                     if num_p > 0:
-                        cloud_staged_count = 0
-                        slot_arr, uvc, c_ox, c_oy = self.terrain_streamer.resolve_tiles_batch(
-                            b_name, "clouds",
-                            raw_p[:, 4], raw_p[:, 5], raw_p[:, 6], raw_p[:, 7]
-                        )
-                        pack_cloud_patches_jit(
-                            self.terrain_cloud_staging, self.terrain_patch_staging,
-                            st_idx, num_p, uvc, c_ox, c_oy, slot_arr
-                        )
-                        cloud_staged_count = int(np.count_nonzero(slot_arr >= 0.0))
-
+                        cloud_staged_count = int(np.count_nonzero(c_slots >= 0.0))
                         if cloud_staged_count > 0:
+                            pack_cloud_patches_jit(
+                                self.terrain_cloud_staging, 0,
+                                cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi)
+                            )
                             self.hdr_resolve_fbo.use()
                             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                             ctx.enable(moderngl.BLEND)

@@ -15,7 +15,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import moderngl
-from engine.rendering.terrain_quadtree import PlanetQuadtree, cube_to_sphere_point
+from engine.rendering.terrain_quadtree import PlanetQuadtree, cube_to_sphere_point, pack_cloud_patches_jit
 from engine.rendering.terrain_streamer import TerrainTileStreamer
 from engine.rendering.render_utils import create_terrain_grid_patch
 from engine.rendering.shaders import terrain_vertex_shader, terrain_fragment_shader
@@ -223,6 +223,51 @@ def test_cloud_horizon_culling_and_oblateness():
     print("    Cloud horizon culling successfully extends quadtree coverage past limb! (PASSED)")
 
 
+def test_decoupled_cloud_quadtree():
+    print("--> Testing Decoupled Cloud Quadtree LOD Traversal & Packing...")
+    r_earth = 6371.0
+    cloud_alt = 3.5
+    cloud_r = r_earth + cloud_alt
+
+    q_terrain = PlanetQuadtree(radius_km=r_earth, max_lod=6, split_factor=1.0)
+    q_clouds = PlanetQuadtree(radius_km=cloud_r, max_lod=3, split_factor=1.0)
+
+    # Observer near Earth surface (altitude 2 km)
+    cam_ground = np.array([0.0, 0.0, r_earth + 2.0], dtype=np.float32)
+
+    # 1. Ground terrain traversal (cloud_alt_km=0.0)
+    p_ground = q_terrain.traverse_raw(cam_ground, fov_deg=60.0, screen_height=1080.0, max_lod=6, cloud_alt_km=0.0)
+    max_ground_lod = int(np.max(p_ground[:, 5]))
+    print(f"    Ground patches: {len(p_ground)}, Max ground LOD: {max_ground_lod}")
+    assert max_ground_lod >= 4, f"Ground terrain should subdivide deeply, got LOD {max_ground_lod}"
+
+    # 2. Decoupled cloud traversal capped to cloud_max_depth = 3
+    p_clouds = q_clouds.traverse_raw(cam_ground, fov_deg=60.0, screen_height=1080.0, max_lod=3, cloud_alt_km=0.0)
+    max_cloud_lod = int(np.max(p_clouds[:, 5]))
+    print(f"    Cloud patches:  {len(p_clouds)}, Max cloud LOD:  {max_cloud_lod}")
+    assert max_cloud_lod <= 3, f"Cloud LOD should be capped at 3, got LOD {max_cloud_lod}"
+    assert len(p_clouds) <= len(p_ground), f"Decoupled cloud patch count ({len(p_clouds)}) should be <= ground ({len(p_ground)})"
+
+    # 3. Test pack_cloud_patches_jit packing
+    num_cp = len(p_clouds)
+    staging = np.zeros((num_cp, 20), dtype=np.float32)
+    fake_uvs = np.ones(num_cp, dtype=np.float32) * 0.5
+    fake_ox = np.zeros(num_cp, dtype=np.float32)
+    fake_oy = np.zeros(num_cp, dtype=np.float32)
+    fake_slots = np.ones(num_cp, dtype=np.float32) * 2.0
+    body_idx = 3.0
+
+    pack_cloud_patches_jit(staging, 0, p_clouds, fake_uvs, fake_ox, fake_oy, fake_slots, body_idx)
+
+    assert np.allclose(staging[:, 0:4], p_clouds[:, 0:4]), "Cloud patch u/v ranges must match raw_patches"
+    assert np.allclose(staging[:, 4], 0.5), "Cloud uv_scale must match passed uvs"
+    assert np.allclose(staging[:, 7], 0.0), "Cloud skirts must be 0.0"
+    assert np.allclose(staging[:, 10], 2.0), "Cloud tile slot must match passed slots"
+    assert np.allclose(staging[:, 11], body_idx), "Cloud body_idx must match"
+    assert np.allclose(staging[:, 12], -1.0), "Cloud height slot must be -1.0 (disabled)"
+    print("    Decoupled cloud quadtree traversal and packing verified! (PASSED)")
+
+
 def test_terrain_refraction_ground_to_ground_and_space():
     print("--> Testing Terrain LOD Refraction (Ground-to-Ground & Ground-to-Space)...")
     ctx = moderngl.create_context(standalone=True)
@@ -401,6 +446,7 @@ def main():
     test_quadtree_subdivision()
     test_quadtree_frustum_culling_and_low_fov()
     test_cloud_horizon_culling_and_oblateness()
+    test_decoupled_cloud_quadtree()
     test_tiled_streamer_and_fallback()
     test_gpu_terrain_rendering_pipeline()
     test_terrain_refraction_ground_to_ground_and_space()

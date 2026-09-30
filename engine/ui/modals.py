@@ -288,6 +288,25 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             if imgui.is_item_hovered():
                 imgui.set_tooltip("Toggle dynamic planetary cloud layers and quadtree cloud shells on/off across all bodies.")
 
+            if app.camera.get("clouds_enabled", True):
+                imgui.indent()
+                c_max_d = int(app.camera.get("cloud_max_depth", 3))
+                changed_cmd, c_max_d = imgui.slider_int("Cloud Max LOD Depth", c_max_d, 0, 5)
+                if changed_cmd:
+                    app.camera["cloud_max_depth"] = c_max_d
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Maximum quadtree LOD depth for planetary cloud shells (default 3).\nDecoupled from terrain: prevents high-LOD over-tessellation at ground level.")
+
+                c_split_f = float(app.camera.get("cloud_lod_split_factor", 1.0))
+                changed_csf, c_split_f = imgui.slider_float("Cloud LOD Sensitivity", c_split_f, 0.5, 3.0, "%.2fx")
+                if changed_csf:
+                    app.camera["cloud_lod_split_factor"] = c_split_f
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("LOD subdivision distance threshold multiplier for planetary clouds.")
+                imgui.unindent()
+
             changed_refr, app.camera["refraction_enabled"] = imgui.checkbox("Enable Atmospheric Refraction", app.camera.get("refraction_enabled", True))
             if changed_refr: settings_changed = True
 
@@ -392,8 +411,12 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     res_cnt = len(app.terrain_streamer.resident_tiles)
                     cap = app.terrain_streamer.pool_capacity
                     p_cnt = getattr(app, 'terrain_last_patch_count', 0)
+                    cp_cnt = getattr(app, 'terrain_last_cloud_patch_count', 0)
                     t_cnt = getattr(app, 'terrain_last_triangle_count', 0)
-                    imgui.text_disabled(f"Resident Tiles: {res_cnt} / {cap} ({(res_cnt/cap)*100:.0f}%) | Patches: {p_cnt:,} | Tris: {t_cnt:,}")
+                    if cp_cnt > 0:
+                        imgui.text_disabled(f"Resident Tiles: {res_cnt}/{cap} ({(res_cnt/cap)*100:.0f}%) | Ground: {p_cnt:,} p | Clouds: {cp_cnt:,} p | Tris: {t_cnt:,}")
+                    else:
+                        imgui.text_disabled(f"Resident Tiles: {res_cnt}/{cap} ({(res_cnt/cap)*100:.0f}%) | Patches: {p_cnt:,} | Tris: {t_cnt:,}")
                 imgui.unindent()
 
 

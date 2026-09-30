@@ -61,9 +61,21 @@ def render_viewport_hud(app, bodies_data):
             imgui.separator()
             imgui.text(f"Total:   {total_tris:,}")
             p_res = int(app.camera.get("terrain_patch_res", 32))
-            imgui.text_colored(f"Terrain: {terrain_tris:,}", 0.3, 1.0, 0.5)
-            imgui.same_line()
-            imgui.text_disabled(f"({patches:,} patches @ {p_res}x{p_res})")
+            tris_per_p = p_res * p_res * 2
+            cp_cnt = getattr(app, "terrain_last_cloud_patch_count", 0)
+            if cp_cnt > 0:
+                g_tris = patches * tris_per_p
+                c_tris = cp_cnt * tris_per_p
+                imgui.text_colored(f"Ground:  {g_tris:,}", 0.3, 1.0, 0.5)
+                imgui.same_line()
+                imgui.text_disabled(f"({patches:,} patches @ {p_res}x{p_res})")
+                imgui.text_colored(f"Clouds:  {c_tris:,}", 0.7, 0.9, 1.0)
+                imgui.same_line()
+                imgui.text_disabled(f"({cp_cnt:,} patches)")
+            else:
+                imgui.text_colored(f"Terrain: {terrain_tris:,}", 0.3, 1.0, 0.5)
+                imgui.same_line()
+                imgui.text_disabled(f"({patches:,} patches @ {p_res}x{p_res})")
             if sphere_tris > 0:
                 imgui.text(f"Spheres: {sphere_tris:,}")
 

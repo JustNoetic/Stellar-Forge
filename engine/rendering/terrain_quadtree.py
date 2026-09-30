@@ -280,17 +280,30 @@ if _HAS_NUMBA:
             staging[idx, 19] = 0.0
 
     @njit(fastmath=True)
-    def pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr):
-        for i in range(num_p):
-            src_idx = st_idx + i
-            for c in range(20):
-                cloud_staging[i, c] = terrain_staging[src_idx, c]
-            cloud_staging[i, 4] = uvc[i]
-            cloud_staging[i, 5] = c_ox[i]
-            cloud_staging[i, 6] = c_oy[i]
-            cloud_staging[i, 10] = slot_arr[i]
-            # Cloud shells radiate from the base radius: disable height displacement
-            cloud_staging[i, 12] = -1.0
+    def pack_cloud_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+        n = raw_patches.shape[0]
+        for i in range(n):
+            idx = st + i
+            staging[idx, 0] = raw_patches[i, 0]
+            staging[idx, 1] = raw_patches[i, 1]
+            staging[idx, 2] = raw_patches[i, 2]
+            staging[idx, 3] = raw_patches[i, 3]
+            staging[idx, 4] = uvs[i]
+            staging[idx, 5] = ox_arr[i]
+            staging[idx, 6] = oy_arr[i]
+            staging[idx, 7] = 0.0
+            staging[idx, 8] = raw_patches[i, 4]
+            staging[idx, 9] = raw_patches[i, 5]
+            staging[idx, 10] = slots[i]
+            staging[idx, 11] = body_idx
+            staging[idx, 12] = -1.0
+            staging[idx, 13] = 0.0
+            staging[idx, 14] = 0.0
+            staging[idx, 15] = 0.0
+            staging[idx, 16] = 0.0
+            staging[idx, 17] = 0.0
+            staging[idx, 18] = 0.0
+            staging[idx, 19] = 0.0
 
     # Warmup Numba JIT at import time to prevent first-frame runtime stutter
     try:
@@ -303,8 +316,7 @@ if _HAS_NUMBA:
         _dummy_f = np.zeros(1, dtype=np.float32)
         _dummy_staging = np.zeros((1, 20), dtype=np.float32)
         pack_terrain_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0, 0.0)
-        _dummy_cloud = np.zeros((1, 20), dtype=np.float32)
-        pack_cloud_patches_jit(_dummy_cloud, _dummy_staging, 0, 1, _dummy_f, _dummy_f, _dummy_f, _dummy_f)
+        pack_cloud_patches_jit(_dummy_staging, 0, _dummy_raw, _dummy_f, _dummy_f, _dummy_f, _dummy_f, 0.0)
     except Exception:
         pass
 else:
@@ -328,14 +340,19 @@ else:
         staging[st:st+n, 18] = 0.0
         staging[st:st+n, 19] = 0.0
 
-    def pack_cloud_patches_jit(cloud_staging, terrain_staging, st_idx, num_p, uvc, c_ox, c_oy, slot_arr):
-        cloud_staging[:num_p] = terrain_staging[st_idx:st_idx + num_p]
-        cloud_staging[:num_p, 4] = uvc
-        cloud_staging[:num_p, 5] = c_ox
-        cloud_staging[:num_p, 6] = c_oy
-        cloud_staging[:num_p, 10] = slot_arr
-        # Cloud shells radiate from the base radius: disable height displacement
-        cloud_staging[:num_p, 12] = -1.0
+    def pack_cloud_patches_jit(staging, st, raw_patches, uvs, ox_arr, oy_arr, slots, body_idx):
+        n = raw_patches.shape[0]
+        staging[st:st+n, 0:4] = raw_patches[:, 0:4]
+        staging[st:st+n, 4] = uvs
+        staging[st:st+n, 5] = ox_arr
+        staging[st:st+n, 6] = oy_arr
+        staging[st:st+n, 7] = 0.0
+        staging[st:st+n, 8] = raw_patches[:, 4]
+        staging[st:st+n, 9] = raw_patches[:, 5]
+        staging[st:st+n, 10] = slots
+        staging[st:st+n, 11] = body_idx
+        staging[st:st+n, 12] = -1.0
+        staging[st:st+n, 13:20] = 0.0
 
 
 class PlanetQuadtree:

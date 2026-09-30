@@ -4,7 +4,11 @@ Validates ring_generator.py profiles, presets, mathematical properties,
 and texture_baker integration.
 """
 
+import os
 import sys
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 import numpy as np
 from PIL import Image
 
