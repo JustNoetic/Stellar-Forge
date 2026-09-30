@@ -37,6 +37,7 @@ class InputHandlerMixin:
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
+                "clouds_enabled": self.camera.get("clouds_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_mode": self.camera.get("bloom_mode", 2),
                 "conv_bloom_intensity": self.camera.get("conv_bloom_intensity", 0.5),

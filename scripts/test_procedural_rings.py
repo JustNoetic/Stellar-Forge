@@ -79,10 +79,76 @@ def test_custom_parameters():
     assert arr[:, 0].mean() > arr[:, 2].mean(), "Red tint should make R > B"
     print("  [PASS] Custom parameters override test passed.")
 
+def test_apply_procedural_ring_multi_layer():
+    """Verify applying procedural ring to a body with multiple existing layers doesn't crash on unhashable dict."""
+    from engine.rendering.texture_baker import apply_procedural_ring_to_body
+    
+    class MockApp:
+        def __init__(self):
+            self.ring_textures = {}
+            self.ring_gl_textures = {}
+            self.camera = {}
+    
+    app = MockApp()
+    bodies_data = [
+        {'name': 'Saturn', 'r': 58232.0 / 696340.0, 'rings': [{'inner': 1.2, 'outer': 2.3}]}
+    ]
+    visual_arr = np.zeros((1, 8), dtype=np.float32)
+    visual_arr[0, 5:8] = [0.0, 1.0, 0.0]
+    
+    # 3 existing ring layers for Saturn
+    ring_precomputed = [
+        {
+            'body_idx': 0, 'pole': np.array([0.0, 1.0, 0.0], dtype='f4'),
+            'inner_r': 0.0004, 'outer_r': 0.0008, 'opacity': 1.0,
+            'scatter': 1.0, 'asymmetry': 0.5, 'backscatter': -0.3,
+            'unlit_factor': 1.0, 'shadow_grad': np.zeros((4096, 4), dtype='f4'),
+            'color': (1.0, 1.0, 1.0), 'raw_color': (1.0, 1.0, 1.0),
+            'gradient': [], 'tex_sampled': None, '5colors': np.zeros((5, 4), dtype='f4'),
+            'is_textured': False, 'row_idx': 0
+        },
+        {
+            'body_idx': 0, 'pole': np.array([0.0, 1.0, 0.0], dtype='f4'),
+            'inner_r': 0.0009, 'outer_r': 0.0010, 'opacity': 0.5,
+            'scatter': 1.0, 'asymmetry': 0.5, 'backscatter': -0.3,
+            'unlit_factor': 1.0, 'shadow_grad': np.zeros((4096, 4), dtype='f4'),
+            'color': (0.8, 0.8, 0.8), 'raw_color': (0.8, 0.8, 0.8),
+            'gradient': [], 'tex_sampled': None, '5colors': np.zeros((5, 4), dtype='f4'),
+            'is_textured': False, 'row_idx': 1
+        },
+        {
+            'body_idx': 0, 'pole': np.array([0.0, 1.0, 0.0], dtype='f4'),
+            'inner_r': 0.0011, 'outer_r': 0.0015, 'opacity': 0.2,
+            'scatter': 1.0, 'asymmetry': 0.5, 'backscatter': -0.3,
+            'unlit_factor': 1.0, 'shadow_grad': np.zeros((4096, 4), dtype='f4'),
+            'color': (0.6, 0.6, 0.6), 'raw_color': (0.6, 0.6, 0.6),
+            'gradient': [], 'tex_sampled': None, '5colors': np.zeros((5, 4), dtype='f4'),
+            'is_textured': False, 'row_idx': 2
+        }
+    ]
+    
+    success = apply_procedural_ring_to_body(
+        app,
+        body_idx=0,
+        preset="Saturnian Ice",
+        seed=42,
+        bodies_data=bodies_data,
+        visual_arr=visual_arr,
+        ring_precomputed=ring_precomputed,
+        bake_to_disk=False
+    )
+    assert success is True, "apply_procedural_ring_to_body returned False"
+    assert len(ring_precomputed) == 1, f"Expected 1 ring layer after procedural replacement, got {len(ring_precomputed)}"
+    assert ring_precomputed[0]['is_textured'] is True, "Expected procedural ring layer to be textured"
+    assert ring_precomputed[0]['row_idx'] == 0, "Expected row_idx to be 0"
+    assert 'saturn' in app.ring_textures, "Expected 'saturn' in app.ring_textures"
+    print("  [PASS] apply_procedural_ring_to_body multi-layer replacement test passed.")
+
 if __name__ == "__main__":
     print("Running Stellar-Forge Procedural Ring Test Suite...")
     test_noise_continuity()
     test_all_presets()
     test_seed_determinism()
     test_custom_parameters()
+    test_apply_procedural_ring_multi_layer()
     print("\nAll Procedural Ring tests PASSED successfully!")

@@ -530,6 +530,7 @@ class App(InputHandlerMixin):
             "atmo_sky_view_steps": 24,
             "atmo_sky_view_res": 0,
             "atmo_enabled": True,
+            "clouds_enabled": True,
             "refraction_enabled": True,
             "grav_lensing_enabled": True,
             "grav_lensing_multiplier": 1.0,
@@ -752,6 +753,7 @@ class App(InputHandlerMixin):
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
+                "clouds_enabled": self.camera.get("clouds_enabled", True),
                 "exposure": self.camera.get("exposure", 1.0),
                 "bloom_mode": self.camera.get("bloom_mode", 2),
                 "conv_bloom_intensity": self.camera.get("conv_bloom_intensity", 0.5),
@@ -5307,6 +5309,8 @@ class App(InputHandlerMixin):
 
             # Helper to check if a body has a cloud layer texture
             def _body_has_clouds(bi, is_cmp=False):
+                if not self.camera.get("clouds_enabled", True):
+                    return False
                 if 'u_is_cloud_pass' not in prog_spheres or getattr(self, 'body_textures_ssbo', None) is None:
                     return False
                 bdata = bodies_data_cmp if is_cmp else bodies_data

@@ -174,6 +174,9 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         c_atmo, app.camera["atmo_enabled"] = imgui.checkbox("Volumetric Atmosphere", app.camera.get("atmo_enabled", True))
         if c_atmo: settings_changed = True
 
+        c_clouds, app.camera["clouds_enabled"] = imgui.checkbox("Dynamic Clouds", app.camera.get("clouds_enabled", True))
+        if c_clouds: settings_changed = True
+
         c_stoch, app.camera["atmo_stochastic"] = imgui.checkbox("Stochastic Raymarching", app.camera.get("atmo_stochastic", True))
         if c_stoch: settings_changed = True
 

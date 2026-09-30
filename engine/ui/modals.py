@@ -283,6 +283,11 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
             changed_atmo, app.camera["atmo_enabled"] = imgui.checkbox("Enable Atmosphere Rendering", app.camera.get("atmo_enabled", True))
             if changed_atmo: settings_changed = True
 
+            changed_clouds, app.camera["clouds_enabled"] = imgui.checkbox("Enable Dynamic Cloud Layers", app.camera.get("clouds_enabled", True))
+            if changed_clouds: settings_changed = True
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Toggle dynamic planetary cloud layers and quadtree cloud shells on/off across all bodies.")
+
             changed_refr, app.camera["refraction_enabled"] = imgui.checkbox("Enable Atmospheric Refraction", app.camera.get("refraction_enabled", True))
             if changed_refr: settings_changed = True
 

@@ -1601,8 +1601,36 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
 
                     if imgui.button(f"Remove Layer##{i}"):
+                        was_textured = ring_item.get('is_textured', False)
                         ring_precomputed[:] = [r for r in ring_precomputed if r is not ring_item]
                         app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+                        b_name = cur_bodies_data[insp_idx]['name'].lower()
+                        has_other_tex = any(r.get('is_textured', False) for r in ring_precomputed if r['body_idx'] == insp_idx)
+                        if was_textured and not has_other_tex:
+                            if hasattr(app, 'ring_textures'):
+                                app.ring_textures.pop(b_name, None)
+                            if hasattr(app, 'ring_gl_textures'):
+                                old_gl = app.ring_gl_textures.pop(b_name, None)
+                                if old_gl is not None:
+                                    try:
+                                        old_gl.release()
+                                    except Exception:
+                                        pass
+                            cur_bodies_data[insp_idx].pop("ring_texture_inner", None)
+                            cur_bodies_data[insp_idx].pop("ring_texture_outer", None)
+                        if not any(r['body_idx'] == insp_idx for r in ring_precomputed):
+                            cur_bodies_data[insp_idx].pop("rings", None)
+                            cur_bodies_data[insp_idx].pop("ring_texture_inner", None)
+                            cur_bodies_data[insp_idx].pop("ring_texture_outer", None)
+                            if hasattr(app, 'ring_textures'):
+                                app.ring_textures.pop(b_name, None)
+                            if hasattr(app, 'ring_gl_textures'):
+                                old_gl = app.ring_gl_textures.pop(b_name, None)
+                                if old_gl is not None:
+                                    try:
+                                        old_gl.release()
+                                    except Exception:
+                                        pass
 
                     imgui.tree_pop()
 

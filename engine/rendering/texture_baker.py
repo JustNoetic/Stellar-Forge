@@ -2,6 +2,7 @@ import os
 import numpy as np
 from PIL import Image
 import moderngl
+from engine.path_utils import get_external_path
 from engine.rendering.render_utils import (
     generate_ring_shadow_grad, 
     rebuild_ring_render_group, 
@@ -13,8 +14,7 @@ from engine.rendering.ring_generator import generate_procedural_ring_profile, RI
 def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=None, ring_render_groups=None, ring_gradient_tex=None):
     name_lower = body_name.lower()
 
-    root_dir = getattr(app, 'root_dir', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    base_textures = os.path.join(root_dir, 'textures')
+    base_textures = get_external_path('textures')
 
     system_name = getattr(app, 'loaded_system_name', 'Solar System') or 'Solar System'
 
@@ -74,6 +74,13 @@ def bake_and_export_ring_textures(app, body_name, ring_item, ring_precomputed=No
     tex.build_mipmaps()
     tex.anisotropy = aniso_value
 
+    if hasattr(app, 'ring_gl_textures') and name_lower in app.ring_gl_textures:
+        try:
+            old_tex = app.ring_gl_textures[name_lower]
+            if old_tex is not None and old_tex is not tex:
+                old_tex.release()
+        except Exception:
+            pass
     app.ring_gl_textures[name_lower] = tex
 
     ring_item['saturation'] = 1.0
@@ -167,6 +174,13 @@ def apply_procedural_ring_to_body(
         tex.repeat_y = False
         tex.build_mipmaps()
         tex.anisotropy = aniso_value
+        if hasattr(app, 'ring_gl_textures') and name_lower in app.ring_gl_textures:
+            try:
+                old_tex = app.ring_gl_textures[name_lower]
+                if old_tex is not None and old_tex is not tex:
+                    old_tex.release()
+            except Exception:
+                pass
         app.ring_gl_textures[name_lower] = tex
 
     # Resolve pole normal
@@ -179,6 +193,10 @@ def apply_procedural_ring_to_body(
     pole_n = pole_render / pole_norm if pole_norm > 1e-8 else np.array([0.0, 1.0, 0.0])
 
     ring_precomputed = ring_precomputed if ring_precomputed is not None else getattr(app, 'ring_precomputed', None)
+    if ring_precomputed is None:
+        ring_precomputed = []
+        if hasattr(app, 'ring_precomputed'):
+            app.ring_precomputed = ring_precomputed
     ring_render_groups = ring_render_groups if ring_render_groups is not None else getattr(app, 'ring_render_groups', None)
     ring_gradient_tex = ring_gradient_tex if ring_gradient_tex is not None else getattr(app, 'ring_gradient_tex', None)
     prog_rings = prog_rings if prog_rings is not None else getattr(app, 'prog_rings', None)
@@ -213,8 +231,8 @@ def apply_procedural_ring_to_body(
         r_item['alpha_boost'] = 1.0
 
         if len(existing) > 1:
-            extras = set(existing[1:])
-            ring_precomputed[:] = [r for r in ring_precomputed if r not in extras]
+            extras_ids = {id(r) for r in existing[1:]}
+            ring_precomputed[:] = [r for r in ring_precomputed if id(r) not in extras_ids]
             for idx, r in enumerate(ring_precomputed):
                 r['row_idx'] = idx
     else:
@@ -267,8 +285,7 @@ def apply_procedural_ring_to_body(
     }]
 
     if bake_to_disk:
-        root_dir = getattr(app, 'root_dir', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        base_textures = os.path.join(root_dir, 'textures')
+        base_textures = get_external_path('textures')
         system_name = getattr(app, 'loaded_system_name', 'Solar System') or 'Solar System'
 
         cand_sys_body = os.path.join(base_textures, system_name, body_name)
