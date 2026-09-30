@@ -1,0 +1,54 @@
+#version 460 core
+#define PI 3.14159265358979323846
+#include "common/atmosphere_lut_lighting.glsl"
+#include "common/aerial_volume_mapping.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba32f, binding = 0) uniform writeonly image3D u_scatter_volume;
+layout(rgba32f, binding = 1) uniform writeonly image3D u_trans_volume;
+uniform mat4 u_inv_proj;
+uniform mat4 u_inv_view;
+uniform vec2 u_radius_range;
+
+void main() {
+    ivec3 size = imageSize(u_scatter_volume);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, size.xy))) return;
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size.xy);
+    vec4 eye = u_inv_proj * vec4(uv * 2.0 - 1.0, -1.0, 1.0);
+    vec3 world_ray = normalize((u_inv_view * vec4(eye.xy, -1.0, 0.0)).xyz);
+    // Keep the world-distance parameter after oblate scaling; normalizing here
+    // would overestimate optical path lengths along the polar axis.
+    vec3 V = toSphericalSpace(world_ray, u_pole_obl);
+    vec2 span = aerialRaySpan(u_cam_pos, V, u_atmo_radius_km);
+
+    vec3 S = vec3(0.0);
+    vec3 T = vec3(1.0);
+    imageStore(u_scatter_volume, ivec3(pixel, 0), vec4(S, 1.0));
+    imageStore(u_trans_volume, ivec3(pixel, 0), vec4(T, 1.0));
+    float previous = span.x;
+    // Stellar directions, irradiance and phase functions are shared by every
+    // altitude interval in this column; calculate them once per invocation.
+    AtmosphereRayLighting lighting = precomputeAtmosphereRayLighting(V);
+    // One invocation integrates a complete column incrementally, sharing the
+    // prefix instead of raymarching from the camera again for every voxel.
+    for (int z = 1; z < size.z; z++) {
+        float next = aerialRadiusDistance(u_cam_pos, V, aerialSliceRadius(z, size.z, u_radius_range));
+        float segment_start = max(previous, span.x);
+        float segment_end = min(next, span.y);
+        if (dot(u_cam_pos, V) < 0.0 && segment_end > segment_start && any(greaterThan(T, vec3(1e-5)))) {
+            vec4 segment_S, segment_T, star0, star1, star2, star3;
+            // Two midpoint samples per slice. Physical night-side occlusion
+            // remains active; sharp caster/ring shadows are resolved per pixel.
+            // Each slice ends at a shared altitude. Terrain sampling matches
+            // that altitude independently in neighboring compatible columns.
+            integrateAtmosphereSegmentWithLighting(u_cam_pos, V, segment_start, segment_end, 2, false, lighting,
+                segment_S, segment_T, star0, star1, star2, star3);
+            S += T * segment_S.rgb;
+            T *= segment_T.rgb;
+        }
+        imageStore(u_scatter_volume, ivec3(pixel, z), vec4(S, 1.0));
+        imageStore(u_trans_volume, ivec3(pixel, z), vec4(T, 1.0));
+        previous = next;
+    }
+}

@@ -138,6 +138,13 @@ uniform int u_ringshine_band_count;
 uniform sampler2D u_depth_texture;
 uniform vec2 u_screen_res;
 uniform bool u_terrain_depth_enabled;
+uniform bool u_aerial_volume_enabled;
+uniform sampler3D u_aerial_scatter_lut;
+uniform sampler3D u_aerial_trans_lut;
+uniform vec3 u_aerial_cam_sph;
+uniform vec2 u_aerial_radius_range;
+#include "common/aerial_volume_mapping.glsl"
+
 
 uniform sampler2D u_sky_view_lut;
 uniform sampler2D u_sky_view_trans_lut;
@@ -846,6 +853,8 @@ void resolveTerrainDepthEndpoint(
 }
 // TERRAIN_DEPTH_ENDPOINT_END
 
+#include "common/aerial_volume_shadows.glsl"
+
 void main() {
     if (f_clip_z < 0.0) discard;
     
@@ -1110,6 +1119,7 @@ void main() {
     }
     float analytical_surface_s = s_end;
     bool terrain_depth_override = false;
+    bool has_local_opaque_depth = false;
 
     vec3 frag_local = cam_local;
 
@@ -1198,10 +1208,19 @@ void main() {
             float log_far_denom = log2(u_depth_C * u_far + 1.0);
             float scene_clip_z = (exp2(log_depth * log_far_denom) - 1.0) / u_depth_C;
             vec3 cam_fw = -vec3(view[0][2], view[1][2], view[2][2]);
-            float cos_angle = dot(ray_dir, cam_fw);
+            // Log depth belongs to the rendered screen ray. Refraction/lensing
+            // can rotate the physical integration ray, but preserves distance.
+            float cos_angle = dot(view_ray, cam_fw);
             if (cos_angle > 1e-4) {
                 float s_depth = (scene_clip_z * u_au_to_km) / cos_angle;
                 s_depth -= ray_shift_au * u_au_to_km; // Convert from camera-relative to O_local_km relative
+
+                // An opaque foreground surface blocks this atmosphere too,
+                // even when it lies outside this body's atmospheric ellipsoid.
+                if (s_depth < s_start) discard;
+                float depth_margin = max(0.01, u_atmo_radius_km * 1e-5);
+                has_local_opaque_depth = s_depth <= s_atmo.y + depth_margin
+                    && length(cam_local_sph + s_depth * ray_dir_sph) <= u_atmo_radius_km + depth_margin;
 
                 // The analytical ellipsoid is only a fallback for pixels without
                 // local opaque depth. Terrain can lie on either side of it.
@@ -1300,7 +1319,112 @@ void main() {
     bool use_sky_view_lut = (u_atmo_quality == 3) && !terrain_depth_override;
     int raymarch_quality = (u_atmo_quality == 3) ? 2 : u_atmo_quality;
 
-    if (use_sky_view_lut) {
+    // Host refraction can rotate the view ray: sample the volume using the
+    // projected bent direction. Rays with an anchored lens/refraction origin
+    // still require the terrain-aware marcher because they leave this camera.
+    vec4 aerial_clip = projection * view * vec4(ray_dir, 0.0);
+    vec2 aerial_uv = aerial_clip.xy / max(aerial_clip.w, 1e-12) * 0.5 + 0.5;
+    bool use_aerial_volume = u_atmo_quality == 3 && u_aerial_volume_enabled
+        && u_terrain_depth_enabled && has_local_opaque_depth && hits_surface && s_min_au == 0.0
+        && aerial_clip.w > 0.0
+        && all(greaterThanEqual(aerial_uv, vec2(0.0)))
+        && all(lessThanEqual(aerial_uv, vec2(1.0)));
+    vec3 aerial_S, aerial_T;
+    bool aerial_sample_valid = false;
+    float aerial_refinement = 0.0;
+    float aerial_shadow_refinement = 0.0;
+    vec2 aerial_shadow_span = vec2(s_end, s_start);
+    float minimum_shadow_width = s_end - s_start;
+    ivec3 aerial_segment_steps = ivec3(0);
+    if (use_aerial_volume) {
+        vec3 V = ray_dir_sph;
+        bool clipped_start = s_start > max(0.0, s_atmo.x) + 1e-5;
+        float a = clipped_start
+            ? dot(cam_local_sph + s_start * V - u_aerial_cam_sph, V) / dot(V, V)
+            : 0.0;
+        float b = dot(cam_local_sph + s_end * V - u_aerial_cam_sph, V) / dot(V, V);
+        {
+            if (u_num_active_casters > 0 || (u_num_ring_planes > 0 && u_ring_mask != 0u)) {
+                // Expand selection by one coarse column footprint. The shadow
+                // itself is evaluated only along the actual finite pixel ray.
+                vec2 grid = vec2(textureSize(u_aerial_scatter_lut, 0).xy);
+                float footprint = 0.0;
+                for (int axis = 0; axis < 2; axis++) {
+                    vec2 offset = axis == 0 ? vec2(1.0 / grid.x, 0.0) : vec2(0.0, 1.0 / grid.y);
+                    for (int side = -1; side <= 1; side += 2) {
+                        vec3 neighbor_sph = aerialColumnRay(clamp(aerial_uv + float(side) * offset, 0.0, 1.0),
+                            u_inv_proj, u_inv_view, u_pole_obl);
+                        footprint = max(footprint, s_end * length(fromSphericalSpace(neighbor_sph - V, u_pole_obl)));
+                    }
+                }
+                aerial_shadow_refinement = aerialShadowRefinement(cam_local, ray_dir, s_start, s_end, footprint,
+                                                                  aerial_shadow_span, minimum_shadow_width);
+            }
+            aerial_refinement = aerial_shadow_refinement;
+            if (aerial_refinement < 1.0) {
+                float angular_footprint = aerialGroundFootprint(aerial_uv, b, u_aerial_cam_sph, V,
+                    textureSize(u_aerial_scatter_lut, 0).xy, u_inv_proj, u_inv_view, u_pole_obl);
+                for (int st = 0; st < clamp(u_num_stars, 1, 4); st++) {
+                    vec3 L = u_star_dir_sph_eff[st].xyz;
+                    if (length(L) < 1e-4) L = normalize(toSphericalSpace(
+                        u_stars_pos_radius[st].xyz - u_body_offset, u_pole_obl));
+                    aerial_refinement = max(aerial_refinement, aerialTerminatorRefinement(
+                        b, u_aerial_cam_sph, V, vec4(L, u_star_pos_local[st].w),
+                        vec3(u_planet_radius_km, u_atmo_radius_km, max(u_h_rayleigh, u_h_mie)),
+                        angular_footprint));
+                }
+            }
+        }
+        // Fully refined pixels need column compatibility, but no cached
+        // radiance. Decide this before paying for 16 (or 32) voxel fetches.
+        bool read_voxels = aerial_refinement < 1.0;
+        bool valid_b = sampleAerialGround(u_aerial_scatter_lut, u_aerial_trans_lut,
+            aerial_uv, b, u_aerial_cam_sph, V, u_atmo_radius_km, u_aerial_radius_range,
+            u_inv_proj, u_inv_view, u_pole_obl, read_voxels, aerial_S, aerial_T);
+        // Recover clipped segments: T_ab=T_b/T_a, S_ab=(S_b-S_a)/T_a.
+        if (clipped_start && valid_b) {
+            vec3 Sa, Ta;
+            valid_b = sampleAerialGround(u_aerial_scatter_lut, u_aerial_trans_lut,
+                aerial_uv, a, u_aerial_cam_sph, V, u_atmo_radius_km, u_aerial_radius_range,
+                u_inv_proj, u_inv_view, u_pole_obl, read_voxels, Sa, Ta);
+            aerial_S = max(vec3(0.0), (aerial_S - Sa) / max(Ta, vec3(1e-6)));
+            aerial_T = clamp(aerial_T / max(Ta, vec3(1e-6)), vec3(0.0), vec3(1.0));
+        }
+        aerial_sample_valid = valid_b;
+        if (!valid_b) {
+            aerial_refinement = 0.0;
+            aerial_shadow_refinement = 0.0;
+        }
+        use_aerial_volume = valid_b && aerial_refinement == 0.0;
+        if (!use_aerial_volume) use_sky_view_lut = false;
+        if (aerial_shadow_refinement > 0.0) {
+            // Resolve thin shadows inside their finite bounds instead of
+            // spending 128 samples uniformly across mostly unshadowed air.
+            // A requested 128-step reference retains its original quadrature.
+            if (u_num_samples >= 128 || steps >= 128) {
+                steps = max(steps, 128);
+            } else if (aerial_shadow_span.y > aerial_shadow_span.x) {
+                int shadow_steps = max(steps, clamp(u_aerial_shadow_steps, 16, 128));
+                // Several separated thin shadows can have a wide union. Raise
+                // the budget there so concentrating the march cannot miss them.
+                int feature_steps = int(clamp(ceil(8.0 * (aerial_shadow_span.y - aerial_shadow_span.x)
+                    / max(minimum_shadow_width, 1e-5)), 16.0, 128.0));
+                shadow_steps = max(shadow_steps, feature_steps);
+                float inv_length = 1.0 / max(s_end - s_start, 1e-6);
+                float outer_budget = float(max(u_num_samples, 8));
+                int before = aerial_shadow_span.x > s_start + 1e-5
+                    ? max(1, int(ceil(outer_budget * (aerial_shadow_span.x - s_start) * inv_length))) : 0;
+                int after = aerial_shadow_span.y < s_end - 1e-5
+                    ? max(1, int(ceil(outer_budget * (s_end - aerial_shadow_span.y) * inv_length))) : 0;
+                aerial_segment_steps = ivec3(before, shadow_steps, after);
+                steps = before + shadow_steps + after;
+            }
+        }
+    }
+    if (use_aerial_volume) {
+        scattered = aerial_S;
+        final_transmittance = aerial_T;
+    } else if (use_sky_view_lut) {
         // Multi-pass ring clipping: Pass 1 (clip_mode == 1) renders behind the rings.
         // If clip_mode == 2, discard for pixels where rings exist in front to avoid duplicate draw blowout.
         if (u_atmo_clip_mode == 2 && closest_s_ring < s_end) {
@@ -1475,6 +1599,7 @@ void main() {
                 // Circumplanetary (own) rings only: external rings (parent/neighbor planets) are
                 // baked directly into the Sky-View LUT (sky_view_lut.frag) along with other eclipse casters.
                 if (distance(u_ring_center[k], planet_center_render) > 1e-4) continue;
+                if (!aerialRingMayOcclude(k, 0.0, 1.0)) continue;
 
                 float r_inner = u_ring_params[k].x * u_au_to_km;
                 float r_outer = u_ring_params[k].y * u_au_to_km;
@@ -1842,7 +1967,7 @@ void main() {
         float sr_start = star_radius / max(dist_mid_star, 1e-6);
         vec3 O = frag_local / u_au_to_km + planet_center_render;
         vec3 V = ray_dir; // Fix dimensional error: ray_dir is unit vector in km space
-        if (raymarch_quality > 0) {
+        if (raymarch_quality > 0 && !skip_volumetric_shadow) {
             if (raymarch_quality == 1) {
                 global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
                 end_eclipse_shadow = global_eclipse_shadow;
@@ -2068,6 +2193,25 @@ void main() {
             float s0 = map_t_to_s(t0, s_start, s_end, s_closest, grade_p);
             float s1 = map_t_to_s(t1, s_start, s_end, s_closest, grade_p);
             float current_s = map_t_to_s(tj, s_start, s_end, s_closest, grade_p);
+            if (aerial_segment_steps.y > 0) {
+                int offset = 0;
+                int count = aerial_segment_steps.x;
+                float begin = s_start, end = aerial_shadow_span.x;
+                if (i >= count) {
+                    offset = count;
+                    count = aerial_segment_steps.y;
+                    begin = aerial_shadow_span.x; end = aerial_shadow_span.y;
+                    if (i >= offset + count) {
+                        offset += count;
+                        count = aerial_segment_steps.z;
+                        begin = aerial_shadow_span.y; end = s_end;
+                    }
+                }
+                float local_t = float(i - offset) / float(count);
+                s0 = map_t_to_s(local_t, begin, end, clamp(s_closest, begin, end), grade_p);
+                s1 = map_t_to_s(local_t + 1.0 / float(count), begin, end, clamp(s_closest, begin, end), grade_p);
+                current_s = map_t_to_s(local_t + jitter / float(count), begin, end, clamp(s_closest, begin, end), grade_p);
+            }
             float step_size = max(1e-4, s1 - s0);
 
             vec3 current_pos_sph = cam_local_sph + current_s * ray_dir_sph;
@@ -2304,13 +2448,17 @@ void main() {
     }
     }
 
+    if (aerial_sample_valid && aerial_refinement > 0.0 && aerial_refinement < 1.0) {
+        scattered = mix(aerial_S, scattered, aerial_refinement);
+        final_transmittance = mix(aerial_T, final_transmittance, aerial_refinement);
+    }
     vec3 transmittance = final_transmittance;
 
     if (u_hdr_enabled) {
         scattered *= u_exposure;
     }
 
-    if (!use_sky_view_lut && u_temporal_accum && u_history_valid) {
+    if (!aerial_sample_valid && !use_sky_view_lut && u_temporal_accum && u_history_valid) {
         float d_repr_km;
         if (hits_surface) {
             d_repr_km = max(s_end, 0.001);
