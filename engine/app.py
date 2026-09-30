@@ -350,6 +350,7 @@ from engine.physics.physics_core import *
 from engine.physics.physics_core import _extract_render_state, _update_hierarchy_core
 from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
+from engine.rendering.scattering_lut import ScatteringLUTCache
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
 from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches_jit, pack_cloud_patches_jit
@@ -645,6 +646,7 @@ class App(InputHandlerMixin):
         self.sky_view_width = 192
         self.sky_view_height = 108
         self.sky_view_baked_key = None
+        self.scattering_lut_cache = None
         self.star_catalog = None
         self._ephem_trajectories_pts_count = 0
         self.prev_atmo_exposure = 1.0
@@ -1789,6 +1791,11 @@ class App(InputHandlerMixin):
                 p['u_sky_view_star_lut'].value = (15, 16, 17, 18)
             if 'u_stbn_tex' in p:
                 p['u_stbn_tex'].value = 19
+            for _endpoint_name, _endpoint_unit in (
+                ('u_scattering_tau_lut', 20), ('u_scattering_rayleigh_lut', 21),
+                ('u_scattering_mie_lut', 22), ('u_scattering_multiple_lut', 23)):
+                if _endpoint_name in p:
+                    p[_endpoint_name].value = _endpoint_unit
         
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
         if 'u_ring_gradients' in self.prog_sky_view:
@@ -6396,6 +6403,49 @@ class App(InputHandlerMixin):
                     # Single buffer upload per atmosphere body (must precede Sky-View LUT pass)
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
 
+                    # Position-queryable tables are only needed by Mode 3's
+                    # active terrain bodies. Four cached atmospheres bound VRAM;
+                    # comparison bodies follow the same rendering path.
+                    _endpoint_enabled = (atmo_quality == 3
+                        and body_idx_in_unified in active_terrain_body_indices)
+                    if 'u_scattering_enabled' in cur_prog:
+                        cur_prog['u_scattering_enabled'].value = _endpoint_enabled
+                    if _endpoint_enabled:
+                        if self.scattering_lut_cache is None:
+                            self.scattering_lut_cache = ScatteringLUTCache(ctx)
+                        _endpoint_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
+                        _height_min = min(0.0, float(_endpoint_body.get('height_range_km', [0.0, 8.848])[0]))
+                        _bottom = max(1e-3, float(atmo['planet_radius_km']) + _height_min * f_scale - 0.05)
+                        _eff_sun = max(0.0, round(float(self.atmo_staging[227]), 4))
+                        _endpoint_parameters = {
+                            'u_planet_radius_km': float(atmo['planet_radius_km']),
+                            'u_atmo_radius_km': float(atmo['atmo_radius_km']),
+                            'u_scattering_bottom_km': _bottom,
+                            'u_scattering_sun_radius': _eff_sun,
+                            'u_h_rayleigh': float(props['scale_height_km']),
+                            'u_h_mie': float(atmo.get('h_mie', 1.2)),
+                            'u_beta_rayleigh': tuple(float(x) for x in props['beta_rayleigh']),
+                            'u_beta_mie': tuple(float(x) for x in beta_mie_coeffs),
+                            'u_beta_abs_mixed': tuple(float(x) for x in props['beta_abs_mixed']),
+                            'u_beta_abs_layered': tuple(float(x) for x in props['beta_abs_layered']),
+                            'u_mie_albedo': tuple(float(x) for x in np.broadcast_to(atmo.get('mie_albedo', 1.0), (3,))),
+                            'u_ozone_peak_km': float(props.get('ozone_peak_km', 25.0)),
+                            'u_ozone_width_km': float(props.get('ozone_width_km', 8.0)),
+                            # Also key the MS inputs, including ground albedo.
+                            'u_mie_g': float(atmo.get('mie_g', 0.8)),
+                            'u_ground_albedo': tuple(float(x) for x in self.visual_arr_cmp[bi, 0:3])
+                                if is_cmp else tuple(float(x) for x in visual_arr[bi, 0:3]),
+                        }
+                        _endpoint_textures = self.scattering_lut_cache.get(
+                            _endpoint_parameters, atmo['lut_multi_scatter'])
+                        self.scattering_lut_cache.bind(_endpoint_textures)
+                        if 'u_scattering_bottom_km' in cur_prog:
+                            cur_prog['u_scattering_bottom_km'].value = _bottom
+                        if 'u_scattering_sun_radius' in cur_prog:
+                            cur_prog['u_scattering_sun_radius'].value = _eff_sun
+                        if 'u_scattering_azimuth_count' in cur_prog:
+                            cur_prog['u_scattering_azimuth_count'].value = self.scattering_lut_cache.size[3]
+
                     # Mode 3: Analytical Sky-View LUT pass
                     if atmo_quality == 3 and self.prog_sky_view is not None:
                         _sv_res_idx = max(0, min(len(SKY_VIEW_RESOLUTIONS) - 1, int(self.camera.get("atmo_sky_view_res", 0))))
@@ -7737,6 +7787,8 @@ class App(InputHandlerMixin):
         for _t in getattr(self, 'sky_view_star_tex', []):
             if _t: _t.release()
         if getattr(self, 'sky_view_fbo', None): self.sky_view_fbo.release()
+        if self.scattering_lut_cache is not None:
+            self.scattering_lut_cache.release()
         self.impl.shutdown()
         glfw.terminate()
     

@@ -1,0 +1,28 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba32f, binding = 0) writeonly uniform image2D u_tau_output;
+#include "common/scattering_bake.glsl"
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(u_tau_output);
+    if (any(greaterThanEqual(pixel, size))) return;
+    int half_width = size.x / 2;
+    bool ground = pixel.x < half_width;
+    float r = scattering_radius(float(pixel.y) / float(size.y - 1));
+    float mu = scattering_view_cos(r, float(pixel.x % half_width) / float(half_width - 1), ground);
+    float distance = scattering_boundary_distance(r, mu, ground);
+    float closest = clamp(-r * mu, 0.0, distance);
+    vec3 tau = vec3(0.0);
+    for (int i = 0; i < u_scattering_steps; ++i) {
+        float a = scattering_station(float(i) / float(u_scattering_steps), distance, closest);
+        float b = scattering_station(float(i + 1) / float(u_scattering_steps), distance, closest);
+        float s = 0.5 * (a + b);
+        // Factored form preserves meter-scale altitudes on planetary radii.
+        float altitude_radius = sqrt(max(0.0, r * r + s * (2.0 * r * mu + s)));
+        vec3 rayleigh, mie, extinction;
+        scattering_medium(altitude_radius, rayleigh, mie, extinction);
+        tau += extinction * (b - a);
+    }
+    imageStore(u_tau_output, pixel, vec4(tau, 1.0));
+}

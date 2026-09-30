@@ -1,0 +1,57 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 4, local_size_z = 1) in;
+layout(rgba32f, binding = 0) writeonly uniform image3D u_rayleigh_output;
+layout(rgba32f, binding = 1) writeonly uniform image3D u_mie_output;
+layout(rgba32f, binding = 2) writeonly uniform image3D u_multiple_output;
+uniform sampler2D u_scattering_tau_lut;
+uniform sampler2D u_multi_scatter_lut;
+uniform int u_scattering_azimuth_count;
+#include "common/scattering_bake.glsl"
+#include "common/sun_terminator.glsl"
+
+void main() {
+    ivec3 pixel = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 size = imageSize(u_rayleigh_output);
+    if (any(greaterThanEqual(pixel, size))) return;
+    int sun_count = size.x / u_scattering_azimuth_count;
+    int half_height = size.y / 2;
+    bool ground = pixel.y < half_height;
+    float r = scattering_radius(float(pixel.z) / float(size.z - 1));
+    float mu = scattering_view_cos(r, float(pixel.y % half_height) / float(half_height - 1), ground);
+    float mus = scattering_sun_cos(float(pixel.x % sun_count) / float(sun_count - 1));
+    float azimuth_cos = 2.0 * float(pixel.x / sun_count) / float(u_scattering_azimuth_count - 1) - 1.0;
+    float nu = mu * mus + sqrt(max(0.0, (1.0 - mu * mu) * (1.0 - mus * mus))) * azimuth_cos;
+    float distance = scattering_boundary_distance(r, mu, ground);
+    float closest = clamp(-r * mu, 0.0, distance);
+    vec3 T = vec3(1.0);
+    vec3 result_R = vec3(0.0), result_M = vec3(0.0), result_MS = vec3(0.0);
+    for (int i = 0; i < u_scattering_steps; ++i) {
+        float a = scattering_station(float(i) / float(u_scattering_steps), distance, closest);
+        float b = scattering_station(float(i + 1) / float(u_scattering_steps), distance, closest);
+        float s = 0.5 * (a + b);
+        float rq = sqrt(max(1e-8, r * r + s * (2.0 * r * mu + s)));
+        float musq = clamp((r * mus + s * nu) / rq, -1.0, 1.0);
+        vec3 rayleigh, mie, extinction;
+        scattering_medium(rq, rayleigh, mie, extinction);
+        float ds = b - a;
+        vec3 cell_T = exp(-extinction * ds);
+        // Stable homogeneous-cell integral, including near-vacuum channels.
+        vec3 factor = mix((1.0 - cell_T) / max(extinction, vec3(1e-20)),
+                          vec3(ds), lessThan(extinction * ds, vec3(1e-4)));
+        float sin_planet = u_planet_radius_km / max(rq, u_planet_radius_km + 0.01);
+        vec2 term = sun_terminator(musq, sin_planet, sqrt(max(0.0, 1.0 - sin_planet * sin_planet)),
+                                  u_scattering_sun_radius, sqrt(max(0.0, 1.0 - u_scattering_sun_radius * u_scattering_sun_radius)));
+        vec2 tau_uv = scattering_tau_uv(rq, max(term.y, scattering_horizon(rq) + 1e-5), false,
+                                       vec2(textureSize(u_scattering_tau_lut, 0)));
+        vec3 sun_T = exp(-textureLod(u_scattering_tau_lut, tau_uv, 0.0).rgb) * term.x;
+        float h = clamp((rq - u_planet_radius_km) / (u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0);
+        vec3 psi = textureLod(u_multi_scatter_lut, vec2(scattering_sun_coord(musq), sqrt(h)), 0.0).rgb;
+        result_R += T * factor * rayleigh * sun_T;
+        result_M += T * factor * mie * sun_T;
+        result_MS += T * factor * (rayleigh + mie) * psi;
+        T *= cell_T;
+    }
+    imageStore(u_rayleigh_output, pixel, vec4(result_R, 1.0));
+    imageStore(u_mie_output, pixel, vec4(result_M, 1.0));
+    imageStore(u_multiple_output, pixel, vec4(result_MS, 1.0));
+}

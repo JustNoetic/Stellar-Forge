@@ -325,6 +325,8 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
     return textureLod(u_transmittance_lut, vec2(u, v), 0.0).rgb;
 }
 
+#include "common/scattering_segment.glsl"
+
 // --- Mode 3 station-locked ring-shadow quadrature helpers ---
 // Cell boundaries are baked on the CPU in ring coordinate u (see bake_station_cells in
 // render_utils.py) and packed 4 floats per vec4: index i -> element (i/4, i%4).
@@ -1062,10 +1064,14 @@ void main() {
             : vec3(0.0, u_planet_radius_km + 1e-4, 0.0);
     }
 
-    vec2 s_planet = raySphereIntersect(cam_pos_eff, ray_dir_sph, u_planet_clip_km);
+    float clip_radius = (u_atmo_quality == 3 && u_scattering_enabled)
+        ? u_scattering_bottom_km : u_planet_clip_km;
+    vec2 s_planet = raySphereIntersect(cam_pos_eff, ray_dir_sph, clip_radius);
 
     float s_start = max(0.0, s_atmo.x);
     float s_end = s_atmo.y;
+    float scene_limit = s_atmo.y;
+    bool has_scene_surface = false;
 
     bool hits_surface = false;
     if (s_planet.x > 0.0 && s_planet.x < s_end) {
@@ -1114,6 +1120,7 @@ void main() {
         s_start = max(s_start, closest_s_ring);
     } else if (u_atmo_clip_mode == 2) {
         s_end = min(s_end, closest_s_ring);
+        scene_limit = min(scene_limit, closest_s_ring);
     }
 
     if (u_num_active_casters > 0) {
@@ -1131,6 +1138,7 @@ void main() {
             vec2 s_c = raySphereIntersect(origin_c, dir_c, caster_r);
             if (s_c.x > 0.0 && s_c.x < s_end) {
                 s_end = s_c.x;
+                scene_limit = min(scene_limit, s_c.x);
             }
         }
     }
@@ -1160,7 +1168,10 @@ void main() {
             float log_far_denom = log2(u_depth_C * u_far + 1.0);
             float scene_clip_z = (exp2(log_depth * log_far_denom) - 1.0) / u_depth_C;
             vec3 cam_fw = -vec3(view[0][2], view[1][2], view[2][2]);
-            float cos_angle = dot(ray_dir, cam_fw);
+            // Terrain depth is written after apparent-position refraction.
+            // Its projection cosine belongs to the screen ray; recover the
+            // distance before mapping it onto the atmospheric ray.
+            float cos_angle = dot((u_atmo_quality == 3 && u_scattering_enabled) ? view_ray : ray_dir, cam_fw);
             if (cos_angle > 1e-4) {
                 float s_depth = (scene_clip_z * u_au_to_km) / cos_angle;
                 s_depth -= ray_shift_au * u_au_to_km; // Convert from camera-relative to O_local_km relative
@@ -1170,8 +1181,13 @@ void main() {
                 // and must NOT clamp s_end or set hits_surface, allowing atmospheric sunset extinction to apply.
                 float max_local_ground_s = length(cam_local_sph) + u_atmo_radius_km + 100.0;
                 if (s_depth <= max_local_ground_s) {
-                    float error_margin = dist_to_center * 2500.0;
-                    if (s_depth < s_end - error_margin) {
+                    if (u_atmo_quality == 3 && u_scattering_enabled) {
+                        // Actual rasterized terrain is authoritative, even below
+                        // the datum or above the smooth planet's horizon.
+                        s_end = min(s_depth, scene_limit);
+                        has_scene_surface = true;
+                        hits_surface = true;
+                    } else if (s_depth < s_end - dist_to_center * 2500.0) {
                         s_end = s_depth;
                         hits_surface = true;
                     }
@@ -1263,7 +1279,26 @@ void main() {
     vec3 scattered = vec3(0.0);
     vec3 final_transmittance = vec3(1.0);
 
-    if (u_atmo_quality == 3) {
+    bool endpoint_surface = u_atmo_quality == 3 && u_scattering_enabled && has_scene_surface;
+    // A stationary spherical table cannot encode spatially varying shine,
+    // polar-winter aerosol density, or external ring shadows. Preserve those
+    // effects with the existing finite-distance integrator on surface pixels.
+    bool endpoint_fallback = endpoint_surface && (
+        ((u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12)
+        || (u_ringshine_enabled && u_num_ring_planes > 0 && u_ring_mask != 0u));
+    if (endpoint_surface) {
+        for (int st = 0; st < min(u_num_stars, 4); ++st) {
+            if ((u_ring_mask != 0u && u_star_solstice[st].x > 1e-4)
+                || abs(u_star_pos_local[st].w - u_scattering_sun_radius) > 0.001)
+                endpoint_fallback = true;
+        }
+        for (int k = 0; k < u_num_ring_planes; ++k) {
+            if (length(u_ring_center[k] - u_body_offset) >= 1e-4)
+                endpoint_fallback = true;
+        }
+    }
+    int integration_quality = endpoint_fallback ? 2 : u_atmo_quality;
+    if (integration_quality == 3) {
         // Multi-pass ring clipping: Pass 1 (clip_mode == 1) renders behind the rings.
         // If clip_mode == 2, discard for pixels where rings exist in front to avoid duplicate draw blowout.
         if (u_atmo_clip_mode == 2 && closest_s_ring < s_end) {
@@ -1367,8 +1402,23 @@ void main() {
         vec4 atmo_sample = texture(u_sky_view_lut, vec2(u_lut, v_lut));
         vec3 L_scatter = atmo_sample.rgb;
         vec3 T_lut = texture(u_sky_view_trans_lut, vec2(u_lut, v_lut)).rgb;
+        vec3 finite_star_scatter[4];
+        for (int st = 0; st < 4; ++st) finite_star_scatter[st] = vec3(0.0);
+        if (endpoint_surface) {
+            vec3 start_point = cam_local_sph + s_start * ray_dir_sph;
+            vec3 terrain_point = cam_local_sph + s_end * ray_dir_sph;
+            T_lut = endpoint_transmittance(start_point, terrain_point);
+            L_scatter = vec3(0.0);
+            for (int st = 0; st < min(u_num_stars, 4); ++st) {
+                vec3 sunlight = u_star_dir_sph_eff[st].xyz;
+                if (dot(sunlight, sunlight) < 1e-8) continue;
+                finite_star_scatter[st] = endpoint_radiance(start_point, terrain_point, normalize(sunlight), T_lut)
+                    * u_star_color_irrad[st].rgb;
+                L_scatter += finite_star_scatter[st];
+            }
+        }
 
-        if (!cam_inside && !is_ground) {
+        if (!endpoint_surface && !cam_inside && !is_ground) {
             float limb_fade = clamp((1.0 - t_limb) * 128.0, 0.0, 1.0);
             L_scatter *= limb_fade;
             T_lut = mix(vec3(1.0), T_lut, limb_fade);
@@ -1394,7 +1444,7 @@ void main() {
 
         vec3 L_atmo = L_scatter;
         int n_stars_m3 = clamp(u_num_stars, 1, 4);
-        bool limb_faded = (!cam_inside && !is_ground);
+        bool limb_faded = (!endpoint_surface && !cam_inside && !is_ground);
         float limb_fade = limb_faded ? clamp((1.0 - t_limb) * 128.0, 0.0, 1.0) : 1.0;
 
         for (int st = 0; st < n_stars_m3; st++) {
@@ -1666,7 +1716,8 @@ void main() {
             if (has_shadow_interval) {
                 // Deficit evaluation against this star's baked in-scatter slice:
                 // the subtraction can never eat another star's light or shine.
-                vec3 L_scatter_s = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
+                vec3 L_scatter_s = endpoint_surface ? finite_star_scatter[st]
+                    : texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
                 if (limb_faded) L_scatter_s *= limb_fade;
 
                 if (u_atmo_shadow_method == 2) {
@@ -1696,7 +1747,7 @@ void main() {
             }
 
             // Method 2 (Blackrack): Analytical bounding cylinder culling + raymarching for celestial eclipse casters (moons/planets)
-            if (u_atmo_shadow_method == 2 && u_num_active_casters > 0) {
+            if ((u_atmo_shadow_method == 2 || endpoint_surface) && u_num_active_casters > 0) {
                 vec3 delta_L_eclipse = vec3(0.0);
                 vec3 slice_total_eclipse = vec3(0.0);
                 vec3 cone_axis = -L_cart;
@@ -1748,7 +1799,8 @@ void main() {
                 }
 
                 if (dot(delta_L_eclipse, vec3(1.0)) > 1e-6) {
-                    vec3 L_scatter_s = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
+                    vec3 L_scatter_s = endpoint_surface ? finite_star_scatter[st]
+                        : texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
                     if (limb_faded) L_scatter_s *= limb_fade;
                     vec3 max_sub = max(vec3(0.0), L_scatter_s - delta_L);
                     vec3 eclipse_sub = min(delta_L_eclipse, max_sub);
@@ -1805,13 +1857,13 @@ void main() {
         float sr_start = star_radius / max(dist_mid_star, 1e-6);
         vec3 O = frag_local / u_au_to_km + planet_center_render;
         vec3 V = ray_dir; // Fix dimensional error: ray_dir is unit vector in km space
-        if (u_atmo_quality > 0) {
-            if (u_atmo_quality == 1) {
+        if (integration_quality > 0) {
+            if (integration_quality == 1) {
                 global_eclipse_shadow = compute_shadow(mid_render, L_mid, dist_mid_star, planet_center_render, star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
                 end_eclipse_shadow = global_eclipse_shadow;
             }
 
-            if (u_atmo_quality == 2) {
+            if (integration_quality == 2) {
                 ring_count = 0;
                 uint processed_mask = 0u;
                 if (u_num_ring_planes > 0) {
@@ -2065,7 +2117,7 @@ void main() {
             vec3 transmittance_to_sun = (vis_fraction > 1e-4) ? get_transmittance_precomputed(v_norm, effective_cos) : vec3(0.0);
 
             vec3 sample_shadow = global_eclipse_shadow;
-            if (u_atmo_quality == 2 && !skip_volumetric_shadow) {
+            if (integration_quality == 2 && !skip_volumetric_shadow) {
                 sample_shadow = vec3(1.0);
 
                 if (ring_count > 0) {
