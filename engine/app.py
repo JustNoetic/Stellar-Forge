@@ -355,6 +355,7 @@ from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
 from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches_jit, pack_cloud_patches_jit
 from engine.rendering.terrain_streamer import TerrainTileStreamer
+from engine.rendering.terrain_collision import CameraSurface, GROUND_CLEARANCE_KM, camera_near_plane
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 from engine.ui import render_ui
 
@@ -1791,11 +1792,7 @@ class App(InputHandlerMixin):
                 p['u_sky_view_star_lut'].value = (15, 16, 17, 18)
             if 'u_stbn_tex' in p:
                 p['u_stbn_tex'].value = 19
-            for _endpoint_name, _endpoint_unit in (
-                ('u_scattering_tau_lut', 20), ('u_scattering_rayleigh_lut', 21),
-                ('u_scattering_mie_lut', 22), ('u_scattering_multiple_lut', 23)):
-                if _endpoint_name in p:
-                    p[_endpoint_name].value = _endpoint_unit
+            ScatteringLUTCache.configure(p)
         
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
         if 'u_ring_gradients' in self.prog_sky_view:
@@ -1806,6 +1803,7 @@ class App(InputHandlerMixin):
             self.prog_sky_view['u_multi_scatter_lut'].value = 3
         if 'u_ringshine_map' in self.prog_sky_view:
             self.prog_sky_view['u_ringshine_map'].value = 8
+        ScatteringLUTCache.configure(self.prog_sky_view)
         self.resize_sky_view_lut(self.sky_view_width, self.sky_view_height)
 
         self.prog_bloom_down = ctx.program(vertex_shader=bloom_downsample_shader_vs, fragment_shader=bloom_downsample_shader_fs)
@@ -3682,7 +3680,7 @@ class App(InputHandlerMixin):
 
             # ── Camera: Space Engine-style free flight / orbit / landing ──
             cam = self.camera
-            LAND_ALT_AU = 1e-10   # ~15 m stick height above the surface
+            LAND_ALT_AU = GROUND_CLEARANCE_KM / AU_TO_KM  # one metre above terrain
             rel_prev = np.array(cam.get("cam_pos_rel_prev", cam["cam_pos_rel"]), dtype='f8')
             rel = np.array(cam["cam_pos_rel"], dtype='f8')
 
@@ -3719,12 +3717,53 @@ class App(InputHandlerMixin):
             else:
                 base_pos = np.array(cam["target"], dtype='f8')
 
+            # Upload height changes before collision, so newly visible relief
+            # cannot appear around a camera still clamped to yesterday's tile.
+            terrain_streamer = getattr(self, 'terrain_streamer', None)
+            terrain_enabled = bool(cam.get("terrain_lod_enabled", False))
+            if terrain_enabled and terrain_streamer is not None:
+                terrain_streamer.begin_frame()
+                terrain_streamer.process_uploads(max_per_frame=4)
+            body_spin_angles = compute_body_rotation_angles_jit(
+                float(display_t) * 31557600.0, self.rot_period_arr, self.w0_arr,
+                self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render,
+                self.pole_n_arr, self.tangent_arr, self.bitangent_arr)
+            body_spin_angles_cmp = None
+            if self.comparison_enabled:
+                body_spin_angles_cmp = compute_body_rotation_angles_jit(
+                    float(cmp_sim_t) * 31557600.0, self.rot_period_arr_cmp, self.w0_arr_cmp,
+                    self.tidally_locked_arr_cmp, self.parent_idx_arr_cmp, self.pos_snap_cmp,
+                    self.pole_n_arr_cmp, self.tangent_arr_cmp, self.bitangent_arr_cmp)
+            camera_surfaces = {}
+
+            def camera_surface(index, is_cmp=False):
+                key = (is_cmp, index)
+                if key not in camera_surfaces:
+                    info = self.bodies_data_cmp[index] if is_cmp else bodies_data[index]
+                    visuals = self.visual_arr_cmp if is_cmp else visual_arr
+                    radii = self.body_radii_cmp if is_cmp else body_radii
+                    angles = body_spin_angles_cmp if is_cmp else body_spin_angles
+                    name = info.get('name', '').lower()
+                    tiles = terrain_streamer if terrain_enabled and terrain_streamer is not None and any(
+                        terrain_streamer.get_max_lod(name, layer) >= 0
+                        for layer in ('height', 'diffuse', 'clouds')) else None
+                    unified = index + num_bodies if is_cmp else index
+                    previous = getattr(self, 'terrain_active_body_patches', {}).get(unified)
+                    patches = previous[0] if previous is not None and previous[1] == name else None
+                    camera_surfaces[key] = CameraSurface(
+                        float(radii[index]) * AU_TO_KM, float(visuals[index, 8]),
+                        visuals[index, 5:8], float(np.float32(angles[index])), tiles, name,
+                        info.get('height_range_km', [0., 8.848]),
+                        cam.get('terrain_max_depth', 6), cam.get('terrain_patch_res', 32), patches)
+                return camera_surfaces[key]
+
             # Tracked body surface radius (used for approach gesture & landing).
             # Oblate bodies: track_r is the equatorial radius; the surface is an
             # ellipsoid, so the clamp uses the radius along the camera's direction.
             track_r = 0.0
             track_f = 0.0
             track_pole = np.array([0.0, 1.0, 0.0], dtype='f8')
+            track_surface = None
             if cam["tracking_idx"] is not None and cam["tracking_mode"] == "body":
                 t_idx = cam["tracking_idx"]
                 if cam.get("tracking_is_cmp", False):
@@ -3738,11 +3777,13 @@ class App(InputHandlerMixin):
                     track_f = float(bodies_data[t_idx].get('oblateness', 0.0))
                     if hasattr(self, "pole_n_arr") and t_idx < len(self.pole_n_arr):
                         track_pole = np.array(self.pole_n_arr[t_idx], dtype='f8')
+                if track_r > 0.:
+                    track_surface = camera_surface(t_idx, cam.get("tracking_is_cmp", False))
             
             cam["track_f"] = track_f
             cam["track_pole"] = track_pole.tolist()
             if cam.get("tracking_idx") is not None and track_r > 0.0:
-                alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
+                alt_au = max(0.0, track_surface.clearance(rel * AU_TO_KM) / AU_TO_KM)
                 cam["is_near_surface"] = (alt_au < _ROT_FOLLOW_ALT_AU)
             else:
                 cam["is_near_surface"] = False
@@ -3752,10 +3793,11 @@ class App(InputHandlerMixin):
                 cam["centered_idx"] = None
                 r_ap = np.linalg.norm(rel)
                 if r_ap > 1e-300 and cam["tracking_idx"] is not None and cam["tracking_mode"] == "body" and track_r > 0.0:
-                    surf_r = _ellipsoid_surface_radius(track_r, track_f, track_pole, rel)
-                    min_r = surf_r + LAND_ALT_AU
-                    alt = max(LAND_ALT_AU, r_ap - surf_r)
-                    alt_new = max(LAND_ALT_AU, alt * math.exp(-cam["approach_delta"]))
+                    ground_radius, ground_cosine = track_surface.surface(rel * AU_TO_KM)
+                    surf_r = ground_radius / AU_TO_KM
+                    min_alt = LAND_ALT_AU / max(ground_cosine, 1e-4)
+                    alt = max(min_alt, r_ap - surf_r)
+                    alt_new = max(min_alt, alt * math.exp(-cam["approach_delta"]))
                     r_new = surf_r + alt_new
                     rel = (rel / r_ap) * r_new
                 else:
@@ -3775,7 +3817,7 @@ class App(InputHandlerMixin):
             rot_follow = (track_r > 0.0 and cam["tracking_mode"] == "body" and
                           cam["tracking_idx"] is not None and not cam.get("tracking_is_cmp", False))
             if rot_follow:
-                alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
+                alt_au = max(0.0, track_surface.clearance(rel * AU_TO_KM) / AU_TO_KM)
                 if alt_au < _ROT_FOLLOW_ALT_AU:
                     alt_km = alt_au * AU_TO_KM
                     if alt_km <= 50.0:
@@ -3783,10 +3825,7 @@ class App(InputHandlerMixin):
                     else:
                         t_fade = (alt_km - 50.0) / 150.0
                         rot_weight = 1.0 - (3.0 * t_fade**2 - 2.0 * t_fade**3)
-                    spin_angles = compute_body_rotation_angles_jit(
-                        float(display_t) * 31557600.0,
-                        self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr,
-                        pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr)
+                    spin_angles = body_spin_angles
                     t_idx = cam["tracking_idx"]
                     if t_idx < len(spin_angles):
                         spin_angle = float(spin_angles[t_idx])
@@ -3833,7 +3872,7 @@ class App(InputHandlerMixin):
             #     view just levels back within a few seconds. Toggleable via
             #     cam["horizon_align"].
             if cam.get("horizon_align", True) and cam.get("tracking_idx") is not None and track_r > 0.0:
-                alt_au = max(0.0, np.linalg.norm(rel) - _ellipsoid_surface_radius(track_r, track_f, track_pole, rel))
+                alt_au = max(0.0, track_surface.clearance(rel * AU_TO_KM) / AU_TO_KM)
                 if alt_au < _ROT_FOLLOW_ALT_AU:
                     align_strength = 1.0 - alt_au / _ROT_FOLLOW_ALT_AU
                     if cam["cam_look"] == "aim":
@@ -3857,6 +3896,7 @@ class App(InputHandlerMixin):
                             cam["up"] = (new_up / np.linalg.norm(new_up)).tolist()
 
             # 3) WASD flight (screen-space strafe)
+            move_start = rel.copy()
             keys = cam.get("keys", {})
             w_key = keys.get("w", False)
             s_key = keys.get("s", False)
@@ -3890,17 +3930,32 @@ class App(InputHandlerMixin):
                 rel = rel + (move / nm) * cam["flight_speed"] * dt_render
                 cam["centered_idx"] = None
 
-            # 3b) floor: push back out of the ground after movement
-            if track_r > 0.0 and cam["tracking_mode"] == "body":
-                r_s = np.linalg.norm(rel)
-                r_floor = _ellipsoid_surface_radius(track_r, track_f, track_pole, rel) + LAND_ALT_AU
-                if r_s <= r_floor:
-                    if r_s > 1e-300:
-                        rel = rel / r_s * r_floor
-                    else:
-                        rel = track_pole * r_floor
-                    # Cap flight speed to 100 m/s when hitting the ground
-                    cam["flight_speed"] = 100.0 / 149597870700.0
+            # 3b) Collision applies to nearby bodies even in free/barycenter
+            # flight, including the offset comparison system. Sweep only the
+            # physical translation; an orbit gesture is not a straight chord.
+            ground_contact = False
+            collision_systems = [(False, pos_snap_render - base_pos, body_radii)]
+            if self.comparison_enabled:
+                collision_systems.append((True, self.pos_snap_cmp - base_pos
+                    + np.array([self.comparison_offset_au, 0., 0.]), self.body_radii_cmp))
+            for is_cmp, centers, radii in collision_systems:
+                starts = (move_start - centers) * AU_TO_KM
+                delta = (rel - move_start) * AU_TO_KM
+                stations = np.clip(-np.sum(starts * delta, axis=1) / max(np.dot(delta, delta), 1e-30), 0., 1.)
+                closest = np.linalg.norm(starts + stations[:, None] * delta, axis=1)
+                infos = self.bodies_data_cmp if is_cmp else bodies_data
+                heights = np.array([max(0., float(info.get('height_range_km', [0., 8.848])[1])) for info in infos])
+                nearby = np.flatnonzero((radii > 0.) & (closest <= radii.astype('f8') * AU_TO_KM + heights + .01))
+                for index in nearby:
+                    center = centers[index]
+                    start_km, end_km = (move_start - center) * AU_TO_KM, (rel - center) * AU_TO_KM
+                    surface = camera_surface(index, is_cmp)
+                    corrected, contact = surface.constrain_motion(start_km, end_km)
+                    if contact:
+                        rel = center + corrected / AU_TO_KM
+                        ground_contact = True
+            if ground_contact:
+                cam["flight_speed"] = min(cam["flight_speed"], 0.1 / AU_TO_KM)
 
             cam["cam_pos_rel"] = rel
             cam["cam_pos_rel_prev"] = rel.copy()
@@ -4049,14 +4104,23 @@ class App(InputHandlerMixin):
             view = view_f8.astype('f4')
             cam_pos = cam_pos_f8.astype('f4')
 
-            # Adaptive near plane: scale with the nearest surface so landing stays valid
+            # Measure from the actual eye, not the tracking pivot. Mountains,
+            # depressions and oblateness override the smooth reference radius.
+            aspect_ratio = self.fb_width / max(self.fb_height, 1)
             if num_bodies > 0:
-                d_surf = np.linalg.norm(pos_snap_render - cam_origin, axis=1) - body_radii
+                d_surf = np.linalg.norm(pos_snap_render - cam_origin - rel, axis=1) - body_radii
+                for (is_cmp, index), surface in camera_surfaces.items():
+                    if not is_cmp:
+                        d_surf[index] = surface.clearance((rel - (pos_snap_render[index] - cam_origin)) * AU_TO_KM) / AU_TO_KM
                 near_surf = float(np.min(d_surf))
                 if self.comparison_enabled and self.num_bodies_cmp > 0:
-                    d_surf_cmp = np.linalg.norm(self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8'), axis=1) - self.body_radii_cmp
+                    cmp_centers = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0., 0.])
+                    d_surf_cmp = np.linalg.norm(cmp_centers - rel, axis=1) - self.body_radii_cmp
+                    for (is_cmp, index), surface in camera_surfaces.items():
+                        if is_cmp:
+                            d_surf_cmp[index] = surface.clearance((rel - cmp_centers[index]) * AU_TO_KM) / AU_TO_KM
                     near_surf = min(near_surf, float(np.min(d_surf_cmp)))
-                near = min(max(near_surf * 0.02, 1e-13), 1e-4)
+                near = camera_near_plane(near_surf, AU_TO_KM, cam['fov'], aspect_ratio)
             else:
                 near = 1e-4
             
@@ -4230,9 +4294,7 @@ class App(InputHandlerMixin):
             
             all_instances[:num_bodies, 24] = self.tex_idx_arr[:num_bodies]
             sim_t_sec = float(display_t) * 31557600.0
-            all_instances[:num_bodies, 25] = compute_body_rotation_angles_jit(
-                sim_t_sec, self.rot_period_arr, self.w0_arr, self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render, self.pole_n_arr, self.tangent_arr, self.bitangent_arr
-            )
+            all_instances[:num_bodies, 25] = body_spin_angles
             
             if self.comparison_enabled:
                 cmp_pos_rel = self.pos_snap_cmp - cam_origin + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
@@ -4242,9 +4304,7 @@ class App(InputHandlerMixin):
                 all_instances[num_bodies:, 9:12] = self.visual_arr_cmp[:, 5:8]
                 all_instances[num_bodies:, 24] = self.tex_idx_arr_cmp[:self.num_bodies_cmp]
                 cmp_t_sec = float(cmp_sim_t) * 31557600.0
-                all_instances[num_bodies:, 25] = compute_body_rotation_angles_jit(
-                    cmp_t_sec, self.rot_period_arr_cmp, self.w0_arr_cmp, self.tidally_locked_arr_cmp, self.parent_idx_arr_cmp, self.pos_snap_cmp, self.pole_n_arr_cmp, self.tangent_arr_cmp, self.bitangent_arr_cmp
-                )
+                all_instances[num_bodies:, 25] = body_spin_angles_cmp
                 
             # --- Dynamic Texture Streaming: evaluate apparent pixel sizes & process completed uploads ---
             stream_thresh_px = float(self.camera.get("tex_stream_threshold_px", 500.0))
@@ -4476,8 +4536,6 @@ class App(InputHandlerMixin):
             terrain_enabled = bool(self.camera.get("terrain_lod_enabled", False))
 
             if terrain_enabled and getattr(self, 'terrain_streamer', None) is not None:
-                self.terrain_streamer.begin_frame()
-                self.terrain_streamer.process_uploads(max_per_frame=4)
                 cand_indices = []
                 if tracking_idx_uni >= 0 and tracking_idx_uni < total_render_bodies:
                     cand_indices.append(tracking_idx_uni)
@@ -6403,11 +6461,10 @@ class App(InputHandlerMixin):
                     # Single buffer upload per atmosphere body (must precede Sky-View LUT pass)
                     self.atmo_ssbo.write(self.atmo_staging.tobytes())
 
-                    # Position-queryable tables are only needed by Mode 3's
-                    # active terrain bodies. Four cached atmospheres bound VRAM;
+                    # Mode 3 uses position-queryable tables for sky and terrain.
+                    # Four cached atmospheres bound VRAM;
                     # comparison bodies follow the same rendering path.
-                    _endpoint_enabled = (atmo_quality == 3
-                        and body_idx_in_unified in active_terrain_body_indices)
+                    _endpoint_enabled = atmo_quality == 3
                     if 'u_scattering_enabled' in cur_prog:
                         cur_prog['u_scattering_enabled'].value = _endpoint_enabled
                     if _endpoint_enabled:
@@ -6415,7 +6472,10 @@ class App(InputHandlerMixin):
                             self.scattering_lut_cache = ScatteringLUTCache(ctx)
                         _endpoint_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
                         _height_min = min(0.0, float(_endpoint_body.get('height_range_km', [0.0, 8.848])[0]))
-                        _bottom = max(1e-3, float(atmo['planet_radius_km']) + _height_min * f_scale - 0.05)
+                        _terrain_bottom = max(1e-3, float(atmo['planet_radius_km']) + _height_min * f_scale - 0.05)
+                        # Reference-radius tables avoid subtracting imaginary
+                        # ocean-floor columns from above-datum terrain haze.
+                        _bottom = float(atmo['planet_radius_km'])
                         _eff_sun = max(0.0, round(float(self.atmo_staging[227]), 4))
                         _endpoint_parameters = {
                             'u_planet_radius_km': float(atmo['planet_radius_km']),
@@ -6439,12 +6499,25 @@ class App(InputHandlerMixin):
                         _endpoint_textures = self.scattering_lut_cache.get(
                             _endpoint_parameters, atmo['lut_multi_scatter'])
                         self.scattering_lut_cache.bind(_endpoint_textures)
+                        # Distinct stellar angular sizes share medium/shine tables,
+                        # with their own cached solar response and no raymarch fallback.
+                        for _slot in range(1, min(num_stars, 4)):
+                            _star_parameters = dict(_endpoint_parameters,
+                                u_scattering_sun_radius=max(0.0, round(float(self.atmo_staging[227 + 4 * _slot]), 4)))
+                            _star_tables = self.scattering_lut_cache.get(_star_parameters, atmo['lut_multi_scatter'])
+                            self.scattering_lut_cache.bind_star(_star_tables, _slot)
+                        if 'u_scattering_terrain_bottom_km' in cur_prog:
+                            cur_prog['u_scattering_terrain_bottom_km'].value = _terrain_bottom
                         if 'u_scattering_bottom_km' in cur_prog:
                             cur_prog['u_scattering_bottom_km'].value = _bottom
                         if 'u_scattering_sun_radius' in cur_prog:
                             cur_prog['u_scattering_sun_radius'].value = _eff_sun
                         if 'u_scattering_azimuth_count' in cur_prog:
                             cur_prog['u_scattering_azimuth_count'].value = self.scattering_lut_cache.size[3]
+                        for _name, _value in (('u_scattering_bottom_km', _bottom),
+                                ('u_scattering_sun_radius', _eff_sun),
+                                ('u_scattering_azimuth_count', self.scattering_lut_cache.size[3])):
+                            if _name in self.prog_sky_view: self.prog_sky_view[_name].value = _value
 
                     # Mode 3: Analytical Sky-View LUT pass
                     if atmo_quality == 3 and self.prog_sky_view is not None:
@@ -6494,8 +6567,6 @@ class App(InputHandlerMixin):
 
                             self.prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km.astype(np.float32))
                             self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
-                            if 'u_num_steps' in self.prog_sky_view:
-                                self.prog_sky_view['u_num_steps'].value = int(self.camera.get("atmo_sky_view_steps", 24))
                             if 'u_atmo_shadow_method' in self.prog_sky_view:
                                 self.prog_sky_view['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
 

@@ -38,11 +38,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     app.camera["atmo_sky_view_res"] = new_svr_idx
                     settings_changed = True
 
-                sky_view_steps = int(app.camera.get("atmo_sky_view_steps", 24))
-                changed_sv, sky_view_steps = imgui.slider_int("Sky-View LUT Steps", sky_view_steps, 8, 64)
-                if changed_sv:
-                    app.camera["atmo_sky_view_steps"] = sky_view_steps
-                    settings_changed = True
+                imgui.text("Analytical sky and terrain lighting")
 
                 shadow_methods = ["Station-Locked Slicing", "Uniform Stochastic Raymarching", "Bounded Subtraction (Blackrack)"]
                 shadow_method = int(app.camera.get("atmo_shadow_method", 1))

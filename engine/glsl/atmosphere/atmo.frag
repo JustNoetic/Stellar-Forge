@@ -113,6 +113,8 @@ uniform sampler2D u_ring_gradients;
 uniform sampler2D u_ring_shadow_tex;
 uniform int u_num_ring_planes;
 uniform int u_atmo_quality;
+// Scene clipping follows terrain elevations; table coordinates stay at the datum.
+uniform float u_scattering_terrain_bottom_km;
 uniform bool u_stochastic_noise;
 uniform vec3 u_ring_center[MAX_RING_PLANES];
 uniform vec3 u_ring_normal[MAX_RING_PLANES];
@@ -326,6 +328,7 @@ vec3 get_transmittance_precomputed(float v, float cos_theta) {
 }
 
 #include "common/scattering_segment.glsl"
+#include "common/scattering_shine.glsl"
 
 // --- Mode 3 station-locked ring-shadow quadrature helpers ---
 // Cell boundaries are baked on the CPU in ring coordinate u (see bake_station_cells in
@@ -1064,8 +1067,8 @@ void main() {
             : vec3(0.0, u_planet_radius_km + 1e-4, 0.0);
     }
 
-    float clip_radius = (u_atmo_quality == 3 && u_scattering_enabled)
-        ? u_scattering_bottom_km : u_planet_clip_km;
+    float clip_radius = (u_atmo_quality == 3 && u_scattering_enabled && u_scattering_terrain_bottom_km > 0.0)
+        ? u_scattering_terrain_bottom_km : u_planet_clip_km;
     vec2 s_planet = raySphereIntersect(cam_pos_eff, ray_dir_sph, clip_radius);
 
     float s_start = max(0.0, s_atmo.x);
@@ -1236,12 +1239,12 @@ void main() {
     }
 
     float jitter = 0.5;
-    if (u_stochastic_noise) {
+    if (u_atmo_quality != 3 && u_stochastic_noise) {
         jitter = get_stochastic_jitter(gl_FragCoord.xy, u_frame_counter);
     }
 
     int steps = u_num_samples;
-    if (u_atmo_adaptive_steps) {
+    if (u_atmo_quality != 3 && u_atmo_adaptive_steps) {
         float base_steps = float(u_num_samples);
         float max_adaptive = max(base_steps, u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
         float min_steps = clamp(base_steps * 0.15, 3.0, 8.0);
@@ -1280,24 +1283,7 @@ void main() {
     vec3 final_transmittance = vec3(1.0);
 
     bool endpoint_surface = u_atmo_quality == 3 && u_scattering_enabled && has_scene_surface;
-    // A stationary spherical table cannot encode spatially varying shine,
-    // polar-winter aerosol density, or external ring shadows. Preserve those
-    // effects with the existing finite-distance integrator on surface pixels.
-    bool endpoint_fallback = endpoint_surface && (
-        ((u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12)
-        || (u_ringshine_enabled && u_num_ring_planes > 0 && u_ring_mask != 0u));
-    if (endpoint_surface) {
-        for (int st = 0; st < min(u_num_stars, 4); ++st) {
-            if ((u_ring_mask != 0u && u_star_solstice[st].x > 1e-4)
-                || abs(u_star_pos_local[st].w - u_scattering_sun_radius) > 0.001)
-                endpoint_fallback = true;
-        }
-        for (int k = 0; k < u_num_ring_planes; ++k) {
-            if (length(u_ring_center[k] - u_body_offset) >= 1e-4)
-                endpoint_fallback = true;
-        }
-    }
-    int integration_quality = endpoint_fallback ? 2 : u_atmo_quality;
+    int integration_quality = u_atmo_quality;
     if (integration_quality == 3) {
         // Multi-pass ring clipping: Pass 1 (clip_mode == 1) renders behind the rings.
         // If clip_mode == 2, discard for pixels where rings exist in front to avoid duplicate draw blowout.
@@ -1412,10 +1398,12 @@ void main() {
             for (int st = 0; st < min(u_num_stars, 4); ++st) {
                 vec3 sunlight = u_star_dir_sph_eff[st].xyz;
                 if (dot(sunlight, sunlight) < 1e-8) continue;
-                finite_star_scatter[st] = endpoint_radiance(start_point, terrain_point, normalize(sunlight), T_lut)
+                finite_star_scatter[st] = endpoint_radiance_star(start_point, terrain_point, normalize(sunlight), T_lut, st, u_star_pos_local[st].w)
                     * u_star_color_irrad[st].rgb;
                 L_scatter += finite_star_scatter[st];
             }
+            L_scatter += endpoint_secondary_light(start_point, terrain_point, T_lut,
+                body_planetshine_dir, body_planetshine_color, u_ring_mask);
         }
 
         if (!endpoint_surface && !cam_inside && !is_ground) {
@@ -1448,7 +1436,7 @@ void main() {
         float limb_fade = limb_faded ? clamp((1.0 - t_limb) * 128.0, 0.0, 1.0) : 1.0;
 
         for (int st = 0; st < n_stars_m3; st++) {
-            u_cur_solstice = (st < 4) ? u_star_solstice[st].xy : vec2(0.0);
+            u_cur_solstice = vec2(0.0);
             vec3 sun_pos_km = u_star_pos_local[st].xyz;
             if (dot(sun_pos_km, sun_pos_km) < 1e-8) continue;
             vec3 L_cart = normalize(sun_pos_km);
@@ -1747,7 +1735,7 @@ void main() {
             }
 
             // Method 2 (Blackrack): Analytical bounding cylinder culling + raymarching for celestial eclipse casters (moons/planets)
-            if ((u_atmo_shadow_method == 2 || endpoint_surface) && u_num_active_casters > 0) {
+            if (u_num_active_casters > 0) {
                 vec3 delta_L_eclipse = vec3(0.0);
                 vec3 slice_total_eclipse = vec3(0.0);
                 vec3 cone_axis = -L_cart;

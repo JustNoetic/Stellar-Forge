@@ -3,6 +3,11 @@ layout(local_size_x = 8, local_size_y = 4, local_size_z = 1) in;
 layout(rgba32f, binding = 0) writeonly uniform image3D u_rayleigh_output;
 layout(rgba32f, binding = 1) writeonly uniform image3D u_mie_output;
 layout(rgba32f, binding = 2) writeonly uniform image3D u_multiple_output;
+layout(rgba32f, binding = 3) writeonly uniform image3D u_shine_rayleigh_output;
+layout(rgba32f, binding = 4) writeonly uniform image3D u_shine_mie_output;
+layout(rgba32f, binding = 5) writeonly uniform image3D u_shine_multiple_output;
+layout(rgba32f, binding = 6) writeonly uniform image3D u_ring_multiple_output;
+uniform bool u_bake_transport;
 uniform sampler2D u_scattering_tau_lut;
 uniform sampler2D u_multi_scatter_lut;
 uniform int u_scattering_azimuth_count;
@@ -18,13 +23,16 @@ void main() {
     bool ground = pixel.y < half_height;
     float r = scattering_radius(float(pixel.z) / float(size.z - 1));
     float mu = scattering_view_cos(r, float(pixel.y % half_height) / float(half_height - 1), ground);
-    float mus = scattering_sun_cos(float(pixel.x % sun_count) / float(sun_count - 1));
-    float azimuth_cos = 2.0 * float(pixel.x / sun_count) / float(u_scattering_azimuth_count - 1) - 1.0;
-    float nu = mu * mus + sqrt(max(0.0, (1.0 - mu * mu) * (1.0 - mus * mus))) * azimuth_cos;
+    vec3 anchor = scattering_light_anchor(r, mu, ground);
+    float mus_anchor = scattering_light_cos(anchor.x, float(pixel.x % sun_count) / float(sun_count - 1));
+    float azimuth_cos = scattering_azimuth_cos(float(pixel.x / sun_count) / float(u_scattering_azimuth_count - 1));
+    float nu = anchor.y * mus_anchor + sqrt(max(0.0, (1.0 - anchor.y * anchor.y) * (1.0 - mus_anchor * mus_anchor))) * azimuth_cos;
+    float mus = clamp((anchor.x * mus_anchor - anchor.z * nu) / r, -1.0, 1.0);
     float distance = scattering_boundary_distance(r, mu, ground);
     float closest = clamp(-r * mu, 0.0, distance);
     vec3 T = vec3(1.0);
     vec3 result_R = vec3(0.0), result_M = vec3(0.0), result_MS = vec3(0.0);
+    vec3 shine_R = vec3(0.0), shine_M = vec3(0.0), shine_MS = vec3(0.0), ring_MS = vec3(0.0);
     for (int i = 0; i < u_scattering_steps; ++i) {
         float a = scattering_station(float(i) / float(u_scattering_steps), distance, closest);
         float b = scattering_station(float(i + 1) / float(u_scattering_steps), distance, closest);
@@ -49,9 +57,34 @@ void main() {
         result_R += T * factor * rayleigh * sun_T;
         result_M += T * factor * mie * sun_T;
         result_MS += T * factor * (rayleigh + mie) * psi;
+        if (u_bake_transport) {
+            float horizon = -sqrt(max(0.0, 1.0 - sin_planet * sin_planet));
+            float visibility = smoothstep(horizon - 0.05, horizon + 0.05, musq);
+            vec2 ps_uv = scattering_tau_uv(rq, max(musq, scattering_horizon(rq) + 1e-5), false,
+                                          vec2(textureSize(u_scattering_tau_lut, 0)));
+            vec3 ps_T = musq < horizon ? vec3(0.0)
+                : exp(-textureLod(u_scattering_tau_lut, ps_uv, 0.0).rgb) * visibility;
+            shine_R += T * factor * rayleigh * ps_T;
+            shine_M += T * factor * mie * ps_T;
+            shine_MS += T * factor * (rayleigh + mie) * psi * ps_T;
+            float ring_cos = sqrt(max(0.0, 1.0 - musq * musq));
+            vec3 ring_psi = textureLod(u_multi_scatter_lut,
+                vec2(scattering_sun_coord(ring_cos), sqrt(h)), 0.0).rgb;
+            ring_MS += T * factor * (rayleigh + mie) * ring_psi;
+        }
         T *= cell_T;
     }
-    imageStore(u_rayleigh_output, pixel, vec4(result_R, 1.0));
-    imageStore(u_mie_output, pixel, vec4(result_M, 1.0));
+    // Encode direct response before filtering. Linear interpolation of tiny
+    // sunset radiances with bright neighbors otherwise spreads light into
+    // shadow; square-root interpolation reduces that HDR tail and is finite
+    // at zero. Decode after all four dimensions have been interpolated.
+    imageStore(u_rayleigh_output, pixel, vec4(sqrt(max(result_R, vec3(0.0))), 1.0));
+    imageStore(u_mie_output, pixel, vec4(sqrt(max(result_M, vec3(0.0))), 1.0));
     imageStore(u_multiple_output, pixel, vec4(result_MS, 1.0));
+    if (u_bake_transport) {
+        imageStore(u_shine_rayleigh_output, pixel, vec4(shine_R, 1.0));
+        imageStore(u_shine_mie_output, pixel, vec4(shine_M, 1.0));
+        imageStore(u_shine_multiple_output, pixel, vec4(shine_MS, 1.0));
+        imageStore(u_ring_multiple_output, pixel, vec4(ring_MS, 1.0));
+    }
 }

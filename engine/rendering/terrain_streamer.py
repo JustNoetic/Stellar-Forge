@@ -49,6 +49,9 @@ class TerrainTileStreamer:
 
         self.free_slots = list(range(self.pool_capacity))
         self.current_frame = 0
+        # Red-channel copies only for resident height slots, bounded by the GPU
+        # pool. Camera collision samples these without a GPU readback or disk I/O.
+        self.height_tiles = {}
 
         # Background worker thread & queues
         self.request_queue = queue.Queue()
@@ -121,7 +124,7 @@ class TerrainTileStreamer:
                             raw_bytes = self._read_tile_from_disk(*key)
                             if raw_bytes and self.free_slots and len(self.locked_slots) < max_locked:
                                 slot = self.free_slots.pop(0)
-                                self.upload_tile_to_slot(slot, raw_bytes)
+                                self.upload_tile_to_slot(slot, raw_bytes, key)
                                 self.resident_tiles[key] = slot
                                 self.slot_to_key[slot] = key
                                 self.locked_slots.add(slot)
@@ -141,7 +144,7 @@ class TerrainTileStreamer:
                                 raw_bytes = self._read_tile_from_disk(*key)
                                 if raw_bytes and self.free_slots and len(self.locked_slots) < max_locked:
                                     slot = self.free_slots.pop(0)
-                                    self.upload_tile_to_slot(slot, raw_bytes)
+                                    self.upload_tile_to_slot(slot, raw_bytes, key)
                                     self.resident_tiles[key] = slot
                                     self.slot_to_key[slot] = key
                                     self.locked_slots.add(slot)
@@ -454,12 +457,31 @@ class TerrainTileStreamer:
             off_y_list.append(off_y)
         return slots_list, uv_scales_list, off_x_list, off_y_list
 
-    def upload_tile_to_slot(self, slot_idx: int, raw_bytes: bytes):
+    def upload_tile_to_slot(self, slot_idx: int, raw_bytes: bytes, key=None):
         """Upload raw RGBA tile bytes to the specified layer of Texture2DArray."""
         self.texture_array.write(
             raw_bytes,
             viewport=(0, 0, slot_idx, self.tile_size, self.tile_size, 1)
         )
+        if key is not None and key[1] == 'height':
+            self.height_tiles[slot_idx] = np.frombuffer(raw_bytes, 'u1').reshape(
+                self.tile_size, self.tile_size, 4)[..., 0].copy()
+        else:
+            self.height_tiles.pop(slot_idx, None)
+
+    def sample_height(self, slot, uv):
+        """GL_LINEAR and CLAMP_TO_EDGE sampling of a resident height tile."""
+        tile = self.height_tiles.get(slot)
+        if tile is None:
+            return None
+        self.slot_last_used[slot] = self.current_frame
+        p = np.clip(np.asarray(uv) * self.tile_size - .5, 0., self.tile_size - 1.)
+        ij = np.floor(p).astype(int)
+        nxt = np.minimum(ij + 1, self.tile_size - 1)
+        f = p - ij
+        x, y = ij.T; nx, ny = nxt.T; fx, fy = f.T
+        return ((tile[y, x] * (1.-fx) + tile[y, nx] * fx) * (1.-fy)
+                + (tile[ny, x] * (1.-fx) + tile[ny, nx] * fx) * fy) / 255.
 
     def begin_frame(self):
         """Advances the frame counter used for LRU timestamps. Call once per render frame."""
@@ -482,6 +504,7 @@ class TerrainTileStreamer:
                 if (key[0], key[1]) in reloads or (key[0], None) in reloads:
                     del self.resident_tiles[key]
                     self.slot_to_key.pop(slot, None)
+                    self.height_tiles.pop(slot, None)
                     self.locked_slots.discard(slot)
                     self.free_slots.append(slot)
             self._dir_file_cache.clear()
@@ -544,7 +567,7 @@ class TerrainTileStreamer:
                     self._resolve_memo.pop((old_key[0], old_key[1], old_key[2]), None)
 
             # Upload to GPU
-            self.upload_tile_to_slot(slot, raw_bytes)
+            self.upload_tile_to_slot(slot, raw_bytes, key)
             self.resident_tiles[key] = slot
             self.slot_to_key[slot] = key
             self.slot_last_used[slot] = self.current_frame
