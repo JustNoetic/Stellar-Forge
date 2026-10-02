@@ -99,3 +99,5 @@ data/graphics_settings.json
 *.zip
 demos/
 data/tiles/
+scratch/*
+!scratch/.gitkeep
