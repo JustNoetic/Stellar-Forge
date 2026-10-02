@@ -39,6 +39,14 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     settings_changed = True
 
                 imgui.text("Analytical sky and terrain lighting")
+                changed_ap, aerial_volume = imgui.checkbox(
+                    "Fast Aerial Perspective (Experimental)",
+                    app.camera.get("atmo_aerial_volume", True))
+                if changed_ap:
+                    app.camera["atmo_aerial_volume"] = aerial_volume
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Use a small 3D LUT for terrain haze. Disable to compare with direct endpoint lighting.")
 
             elif atmo_quality > 0:
                 atmo_res = float(app.camera.get("atmo_resolution", 1.0))

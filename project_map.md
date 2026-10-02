@@ -164,6 +164,7 @@ stellar_forge.spec              # PyInstaller standalone build configuration
 - `bloom_mode`: `0` = Gaussian Blur, `1` = Diffraction Spikes, `2` = Hybrid
 - `spike_count`: Number of diffraction spikes (`4`, `6`, `8`)
 - `atmo_quality`: `0` = Off, `1` = Low (2D), `2` = High (Volumetric), `3` = Analytical (Sky-View)
+- `atmo_aerial_volume`: Experimental Mode 3 terrain haze acceleration (default `True`); `engine/rendering/aerial_perspective.py`, `engine/glsl/atmosphere/aerial_perspective.comp`, `engine/glsl/common/aerial_{coordinates,lookup}.glsl`. Camera-frustum 32³ volume; atmosphere-relative cosine depth slices; shared solar/planetshine/ringshine transport in `common/scattering_scene.glsl`; endpoint fallback at orbital rims, distant views, and ring-split passes. Disable in graphics settings for direct endpoint comparison.
 - `tracking_idx`: Integer index of tracked celestial body (or `None`)
 - `inspected_idx`: Integer index of currently inspected body in Inspector panel
 

@@ -113,7 +113,9 @@ class ScatteringLUTCache:
                  'u_scattering_shine_multiple_lut': 26,
                  'u_scattering_ambient_rayleigh_lut': 27,
                  'u_scattering_ambient_mie_lut': 28,
-                 'u_scattering_ring_multiple_lut': 29}
+                 'u_scattering_ring_multiple_lut': 29,
+                 'u_aerial_scatter_lut': 39,
+                 'u_aerial_tau_lut': 40}
         for name, unit in units.items():
             if name in program: program[name].value = unit
 

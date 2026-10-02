@@ -36,6 +36,7 @@ class InputHandlerMixin:
                 "atmo_noise_type": self.camera.get("atmo_noise_type", 0),
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
+                "atmo_aerial_volume": self.camera.get("atmo_aerial_volume", True),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "clouds_enabled": self.camera.get("clouds_enabled", True),
                 "cloud_max_depth": self.camera.get("cloud_max_depth", 3),

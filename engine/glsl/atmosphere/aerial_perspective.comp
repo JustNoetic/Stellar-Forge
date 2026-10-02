@@ -1,0 +1,42 @@
+#version 460 core
+#define PI 3.14159265358979323846
+#include "common/scattering_scene.glsl"
+#include "common/aerial_coordinates.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba32f, binding = 0) writeonly uniform image3D aerial_scatter;
+layout(rgba32f, binding = 1) writeonly uniform image3D aerial_tau;
+uniform mat4 u_inv_proj;
+uniform mat4 u_inv_view;
+
+void main() {
+    ivec3 cell = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(aerial_scatter);
+    if (any(greaterThanEqual(cell, size))) return;
+    vec3 q = vec3(cell) / vec3(size - 1);
+    vec4 eye = u_inv_proj * vec4(q.xy * 2.0 - 1.0, -1.0, 1.0);
+    vec3 world_ray = normalize((u_inv_view * vec4(eye.xy, -1.0, 0.0)).xyz);
+    vec3 direction = normalize(toSphericalSpace(world_ray, u_pole_obl));
+    float family;
+    vec2 interval = aerial_interval(u_cam_pos, direction, family);
+    if (interval.y <= interval.x) {
+        imageStore(aerial_scatter, cell, vec4(0.0));
+        imageStore(aerial_tau, cell, vec4(0.0));
+        return;
+    }
+    vec3 a = u_cam_pos + interval.x * direction;
+    vec3 b = a + (interval.y - interval.x) * aerial_distance_fraction(q.z) * direction;
+    vec3 T = endpoint_transmittance(a, b), L = vec3(0.0);
+    for (int st = 0; st < min(u_num_stars, 4); ++st) {
+        if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8) {
+            L += endpoint_radiance_star(a, b, normalize(u_star_dir_sph_eff[st].xyz),
+                T, st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
+        }
+    }
+    L += endpoint_secondary_light(a, b, T, instances[u_body_idx*7+4].xyz,
+        instances[u_body_idx*7+5].xyz, floatBitsToUint(instances[u_body_idx*7+3].w));
+    // Square-root encoding preserves the zero-length limit with cosine slices.
+    // Full floats avoid adding half-float quantization to faint orbital haze.
+    imageStore(aerial_scatter, cell, vec4(sqrt(max(L, vec3(0.0))), 1.0));
+    imageStore(aerial_tau, cell, vec4(sqrt(-log(max(T, vec3(1e-30)))), family));
+}

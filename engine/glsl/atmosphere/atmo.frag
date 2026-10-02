@@ -114,7 +114,6 @@ uniform sampler2D u_ring_shadow_tex;
 uniform int u_num_ring_planes;
 uniform int u_atmo_quality;
 // Scene clipping follows terrain elevations; table coordinates stay at the datum.
-uniform bool u_scattering_enabled;
 uniform float u_scattering_terrain_bottom_km;
 uniform bool u_stochastic_noise;
 uniform vec3 u_ring_center[MAX_RING_PLANES];
@@ -221,6 +220,9 @@ void eval_polar_winter(vec3 pos_sph, vec2 solstice_params, float has_rings,
 #include "common/refraction.glsl"
 
 #include "common/sun_terminator.glsl"
+#include "common/scattering_segment.glsl"
+#include "common/scattering_shine.glsl"
+#include "common/aerial_lookup.glsl"
 // get_oblate_radius / casterShadowTerm / compute_caster_shadow live in the
 // shared include so the Mode 3 Sky-View LUT bake uses identical eclipse math.
 #include "common/caster_shadow.glsl"
@@ -815,7 +817,36 @@ void main() {
     vec3 final_transmittance = vec3(1.0);
 
     int integration_quality = u_atmo_quality;
-    if (integration_quality == 3) {
+    if (integration_quality == 3 && u_scattering_enabled
+        && (has_scene_surface || u_atmo_clip_mode != 0 || scene_limit < s_atmo.y)) {
+        // The sky-view LUT ends at the smooth ground/top boundary. For actual
+        // scene hits and split atmosphere passes, query only the visible segment.
+        // Keep the unnormalized spherical-space direction: s_start/s_end are
+        // physical ray distances, including the oblate transform and origin shift.
+        vec3 a = cam_local_sph + s_start * ray_dir_sph;
+        vec3 b = cam_local_sph + s_end * ray_dir_sph;
+        float volume_weight = 0.0;
+        bool used_volume = u_atmo_clip_mode == 0
+            && aerial_lookup(a, b, ray_dir, scattered, final_transmittance, volume_weight);
+        if (!used_volume || volume_weight < 1.0) {
+            vec3 volume_L = scattered, volume_T = final_transmittance;
+            scattered = vec3(0.0);
+            final_transmittance = endpoint_transmittance(a, b);
+            for (int st = 0; st < min(u_num_stars, 4); ++st) {
+                if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8) {
+                    scattered += endpoint_radiance_star(a, b,
+                        normalize(u_star_dir_sph_eff[st].xyz), final_transmittance,
+                        st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
+                }
+            }
+            scattered += endpoint_secondary_light(a, b, final_transmittance,
+                body_planetshine_dir, body_planetshine_color, u_ring_mask);
+            if (used_volume) {
+                scattered = mix(scattered, volume_L, volume_weight);
+                final_transmittance = mix(final_transmittance, volume_T, volume_weight);
+            }
+        }
+    } else if (integration_quality == 3) {
 
 
         // Camera position and Zenith in planet local spherical frame (km)

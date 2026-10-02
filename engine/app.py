@@ -351,6 +351,7 @@ from engine.physics.physics_core import _extract_render_state, _update_hierarchy
 from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.scattering_lut import ScatteringLUTCache
+from engine.rendering.aerial_perspective import AerialPerspectiveVolume
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
 from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches_jit, pack_cloud_patches_jit
@@ -531,6 +532,7 @@ class App(InputHandlerMixin):
             "atmo_noise_type": 0,
             "atmo_sky_view_steps": 24,
             "atmo_sky_view_res": 0,
+            "atmo_aerial_volume": True,
             "atmo_enabled": True,
             "clouds_enabled": True,
             "cloud_max_depth": 3,
@@ -648,6 +650,7 @@ class App(InputHandlerMixin):
         self.sky_view_height = 108
         self.sky_view_baked_key = None
         self.scattering_lut_cache = None
+        self.aerial_volume = None
         self.star_catalog = None
         self._ephem_trajectories_pts_count = 0
         self.prev_atmo_exposure = 1.0
@@ -757,6 +760,7 @@ class App(InputHandlerMixin):
                 "atmo_noise_type": self.camera.get("atmo_noise_type", 0),
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
+                "atmo_aerial_volume": self.camera.get("atmo_aerial_volume", True),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "clouds_enabled": self.camera.get("clouds_enabled", True),
                 "cloud_max_depth": self.camera.get("cloud_max_depth", 3),
@@ -6095,6 +6099,7 @@ class App(InputHandlerMixin):
                 cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
     
                 if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
+                if 'u_aerial_enabled' in cur_prog: cur_prog['u_aerial_enabled'].value = False
                 if 'u_atmo_shadow_method' in cur_prog:
                     cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
                 if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
@@ -6541,15 +6546,15 @@ class App(InputHandlerMixin):
                             self.resize_sky_view_lut(_target_w, _target_h)
 
                         current_bake_key = (self.frame_counter, body_idx_in_unified)
-                        if self.sky_view_baked_key != current_bake_key:
-                            cam_rel_au = cam_pos - body_pos_rel
-                            cam_rel_km = cam_rel_au * AU_TO_KM
-                            if f_scale > 1.00001:
-                                h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
-                                cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
-                            else:
-                                cam_sph_km = cam_rel_km
+                        cam_rel_au = cam_pos - body_pos_rel
+                        cam_rel_km = cam_rel_au * AU_TO_KM
+                        if f_scale > 1.00001:
+                            h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
+                            cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
+                        else:
+                            cam_sph_km = cam_rel_km
 
+                        if self.sky_view_baked_key != current_bake_key:
                             if 'lut_tex' in atmo and atmo['lut_tex']:
                                 atmo['lut_tex'].use(location=1)
                             if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
@@ -6586,6 +6591,25 @@ class App(InputHandlerMixin):
 
                             self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
                             self.sky_view_baked_key = current_bake_key
+
+                        # A small frustum volume amortizes terrain endpoint queries.
+                        # Split ring passes and distant planets retain exact
+                        # endpoints; the lookup also rejects mixed limb cells.
+                        _use_aerial = (self.camera.get("atmo_aerial_volume", True)
+                                       and clip_mode == 0
+                                       and np.linalg.norm(cam_sph_km) < 4.0 * atmo['atmo_radius_km'])
+                        cur_prog['u_aerial_enabled'].value = False
+                        if _use_aerial:
+                            if self.aerial_volume is None:
+                                self.aerial_volume = AerialPerspectiveVolume(ctx)
+                            atmo['lut_multi_scatter'].use(location=3)
+                            self.ringshine_map_tex.use(location=8)
+                            self.aerial_volume.update(
+                                current_bake_key, cam_sph_km, _terrain_bottom,
+                                _endpoint_parameters, self.scattering_lut_cache.size[3],
+                                inv_proj_bytes, inv_view_bytes, n_ring_planes,
+                                ring_normals_buf, ps_enabled, rs_enabled)
+                            self.aerial_volume.bind(cur_prog, cam_sph_km, _terrain_bottom)
 
                         # Restore framebuffer and raster state for atmosphere polyhedron rendering
                         if is_lowres:
@@ -7894,6 +7918,8 @@ class App(InputHandlerMixin):
             self.surface_ring_shadow_filter.release()
         if self.scattering_lut_cache is not None:
             self.scattering_lut_cache.release()
+        if self.aerial_volume is not None:
+            self.aerial_volume.release()
         self.impl.shutdown()
         glfw.terminate()
     
