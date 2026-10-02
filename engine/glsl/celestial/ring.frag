@@ -38,6 +38,7 @@ uniform vec3 u_camera_pos;
 uniform vec4 u_host_planet_pole_obl;
 uniform float u_host_planet_R_minor;
 uniform int u_clip_mode;
+uniform float u_clip_atmo_radius; // host atmosphere's equatorial radius, AU
 uniform uint u_caster_mask_lo;
 uniform uint u_caster_mask_hi;
 uniform bool u_planetshine_enabled;
@@ -347,9 +348,27 @@ void main() {
     gl_FragDepth = log2(max(1e-6, u_depth_C * hit_clip_z + 1.0)) / log2(u_depth_C * u_far + 1.0);
 
     if (u_clip_mode != 0) {
-        float d = dot(hit_local, -cam_to_host);
-        if (u_clip_mode == 1 && d > 0.0) discard;
-        if (u_clip_mode == 2 && d <= 0.0) discard;
+        // A camera-facing ring point can still lie behind the atmospheric limb.
+        // Split by atmosphere crossed BEFORE the hit, rather than a hemisphere.
+        // Work at the precise local ray anchor, using the same oblate-to-sphere
+        // scale as atmo.frag; do not reconstruct a distant world-space origin.
+        float f_scale = max(1.0, u_host_planet_pole_obl.w);
+        vec3 origin_sph = O_local + pole_n * (dot(O_local, pole_n) * (f_scale - 1.0));
+        vec3 dir_sph = ray_dir + pole_n * (dot(ray_dir, pole_n) * (f_scale - 1.0));
+        float a = dot(dir_sph, dir_sph);
+        vec3 cross_vec = cross(origin_sph, dir_sph);
+        float p2 = dot(cross_vec, cross_vec) / a;
+        float r2 = u_clip_atmo_radius * u_clip_atmo_radius;
+        bool atmo_in_front = false;
+        if (u_clip_atmo_radius > 0.0 && p2 < r2) {
+            float half_chord = sqrt((r2 - p2) / a);
+            float t_closest = -dot(origin_sph, dir_sph) / a;
+            float entry = max(t_closest - half_chord, -d_bounding);
+            float exit = min(t_closest + half_chord, t_local);
+            atmo_in_front = entry < exit;
+        }
+        if (u_clip_mode == 1 && !atmo_in_front) discard;
+        if (u_clip_mode == 2 && atmo_in_front) discard;
     }
 
     float r = length(hit_local);

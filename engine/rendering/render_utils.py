@@ -893,6 +893,12 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
         ring_shadow_tex.build_mipmaps()
         ring_shadow_tex.current_body_idx = 0
     ring_gradient_tex.atlas_data = ring_gradient_data
+    from engine.rendering.ring_shadow_filter import RingShadowFilter
+    shadow_filter = getattr(ring_gradient_tex, 'surface_shadow_filter', None)
+    if shadow_filter is None:
+        shadow_filter = RingShadowFilter(ring_gradient_tex.ctx)
+        ring_gradient_tex.surface_shadow_filter = shadow_filter
+    shadow_filter.update(ring_gradient_data)
 
     # Station-cell boundary cache for Mode 3 shadow slicing (see bake_station_cells).
     # Keyed (body_idx, K); baked lazily by the app for the active cell count and reset

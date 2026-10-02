@@ -2154,6 +2154,7 @@ class App(InputHandlerMixin):
         ring_gradient_tex.shadow_tex = ring_shadow_tex
         self.ring_shadow_tex = ring_shadow_tex
         self.body_ring_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
+        self.surface_ring_shadow_filter = ring_gradient_tex.surface_shadow_filter
 
 
         def build_ringshine_lut(ctx):
@@ -2411,6 +2412,11 @@ class App(InputHandlerMixin):
         uniform_ring_coplanar_mask = prog_spheres.get('u_ring_coplanar_mask', None)
         uniform_caster_max_bend = prog_spheres.get('u_caster_max_bend', None)
         uniform_caster_mie = prog_spheres.get('u_caster_mie', None)
+        from engine.rendering.ring_shadow_filter import RingShadowFilter
+        RingShadowFilter.configure(prog_spheres)
+        RingShadowFilter.configure(self.prog_terrain)
+        RingShadowFilter.configure(prog_atmo)
+        RingShadowFilter.configure(prog_atmo_lowres)
         uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
         if 'u_ring_gradients' in prog_spheres:
             prog_spheres['u_ring_gradients'].value = 0
@@ -2450,6 +2456,7 @@ class App(InputHandlerMixin):
         u_ring_camera_pos = prog_rings['u_camera_pos']
         u_ring_body_offset = prog_rings['u_body_offset']
         u_ring_clip_mode = prog_rings['u_clip_mode']
+        u_ring_clip_atmo_radius = prog_rings['u_clip_atmo_radius']
         u_ring_caster_mask_lo_uni = prog_rings['u_caster_mask_lo']
         u_ring_caster_mask_hi_uni = prog_rings['u_caster_mask_hi']
         u_ring_planetshine_enabled = prog_rings.get('u_planetshine_enabled', None)
@@ -4505,6 +4512,11 @@ class App(InputHandlerMixin):
             
             prog_culling_compute['u_num_bodies'].value = total_render_bodies
             prog_culling_compute['u_star_idx'].value = star_idx
+            ring_star_indices = np.zeros(16, dtype=np.int32)
+            ring_star_count = min(len(star_indices_numba), 16)
+            ring_star_indices[:ring_star_count] = star_indices_numba[:ring_star_count]
+            prog_culling_compute['u_num_ring_stars'].value = ring_star_count
+            prog_culling_compute['u_ring_star_indices'].write(ring_star_indices.tobytes())
             prog_culling_compute['u_n_casters'].value = n_casters_fixed
             
             c_idx_arr = np.zeros(64, dtype=np.int32)
@@ -6125,6 +6137,8 @@ class App(InputHandlerMixin):
                     if 'u_ring_params' in cur_prog: cur_prog['u_ring_params'].write(ring_params_buf)
                     if 'u_ring_coplanar_mask' in cur_prog: cur_prog['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
                     ring_gradient_tex.use(location=0)
+                    if atmo_quality == 2:
+                        self.surface_ring_shadow_filter.bind()
                     if ring_shadow_tex is not None:
                         ring_shadow_tex.use(location=13)
                 
@@ -6820,13 +6834,14 @@ class App(InputHandlerMixin):
                         return True
                 return False
 
-            def render_single_ring_group(group, is_cmp=False):
+            def render_single_ring_group(group, is_cmp=False, clip_mode=0, clip_atmo_radius=0.0):
                 ctx.disable(moderngl.CULL_FACE)
                 ctx.enable(moderngl.BLEND)
                 ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
                 u_ring_camera_pos.write(cam_pos)
                 ctx.depth_mask = False
-                u_ring_clip_mode.value = 0
+                u_ring_clip_mode.value = clip_mode
+                u_ring_clip_atmo_radius.value = clip_atmo_radius
                 if u_ring_planetshine_enabled is not None:
                     u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
                 ring_gradient_tex.use(location=0)
@@ -6999,6 +7014,7 @@ class App(InputHandlerMixin):
                     group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
 
                 ctx.depth_mask = True
+                u_ring_clip_mode.value = 0
 
             def render_habitable_zone():
                 if not (self.camera.get("show_habitable_zone", False) and self.hz_vao is not None):
@@ -7247,20 +7263,36 @@ class App(InputHandlerMixin):
 
                 if atmo_entry is not None and body_ring_groups:
                     if _body_needs_ring_clip(atmo_entry):
-                        if is_below_clouds:
-                            execute_atmosphere_pass(1, [atmo_entry])
+                        if atmo_quality == 3:
+                            # Per-fragment atmosphere entry handles both inside
+                            # and outside observers, including oblate envelopes.
+                            _a_r_au = float(atmo_entry[1]['atmo_radius_au'])
                             for rg in body_ring_groups:
-                                render_single_ring_group(rg, is_cmp=_is_c)
-                            execute_atmosphere_pass(2, [atmo_entry])
-                            render_body_clouds(_bi, is_cmp=_is_c)
+                                render_single_ring_group(rg, is_cmp=_is_c, clip_mode=1, clip_atmo_radius=_a_r_au)
+                            if is_below_clouds:
+                                execute_atmosphere_pass(0, [atmo_entry])
+                                render_body_clouds(_bi, is_cmp=_is_c)
+                            else:
+                                render_body_clouds(_bi, is_cmp=_is_c)
+                                execute_atmosphere_pass(0, [atmo_entry])
                             rendered_cloud_bodies.add(key)
+                            for rg in body_ring_groups:
+                                render_single_ring_group(rg, is_cmp=_is_c, clip_mode=2, clip_atmo_radius=_a_r_au)
                         else:
-                            render_body_clouds(_bi, is_cmp=_is_c)
-                            rendered_cloud_bodies.add(key)
-                            execute_atmosphere_pass(1, [atmo_entry])
-                            for rg in body_ring_groups:
-                                render_single_ring_group(rg, is_cmp=_is_c)
-                            execute_atmosphere_pass(2, [atmo_entry])
+                            if is_below_clouds:
+                                execute_atmosphere_pass(1, [atmo_entry])
+                                for rg in body_ring_groups:
+                                    render_single_ring_group(rg, is_cmp=_is_c)
+                                execute_atmosphere_pass(2, [atmo_entry])
+                                render_body_clouds(_bi, is_cmp=_is_c)
+                                rendered_cloud_bodies.add(key)
+                            else:
+                                render_body_clouds(_bi, is_cmp=_is_c)
+                                rendered_cloud_bodies.add(key)
+                                execute_atmosphere_pass(1, [atmo_entry])
+                                for rg in body_ring_groups:
+                                    render_single_ring_group(rg, is_cmp=_is_c)
+                                execute_atmosphere_pass(2, [atmo_entry])
                     else:
                         if is_below_clouds:
                             execute_atmosphere_pass(0, [atmo_entry])
@@ -7858,6 +7890,8 @@ class App(InputHandlerMixin):
         for _t in getattr(self, 'sky_view_star_tex', []):
             if _t: _t.release()
         if getattr(self, 'sky_view_fbo', None): self.sky_view_fbo.release()
+        if getattr(self, 'surface_ring_shadow_filter', None):
+            self.surface_ring_shadow_filter.release()
         if self.scattering_lut_cache is not None:
             self.scattering_lut_cache.release()
         self.impl.shutdown()

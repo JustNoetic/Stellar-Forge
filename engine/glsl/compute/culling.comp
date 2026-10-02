@@ -28,6 +28,8 @@ layout(std430, binding = 8) buffer FocusMask {
 
 uniform int u_num_bodies;
 uniform int u_star_idx;
+uniform int u_num_ring_stars;
+uniform int u_ring_star_indices[16];
 uniform int u_n_casters;
 uniform int u_caster_indices[64];
 uniform vec4 u_frustum_planes[6];
@@ -146,30 +148,52 @@ void main() {
                 }
             }
 
-            for (int k = 0; k < u_n_rings; k++) {
-                vec3 C_k = u_ring_centers[k];
-                vec3 N_k = u_ring_normals[k];
-                float r_out = u_ring_outer_radii[k];
+        }
+    }
 
-                float denom = dot(L_dir, N_k);
-                if (abs(denom) > 1e-8) {
-                    vec3 vec_c = C_k - pos;
-                    float dist_centers = length(vec_c);
-                    if (dist_centers < 1e-6) {
-                        r_mask |= (1u << k);
-                    } else {
-                        float s = dot(vec_c, N_k) / denom;
-                        if (s > -r && s < dist_star + r) {
-                            vec3 hit = pos + s * L_dir;
-                            float d = length(hit - C_k);
-                            float r_cone = star_r * max(0.0, s) / dist_star + r;
-                            if (d < r_out + r_cone) {
-                                r_mask |= (1u << k);
-                            }
-                        }
-                    }
-                }
+    // Union ring candidates over every rendered star. Caster eclipse masks
+    // above retain their existing primary-star selection.
+    int ring_star_count = u_num_ring_stars > 0 ? min(u_num_ring_stars, 16) : 1;
+    for (int st = 0; st < ring_star_count && u_n_rings > 0; st++) {
+        int star_index = u_num_ring_stars > 0 ? u_ring_star_indices[st] : u_star_idx;
+        if (star_index == int(idx)) continue;
+        vec3 to_star = instances[star_index * 7].xyz - pos;
+        float light_distance = length(to_star);
+        float light_radius = instances[star_index * 7 + 1].z;
+        if (light_distance <= light_radius + r) {
+            // A source overlapping the receiver has no safely bounded cone.
+            for (int k = 0; k < u_n_rings; k++) r_mask |= (1u << k);
+            continue;
+        }
+        vec3 light_dir = to_star / light_distance;
+        // Bounds direction changes across both the star and the whole receiver.
+        float sin_alpha = clamp((light_radius + r) / light_distance, 0.0, 1.0);
+        float cos_alpha = sqrt(max(0.0, 1.0 - sin_alpha * sin_alpha));
+        float direction_spread = sqrt(2.0) * sin_alpha / sqrt(1.0 + cos_alpha);
+        for (int k = 0; k < u_n_rings; k++) {
+            if ((r_mask & (1u << k)) != 0u) continue;
+            vec3 center_rel = u_ring_centers[k] - pos;
+            float outer_r = u_ring_outer_radii[k];
+            if (outer_r <= 0.0) continue;
+            if (length(center_rel) <= outer_r + r) {
+                r_mask |= (1u << k);
+                continue;
             }
+            vec3 normal = normalize(u_ring_normals[k]);
+            float denom = dot(light_dir, normal);
+            float safe_denom = abs(denom) - direction_spread;
+            if (safe_denom <= 1e-8) {
+                // Keep ambiguous grazing candidates; the surface shader still
+                // uses its existing footprint model, without a ray fallback.
+                r_mask |= (1u << k);
+                continue;
+            }
+            float s = dot(center_rel, normal) / denom;
+            float delta_s = (r + abs(s) * direction_spread) / safe_denom;
+            if (s + delta_s <= 0.0 || s - delta_s >= light_distance + light_radius + r) continue;
+            vec3 hit_rel = s * light_dir - center_rel;
+            float footprint = r + delta_s * (1.0 + direction_spread) + abs(s) * direction_spread;
+            if (length(hit_rel) <= outer_r + footprint) r_mask |= (1u << k);
         }
     }
 
