@@ -114,19 +114,41 @@ flowchart TD
 ## 🚀 Quick Start
 
 ### Prerequisites
-- **Operating System**: Windows 10/11 or modern Linux
+- **Operating System**: Windows 10/11 or modern Linux (Ubuntu/Debian, Fedora, Arch, etc.)
 - **GPU**: OpenGL 4.3+ capable graphics card (NVIDIA GTX 900+ / AMD Radeon RX 400+ / Intel Iris Xe or newer)
 - **Python**: Python 3.10, 3.11, or 3.12 (64-bit recommended)
 
-### One-Click Launch (Windows)
-Double-click [`run.bat`](run.bat) or execute it from PowerShell / CMD:
-```cmd
-run.bat
-```
-`run.bat` automatically:
-1. Detects and creates a Python virtual environment (`venv`).
-2. Validates and installs all required dependencies from [`requirements.txt`](requirements.txt).
-3. Configures engine paths and launches [`engine/main.py`](engine/main.py).
+#### Linux System Packages
+Ensure standard OpenGL, GLFW, and Python venv libraries are installed:
+- **Debian / Ubuntu**:
+  ```bash
+  sudo apt update
+  sudo apt install python3-venv python3-tk libgl1-mesa-glx libglfw3
+  ```
+- **Fedora**:
+  ```bash
+  sudo dnf install python3-tkinter mesa-libGL glfw
+  ```
+- **Arch Linux**:
+  ```bash
+  sudo pacman -S python tk mesa glfw
+  ```
+
+### Quick Launch
+- **Windows**: Double-click [`run.bat`](run.bat) or execute it from CMD/PowerShell:
+  ```cmd
+  run.bat
+  ```
+- **Linux**: Make [`run.sh`](run.sh) executable and launch it:
+  ```bash
+  chmod +x run.sh
+  ./run.sh
+  ```
+
+The launcher scripts automatically:
+1. Detect and create a Python virtual environment (`venv`).
+2. Validate and install all required dependencies from [`requirements.txt`](requirements.txt).
+3. Configure engine paths and launch [`engine/main.py`](engine/main.py).
 
 ### Manual Setup
 ```bash
@@ -277,7 +299,8 @@ Stellar-Forge/
 ├── textures/                     # Planet surfaces, ring profiles, bloom kernels
 ├── screenshots/                  # High-resolution captures and render gallery (git-ignored)
 ├── requirements.txt              # Python package dependencies
-├── run.bat                       # Automated setup and launcher batch script
+├── run.bat                       # Automated setup and launcher batch script (Windows)
+├── run.sh                        # Automated setup and launcher shell script (Linux)
 ├── build.bat                     # PyInstaller standalone compilation script
 ├── stellar_forge.spec            # PyInstaller build specification
 └── LICENSE                       # MIT License

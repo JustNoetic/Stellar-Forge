@@ -17,6 +17,7 @@
 | **Path Resolution** | NEVER hardcode root paths. Bundle/frozen paths vs. external user data paths. | `engine/path_utils.py` (`get_bundled_path`, `get_external_path`) |
 | **Thread Synchronization** | Sim thread & Render thread communicate through `app.shared_state` under `app.shared_state["lock"]`. | `engine/app.py`, `engine/physics/physics_core.py` |
 | **Agent Scratchpad** | Put temporary test/debug Python scripts in `scratch/`. Ignored by git; prevents repo pollution. | `scratch/` |
+| **OS & Platform Support** | Fully cross-platform (Windows & Linux). High-res timer gracefully no-ops on Linux. GLFW supports X11/Wayland. Use `run.sh` on Linux, `run.bat` on Windows. | `run.bat`, `run.sh`, `engine/physics/physics_core.py` |
 
 ---
 
@@ -24,7 +25,7 @@
 
 | Task / Feature | Primary File | Key Functions / Classes / Symbols |
 | :--- | :--- | :--- |
-| **Application Lifecycle & Main Loop** | `engine/app.py`<br>`engine/main.py` | `App.__init__`, `App.run`, `App.render_frame`<br>Entrypoint, exception log to `main_error.txt` |
+| **Application Lifecycle & Launchers** | `engine/app.py`<br>`engine/main.py`<br>`run.bat` (Windows)<br>`run.sh` (Linux) | `App.__init__`, `App.run`, `App.render_frame`<br>Venv bootstrap & launch, crash logging to `main_error.txt` |
 | **N-Body Gravitational Physics** | `engine/physics/physics_core.py` | `Simulation`, `compute_custom_forces`, `compute_all_accelerations`, `attach_custom_forces` |
 | **Relativity (1PN) & Oblateness (J2/J4)** | `engine/physics/physics_core.py` | `compute_custom_forces` (Jacobi coords, J2, J4 zonal harmonics) |
 | **Analytical Keplerian Propagator** | `engine/physics/kepler_analytical.py` | `propagate_keplerian_system_numba`, `extract_all_kepler_elements`, `state_to_kepler_vectors` |
@@ -117,6 +118,10 @@ engine/
     ├── common/                 # caster_shadow.glsl, refraction.glsl, ring_shadow_filter.glsl, scattering_bake.glsl
     ├── compute/                # culling.comp (frustum/horizon culling), orbit.comp
     └── post/                   # composite.frag, accum.frag, bloom_*.frag, conv_bloom_*.comp (diffraction spikes)
+run.bat                         # Automated setup & launcher batch script (Windows)
+run.sh                          # Automated setup & launcher shell script (Linux)
+requirements.txt                # Python package dependencies
+stellar_forge.spec              # PyInstaller standalone build configuration
 ```
 
 ---
