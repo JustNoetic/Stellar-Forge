@@ -27,7 +27,8 @@ float surface_ring_shadow(vec3 body_center, vec3 surface_rel, vec3 L,
             vec3 dir_radial = vec_radial / d;
             float cos_theta = dot(dir_radial, L_plane / L_plane_len);
             float sin_theta = dot(dir_radial, normalize(cross(plane_normal, L)));
-            R_eff *= sqrt(pow(cos_theta / max(1e-6, abs(denom)), 2.0) + sin_theta * sin_theta);
+            float inv_denom_clamped = min(1.0 / max(1e-4, abs(denom)), 20.0);
+            R_eff *= sqrt(pow(cos_theta * inv_denom_clamped, 2.0) + sin_theta * sin_theta);
         }
         R_eff = max(R_eff, fwidth(d) * 0.75);
         float plane_occlusion = 0.0;
@@ -38,8 +39,9 @@ float surface_ring_shadow(vec3 body_center, vec3 surface_rel, vec3 L,
             float opacity = u_ring_params[j].z;
             if (outer_r <= inner_r || opacity <= 0.0) continue;
             float inv_mu = 1.0 / max(1e-4, abs(dot(normalize(u_ring_normal[j]), L)));
+            float R_eff_clamped = min(R_eff, (outer_r - inner_r) * 0.5);
             plane_occlusion += surface_ring_profile_occlusion(j, d, inner_r, outer_r,
-                opacity, inv_mu, R_eff);
+                opacity, inv_mu, R_eff_clamped);
         }
         transmission *= 1.0 - clamp(plane_occlusion, 0.0, 1.0);
     }

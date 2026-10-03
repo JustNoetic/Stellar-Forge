@@ -351,6 +351,7 @@ from engine.physics.physics_core import _extract_render_state, _update_hierarchy
 from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.scattering_lut import ScatteringLUTCache
+from engine.rendering.atmosphere_programs import AtmospherePrograms
 from engine.rendering.aerial_perspective import AerialPerspectiveVolume
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
@@ -533,6 +534,7 @@ class App(InputHandlerMixin):
             "atmo_sky_view_steps": 24,
             "atmo_sky_view_res": 0,
             "atmo_aerial_volume": True,
+            "atmo_bounded_shadows": True,
             "atmo_enabled": True,
             "clouds_enabled": True,
             "cloud_max_depth": 3,
@@ -761,6 +763,7 @@ class App(InputHandlerMixin):
                 "atmo_sky_view_steps": self.camera.get("atmo_sky_view_steps", 24),
                 "atmo_sky_view_res": self.camera.get("atmo_sky_view_res", 0),
                 "atmo_aerial_volume": self.camera.get("atmo_aerial_volume", True),
+                "atmo_bounded_shadows": self.camera.get("atmo_bounded_shadows", True),
                 "hdr_enabled": self.camera.get("hdr_enabled", True),
                 "clouds_enabled": self.camera.get("clouds_enabled", True),
                 "cloud_max_depth": self.camera.get("cloud_max_depth", 3),
@@ -1756,48 +1759,10 @@ class App(InputHandlerMixin):
         if 'u_ring_texture' in prog_rings:
             prog_rings['u_ring_texture'].value = 4
     
-        prog_atmo = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_fragment_shader)
-        
-        atmo_frag_lowres_src = atmo_fragment_shader.replace(
-            "layout(location = 0, index = 0) out vec4 out_scattered;",
-            "layout(location = 0) out vec4 out_scattered;"
-        ).replace(
-            "layout(location = 0, index = 1) out vec4 out_transmittance;",
-            "layout(location = 1) out vec4 out_transmittance;"
-        )
-        prog_atmo_lowres = ctx.program(vertex_shader=atmo_vertex_shader, fragment_shader=atmo_frag_lowres_src)
-        
-        for p in (prog_atmo, prog_atmo_lowres):
-            if 'u_ringshine_lut' in p:
-                p['u_ringshine_lut'].value = 6
-            if 'u_ringshine_cdf_lut' in p:
-                p['u_ringshine_cdf_lut'].value = 7
-            if 'u_ringshine_map' in p:
-                p['u_ringshine_map'].value = 8
-            if 'u_depth_texture' in p:
-                p['u_depth_texture'].value = 9
-            if 'u_transmittance_lut' in p:
-                p['u_transmittance_lut'].value = 1
-            if 'u_multi_scatter_lut' in p:
-                p['u_multi_scatter_lut'].value = 3
-            if 'u_ring_gradients' in p:
-                p['u_ring_gradients'].value = 0
-            if 'u_history_scatter' in p:
-                p['u_history_scatter'].value = 10
-            if 'u_history_trans' in p:
-                p['u_history_trans'].value = 11
-            if 'u_sky_view_lut' in p:
-                p['u_sky_view_lut'].value = 12
-            if 'u_ring_shadow_tex' in p:
-                p['u_ring_shadow_tex'].value = 13
-            if 'u_sky_view_trans_lut' in p:
-                p['u_sky_view_trans_lut'].value = 14
-            if 'u_sky_view_star_lut' in p:
-                p['u_sky_view_star_lut'].value = (15, 16, 17, 18)
-            if 'u_stbn_tex' in p:
-                p['u_stbn_tex'].value = 19
-            ScatteringLUTCache.configure(p)
-        
+        atmo_programs = AtmospherePrograms(ctx, atmo_vertex_shader, atmo_fragment_shader)
+        prog_atmo, prog_atmo_lowres = atmo_programs.programs(
+            self.camera.get("atmo_quality", 2), self.camera.get("atmo_bounded_shadows", True))
+
         self.prog_sky_view = ctx.program(vertex_shader=sky_view_lut_vertex_shader, fragment_shader=sky_view_lut_fragment_shader)
         if 'u_ring_gradients' in self.prog_sky_view:
             self.prog_sky_view['u_ring_gradients'].value = 0
@@ -2348,7 +2313,7 @@ class App(InputHandlerMixin):
         self.terrain_current_raw_patches = None
         self.terrain_current_body_name = None
         self.terrain_current_body_idx = -1
-        self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=256, tile_size=512)
+        self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=512, tile_size=512)
         self.planet_quadtrees = {}
         self.planet_cloud_quadtrees = {}
         self.terrain_active_cloud_patches = {}
@@ -2371,17 +2336,9 @@ class App(InputHandlerMixin):
 
         self.single_cloud_body_buf = ctx.buffer(reserve=4)
     
-        vao_atmo = ctx.vertex_array(
-            prog_atmo,
-            [(vbo_hi, '3f 12x', 'in_position')],
-            index_buffer=ibo_hi
-        )
-        vao_atmo_lowres = ctx.vertex_array(
-            prog_atmo_lowres,
-            [(vbo_hi, '3f 12x', 'in_position')],
-            index_buffer=ibo_hi
-        )
-    
+        vao_atmo, vao_atmo_lowres = atmo_programs.vaos(
+            (prog_atmo, prog_atmo_lowres), vbo_hi, ibo_hi)
+
         max_orbits = MAX_BODIES * 2
         orbit_ssbo = ctx.buffer(reserve=max_orbits * 160)
         orbit_ssbo.bind_to_storage_buffer(binding=0)
@@ -3475,6 +3432,13 @@ class App(InputHandlerMixin):
             orbit_fade_dir = 1.0 if orbit_fade_dir_idx == 0 else -1.0
             orbit_min_alpha = self.camera.get("orbit_min_alpha", 0.3)
             atmo_quality = min(self.camera.get("atmo_quality", 2), 3)
+            # Select before any per-frame uniforms are uploaded. The bounded
+            # toggle changes compiled programs, not just a branch in High mode.
+            prog_atmo, prog_atmo_lowres = atmo_programs.programs(
+                atmo_quality, self.camera.get("atmo_bounded_shadows", True))
+            vao_atmo, vao_atmo_lowres = atmo_programs.vaos(
+                (prog_atmo, prog_atmo_lowres), vbo_hi, ibo_hi)
+
             
             glfw.poll_events()
             
@@ -3734,7 +3698,7 @@ class App(InputHandlerMixin):
             terrain_enabled = bool(cam.get("terrain_lod_enabled", False))
             if terrain_enabled and terrain_streamer is not None:
                 terrain_streamer.begin_frame()
-                terrain_streamer.process_uploads(max_per_frame=4)
+                terrain_streamer.process_uploads(max_per_frame=16, max_time_ms=2.5)
             body_spin_angles = compute_body_rotation_angles_jit(
                 float(display_t) * 31557600.0, self.rot_period_arr, self.w0_arr,
                 self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render,
@@ -4327,13 +4291,12 @@ class App(InputHandlerMixin):
                 if t_slice <= 0:
                     continue
                 b_name_lower = bodies_data[b_i].get('name', '').lower()
-                b_pos = pos_rel_all[b_i]
-                b_rad = body_radii[b_i]
-                cam_d = math.sqrt(b_pos[0]**2 + b_pos[1]**2 + b_pos[2]**2)
+                b_pos_world = pos_snap_render[b_i]
+                b_rad = float(body_radii[b_i])
+                cam_d = float(np.linalg.norm((cam_origin + rel) - b_pos_world))
                 apparent_px = (b_rad / max(1e-12, cam_d)) * self.fb_height * cur_fov_factor
-                is_tracked = (self.camera.get("tracking_idx") == b_i and not self.camera.get("tracking_is_cmp", False))
                 
-                if (apparent_px >= stream_thresh_px or is_tracked) and self.active_res_level.get(t_slice) != 'high':
+                if apparent_px >= stream_thresh_px and self.active_res_level.get(t_slice) != 'high':
                     # If Terrain LOD is active and this body has baked tiles, skip legacy 21.6K monolithic load to prevent stutter
                     if self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
                         body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name_lower)
@@ -4342,7 +4305,7 @@ class App(InputHandlerMixin):
                     self.texture_streamer.request_high_res(b_name_lower)
 
             # Process any completed high-res decoded textures from background worker
-            decoded_results = self.texture_streamer.poll_results(max_items=2)
+            decoded_results = self.texture_streamer.poll_results(max_items=4)
             for res in decoded_results:
                 r_idx = res['idx']
                 b_name_lower = res.get('name_lower', '')
@@ -4552,21 +4515,6 @@ class App(InputHandlerMixin):
             terrain_enabled = bool(self.camera.get("terrain_lod_enabled", False))
 
             if terrain_enabled and getattr(self, 'terrain_streamer', None) is not None:
-                cand_indices = []
-                if tracking_idx_uni >= 0 and tracking_idx_uni < total_render_bodies:
-                    cand_indices.append(tracking_idx_uni)
-                    # Preload low/intermediate LOD 2 tiles for the active tracked body so zooming in/out never encounters missing parent tiles
-                    if getattr(self, '_last_preloaded_lod2_body', None) != tracking_idx_uni:
-                        self._last_preloaded_lod2_body = tracking_idx_uni
-                        t_b_name = bodies_data[tracking_idx_uni]["name"].lower() if tracking_idx_uni < num_bodies else self.bodies_data_cmp[tracking_idx_uni - num_bodies]["name"].lower()
-                        self.terrain_streamer.preload_body_lod(t_b_name, map_types=("diffuse", "clouds"), target_lod=2)
-                insp_idx = self.camera.get("inspected_idx", -1)
-                if insp_idx is not None and 0 <= insp_idx < total_render_bodies and insp_idx not in cand_indices:
-                    cand_indices.append(insp_idx)
-                for b_i in range(total_render_bodies):
-                    if b_i not in cand_indices:
-                        cand_indices.append(b_i)
-
                 fov_fac = float(1.0 / math.tan(math.radians(max(0.001, self.camera["fov"]) / 2.0)))
                 max_terrain_bodies = 4
 
@@ -4579,11 +4527,21 @@ class App(InputHandlerMixin):
                     tiles_dir_cache = self._terrain_tiles_dir_cache = {}
 
                 prev_active_terrain_indices = getattr(self, "_prev_active_terrain_indices", set())
-                for b_i in cand_indices:
-                    b_pos = all_instances[b_i, 0:3]
+                cam_world_pos_f8 = cam_origin + rel
+                candidates = []
+
+                for b_i in range(total_render_bodies):
                     b_r = all_instances[b_i, 6]
-                    d_cam = float(np.linalg.norm(b_pos - cam_pos))
+                    if b_i < num_bodies:
+                        b_pos_world = pos_snap_render[b_i]
+                        b_name = bodies_data[b_i]["name"].lower()
+                    else:
+                        b_pos_world = self.pos_snap_cmp[b_i - num_bodies] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                        b_name = self.bodies_data_cmp[b_i - num_bodies]["name"].lower()
+
+                    d_cam = float(np.linalg.norm(b_pos_world - cam_world_pos_f8))
                     apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
+
                     # Hysteresis: keep terrain LOD active until the body shrinks below
                     # the GPU's lo-mesh threshold (apparent_px < 2.0 in culling.comp),
                     # so the terrain pass renders the surface all the way down to the
@@ -4594,7 +4552,6 @@ class App(InputHandlerMixin):
                     if apparent_px < min_px_thresh:
                         continue
 
-                    b_name = bodies_data[b_i]["name"].lower() if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]["name"].lower()
                     has_tiles = tiles_dir_cache.get(b_i)
                     if has_tiles is None:
                         has_tiles = os.path.isdir(os.path.join(tiles_base, b_name))
@@ -4602,13 +4559,23 @@ class App(InputHandlerMixin):
                     if not has_tiles:
                         continue
 
+                    b_pos = all_instances[b_i, 0:3]
                     r_cull = b_r * (1.5 if d_cam > b_r else 5.0)
                     if is_sphere_in_frustum(b_pos, r_cull, frustum_planes):
-                        active_terrain_bodies.append((b_i, b_name))
-                        if len(active_terrain_bodies) >= max_terrain_bodies:
-                            break
+                        candidates.append((b_i, b_name, apparent_px))
 
+                # Purely determined by object size on screen (descending apparent_px):
+                candidates.sort(key=lambda c: c[2], reverse=True)
+                active_terrain_bodies = [(c[0], c[1]) for c in candidates[:max_terrain_bodies]]
                 self._prev_active_terrain_indices = {tb[0] for tb in active_terrain_bodies}
+
+                # Preload low/intermediate LOD 2 tiles for the largest dominant visible terrain body on screen
+                if active_terrain_bodies:
+                    dominant_b_i, dominant_b_name = active_terrain_bodies[0]
+                    dominant_px = candidates[0][2]
+                    if dominant_px >= 300.0 and getattr(self, '_last_preloaded_lod2_body', None) != dominant_b_i:
+                        self._last_preloaded_lod2_body = dominant_b_i
+                        self.terrain_streamer.preload_body_lod(dominant_b_name, map_types=("diffuse", "clouds"), target_lod=2)
 
             active_terrain_body_idx = -1
             active_terrain_body_name = None
@@ -5429,6 +5396,7 @@ class App(InputHandlerMixin):
                 return has_cloud
 
             # Pass 1b: Terrain Quadtree LOD (SpaceEngine style) - Multi-Body with Local Frustum Culling
+            prev_active_body_patches = getattr(self, 'terrain_active_body_patches', {})
             self.terrain_active_body_patches = {}
             self.terrain_active_cloud_patches = {}
             self.terrain_last_cloud_patch_count = 0
@@ -5439,6 +5407,7 @@ class App(InputHandlerMixin):
                 res_scale = max(0.6, patch_res / 32.0)
                 split_fac = float(self.camera.get("terrain_lod_split_factor", 1.0)) * res_scale
                 max_d = int(self.camera.get("terrain_max_depth", 6))
+                cam_world_pos_f8 = cam_origin + rel
 
                 for b_i, b_name in active_terrain_bodies:
                     rem_budget = MAX_TERRAIN_PATCHES - total_patches_rendered
@@ -5452,9 +5421,16 @@ class App(InputHandlerMixin):
                     p_quadtree = self.planet_quadtrees[b_i]
                     p_quadtree.update_radius(b_r_km)
 
-                    b_pos = all_instances[b_i, 0:3]
-                    cam_rel_au = cam_pos - b_pos
-                    cam_rel_km = cam_rel_au * AU_TO_KM
+                    if b_i < num_bodies:
+                        b_pos_world = pos_snap_render[b_i]
+                    else:
+                        b_pos_world = self.pos_snap_cmp[b_i - num_bodies] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+
+                    # Compute relative camera vector in double precision (float64) to eliminate
+                    # float32 truncation error regardless of what body is tracked or where cam_origin is!
+                    cam_rel_world_au = cam_world_pos_f8 - b_pos_world
+                    cam_rel_km = (cam_rel_world_au * AU_TO_KM).astype(np.float32)
+                    b_pos_rel_f8 = b_pos_world - cam_origin
 
                     pole = all_instances[b_i, 9:12]
                     pole_norm = float(np.linalg.norm(pole))
@@ -5494,15 +5470,25 @@ class App(InputHandlerMixin):
                     N_world = frustum_planes[:, :3].astype(np.float64)
                     D_world = frustum_planes[:, 3].astype(np.float64)
                     N_local = N_world @ R_mat.T
-                    D_local = AU_TO_KM * (np.dot(N_world, b_pos.astype(np.float64)) + D_world)
+                    D_local = AU_TO_KM * (np.dot(N_world, b_pos_rel_f8) + D_world)
 
                     # Widen side frustum planes ONLY if line of sight to body passes through refracting atmosphere or gravitational lens
-                    d_cam_body_km = float(np.linalg.norm(cam_pos - b_pos)) * AU_TO_KM
-                    dist_cb_au = float(np.linalg.norm(b_pos - cam_pos))
-                    ray_dir = (b_pos - cam_pos) / max(1e-9, dist_cb_au)
+                    d_cam_body_km = float(np.linalg.norm(cam_rel_world_au)) * AU_TO_KM
+                    dist_cb_au = float(np.linalg.norm(cam_rel_world_au))
+                    ray_dir = -cam_rel_world_au / max(1e-9, dist_cb_au)
 
-                    if refract_max_bend > 1e-6 and not (np.linalg.norm(b_pos - refract_center) < 1e-7):
-                        v_cr = np.array(refract_center) - cam_pos
+                    is_b_cmp = (b_i >= num_bodies)
+                    b_local_idx = (b_i - num_bodies) if is_b_cmp else b_i
+                    is_refract_host = (refract_params is not None and 
+                                       b_local_idx == refract_params.get('body_idx') and 
+                                       is_b_cmp == refract_params.get('is_cmp', False))
+                    is_grav_host = (grav_lens_params is not None and 
+                                    b_local_idx == grav_lens_params.get('body_idx') and 
+                                    is_b_cmp == grav_lens_params.get('is_cmp', False))
+
+                    if refract_max_bend > 1e-6 and not is_refract_host:
+                        refract_pos_world = refract_params['center_world']
+                        v_cr = refract_pos_world - cam_world_pos_f8
                         t_cr = float(np.dot(v_cr, ray_dir))
                         if t_cr < dist_cb_au:
                             t_fwd = max(0.0, t_cr)
@@ -5510,8 +5496,9 @@ class App(InputHandlerMixin):
                             if d_perp_km < (refract_radius_km + 15.0 * refract_scale_height):
                                 D_local[:4] += (d_cam_body_km * math.tan(refract_max_bend) * 1.5)
 
-                    if grav_lens_enabled and grav_lens_rs > 1e-6 and not (np.linalg.norm(b_pos - grav_lens_center) < 1e-7):
-                        v_gl = np.array(grav_lens_center) - cam_pos
+                    if grav_lens_enabled and grav_lens_rs > 1e-6 and not is_grav_host:
+                        grav_pos_world = grav_lens_params['center_world']
+                        v_gl = grav_pos_world - cam_world_pos_f8
                         t_gl = float(np.dot(v_gl, ray_dir))
                         if t_gl < dist_cb_au:
                             t_fwd_gl = max(0.0, t_gl)
@@ -5542,7 +5529,7 @@ class App(InputHandlerMixin):
                         _c_varr = visual_arr
                         b_cloud_alt_km = float(_c_varr[b_i, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[b_i, 12] > 0 else 3.5
 
-                    body_refract_bend = refract_max_bend if (np.linalg.norm(b_pos - refract_center) < 1e-7) else 0.0
+                    body_refract_bend = refract_max_bend if is_refract_host else 0.0
 
                     raw_patches = p_quadtree.traverse_raw(
                         cam_pos_local,
@@ -5591,7 +5578,7 @@ class App(InputHandlerMixin):
                         # If a patch merged but its parent tile is still loading from disk (uvs[0] < 0.999),
                         # and previous frame had its 4 resident child patches, retain the child patches for a
                         # brief grace period (up to 25 frames / ~0.4s) so the user never sees blurry intermediate fallback.
-                        prev_info = self.terrain_active_body_patches.get(b_i)
+                        prev_info = prev_active_body_patches.get(b_i)
                         if prev_info is not None and prev_info[0] is not None:
                             prev_raw_p = prev_info[0]
                             patches_to_replace = []
@@ -6102,6 +6089,8 @@ class App(InputHandlerMixin):
                 if 'u_aerial_enabled' in cur_prog: cur_prog['u_aerial_enabled'].value = False
                 if 'u_atmo_shadow_method' in cur_prog:
                     cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
+                if 'u_bounded_shadows' in cur_prog:
+                    cur_prog['u_bounded_shadows'].value = bool(self.camera.get("atmo_bounded_shadows", True))
                 if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
                     shadow_method = int(self.camera.get("atmo_shadow_method", 1))
                     if shadow_method in (1, 2):
@@ -6142,7 +6131,7 @@ class App(InputHandlerMixin):
                     if 'u_ring_params' in cur_prog: cur_prog['u_ring_params'].write(ring_params_buf)
                     if 'u_ring_coplanar_mask' in cur_prog: cur_prog['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
                     ring_gradient_tex.use(location=0)
-                    if atmo_quality == 2:
+                    if atmo_quality in (2, 3):
                         self.surface_ring_shadow_filter.bind()
                     if ring_shadow_tex is not None:
                         ring_shadow_tex.use(location=13)
@@ -6376,10 +6365,7 @@ class App(InputHandlerMixin):
                     # culling compute shader) so the atmosphere covers the polyhedron.
                     _atmo_rad_au = self.body_radii_cmp[bi] if is_cmp else body_radii[bi]
                     _apparent_px = (float(_atmo_rad_au) / max(dist_to_body, 1e-12)) * self.window_height * fov_factor
-                    _tracking_idx_uni = -1
-                    if self.camera["tracking_idx"] is not None:
-                        _tracking_idx_uni = self.camera["tracking_idx"] + (num_bodies if self.camera.get("tracking_is_cmp", False) else 0)
-                    if (body_idx_in_unified == _tracking_idx_uni) or (_apparent_px >= 300.0):
+                    if _apparent_px >= 300.0:
                         _lod_subdiv = 6
                     elif _apparent_px >= 40.0:
                         _lod_subdiv = 4
@@ -6404,7 +6390,10 @@ class App(InputHandlerMixin):
                     _c1 = (3.0 / (8.0 * math.pi)) * ((1.0 - _g2) / (2.0 + _g2))
                     _c2 = 1.0 + _g2
                     _c3 = 2.0 * _g
-                    self.atmo_staging[188:192] = [_c1, _c2, _c3, 0.0]
+                    _has_methane = 1.0 if atmo.get('composition', {}).get('CH4', 0.0) > 1e-4 else 0.0
+                    _cur_body_data = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
+                    _has_rings = 1.0 if len(_cur_body_data.get('rings', [])) > 0 else 0.0
+                    self.atmo_staging[188:192] = [_c1, _c2, _c3, _has_methane]
 
                     # Precomputed star parameters (up to 4 stars)
                     self.atmo_staging[192:256] = 0.0
@@ -6455,7 +6444,7 @@ class App(InputHandlerMixin):
                         _s_pole_dot = float(np.dot(_s_dir_sph, _p_pole_norm))
                         _cosPhi = abs(_s_pole_dot)
                         _tanPhi = _cosPhi / math.sqrt(max(1.0 - _cosPhi * _cosPhi, 1e-4))
-                        _solstice_f = float(np.clip(_tanPhi * 1.8, 0.0, 1.0))
+                        _solstice_f = float(np.clip(_tanPhi * 1.8, 0.0, 1.0)) * _has_methane * _has_rings
 
                         if _s == 0:
                             _star0_s_dir_sph = _s_dir_sph
@@ -6640,6 +6629,8 @@ class App(InputHandlerMixin):
                                     ring_shadow_tex.build_mipmaps()
                                     ring_shadow_tex.current_body_idx = u_idx
                             ring_shadow_tex.use(location=13)
+                        if n_ring_planes > 0:
+                            self.surface_ring_shadow_filter.bind()
                         if 'u_atmo_shadow_method' in cur_prog:
                             cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
                         shadow_method = int(self.camera.get("atmo_shadow_method", 1))
@@ -7920,6 +7911,7 @@ class App(InputHandlerMixin):
             self.scattering_lut_cache.release()
         if self.aerial_volume is not None:
             self.aerial_volume.release()
+        atmo_programs.release()
         self.impl.shutdown()
         glfw.terminate()
     

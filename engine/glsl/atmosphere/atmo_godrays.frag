@@ -482,7 +482,7 @@ void main() {
         float frag_pole_dot = dot(mid_dir_norm, pole_dir_norm);
         float is_winter = step(sun_pole_dot * frag_pole_dot, 0.0);
         float has_rings = (u_ring_mask != 0u) ? 1.0 : 0.0;
-        float winter_solstice_effect = lat_factor * is_winter * solstice_factor * has_rings;
+        float winter_solstice_effect = lat_factor * is_winter * solstice_factor * has_rings * u_precomp_mie.w;
         vec3 polar_rayleigh_inscatter_boost = mix(vec3(1.0), vec3(0.65, 0.95, 2.5), winter_solstice_effect);
 
         float inv_atmo_thickness = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);

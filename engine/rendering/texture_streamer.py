@@ -2,9 +2,13 @@ import os
 import glob
 import threading
 import queue
+import pickle
+import concurrent.futures
 from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 import numpy as np
+
+from engine.path_utils import get_external_path
 
 def compute_texture_spherical_mean(img):
     """
@@ -36,7 +40,7 @@ def _prepare_cloud_image(img, target_size=None):
         white = Image.new('L', img_l.size, 255)
         img_rgba = Image.merge('RGBA', (white, white, white, img_l))
     if target_size:
-        return img_rgba.resize(target_size, Image.Resampling.LANCZOS)
+        return img_rgba.resize(target_size, Image.Resampling.BILINEAR)
     return img_rgba
 
 class TextureStreamer:
@@ -66,11 +70,14 @@ class TextureStreamer:
         self.in_progress = set() # (name_lower, level)
         
         self._shutdown_event = threading.Event()
-        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.num_workers = 2
+        self.worker_threads = [threading.Thread(target=self._worker_loop, daemon=True) for _ in range(self.num_workers)]
+        self.worker_thread = self.worker_threads[0]  # Backward compatibility
         
         self._scan_manifest()
         self._build_fallbacks()
-        self.worker_thread.start()
+        for t in self.worker_threads:
+            t.start()
 
     def _scan_manifest(self):
         if not os.path.exists(self.textures_dir):
@@ -171,17 +178,40 @@ class TextureStreamer:
             self.idx_to_name[idx] = name_lower
 
     def _build_fallbacks(self):
-        """Pre-decode low-resolution fallback textures at startup."""
-        for name_lower, idx in self.name_to_idx.items():
+        """Pre-decode low-resolution fallback textures at startup using multithreading and disk caching."""
+        cache_dir = get_external_path("data", "cache", "texture_fallbacks")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        def _process_one(item):
+            name_lower, idx = item
             paths = self.file_manifest[name_lower]
+            cache_file = os.path.join(cache_dir, f"{name_lower}.pkl")
+
+            # Check if cache is valid (newer than all source files)
+            src_files = [p for p in paths.values() if p and os.path.exists(p)]
+            if os.path.exists(cache_file) and src_files:
+                cache_mtime = os.path.getmtime(cache_file)
+                if all(os.path.getmtime(p) <= cache_mtime for p in src_files):
+                    try:
+                        with open(cache_file, 'rb') as f:
+                            cached_entry, cached_mean = pickle.load(f)
+                        return name_lower, idx, cached_entry, cached_mean
+                    except Exception:
+                        pass
+
             entry = {}
-            
+            mean_color = None
+
             # Diffuse
             if paths['diffuse'] and os.path.exists(paths['diffuse']):
                 try:
-                    img_d = Image.open(paths['diffuse']).convert('RGBA')
-                    self.texture_mean_colors[name_lower] = compute_texture_spherical_mean(img_d)
-                    img_d_low = img_d.resize(self.fallback_size, Image.Resampling.LANCZOS)
+                    img_d = Image.open(paths['diffuse'])
+                    img_d.draft('RGB', self.fallback_size)
+                    img_d_low = img_d.resize(self.fallback_size, Image.Resampling.BILINEAR).convert('RGBA')
+                    mean_color = compute_texture_spherical_mean(img_d_low)
                     entry['diffuse'] = (self.fallback_size, img_d_low.tobytes(), 4)
                 except Exception as e:
                     print(f"[TextureStreamer] Error loading fallback diffuse for {name_lower}: {e}")
@@ -194,8 +224,9 @@ class TextureStreamer:
             # Normal
             if paths['normal'] and os.path.exists(paths['normal']):
                 try:
-                    img_n = Image.open(paths['normal']).convert('RGBA')
-                    img_n_low = img_n.resize(self.fallback_size, Image.Resampling.LANCZOS)
+                    img_n = Image.open(paths['normal'])
+                    img_n.draft('RGB', self.fallback_size)
+                    img_n_low = img_n.resize(self.fallback_size, Image.Resampling.BILINEAR).convert('RGBA')
                     entry['normal'] = (self.fallback_size, img_n_low.tobytes(), 4)
                 except Exception as e:
                     img_flat = Image.new('RGBA', self.fallback_size, (128, 128, 255, 255))
@@ -207,8 +238,9 @@ class TextureStreamer:
             # Specular
             if paths['specular'] and os.path.exists(paths['specular']):
                 try:
-                    img_s = Image.open(paths['specular']).convert('L')
-                    img_s_low = img_s.resize(self.fallback_size, Image.Resampling.LANCZOS)
+                    img_s = Image.open(paths['specular'])
+                    img_s.draft('L', self.fallback_size)
+                    img_s_low = img_s.resize(self.fallback_size, Image.Resampling.BILINEAR).convert('L')
                     entry['specular'] = (self.fallback_size, img_s_low.tobytes(), 1)
                 except Exception as e:
                     img_black = Image.new('L', self.fallback_size, 0)
@@ -220,7 +252,9 @@ class TextureStreamer:
             # Clouds
             if paths['clouds'] and os.path.exists(paths['clouds']):
                 try:
-                    img_c = _prepare_cloud_image(Image.open(paths['clouds']), self.fallback_size)
+                    img_c_raw = Image.open(paths['clouds'])
+                    img_c_raw.draft('RGB', self.fallback_size)
+                    img_c = _prepare_cloud_image(img_c_raw, self.fallback_size)
                     entry['clouds'] = (self.fallback_size, img_c.tobytes(), 4)
                 except Exception as e:
                     img_trans = Image.new('RGBA', self.fallback_size, (0, 0, 0, 0))
@@ -229,7 +263,21 @@ class TextureStreamer:
                 img_trans = Image.new('RGBA', self.fallback_size, (0, 0, 0, 0))
                 entry['clouds'] = (self.fallback_size, img_trans.tobytes(), 4)
 
+            try:
+                with open(cache_file, 'wb') as f:
+                    pickle.dump((entry, mean_color), f, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                pass
+
+            return name_lower, idx, entry, mean_color
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor:
+            results = list(executor.map(_process_one, self.name_to_idx.items()))
+
+        for name_lower, idx, entry, mean_color in results:
             self.fallback_data[idx] = entry
+            if mean_color is not None:
+                self.texture_mean_colors[name_lower] = mean_color
 
     def request_high_res(self, name_lower):
         """Request asynchronous decoding of high-resolution textures."""
@@ -263,7 +311,7 @@ class TextureStreamer:
                     scale = min(MAX_HIGH_RES_DIM / im.width, (MAX_HIGH_RES_DIM // 2) / im.height)
                     nw = max(1, int(im.width * scale))
                     nh = max(1, int(im.height * scale))
-                    return im.resize((nw, nh), Image.Resampling.LANCZOS)
+                    return im.resize((nw, nh), Image.Resampling.BILINEAR)
                 return im
 
             # High-res Diffuse
@@ -301,7 +349,7 @@ class TextureStreamer:
             self.result_queue.put(result)
             self.in_progress.discard((name_lower, 'high'))
 
-    def poll_results(self, max_items=2):
+    def poll_results(self, max_items=4):
         """Retrieve up to max_items completed decode results for main-thread GPU upload."""
         results = []
         for _ in range(max_items):
@@ -345,5 +393,6 @@ class TextureStreamer:
 
     def shutdown(self):
         self._shutdown_event.set()
-        if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=1.0)
+        for t in self.worker_threads:
+            if t.is_alive():
+                t.join(timeout=1.0)

@@ -53,11 +53,14 @@ class TerrainTileStreamer:
         # pool. Camera collision samples these without a GPU readback or disk I/O.
         self.height_tiles = {}
 
-        # Background worker thread & queues
-        self.request_queue = queue.Queue()
+        # Background worker threads & queues
+        self.request_queue = queue.PriorityQueue()
         self.upload_queue = queue.Queue()
         self.reload_queue = queue.Queue()
         self.in_flight_requests = set()
+        self._request_lock = threading.Lock()
+        self._dir_cache_lock = threading.Lock()
+        self._req_counter = 0
         self._shutdown_event = threading.Event()
 
         # Missing / unavailable tiles cache & per-body max LOD
@@ -77,8 +80,12 @@ class TerrainTileStreamer:
         self.locked_slots.add(0)
         self.free_slots.remove(0)
 
-        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-        self.worker_thread.start()
+        # Multi-threaded tile decode worker pool (4 to 6 concurrent workers)
+        self.num_workers = min(6, max(2, (os.cpu_count() or 4) - 2))
+        self.worker_threads = [threading.Thread(target=self._worker_loop, daemon=True) for _ in range(self.num_workers)]
+        self.worker_thread = self.worker_threads[0]  # Backward compatibility
+        for t in self.worker_threads:
+            t.start()
 
         # Scan available bodies in data/tiles and preload LOD 0
         self._preload_root_tiles()
@@ -153,13 +160,14 @@ class TerrainTileStreamer:
         dir_path = os.path.join(self.tiles_base_dir, body_name, map_type, str(face), str(lod))
         base_name = f"{x}_{y}"
 
-        files = self._dir_file_cache.get(dir_path)
-        if files is None:
-            if os.path.isdir(dir_path):
-                files = set(os.listdir(dir_path))
-            else:
-                files = set()
-            self._dir_file_cache[dir_path] = files
+        with self._dir_cache_lock:
+            files = self._dir_file_cache.get(dir_path)
+            if files is None:
+                if os.path.isdir(dir_path):
+                    files = set(os.listdir(dir_path))
+                else:
+                    files = set()
+                self._dir_file_cache[dir_path] = files
 
         for ext in ((".png",) if map_type == 'height' else (".jpg", ".png", ".webp", ".jpeg")):
             fn = base_name + ext
@@ -199,7 +207,7 @@ class TerrainTileStreamer:
     def _worker_loop(self):
         while not self._shutdown_event.is_set():
             try:
-                key = self.request_queue.get(timeout=0.1)
+                prio, _, key = self.request_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -209,7 +217,9 @@ class TerrainTileStreamer:
                 # Note: key remains in in_flight_requests until process_uploads()
                 # uploads it, preventing redundant requests on subsequent frames.
             else:
-                self.in_flight_requests.discard(key)
+                with self._request_lock:
+                    self.in_flight_requests.discard(key)
+                    self.missing_tiles.add(key)
                 # Tile absent on disk: request the nearest on-disk ancestor so
                 # a resident parent exists for hierarchical UV fallback instead
                 # of churning re-requests for the missing key every frame.
@@ -219,12 +229,13 @@ class TerrainTileStreamer:
                 if min_lod >= 0:
                     shift = lod - min_lod
                     anc_key = (b_name, map_type, face, min_lod, x >> shift, y >> shift)
-                    if anc_key not in self.resident_tiles and anc_key not in self.missing_tiles and anc_key not in self.in_flight_requests:
-                        self.in_flight_requests.add(anc_key)
-                        self.request_queue.put(anc_key)
-                self.missing_tiles.add(key)
+                    with self._request_lock:
+                        if anc_key not in self.resident_tiles and anc_key not in self.missing_tiles and anc_key not in self.in_flight_requests:
+                            self.in_flight_requests.add(anc_key)
+                            self._req_counter += 1
+                            self.request_queue.put((min_lod, self._req_counter, anc_key))
 
-    def request_tile(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int):
+    def request_tile(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int, priority: int = None):
         b_name = body_name.lower()
         max_d = self.max_available_lods.get((b_name, map_type, face), -1)
         if max_d >= 0 and lod > max_d:
@@ -234,10 +245,13 @@ class TerrainTileStreamer:
             y = y >> k
 
         key = (b_name, map_type, face, lod, x, y)
-        if key in self.resident_tiles or key in self.in_flight_requests or key in self.missing_tiles:
-            return
-        self.in_flight_requests.add(key)
-        self.request_queue.put(key)
+        with self._request_lock:
+            if key in self.resident_tiles or key in self.in_flight_requests or key in self.missing_tiles:
+                return
+            self.in_flight_requests.add(key)
+            self._req_counter += 1
+            prio = lod if priority is None else priority
+            self.request_queue.put((prio, self._req_counter, key))
 
     def get_max_lod(self, body_name: str, map_type: str = "diffuse") -> int:
         """Return the maximum LOD available on disk across all 6 faces for a body."""
@@ -487,7 +501,7 @@ class TerrainTileStreamer:
         """Advances the frame counter used for LRU timestamps. Call once per render frame."""
         self.current_frame += 1
 
-    def process_uploads(self, max_per_frame: int = 4):
+    def process_uploads(self, max_per_frame: int = 16, max_time_ms: float = 2.5):
         """Called every frame on the main OpenGL render thread to flush completed decodes."""
         reloads = set()
         while not self.reload_queue.empty():
@@ -496,10 +510,12 @@ class TerrainTileStreamer:
             # Rare edit/bake transition: drain the decoder before invalidating so
             # an old in-flight tile cannot reappear after a replacement/deletion.
             self._shutdown_event.set()
-            self.worker_thread.join()
-            self.request_queue = queue.Queue()
+            for t in self.worker_threads:
+                t.join(timeout=1.0)
+            self.request_queue = queue.PriorityQueue()
             self.upload_queue = queue.Queue()
-            self.in_flight_requests.clear()
+            with self._request_lock:
+                self.in_flight_requests.clear()
             for key, slot in list(self.resident_tiles.items()):
                 if (key[0], key[1]) in reloads or (key[0], None) in reloads:
                     del self.resident_tiles[key]
@@ -507,23 +523,30 @@ class TerrainTileStreamer:
                     self.height_tiles.pop(slot, None)
                     self.locked_slots.discard(slot)
                     self.free_slots.append(slot)
-            self._dir_file_cache.clear()
+            with self._dir_cache_lock:
+                self._dir_file_cache.clear()
             self.missing_tiles.clear()
             self._resolve_memo.clear()
             self.max_available_lods.clear()
             self._preload_root_tiles()
             self._shutdown_event.clear()
-            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-            self.worker_thread.start()
+            self.worker_threads = [threading.Thread(target=self._worker_loop, daemon=True) for _ in range(self.num_workers)]
+            self.worker_thread = self.worker_threads[0]
+            for t in self.worker_threads:
+                t.start()
 
+        t_start = time.perf_counter()
         uploaded_count = 0
         for _ in range(max_per_frame):
+            if (time.perf_counter() - t_start) * 1000.0 >= max_time_ms and uploaded_count > 0:
+                break
             try:
                 key, raw_bytes = self.upload_queue.get_nowait()
             except queue.Empty:
                 break
 
-            self.in_flight_requests.discard(key)
+            with self._request_lock:
+                self.in_flight_requests.discard(key)
 
             # If already resident (e.g. redundant request), skip
             if key in self.resident_tiles:
@@ -587,8 +610,9 @@ class TerrainTileStreamer:
 
     def shutdown(self):
         self._shutdown_event.set()
-        if self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=1.0)
+        for t in self.worker_threads:
+            if t.is_alive():
+                t.join(timeout=1.0)
         try:
             self.texture_array.release()
         except Exception:

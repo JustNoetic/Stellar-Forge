@@ -9,6 +9,7 @@ uniform sampler3D u_scattering_multiple_lut[4];
 uniform int u_scattering_azimuth_count;
 uniform float u_scattering_sun_radius;
 #include "scattering_coordinates.glsl"
+#include "polar_winter.glsl"
 
 vec2 endpoint_tau_uv(vec3 p, vec3 v, bool ground) {
     float r = clamp(length(p), u_scattering_bottom_km, u_atmo_radius_km);
@@ -157,6 +158,17 @@ vec3 endpoint_subsurface_solar(vec3 a, vec3 b, vec3 sun, float radius) {
         / pow(max(1e-4, 1.0 + g * g - 2.0 * g * nu), 1.5);
     vec3 R, M, extinction;
     endpoint_medium(p, R, M, extinction);
+
+    vec2 solstice_params = u_star_solstice[0].xy;
+    uint ring_mask = floatBitsToUint(instances[u_body_idx * 7 + 3].w);
+    float has_rings = (ring_mask != 0u) ? 1.0 : 0.0;
+    float has_methane = u_precomp_mie.w;
+    float polar_haze_factor;
+    vec3 polar_rayleigh_boost;
+    eval_polar_winter(p, solstice_params, has_rings, has_methane, polar_haze_factor, polar_rayleigh_boost);
+    R *= polar_rayleigh_boost;
+    M *= polar_haze_factor;
+
     float sin_planet = u_planet_radius_km / max(r, u_planet_radius_km + 0.01);
     vec2 term = sun_terminator(dot(radial, sun), sin_planet, sqrt(max(0.0, 1.0 - sin_planet * sin_planet)),
         radius, sqrt(max(0.0, 1.0 - radius * radius)));
@@ -183,15 +195,28 @@ vec3 endpoint_radiance_above(vec3 a, vec3 b, vec3 sun, vec3 transmission, int sl
     vec3 Ra, Ma, MSa, Rb, Mb, MSb;
     endpoint_scattering(a, v, sun, ground, slot, Ra, Ma, MSa);
     endpoint_scattering(b, v, sun, ground, slot, Rb, Mb, MSb);
-    vec3 direct = (Ra - transmission * Rb) * phase_R + (Ma - transmission * Mb) * phase_M;
+
+    vec3 p = 0.5 * (a + b);
+    vec2 solstice_params = (slot < 4) ? u_star_solstice[slot].xy : vec2(0.0);
+    uint ring_mask = floatBitsToUint(instances[u_body_idx * 7 + 3].w);
+    float has_rings = (ring_mask != 0u) ? 1.0 : 0.0;
+    float has_methane = u_precomp_mie.w;
+    float polar_haze_factor;
+    vec3 polar_rayleigh_boost;
+    eval_polar_winter(p, solstice_params, has_rings, has_methane, polar_haze_factor, polar_rayleigh_boost);
+
+    vec3 direct_R = max(vec3(0.0), Ra - transmission * Rb) * phase_R * polar_rayleigh_boost;
+    vec3 direct_M = max(vec3(0.0), Ma - transmission * Mb) * phase_M * polar_haze_factor;
+    vec3 direct = direct_R + direct_M;
     if (endpoint_solar_umbra(a, sun, sun_radius) && endpoint_solar_umbra(b, sun, sun_radius))
         direct = vec3(0.0);
     vec3 result = max(vec3(0.0), direct + MSa - transmission * MSb);
     if (endpoint_long_weight(distance) < 1.0) {
-        vec3 p = 0.5 * (a + b);
         float r = length(p);
         vec3 R, M, extinction;
         endpoint_medium(p, R, M, extinction);
+        R *= polar_rayleigh_boost;
+        M *= polar_haze_factor;
         float sin_planet = u_planet_radius_km / max(r, u_planet_radius_km + 0.01);
         vec2 term = sun_terminator(dot(p, sun) / r, sin_planet, sqrt(max(0.0, 1.0 - sin_planet * sin_planet)),
                                   sun_radius, sqrt(max(0.0, 1.0 - sun_radius * sun_radius)));

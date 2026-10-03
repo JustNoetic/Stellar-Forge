@@ -35,6 +35,7 @@
 | **Atmospheric Physics (Rayleigh/Mie)** | `engine/physics/atmosphere_physics.py` | `compute_atmosphere_properties`, `compute_dynamic_mie_properties`, `compute_mie_coefficients` |
 | **Atmospheric Scattering LUTs** | `engine/rendering/scattering_lut.py`<br>`engine/glsl/atmosphere/` | `ScatteringLUTCache`<br>`scattering_lut.comp`, `sky_view_lut.frag`, `multi_scatter_lut.frag`, `atmo_lut.frag` |
 | **Atmospheric Raymarching & God Rays** | `engine/glsl/atmosphere/` | `atmo.frag`, `atmo.vert`, `atmo_godrays.frag`, `atmo_upsample.frag` |
+| **Atmosphere Program Variants** | `engine/rendering/atmosphere_programs.py` | `AtmospherePrograms`, `specialize_atmosphere`: cached Low/High/Analytical programs; Analytical bounded on/off is a compile-time choice to avoid shared-shader performance regressions. |
 | **Light Refraction & Bending** | `engine/physics/refraction.py`<br>`engine/glsl/common/refraction.glsl` | `compute_refraction_angle`, `solve_refraction_apparent`, `get_apparent_look_direction` |
 | **Terrain Quadtree & LOD Geometry** | `engine/rendering/terrain_quadtree.py` | `PlanetQuadtree`, `QuadtreePatch`, `cube_to_sphere_point`, `_tan_warp` |
 | **Terrain Tile Streaming** | `engine/rendering/terrain_streamer.py` | `TerrainTileStreamer` |
@@ -130,7 +131,7 @@ stellar_forge.spec              # PyInstaller standalone build configuration
 
 | Script Path | Purpose |
 | :--- | :--- |
-| `scripts/bake_planet_tiles.py` | Reprojects equirectangular planetary maps to tangent-corrected Spherified Cube Quadtree pyramids (`data/tiles/{body}/{map}/{face}/{lod}/{x}_{y}.jpg`). |
+| scripts/bake_planet_tiles.py | Reprojects equirectangular planetary maps to tangent-corrected Spherified Cube Quadtree pyramids (data/tiles/{body}/{map}/{face}/{lod}/{x}_{y}.jpg). NVIDIA CUDA-accelerated (via CuPy/RawKernel) with automatic CPU fallback. |
 | `scripts/fetch_gaia.py` | Queries ESA Gaia Archive TAP (and VizieR TAP) in RA bands; outputs compact binary `data/gaia/stars.bin`. |
 | `scripts/fetch_horizons.py` | Queries JPL Horizons REST API for J2000 state vectors and updates `data/systems/*/system.json`. |
 | `scripts/fetch_artemis2_kernel.py` | Downloads Artemis II SPK trajectories into `data/kernels/additional/`. |

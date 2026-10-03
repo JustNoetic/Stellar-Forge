@@ -48,6 +48,36 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 if imgui.is_item_hovered():
                     imgui.set_tooltip("Use a small 3D LUT for terrain haze. Disable to compare with direct endpoint lighting.")
 
+                changed_bs, bounded_shadows = imgui.checkbox(
+                    "Bounded Shadow Raymarching (Experimental)",
+                    app.camera.get("atmo_bounded_shadows", True))
+                if changed_bs:
+                    app.camera["atmo_bounded_shadows"] = bounded_shadows
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip(
+                        "When ring or body shadows intersect the atmosphere in Mode 3,\n"
+                        "only raymarch inside the shadow bounds instead of the entire chord.\n"
+                        "Respects the ray-step budget below. Savings depend on shadow coverage."
+                    )
+
+                changed_steps, shadow_steps = imgui.slider_int(
+                    "Shadow Ray Steps", app.camera.get("atmo_steps_max", 32), 4, 128)
+                if changed_steps:
+                    app.camera["atmo_steps_max"] = shadow_steps
+                    settings_changed = True
+                changed_adapt, adaptive_steps = imgui.checkbox(
+                    "Adaptive Shadow Steps", app.camera.get("atmo_adaptive_steps", True))
+                if changed_adapt:
+                    app.camera["atmo_adaptive_steps"] = adaptive_steps
+                    settings_changed = True
+                if adaptive_steps:
+                    changed_max, max_steps = imgui.slider_int(
+                        "Max Adaptive Shadow Steps", app.camera.get("atmo_adaptive_steps_max", 128), 8, 256)
+                    if changed_max:
+                        app.camera["atmo_adaptive_steps_max"] = max_steps
+                        settings_changed = True
+
             elif atmo_quality > 0:
                 atmo_res = float(app.camera.get("atmo_resolution", 1.0))
                 changed_res, atmo_res = imgui.slider_float("Atmosphere Render Scale", atmo_res, 0.2, 1.0, "%.2fx")

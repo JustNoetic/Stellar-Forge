@@ -65,7 +65,8 @@ def compute_refraction_angle(C, V, d, max_bend, radius, scale_height, oblateness
         if delta_cam <= 1e-9:
             return 0.0
         k = Rc / (2.0 * max(1e-4, scale_height))
-        bend = 0.5 * delta_cam * refract_erfcx(math.sqrt(k) * sin_e)
+        cos_e = math.sqrt(max(0.0, 1.0 - sin_e * sin_e))
+        bend = 0.5 * delta_cam * refract_erfcx(math.sqrt(k) * sin_e) * cos_e
         sigma_cam = math.sqrt(max(1e-4, Rc * scale_height))
         x_d = d / (1.4142135 * sigma_cam)
         E_d = (1.0 if x_d >= 0.0 else -1.0) * math.sqrt(max(0.0, 1.0 - math.exp(-1.239 * x_d * x_d)))
@@ -108,7 +109,8 @@ def solve_refraction_apparent(C, V, d, max_bend, radius, scale_height, oblatenes
     uz = C[2] - V[2] * c_dot_v
     u_len = math.sqrt(ux*ux + uy*uy + uz*uz)
     if u_len <= 1e-5:
-        return V, True
+        is_occ = (c_dot_v < 0.0)
+        return V, is_occ
     ux /= u_len
     uy /= u_len
     uz /= u_len
