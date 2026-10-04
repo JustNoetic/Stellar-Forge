@@ -1782,13 +1782,8 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
         elapsed = time.perf_counter() - now
         target_time = 0.00832
         sleep_time = target_time - elapsed
-        if sleep_time > 0:
-            # Sleep for most of the time to save CPU, but leave 1ms for busy wait
-            if sleep_time > 0.001:
-                time.sleep(sleep_time - 0.001)
-            # Busy wait the remainder for high precision
-            while (time.perf_counter() - now) < target_time:
-                pass
+        if sleep_time > 0.0005:
+            time.sleep(sleep_time)
 
     if _timer_set:
         try:

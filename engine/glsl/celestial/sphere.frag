@@ -81,9 +81,8 @@ uniform vec4 u_ring_params[MAX_RING_PLANES];
 uniform vec3 u_ring_colors[MAX_RING_PLANES];
 uniform vec3 u_ring_5colors[MAX_RING_PLANES * 5];
 uniform sampler2D u_ring_gradients;
-uniform sampler3D u_ringshine_lut;
-uniform sampler3D u_ringshine_cdf_lut;
 uniform sampler2D u_ringshine_map;
+#include "common/ringshine_lookup.glsl"
 uniform int u_num_ring_planes;
 uniform float u_caster_max_bend[64];
 uniform uint u_ring_coplanar_mask[16];
@@ -196,21 +195,7 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
     return clamp(sh, vec3(0.0), vec3(1.0));
 }
 
-float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
-    float TWO_PI = 6.28318530717958647692;
-    float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
-    float k = floor((angle + PI) / TWO_PI);
-    float u = clamp(abs(a_mod) / PI, 0.0, 1.0);
 
-    // Remap coordinates to texel centers to avoid GL_CLAMP_TO_EDGE flat spots (derivative kinks)
-    float u_tex = 0.5 / 128.0 + u * (127.0 / 128.0);
-    float v_tex_mapped = 0.5 / 128.0 + v_tex * (127.0 / 128.0);
-    float sin_lat_mapped = 0.5 / 64.0 + sin_lat * (63.0 / 64.0);
-
-    float base_cdf = texture(u_ringshine_cdf_lut, vec3(u_tex, v_tex_mapped, sin_lat_mapped)).r;
-    float signed_cdf = (a_mod < 0.0) ? -base_cdf : base_cdf;
-    return 2.0 * k + signed_cdf;
-}
 
 void main() {
     if (f_clip_z <= 0.0) discard;
@@ -899,11 +884,6 @@ void main() {
             vec3 P_dir = normalize(P_rel);
             float frag_elevation = dot(P_dir, ring_normal);
 
-            vec3 frag_to_star0 = (u_stars_pos_radius[0].xyz - f_center_pos) - P_rel;
-            float dist_to_star0 = length(frag_to_star0);
-            vec3 L0 = dist_to_star0 > 1e-5 ? (frag_to_star0 / dist_to_star0) : vec3(0.0, 1.0, 0.0);
-            float sun_elev_0 = dot(L0, ring_normal);
-
             for (int s = 0; s < u_num_stars; s++) {
                 vec3 star_pos = u_stars_pos_radius[s].xyz;
                 float star_radius = u_stars_pos_radius[s].w;
@@ -911,8 +891,6 @@ void main() {
                 float dist_to_star = length(frag_to_star);
                 if (dist_to_star < 1e-5) continue;
                 vec3 L = frag_to_star / dist_to_star;
-                float sun_elev_s = dot(L, ring_normal);
-                float rel_hemi = (sun_elev_s * sun_elev_0 >= 0.0) ? 1.0 : -1.0;
 
                 vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
                 float star_sin_lat = abs(dot(L, pole_dir));
@@ -947,11 +925,11 @@ void main() {
                 float x_prime = phi_center / PI;
                 float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                float y_prime = frag_elevation * rel_hemi;
+                float y_prime = frag_elevation;
                 float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
                 vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
-                vec3 total_ring_irradiance = texture(u_ringshine_map, map_uv).rgb;
+                vec3 total_ring_irradiance = ringshine_sample(map_uv, k, s);
 
                 // Apply 1/PI (~0.318309886) Lambertian BRDF factor to convert incoming irradiance map to surface reflection.
                 // Note: Solar elevation (mu_0) is already fully resolved inside ringshine_map.frag radiative transfer.

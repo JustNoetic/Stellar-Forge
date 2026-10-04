@@ -1,6 +1,7 @@
 import math
 import numpy as np
 from numba import njit, prange
+from engine.rendering.ringshine import MAX_RING_HOSTS, RING_PROPERTY_ROWS
 import datetime
 from engine.core.constants import *
 
@@ -849,11 +850,14 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
     for r in ring_precomputed:
         rings_by_body.setdefault(r['body_idx'], []).append(r)
         
-    # Assign unified_idx for each body (up to 4)
+    # Reserve sixteen unified host rows, followed by segment rows
     body_indices = {bi: i for i, bi in enumerate(rings_by_body.keys())}
     
-    ring_gradient_data = np.zeros((16, 4096, 4), dtype='f4')
-    ring_props_data = np.zeros((8, 4096, 4), dtype='f4')
+    width, rows = ring_gradient_tex.size
+    if len(body_indices) > MAX_RING_HOSTS or len(ring_precomputed) > rows - MAX_RING_HOSTS:
+        raise ValueError("Ring atlas supports 16 hosts and at most %d segments" % (rows - MAX_RING_HOSTS))
+    ring_gradient_data = np.zeros((rows, width, 4), dtype='f4')
+    ring_props_data = np.zeros((RING_PROPERTY_ROWS, width, 4), dtype='f4')
     # Default untextured scattering properties
     ring_props_data[0::2, :, 0] = 0.7
     ring_props_data[0::2, :, 1] = -0.3
@@ -862,23 +866,19 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
     
     # 1. Bake unified shadow profile for each body into rows 0 to len(body_indices)-1
     for bi, unified_idx in body_indices.items():
-        if unified_idx >= 4:
-            break
         body_rings = rings_by_body[bi]
         # Always use all defined body rings to determine radial bounds so domain never collapses
         if body_rings:
             min_r = min(r['inner_r'] for r in body_rings)
             max_r = max(r['outer_r'] for r in body_rings)
-            combined_shadow, combined_props, combined_props_extra = bake_unified_shadow_profile(body_rings, min_r, max_r)
+            combined_shadow, combined_props, combined_props_extra = bake_unified_shadow_profile(body_rings, min_r, max_r, res=width)
             ring_gradient_data[unified_idx, :, :] = combined_shadow
             ring_props_data[unified_idx * 2, :, :] = combined_props
             ring_props_data[unified_idx * 2 + 1, :, :] = combined_props_extra
             
-    # 2. Copy individual segment profiles into rows 4 to 15
+    # 2. Segment rows cannot alias any unified host profile
     for j, ring in enumerate(ring_precomputed):
-        row_idx = 4 + j
-        if row_idx >= 16:
-            break
+        row_idx = MAX_RING_HOSTS + j
         ring_gradient_data[row_idx, :, :] = ring['shadow_grad']
         ring['row_idx'] = row_idx
         
@@ -893,10 +893,12 @@ def rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex):
         ring_shadow_tex.build_mipmaps()
         ring_shadow_tex.current_body_idx = 0
     ring_gradient_tex.atlas_data = ring_gradient_data
+    ring_gradient_tex.property_data = ring_props_data
+    ring_gradient_tex.profile_revision = getattr(ring_gradient_tex, "profile_revision", 0) + 1
     from engine.rendering.ring_shadow_filter import RingShadowFilter
     shadow_filter = getattr(ring_gradient_tex, 'surface_shadow_filter', None)
     if shadow_filter is None:
-        shadow_filter = RingShadowFilter(ring_gradient_tex.ctx)
+        shadow_filter = RingShadowFilter(ring_gradient_tex.ctx, width=width, rows=MAX_RING_HOSTS)
         ring_gradient_tex.surface_shadow_filter = shadow_filter
     shadow_filter.update(ring_gradient_data)
 
@@ -946,60 +948,3 @@ def rebuild_ring_render_group(bi, ctx, prog_rings, ring_precomputed, ring_render
         
     body_indices = rebuild_ring_gradients_atlas(ring_precomputed, ring_gradient_tex)
     return body_indices
-
-
-@njit(parallel=True, fastmath=False, cache=True)
-def build_ringshine_3d_lut_numba(sin_lats, radii, flats, num_alpha=180):
-    """Precompute the 3D geometric form-factor Look-Up Table K(r, sin lambda, f).
-    
-    Dimensions:
-      res_z: oblateness f in [0.0, 0.3] (slice 0 is bit-exact spherical f=0)
-      res_y: normalized ring radius r in [1.001, 5.0] Req
-      res_x: sine of planetocentric latitude sin(lambda) in [0.0, 1.0]
-    
-    Returns a C-contiguous array of shape (res_z, res_y, res_x) in float32.
-    """
-    res_x = len(sin_lats)
-    res_y = len(radii)
-    res_z = len(flats)
-    lut = np.zeros((res_z, res_y, res_x), dtype=np.float32)
-    d_alpha = np.float32((2.0 * np.pi) / num_alpha)
-    
-    for z in prange(res_z):
-        f = flats[z]
-        f_factor = np.float32(1.0) - f
-        eta = np.float32(1.0) / max(np.float32(1e-4), f_factor * f_factor)
-        
-        for y in range(res_y):
-            r = radii[y]
-            
-            for x in range(res_x):
-                slat = sin_lats[x]
-                if slat < 1e-6:
-                    lut[z, y, x] = np.float32(0.0)
-                    continue
-                clat = np.sqrt(max(np.float32(0.0), np.float32(1.0) - slat * slat))
-                
-                denom_rho = np.sqrt(f_factor * f_factor * clat * clat + slat * slat)
-                rho = f_factor / max(np.float32(1e-6), denom_rho)
-                norm_denom = np.sqrt(clat * clat + (slat * eta) * (slat * eta))
-                
-                tot = np.float32(0.0)
-                for a_idx in range(num_alpha):
-                    alpha = a_idx * d_alpha
-                    cos_a = np.cos(alpha)
-                    
-                    d2 = max(np.float32(1e-6), r * r + rho * rho - np.float32(2.0) * r * rho * clat * cos_a)
-                    d = np.sqrt(d2)
-                    
-                    horizon_term = r * clat * cos_a - np.float32(1.0) / rho
-                    if horizon_term > 0.0:
-                        ndotl = horizon_term / (norm_denom * d)
-                        ring_mu = (rho * slat) / d
-                        tot += (ndotl * ring_mu / d2) * r * d_alpha
-                
-                lut[z, y, x] = tot
-    return lut
-
-
-

@@ -10,6 +10,8 @@ import OpenGL
 OpenGL.ERROR_CHECKING = False
 import glfw
 import moderngl
+from engine.rendering.ringshine import (RingshineMap, RING_PROFILE_ROWS, RING_PROPERTY_ROWS,
+    build_secondary_ring_properties)
 if not hasattr(moderngl.Program, '__contains__'):
     moderngl.Program.__contains__ = lambda self, name: self.get(name, None) is not None
 import numpy as np
@@ -805,7 +807,9 @@ class App(InputHandlerMixin):
                 "terrain_lod_enabled": self.camera.get("terrain_lod_enabled", False),
                 "terrain_debug_tiles": self.camera.get("terrain_debug_tiles", False),
                 "terrain_lod_split_factor": self.camera.get("terrain_lod_split_factor", 1.0),
-                "terrain_max_depth": self.camera.get("terrain_max_depth", 6),
+                "terrain_lod_distance": self.camera.get("terrain_lod_distance", 1.0),
+                "terrain_ground_lod_distance": self.camera.get("terrain_ground_lod_distance", 1.0),
+                "terrain_max_depth": self.camera.get("terrain_max_depth", 10),
                 "terrain_patch_res": self.camera.get("terrain_patch_res", 32),
                 "show_triangle_count": self.camera.get("show_triangle_count", False),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
@@ -2107,11 +2111,11 @@ class App(InputHandlerMixin):
                         'row_idx': len(ring_precomputed),
                     })
     
-        ring_gradient_tex = ctx.texture((4096, 16), 4, dtype='f4')
+        ring_gradient_tex = ctx.texture((4096, RING_PROFILE_ROWS), 4, dtype='f4')
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
-        ring_props_tex = ctx.texture((4096, 8), 4, dtype='f4')
+        ring_props_tex = ctx.texture((4096, RING_PROPERTY_ROWS), 4, dtype='f4')
         ring_props_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_props_tex.repeat_x = False
         ring_props_tex.repeat_y = False
@@ -2128,66 +2132,10 @@ class App(InputHandlerMixin):
         self.surface_ring_shadow_filter = ring_gradient_tex.surface_shadow_filter
 
 
-        def build_ringshine_lut(ctx):
-            res_x, res_y, res_z = 256, 256, 16
-            sin_lats = np.linspace(0.0, 1.0, res_x, dtype=np.float32)
-            radii = np.linspace(1.001, 5.0, res_y, dtype=np.float32)
-            flats = np.linspace(0.0, 0.3, res_z, dtype=np.float32)
+        self.ringshine_maps = RingshineMap(
+            ctx, ringshine_map_vertex_shader, ringshine_map_fragment_shader, lut_vbo)
+        self.ringshine_map_tex = self.ringshine_maps.texture
 
-            lut_3d = build_ringshine_3d_lut_numba(sin_lats, radii, flats, num_alpha=180)
-
-            tex = ctx.texture3d((res_x, res_y, res_z), 1, lut_3d.tobytes(), dtype='f4')
-            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            tex.repeat_x = False
-            tex.repeat_y = False
-            tex.repeat_z = False
-
-            # Precompute 3D Cumulative Distribution Function (CDF) Texture (64x128x128)
-            res_cdf_lat, res_cdf_r, res_cdf_theta = 64, 128, 128
-            cdf_sin_lats = np.linspace(0.001, 0.999, res_cdf_lat, dtype=np.float32)[:, None, None]
-            cdf_cos_lats = np.sqrt(np.maximum(0.0, 1.0 - cdf_sin_lats**2))
-            cdf_radii = np.linspace(1.001, 5.0, res_cdf_r, dtype=np.float32)[None, :, None]
-            cdf_thetas = np.linspace(0.0, np.pi, res_cdf_theta, dtype=np.float32)[None, None, :]
-
-            cdf_cos_alpha = np.cos(cdf_thetas)
-            cdf_d2 = cdf_radii**2 + 1.0 - 2.0 * cdf_radii * cdf_cos_lats * cdf_cos_alpha
-            cdf_d = np.sqrt(np.maximum(cdf_d2, 1e-6))
-
-            cdf_ndotl = np.maximum(0.0, (cdf_radii * cdf_cos_lats * cdf_cos_alpha - 1.0) / cdf_d)
-            cdf_ring_mu = cdf_sin_lats / cdf_d
-            cdf_d_alpha = np.pi / max(1, res_cdf_theta - 1)
-            cdf_diff_irrad = (cdf_ndotl * cdf_ring_mu / np.maximum(cdf_d2, 1e-6)) * cdf_radii * cdf_d_alpha
-
-            # Smooth trapezoidal integration for C1 continuous CDF
-            trapz_step = 0.5 * (cdf_diff_irrad[:, :, :-1] + cdf_diff_irrad[:, :, 1:])
-            cdf_cum_irrad = np.zeros_like(cdf_diff_irrad)
-            cdf_cum_irrad[:, :, 1:] = np.cumsum(trapz_step, axis=2)
-
-            cdf_totals = cdf_cum_irrad[:, :, -1:]
-            cdf_normalized = np.divide(cdf_cum_irrad, cdf_totals, out=np.ones_like(cdf_cum_irrad), where=cdf_totals > 1e-12).astype(np.float32)
-
-            cdf_tex = ctx.texture3d((res_cdf_theta, res_cdf_r, res_cdf_lat), 1, cdf_normalized.tobytes(), dtype='f4')
-            cdf_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            cdf_tex.repeat_x = False
-            cdf_tex.repeat_y = False
-            cdf_tex.repeat_z = False
-
-            return tex, cdf_tex
-
-        ringshine_lut_tex, ringshine_cdf_tex = build_ringshine_lut(ctx)
-
-        self.ringshine_map_tex = ctx.texture((128, 1040), 4, dtype='f4')
-        self.ringshine_map_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.ringshine_map_tex.repeat_x = True
-        self.ringshine_map_tex.repeat_y = False
-        self.ringshine_map_fbo = ctx.framebuffer(color_attachments=[self.ringshine_map_tex])
-        self.prog_ringshine_map = ctx.program(vertex_shader=ringshine_map_vertex_shader, fragment_shader=ringshine_map_fragment_shader)
-        if 'u_ring_gradients' in self.prog_ringshine_map: self.prog_ringshine_map['u_ring_gradients'].value = 0
-        if 'u_ring_props' in self.prog_ringshine_map: self.prog_ringshine_map['u_ring_props'].value = 5
-        if 'u_ringshine_lut' in self.prog_ringshine_map: self.prog_ringshine_map['u_ringshine_lut'].value = 6
-        if 'u_ringshine_cdf_lut' in self.prog_ringshine_map: self.prog_ringshine_map['u_ringshine_cdf_lut'].value = 7
-        self.ringshine_map_vao = ctx.vertex_array(self.prog_ringshine_map, [(lut_vbo, '2f', 'in_position')])
-    
         ring_render_groups = []
         rings_by_body_init = {}
         for ring in ring_precomputed:
@@ -2319,7 +2267,7 @@ class App(InputHandlerMixin):
         self.terrain_current_raw_patches = None
         self.terrain_current_body_name = None
         self.terrain_current_body_idx = -1
-        self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=512, tile_size=512)
+        self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=1024, tile_size=512)
         self.planet_quadtrees = {}
         self.planet_cloud_quadtrees = {}
         self.terrain_active_cloud_patches = {}
@@ -2387,10 +2335,6 @@ class App(InputHandlerMixin):
         uniform_num_ring_planes = prog_spheres['u_num_ring_planes']
         if 'u_ring_gradients' in prog_spheres:
             prog_spheres['u_ring_gradients'].value = 0
-        if 'u_ringshine_lut' in prog_spheres:
-            prog_spheres['u_ringshine_lut'].value = 6
-        if 'u_ringshine_cdf_lut' in prog_spheres:
-            prog_spheres['u_ringshine_cdf_lut'].value = 7
         if 'u_ringshine_map' in prog_spheres:
             prog_spheres['u_ringshine_map'].value = 8
 
@@ -2486,7 +2430,6 @@ class App(InputHandlerMixin):
         caster_mie_buf = np.zeros((64, 4), dtype='f4')
         ring_centers_buf = np.zeros((16, 3), dtype='f4')
         ring_normals_buf = np.zeros((16, 3), dtype='f4')
-        ring_sun_dirs_buf = np.zeros((16, 3), dtype='f4')
         ring_params_buf = np.zeros((16, 4), dtype='f4')
         ring_colors_buf = np.zeros((16, 3), dtype='f4')
         ring_5colors_buf = np.zeros((16, 5, 3), dtype='f4')
@@ -3704,7 +3647,7 @@ class App(InputHandlerMixin):
             terrain_enabled = bool(cam.get("terrain_lod_enabled", False))
             if terrain_enabled and terrain_streamer is not None:
                 terrain_streamer.begin_frame()
-                terrain_streamer.process_uploads(max_per_frame=16, max_time_ms=2.5)
+                terrain_streamer.process_uploads(max_per_frame=16, max_time_ms=1.5)
             body_spin_angles = compute_body_rotation_angles_jit(
                 float(display_t) * 31557600.0, self.rot_period_arr, self.w0_arr,
                 self.tidally_locked_arr, self.parent_idx_arr, pos_snap_render,
@@ -3735,7 +3678,7 @@ class App(InputHandlerMixin):
                         float(radii[index]) * AU_TO_KM, float(visuals[index, 8]),
                         visuals[index, 5:8], float(np.float32(angles[index])), tiles, name,
                         info.get('height_range_km', [0., 8.848]),
-                        cam.get('terrain_max_depth', 6), cam.get('terrain_patch_res', 32), patches)
+                        cam.get('terrain_max_depth', 10), cam.get('terrain_patch_res', 32), patches)
                 return camera_surfaces[key]
 
             # Tracked body surface radius (used for approach gesture & landing).
@@ -4129,12 +4072,11 @@ class App(InputHandlerMixin):
             n_ring_planes = 0
             ring_centers_buf[:] = 0
             ring_normals_buf[:] = 0
-            ring_sun_dirs_buf[:] = 0
             ring_params_buf[:] = 0
             ring_colors_buf[:] = 0
             ring_5colors_buf[:] = 0
             
-            n_ring_planes = len(self.body_ring_indices)
+            n_ring_planes = min(16, len(self.body_ring_indices))
             star_pos = pos_rel_all[star_idx]
             for bi, unified_idx in self.body_ring_indices.items():
                 if unified_idx >= 16:
@@ -4156,13 +4098,8 @@ class App(InputHandlerMixin):
                     raw_color = (0.0, 0.0, 0.0)
                     colors5 = raw_color
                     
-                ring_centers_buf[unified_idx] = pos_rel_all[bi]
-                to_star = star_pos - pos_rel_all[bi]
-                to_star_norm = np.linalg.norm(to_star)
-                ring_sun_dirs_buf[unified_idx] = (
-                    to_star / to_star_norm if to_star_norm > 1e-6
-                    else np.array([0.0, 1.0, 0.0], dtype='f4')
-                )
+                ring_centers_buf[unified_idx] = (pos_rel_all[bi] if bi < num_bodies
+                    else cmp_pos_rel[bi - num_bodies])
                 ring_normals_buf[unified_idx] = pole
                 ring_params_buf[unified_idx, 0] = min_r
                 ring_params_buf[unified_idx, 1] = max_r
@@ -4369,89 +4306,16 @@ class App(InputHandlerMixin):
             planetshine_enabled = self.camera.get("planetshine_enabled", True)
             ringshine_enabled = self.camera.get("ringshine_enabled", True)
 
-            # Build per-body ring parameters for ringshine-augmented planetshine
-            n_ps_bodies = total_render_bodies
-            if not hasattr(self, '_ps_ring_params') or self._ps_ring_params.shape[0] != n_ps_bodies:
-                self._ps_ring_params = np.zeros((n_ps_bodies, 4), dtype=np.float32)
-                self._ps_ring_normals = np.zeros((n_ps_bodies, 3), dtype=np.float32)
-                self._ps_ring_colors = np.zeros((n_ps_bodies, 3), dtype=np.float32)
-            else:
-                self._ps_ring_params[:] = 0.0
-                self._ps_ring_normals[:] = 0.0
-                self._ps_ring_colors[:] = 0.0
+            # Distant-body material averages use the same profiles as host
+            # lighting, and only change when the profile atlas is rebuilt.
+            ps_material_key = (ring_gradient_tex.profile_revision, total_render_bodies)
+            if getattr(self, '_ps_ring_material_key', None) != ps_material_key:
+                self._ps_ring_materials = build_secondary_ring_properties(
+                    ring_precomputed, ring_gradient_tex, self.body_ring_indices,
+                    total_render_bodies)
+                self._ps_ring_material_key = ps_material_key
+            ps_ring_params, ps_ring_normals, ps_ring_colors, ps_ring_scattering = self._ps_ring_materials
 
-            ps_ring_params = self._ps_ring_params
-            ps_ring_normals = self._ps_ring_normals
-            ps_ring_colors = self._ps_ring_colors
-
-            if ring_precomputed:
-                rings_by_bi = {}
-                for r in ring_precomputed:
-                    bi = r['body_idx']
-                    if bi < num_bodies:
-                        rings_by_bi.setdefault(bi, []).append(r)
-                for bi, b_rings in rings_by_bi.items():
-                    act_rings = [r for r in b_rings if r['opacity'] > 0.0]
-                    if act_rings:
-                        min_r = min(r['inner_r'] for r in b_rings)
-                        max_r = max(r['outer_r'] for r in b_rings)
-                        total_annulus_area = max(1e-6, max_r * max_r - min_r * min_r)
-                        
-                        flux_sum = 0.0
-                        color_sum = np.zeros(3, dtype='f4')
-                        unlit_sum = 0.0
-                        for r in act_rings:
-                            seg_area = max(0.0, r['outer_r'] * r['outer_r'] - r['inner_r'] * r['inner_r'])
-                            seg_flux = seg_area * r['opacity']
-                            flux_sum += seg_flux
-                            color_sum += seg_flux * np.array(r['raw_color'], dtype='f4')
-                            unlit_sum += seg_flux * float(r.get('unlit_factor', 1.0))
-                            
-                        weighted_opacity = min(1.0, flux_sum / total_annulus_area)
-                        weighted_color = (color_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else act_rings[0]['raw_color']
-                        weighted_unlit = (unlit_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else 1.0
-                        
-                        ps_ring_params[bi, 0] = min_r
-                        ps_ring_params[bi, 1] = max_r
-                        ps_ring_params[bi, 2] = weighted_opacity
-                        ps_ring_params[bi, 3] = weighted_unlit
-                        ps_ring_normals[bi] = act_rings[0]['pole']
-                        ps_ring_colors[bi] = weighted_color
-
-            if self.comparison_enabled and hasattr(self, 'ring_precomputed_cmp') and self.ring_precomputed_cmp:
-                rings_by_bi_cmp = {}
-                for r in self.ring_precomputed_cmp:
-                    bi = num_bodies + r['body_idx']
-                    if bi < n_ps_bodies:
-                        rings_by_bi_cmp.setdefault(bi, []).append(r)
-                for bi, b_rings in rings_by_bi_cmp.items():
-                    act_rings = [r for r in b_rings if r['opacity'] > 0.0]
-                    if act_rings:
-                        min_r = min(r['inner_r'] for r in b_rings)
-                        max_r = max(r['outer_r'] for r in b_rings)
-                        total_annulus_area = max(1e-6, max_r * max_r - min_r * min_r)
-                        
-                        flux_sum = 0.0
-                        color_sum = np.zeros(3, dtype='f4')
-                        unlit_sum = 0.0
-                        for r in act_rings:
-                            seg_area = max(0.0, r['outer_r'] * r['outer_r'] - r['inner_r'] * r['inner_r'])
-                            seg_flux = seg_area * r['opacity']
-                            flux_sum += seg_flux
-                            color_sum += seg_flux * np.array(r['raw_color'], dtype='f4')
-                            unlit_sum += seg_flux * float(r.get('unlit_factor', 1.0))
-                            
-                        weighted_opacity = min(1.0, flux_sum / total_annulus_area)
-                        weighted_color = (color_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else act_rings[0]['raw_color']
-                        weighted_unlit = (unlit_sum / max(1e-6, flux_sum)) if flux_sum > 1e-6 else 1.0
-                        
-                        ps_ring_params[bi, 0] = min_r
-                        ps_ring_params[bi, 1] = max_r
-                        ps_ring_params[bi, 2] = weighted_opacity
-                        ps_ring_params[bi, 3] = weighted_unlit
-                        ps_ring_normals[bi] = act_rings[0]['pole']
-                        ps_ring_colors[bi] = weighted_color
-            
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
                 all_instances[:total_render_bodies, 6],
@@ -4466,7 +4330,8 @@ class App(InputHandlerMixin):
                 ps_ring_normals,
                 ps_ring_colors,
                 planetshine_enabled,
-                ringshine_enabled
+                ringshine_enabled,
+                ps_ring_scattering
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
             all_instances[:total_render_bodies, 20:23] = planetshine_colors
@@ -5147,59 +5012,25 @@ class App(InputHandlerMixin):
             ring_gradient_tex.use(location=0)
             if hasattr(self, 'ring_props_tex') and self.ring_props_tex is not None:
                 self.ring_props_tex.use(location=5)
-            ringshine_lut_tex.use(location=6)
-            ringshine_cdf_tex.use(location=7)
-
             if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
-                self.ringshine_map_fbo.use()
-                ctx.viewport = (0, 0, 128, 1040)
-                if 'u_sun_dir' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_sun_dir'].write(ring_sun_dirs_buf)
-                if 'u_num_ring_planes' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_num_ring_planes'].value = n_ring_planes
-                if 'u_ring_normal' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_ring_normal'].write(ring_normals_buf)
-                if 'u_ring_params' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_ring_params'].write(ring_params_buf)
-                for bi, unified_idx in self.body_ring_indices.items():
-                    if unified_idx >= 16: break
-                    body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
-                    active_rings = [r for r in body_rings if r['opacity'] > 0.0]
-                    r = active_rings[0] if active_rings else (body_rings[0] if body_rings else {})
-                    idx = unified_idx
-                    if f'u_ring_planes[{idx}].unlit_factor' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
-                    if f'u_ring_planes[{idx}].saturation' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
-                    if f'u_ring_planes[{idx}].hue_shift' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
-                    if f'u_ring_planes[{idx}].brightness' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
-                    if f'u_ring_planes[{idx}].alpha_boost' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
-                    if f'u_ring_planes[{idx}].is_textured' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
-                    if f'u_ring_planes[{idx}].asymmetry' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].asymmetry'].value = float(r.get('asymmetry', 0.436))
-                    if f'u_ring_planes[{idx}].backscatter' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].backscatter'].value = float(r.get('backscatter', -0.65711))
-                    if f'u_ring_planes[{idx}].scatter' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].scatter'].value = float(r.get('scatter', 1.69))
-                    b_obl = 0.0
-                    if bi < len(bodies_data):
-                        b_obl = float(bodies_data[bi].get('oblateness', bodies_data[bi].get('f', 0.0)))
-                    elif self.comparison_enabled and hasattr(self, 'bodies_data_cmp') and (bi - num_bodies) < len(self.bodies_data_cmp):
-                        b_obl = float(self.bodies_data_cmp[bi - num_bodies].get('oblateness', self.bodies_data_cmp[bi - num_bodies].get('f', 0.0)))
-                    if f'u_ring_planes[{idx}].oblateness' in self.prog_ringshine_map:
-                        self.prog_ringshine_map[f'u_ring_planes[{idx}].oblateness'].value = b_obl
-                if 'u_ringshine_band_count' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_ringshine_band_count'].value = int(self.camera.get("ringshine_band_count", 100))
-                if 'u_ringshine_oblate_enabled' in self.prog_ringshine_map:
-                    self.prog_ringshine_map['u_ringshine_oblate_enabled'].value = self.camera.get("ringshine_oblate_enabled", True)
+                # Use world-space float64 positions: camera rebasing must not
+                # invalidate maps or perturb stellar elevations.
+                rs_positions = pos_snap_render
+                if self.comparison_enabled and total_render_bodies > num_bodies:
+                    rs_positions = np.vstack((pos_snap_render,
+                        self.pos_snap_cmp + np.array([self.comparison_offset_au, 0.0, 0.0])))
+                rs_hosts = []
+                for bi, index in self.body_ring_indices.items():
+                    bd = bodies_data[bi] if bi < num_bodies else self.bodies_data_cmp[bi-num_bodies]
+                    flattening = float(bd.get('oblateness', bd.get('f', 0.0)))
+                    rs_hosts.append((index, rs_positions[bi], ring_normals_buf[index],
+                                     ring_params_buf[index], flattening))
+                rs_stars = rs_positions[star_indices_numba[:num_stars]]
                 _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
-                self.ringshine_map_vao.render(moderngl.TRIANGLE_STRIP)
+                self.ringshine_maps.update(ring_gradient_tex, self.ring_props_tex,
+                    rs_hosts, rs_stars, self.camera.get("ringshine_band_count", 10),
+                    self.camera.get("ringshine_oblate_enabled", True))
                 _perf_gpu_end(_gq)
-
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 self.hdr_resolve_fbo.use()
 
@@ -5210,7 +5041,7 @@ class App(InputHandlerMixin):
             hdr_enabled = bool(self.camera.get("hdr_enabled", True))
             ps_enabled = bool(self.camera.get("planetshine_enabled", True))
             rs_enabled = bool(self.camera.get("ringshine_enabled", True))
-            rs_band_count = int(self.camera.get("ringshine_band_count", 100))
+            rs_band_count = int(self.camera.get("ringshine_band_count", 10))
             rs_oblate = bool(self.camera.get("ringshine_oblate_enabled", True))
             
             for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view, self.prog_terrain):
@@ -5412,7 +5243,7 @@ class App(InputHandlerMixin):
                 patch_res = int(self.camera.get("terrain_patch_res", 32))
                 res_scale = max(0.6, patch_res / 32.0)
                 split_fac = float(self.camera.get("terrain_lod_split_factor", 1.0)) * res_scale
-                max_d = int(self.camera.get("terrain_max_depth", 6))
+                max_d = int(self.camera.get("terrain_max_depth", 10))
                 cam_world_pos_f8 = cam_origin + rel
 
                 for slot_idx, (b_i, b_name) in enumerate(active_terrain_bodies):
@@ -5523,12 +5354,19 @@ class App(InputHandlerMixin):
                     elev_span_km = elev_max_km - elev_min_km
                     has_height = self.terrain_streamer.get_max_lod(b_name, "height") >= 0
                     height_max_km = max(abs(elev_min_km), abs(elev_max_km)) if has_height else 0.0
+                    alt_km = max(0.0, d_cam_body_km - b_r_km)
+                    # Ground LOD closeness: smoothly adapts the LOD transition distance near the surface.
+                    # alt_factor = 0.0 at ground level, 1.0 at 50 km altitude and above.
+                    alt_factor = min(1.0, alt_km / 50.0)
+                    default_global_dist = 1.0 / max(0.1, float(self.camera.get("terrain_lod_split_factor", 1.0))) if "terrain_lod_distance" not in self.camera else 1.0
+                    global_dist = float(self.camera.get("terrain_lod_distance", default_global_dist))
+                    ground_dist = float(self.camera.get("terrain_ground_lod_distance", 1.0))
+                    # Effective distance multiplier: near the ground, lower ground_dist brings high-quality LOD patches closer to the camera
+                    effective_dist = global_dist * (ground_dist + (1.0 - ground_dist) * alt_factor)
+                    effective_dist = max(0.15, min(5.0, effective_dist))
+                    split_fac = (1.0 / effective_dist) * res_scale
+
                     body_max_lod = max_d
-                    if d_cam_body_km > b_r_km * 2.0:
-                        max_disk_lod = max(self.terrain_streamer.get_max_lod(b_name, "diffuse"),
-                                           self.terrain_streamer.get_max_lod(b_name, "height"))
-                        if max_disk_lod >= 0:
-                            body_max_lod = min(max_d, max_disk_lod)
 
                     b_cloud_alt_km = 0.0
                     if _body_has_clouds(b_i, is_cmp=False):
@@ -5579,64 +5417,6 @@ class App(InputHandlerMixin):
                             raw_patches[:, 4], raw_patches[:, 5],
                             raw_patches[:, 6], raw_patches[:, 7]
                         )
-
-                        # Deferred Quadtree Collapse Grace Period:
-                        # If a patch merged but its parent tile is still loading from disk (uvs[0] < 0.999),
-                        # and previous frame had its 4 resident child patches, retain the child patches for a
-                        # brief grace period (up to 25 frames / ~0.4s) so the user never sees blurry intermediate fallback.
-                        prev_info = prev_active_body_patches.get(b_i)
-                        if prev_info is not None and prev_info[0] is not None:
-                            prev_raw_p = prev_info[0]
-                            patches_to_replace = []
-                            for p_idx in range(num_p):
-                                if uvs[0][p_idx] < 0.999:
-                                    pf = int(raw_patches[p_idx, 4])
-                                    plod = int(raw_patches[p_idx, 5])
-                                    px = int(raw_patches[p_idx, 6])
-                                    py = int(raw_patches[p_idx, 7])
-                                    if (b_name, "diffuse", pf, plod, px, py) in self.terrain_streamer.in_flight_requests:
-                                        c_mask = (prev_raw_p[:, 4] == pf) & (prev_raw_p[:, 5] == plod + 1) & (prev_raw_p[:, 6].astype(np.int32) >> 1 == px) & (prev_raw_p[:, 7].astype(np.int32) >> 1 == py)
-                                        if np.count_nonzero(c_mask) == 4:
-                                            patches_to_replace.append((p_idx, prev_raw_p[c_mask]))
-
-                            if patches_to_replace:
-                                grace_dict = getattr(self, '_terrain_merge_grace_frames', None)
-                                if grace_dict is None:
-                                    grace_dict = self._terrain_merge_grace_frames = {}
-
-                                new_p_list = []
-                                for p_idx in range(num_p):
-                                    pf = int(raw_patches[p_idx, 4])
-                                    plod = int(raw_patches[p_idx, 5])
-                                    px = int(raw_patches[p_idx, 6])
-                                    py = int(raw_patches[p_idx, 7])
-                                    p_key = (b_name, pf, plod, px, py)
-                                    replace_children = None
-                                    for r_idx, c_patches in patches_to_replace:
-                                        if r_idx == p_idx:
-                                            replace_children = c_patches
-                                            break
-
-                                    if replace_children is not None:
-                                        g_count = grace_dict.get(p_key, 0)
-                                        if g_count < 25:
-                                            grace_dict[p_key] = g_count + 1
-                                            new_p_list.append(replace_children)
-                                            continue
-                                        else:
-                                            grace_dict.pop(p_key, None)
-                                    else:
-                                        grace_dict.pop(p_key, None)
-
-                                    new_p_list.append(raw_patches[p_idx:p_idx+1])
-
-                                raw_patches = np.vstack(new_p_list)
-                                num_p = len(raw_patches)
-                                slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch_multi(
-                                    b_name, ["diffuse", "height"],
-                                    raw_patches[:, 4], raw_patches[:, 5],
-                                    raw_patches[:, 6], raw_patches[:, 7]
-                                )
 
                         pack_terrain_patches_jit(
                             self.terrain_patch_staging, st, raw_patches,

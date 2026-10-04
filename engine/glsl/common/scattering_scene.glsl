@@ -80,6 +80,7 @@ uniform sampler2D u_multi_scatter_lut;
 // SSBO) and host-planet ringshine (irradiance map), matching Mode 1/2 exactly.
 #define MAX_RING_PLANES 16
 uniform sampler2D u_ringshine_map;
+#include "common/ringshine_lookup.glsl"
 uniform int  u_num_ring_planes;
 uniform vec3 u_ring_normal[MAX_RING_PLANES];
 uniform bool u_planetshine_enabled;

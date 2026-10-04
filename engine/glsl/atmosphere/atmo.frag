@@ -141,9 +141,8 @@ uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform bool u_planetshine_enabled;
 
-uniform sampler3D u_ringshine_lut;
-uniform sampler3D u_ringshine_cdf_lut;
 uniform sampler2D u_ringshine_map;
+#include "common/ringshine_lookup.glsl"
 uniform bool u_ringshine_enabled;
 uniform int u_ringshine_band_count;
 uniform sampler2D u_depth_texture;
@@ -176,20 +175,7 @@ uniform sampler2D u_history_trans;
 layout(location = 0, index = 0) out vec4 out_scattered;
 layout(location = 0, index = 1) out vec4 out_transmittance;
 
-float eval_ringshine_cdf(float angle, float v_tex, float sin_lat) {
-    float TWO_PI = 6.28318530717958647692;
-    float a_mod = angle - TWO_PI * floor((angle + PI) / TWO_PI);
-    float k = floor((angle + PI) / TWO_PI);
-    float u = clamp(abs(a_mod) / PI, 0.0, 1.0);
 
-    float u_tex = 0.5 / 128.0 + u * (127.0 / 128.0);
-    float v_tex_mapped = 0.5 / 128.0 + v_tex * (127.0 / 128.0);
-    float sin_lat_mapped = 0.5 / 64.0 + sin_lat * (63.0 / 64.0);
-
-    float base_cdf = texture(u_ringshine_cdf_lut, vec3(u_tex, v_tex_mapped, sin_lat_mapped)).r;
-    float signed_cdf = (a_mod < 0.0) ? -base_cdf : base_cdf;
-    return 2.0 * k + signed_cdf;
-}
 vec3 toSphericalSpace(vec3 p, vec4 pole_scale) {
     float f_scale = pole_scale.w;
     if (f_scale <= 1.00001) return p;
@@ -279,7 +265,7 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             float fraction = max(0.0, f_max - f_min);
 
             float p_mid = ((overlap_min + overlap_max) * 0.5 - inner_r) / max(1e-6, outer_r - inner_r);
-            float alpha_mult = textureLod(u_ring_gradients, vec2(p_mid, (float(ring_idx) + 0.5) / 16.0), 0.0).a;
+            float alpha_mult = textureLod(u_ring_gradients, vec2(p_mid, (float(ring_idx) + 0.5) / float(textureSize(u_ring_gradients, 0).y)), 0.0).a;
             float opacity = u_ring_params[ring_idx].z;
 
             float tau = -log(max(1e-6, 1.0 - opacity * alpha_mult));
@@ -532,6 +518,60 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
     return false;
 }
 
+void march_unshadowed_segment(
+    float seg_start, float seg_end,
+    vec3 cam_sph, vec3 dir_sph, vec3 dir_world,
+    vec3 b_R, vec3 b_M, vec3 b_M_abs, vec3 b_A_mix, vec3 b_A_lay,
+    float inv_h_r, float inv_h_m, float inv_oz_w,
+    out vec3 out_L, out vec3 out_T
+) {
+    out_T = vec3(1.0);
+    out_L = vec3(0.0);
+    float seg_len = seg_end - seg_start;
+    if (seg_len <= 0.001) return;
+
+    const int UN_STEPS = 8;
+    float step_sz = seg_len / float(UN_STEPS);
+    float inv_atmo_thick = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);
+
+    for (int p_i = 0; p_i < UN_STEPS; ++p_i) {
+        float cur_s = seg_start + (float(p_i) + 0.5) * step_sz;
+        vec3 p_sph = cam_sph + cur_s * dir_sph;
+        float s_len = max(length(p_sph), 1e-3);
+        float alt = max(0.0, s_len - u_planet_radius_km);
+        float r_R = exp(-alt * inv_h_r);
+        float r_M = exp(-alt * inv_h_m);
+        float t_oz = (alt - u_ozone_peak_km) * inv_oz_w;
+        float r_O = exp(-t_oz * t_oz);
+        vec3 st_ext = b_R * r_R + b_M * r_M + b_M_abs * r_M + b_A_mix * r_R + b_A_lay * r_O;
+        vec3 st_T = exp(-st_ext * step_sz);
+        vec3 factor = (vec3(1.0) - st_T) / max(st_ext, vec3(1e-6));
+        float h_n = clamp(alt * inv_atmo_thick, 0.0, 1.0);
+
+        for (int st = 0; st < min(u_num_stars, 4); ++st) {
+            vec3 sun_d = u_star_dir_sph_eff[st].xyz;
+            if (dot(sun_d, sun_d) <= 1e-8) continue;
+            float l_cos = dot(p_sph, sun_d) / s_len;
+            float sin_p = u_planet_radius_km / max(s_len, u_planet_radius_km + 0.01);
+            float cos_p = sqrt(max(0.0, 1.0 - sin_p * sin_p));
+            float eff_rad = u_star_pos_local[st].w;
+            float cos_s_eff = (eff_rad > 0.0) ? u_star_dir_sph_eff[st].w : 0.9999;
+            vec2 tm = sun_terminator(l_cos, sin_p, cos_p, eff_rad, cos_s_eff);
+            vec3 T_sun = (tm.x > 1e-4) ? get_transmittance_precomputed(sqrt(h_n), tm.y) : vec3(0.0);
+            vec3 att = out_T * T_sun * tm.x;
+            float cos_th = clamp(dot(dir_world, sun_d / max(1e-4, length(sun_d))), -1.0, 1.0);
+            float ph_R = (3.0 / (16.0 * PI)) * (1.0 + cos_th * cos_th);
+            float ph_M = u_precomp_mie.x * (1.0 + cos_th * cos_th) / pow(max(1e-4, u_precomp_mie.y - u_precomp_mie.z * cos_th), 1.5);
+            float ms_u = 0.5 + 0.5 * sign(l_cos) * sqrt(abs(l_cos));
+            vec3 psi = textureLod(u_multi_scatter_lut, vec2(ms_u, sqrt(h_n)), 0.0).rgb;
+            vec3 st_I = u_star_color_irrad[st].rgb;
+            out_L += st_I * (ph_R * b_R * r_R + ph_M * b_M * r_M) * att * factor
+                   + st_I * (b_R * r_R + b_M * r_M) * psi * out_T * factor;
+        }
+        out_T *= st_T;
+    }
+}
+
 void main() {
     if (f_clip_z < 0.0) discard;
     
@@ -777,6 +817,7 @@ void main() {
     // Clamping to slightly outside the sphere (1e-4 km = 10 cm) ensures landed origins
     // do not produce negative entry roots (t1 <= 0) when intersecting the planet.
     float dist_to_planet_center_km = length(cam_local_sph);
+    bool cam_inside = dist_to_planet_center_km <= u_atmo_radius_km;
     vec3 cam_pos_eff = cam_local_sph;
     if (dist_to_planet_center_km < u_planet_radius_km + 1e-4) {
         cam_pos_eff = (dist_to_planet_center_km > 1e-4)
@@ -784,7 +825,7 @@ void main() {
             : vec3(0.0, u_planet_radius_km + 1e-4, 0.0);
     }
 
-    float clip_radius = (u_atmo_quality == 3 && u_scattering_enabled && u_scattering_terrain_bottom_km > 0.0)
+    float clip_radius = (u_atmo_quality == 3 && u_scattering_enabled && u_scattering_terrain_bottom_km > 0.0 && cam_inside)
         ? u_scattering_terrain_bottom_km : u_planet_clip_km;
     vec2 s_planet = raySphereIntersect(cam_pos_eff, ray_dir_sph, clip_radius);
 
@@ -901,14 +942,16 @@ void main() {
                 // and must NOT clamp s_end or set hits_surface, allowing atmospheric sunset extinction to apply.
                 float max_local_ground_s = length(cam_local_sph) + u_atmo_radius_km + 100.0;
                 if (s_depth <= max_local_ground_s) {
-                    if (u_atmo_quality == 3 && u_scattering_enabled) {
-                        // Actual rasterized terrain is authoritative, even below
-                        // the datum or above the smooth planet's horizon.
-                        s_end = min(s_depth, scene_limit);
-                        has_scene_surface = true;
-                        hits_surface = true;
-                    } else if (s_depth < s_end - dist_to_center * 2500.0) {
+                    // For space observers (!cam_inside), planetary terrain forms the macro ground boundary
+                    // and is evaluated by the smooth analytical Sky-View LUT without faceted mesh sagitta.
+                    // Only explicit foreground objects in space/air (satellites, moons, spacecraft > 50 km)
+                    // clamp s_end and set has_scene_surface.
+                    // For observers inside the atmosphere (cam_inside), terrain in front of the horizon
+                    // acts as an authoritative scene surface for aerial perspective.
+                    float scene_margin = cam_inside ? (dist_to_center * 2500.0) : max(50.0, dist_to_center * 2500.0);
+                    if (s_depth < s_end - scene_margin) {
                         s_end = s_depth;
+                        has_scene_surface = true;
                         hits_surface = true;
                     }
                 }
@@ -1051,6 +1094,10 @@ void main() {
         // physical ray distances, including the oblate transform and origin shift.
         vec3 a = cam_local_sph + s_start * ray_dir_sph;
         vec3 b = cam_local_sph + s_end * ray_dir_sph;
+        float r_b = length(b);
+        if (r_b < u_scattering_bottom_km && r_b > 1e-4) {
+            b *= (u_scattering_bottom_km / r_b);
+        }
         float volume_weight = 0.0;
         bool used_volume = u_atmo_clip_mode == 0
             && aerial_lookup(a, b, ray_dir, scattered, final_transmittance, volume_weight);
@@ -1105,7 +1152,7 @@ void main() {
         float u_lut = 0.0;
         float v_lut = 0.0;
         float half_tex_y = 0.5 / float(textureSize(u_sky_view_lut, 0).y);
-        bool cam_inside = (D <= u_atmo_radius_km);
+        cam_inside = (D <= u_atmo_radius_km);
         bool is_ground = false;
         float t_limb = 0.0;
 
@@ -1185,31 +1232,33 @@ void main() {
             if (march_start > s_start + 0.1) {
                 vec3 a1 = cam_local_sph + s_start * ray_dir_sph;
                 vec3 b1 = cam_local_sph + march_start * ray_dir_sph;
-                T_pre = endpoint_transmittance(a1, b1);
-                for (int st = 0; st < min(u_num_stars, 4); ++st) {
-                    if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8) {
-                        L_pre += endpoint_radiance_star(a1, b1,
-                            normalize(u_star_dir_sph_eff[st].xyz), T_pre,
-                            st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
-                    }
+                march_unshadowed_segment(
+                    s_start, march_start,
+                    cam_local_sph, ray_dir_sph, ray_dir,
+                    beta_R, beta_M, beta_M_abs, beta_A_mixed, beta_A_layered,
+                    inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                    L_pre, T_pre
+                );
+                if ((u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
+                    L_pre += endpoint_subsurface_secondary_light(a1, b1,
+                        body_planetshine_dir, body_planetshine_color, u_ring_mask);
                 }
-                L_pre += endpoint_secondary_light(a1, b1, T_pre,
-                    body_planetshine_dir, body_planetshine_color, u_ring_mask);
             }
 
             if (s_end > march_end + 0.1) {
                 vec3 a3 = cam_local_sph + march_end * ray_dir_sph;
                 vec3 b3 = cam_local_sph + s_end * ray_dir_sph;
-                T_post = endpoint_transmittance(a3, b3);
-                for (int st = 0; st < min(u_num_stars, 4); ++st) {
-                    if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8) {
-                        L_post += endpoint_radiance_star(a3, b3,
-                            normalize(u_star_dir_sph_eff[st].xyz), T_post,
-                            st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
-                    }
+                march_unshadowed_segment(
+                    march_end, s_end,
+                    cam_local_sph, ray_dir_sph, ray_dir,
+                    beta_R, beta_M, beta_M_abs, beta_A_mixed, beta_A_layered,
+                    inv_h_rayleigh, inv_h_mie, inv_ozone_width,
+                    L_post, T_post
+                );
+                if ((u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
+                    L_post += endpoint_subsurface_secondary_light(a3, b3,
+                        body_planetshine_dir, body_planetshine_color, u_ring_mask);
                 }
-                L_post += endpoint_secondary_light(a3, b3, T_post,
-                    body_planetshine_dir, body_planetshine_color, u_ring_mask);
             }
         }
 
@@ -1632,15 +1681,9 @@ void main() {
             vec3 P_dir = normalize(mid_pos);
             vec3 L_dir = L_mid;
 
-            vec3 sun_pos_local_0 = (0 < 4) ? u_star_pos_local[0].xyz : ((u_stars_pos_radius[0].xyz - planet_center_render) * u_au_to_km);
-            vec3 L0 = (length(sun_pos_local_0) > 1e-6) ? normalize(sun_pos_local_0) : vec3(0.0, 1.0, 0.0);
-
             for (int j = 0; j < u_num_ring_planes; j++) {
                 if ((u_ring_mask & (1u << j)) == 0u) continue;
                 vec3 ring_normal = u_ring_normal[j];
-                float sun_elev_0 = dot(L0, ring_normal);
-                float sun_elev_s = dot(L_dir, ring_normal);
-                float rel_hemi = (sun_elev_s * sun_elev_0 >= 0.0) ? 1.0 : -1.0;
 
                 vec3 antiL = -L_dir;
                 vec3 antiL_eq_raw = antiL - ring_normal * dot(antiL, ring_normal);
@@ -1661,11 +1704,11 @@ void main() {
                 float x_prime = phi_center / PI;
                 float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                float y_prime = frag_elevation * rel_hemi;
+                float y_prime = frag_elevation;
                 float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
                 vec2 map_uv = vec2(phi_uv, (float(j) + elev_uv) / 16.0);
-                ringshine_irradiance += texture(u_ringshine_map, map_uv).rgb;
+                ringshine_irradiance += ringshine_sample(map_uv, j, s);
             }
             // Apply 1/PI (~0.318309886) factor to convert incoming irradiance map to ambient field.
             // Note: Solar elevation (mu_0) is already fully resolved inside ringshine_map.frag radiative transfer.

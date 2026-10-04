@@ -53,8 +53,7 @@ class AtmospherePrograms:
     def _configure(program):
         samplers = {
             'u_ring_gradients': 0, 'u_transmittance_lut': 1,
-            'u_multi_scatter_lut': 3, 'u_ringshine_lut': 6,
-            'u_ringshine_cdf_lut': 7, 'u_ringshine_map': 8,
+            'u_multi_scatter_lut': 3, 'u_ringshine_map': 8,
             'u_depth_texture': 9, 'u_history_scatter': 10,
             'u_history_trans': 11, 'u_sky_view_lut': 12,
             'u_ring_shadow_tex': 13, 'u_sky_view_trans_lut': 14,

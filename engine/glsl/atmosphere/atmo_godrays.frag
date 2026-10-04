@@ -409,11 +409,11 @@ void main() {
                     if (ring_s_valid_min > ring_s_valid_max) continue;
                     if (ring_count == 0) {
                         ring_s1_out.x = ring_s_valid_min; ring_s2_out.x = ring_s_valid_max;
-                        ring_inner.x = inner_r_km; ring_outer.x = outer_r_km; ring_opac.x = scaled_tau; ring_v_coord.x = (float(ring_idx) + 0.5) / 16.0;
+                        ring_inner.x = inner_r_km; ring_outer.x = outer_r_km; ring_opac.x = scaled_tau; ring_v_coord.x = (float(ring_idx) + 0.5) / float(textureSize(u_ring_gradients, 0).y);
                         ring_A_prime = A_prime_km; ring_B = B_km; ring_R_eff.x = R_eff_km;
                     } else if (ring_count == 1) {
                         ring_s1_out.y = ring_s_valid_min; ring_s2_out.y = ring_s_valid_max;
-                        ring_inner.y = inner_r_km; ring_outer.y = outer_r_km; ring_opac.y = scaled_tau; ring_v_coord.y = (float(ring_idx) + 0.5) / 16.0;
+                        ring_inner.y = inner_r_km; ring_outer.y = outer_r_km; ring_opac.y = scaled_tau; ring_v_coord.y = (float(ring_idx) + 0.5) / float(textureSize(u_ring_gradients, 0).y);
                         ring_R_eff.y = R_eff_km;
                     }
                     ring_count++;

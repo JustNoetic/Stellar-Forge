@@ -330,7 +330,7 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
 
             if app.camera.get("ringshine_enabled", True):
                 imgui.indent()
-                ringshine_bands = int(app.camera.get("ringshine_band_count", 100))
+                ringshine_bands = int(app.camera.get("ringshine_band_count", 10))
                 changed_rsb, ringshine_bands = imgui.slider_int("Ringshine Bands", ringshine_bands, 4, 1024)
                 if changed_rsb:
                     app.camera["ringshine_band_count"] = ringshine_bands
@@ -365,17 +365,30 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                 if imgui.is_item_hovered():
                     imgui.set_tooltip("Highlight active quadtree patch borders and false-color each patch by its LOD level.")
 
-                split_factor = float(app.camera.get("terrain_lod_split_factor", 1.0))
-                changed_sf, split_factor = imgui.slider_float("LOD Split Sensitivity", split_factor, 0.5, 3.0, "%.2fx")
-                if changed_sf:
-                    app.camera["terrain_lod_split_factor"] = split_factor
+                lod_dist = float(app.camera.get("terrain_lod_distance", 1.0))
+                changed_ld, lod_dist = imgui.slider_float("LOD Distance Scale", lod_dist, 0.2, 3.0, "%.2fx")
+                if changed_ld:
+                    app.camera["terrain_lod_distance"] = lod_dist
+                    app.camera["terrain_lod_split_factor"] = 1.0 / max(0.1, lod_dist)
                     settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Overall distance scale for terrain LOD subdivision.\nHigher values extend high-detail LOD patches farther toward the horizon.\nLower values keep high-detail patches closer to the camera for higher FPS.")
 
-                max_depth = int(app.camera.get("terrain_max_depth", 6))
-                changed_md, max_depth = imgui.slider_int("Max LOD Depth", max_depth, 0, 8)
+                ground_dist = float(app.camera.get("terrain_ground_lod_distance", 1.0))
+                changed_gd, ground_dist = imgui.slider_float("Ground LOD Closeness", ground_dist, 0.2, 3.0, "%.2fx")
+                if changed_gd:
+                    app.camera["terrain_ground_lod_distance"] = ground_dist
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Near-ground LOD transition distance.\nValues below 1.0x bring higher quality LOD patches closer to the camera\nwhen near the surface, concentrating dense geometry nearby while keeping distant terrain lightweight.")
+
+                max_depth = int(app.camera.get("terrain_max_depth", 10))
+                changed_md, max_depth = imgui.slider_int("Max LOD Depth", max_depth, 0, 10)
                 if changed_md:
                     app.camera["terrain_max_depth"] = max_depth
                     settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Maximum quadtree subdivision depth level (0 to 10).\nGoverns the finest mesh resolution available near the camera.")
 
                 res_options = [8, 16, 24, 32, 48, 64]
                 res_labels = [

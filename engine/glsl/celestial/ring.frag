@@ -394,7 +394,7 @@ void main() {
             if (plane_is_textured) {
                 tex_val = texture(u_ring_texture, vec2(clamp(t, 0.0, 1.0), 0.5));
             } else {
-                tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5)/16.0));
+                tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5) / float(textureSize(u_ring_gradients, 0).y)));
             }
             tex_val.rgb = pow(tex_val.rgb, vec3(2.2));
 

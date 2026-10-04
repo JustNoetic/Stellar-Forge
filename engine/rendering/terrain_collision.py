@@ -103,6 +103,8 @@ class CameraSurface:
         else:
             lo, hi = self.elevation_range
             elevation = lo + samples * (hi - lo)
+            if lo < -0.1:
+                elevation = np.maximum(0.0, elevation)
         vertices = terrain_vertices(face, (grid + [x, y]) / scale,
                                     self.radius, self.oblateness, elevation)
         # Match create_terrain_grid_patch: (p0,p2,p1), (p1,p2,p3).

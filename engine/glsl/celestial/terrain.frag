@@ -68,6 +68,7 @@ uniform float u_au_to_km;
 
 uniform sampler2D u_ring_gradients;
 uniform sampler2D u_ringshine_map;
+#include "common/ringshine_lookup.glsl"
 
 uniform bool u_planetshine_enabled;
 uniform bool u_ringshine_enabled;
@@ -404,11 +405,6 @@ void main() {
                 vec3 P_dir = normalize(f_rel_pos);
                 float frag_elevation = dot(P_dir, ring_normal);
 
-                vec3 frag_to_star0 = (u_stars_pos_radius[0].xyz - f_body_center) - f_rel_pos;
-                float dist_to_star0 = length(frag_to_star0);
-                vec3 L0 = dist_to_star0 > 1e-5 ? (frag_to_star0 / dist_to_star0) : vec3(0.0, 1.0, 0.0);
-                float sun_elev_0 = dot(L0, ring_normal);
-
                 for (int s = 0; s < num_stars; s++) {
                     vec3 star_pos = u_stars_pos_radius[s].xyz;
                     float star_radius = u_stars_pos_radius[s].w;
@@ -416,8 +412,6 @@ void main() {
                     float dist_to_star = length(frag_to_star);
                     if (dist_to_star < 1e-5) continue;
                     vec3 L = frag_to_star / dist_to_star;
-                    float sun_elev_s = dot(L, ring_normal);
-                    float rel_hemi = (sun_elev_s * sun_elev_0 >= 0.0) ? 1.0 : -1.0;
 
                     vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
                     float star_sin_lat = abs(dot(L, pole_dir));
@@ -447,11 +441,11 @@ void main() {
                     float x_prime = phi_center / PI;
                     float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                    float y_prime = frag_elevation * rel_hemi;
+                    float y_prime = frag_elevation;
                     float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
                     vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
-                    vec3 total_ring_irradiance = texture(u_ringshine_map, map_uv).rgb;
+                    vec3 total_ring_irradiance = ringshine_sample(map_uv, k, s);
 
                     float shine_intensity = 0.318309886; // 1 / PI
                     vec3 ring_tint = total_ring_irradiance;
@@ -654,11 +648,6 @@ void main() {
             vec3 P_dir = normalize(f_rel_pos);
             float frag_elevation = dot(P_dir, ring_normal);
 
-            vec3 frag_to_star0 = (u_stars_pos_radius[0].xyz - f_body_center) - f_rel_pos;
-            float dist_to_star0 = length(frag_to_star0);
-            vec3 L0 = dist_to_star0 > 1e-5 ? (frag_to_star0 / dist_to_star0) : vec3(0.0, 1.0, 0.0);
-            float sun_elev_0 = dot(L0, ring_normal);
-
             for (int s = 0; s < num_stars; s++) {
                 vec3 star_pos = u_stars_pos_radius[s].xyz;
                 float star_radius = u_stars_pos_radius[s].w;
@@ -666,8 +655,6 @@ void main() {
                 float dist_to_star = length(frag_to_star);
                 if (dist_to_star < 1e-5) continue;
                 vec3 L = frag_to_star / dist_to_star;
-                float sun_elev_s = dot(L, ring_normal);
-                float rel_hemi = (sun_elev_s * sun_elev_0 >= 0.0) ? 1.0 : -1.0;
 
                 vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
                 float star_sin_lat = abs(dot(L, pole_dir));
@@ -697,11 +684,11 @@ void main() {
                 float x_prime = phi_center / PI;
                 float phi_uv = sign(x_prime) * pow(abs(x_prime), 0.666666667) * 0.5 + 0.5;
 
-                float y_prime = frag_elevation * rel_hemi;
+                float y_prime = frag_elevation;
                 float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
                 vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
-                vec3 total_ring_irradiance = texture(u_ringshine_map, map_uv).rgb;
+                vec3 total_ring_irradiance = ringshine_sample(map_uv, k, s);
 
                 float shine_intensity = 0.318309886; // 1 / PI
                 vec3 ring_tint = total_ring_irradiance;

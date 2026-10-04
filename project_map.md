@@ -43,6 +43,7 @@
 | **Planetary Rings & Procedural Profiles** | `engine/rendering/ring_generator.py`<br>`engine/rendering/texture_baker.py` | `generate_procedural_ring_profile`<br>`bake_and_export_ring_textures`, `apply_procedural_ring_to_body` |
 | **Ring Shadows & Filtering** | `engine/rendering/ring_shadow_filter.py`<br>`engine/glsl/common/` | `RingShadowFilter`<br>`ring_shadow_filter.glsl`, `surface_ring_shadow.glsl`, `caster_shadow.glsl` |
 | **Planetshine & Moonshine** | `engine/rendering/planetshine.py` | `compute_planetshine_numba`, `compute_body_rotation_angles_jit`, `get_cached_atmosphere_properties` |
+| **Ringshine & Oblate Ring Transport** | `engine/rendering/ringshine.py`<br>`engine/glsl/post/ringshine_map.frag`<br>`engine/glsl/common/ringshine_{integral,lookup}.glsl` | `RingshineMap.update`, `build_secondary_ring_properties`, `ring_phase_radiance` (`planetshine.py`). Cached 128×65 tiles per host/star in a 16×16 atlas; exact oblate lit arcs with warped 16-node azimuth quadrature and four-node radial transfer. No geometry/CDF LUT. Material atlas reserves 16 host rows, followed by up to 256 segment rows; readers use texture height. |
 | **Starfield & Gaia DR3 Catalog** | `engine/rendering/star_catalog.py`<br>`engine/glsl/celestial/` | `StarCatalog`, `_pack_kernel`<br>`starfield.vert`, `starfield.frag`, `point_celestial.frag` |
 | **HDR, Tone Mapping & Bloom** | `engine/rendering/post_shaders.py`<br>`engine/glsl/post/` | Post-processing program compilations<br>`composite.frag`, `accum.frag`, `bloom_downsample.frag`, `bloom_upsample.frag` |
 | **FFT / Convolution Diffraction Spikes** | `engine/glsl/post/` | `conv_bloom_scene.comp`, `conv_bloom_kernel.comp`, `conv_bloom_convolve.comp`, `conv_bloom_common.glsl` |
@@ -167,6 +168,7 @@ stellar_forge.spec              # PyInstaller standalone build configuration
 - `atmo_quality`: `0` = Off, `1` = Low (2D), `2` = High (Volumetric), `3` = Analytical (Sky-View)
 - `atmo_aerial_volume`: Experimental Mode 3 terrain haze acceleration (default `True`); `engine/rendering/aerial_perspective.py`, `engine/glsl/atmosphere/aerial_perspective.comp`, `engine/glsl/common/aerial_{coordinates,lookup}.glsl`. Camera-frustum 32³ volume; atmosphere-relative cosine depth slices; shared solar/planetshine/ringshine transport in `common/scattering_scene.glsl`; endpoint fallback at orbital rims, distant views, and ring-split passes. Disable in graphics settings for direct endpoint comparison.
 - `tracking_idx`: Integer index of tracked celestial body (or `None`)
+- `ringshine_enabled`, `ringshine_oblate_enabled`: Toggle host/moon ringshine and host oblateness. `ringshine_band_count`: 4–1024 radial bands (default 10). Host maps rebake on material revision, normalized ring geometry, flattening, band count, or per-star sine elevation quantized to 1e-5; camera/azimuth/stellar flux changes reuse maps.
 - `inspected_idx`: Integer index of currently inspected body in Inspector panel
 
 ### `app.shared_state` (Dict)

@@ -168,25 +168,55 @@ vec3 endpoint_secondary_light(vec3 a, vec3 b, vec3 T, vec3 ps_dir, vec3 ps_color
     if (!u_ringshine_enabled || ring_mask == 0u) return result;
     vec3 midpoint = fromSphericalSpace(0.5 * (a + b), u_pole_obl);
     vec3 P = normalize(midpoint);
-    vec3 L0 = normalize(u_star_pos_local[0].xyz);
     for (int k = 0; k < u_num_ring_planes; ++k) {
         if ((ring_mask & (1u << k)) == 0u) continue;
         vec3 normal = normalize(u_ring_normal[k]);
         vec3 response = endpoint_ring_response(a, b, normalize(toSphericalSpace(normal, u_pole_obl)), T);
         for (int st = 0; st < min(u_num_stars, 4); ++st) {
             vec3 L = normalize(u_star_pos_local[st].xyz);
-            float hemi = dot(L, normal) * dot(L0, normal) >= 0.0 ? 1.0 : -1.0;
             vec3 anti = -L + normal * dot(L, normal);
             anti = length(anti) > 1e-5 ? normalize(anti) : vec3(-1.0, 0.0, 0.0);
             vec3 equator = P - normal * dot(P, normal);
             equator = length(equator) > 1e-5 ? normalize(equator) : vec3(1.0, 0.0, 0.0);
             float x = atan(dot(cross(anti, equator), normal), clamp(dot(anti, equator), -1.0, 1.0)) / PI;
-            float y = dot(P, normal) * hemi;
+            float y = dot(P, normal);
             vec2 uv = vec2(0.5 + 0.5 * sign(x) * pow(abs(x), 2.0/3.0),
                 (float(k) + 0.5 + 0.5 * sign(y) * pow(abs(y), 2.0/3.0)) / 16.0);
-            vec3 irradiance = textureLod(u_ringshine_map, uv, 0.0).rgb / PI;
+            vec3 irradiance = ringshine_sample(uv, k, st) / PI;
             result += response * irradiance * u_star_color_irrad[st].rgb;
         }
     }
     return result;
 }
+
+vec3 endpoint_subsurface_secondary_light(vec3 a, vec3 b, vec3 ps_dir, vec3 ps_color, uint ring_mask) {
+    vec3 result = vec3(0.0);
+    if ((u_planetshine_enabled || u_ringshine_enabled) && dot(ps_color, ps_color) > 1e-12
+        && dot(ps_dir, ps_dir) > 1e-12) {
+        vec3 light = normalize(toSphericalSpace(normalize(ps_dir), u_pole_obl));
+        result += endpoint_subsurface_shine(a, b, light) * ps_color * (u_sun_intensity * PI);
+    }
+    if (!u_ringshine_enabled || ring_mask == 0u) return result;
+    vec3 midpoint = fromSphericalSpace(0.5 * (a + b), u_pole_obl);
+    vec3 P = normalize(midpoint);
+    for (int k = 0; k < u_num_ring_planes; ++k) {
+        if ((ring_mask & (1u << k)) == 0u) continue;
+        vec3 normal = normalize(u_ring_normal[k]);
+        vec3 response = endpoint_subsurface_ring(a, b, normalize(toSphericalSpace(normal, u_pole_obl)));
+        for (int st = 0; st < min(u_num_stars, 4); ++st) {
+            vec3 L = normalize(u_star_pos_local[st].xyz);
+            vec3 anti = -L + normal * dot(L, normal);
+            anti = length(anti) > 1e-5 ? normalize(anti) : vec3(-1.0, 0.0, 0.0);
+            vec3 equator = P - normal * dot(P, normal);
+            equator = length(equator) > 1e-5 ? normalize(equator) : vec3(1.0, 0.0, 0.0);
+            float x = atan(dot(cross(anti, equator), normal), clamp(dot(anti, equator), -1.0, 1.0)) / PI;
+            float y = dot(P, normal);
+            vec2 uv = vec2(0.5 + 0.5 * sign(x) * pow(abs(x), 2.0/3.0),
+                (float(k) + 0.5 + 0.5 * sign(y) * pow(abs(y), 2.0/3.0)) / 16.0);
+            vec3 irradiance = ringshine_sample(uv, k, st) / PI;
+            result += response * irradiance * u_star_color_irrad[st].rgb;
+        }
+    }
+    return result;
+}
+

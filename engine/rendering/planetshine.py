@@ -274,11 +274,62 @@ def compute_body_rotation_angles_jit(sim_t_sec, rot_period_arr, w0_arr, tidally_
                 angles[i] = w0
     return angles
 
+@njit(cache=True)
+def ring_slab_response(mu_v, sun_elevation, alpha, on_lit_side):
+    """Single-scattering slab response, including coincident optical depths."""
+    mu_0 = abs(sun_elevation)
+    if mu_0 < 1e-7 or alpha <= 0.0:
+        return 0.0
+    mu_v = max(mu_v, 1e-7)
+    tau = -math.log(max(1e-7, 1.0 - min(alpha, 0.9999999)))
+    vd, ld = tau / mu_v, tau / mu_0
+    if on_lit_side:
+        single = mu_0 / (mu_v + mu_0) * (-math.expm1(-vd - ld))
+    else:
+        delta = abs(ld - vd)
+        ratio = -math.expm1(-delta) / delta if delta > 1e-12 else 1.0
+        single = vd * math.exp(-min(vd, ld)) * ratio
+    return single
+
+
+@njit(cache=True)
+def ring_phase_radiance(mu_v, sun_elevation, alpha, cos_theta, asymmetry,
+                        backscatter, scatter, textured, unlit_factor, on_lit_side):
+    single = ring_slab_response(mu_v, sun_elevation, alpha, on_lit_side)
+    if single == 0.0:
+        return 0.0
+    gf, gb = min(.99, max(-.99, asymmetry)), min(.99, max(-.99, backscatter))
+    denom_f = max(1e-6, 1.0 + gf*gf - 2.0*gf*cos_theta)
+    denom_b = max(1e-6, 1.0 + gb*gb - 2.0*gb*cos_theta)
+    pf_f = (1.0-gf*gf) / (denom_f*math.sqrt(denom_f)*4.0*math.pi)
+    pf_b = (1.0-gb*gb) / (denom_b*math.sqrt(denom_b)*4.0*math.pi)
+    if textured:
+        chunks = min(1.0, max(0.0, (alpha-.1)/.5))
+        forward, ms_weight = .95-.45*chunks, chunks
+    else:
+        balance = min(1.0, max(0.0, scatter))
+        forward, ms_weight = .1+.8*balance, min(1.0, max(.1, 1.0-balance*.7))
+        pf_f *= 1.5*(1.0+cos_theta*cos_theta)/(2.0+gf*gf)
+        pf_b *= 1.5*(1.0+cos_theta*cos_theta)/(2.0+gb*gb)
+    pf = forward*pf_f+(1.0-forward)*pf_b
+    if not on_lit_side:
+        return single*pf*unlit_factor
+    mu_0 = abs(sun_elevation)
+    mu_v = max(mu_v, 1e-7)
+    tau = -math.log(max(1e-7, 1.0-min(alpha, .9999999)))
+    gamma = math.sqrt(.08)
+    hv = (1.0+2.0*mu_v)/(1.0+2.0*mu_v*gamma)
+    h0 = (1.0+2.0*mu_0)/(1.0+2.0*mu_0*gamma)
+    multiple = .92*mu_0/(mu_v+mu_0)*max(0.0,hv*h0-1.0) \
+        *(-math.expm1(-tau/mu_v-tau/mu_0))/(4.0*math.pi)
+    return single*pf+multiple*ms_weight
+
+
 @njit
 def compute_planetshine_numba(
     pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled,
     ring_params=None, ring_normals=None, ring_colors=None,
-    planetshine_enabled=True, ringshine_enabled=True
+    planetshine_enabled=True, ringshine_enabled=True, ring_scattering=None
 ):
     N = len(pos)
     num_stars = len(star_positions)
@@ -406,7 +457,6 @@ def compute_planetshine_numba(
             ring_solid_angle = 0.0
             rn_x, rn_y, rn_z = 0.0, 0.0, 0.0
             sin_B_v = 0.0
-            tau_ring = 0.0
             lit_frac = 1.0
             
             if has_ring and dist > 1e-6 and ring_normals is not None:
@@ -417,8 +467,7 @@ def compute_planetshine_numba(
                 mu_v = abs(sin_B_v)
                 
                 # Projected solid angle: (R_out^2 - R_in^2) * mu_v / d^2
-                ring_solid_angle = max(0.0, (r_out * r_out - r_in * r_in) * mu_v) / dist_sq
-                tau_ring = -math.log(max(1e-4, 1.0 - min(0.999, r_opacity)))
+                ring_solid_angle = math.pi * max(0.0, (r_out * r_out - r_in * r_in) * mu_v) / dist_sq
                 
                 # Cylindrical shadow of host planet across ring plane
                 shadow_frac = min(0.5, (2.0 * r_j) / max(1e-6, 3.1415926535 * (r_out + r_in)))
@@ -491,40 +540,31 @@ def compute_planetshine_numba(
                 
                 if has_ring and ring_solid_angle > 1e-8 and ring_colors is not None:
                     sin_B_sun = cx * rn_x + cy * rn_y + cz * rn_z
-                    mu_0 = max(1e-4, abs(sin_B_sun))
                     same_hemi = sin_B_sun * sin_B_v
                     
-                    if same_hemi >= 0.0:
-                        # Sunlit face: direct reflection / backscatter
-                        face_factor = 1.0
-                    else:
-                        # Unlit face: transmitted light through the ring slab
-                        face_factor = r_unlit * math.exp(-tau_ring / mu_0)
-                        
-                    # Scattering phase angle: angle between incident solar ray (-L) and scattered ray to moon (+u_moon)
-                    cos_theta = -(cx * u_moon_x + cy * u_moon_y + cz * u_moon_z)
+                    cos_theta = -(cx*u_moon_x + cy*u_moon_y + cz*u_moon_z)
                     cos_theta = max(-1.0, min(1.0, cos_theta))
-                    
-                    # Double Henyey-Greenstein particulate phase function (gf=0.436, gb=-0.657)
-                    gf = 0.436
-                    gb = -0.657
-                    denom_f = max(1e-6, 1.0 + gf * gf - 2.0 * gf * cos_theta)
-                    denom_b = max(1e-6, 1.0 + gb * gb - 2.0 * gb * cos_theta)
-                    pf_f = (1.0 - gf * gf) / (denom_f * math.sqrt(denom_f))
-                    pf_b = (1.0 - gb * gb) / (denom_b * math.sqrt(denom_b))
-                    pf_ring = 0.7 * pf_f + 0.3 * pf_b
-                    
+                    gf, gb, balance, textured = 0.436, -0.65711, 1.0, True
+                    if ring_scattering is not None:
+                        gf = ring_scattering[j, 0]
+                        gb = ring_scattering[j, 1]
+                        balance = ring_scattering[j, 2]
+                        textured = ring_scattering[j, 3] > 0.5
+                    response = ring_phase_radiance(abs(sin_B_v), sin_B_sun,
+                        r_opacity, cos_theta, gf, gb, balance, textured,
+                        r_unlit, same_hemi >= 0.0)
+
                     ring_r = ring_colors[j, 0]
                     ring_g = ring_colors[j, 1]
                     ring_b = ring_colors[j, 2]
                     
-                    ring_light_r = star_colors[s, 0] * pf_ring * j_lit[j, s] * face_factor * lit_frac
-                    ring_light_g = star_colors[s, 1] * pf_ring * j_lit[j, s] * face_factor * lit_frac
-                    ring_light_b = star_colors[s, 2] * pf_ring * j_lit[j, s] * face_factor * lit_frac
+                    ring_light_r = star_colors[s, 0] * response * j_lit[j, s] * lit_frac
+                    ring_light_g = star_colors[s, 1] * response * j_lit[j, s] * lit_frac
+                    ring_light_b = star_colors[s, 2] * response * j_lit[j, s] * lit_frac
                     
-                    ring_bounce_r = ring_r * ring_light_r * ring_solid_angle * (2.0 / 3.0) * boost
-                    ring_bounce_g = ring_g * ring_light_g * ring_solid_angle * (2.0 / 3.0) * boost
-                    ring_bounce_b = ring_b * ring_light_b * ring_solid_angle * (2.0 / 3.0) * boost
+                    ring_bounce_r = ring_r * ring_light_r * ring_solid_angle
+                    ring_bounce_g = ring_g * ring_light_g * ring_solid_angle
+                    ring_bounce_b = ring_b * ring_light_b * ring_solid_angle
                 
                 bounce_r = planet_bounce_r + ring_bounce_r
                 bounce_g = planet_bounce_g + ring_bounce_g

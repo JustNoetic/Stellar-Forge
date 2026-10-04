@@ -32,7 +32,7 @@ float surface_ring_disc_cdf(float v) {
 float surface_ring_occlusion(int row, float radius, float inner_r, float outer_r,
                              float opacity, float inv_light_mu) {
     float p = (radius - inner_r) / (outer_r - inner_r);
-    float alpha = textureLod(u_ring_gradients, vec2(p, (float(row) + 0.5) / 16.0), 0.0).a;
+    float alpha = textureLod(u_ring_gradients, vec2(p, (float(row) + 0.5) / float(textureSize(u_ring_gradients, 0).y)), 0.0).a;
     float normal_transmission = clamp(1.0 - opacity * alpha, 1e-6, 1.0);
     // Apply oblique extinction BEFORE filtering, so opaque bands and clear gaps
     // retain their separate transmissions within the stellar footprint.

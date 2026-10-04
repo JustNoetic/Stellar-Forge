@@ -228,7 +228,13 @@ if _HAS_NUMBA:
             dz = cz - cam_z
             dist_to_center = math.sqrt(dx*dx + dy*dy + dz*dz)
             dist_to_surface = max(0.01, dist_to_center - radius - max(0.0, height_max_km))
-            screen_size = (radius * screen_height) / (dist_to_surface * 2.0 * tan_half_fov)
+            # Horizon foreshortening: when a patch is viewed at a grazing angle near the horizon,
+            # its screen-projected area is compressed by cos_view. This prevents thin edge-on horizon
+            # patches from over-subdividing into hundreds of tiny redundant slivers.
+            inv_dist = 1.0 / max(1e-6, dist_to_center)
+            cos_view = abs(cnx * (-dx * inv_dist) + cny * (-dy * inv_dist) + cnz * (-dz * inv_dist))
+            foreshorten = max(0.35, min(1.0, cos_view))
+            screen_size = (radius * screen_height * foreshorten) / (dist_to_surface * 2.0 * tan_half_fov)
             
             if screen_size > threshold_px and lod < max_lod and (s_ptr + 4 < 512):
                 nl = lod + 1
@@ -526,7 +532,12 @@ class PlanetQuadtree:
             dist_to_center = float(np.linalg.norm(c_center - cam_pos_local_km))
             dist_to_surface = max(0.01, dist_to_center - radius - max(0.0, height_max_km))
 
-            screen_size = (radius * screen_height) / (dist_to_surface * 2.0 * tan_half_fov)
+            # Horizon foreshortening: project area compression when viewed at grazing angle
+            v_dir = (cam_pos_local_km - c_center) / max(1e-6, dist_to_center)
+            cos_view = abs(float(np.dot(c_dir, v_dir)))
+            foreshorten = max(0.35, min(1.0, cos_view))
+
+            screen_size = (radius * screen_height * foreshorten) / (dist_to_surface * 2.0 * tan_half_fov)
 
             if screen_size > threshold_px and lod < max_lod:
                 nl = lod + 1

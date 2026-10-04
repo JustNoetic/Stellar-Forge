@@ -50,6 +50,7 @@ uniform float u_grid_step;
 uniform vec3 u_body_cam_rel_au[8];
 
 #include "common/refraction.glsl"
+#include "common/procedural_terrain.glsl"
 
 out vec3 f_world_pos;
 out vec3 f_normal;
@@ -79,7 +80,7 @@ out vec3 f_rel_pos;
 
 #define PI 3.14159265358979323846
 
-vec3 base_surface(int face, vec2 uv, float obl) {
+vec3 sphere_dir(int face, vec2 uv) {
     vec2 p = tan(uv * (PI * 0.25));
     vec3 v;
     if (face == 0)      v = vec3(1.0, -p.y, -p.x);
@@ -87,8 +88,13 @@ vec3 base_surface(int face, vec2 uv, float obl) {
     else if (face == 2) v = vec3(p.x, 1.0, p.y);
     else if (face == 3) v = vec3(p.x, -1.0, -p.y);
     else if (face == 4) v = vec3(p.x, -p.y, 1.0);
-    else               v = vec3(-p.x, -p.y, -1.0);
-    return normalize(v) * vec3(1.0, 1.0 - obl, 1.0);
+    else                v = vec3(-p.x, -p.y, -1.0);
+    return normalize(v);
+}
+
+vec3 base_surface(int face, vec2 uv, float obl) {
+    vec3 n = sphere_dir(face, uv);
+    return vec3(n.x, n.y * (1.0 - obl), n.z);
 }
 
 void main() {
@@ -116,20 +122,8 @@ void main() {
     float v_local = mix(t_inst.u_range.y, t_inst.u_range.w, in_position.y);
 
     // Tangent warping to minimize area distortion
-    float x_p = tan(u_local * (PI * 0.25));
-    float y_p = tan(v_local * (PI * 0.25));
-
-    // Cube face vector
-    vec3 v;
     int face = int(t_inst.u_meta.x + 0.5);
-    if (face == 0)      v = vec3(1.0, -y_p, -x_p);
-    else if (face == 1) v = vec3(-1.0, -y_p, x_p);
-    else if (face == 2) v = vec3(x_p, 1.0, y_p);
-    else if (face == 3) v = vec3(x_p, -1.0, -y_p);
-    else if (face == 4) v = vec3(x_p, -y_p, 1.0);
-    else                v = vec3(-x_p, -y_p, -1.0);
-
-    vec3 n_sphere = normalize(v);
+    vec3 n_sphere = sphere_dir(face, vec2(u_local, v_local));
 
     // Oblate spheroid shape in body local frame (Y is polar axis)
     vec3 p_ellip = vec3(n_sphere.x, n_sphere.y * (1.0 - obl), n_sphere.z);
@@ -144,10 +138,16 @@ void main() {
     f_elev_span_km = height_active ? t_inst.u_hrange.y : 0.0;
     if (height_active) {
         float e = textureLod(u_tile_array, vec3(height_uv, t_inst.u_height.x), 0.0).r;
-        p_local_km += normalize(p_ellip) * (t_inst.u_hrange.x + e * t_inst.u_hrange.y);
+        float elev_phys = t_inst.u_hrange.x + e * t_inst.u_hrange.y;
+        if (t_inst.u_hrange.x < -0.1) {
+            elev_phys = max(0.0, elev_phys);
+        }
+        float proc_e = compute_procedural_micro_elevation_km(n_sphere, t_inst.u_meta.y, e, t_inst.u_hrange.x, t_inst.u_hrange.y);
+        p_local_km += normalize(p_ellip) * (elev_phys + proc_e);
     }
 
     // Boundary skirt extrusion (only for ground terrain, never for clouds)
+    vec3 p_local_km_surf = p_local_km;
     if (!u_is_cloud_pass && in_position.z > 0.5) {
         float skirt_depth = t_inst.u_uv_trans.w;
         if (height_active) skirt_depth += t_inst.u_hrange.y;
@@ -170,25 +170,46 @@ void main() {
         vec2 d_uv = (t_inst.u_range.zw - t_inst.u_range.xy) * grid_step;
         vec2 d_huv = vec2(grid_step * t_inst.u_height.y);
 
-        vec3 s_R = base_surface(face, vec2(u_local + d_uv.x, v_local), obl);
-        vec3 s_L = base_surface(face, vec2(u_local - d_uv.x, v_local), obl);
-        vec3 s_U = base_surface(face, vec2(u_local, v_local + d_uv.y), obl);
-        vec3 s_D = base_surface(face, vec2(u_local, v_local - d_uv.y), obl);
+        vec3 n_R = sphere_dir(face, vec2(u_local + d_uv.x, v_local));
+        vec3 n_L = sphere_dir(face, vec2(u_local - d_uv.x, v_local));
+        vec3 n_U = sphere_dir(face, vec2(u_local, v_local + d_uv.y));
+        vec3 n_D = sphere_dir(face, vec2(u_local, v_local - d_uv.y));
+
+        vec3 s_R = vec3(n_R.x, n_R.y * (1.0 - obl), n_R.z);
+        vec3 s_L = vec3(n_L.x, n_L.y * (1.0 - obl), n_L.z);
+        vec3 s_U = vec3(n_U.x, n_U.y * (1.0 - obl), n_U.z);
+        vec3 s_D = vec3(n_D.x, n_D.y * (1.0 - obl), n_D.z);
 
         float e_R = textureLod(u_tile_array, vec3(clamp(height_uv + vec2(d_huv.x, 0.0), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
         float e_L = textureLod(u_tile_array, vec3(clamp(height_uv - vec2(d_huv.x, 0.0), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
         float e_U = textureLod(u_tile_array, vec3(clamp(height_uv + vec2(0.0, d_huv.y), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
         float e_D = textureLod(u_tile_array, vec3(clamp(height_uv - vec2(0.0, d_huv.y), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
 
-        vec3 p_R = s_R * r_km + normalize(s_R) * (t_inst.u_hrange.x + e_R * t_inst.u_hrange.y);
-        vec3 p_L = s_L * r_km + normalize(s_L) * (t_inst.u_hrange.x + e_L * t_inst.u_hrange.y);
-        vec3 p_U = s_U * r_km + normalize(s_U) * (t_inst.u_hrange.x + e_U * t_inst.u_hrange.y);
-        vec3 p_D = s_D * r_km + normalize(s_D) * (t_inst.u_hrange.x + e_D * t_inst.u_hrange.y);
+        float pe_R = compute_procedural_micro_elevation_km(n_R, t_inst.u_meta.y, e_R, t_inst.u_hrange.x, t_inst.u_hrange.y);
+        float pe_L = compute_procedural_micro_elevation_km(n_L, t_inst.u_meta.y, e_L, t_inst.u_hrange.x, t_inst.u_hrange.y);
+        float pe_U = compute_procedural_micro_elevation_km(n_U, t_inst.u_meta.y, e_U, t_inst.u_hrange.x, t_inst.u_hrange.y);
+        float pe_D = compute_procedural_micro_elevation_km(n_D, t_inst.u_meta.y, e_D, t_inst.u_hrange.x, t_inst.u_hrange.y);
 
-        vec3 tu = (in_position.x <= 0.0) ? (p_R - p_local_km) * 2.0 :
-                  (in_position.x >= 1.0) ? (p_local_km - p_L) * 2.0 : (p_R - p_L);
-        vec3 tv = (in_position.y <= 0.0) ? (p_U - p_local_km) * 2.0 :
-                  (in_position.y >= 1.0) ? (p_local_km - p_D) * 2.0 : (p_U - p_D);
+        float elev_R = t_inst.u_hrange.x + e_R * t_inst.u_hrange.y;
+        float elev_L = t_inst.u_hrange.x + e_L * t_inst.u_hrange.y;
+        float elev_U = t_inst.u_hrange.x + e_U * t_inst.u_hrange.y;
+        float elev_D = t_inst.u_hrange.x + e_D * t_inst.u_hrange.y;
+        if (t_inst.u_hrange.x < -0.1) {
+            elev_R = max(0.0, elev_R);
+            elev_L = max(0.0, elev_L);
+            elev_U = max(0.0, elev_U);
+            elev_D = max(0.0, elev_D);
+        }
+
+        vec3 p_R = s_R * r_km + normalize(s_R) * (elev_R + pe_R);
+        vec3 p_L = s_L * r_km + normalize(s_L) * (elev_L + pe_L);
+        vec3 p_U = s_U * r_km + normalize(s_U) * (elev_U + pe_U);
+        vec3 p_D = s_D * r_km + normalize(s_D) * (elev_D + pe_D);
+
+        vec3 tu = (in_position.x <= 0.0) ? (p_R - p_local_km_surf) * 2.0 :
+                  (in_position.x >= 1.0) ? (p_local_km_surf - p_L) * 2.0 : (p_R - p_L);
+        vec3 tv = (in_position.y <= 0.0) ? (p_U - p_local_km_surf) * 2.0 :
+                  (in_position.y >= 1.0) ? (p_local_km_surf - p_D) * 2.0 : (p_U - p_D);
         vec3 n_cand = cross(tv, tu);
         if (dot(n_cand, n_cand) > 1e-12) {
             n_cand = normalize(n_cand);
@@ -221,11 +242,17 @@ void main() {
         // planet radius, whose rounding noise overwhelms ground-level derivatives.
         vec2 center_uv = (t_inst.u_range.xy + t_inst.u_range.zw) * 0.5;
         vec3 center_surface = base_surface(face, center_uv, obl);
+        vec3 center_n = sphere_dir(face, center_uv);
         vec2 center_height_uv = vec2(0.5) * t_inst.u_height.y + t_inst.u_height.zw;
         float center_e = textureLod(u_tile_array, vec3(center_height_uv, t_inst.u_height.x), 0.0).r;
+        float center_elev = t_inst.u_hrange.x + center_e * t_inst.u_hrange.y;
+        if (t_inst.u_hrange.x < -0.1) {
+            center_elev = max(0.0, center_elev);
+        }
+        float center_pe = compute_procedural_micro_elevation_km(center_n, t_inst.u_meta.y, center_e, t_inst.u_hrange.x, t_inst.u_hrange.y);
         vec3 anchor = center_surface * r_km
-                    + normalize(center_surface) * (t_inst.u_hrange.x + center_e * t_inst.u_hrange.y);
-        vec3 offset = p_local_km - anchor;
+                    + normalize(center_surface) * (center_elev + center_pe);
+        vec3 offset = p_local_km_surf - anchor;
         vec3 offset_body = vec3(offset.x * c_rot - offset.z * s_rot,
                                offset.y, offset.x * s_rot + offset.z * c_rot);
         f_patch_pos_km = offset_body.x * tangent + offset_body.y * pole + offset_body.z * bitangent;
