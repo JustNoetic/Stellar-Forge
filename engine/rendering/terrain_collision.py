@@ -21,6 +21,18 @@ def terrain_frame(pole, angle):
     return np.column_stack((tangent, pole, bitangent)) @ np.array([[c, 0, -s], [0, 1, 0], [s, 0, c]])
 
 
+def terrain_camera_split(position_km, pole, angle):
+    """Split the body-local camera origin before GPU rotation/subtraction.
+
+    The low component preserves ground clearance when the high component is
+    rounded at planet-radius scale. Rotation then acts on the small relative
+    vector, so spin-dependent rounding cannot shake stationary terrain.
+    """
+    local = terrain_frame(pole, angle).T @ np.asarray(position_km, dtype='f8')
+    high = local.astype('f4')
+    return high, (local - high.astype('f8')).astype('f4')
+
+
 def terrain_face_uv(direction, oblateness):
     """Inverse of the shader's tangent-warped, oblate cube mapping."""
     x, y, z = direction
@@ -76,7 +88,7 @@ def triangle_radius(direction, triangle):
 class CameraSurface:
     def __init__(self, radius, oblateness, pole, angle=0., streamer=None,
                  body_name='', elevation_range=(0., 8.848), max_lod=6,
-                 patch_res=32, patches=None):
+                 patch_res=32, patches=None, cache_queries=False):
         self.radius = float(radius)
         self.oblateness = np.clip(oblateness, 0., .8)
         self.frame = terrain_frame(pole, angle)
@@ -87,6 +99,10 @@ class CameraSurface:
         self.elevation_range = lo, hi
         self.max_lod, self.patch_res = max(0, int(max_lod)), max(1, int(patch_res))
         self.patches = patches
+        # App creates a surface after uploads on each frame. Reuse only exact
+        # repeated queries within that frame; sweeps still inspect every point.
+        self.cache_queries = cache_queries
+        self._query_key = self._query_result = None
         self.outer_radius = self.radius + max(0., hi if streamer is not None else 0.) + .01
         self.cell_size = self.radius / (2**self.max_lod * self.patch_res)
 
@@ -115,6 +131,15 @@ class CameraSurface:
         return None
 
     def surface(self, position):
+        if not self.cache_queries:
+            return self._surface(position)
+        key = np.asarray(position, dtype='f8').tobytes()
+        if key != self._query_key:
+            self._query_result = self._surface(position)
+            self._query_key = key
+        return self._query_result
+
+    def _surface(self, position):
         r = np.linalg.norm(position)
         direction = (self.frame.T @ position) / r if r > 1e-30 else np.array([0., 1., 0.])
         q = direction.copy(); q[1] /= 1. - self.oblateness

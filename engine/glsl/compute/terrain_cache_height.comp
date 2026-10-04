@@ -1,0 +1,26 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "common/terrain_geometry_cache.glsl"
+#include "common/procedural_terrain.glsl"
+layout(std430, binding = 5) readonly buffer BakeJobs { TerrainBakeJob jobs[]; };
+layout(std430, binding = 7) writeonly buffer BakeHeights { float heights[]; };
+layout(binding = 14) uniform sampler2DArray u_tile_array;
+uniform int u_resolution;
+
+void main() {
+    ivec2 ij = ivec2(gl_GlobalInvocationID.xy);
+    int width = u_resolution + 1;
+    if (any(greaterThanEqual(ij, ivec2(width)))) return;
+    int job_index = int(gl_GlobalInvocationID.z);
+    TerrainBakeJob job = jobs[job_index];
+    vec2 uv = vec2(ij) / float(u_resolution);
+    vec2 sphere_uv = mix(job.range.xy, job.range.zw, uv);
+    vec3 direction = terrain_cache_direction(int(job.meta.x + 0.5), sphere_uv);
+    vec2 height_uv = uv * job.height.y + job.height.zw;
+    float e = textureLod(u_tile_array, vec3(height_uv, job.height.x), 0.0).r;
+    float elevation = job.hrange.x + e * job.hrange.y;
+    if (job.hrange.x < -0.1) elevation = max(0.0, elevation);
+    elevation += compute_procedural_micro_elevation_km(
+        direction, job.meta.y, e, job.hrange.x, job.hrange.y);
+    heights[job_index * width * width + ij.y * width + ij.x] = elevation;
+}

@@ -1024,6 +1024,25 @@ def estimate_min_orbital_period(pos, vel, mass, parent_indices):
     return p_min
 
 
+@njit(cache=True, nogil=True)
+def first_body_collision(positions, radii):
+    """Return the first overlapping pair in the existing merge order.
+
+    This runs every N-body tick. Release the GIL throughout the pair scan so
+    physics cannot interrupt rendering with a Python O(N squared) loop.
+    """
+    for i in range(len(positions)):
+        for j in range(i + 1, len(positions)):
+            dx = positions[i, 0] - positions[j, 0]
+            dy = positions[i, 1] - positions[j, 1]
+            dz = positions[i, 2] - positions[j, 2]
+            distance_sq = dx*dx + dy*dy + dz*dz
+            r_sum = radii[i] + radii[j]
+            if distance_sq < r_sum * r_sum:
+                return i, j
+    return -1, -1
+
+
 def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
     _timer_set = False
     try:
@@ -1689,20 +1708,9 @@ def physics_loop(sim, num_bodies, shared_state, time_ctrl, running):
                     radii = shared_state.get("radii")
                     
                 if radii is not None:
-                    collisions = []
-                    for i in range(num_bodies):
-                        for j in range(i + 1, num_bodies):
-                            dx = local_pos[i, 0] - local_pos[j, 0]
-                            dy = local_pos[i, 1] - local_pos[j, 1]
-                            dz = local_pos[i, 2] - local_pos[j, 2]
-                            dist_sq = dx*dx + dy*dy + dz*dz
-                            r_sum = radii[i] + radii[j]
-                            if dist_sq < r_sum * r_sum:
-                                collisions.append((i, j))
-                                
-                    if collisions:
+                    idxA, idxB = first_body_collision(local_pos, radii)
+                    if idxA >= 0:
                         # Process only the first collision to avoid overlapping indices complexity this tick
-                        idxA, idxB = collisions[0]
                         massA = sim.arr[idxA, 9]
                         massB = sim.arr[idxB, 9]
                         

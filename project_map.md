@@ -39,7 +39,9 @@
 | **Light Refraction & Bending** | `engine/physics/refraction.py`<br>`engine/glsl/common/refraction.glsl` | `compute_refraction_angle`, `solve_refraction_apparent`, `get_apparent_look_direction` |
 | **Terrain Quadtree & LOD Geometry** | `engine/rendering/terrain_quadtree.py` | `PlanetQuadtree`, `QuadtreePatch`, `cube_to_sphere_point`, `_tan_warp` |
 | **Terrain Tile Streaming** | `engine/rendering/terrain_streamer.py` | `TerrainTileStreamer` |
-| **Surface Landing & Collision** | `engine/rendering/terrain_collision.py` | `CameraSurface`, `terrain_vertices`, `terrain_frame`, `terrain_face_uv` |
+| **Terrain Geometry Cache** | `engine/rendering/terrain_geometry_cache.py`<br>`engine/glsl/compute/terrain_cache_{height,normal}.comp` | `TerrainGeometryCache`: CPU LOD retained; bounded body-local elevation/normal cache, shared grid samples, 128 patch bakes/frame, 96 MiB geometry cap. Height-slot upload versions invalidate edited/recycled layers; misses use original vertex shading. |
+| **Surface Landing & Collision** | `engine/rendering/terrain_collision.py` | `CameraSurface`, `terrain_vertices`, `terrain_frame`, `terrain_face_uv`, `terrain_camera_split`: split body-local camera origin; exact frame-local query reuse. Rotation-follow probes use the predicted post-spin pose. |
+| **N-body Warp Frame Stalls** | `engine/physics/physics_core.py`<br>`engine/app.py`<br>`scripts/test_ground_warp.py` | `first_body_collision`: compiled pair scan releases the GIL and preserves merge order. Corrected hierarchy/integrator warmup precedes both physics threads. |
 | **Planetary Rings & Procedural Profiles** | `engine/rendering/ring_generator.py`<br>`engine/rendering/texture_baker.py` | `generate_procedural_ring_profile`<br>`bake_and_export_ring_textures`, `apply_procedural_ring_to_body` |
 | **Ring Shadows & Filtering** | `engine/rendering/ring_shadow_filter.py`<br>`engine/glsl/common/` | `RingShadowFilter`<br>`ring_shadow_filter.glsl`, `surface_ring_shadow.glsl`, `caster_shadow.glsl` |
 | **Planetshine & Moonshine** | `engine/rendering/planetshine.py` | `compute_planetshine_numba`, `compute_body_rotation_angles_jit`, `get_cached_atmosphere_properties` |

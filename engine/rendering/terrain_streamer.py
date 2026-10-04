@@ -44,6 +44,8 @@ class TerrainTileStreamer:
         self.slot_to_key = {}
         # slot_idx -> last_used_frame (int)
         self.slot_last_used = [0] * self.pool_capacity
+        # Cache keys must distinguish edits/reuse of the same physical layer.
+        self.slot_upload_versions = [0] * self.pool_capacity
         # Locked slots (cannot be evicted, e.g. root LOD 0 tiles)
         self.locked_slots = set()
 
@@ -480,6 +482,7 @@ class TerrainTileStreamer:
             raw_bytes,
             viewport=(0, 0, slot_idx, self.tile_size, self.tile_size, 1)
         )
+        self.slot_upload_versions[slot_idx] += 1
         if key is not None and key[1] == 'height':
             self.height_tiles[slot_idx] = np.frombuffer(raw_bytes, 'u1').reshape(
                 self.tile_size, self.tile_size, 4)[..., 0].copy()

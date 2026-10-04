@@ -359,7 +359,8 @@ from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
 from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches_jit, pack_cloud_patches_jit
 from engine.rendering.terrain_streamer import TerrainTileStreamer
-from engine.rendering.terrain_collision import CameraSurface, GROUND_CLEARANCE_KM, camera_near_plane
+from engine.rendering.terrain_geometry_cache import TerrainGeometryCache
+from engine.rendering.terrain_collision import CameraSurface, GROUND_CLEARANCE_KM, camera_near_plane, terrain_camera_split
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
 from engine.ui import render_ui
 
@@ -1260,6 +1261,28 @@ class App(InputHandlerMixin):
 
         return refract_params, grav_lens_params
 
+    def _upload_terrain_camera(self, body_indices, positions, origin, camera_rel):
+        body_cam_rel = np.zeros((8, 3), dtype='f4')
+        high = np.zeros((8, 3), dtype='f4')
+        low = np.zeros((8, 3), dtype='f4')
+        count = len(positions)
+        for slot, index in enumerate(body_indices[:8]):
+            is_cmp = index >= count
+            local_index = index - count if is_cmp else index
+            center = self.pos_snap_cmp[local_index].copy() if is_cmp else positions[index]
+            if is_cmp:
+                center += np.array([self.comparison_offset_au, 0., 0.])
+            poles = self.pole_n_arr_cmp if is_cmp else self.pole_n_arr
+            relative = (origin - center) + camera_rel
+            body_cam_rel[slot] = -relative
+            high[slot], low[slot] = terrain_camera_split(
+                relative * AU_TO_KM, poles[local_index],
+                float(self._all_instances_cache[index, 25]))
+        self.prog_terrain['u_body_cam_rel_au'].write(body_cam_rel.tobytes())
+        self.prog_terrain['u_body_camera_high_km'].write(high.tobytes())
+        self.prog_terrain['u_body_camera_low_km'].write(low.tobytes())
+        self.prog_terrain['u_local_camera_enabled'].value = True
+
     def run(self):
         if _PERF_ENABLED:
             import sys
@@ -1626,13 +1649,9 @@ class App(InputHandlerMixin):
         }
         self.shared_state_cmp["system_switch_request"] = req_cmp
 
-        running_cmp = [True]
-        physics_thread_cmp = threading.Thread(target=physics_loop, args=(sim_cmp, num_bodies_cmp, self.shared_state_cmp, self.time_ctrl_cmp, running_cmp), daemon=True)
-        physics_thread_cmp.start()
-        
         print("[Init] Warming up Numba JIT functions...")
         try:
-            _update_hierarchy_core(np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), 2, np.zeros(2, dtype=np.bool_))
+            _update_hierarchy_core(np.zeros((2, 3)), np.zeros(2), np.array([-1, 0], dtype=np.int32), 2, np.zeros(2, dtype=np.bool_), np.zeros(2, dtype=np.bool_))
             
                 
             compute_keplerian_elements(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0)
@@ -1644,9 +1663,15 @@ class App(InputHandlerMixin):
             dummy_sim.add(m=1.0, x=0.0, y=0.0, z=0.0, vx=0.0, vy=0.0, vz=0.0)
             dummy_sim.add(m=1e-6, x=1.0, y=0.0, z=0.0, vx=0.0, vy=1.0, vz=0.0)
             dummy_sim.integrate(1e-6)
+            from engine.physics.physics_core import first_body_collision
+            first_body_collision(np.zeros((2, 3)), np.zeros(2, dtype=self.shared_state["radii"].dtype))
         except Exception as e:
             print(f"[Init] Warmup warning: {e}")
             
+        running_cmp = [True]
+        physics_thread_cmp = threading.Thread(target=physics_loop, args=(sim_cmp, num_bodies_cmp, self.shared_state_cmp, self.time_ctrl_cmp, running_cmp), daemon=True)
+        physics_thread_cmp.start()
+
         running = [True]
         physics_thread = threading.Thread(target=physics_loop, args=(sim, num_bodies, self.shared_state, self.time_ctrl, running), daemon=True)
         physics_thread.start()
@@ -2268,6 +2293,7 @@ class App(InputHandlerMixin):
         self.terrain_current_body_name = None
         self.terrain_current_body_idx = -1
         self.terrain_streamer = TerrainTileStreamer(ctx, tiles_base_dir=get_external_path("data", "tiles"), pool_capacity=1024, tile_size=512)
+        self.terrain_geometry_cache = TerrainGeometryCache(ctx, MAX_TERRAIN_PATCHES)
         self.planet_quadtrees = {}
         self.planet_cloud_quadtrees = {}
         self.terrain_active_cloud_patches = {}
@@ -3676,9 +3702,10 @@ class App(InputHandlerMixin):
                     patches = previous[0] if previous is not None and previous[1] == name else None
                     camera_surfaces[key] = CameraSurface(
                         float(radii[index]) * AU_TO_KM, float(visuals[index, 8]),
-                        visuals[index, 5:8], float(np.float32(angles[index])), tiles, name,
+                        (self.pole_n_arr_cmp if is_cmp else self.pole_n_arr)[index],
+                        float(np.float32(angles[index])), tiles, name,
                         info.get('height_range_km', [0., 8.848]),
-                        cam.get('terrain_max_depth', 10), cam.get('terrain_patch_res', 32), patches)
+                        cam.get('terrain_max_depth', 10), cam.get('terrain_patch_res', 32), patches, cache_queries=True)
                 return camera_surfaces[key]
 
             # Tracked body surface radius (used for approach gesture & landing).
@@ -3704,10 +3731,21 @@ class App(InputHandlerMixin):
                 if track_r > 0.:
                     track_surface = camera_surface(t_idx, cam.get("tracking_is_cmp", False))
             
+            # Probe clearance at the point the camera will occupy after spin,
+            # rather than sampling another longitude with the old camera pose.
+            # The latter requests unrelated tiles during stationary time warp.
+            follow_rotation = np.eye(3, dtype='f8')
+            if (track_surface is not None and not cam.get("tracking_is_cmp", False)
+                    and getattr(self, "_contact_prev_track", None) == cam["tracking_idx"]
+                    and getattr(self, "_contact_prev_spin", None) is not None):
+                spin_delta = float(body_spin_angles[cam["tracking_idx"]]) - self._contact_prev_spin
+                spin_delta = (spin_delta + math.pi) % (2.0 * math.pi) - math.pi
+                follow_rotation = _camera_rot_axis(track_pole, spin_delta)
+
             cam["track_f"] = track_f
             cam["track_pole"] = track_pole.tolist()
             if cam.get("tracking_idx") is not None and track_r > 0.0:
-                alt_au = max(0.0, track_surface.clearance(rel * AU_TO_KM) / AU_TO_KM)
+                alt_au = max(0.0, track_surface.clearance((follow_rotation @ rel) * AU_TO_KM) / AU_TO_KM)
                 cam["is_near_surface"] = (alt_au < _ROT_FOLLOW_ALT_AU)
             else:
                 cam["is_near_surface"] = False
@@ -3717,7 +3755,7 @@ class App(InputHandlerMixin):
                 cam["centered_idx"] = None
                 r_ap = np.linalg.norm(rel)
                 if r_ap > 1e-300 and cam["tracking_idx"] is not None and cam["tracking_mode"] == "body" and track_r > 0.0:
-                    ground_radius, ground_cosine = track_surface.surface(rel * AU_TO_KM)
+                    ground_radius, ground_cosine = track_surface.surface((follow_rotation @ rel) * AU_TO_KM)
                     surf_r = ground_radius / AU_TO_KM
                     min_alt = LAND_ALT_AU / max(ground_cosine, 1e-4)
                     alt = max(min_alt, r_ap - surf_r)
@@ -3741,7 +3779,7 @@ class App(InputHandlerMixin):
             rot_follow = (track_r > 0.0 and cam["tracking_mode"] == "body" and
                           cam["tracking_idx"] is not None and not cam.get("tracking_is_cmp", False))
             if rot_follow:
-                alt_au = max(0.0, track_surface.clearance(rel * AU_TO_KM) / AU_TO_KM)
+                alt_au = max(0.0, track_surface.clearance((follow_rotation @ rel) * AU_TO_KM) / AU_TO_KM)
                 if alt_au < _ROT_FOLLOW_ALT_AU:
                     alt_km = alt_au * AU_TO_KM
                     if alt_km <= 50.0:
@@ -3762,9 +3800,9 @@ class App(InputHandlerMixin):
                         if prev_spin is not None:
                             d_spin = spin_angle - prev_spin
                             d_spin = (d_spin + math.pi) % (2.0 * math.pi) - math.pi
-                            if abs(d_spin) > 1e-12 and abs(d_spin) < 0.5:
+                            if abs(d_spin) > 1e-12:
                                 pole_axis = self.pole_n_arr[t_idx]
-                                R_spin = _camera_rot_axis(pole_axis, d_spin * rot_weight)
+                                R_spin = follow_rotation if rot_weight == 1.0 else _camera_rot_axis(pole_axis, d_spin * rot_weight)
                                 rel = R_spin @ rel
                                 cur_fwd = -rel / max(np.linalg.norm(rel), 1e-300) if cam["cam_look"] == "aim" else _camera_forward(cam["yaw_actual"], cam["pitch_actual"])
                                 cur_up = _camera_get_up(cam, cur_fwd)
@@ -5494,18 +5532,23 @@ class App(InputHandlerMixin):
                     terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
                     all_instances_buffer.bind_to_storage_buffer(binding=2)
 
+                    self.terrain_streamer.use(location=14)
+                    self.terrain_geometry_cache.prepare(
+                        self.terrain_patch_staging[:total_patches_rendered],
+                        all_instances, dict(active_terrain_bodies),
+                        self.terrain_streamer, patch_res)
+                    self.prog_terrain['u_geometry_cache_enabled'].value = True
+                    self.prog_terrain['u_cache_grid_resolution'].value = patch_res
+
                     ring_gradient_tex.use(location=0)
                     self.ringshine_map_tex.use(location=8)
                     self.terrain_streamer.use(location=14)
                     if 'u_camera_pos' in self.prog_terrain:
                         self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
                     if 'u_body_cam_rel_au' in self.prog_terrain:
-                        cam_world_f8 = cam_origin + rel
-                        body_cam_rel = np.zeros((8, 3), dtype=np.float32)
-                        for s_i, (t_bi, t_bname) in enumerate(active_terrain_bodies[:8]):
-                            t_bpos = pos_snap_render[t_bi]
-                            body_cam_rel[s_i] = (t_bpos - cam_world_f8).astype(np.float32)
-                        self.prog_terrain['u_body_cam_rel_au'].write(body_cam_rel.tobytes())
+                        self._upload_terrain_camera(
+                            [item[0] for item in active_terrain_bodies],
+                            pos_snap_render, cam_origin, rel)
                     if 'u_is_cloud_pass' in self.prog_terrain:
                         self.prog_terrain['u_is_cloud_pass'].value = False
                     if 'u_debug_tiles' in self.prog_terrain:
@@ -6914,11 +6957,9 @@ class App(InputHandlerMixin):
                             if 'u_camera_pos' in self.prog_terrain:
                                 self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
                             if 'u_body_cam_rel_au' in self.prog_terrain:
-                                cam_world_f8 = cam_origin + rel
-                                cloud_bpos = self.pos_snap_cmp[bi] if is_cmp else pos_snap_render[bi]
-                                cloud_cam_rel = np.zeros((8, 3), dtype=np.float32)
-                                cloud_cam_rel[0] = (cloud_bpos - cam_world_f8).astype(np.float32)
-                                self.prog_terrain['u_body_cam_rel_au'].write(cloud_cam_rel.tobytes())
+                                self._upload_terrain_camera(
+                                    [num_bodies + bi if is_cmp else bi],
+                                    pos_snap_render, cam_origin, rel)
                             if 'u_debug_tiles' in self.prog_terrain:
                                 self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
                             if 'u_hdr_enabled' in self.prog_terrain:
@@ -7694,6 +7735,7 @@ class App(InputHandlerMixin):
         physics_thread.join(timeout=1.0)
         physics_thread_cmp.join(timeout=1.0)
         self.save_settings()
+        if getattr(self, 'terrain_geometry_cache', None): self.terrain_geometry_cache.release()
         if getattr(self, 'terrain_streamer', None): self.terrain_streamer.shutdown()
         if getattr(self, 'conv_tmp_tex', None): self.conv_tmp_tex.release()
         if getattr(self, 'conv_ker_fft_tex', None): self.conv_ker_fft_tex.release()

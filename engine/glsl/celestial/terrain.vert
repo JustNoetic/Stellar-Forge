@@ -48,6 +48,13 @@ uniform float u_cloud_altitude_km;
 uniform vec3 u_camera_pos;
 uniform float u_grid_step;
 uniform vec3 u_body_cam_rel_au[8];
+uniform bool u_local_camera_enabled;
+uniform vec3 u_body_camera_high_km[8];
+uniform vec3 u_body_camera_low_km[8];
+uniform bool u_geometry_cache_enabled;
+uniform int u_cache_grid_resolution;
+layout(std430, binding = 5) readonly buffer TerrainCacheSlots { int cache_slots[]; };
+layout(std430, binding = 6) readonly buffer TerrainCachedGeometry { vec4 cached_geometry[]; };
 
 #include "common/refraction.glsl"
 #include "common/procedural_terrain.glsl"
@@ -136,7 +143,15 @@ void main() {
     f_height_slot = height_active ? t_inst.u_height.x : -1.0;
     f_height_uv = height_uv;
     f_elev_span_km = height_active ? t_inst.u_hrange.y : 0.0;
-    if (height_active) {
+    int cache_slot = -1;
+    if (height_active && u_geometry_cache_enabled) cache_slot = cache_slots[gl_InstanceID];
+    vec4 cached = vec4(0.0);
+    if (cache_slot >= 0) {
+        int width = u_cache_grid_resolution + 1;
+        ivec2 ij = ivec2(round(in_position.xy * float(u_cache_grid_resolution)));
+        cached = cached_geometry[cache_slot * width * width + ij.y * width + ij.x];
+        p_local_km += normalize(p_ellip) * cached.w;
+    } else if (height_active) {
         float e = textureLod(u_tile_array, vec3(height_uv, t_inst.u_height.x), 0.0).r;
         float elev_phys = t_inst.u_hrange.x + e * t_inst.u_hrange.y;
         if (t_inst.u_hrange.x < -0.1) {
@@ -165,7 +180,9 @@ void main() {
 
     // Compute smooth geometric normal of displaced terrain at mesh vertex spacing
     vec3 n_local = n_sphere;
-    if (height_active && t_inst.u_hrange.y > 0.0) {
+    if (cache_slot >= 0) {
+        n_local = cached.xyz;
+    } else if (height_active && t_inst.u_hrange.y > 0.0) {
         float grid_step = (u_grid_step > 0.0) ? u_grid_step : (1.0 / 32.0);
         vec2 d_uv = (t_inst.u_range.zw - t_inst.u_range.xy) * grid_step;
         vec2 d_huv = vec2(grid_step * t_inst.u_height.y);
@@ -264,7 +281,19 @@ void main() {
     vec3 body_cam_rel = (body_slot >= 0 && body_slot < 8) ? u_body_cam_rel_au[body_slot] : (body_pos - u_camera_pos);
 
     // Camera-relative vertex position in AU (origin at camera eye):
-    vec3 p_cam_rel = body_cam_rel + p_world_km * u_km_to_au;
+    vec3 p_cam_rel;
+    if (u_local_camera_enabled && body_slot >= 0 && body_slot < 8) {
+        // Cancel planet-radius coordinates before spin and frame transforms.
+        // Subtract high and low separately to retain metre-scale clearance.
+        vec3 offset = (p_local_km - u_body_camera_high_km[body_slot])
+                    - u_body_camera_low_km[body_slot];
+        vec3 offset_body = vec3(offset.x * c_rot - offset.z * s_rot,
+                               offset.y, offset.x * s_rot + offset.z * c_rot);
+        p_cam_rel = (offset_body.x * tangent + offset_body.y * pole
+                   + offset_body.z * bitangent) * u_km_to_au;
+    } else {
+        p_cam_rel = body_cam_rel + p_world_km * u_km_to_au;
+    }
 
     // Apply atmospheric refraction and gravitational lensing
     bool is_refract_host = (length(body_pos - u_refract_center) < 1e-7);
