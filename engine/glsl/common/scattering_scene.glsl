@@ -37,6 +37,7 @@ layout(std430, binding = 8) buffer AtmoData {
     vec4  u_star_dir_sph_eff[4]; // xyz = sun_dir_sph_const, w = cos_sun_eff
     vec4  u_star_pos_local[4];   // xyz = sun_pos_local_km, w = effective_star_rad
     vec4  u_star_solstice[4];    // x = solstice_factor, y = sun_pole_dot, z = dist_star_au, w = star_radius_au
+    float u_active_scale_height[8]; // km, appended at byte offset 1024
 };
 
 // Scene UBO (bound globally at binding 1 by app.py): supplies the star count

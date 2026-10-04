@@ -77,7 +77,7 @@ class Probe:
         self.ubo = ctx.buffer(self.scene.tobytes())
         self.ubo.bind_to_uniform_block(1)
         # AtmoData std430 offsets mirror app.py's atmo_staging upload.
-        self.data = np.zeros(256, 'f4')
+        self.data = np.zeros(264, 'f4')
         d = self.data
         d[3] = 6471 / AU
         d[4:7] = PARAMETERS['u_beta_rayleigh']

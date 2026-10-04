@@ -22,6 +22,8 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
     vec4 u_caster_ozone[MAX_CASTERS];
+    vec4 u_caster_ozone_vert[MAX_CASTERS];
+    vec4 u_caster_grazing[MAX_CASTERS]; // xyz: grazing tau, w: inverse reference radius km
 };
 uniform vec3 u_body_offset;
 uniform vec3 u_camera_pos;

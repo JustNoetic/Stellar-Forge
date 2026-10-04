@@ -32,6 +32,8 @@ from engine.rendering.render_utils import (
     generate_ring_shadow_grad
 )
 from engine.rendering.planetshine import get_cached_atmosphere_properties
+from engine.rendering.surface_materials import resolve_material, material_albedos
+from engine.ui.surface_material_editor import render_surface_material_editor
 from engine.rendering.texture_baker import bake_and_export_ring_textures, apply_procedural_ring_to_body
 from engine.rendering.ring_generator import RING_PRESETS
 from engine.rendering.texture_manager import render_texture_management_ui
@@ -90,6 +92,9 @@ def compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo
 
     atmo_bodies_list = app.atmo_bodies_cmp if insp_is_cmp else atmo_bodies
     atmo_item = next((a for a in atmo_bodies_list if a.get('body_idx') == insp_idx), None)
+
+    if not atmo_item and resolve_material(body_info)['model'] == 'hapke':
+        return material_albedos(body_info,p_surf)
 
     if atmo_item:
         mass_snap_buf = app.mass_snap_cmp if insp_is_cmp else cur_mass_snap
@@ -185,6 +190,10 @@ def _save_system_cosmetics(app, bodies_data, visual_arr, atmo_bodies, ring_preco
                 hex_col = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
                 s_body["color"] = hex_col
                 bodies_data[b_idx]["color"] = hex_col
+                if 'material' in bodies_data[b_idx]:
+                    s_body['material'] = copy.deepcopy(bodies_data[b_idx]['material'])
+                else:
+                    s_body.pop('material',None)
 
                 for tex_prop in ("texture", "clouds", "specular", "normal"):
                     if tex_prop in bodies_data[b_idx] and bodies_data[b_idx][tex_prop]:
@@ -1683,6 +1692,10 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
             imgui.separator()
 
 
+            if obj_type != 'Star':
+                render_surface_material_editor(body_info)
+                imgui.separator()
+
             # Convert linear albedo to sRGB for the color picker
             if insp_is_cmp:
                 srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in app.visual_arr_cmp[insp_idx, 0:3]]
@@ -1726,6 +1739,8 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 if imgui.button(f"Export {body_info['name']} to JSON (exports/)##exp_single", width=-1):
                     def fmt(val, dec=5): return round(float(val), dec)
                     exp = {"name": body_info['name']}
+                    if 'material' in body_info:
+                        exp['material'] = copy.deepcopy(body_info['material'])
                     c = visual_arr[insp_idx, 0:3]
                     exp["color"] = '#%02x%02x%02x' % (min(255, max(0, int(c[0]*255))), min(255, max(0, int(c[1]*255))), min(255, max(0, int(c[2]*255))))
                     for tex_prop in ("texture", "clouds", "specular", "normal"):

@@ -1,6 +1,7 @@
 import math
 import numpy as np
 from numba import njit
+from engine.rendering.surface_materials import disk_response
 from engine.core.constants import SOLAR_RADIUS_KM
 from engine.core.math_utils import pole_to_ecliptic
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, compute_mie_coefficients
@@ -329,7 +330,8 @@ def ring_phase_radiance(mu_v, sun_elevation, alpha, cos_theta, asymmetry,
 def compute_planetshine_numba(
     pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled,
     ring_params=None, ring_normals=None, ring_colors=None,
-    planetshine_enabled=True, ringshine_enabled=True, ring_scattering=None
+    planetshine_enabled=True, ringshine_enabled=True, ring_scattering=None,
+    surface_materials=None, surface_phases=None
 ):
     N = len(pos)
     num_stars = len(star_positions)
@@ -525,6 +527,15 @@ def compute_planetshine_numba(
                         a_eff = math.acos(cos_a_eff)
                         phase = (math.sin(a_eff) + (math.pi - a_eff) * cos_a_eff) / math.pi
                     
+                    if surface_materials is not None and surface_phases is not None:
+                        if surface_materials[j,0] > 0.5 and cos_a > mu_cutoff:
+                            # Preserve the existing finite-distance cap mapping.
+                            star_distance = math.sqrt((star_positions[s,0]-pos_j[0])**2
+                                +(star_positions[s,1]-pos_j[1])**2+(star_positions[s,2]-pos_j[2])**2)
+                            angular_radius = math.asin(min(0.84, star_radii[s]/max(star_distance,1e-6)))
+                            phase = disk_response(surface_phases[j],cos_a_eff,angular_radius)/(2.0/3.0)
+                        elif surface_materials[j,0] < 0.5:
+                            phase *= surface_materials[j,7]
                     light_r = star_colors[s, 0] * phase * j_lit[j, s]
                     light_g = star_colors[s, 1] * phase * j_lit[j, s]
                     light_b = star_colors[s, 2] * phase * j_lit[j, s]

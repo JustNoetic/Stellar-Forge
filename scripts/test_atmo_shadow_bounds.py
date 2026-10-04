@@ -138,6 +138,31 @@ def check_penumbra(ctx, shader):
     print('Projected ring bounds: growing penumbra, empty hole, and behind-light rejection passed')
 
 
+
+def check_caster_parameters(ctx, shader):
+    # A small distant caster cannot obscure these camera-facing parcels.
+    # Its thickness is km, not AU, and is never an opaque-body radius.
+    probe = Probe(ctx, specialize_atmosphere(shader, 2, False), (32, 32), steps=32)
+    camera, target, sun = (0, 0, 8500), (0, 0, 6371), (1, 0, 0)
+    probe.configure(camera, target, sun, ring=False)
+    probe.draw()
+    unshadowed = probe.read()
+    assert np.max(unshadowed[0, :, :, :3]) > 0.0
+    probe.data.view('i4')[28] = 1
+    probe.data[36:40] = np.asarray([300000, 0, 0, 1000]) / 149597870.7
+    probe.data[68:72] = [0, 1, 0, 1]
+    probe.data[100] = 1000 / 149597870.7
+    probe.data[108:112] = [10, 10, 10, 100]  # grazing tau + thickness km
+    probe.data[140] = 0.02
+    probe.data[256] = 8.5  # independent atmospheric scale height km
+    probe.inst.view('u4')[12] = 1
+    probe.configure(camera, target, sun, ring=False)
+    probe.draw()
+    np.testing.assert_allclose(probe.read(), unshadowed, atol=1e-6, rtol=0)
+    probe.release()
+    print('Mode 2 caster: km thickness does not inflate the opaque shadow radius')
+
+
 def check_rendering(ctx, shader):
     # Compile with the actual vertex shader for both production output layouts.
     for fragment in (shader, shader.replace('layout(location = 0, index = 1)', 'layout(location = 1)')):
@@ -232,6 +257,7 @@ def main():
     print(ctx.info['GL_RENDERER'])
     check_intervals(ctx, shader)
     check_penumbra(ctx, shader)
+    check_caster_parameters(ctx, shader)
     check_budgets(ctx, shader)
     check_rendering(ctx, shader)
     check_specializations(ctx, shader)

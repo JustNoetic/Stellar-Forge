@@ -112,6 +112,7 @@ layout(std430, binding = 8) buffer AtmoData {
     vec4  u_star_dir_sph_eff[4];
     vec4  u_star_pos_local[4];
     vec4  u_star_solstice[4];
+    float u_active_scale_height[8]; // km, appended at byte offset 1024
 };
 
 uniform sampler2D u_ring_gradients;
@@ -163,48 +164,7 @@ vec3 get_transmittance_precomputed(float v_norm, float sun_cos_zenith) {
     return textureLod(u_transmittance_lut, lut_uv, 0.0).rgb;
 }
 
-vec3 casterShadowTerm(float alpha, float beta, float gamma,
-                      float penumbra_outer, float penumbra_inner,
-                      float max_bend, vec4 atmo_param, vec4 ozone_param,
-                      float scale_height_km, float dist_to_caster) {
-    float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
-    float occ = clamp(max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma), 0.0, 1.0);
-    float geom_sh = pow(clamp(1.0 - occ, 0.0, 1.0), 1.0 / 1.6);
-    vec3 sh = vec3(geom_sh);
-
-    if (max_bend > 1e-6 && gamma < penumbra_outer) {
-        float H_scale = max(scale_height_km, 0.1);
-        float sigma_z = max(0.707 * H_scale, 0.1);
-        float z_peak = ozone_param.w;
-        float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
-
-        float caster_r_km = max(beta * dist_km, 100.0);
-
-        float req_bend = beta - gamma - alpha * 0.8;
-        if (req_bend <= max_bend) {
-            float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
-            float z_km = -H_scale * log(max(atmo_depth, 1e-5));
-            vec3 tau_R = atmo_param.xyz * atmo_depth;
-            float z_diff = (z_km - z_peak) / sigma_z;
-            vec3 tau_O3 = ozone_param.xyz * exp(-0.5 * z_diff * z_diff);
-            vec3 tau_total = tau_R + tau_O3;
-            vec3 atmo_transmittance = exp(-tau_total);
-            float radial_defocus = 1.0 / (1.0 + (dist_km * max(req_bend, 1e-6)) / H_scale);
-
-            float f_focal_km = caster_r_km / max(max_bend, 1e-6);
-            float focal_ratio = clamp(dist_km / f_focal_km, 0.0, 1.0);
-            float off_axis_factor = clamp(alpha / max(1e-6, gamma), 0.0, 1.0);
-
-            float annular_factor = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
-            float ring_intensity = clamp(annular_factor * focal_ratio * off_axis_factor, 0.0, 1.0) * radial_defocus;
-            float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
-            float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
-            float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-            sh += atmo_transmittance * refraction_intensity * atmo_blend;
-        }
-    }
-    return clamp(sh, vec3(0.0), vec3(1.0));
-}
+#include "common/eclipse_shadow.glsl"
 
 float map_t_to_s(float t, float s_start, float s_end, float s_min, float p) {
     float L = s_end - s_start;
@@ -456,16 +416,14 @@ void main() {
                 if (t_proj_mid <= 0.0) continue;
                 float perp_sq_mid = qa * s_mid_valid * s_mid_valid + qb * s_mid_valid + qc;
                 float dist_to_caster_mid = sqrt(max(0.0, perp_sq_mid) + t_proj_mid * t_proj_mid);
-                float inv_dist = 1.0 / max(dist_to_caster_mid, 1e-6);
-                float beta = eff_r_km * inv_dist;
-                float po = alpha_star + beta;
-                float pi = abs(beta - alpha_star);
-                float r_penumbra_sq = po * po * dist_to_caster_mid * dist_to_caster_mid;
-                float occ_mult = min(1.0, (beta * beta) / max(1e-9, alpha_star * alpha_star));
-                c_p0[opt_caster_count] = vec4(qa, qb, qc, r_penumbra_sq);
-                c_p1[opt_caster_count] = vec4(inv_dist, po, pi, occ_mult);
-                c_p2[opt_caster_count] = vec4(alpha_star, beta, u_active_max_bend[c], dist_to_caster_mid / u_au_to_km);
-                c_p3[opt_caster_count] = u_active_caster_atmos[c];
+                float footprint_km = alpha_star * dist_to_caster_mid;
+                float outer_km = eff_r_km + footprint_km;
+                c_p0[opt_caster_count] = vec4(qa, qb, qc, outer_km * outer_km);
+                c_p1[opt_caster_count] = vec4(footprint_km, eff_r_km,
+                    u_active_scale_height[c], dist_to_caster_mid);
+                c_p2[opt_caster_count] = vec4(0.0, 0.0, u_active_max_bend[c], 0.0);
+                c_p3[opt_caster_count] = vec4(u_active_caster_atmos[c].xyz,
+                    1.0 / max(caster_r_km, 100.0));
                 c_p4[opt_caster_count] = vec2(s_valid_min, s_valid_max);
                 c_p5[opt_caster_count] = u_active_caster_ozone[c];
                 opt_caster_count++;
@@ -567,9 +525,9 @@ void main() {
                         float perp_sq = p0.x * current_s * current_s + p0.y * current_s + p0.z;
                         if (perp_sq < p0.w) {
                             vec4 p1 = c_p1[c];
-                            float gamma = sqrt(max(0.0, perp_sq)) * p1.x;
+                            float perpendicular_km = sqrt(max(0.0, perp_sq));
                             vec4 p2 = c_p2[c];
-                            vec3 sh = casterShadowTerm(p2.x, p2.y, gamma, p1.y, p1.z, p2.z, c_p3[c], c_p5[c], c_p3[c].w, p2.w);
+                            vec3 sh = casterShadowTerm(p1.x, p1.y, perpendicular_km, p2.z, c_p3[c], c_p5[c], p1.z, p1.w, 1.0);
                             sample_shadow *= sh;
                         }
                     }

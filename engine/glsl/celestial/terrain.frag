@@ -20,6 +20,7 @@ flat in float f_radius_km;
 
 flat in uvec2 f_caster_mask;
 flat in uint f_ring_mask;
+flat in uint f_surface_body_idx;
 flat in vec3 f_planetshine_dir;
 flat in vec3 f_planetshine_color;
 flat in vec3 f_body_center;
@@ -49,6 +50,7 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_atmos[MAX_CASTERS];
     vec4 u_caster_ozone[MAX_CASTERS];
     vec4 u_caster_ozone_vert[MAX_CASTERS];
+    vec4 u_caster_grazing[MAX_CASTERS]; // xyz: grazing tau, w: inverse reference radius km
 };
 
 uniform sampler2DArray u_tile_array;
@@ -93,50 +95,8 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
     return perp_len / denom;
 }
 
-vec3 casterShadowTerm(float alpha, float beta, float gamma,
-                      float penumbra_outer, float penumbra_inner,
-                      float max_bend, vec4 atmo_param, vec4 ozone_param,
-                      float scale_height_km, float dist_to_caster) {
-    float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
-    float occ = clamp(max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma), 0.0, 1.0);
-    float geom_sh = pow(clamp(1.0 - occ, 0.0, 1.0), 1.0 / 1.6);
-    vec3 sh = vec3(geom_sh);
-
-    if (max_bend > 1e-6 && gamma < penumbra_outer) {
-        float H_scale = max(scale_height_km, 0.1);
-        float sigma_z = max(0.707 * H_scale, 0.1);
-        float z_peak = ozone_param.w;
-        float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
-
-        float caster_r_km = max(beta * dist_km, 100.0);
-        float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
-        vec3 tau_grazing_0 = atmo_param.xyz * grazing_factor;
-
-        float req_bend = beta - gamma - alpha * 0.8;
-
-        if (req_bend <= max_bend) {
-            float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
-            float z_km = -H_scale * log(max(atmo_depth, 1e-5));
-            vec3 tau_R = tau_grazing_0 * atmo_depth;
-            float z_diff = (z_km - z_peak) / sigma_z;
-            vec3 tau_O3 = ozone_param.xyz * exp(-0.5 * z_diff * z_diff);
-            vec3 tau_total = tau_R + tau_O3;
-            vec3 atmo_transmittance = exp(-tau_total);
-
-            float radial_defocus = 1.0 / (1.0 + (dist_km * max(req_bend, 1e-6)) / H_scale);
-            float f_focal_km = caster_r_km / max(max_bend, 1e-6);
-            float focal_ratio = clamp(dist_km / f_focal_km, 0.0, 1.0);
-            float off_axis_factor = clamp(alpha / max(1e-6, gamma), 0.0, 1.0);
-            float annular_factor = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
-            float ring_intensity = clamp(annular_factor * focal_ratio * off_axis_factor, 0.0, 1.0) * radial_defocus;
-            float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
-            float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
-            float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-            sh += atmo_transmittance * refraction_intensity * atmo_blend;
-        }
-    }
-    return clamp(sh, vec3(0.0), vec3(1.0));
-}
+#include "common/eclipse_shadow.glsl"
+#include "common/surface_material.glsl"
 
 // Adaptive B-spline bicubic filter for magnified tiles:
 // Eliminates texel blockiness, bilinear creases, and stair-stepped diamond edges.
@@ -334,13 +294,9 @@ void main() {
                 float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
                 if (perp_sq > r_penumbra * r_penumbra) continue;
 
-                float inv_dist = 1.0 / dist_to_caster;
-                float alpha = local_star_radius_over_dist;
-                float beta = caster_r * inv_dist;
-                float gamma = sqrt(perp_sq) * inv_dist;
-                float penumbra_outer = alpha + beta;
-                float penumbra_inner = abs(beta - alpha);
-                shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j], u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster);
+                shadow *= casterShadowTerm(local_star_radius_over_dist * dist_to_caster,
+                    caster_r, sqrt(perp_sq), u_caster_max_bend[j], u_caster_grazing[j],
+                    u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster, u_au_to_km);
             }
 
             if (s == 0) {
@@ -476,6 +432,7 @@ void main() {
     // =========================================================================
     // Decode sRGB to Linear
     vec3 albedo = pow(tex_sample.rgb, vec3(2.2));
+    SurfaceMaterial material = u_surface_materials[f_surface_body_idx];
 
     // Accumulate direct illumination from all stars in SceneData
     vec3 total_diffuse = vec3(0.0);
@@ -584,13 +541,9 @@ void main() {
             float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
             if (perp_sq > r_penumbra * r_penumbra) continue;
 
-            float inv_dist = 1.0 / dist_to_caster;
-            float alpha = local_star_radius_over_dist;
-            float beta = caster_r * inv_dist;
-            float gamma = sqrt(perp_sq) * inv_dist;
-            float penumbra_outer = alpha + beta;
-            float penumbra_inner = abs(beta - alpha);
-            shadow *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j], u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster);
+            shadow *= casterShadowTerm(local_star_radius_over_dist * dist_to_caster,
+                caster_r, sqrt(perp_sq), u_caster_max_bend[j], u_caster_grazing[j],
+                u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster, u_au_to_km);
         }
 
         if (s == 0) {
@@ -603,14 +556,17 @@ void main() {
                 dist_to_star, star_ang_radius, f_ring_mask);
         }
 
-        total_diffuse += star_color * incoming_light_tint * (diffuse * falloff) * shadow;
+        float response = surface_direct_response(N,V,L,sin_alpha,diffuse,material);
+        total_diffuse += star_color * falloff * shadow * (direct_light_tint*response
+            + diffuse_light_tint*diffuse*material.surface.w);
     }
 
     // === Moonshine / Planetshine ===
     vec3 bounce_light = vec3(0.0);
     if (dot(f_planetshine_color, f_planetshine_color) > 1e-12) {
         float NdotC = max(0.0, dot(N, f_planetshine_dir));
-        bounce_light = f_planetshine_color * NdotC * primary_caster_shadow;
+        float response = surface_direct_response(N,V,f_planetshine_dir,0.0,NdotC,material);
+        bounce_light = f_planetshine_color * response * primary_caster_shadow;
     }
 
     // === Ringshine ===

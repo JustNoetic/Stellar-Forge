@@ -53,7 +53,7 @@ class TerrainCacheTest(unittest.TestCase):
         self.shapes[:, 25] = [0.2, -0.7]
         self.bodies = self.keep(self.ctx.buffer(self.shapes.tobytes()))
         self.bodies.bind_to_storage_buffer(2)
-        self.scene = np.zeros(1832, dtype='f4')
+        self.scene = np.zeros(2088, dtype='f4')
         self.scene[:16] = np.eye(4, dtype='f4').ravel()
         self.scene[16:32] = np.eye(4, dtype='f4').ravel()
         self.scene[292:294] = [1e5, 1e11]

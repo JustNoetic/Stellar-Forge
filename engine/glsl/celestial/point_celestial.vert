@@ -48,6 +48,8 @@ flat out float f_half_size_px;
 flat out vec3 f_surface_color;
 
 #define PI 3.14159265358979323846
+#include "common/surface_material.glsl"
+#include "common/surface_phase.glsl"
 
 float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_vec) {
     if (r_minor < 1e-6 || r_eq < 1e-6) return r_eq;
@@ -208,10 +210,20 @@ void main() {
         float phase_angle = acos(phase_cos);
         float phase_func = max(0.0, (phase_sin + (PI - phase_angle) * phase_cos) / PI);
 
+        SurfaceMaterial material = u_surface_materials[inst_idx];
+        bool hapke = material.grain.x > 0.5;
+        if (hapke) {
+            float stellar_radius = asin(clamp(u_stars_pos_radius[0].w/max(dist_star,1e-6),0.0,0.84));
+            phase_func = surface_disk_response(phase_cos,stellar_radius,material);
+        } else {
+            phase_func *= material.surface.w;
+        }
         float star_irradiance = star_lum / max(dist_star * dist_star, 1e-6);
 
         // Geometric albedo: use true Top-Of-Atmosphere (TOA) color if body has an atmosphere
-        vec3 albedo = in_color;
+        // Hapke textures use the same cached linear mean as planetshine.
+        vec3 albedo = hapke ? vec3(instances[inst_idx*7+4].w,
+            instances[inst_idx*7+5].w,instances[inst_idx*7+6].w) : in_color;
         for (int j = 0; j < u_num_casters; j++) {
             // Positions are bit-identical copies from the same CPU buffer, so a
             // tight epsilon suffices (1e-4 AU would misclassify close-in moons).

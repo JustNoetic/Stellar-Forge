@@ -107,6 +107,7 @@ layout(std430, binding = 8) buffer AtmoData {
     vec4  u_star_dir_sph_eff[4]; // xyz = sun_dir_sph_const, w = cos_sun_eff
     vec4  u_star_pos_local[4];   // xyz = sun_pos_local_km, w = effective_star_rad
     vec4  u_star_solstice[4];    // x = solstice_factor, y = sun_pole_dot, z = dist_star_au, w = star_radius_au
+    float u_active_scale_height[8]; // km, appended at byte offset 1024
 };
 
 uniform sampler2D u_ring_gradients;
@@ -438,7 +439,7 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
             for (int c = 0; c < u_num_active_casters && c < 4; c++) {
                 vec3 pos = u_active_casters[c].xyz;
                 float base_rad_au = u_active_casters[c].w;
-                float atmo_au = u_active_caster_atmos[c].w;
+                float atmo_km = u_active_caster_atmos[c].w;
                 float caster_r_minor_au = u_active_caster_R_minor[c];
                 vec3 pole = u_active_caster_poles_obl[c].xyz;
 
@@ -461,7 +462,6 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
                     r_au = get_oblate_radius(base_rad_au, caster_r_minor_au, pole, L_mid, perp_mid_km);
                 }
                 float r_km = r_au * u_au_to_km;
-                float atmo_km = atmo_au * u_au_to_km;
                 float eff_r_km = r_km + (atmo_km > 0.0 ? atmo_km * 4.0 : 0.0);
 
                 float directional_star_r_au = star_radius;
@@ -1397,7 +1397,7 @@ void main() {
                     for (int c = 0; c < u_num_active_casters && opt_caster_count < 4; c++) {
                         vec3 pos = u_active_casters[c].xyz;
                         float base_rad_au = u_active_casters[c].w;
-                        float atmo_au = u_active_caster_atmos[c].w;
+                        float atmo_km = u_active_caster_atmos[c].w;
                         float caster_r_minor_au = u_active_caster_R_minor[c];
                         vec3 pole = u_active_caster_poles_obl[c].xyz;
 
@@ -1420,7 +1420,6 @@ void main() {
                             r_au = get_oblate_radius(base_rad_au, caster_r_minor_au, pole, L_mid, perp_mid_km);
                         }
                         float r_km = r_au * u_au_to_km;
-                        float atmo_km = atmo_au * u_au_to_km;
                         float eff_r_km = r_km + (atmo_km > 0.0 ? atmo_km * 4.0 : 0.0);
 
                         float directional_star_r_au = star_radius;
@@ -1458,19 +1457,15 @@ void main() {
 
                         float perp_sq_mid = qa * s_mid_valid * s_mid_valid + qb * s_mid_valid + qc;
                         float dist_to_caster_mid = sqrt(max(0.0, perp_sq_mid) + t_proj_mid * t_proj_mid);
-                        float inv_dist = 1.0 / max(dist_to_caster_mid, 1e-6);
+                        float footprint_km = alpha_star * dist_to_caster_mid;
+                        float outer_km = r_km + footprint_km;
 
-                        float beta = eff_r_km * inv_dist;
-                        float po = alpha_star + beta;
-                        float pi = abs(beta - alpha_star);
-
-                        float r_penumbra_sq = po * po * dist_to_caster_mid * dist_to_caster_mid;
-                        float occ_mult = min(1.0, (beta * beta) / max(1e-9, alpha_star * alpha_star));
-
-                        c_p0[opt_caster_count] = vec4(qa, qb, qc, r_penumbra_sq);
-                        c_p1[opt_caster_count] = vec4(inv_dist, po, pi, occ_mult);
-                        c_p2[opt_caster_count] = vec4(alpha_star, beta, u_active_max_bend[c], dist_to_caster_mid / u_au_to_km);
-                        c_p3[opt_caster_count] = u_active_caster_atmos[c];
+                        c_p0[opt_caster_count] = vec4(qa, qb, qc, outer_km * outer_km);
+                        c_p1[opt_caster_count] = vec4(footprint_km, r_km,
+                            u_active_scale_height[c], dist_to_caster_mid);
+                        c_p2[opt_caster_count] = vec4(0.0, 0.0, u_active_max_bend[c], 0.0);
+                        c_p3[opt_caster_count] = vec4(u_active_caster_atmos[c].xyz,
+                            1.0 / max(base_rad_au * u_au_to_km, 100.0));
                         c_p4[opt_caster_count] = vec2(s_valid_min, s_valid_max);
                         c_p5[opt_caster_count] = u_active_caster_ozone[c];
 
@@ -1588,10 +1583,10 @@ void main() {
                             float perp_sq = p0.x * current_s * current_s + p0.y * current_s + p0.z;
                             if (perp_sq < p0.w) {
                                 vec4 p1 = c_p1[c];
-                                float gamma = sqrt(max(0.0, perp_sq)) * p1.x;
+                                float perpendicular_km = sqrt(max(0.0, perp_sq));
                                 vec4 p2 = c_p2[c];
 
-                                vec3 sh = casterShadowTerm(p2.x, p2.y, gamma, p1.y, p1.z, p2.z, c_p3[c], c_p5[c], c_p3[c].w, p2.w);
+                                vec3 sh = casterShadowTerm(p1.x, p1.y, perpendicular_km, p2.z, c_p3[c], c_p5[c], p1.z, p1.w, 1.0);
                                 sample_shadow *= sh;
                             }
                         }

@@ -23,6 +23,7 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_atmos[MAX_CASTERS];
     vec4 u_caster_ozone[MAX_CASTERS];
     vec4 u_caster_ozone_vert[MAX_CASTERS];
+    vec4 u_caster_grazing[MAX_CASTERS]; // xyz: grazing tau, w: inverse reference radius km
 };
 
 layout(std430, binding = 2) readonly buffer AllInstances {
@@ -80,6 +81,7 @@ flat out float f_radius_km;
 
 flat out uvec2 f_caster_mask;
 flat out uint f_ring_mask;
+flat out uint f_surface_body_idx;
 flat out vec3 f_planetshine_dir;
 flat out vec3 f_planetshine_color;
 flat out vec3 f_body_center;
@@ -109,6 +111,7 @@ void main() {
 
     // Unpack instance information for this body from AllInstances
     uint inst_idx = uint(max(0.0, t_inst.u_meta.w + 0.5));
+    f_surface_body_idx = inst_idx;
     vec4 f0 = instances[inst_idx * 7 + 0];
     vec4 f1 = instances[inst_idx * 7 + 1];
     vec4 f2 = instances[inst_idx * 7 + 2];

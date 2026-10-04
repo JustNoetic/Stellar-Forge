@@ -25,12 +25,15 @@ layout(std140, binding = 1) uniform SceneData {
     vec4 u_caster_colors[MAX_CASTERS];
     vec4 u_caster_atmos[MAX_CASTERS];
     vec4 u_caster_ozone[MAX_CASTERS];
+    vec4 u_caster_ozone_vert[MAX_CASTERS];
+    vec4 u_caster_grazing[MAX_CASTERS]; // xyz: grazing tau, w: inverse reference radius km
 };
 
 uniform vec3 u_host_planet_pos;
 uniform float u_host_planet_radius;
 uniform vec3 u_host_planet_color;
-uniform vec4 u_host_planet_atmo;
+uniform vec4 u_host_planet_atmo; // xyz: vertical tau, w: thickness km
+uniform vec4 u_host_planet_shadow; // xyz: grazing tau, w: scale height km
 uniform vec4 u_host_planet_ozone;
 uniform float u_host_planet_refractivity;  // surface (n_mix - 1) for eclipse refraction
 uniform float u_host_planet_max_bend;      // precomputed host planet max bend
@@ -204,84 +207,7 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
 }
 
 // Shared analytical eclipse penumbra + physical atmospheric lens optics & Danjon refraction tinting.
-vec3 casterShadowTerm(float alpha, float beta, float gamma,
-                      float penumbra_outer, float penumbra_inner,
-                      float max_bend, vec4 atmo_param, vec4 ozone_param,
-                      float scale_height_km, float dist_to_caster) {
-    float max_occ = min(1.0, (beta * beta) / max(1e-9, alpha * alpha));
-    float occ = clamp(max_occ * smoothstep(penumbra_outer, penumbra_inner, gamma), 0.0, 1.0);
-    // Correct geometric shadow curve: (1 - occ)^GAMMA (Space Engine gamma correction: 1 / 1.6)
-    float geom_sh = pow(clamp(1.0 - occ, 0.0, 1.0), 1.0 / 1.6);
-    vec3 sh = vec3(geom_sh);
-
-    if (max_bend > 1e-6 && gamma < penumbra_outer) {
-        float H_scale = max(scale_height_km, 0.1);
-        float sigma_z = max(0.707 * H_scale, 0.1);
-        float z_peak = ozone_param.w;
-        float dist_km = max(dist_to_caster * u_au_to_km, 1e-6);
-
-        // Direct sunlight grazing the planetary limb in the inner penumbra passes
-        // through the stratosphere and ozone layer before reaching the vacuum.
-        float caster_r_km = max(beta * dist_km, 100.0);
-        float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
-        vec3 tau_grazing_0 = atmo_param.xyz * grazing_factor;
-
-
-        // For an extended light source (like the Sun), the transmitted light is dominated
-        // by the rays passing through the highest possible altitude (least required bend).
-        // We approximate the integral over the Sun's disk by evaluating the ray from the 
-        // upper limb (offset by ~80% of the Sun's radius).
-        float req_bend = beta - gamma - alpha * 0.8;
-
-        // Rays requiring bend > max_bend hit the solid planet body (100% blocked)
-        if (req_bend <= max_bend) {
-            // Normalized penetration depth in atmosphere (0 = top of atmosphere, 1 = surface level)
-            float atmo_depth = clamp(max(0.0, req_bend) / max_bend, 0.0, 1.0);
-
-            // Grazing altitude z corresponding to this refraction bend angle:
-            // theta(z) = max_bend * exp(-z / H) -> atmo_depth = exp(-z / H)
-            float z_km = -H_scale * log(max(atmo_depth, 1e-5));
-
-            // 1. Rayleigh grazing optical depth at altitude z
-            vec3 tau_R = tau_grazing_0 * atmo_depth;
-
-            // 2. Stratospheric ozone layer absorption along grazing ray (Chappuis band)
-            float z_diff = (z_km - z_peak) / sigma_z;
-            vec3 tau_O3 = ozone_param.xyz * exp(-0.5 * z_diff * z_diff);
-
-            // Total optical depth and physical spectral transmittance
-            vec3 tau_total = tau_R + tau_O3;
-            vec3 atmo_transmittance = exp(-tau_total);
-
-            // Physical Atmospheric Ring Geometric Dilution with Radial Astigmatic Defocusing:
-            // Tangential divergence scales as 1/D around the ring. Radial divergence across the
-            // exponential atmosphere density gradient (d_theta/dz = -theta/H) dilutes flux by
-            // 1 / (1 + D * theta / H), giving true 3D 1/D^2 energy conservation at large distances.
-            float radial_defocus = 1.0 / (1.0 + (dist_km * max(req_bend, 1e-6)) / H_scale);
-
-            // Annular lens focusing requires rays from opposite limbs to reach the focal line (D >= f_focal = R / max_bend).
-            // In the near field (D < f_focal, e.g. a planet's own rings), rays have not converged.
-            float f_focal_km = caster_r_km / max(max_bend, 1e-6);
-            float focal_ratio = clamp(dist_km / f_focal_km, 0.0, 1.0);
-
-            // Full annular Einstein ring is only visible on-axis (gamma <= alpha). Off-axis observers
-            // (gamma > alpha, such as planetary rings) only see a local limb arc subtending fraction alpha / gamma.
-            float off_axis_factor = clamp(alpha / max(1e-6, gamma), 0.0, 1.0);
-
-            float annular_factor = (2.0 * H_scale) / max(alpha * dist_km, 1e-9);
-            float ring_intensity = clamp(annular_factor * focal_ratio * off_axis_factor, 0.0, 1.0) * radial_defocus;
-            
-            // Smooth surface grazing fade to zero at solid body boundary (h = 0, atmo_depth = 1)
-            float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
-            
-            float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
-
-            float atmo_blend = smoothstep(penumbra_outer, penumbra_inner, gamma);
-            sh += atmo_transmittance * refraction_intensity * atmo_blend;
-        }
-    }
-    return clamp(sh, vec3(0.0), vec3(1.0));
-}
+#include "common/eclipse_shadow.glsl"
 
 void main() {
     if (f_clip_z <= 0.0) discard;
@@ -607,7 +533,7 @@ void main() {
             float perp_sq = max(0.0, dist_sq - t_proj * t_proj);
 
             // Bounding cone early out using maximum equatorial radius
-            float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
+            float max_effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * (4.0 / u_au_to_km) : 0.0);
             float max_r_penumbra = max_effective_r + dist_to_caster * star_radius_over_dist;
             if (perp_sq > max_r_penumbra * max_r_penumbra) continue;
 
@@ -626,17 +552,13 @@ void main() {
             }
             float local_star_radius_over_dist = directional_star_r / dist_to_star;
 
-            float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * 4.0 : 0.0);
+            float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * (4.0 / u_au_to_km) : 0.0);
             float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
             if (perp_sq > r_penumbra * r_penumbra) continue;
 
-            float inv_dist = 1.0 / dist_to_caster;
-            float alpha = local_star_radius_over_dist;
-            float beta = caster_r * inv_dist;
-            float gamma = sqrt(perp_sq) * inv_dist;
-            float penumbra_outer = alpha + beta;
-            float penumbra_inner = abs(beta - alpha);
-            shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, u_caster_max_bend[j], u_caster_atmos[j], u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster);
+            shadow_s *= casterShadowTerm(local_star_radius_over_dist * dist_to_caster,
+                caster_r, sqrt(perp_sq), u_caster_max_bend[j], u_caster_grazing[j],
+                u_caster_ozone[j], u_caster_colors[j].w, dist_to_caster, u_au_to_km);
         }
 
         if (u_host_planet_radius > 0.0) {
@@ -654,7 +576,7 @@ void main() {
                 float host_r_minor = u_host_planet_R_minor;
 
                 // Bounding cone early out using maximum equatorial radius
-                float max_effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
+                float max_effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * (4.0 / u_au_to_km) : 0.0);
                 float max_r_penumbra = max_effective_r + dist_to_host * star_radius_over_dist;
 
                 if (perp_sq <= max_r_penumbra * max_r_penumbra) {
@@ -672,22 +594,18 @@ void main() {
                     }
                     float local_star_radius_over_dist = directional_star_r / dist_to_star;
 
-                    float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
+                    float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * (4.0 / u_au_to_km) : 0.0);
                     float r_penumbra = effective_r + dist_to_host * local_star_radius_over_dist;
 
                     if (perp_sq <= r_penumbra * r_penumbra) {
-                        float inv_dist = 1.0 / dist_to_host;
-                        float alpha = local_star_radius_over_dist;
-                        float beta = host_r * inv_dist;
-                        float gamma = sqrt(perp_sq) * inv_dist;
-                        float penumbra_outer = alpha + beta;
-                        float penumbra_inner = abs(beta - alpha);
                         float max_bend = u_host_planet_max_bend > 0.0
                             ? u_host_planet_max_bend
                             : (host_atmo_h > 0.0
-                                ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.10)
+                                ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r * u_au_to_km / max(1e-6, u_host_planet_shadow.w * 2.0)), 0.001, 0.10)
                                 : 0.0);
-                        shadow_s *= casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, max_bend, u_host_planet_atmo, u_host_planet_ozone, u_host_planet_atmo.w, dist_to_host);
+                        shadow_s *= casterShadowTerm(local_star_radius_over_dist * dist_to_host, host_r, sqrt(perp_sq),
+                            max_bend, vec4(u_host_planet_shadow.xyz, 1.0 / max(u_host_planet_radius * u_au_to_km, 100.0)),
+                            u_host_planet_ozone, u_host_planet_shadow.w, dist_to_host, u_au_to_km);
                     }
                 }
             }
@@ -787,7 +705,7 @@ void main() {
                     float host_atmo_h = u_host_planet_atmo.w;
                     float host_r_minor = u_host_planet_R_minor;
 
-                    float max_effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
+                    float max_effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * (4.0 / u_au_to_km) : 0.0);
                     float max_r_penumbra = max_effective_r + dist_host * star_radius_over_dist;
                     if (perp_sq <= max_r_penumbra * max_r_penumbra) {
                         vec3 perp_vec = frag_to_host - t_proj * L_host;
@@ -800,21 +718,17 @@ void main() {
                             directional_star_r = get_oblate_radius(star_radius, star_r_minor, u_stars_poles_obl[s].xyz, L_host, perp_vec);
                         }
                         float local_star_radius_over_dist = directional_star_r / max(dist_host_star, 1e-6);
-                        float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * 4.0 : 0.0);
+                        float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * (4.0 / u_au_to_km) : 0.0);
                         float r_penumbra = effective_r + dist_host * local_star_radius_over_dist;
                         if (perp_sq <= r_penumbra * r_penumbra) {
-                            float inv_dist = 1.0 / dist_host;
-                            float alpha = local_star_radius_over_dist;
-                            float beta = host_r * inv_dist;
-                            float gamma = sqrt(perp_sq) * inv_dist;
-                            float penumbra_outer = alpha + beta;
-                            float penumbra_inner = abs(beta - alpha);
                             float max_bend = u_host_planet_max_bend > 0.0
                                 ? u_host_planet_max_bend
                                 : (host_atmo_h > 0.0
-                                    ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r / max(1e-6, host_atmo_h * 2.0)), 0.001, 0.10)
+                                    ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r * u_au_to_km / max(1e-6, u_host_planet_shadow.w * 2.0)), 0.001, 0.10)
                                     : 0.0);
-                            host_shadow = casterShadowTerm(alpha, beta, gamma, penumbra_outer, penumbra_inner, max_bend, u_host_planet_atmo, u_host_planet_ozone, u_host_planet_atmo.w, dist_host);
+                            host_shadow = casterShadowTerm(local_star_radius_over_dist * dist_host, host_r, sqrt(perp_sq),
+                            max_bend, vec4(u_host_planet_shadow.xyz, 1.0 / max(u_host_planet_radius * u_au_to_km, 100.0)),
+                            u_host_planet_ozone, u_host_planet_shadow.w, dist_host, u_au_to_km);
                         }
                     }
                 }

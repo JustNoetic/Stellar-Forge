@@ -33,6 +33,7 @@ layout(std140, binding = 1) uniform SceneData {
     // Vertical Chapman-ozone column (rgb) + layer Gaussian width km (w).
     // Appended tail member: older SceneData declarations remain offset-valid.
     vec4 u_caster_ozone_vert[MAX_CASTERS];
+    vec4 u_caster_grazing[MAX_CASTERS]; // xyz: grazing tau, w: inverse reference radius km
 };
 uniform float screen_height;
 uniform float fov_factor;
@@ -64,6 +65,7 @@ flat out float f_clamped_min_px;
 flat out float f_apparent_px;
 flat out uvec2 f_caster_mask;
 flat out uint f_ring_mask;
+flat out uint f_surface_body_idx;
 flat out vec3 f_planetshine_dir;
 flat out vec3 f_planetshine_color;
 flat out float f_tex_idx;
@@ -93,6 +95,7 @@ vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
 
 void main() {
     uint inst_idx = vis_indices[gl_InstanceID];
+    f_surface_body_idx = inst_idx;
     vec4 f0 = instances[inst_idx * 7 + 0];
     vec4 f1 = instances[inst_idx * 7 + 1];
     vec4 f2 = instances[inst_idx * 7 + 2];

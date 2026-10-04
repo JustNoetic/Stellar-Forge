@@ -354,6 +354,7 @@ from engine.rendering.render_utils import *
 from engine.rendering.shaders import *
 from engine.rendering.scattering_lut import ScatteringLUTCache
 from engine.rendering.atmosphere_programs import AtmospherePrograms
+from engine.rendering.surface_materials import SurfaceMaterialCache
 from engine.rendering.aerial_perspective import AerialPerspectiveVolume
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
@@ -671,6 +672,7 @@ class App(InputHandlerMixin):
         self._atmo_active_poles_obl_buf = np.zeros((8, 4), dtype='f4')
         self._atmo_active_caster_r_minor_buf = np.zeros(8, dtype='f4')
         self._atmo_active_atmos_buf = np.zeros((8, 4), dtype='f4')
+        self._atmo_active_scale_height_buf = np.zeros(8, dtype='f4')
         self._atmo_active_max_bend_buf = np.zeros(8, dtype='f4')
         self._atmo_active_caster_ozone_buf = np.zeros((8, 4), dtype='f4')
         self._clouds_exist_cache = {}
@@ -2326,7 +2328,7 @@ class App(InputHandlerMixin):
         orbit_ssbo_out.bind_to_storage_buffer(binding=1)
         vao_gpu_orbits = ctx.vertex_array(prog_gpu_orbits, [])
     
-        UBO_SIZE = 7328
+        UBO_SIZE = 8352  # Append 64 vec4 grazing-shadow parameters.
         scene_ubo = ctx.buffer(reserve=UBO_SIZE)
         scene_ubo.bind_to_uniform_block(1)
         ubo_staging = np.zeros(UBO_SIZE // 4, dtype=np.float32)
@@ -2388,6 +2390,8 @@ class App(InputHandlerMixin):
         u_ring_host_R_minor = prog_rings.get('u_host_planet_R_minor', None)
         u_ring_host_color = prog_rings.get('u_host_planet_color', None)
         u_ring_host_atmo = prog_rings.get('u_host_planet_atmo', None)
+        u_ring_host_shadow = prog_rings.get('u_host_planet_shadow', None)
+        u_ring_host_ozone = prog_rings.get('u_host_planet_ozone', None)
         u_ring_host_refractivity = prog_rings.get('u_host_planet_refractivity', None)
         u_ring_host_max_bend = prog_rings.get('u_host_planet_max_bend', None)
         u_ring_camera_pos = prog_rings['u_camera_pos']
@@ -2411,9 +2415,9 @@ class App(InputHandlerMixin):
         u_atmo_ring_coplanar_mask = prog_atmo.get('u_ring_coplanar_mask', None)
         u_atmo_clip_mode = prog_atmo.get('u_atmo_clip_mode', None)
 
-        self.atmo_ssbo = ctx.buffer(reserve=1024)
+        self.atmo_ssbo = ctx.buffer(reserve=1056)
         self.atmo_ssbo.bind_to_storage_buffer(binding=8)
-        self.atmo_staging = np.zeros(256, dtype=np.float32)
+        self.atmo_staging = np.zeros(264, dtype=np.float32)
         self.atmo_staging_int_view = self.atmo_staging.view(np.int32)
 
 
@@ -2446,6 +2450,7 @@ class App(InputHandlerMixin):
         caster_poles_obl_buf = np.zeros((64, 4), dtype='f4')
         caster_colors_buf = np.zeros((64, 4), dtype='f4')
         caster_atmos_buf = np.zeros((64, 4), dtype='f4')
+        caster_grazing_buf = np.zeros((64, 4), dtype='f4')
         caster_ozone_buf = np.zeros((64, 4), dtype='f4')
         # Vertical Chapman-ozone column (rgb) + layer Gaussian width km (w)
         # for the terminator direct-light extinction in sphere.frag.
@@ -2796,6 +2801,7 @@ class App(InputHandlerMixin):
                 caster_poles_obl_buf = np.zeros((64, 4), dtype='f4')
                 caster_colors_buf = np.zeros((64, 4), dtype='f4')
                 caster_atmos_buf = np.zeros((64, 4), dtype='f4')
+                caster_grazing_buf = np.zeros((64, 4), dtype='f4')
                 caster_ozone_buf = np.zeros((64, 4), dtype='f4')
                 caster_ozone_vert_buf = np.zeros((64, 4), dtype='f4')
                 caster_max_bend_buf = np.zeros(64, dtype='f4')
@@ -4324,6 +4330,23 @@ class App(InputHandlerMixin):
 
             # Bind the body textures SSBO to binding point 10 before rendering
             self.body_textures_ssbo.bind_to_storage_buffer(binding=10)
+            # Material rows follow the unified primary/comparison instance order.
+            material_bodies = list(bodies_data[:num_bodies])
+            if total_render_bodies > num_bodies:
+                material_bodies += self.bodies_data_cmp[:total_render_bodies-num_bodies]
+            if not hasattr(self, 'surface_material_cache'):
+                self.surface_material_cache = SurfaceMaterialCache(ctx)
+            surface_materials, surface_phases = self.surface_material_cache.update(material_bodies)
+            ps_surface_colors = all_instances[:total_render_bodies,3:6].copy()
+            for bi, body in enumerate(material_bodies):
+                if surface_materials[bi,0] > 0.5:
+                    mean, _, _ = compute_surface_albedo(body,self.texture_mean_colors,ps_surface_colors[bi])
+                    ps_surface_colors[bi] = mean
+                    # These slots carry stellar luminosity/pole color for stars;
+                    # for nonstellar bodies they provide the point pass texture mean.
+                    all_instances[bi,19] = mean[0]
+                    all_instances[bi,23] = mean[1]
+                    all_instances[bi,27] = mean[2]
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
             star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
             star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
@@ -4357,7 +4380,7 @@ class App(InputHandlerMixin):
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
                 all_instances[:total_render_bodies, 6],
-                all_instances[:total_render_bodies, 3:6],
+                ps_surface_colors,
                 all_instances[:total_render_bodies, 8],
                 star_positions,
                 star_colors,
@@ -4369,7 +4392,9 @@ class App(InputHandlerMixin):
                 ps_ring_colors,
                 planetshine_enabled,
                 ringshine_enabled,
-                ps_ring_scattering
+                ps_ring_scattering,
+                surface_materials,
+                surface_phases
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
             all_instances[:total_render_bodies, 20:23] = planetshine_colors
@@ -4900,6 +4925,10 @@ class App(InputHandlerMixin):
                     caster_atmos_buf[i_c, 0:3] = props.get('tau_vertical', trans)
                     caster_atmos_buf[i_c, 3] = thick_km
                     caster_colors_buf[i_c, 3] = scale_height_km
+                    shadow_radius_km = max(float(body_radii[b_idx]) * AU_TO_KM, 100.0)
+                    grazing_factor = math.sqrt(2.0 * math.pi * shadow_radius_km / max(scale_height_km, 0.1))
+                    caster_grazing_buf[i_c, :3] = caster_atmos_buf[i_c, :3] * grazing_factor
+                    caster_grazing_buf[i_c, 3] = 1.0 / shadow_radius_km
                     # Split Mie component for per-species cloud-altitude attenuation.
                     # Falls back to total-minus-Rm if cached props predate the split.
                     _tau_m = props.get('tau_vert_mie', None)
@@ -4938,12 +4967,14 @@ class App(InputHandlerMixin):
                         beta_ext=props.get('beta_rayleigh'))
                 else:
                     caster_atmos_buf[i_c] = 0.0
+                    caster_grazing_buf[i_c] = 0.0
                     caster_ozone_buf[i_c] = 0.0
                     caster_ozone_vert_buf[i_c] = 0.0
                     caster_max_bend_buf[i_c] = 0.0
                     caster_mie_buf[i_c] = 0.0
             if n_casters_fixed < 64:
                 caster_atmos_buf[n_casters_fixed:] = 0
+                caster_grazing_buf[n_casters_fixed:] = 0
                 caster_ozone_buf[n_casters_fixed:] = 0
                 caster_ozone_vert_buf[n_casters_fixed:] = 0
                 caster_max_bend_buf[n_casters_fixed:] = 0
@@ -4985,6 +5016,7 @@ class App(InputHandlerMixin):
             ubo_staging[1064:1320] = caster_atmos_buf.ravel()
             ubo_staging[1320:1576] = caster_ozone_buf.ravel()
             ubo_staging[1576:1832] = caster_ozone_vert_buf.ravel()
+            ubo_staging[1832:2088] = caster_grazing_buf.ravel()
             
             scene_ubo.write(ubo_staging.tobytes())
             
@@ -5988,6 +6020,7 @@ class App(InputHandlerMixin):
                 active_poles_obl_buf = self._atmo_active_poles_obl_buf
                 active_caster_r_minor_buf = self._atmo_active_caster_r_minor_buf
                 active_atmos_buf = self._atmo_active_atmos_buf
+                active_scale_height_buf = self._atmo_active_scale_height_buf
                 active_max_bend_buf = self._atmo_active_max_bend_buf
                 active_caster_ozone_buf = self._atmo_active_caster_ozone_buf
 
@@ -6102,6 +6135,7 @@ class App(InputHandlerMixin):
                     active_poles_obl_buf[:] = 0.0
                     active_caster_r_minor_buf[:] = 0.0
                     active_atmos_buf[:] = 0.0
+                    active_scale_height_buf[:] = 0.0
                     active_max_bend_buf[:] = 0.0
                     active_caster_ozone_buf[:] = 0.0
                     
@@ -6142,14 +6176,14 @@ class App(InputHandlerMixin):
                             thick_km = float(atmo_info.get('atmo_radius_km', 0.0) - atmo_info.get('planet_radius_km', 0.0))
                             scale_height_km = float(props_c.get('scale_height_km', 8.5))
                             r_c_km = float(atmo_info.get('planet_radius_km', rad_c * 149597870.7))
-                            # Limb-grazing vertical optical depth: the atmosphere-pass
-                            # casterShadowTerm consumes grazing tau directly (no internal
-                            # grazing_factor multiplication, unlike the sphere shader which
-                            # receives the plain vertical OD via the scene UBO).
+                            # Precompute grazing tau at the equatorial radius. Shared
+                            # shadow optics only adjust it for projected oblate limbs.
+                            # Thickness and scale height have independent buffer fields.
                             tau_vert_c = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                            grazing_factor_c = math.sqrt(2.0 * math.pi * max(r_c_km, 1e-6) / max(scale_height_km, 1e-3))
+                            grazing_factor_c = math.sqrt(2.0 * math.pi * max(rad_c * AU_TO_KM, 100.0) / max(scale_height_km, 0.1))
                             active_atmos_buf[i_ac, 0:3] = tau_vert_c * grazing_factor_c
                             active_atmos_buf[i_ac, 3] = thick_km
+                            active_scale_height_buf[i_ac] = scale_height_km
                             active_max_bend_buf[i_ac] = compute_max_bend(
                                 rad_c, scale_height_km,
                                 float(props_c.get('refractivity', 0.00029)),
@@ -6189,6 +6223,7 @@ class App(InputHandlerMixin):
                     self.atmo_staging[108:140] = active_atmos_buf.ravel()
                     self.atmo_staging[140:148] = active_max_bend_buf
                     self.atmo_staging[148:180] = active_caster_ozone_buf.ravel()
+                    self.atmo_staging[256:264] = active_scale_height_buf
                     self.atmo_staging[180:184] = [float(props.get('ozone_peak_km', 25.0)),
                                                   float(props.get('ozone_width_km', 8.0)),
                                                   0.0, float(self.camera.get('atmo_adaptive_steps_max', 128))]  # pad to 736 bytes
@@ -6735,16 +6770,27 @@ class App(InputHandlerMixin):
                         if atmo is not None:
                             props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
                             scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                            # ring.frag's casterShadowTerm expects the plain vertical
-                            # optical depth (it applies the grazing factor internally).
+                            # Keep thickness km separate from scale height and grazing tau.
                             _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                            u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
+                            _thickness_km = max(0.0, float(atmo['atmo_radius_km']) - float(atmo['planet_radius_km']))
+                            _shadow_radius_km = max(float(body_radii[bi]) * AU_TO_KM, 100.0)
+                            _grazing_tau = _tau_v * math.sqrt(2.0 * math.pi * _shadow_radius_km / max(scale_height_km, 0.1))
+                            u_ring_host_atmo.value = (*map(float, _tau_v), _thickness_km)
+                            if u_ring_host_shadow is not None:
+                                u_ring_host_shadow.value = (*map(float, _grazing_tau), scale_height_km)
+                            if u_ring_host_ozone is not None:
+                                _ozone_tau = props_c.get('beta_abs_layered', np.zeros(3)) * math.sqrt(2.0 * math.pi * _shadow_radius_km * scale_height_km) * 1000.0
+                                u_ring_host_ozone.value = (*map(float, _ozone_tau), float(props_c.get('ozone_peak_km', 25.0)))
                             if u_ring_host_refractivity is not None:
                                 u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
                             if u_ring_host_max_bend is not None:
                                 u_ring_host_max_bend.value = compute_max_bend(body_radii[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
                         else:
                             u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                            if u_ring_host_shadow is not None:
+                                u_ring_host_shadow.value = (0.0, 0.0, 0.0, 0.0)
+                            if u_ring_host_ozone is not None:
+                                u_ring_host_ozone.value = (0.0, 0.0, 0.0, 0.0)
                             if u_ring_host_refractivity is not None:
                                 u_ring_host_refractivity.value = 0.0
                             if u_ring_host_max_bend is not None:
@@ -6820,16 +6866,27 @@ class App(InputHandlerMixin):
                         if atmo is not None:
                             props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
                             scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                            # ring.frag's casterShadowTerm expects the plain vertical
-                            # optical depth (it applies the grazing factor internally).
+                            # Keep thickness km separate from scale height and grazing tau.
                             _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                            u_ring_host_atmo.value = (float(_tau_v[0]), float(_tau_v[1]), float(_tau_v[2]), scale_height_km)
+                            _thickness_km = max(0.0, float(atmo['atmo_radius_km']) - float(atmo['planet_radius_km']))
+                            _shadow_radius_km = max(float(self.body_radii_cmp[bi]) * AU_TO_KM, 100.0)
+                            _grazing_tau = _tau_v * math.sqrt(2.0 * math.pi * _shadow_radius_km / max(scale_height_km, 0.1))
+                            u_ring_host_atmo.value = (*map(float, _tau_v), _thickness_km)
+                            if u_ring_host_shadow is not None:
+                                u_ring_host_shadow.value = (*map(float, _grazing_tau), scale_height_km)
+                            if u_ring_host_ozone is not None:
+                                _ozone_tau = props_c.get('beta_abs_layered', np.zeros(3)) * math.sqrt(2.0 * math.pi * _shadow_radius_km * scale_height_km) * 1000.0
+                                u_ring_host_ozone.value = (*map(float, _ozone_tau), float(props_c.get('ozone_peak_km', 25.0)))
                             if u_ring_host_refractivity is not None:
                                 u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
                             if u_ring_host_max_bend is not None:
                                 u_ring_host_max_bend.value = compute_max_bend(self.body_radii_cmp[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
                         else:
                             u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                            if u_ring_host_shadow is not None:
+                                u_ring_host_shadow.value = (0.0, 0.0, 0.0, 0.0)
+                            if u_ring_host_ozone is not None:
+                                u_ring_host_ozone.value = (0.0, 0.0, 0.0, 0.0)
                             if u_ring_host_refractivity is not None:
                                 u_ring_host_refractivity.value = 0.0
                             if u_ring_host_max_bend is not None:
@@ -7735,6 +7792,7 @@ class App(InputHandlerMixin):
         physics_thread.join(timeout=1.0)
         physics_thread_cmp.join(timeout=1.0)
         self.save_settings()
+        if getattr(self, "surface_material_cache", None): self.surface_material_cache.release()
         if getattr(self, 'terrain_geometry_cache', None): self.terrain_geometry_cache.release()
         if getattr(self, 'terrain_streamer', None): self.terrain_streamer.shutdown()
         if getattr(self, 'conv_tmp_tex', None): self.conv_tmp_tex.release()
