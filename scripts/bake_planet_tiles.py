@@ -248,6 +248,132 @@ def reproject_face(src_input, face, face_size, src_gpu=None, dst_gpu=None, use_c
 # -----------------------------------------------------------------------------
 # Quadtree Pyramid Slicing
 # -----------------------------------------------------------------------------
+# Quadtree Pyramid Slicing & Boundary Stitching
+# -----------------------------------------------------------------------------
+# 12 Edge pairs connecting the 6 cube faces:
+# (face1, edge1, face2, edge2, reverse_direction)
+CUBE_EDGE_PAIRS = [
+    (0, 'right', 5, 'left', False),
+    (0, 'left', 4, 'right', False),
+    (0, 'bottom', 3, 'right', False),
+    (0, 'top', 2, 'right', True),
+    (1, 'right', 4, 'left', False),
+    (1, 'left', 5, 'right', False),
+    (1, 'bottom', 3, 'left', True),
+    (1, 'top', 2, 'left', False),
+    (4, 'bottom', 3, 'top', False),
+    (4, 'top', 2, 'bottom', False),
+    (5, 'bottom', 3, 'bottom', True),
+    (5, 'top', 2, 'top', True),
+]
+
+# 8 Cube corner vertices each meeting at 3 faces:
+# (face, x_idx, y_idx) where 0 is min and -1 is max
+CUBE_CORNERS = [
+    [(0, 0, 0), (2, -1, -1), (4, -1, 0)],
+    [(0, -1, 0), (2, -1, 0), (5, 0, 0)],
+    [(0, 0, -1), (3, -1, 0), (4, -1, -1)],
+    [(0, -1, -1), (3, -1, -1), (5, 0, -1)],
+    [(1, -1, 0), (2, 0, -1), (4, 0, 0)],
+    [(1, 0, 0), (2, 0, 0), (5, -1, 0)],
+    [(1, -1, -1), (3, 0, 0), (4, 0, -1)],
+    [(1, 0, -1), (3, 0, -1), (5, -1, -1)],
+]
+
+
+def get_edge_slice(arr, edge):
+    if edge == 'right':
+        return arr[:, -1]
+    elif edge == 'left':
+        return arr[:, 0]
+    elif edge == 'top':
+        return arr[0, :]
+    elif edge == 'bottom':
+        return arr[-1, :]
+    raise ValueError(f"Unknown edge: {edge}")
+
+
+def set_edge_slice(arr, edge, val):
+    if edge == 'right':
+        arr[:, -1] = val
+    elif edge == 'left':
+        arr[:, 0] = val
+    elif edge == 'top':
+        arr[0, :] = val
+    elif edge == 'bottom':
+        arr[-1, :] = val
+    else:
+        raise ValueError(f"Unknown edge: {edge}")
+
+
+def stitch_face_arrays(faces, num_tiles_axis, tile_size=512):
+    """
+    Applies seamless C0 stitching across all 6 faces:
+    1. Internal quadtree seams inside each face
+    2. The 12 cube face boundaries across adjacent faces
+    3. The 8 cube corners
+    Supports 2D (grayscale) and 3D (RGB, RGBA) arrays.
+    """
+    # 1. Internal seams within each face
+    for f in range(6):
+        arr = faces[f]
+        # Vertical internal seams between tile tx and tx+1
+        for k in range(1, num_tiles_axis):
+            X = k * tile_size
+            avg = 0.5 * (arr[:, X - 1].astype(np.float32) + arr[:, X].astype(np.float32))
+            arr[:, X - 1] = np.round(avg)
+            arr[:, X] = np.round(avg)
+
+        # Horizontal internal seams between tile ty and ty+1
+        for k in range(1, num_tiles_axis):
+            Y = k * tile_size
+            avg = 0.5 * (arr[Y - 1, :].astype(np.float32) + arr[Y, :].astype(np.float32))
+            arr[Y - 1, :] = np.round(avg)
+            arr[Y, :] = np.round(avg)
+
+        # 4-way internal corner intersections
+        for kx in range(1, num_tiles_axis):
+            X = kx * tile_size
+            for ky in range(1, num_tiles_axis):
+                Y = ky * tile_size
+                avg_c = 0.25 * (
+                    arr[Y - 1, X - 1].astype(np.float32) +
+                    arr[Y - 1, X].astype(np.float32) +
+                    arr[Y, X - 1].astype(np.float32) +
+                    arr[Y, X].astype(np.float32)
+                )
+                c_val = np.round(avg_c)
+                arr[Y - 1, X - 1] = c_val
+                arr[Y - 1, X] = c_val
+                arr[Y, X - 1] = c_val
+                arr[Y, X] = c_val
+
+    # 2. Cube face edges across 6 faces
+    for f1, e1, f2, e2, rev in CUBE_EDGE_PAIRS:
+        s1 = get_edge_slice(faces[f1], e1).astype(np.float32)
+        s2 = get_edge_slice(faces[f2], e2).astype(np.float32)
+        s2_aligned = s2[::-1] if rev else s2
+        avg = np.round(0.5 * (s1 + s2_aligned))
+        set_edge_slice(faces[f1], e1, avg)
+        set_edge_slice(faces[f2], e2, avg[::-1] if rev else avg)
+
+    # 3. 8 Cube corners
+    for c_list in CUBE_CORNERS:
+        vals = [faces[f][y, x].astype(np.float32) for f, x, y in c_list]
+        avg_corner = np.round(np.mean(vals, axis=0))
+        for f, x, y in c_list:
+            faces[f][y, x] = avg_corner
+
+
+def _save_tile_array_task(arr, out_path, ext):
+    """Helper for concurrent tile disk writes from numpy array."""
+    img = Image.fromarray(arr)
+    if ext == "jpg":
+        img.convert("RGB").save(out_path, "JPEG", quality=90)
+    else:
+        img.save(out_path, "PNG")
+
+
 def _save_tile_task(tile_img, out_path, ext):
     """Helper for concurrent tile disk writes."""
     if ext == "jpg":
@@ -290,10 +416,58 @@ def slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size=
         concurrent.futures.wait(futures)
 
 
+def slice_quadtree_pyramid_multi(face_imgs, body_out_dir, max_lod, tile_size=512, fmt="jpg", resample=Image.Resampling.LANCZOS, stitch=True):
+    """
+    Given 6 master face images, generates the quadtree pyramid tiles for lod in 0..max_lod
+    with seamless C0 stitching across all internal tile seams and cube face borders.
+    Uses multi-threaded I/O to avoid disk bottlenecks.
+    """
+    ext = "jpg" if fmt.lower() in ("jpg", "jpeg") else "png"
+
+    save_tasks = []
+    for lod in range(max_lod + 1):
+        t_lod = time.perf_counter()
+        num_tiles_axis = 1 << lod
+        target_face_dim = num_tiles_axis * tile_size
+
+        lod_faces = []
+        for face_idx in range(6):
+            f_img = face_imgs[face_idx]
+            if target_face_dim == f_img.width:
+                lod_face_img = f_img
+            else:
+                lod_face_img = f_img.resize((target_face_dim, target_face_dim), resample)
+            lod_faces.append(np.array(lod_face_img))
+
+        if stitch:
+            stitch_face_arrays(lod_faces, num_tiles_axis, tile_size)
+
+        for face_idx in range(6):
+            lod_dir = os.path.join(body_out_dir, str(face_idx), str(lod))
+            os.makedirs(lod_dir, exist_ok=True)
+            face_arr = lod_faces[face_idx]
+
+            for ty in range(num_tiles_axis):
+                for tx in range(num_tiles_axis):
+                    tile_box = face_arr[ty * tile_size:(ty + 1) * tile_size, tx * tile_size:(tx + 1) * tile_size]
+                    out_path = os.path.join(lod_dir, f"{tx}_{ty}.{ext}")
+                    save_tasks.append((tile_box, out_path, ext))
+
+        dt = time.perf_counter() - t_lod
+        print(f"  LOD {lod} prepared ({num_tiles_axis * num_tiles_axis * 6} tiles, dim={target_face_dim}) in {dt:.2f} s")
+
+    # Concurrently write tiles to disk
+    t_save = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as executor:
+        futures = [executor.submit(_save_tile_array_task, t, p, e) for t, p, e in save_tasks]
+        concurrent.futures.wait(futures)
+    print(f"  Wrote {len(save_tasks)} tiles to disk in {time.perf_counter() - t_save:.2f} s")
+
+
 # -----------------------------------------------------------------------------
 # Planet Baking Pipeline
 # -----------------------------------------------------------------------------
-def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=512, out_base="data/tiles", use_cuda=True, bilinear=True):
+def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=512, out_base="data/tiles", use_cuda=True, bilinear=True, stitch=True):
     t_start = time.perf_counter()
     print(f"[{body_name}] Loading source image: {src_path}...")
     src_img = Image.open(src_path)
@@ -331,29 +505,32 @@ def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=51
     else:
         print(f"[{body_name}] Running on CPU (NumPy)")
 
+    master_faces = []
     for face_idx in range(6):
         t0 = time.perf_counter()
-        print(f"[{body_name}] Baking face {face_idx} ({face_names[face_idx]})...")
+        print(f"[{body_name}] Reprojecting face {face_idx} ({face_names[face_idx]})...")
         face_img = reproject_face(
             src_img, face_idx, master_face_size,
             src_gpu=src_gpu, dst_gpu=dst_gpu,
             use_cuda=cuda_active, bilinear=bilinear
         )
-
-        out_face_dir = os.path.join(body_out_dir, str(face_idx))
-        # Grayscale DEMs overshoot with Lanczos (halo ringing along slope breaks);
-        # bilinear keeps the downsampled elevation field clean and monotonic.
-        resample = Image.Resampling.BILINEAR if "height" in map_type.lower() else Image.Resampling.LANCZOS
-        slice_quadtree_pyramid(face_img, face_idx, out_face_dir, max_lod, tile_size, fmt=fmt, resample=resample)
+        master_faces.append(face_img)
         dt = time.perf_counter() - t0
-        print(f"[{body_name}] Face {face_idx} completed in {dt:.2f} s")
+        print(f"[{body_name}] Face {face_idx} reprojected in {dt:.2f} s")
+
+    print(f"[{body_name}] Slicing and stitching quadtree pyramid across all 6 faces (stitch={stitch})...")
+    resample = Image.Resampling.BILINEAR if "height" in map_type.lower() else Image.Resampling.LANCZOS
+    slice_quadtree_pyramid_multi(
+        master_faces, body_out_dir, max_lod, tile_size, fmt=fmt,
+        resample=resample, stitch=stitch
+    )
 
     total_time = time.perf_counter() - t_start
     backend_str = f"GPU ({_CUDA_DEVICE_NAME})" if cuda_active else "CPU"
-    print(f"[{body_name}] All 6 faces baked successfully using {backend_str} to {body_out_dir} in {total_time:.2f} s!")
+    print(f"[{body_name}] All 6 faces baked and seamlessly stitched using {backend_str} to {body_out_dir} in {total_time:.2f} s!")
 
 
-def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="textures/Solar System", include_clouds=True, include_heights=True, use_cuda=True, bilinear=True):
+def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="textures/Solar System", include_clouds=True, include_heights=True, use_cuda=True, bilinear=True, stitch=True):
     """
     Scans textures/Solar System/ and batch bakes all available planetary maps (diffuse, clouds, heightmaps).
     """
@@ -383,7 +560,7 @@ def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="
             print(f"\n==================================================")
             print(f"[{body}] Batch baking diffuse map ({os.path.basename(diffuse_path)})...")
             print(f"==================================================")
-            bake_planet(body, diffuse_path, map_type="diffuse", max_lod=max_lod, tile_size=tile_size, out_base=out_base, use_cuda=use_cuda, bilinear=bilinear)
+            bake_planet(body, diffuse_path, map_type="diffuse", max_lod=max_lod, tile_size=tile_size, out_base=out_base, use_cuda=use_cuda, bilinear=bilinear, stitch=stitch)
 
         # 2. Cloud layer map
         if include_clouds:
@@ -401,7 +578,7 @@ def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="
                 print(f"\n==================================================")
                 print(f"[{body}] Batch baking cloud map ({os.path.basename(cloud_path)})...")
                 print(f"==================================================")
-                bake_planet(body, cloud_path, map_type="clouds", max_lod=max_lod, tile_size=tile_size, out_base=out_base, use_cuda=use_cuda, bilinear=bilinear)
+                bake_planet(body, cloud_path, map_type="clouds", max_lod=max_lod, tile_size=tile_size, out_base=out_base, use_cuda=use_cuda, bilinear=bilinear, stitch=stitch)
 
         # 3. Heightmap (elevation) layer
         if include_heights:
@@ -419,7 +596,7 @@ def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="
                 print(f"\n==================================================")
                 print(f"[{body}] Batch baking heightmap ({os.path.basename(height_path)})...")
                 print(f"==================================================")
-                bake_planet(body, height_path, map_type="height", max_lod=max_lod, tile_size=tile_size, out_base=out_base, use_cuda=use_cuda, bilinear=bilinear)
+                bake_planet(body, height_path, map_type="height", max_lod=max_lod, tile_size=tile_size, out_base=out_base, use_cuda=use_cuda, bilinear=bilinear, stitch=stitch)
 
 
 def main():
@@ -435,10 +612,12 @@ def main():
     parser.add_argument("--out-dir", type=str, default="data/tiles", help="Base output directory")
     parser.add_argument("--no-cuda", action="store_true", help="Force CPU baking even if CUDA is available")
     parser.add_argument("--nearest", action="store_true", help="Use nearest-neighbor sampling instead of bilinear on CUDA")
+    parser.add_argument("--no-stitch", action="store_true", help="Disable seamless quadtree boundary stitching")
 
     args = parser.parse_args()
     use_cuda = not args.no_cuda
     bilinear = not args.nearest
+    stitch = not args.no_stitch
 
     if args.all:
         bake_all(
@@ -448,7 +627,8 @@ def main():
             include_clouds=not args.no_clouds,
             include_heights=not args.no_height,
             use_cuda=use_cuda,
-            bilinear=bilinear
+            bilinear=bilinear,
+            stitch=stitch
         )
         return
 
@@ -480,7 +660,8 @@ def main():
         tile_size=args.tile_size,
         out_base=args.out_dir,
         use_cuda=use_cuda,
-        bilinear=bilinear
+        bilinear=bilinear,
+        stitch=stitch
     )
 
 

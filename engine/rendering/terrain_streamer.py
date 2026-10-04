@@ -10,6 +10,7 @@ import os
 import threading
 import queue
 import time
+import collections
 import numpy as np
 from PIL import Image
 
@@ -20,6 +21,15 @@ class TerrainTileStreamer:
     """
     Manages a ModernGL TextureArray containing cached planet tiles.
     """
+    # Max decoded tiles waiting for GPU upload (~1 MB each at 512x512 RGBA).
+    UPLOAD_QUEUE_MAX = 32
+    # Max decoded tiles held over while the pool has no evictable slot.
+    HELD_UPLOADS_MAX = 32
+    # A request not wanted by the renderer for this many frames is dropped.
+    STALE_FRAMES = 45
+    # Re-request backoff for tiles dropped because the held-over buffer was full.
+    OVERFLOW_BACKOFF_FRAMES = 120
+
     def __init__(self, ctx, tiles_base_dir="data/tiles", pool_capacity=512, tile_size=512):
         self.ctx = ctx
         self.tiles_base_dir = tiles_base_dir
@@ -42,8 +52,10 @@ class TerrainTileStreamer:
         self.resident_tiles = {}
         # slot_idx -> key
         self.slot_to_key = {}
-        # slot_idx -> last_used_frame (int)
-        self.slot_last_used = [0] * self.pool_capacity
+        # slot_idx -> last_used_frame (int). numpy so eviction is one vectorized argmin.
+        self.slot_last_used = np.zeros(self.pool_capacity, dtype=np.int64)
+        # slot_idx -> LOD of the resident tile (eviction depth bonus)
+        self._slot_lod = np.zeros(self.pool_capacity, dtype=np.int64)
         # Locked slots (cannot be evicted, e.g. root LOD 0 tiles)
         self.locked_slots = set()
 
@@ -55,7 +67,18 @@ class TerrainTileStreamer:
 
         # Background worker threads & queues
         self.request_queue = queue.PriorityQueue()
-        self.upload_queue = queue.Queue()
+        # Bounded: decoders block instead of racing ahead of the per-frame GPU
+        # upload budget (an unbounded queue grew to >1 GB of decoded tiles while orbiting).
+        self.upload_queue = queue.Queue(maxsize=self.UPLOAD_QUEUE_MAX)
+        # Decoded tiles that found no evictable slot (pool saturated by tiles
+        # visible this frame). Kept for later frames instead of being discarded
+        # and re-decoded, which caused a continuous decode storm.
+        self._held_uploads = collections.deque()
+        # key -> last frame the renderer wanted it. Requests not wanted for
+        # STALE_FRAMES are dropped by workers / uploader (camera moved away).
+        self._wanted = {}
+        # key -> frame until which re-requests are suppressed (overflow backoff)
+        self._deferred = {}
         self.reload_queue = queue.Queue()
         self.in_flight_requests = set()
         self._request_lock = threading.Lock()
@@ -139,7 +162,7 @@ class TerrainTileStreamer:
         # Pass 2: Preload and lock LOD 1 for major priority bodies (Earth, Moon) if locked budget allows
         priority_bodies = ("moon", "earth", "mars")
         for b_name in priority_bodies:
-            for m_type in ("diffuse", "clouds"):
+            for m_type in ("diffuse", "clouds", "height"):
                 body_m_dir = os.path.join(self.tiles_base_dir, b_name, m_type)
                 if not os.path.isdir(body_m_dir):
                     continue
@@ -204,6 +227,14 @@ class TerrainTileStreamer:
             print(f"[TerrainStreamer] Error reading tile {path}: {e}")
             return None
 
+    def _is_stale(self, key) -> bool:
+        """True if the renderer has not wanted this tile for STALE_FRAMES frames."""
+        return self.current_frame - self._wanted.get(key, -(1 << 40)) > self.STALE_FRAMES
+
+    def _drop_request(self, key):
+        with self._request_lock:
+            self.in_flight_requests.discard(key)
+
     def _worker_loop(self):
         while not self._shutdown_event.is_set():
             try:
@@ -211,11 +242,26 @@ class TerrainTileStreamer:
             except queue.Empty:
                 continue
 
+            # Camera moved on before this request was serviced: skip the decode.
+            if self._is_stale(key):
+                self._drop_request(key)
+                continue
+
             raw_bytes = self._read_tile_from_disk(*key)
             if raw_bytes:
-                self.upload_queue.put((key, raw_bytes))
                 # Note: key remains in in_flight_requests until process_uploads()
                 # uploads it, preventing redundant requests on subsequent frames.
+                # The upload queue is bounded, so block (re-checking staleness and
+                # shutdown) instead of decoding far ahead of the GPU upload budget.
+                while True:
+                    if self._shutdown_event.is_set() or self._is_stale(key):
+                        self._drop_request(key)
+                        break
+                    try:
+                        self.upload_queue.put((key, raw_bytes), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
             else:
                 with self._request_lock:
                     self.in_flight_requests.discard(key)
@@ -229,11 +275,27 @@ class TerrainTileStreamer:
                 if min_lod >= 0:
                     shift = lod - min_lod
                     anc_key = (b_name, map_type, face, min_lod, x >> shift, y >> shift)
+                    self._wanted[anc_key] = self.current_frame
                     with self._request_lock:
                         if anc_key not in self.resident_tiles and anc_key not in self.missing_tiles and anc_key not in self.in_flight_requests:
                             self.in_flight_requests.add(anc_key)
                             self._req_counter += 1
                             self.request_queue.put((min_lod, self._req_counter, anc_key))
+
+    def _request_key(self, key, prio):
+        """Mark key as wanted this frame and enqueue it if not resident/in flight."""
+        self._wanted[key] = self.current_frame
+        # Lock-free fast path: the common case is an already in-flight tile.
+        if key in self.in_flight_requests or key in self.resident_tiles or key in self.missing_tiles:
+            return
+        if self._deferred.get(key, -1) > self.current_frame:
+            return
+        with self._request_lock:
+            if key in self.resident_tiles or key in self.in_flight_requests or key in self.missing_tiles:
+                return
+            self.in_flight_requests.add(key)
+            self._req_counter += 1
+            self.request_queue.put((prio, self._req_counter, key))
 
     def request_tile(self, body_name: str, map_type: str, face: int, lod: int, x: int, y: int, priority: int = None):
         b_name = body_name.lower()
@@ -245,13 +307,8 @@ class TerrainTileStreamer:
             y = y >> k
 
         key = (b_name, map_type, face, lod, x, y)
-        with self._request_lock:
-            if key in self.resident_tiles or key in self.in_flight_requests or key in self.missing_tiles:
-                return
-            self.in_flight_requests.add(key)
-            self._req_counter += 1
-            prio = lod if priority is None else priority
-            self.request_queue.put((prio, self._req_counter, key))
+        self._request_key(key, lod if priority is None else priority)
+
 
     def get_max_lod(self, body_name: str, map_type: str = "diffuse") -> int:
         """Return the maximum LOD available on disk across all 6 faces for a body."""
@@ -274,7 +331,7 @@ class TerrainTileStreamer:
             y = y >> k
         return (b_name, map_type, face, lod, x, y) in self.resident_tiles
 
-    def preload_body_lod(self, body_name: str, map_types=("diffuse", "clouds"), target_lod: int = 2):
+    def preload_body_lod(self, body_name: str, map_types=("diffuse", "clouds", "height"), target_lod: int = 2):
         """
         Request background streaming of low/intermediate LOD tiles up to target_lod for the active body.
         These tiles are loaded with high depth-weighted retention to avoid zoom-out blur.
@@ -308,6 +365,8 @@ class TerrainTileStreamer:
         Single-tile residency probe with hierarchical ancestor fallback.
         Results are memoized per (body_name, map_type, face) until residency
         changes on that face; a memo hit does not touch LRU timestamps — callers stamp.
+        Fallback entries also remember the wanted tile key so its request stays
+        fresh (not stale-dropped) and is re-issued if it was dropped earlier.
         """
         b_name = body_name.lower()
         sub_key = (b_name, map_type, face)
@@ -317,15 +376,19 @@ class TerrainTileStreamer:
         key = (lod, x, y)
         hit = cache.get(key)
         if hit is not None:
-            return hit
+            result, want = hit
+            if want is not None:
+                self._request_key(want, want[3])
+            return result
 
-        result = self._resolve_uncached(b_name, map_type, face, lod, x, y)
-        cache[key] = result
-        return result
+        hit = self._resolve_uncached(b_name, map_type, face, lod, x, y)
+        cache[key] = hit
+        return hit[0]
 
     def _resolve_uncached(self, b_name: str, map_type: str, face: int, lod: int, x: int, y: int):
         """
         Single-tile residency probe with hierarchical ancestor fallback.
+        Returns ((slot, uv_scale, off_x, off_y), wanted_key_or_None).
         """
         max_d = self.max_available_lods.get((b_name, map_type, face), -1)
 
@@ -333,7 +396,7 @@ class TerrainTileStreamer:
         key = (b_name, map_type, face, lod, x, y)
         slot = self.resident_tiles.get(key)
         if slot is not None:
-            return slot, 1.0, 0.0, 0.0
+            return (slot, 1.0, 0.0, 0.0), None
 
         # 2. Check if the clamped highest available tile (max_d) is resident
         if max_d >= 0 and lod > max_d:
@@ -344,15 +407,16 @@ class TerrainTileStreamer:
             slot = self.resident_tiles.get(eff_key)
             if slot is not None:
                 uv_scale = 1.0 / (1 << k_clamp)
-                return slot, uv_scale, (x & ((1 << k_clamp) - 1)) * uv_scale, (y & ((1 << k_clamp) - 1)) * uv_scale
-
-            # Trigger streaming of the best available tile if not already requested
-            if eff_key not in self.missing_tiles and eff_key not in self.in_flight_requests:
-                self.request_tile(b_name, map_type, face, max_d, eff_x, eff_y)
+                return (slot, uv_scale, (x & ((1 << k_clamp) - 1)) * uv_scale, (y & ((1 << k_clamp) - 1)) * uv_scale), None
+            want = eff_key
         else:
-            # Request missing tile if not known to be missing
-            if key not in self.missing_tiles:
-                self.request_tile(b_name, map_type, face, lod, x, y)
+            want = key
+
+        # Trigger streaming of the best available tile if not known to be missing
+        if want in self.missing_tiles:
+            want = None
+        else:
+            self._request_key(want, want[3])
 
         # 3. Ancestor fallback (nearest resident parent)
         anc_lod = lod - 1
@@ -366,15 +430,14 @@ class TerrainTileStreamer:
             if slot is not None:
                 k = lod - anc_lod
                 uv_scale = 1.0 / (1 << k)
-                return slot, uv_scale, (x & ((1 << k) - 1)) * uv_scale, (y & ((1 << k) - 1)) * uv_scale
+                return (slot, uv_scale, (x & ((1 << k) - 1)) * uv_scale, (y & ((1 << k) - 1)) * uv_scale), want
             anc_lod -= 1
 
         # 4. Default fallback (slot 0 for diffuse; -1 for clouds/height to avoid
         #    opaque fallback blocks and wrong-layer displacement)
         if map_type in ('clouds', 'height'):
-            return -1, 1.0, 0.0, 0.0
-        return 0, 1.0, 0.0, 0.0
-
+            return (-1, 1.0, 0.0, 0.0), want
+        return (0, 1.0, 0.0, 0.0), want
     def resolve_tiles_batch(self, body_name: str, map_type: str, faces, lods, xs, ys):
         """
         Batch replacement for per-patch get_tile_slot_or_fallback() calls.
@@ -482,6 +545,7 @@ class TerrainTileStreamer:
                 self.tile_size, self.tile_size, 4)[..., 0].copy()
         else:
             self.height_tiles.pop(slot_idx, None)
+        self._slot_lod[slot_idx] = key[3] if key is not None else 0
 
     def sample_height(self, slot, uv):
         """GL_LINEAR and CLAMP_TO_EDGE sampling of a resident height tile."""
@@ -500,6 +564,28 @@ class TerrainTileStreamer:
     def begin_frame(self):
         """Advances the frame counter used for LRU timestamps. Call once per render frame."""
         self.current_frame += 1
+        if (self.current_frame & 1023) == 0:
+            # Bound bookkeeping growth: forget tiles not wanted for a long time.
+            cutoff = self.current_frame - 1024
+            self._wanted = {k: f for k, f in self._wanted.items() if f >= cutoff}
+            self._deferred = {k: f for k, f in self._deferred.items() if f > self.current_frame}
+
+    def _pick_eviction_slot(self) -> int:
+        """
+        Depth-weighted LRU victim among unlocked slots not used in the last 2 frames.
+        Lower-LOD parent tiles get retention bonuses (250 frames per level) so leaf
+        tiles are evicted first, preserving parent continuity when zooming out.
+        Returns -1 if every slot is locked or in active use (pool saturated).
+        """
+        last = self.slot_last_used
+        evictable = last < (self.current_frame - 2)
+        if self.locked_slots:
+            evictable[np.fromiter(self.locked_slots, dtype=np.int64, count=len(self.locked_slots))] = False
+        if not evictable.any():
+            return -1
+        score = last + np.maximum(0, 8 - self._slot_lod) * 250
+        score[~evictable] = np.iinfo(np.int64).max
+        return int(np.argmin(score))
 
     def process_uploads(self, max_per_frame: int = 16, max_time_ms: float = 2.5):
         """Called every frame on the main OpenGL render thread to flush completed decodes."""
@@ -513,7 +599,9 @@ class TerrainTileStreamer:
             for t in self.worker_threads:
                 t.join(timeout=1.0)
             self.request_queue = queue.PriorityQueue()
-            self.upload_queue = queue.Queue()
+            self.upload_queue = queue.Queue(maxsize=self.UPLOAD_QUEUE_MAX)
+            self._held_uploads.clear()
+            self._deferred.clear()
             with self._request_lock:
                 self.in_flight_requests.clear()
             for key, slot in list(self.resident_tiles.items()):
@@ -537,50 +625,41 @@ class TerrainTileStreamer:
 
         t_start = time.perf_counter()
         uploaded_count = 0
+        held = self._held_uploads
+        n_held = len(held)
         for _ in range(max_per_frame):
             if (time.perf_counter() - t_start) * 1000.0 >= max_time_ms and uploaded_count > 0:
                 break
-            try:
-                key, raw_bytes = self.upload_queue.get_nowait()
-            except queue.Empty:
-                break
+            if n_held > 0:
+                key, raw_bytes = held.popleft()
+                n_held -= 1
+            else:
+                try:
+                    key, raw_bytes = self.upload_queue.get_nowait()
+                except queue.Empty:
+                    break
 
-            with self._request_lock:
-                self.in_flight_requests.discard(key)
-
-            # If already resident (e.g. redundant request), skip
-            if key in self.resident_tiles:
+            # If already resident (e.g. redundant request) or no longer wanted, skip
+            if key in self.resident_tiles or self._is_stale(key):
+                self._drop_request(key)
                 continue
 
             # Pick slot: free slot if available, else depth-weighted LRU eviction
             if self.free_slots:
                 slot = self.free_slots.pop(0)
             else:
-                # Find least recently used unlocked slot with depth-weighted retention.
-                # Lower-LOD parent tiles (LOD 1, 2, 3) get retention bonuses so leaf
-                # tiles are evicted first, preserving parent continuity when zooming out.
-                best_slot = -1
-                lowest_score = float('inf')
-                for s in range(self.pool_capacity):
-                    if s not in self.locked_slots:
-                        old_k = self.slot_to_key.get(s)
-                        lod_level = old_k[3] if old_k is not None else 0
-                        # 250 frames (~4.2 seconds) of eviction retention per lower LOD level:
-                        depth_bonus = max(0, 8 - lod_level) * 250
-                        score = self.slot_last_used[s] + depth_bonus
-                        if score < lowest_score:
-                            lowest_score = score
-                            best_slot = s
+                slot = self._pick_eviction_slot()
+                if slot < 0:
+                    # Pool saturated by tiles in active use. Protect them from
+                    # eviction (prevents high/low LOD flicker) and keep this decode
+                    # for a later frame rather than discarding and re-decoding it.
+                    if len(held) < self.HELD_UPLOADS_MAX:
+                        held.append((key, raw_bytes))
+                    else:
+                        self._deferred[key] = self.current_frame + self.OVERFLOW_BACKOFF_FRAMES
+                        self._drop_request(key)
+                    break  # No other tile can get a slot this frame either
 
-                if best_slot == -1:
-                    continue  # All slots locked
-
-                # Protect active resident tiles from being evicted in recent frames
-                # to prevent VRAM pool thrashing and high/low LOD rapid flickering.
-                if self.slot_last_used[best_slot] >= self.current_frame - 2:
-                    continue
-
-                slot = best_slot
                 # Evict old occupant
                 if slot in self.slot_to_key:
                     old_key = self.slot_to_key[slot]
@@ -594,6 +673,7 @@ class TerrainTileStreamer:
             self.resident_tiles[key] = slot
             self.slot_to_key[slot] = key
             self.slot_last_used[slot] = self.current_frame
+            self._drop_request(key)
             # Targeted invalidation: only drop memo for this tile's face
             self._resolve_memo.pop((key[0], key[1], key[2]), None)
             uploaded_count += 1

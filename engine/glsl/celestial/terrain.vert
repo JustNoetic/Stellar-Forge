@@ -46,6 +46,8 @@ uniform bool u_is_cloud_pass;
 uniform sampler2DArray u_tile_array;
 uniform float u_cloud_altitude_km;
 uniform vec3 u_camera_pos;
+uniform float u_grid_step;
+uniform vec3 u_body_cam_rel_au[8];
 
 #include "common/refraction.glsl"
 
@@ -53,6 +55,8 @@ out vec3 f_world_pos;
 out vec3 f_normal;
 out vec3 f_patch_pos_km;
 flat out float f_height_slot;
+out vec2 f_height_uv;
+flat out float f_elev_span_km;
 out vec2 f_tile_uv;
 out vec2 f_local_uv;
 flat out float f_tile_slot;
@@ -136,6 +140,8 @@ void main() {
     bool height_active = !u_is_cloud_pass && t_inst.u_height.x >= 0.0;
     vec2 height_uv = in_position.xy * t_inst.u_height.y + t_inst.u_height.zw;
     f_height_slot = height_active ? t_inst.u_height.x : -1.0;
+    f_height_uv = height_uv;
+    f_elev_span_km = height_active ? t_inst.u_hrange.y : 0.0;
     if (height_active) {
         float e = textureLod(u_tile_array, vec3(height_uv, t_inst.u_height.x), 0.0).r;
         p_local_km += normalize(p_ellip) * (t_inst.u_hrange.x + e * t_inst.u_hrange.y);
@@ -157,11 +163,44 @@ void main() {
         p_local_km.x * s_rot + p_local_km.z * c_rot
     );
 
+    // Compute smooth geometric normal of displaced terrain at mesh vertex spacing
+    vec3 n_local = n_sphere;
+    if (height_active && t_inst.u_hrange.y > 0.0) {
+        float grid_step = (u_grid_step > 0.0) ? u_grid_step : (1.0 / 32.0);
+        vec2 d_uv = (t_inst.u_range.zw - t_inst.u_range.xy) * grid_step;
+        vec2 d_huv = vec2(grid_step * t_inst.u_height.y);
+
+        vec3 s_R = base_surface(face, vec2(u_local + d_uv.x, v_local), obl);
+        vec3 s_L = base_surface(face, vec2(u_local - d_uv.x, v_local), obl);
+        vec3 s_U = base_surface(face, vec2(u_local, v_local + d_uv.y), obl);
+        vec3 s_D = base_surface(face, vec2(u_local, v_local - d_uv.y), obl);
+
+        float e_R = textureLod(u_tile_array, vec3(clamp(height_uv + vec2(d_huv.x, 0.0), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
+        float e_L = textureLod(u_tile_array, vec3(clamp(height_uv - vec2(d_huv.x, 0.0), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
+        float e_U = textureLod(u_tile_array, vec3(clamp(height_uv + vec2(0.0, d_huv.y), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
+        float e_D = textureLod(u_tile_array, vec3(clamp(height_uv - vec2(0.0, d_huv.y), 0.0, 1.0), t_inst.u_height.x), 0.0).r;
+
+        vec3 p_R = s_R * r_km + normalize(s_R) * (t_inst.u_hrange.x + e_R * t_inst.u_hrange.y);
+        vec3 p_L = s_L * r_km + normalize(s_L) * (t_inst.u_hrange.x + e_L * t_inst.u_hrange.y);
+        vec3 p_U = s_U * r_km + normalize(s_U) * (t_inst.u_hrange.x + e_U * t_inst.u_hrange.y);
+        vec3 p_D = s_D * r_km + normalize(s_D) * (t_inst.u_hrange.x + e_D * t_inst.u_hrange.y);
+
+        vec3 tu = (in_position.x <= 0.0) ? (p_R - p_local_km) * 2.0 :
+                  (in_position.x >= 1.0) ? (p_local_km - p_L) * 2.0 : (p_R - p_L);
+        vec3 tv = (in_position.y <= 0.0) ? (p_U - p_local_km) * 2.0 :
+                  (in_position.y >= 1.0) ? (p_local_km - p_D) * 2.0 : (p_U - p_D);
+        vec3 n_cand = cross(tv, tu);
+        if (dot(n_cand, n_cand) > 1e-12) {
+            n_cand = normalize(n_cand);
+            n_local = dot(n_cand, n_sphere) < 0.0 ? -n_cand : n_cand;
+        }
+    }
+
     // Normal in rotated local body frame
     vec3 n_local_body = normalize(vec3(
-        n_sphere.x * c_rot - n_sphere.z * s_rot,
-        n_sphere.y / max(1e-4, 1.0 - obl),
-        n_sphere.x * s_rot + n_sphere.z * c_rot
+        n_local.x * c_rot - n_local.z * s_rot,
+        n_local.y / max(1e-4, 1.0 - obl),
+        n_local.x * s_rot + n_local.z * c_rot
     ));
 
     // Rotate from planet frame to world frame using pole (matching sphere basis)
@@ -192,14 +231,21 @@ void main() {
         f_patch_pos_km = offset_body.x * tangent + offset_body.y * pole + offset_body.z * bitangent;
     }
 
-    // Convert km to world AU and add body center
-    vec3 p_world = body_pos + p_world_km * u_km_to_au;
+    // Camera-relative (RTE) transformation:
+    // Extract camera-to-body center offset computed in float64 on the CPU to eliminate AU-scale cancellation
+    int body_slot = int(t_inst.u_hrange.w + 0.5);
+    vec3 body_cam_rel = (body_slot >= 0 && body_slot < 8) ? u_body_cam_rel_au[body_slot] : (body_pos - u_camera_pos);
+
+    // Camera-relative vertex position in AU (origin at camera eye):
+    vec3 p_cam_rel = body_cam_rel + p_world_km * u_km_to_au;
 
     // Apply atmospheric refraction and gravitational lensing
     bool is_refract_host = (length(body_pos - u_refract_center) < 1e-7);
     if (!is_refract_host) {
         // Background celestial body viewed through a foreground atmosphere or black hole
+        vec3 p_world = u_camera_pos + p_cam_rel;
         p_world = apply_refraction(p_world, u_camera_pos);
+        p_cam_rel = p_world - u_camera_pos;
     } else {
         if (u_refract_max_bend > 1e-6) {
             // Terrestrial Refraction for host planet ground/clouds (horizon extension)
@@ -229,7 +275,7 @@ void main() {
                 float max_terr_alpha = clamp(0.5 * k_refr * density * theta_dip_eff, 0.0, 0.05);
 
                 if (max_terr_alpha > 1e-7) {
-                    vec3 view_vec = p_world - u_camera_pos;
+                    vec3 view_vec = p_cam_rel;
                     float d_v = length(view_vec);
                     if (d_v > 1e-7) {
                         float d_v_km = d_v * u_au_to_km;
@@ -254,7 +300,7 @@ void main() {
                                 u_dir /= u_len;
                                 // Rotate view_ray towards local_up (lifting apparent position of terrain upward):
                                 vec3 app_ray = normalize(view_ray * cos(alpha) + u_dir * sin(alpha));
-                                p_world = u_camera_pos + app_ray * d_v;
+                                p_cam_rel = app_ray * d_v;
                             }
                         }
                     }
@@ -265,7 +311,7 @@ void main() {
         // Gravitational lensing for host planet if orbiting near a black hole
         if (u_grav_lens_enabled && u_grav_lens_rs > 1e-6 && length(body_pos - u_grav_lens_center) > 1e-7) {
             vec3 C_km = (u_camera_pos - u_grav_lens_center) * u_au_to_km;
-            vec3 P_km = (p_world - u_grav_lens_center) * u_au_to_km;
+            vec3 P_km = (p_cam_rel + (u_camera_pos - u_grav_lens_center)) * u_au_to_km;
             vec3 true_vec = P_km - C_km;
             float d_km = length(true_vec);
             if (d_km > 1e-5) {
@@ -273,13 +319,13 @@ void main() {
                 bool is_shadow = false;
                 vec3 V_app = apply_gravitational_deflection(C_km, V, d_km, is_shadow);
                 if (!is_shadow) {
-                    p_world = u_camera_pos + V_app * (d_km / u_au_to_km);
+                    p_cam_rel = V_app * (d_km / u_au_to_km);
                 }
             }
         }
     }
 
-    f_world_pos = p_world;
+    f_world_pos = p_cam_rel;
     f_normal = n_world;
 
     // UV coordinates:
@@ -329,7 +375,12 @@ void main() {
     f_body_center = body_pos;
     f_rel_pos = p_world_km * u_km_to_au;
 
-    gl_Position = projection * view * vec4(p_world, 1.0);
+    // Camera-relative view transformation:
+    // mat3(view) is the pure camera rotation matrix R.
+    // p_cam_rel is already the vector from the camera eye to the vertex in AU!
+    // Therefore, mat3(view) * p_cam_rel gives the exact eye-space vertex position without origin precision loss.
+    vec3 p_eye = mat3(view) * p_cam_rel;
+    gl_Position = projection * vec4(p_eye, 1.0);
     f_clip_z = gl_Position.w;
 
     // Logarithmic depth buffer

@@ -833,6 +833,8 @@ class App(InputHandlerMixin):
         self.camera["terrain_patch_res"] = res
         if not hasattr(self, 'ctx') or self.ctx is None or not hasattr(self, 'prog_terrain') or self.prog_terrain is None:
             return
+        if 'u_grid_step' in self.prog_terrain:
+            self.prog_terrain['u_grid_step'].value = float(1.0 / res)
         grid_verts, grid_idx = create_terrain_grid_patch(res=res)
         if hasattr(self, 'vbo_terrain_grid') and self.vbo_terrain_grid:
             try:
@@ -2292,8 +2294,12 @@ class App(InputHandlerMixin):
             self.prog_terrain['u_is_cloud_pass'].value = False
         if 'u_cloud_altitude_km' in self.prog_terrain:
             self.prog_terrain['u_cloud_altitude_km'].value = 0.0
+        if 'u_body_cam_rel_au' in self.prog_terrain:
+            self.prog_terrain['u_body_cam_rel_au'].write(np.zeros((8, 3), dtype=np.float32).tobytes())
 
         patch_res = int(self.camera.get("terrain_patch_res", 32))
+        if 'u_grid_step' in self.prog_terrain:
+            self.prog_terrain['u_grid_step'].value = float(1.0 / max(1, patch_res))
         grid_verts, grid_idx = create_terrain_grid_patch(res=patch_res)
         self.vbo_terrain_grid = ctx.buffer(grid_verts.tobytes())
         self.ibo_terrain_grid = ctx.buffer(grid_idx.tobytes())
@@ -5409,7 +5415,7 @@ class App(InputHandlerMixin):
                 max_d = int(self.camera.get("terrain_max_depth", 6))
                 cam_world_pos_f8 = cam_origin + rel
 
-                for b_i, b_name in active_terrain_bodies:
+                for slot_idx, (b_i, b_name) in enumerate(active_terrain_bodies):
                     rem_budget = MAX_TERRAIN_PATCHES - total_patches_rendered
                     if rem_budget <= 0:
                         break
@@ -5636,7 +5642,7 @@ class App(InputHandlerMixin):
                             self.terrain_patch_staging, st, raw_patches,
                             uvs[0], ox_arr[0], oy_arr[0], slots[0], float(b_i),
                             uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km,
-                            b_caster_idx
+                            b_caster_idx, float(slot_idx)
                         )
 
                         self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
@@ -5713,6 +5719,13 @@ class App(InputHandlerMixin):
                     self.terrain_streamer.use(location=14)
                     if 'u_camera_pos' in self.prog_terrain:
                         self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                    if 'u_body_cam_rel_au' in self.prog_terrain:
+                        cam_world_f8 = cam_origin + rel
+                        body_cam_rel = np.zeros((8, 3), dtype=np.float32)
+                        for s_i, (t_bi, t_bname) in enumerate(active_terrain_bodies[:8]):
+                            t_bpos = pos_snap_render[t_bi]
+                            body_cam_rel[s_i] = (t_bpos - cam_world_f8).astype(np.float32)
+                        self.prog_terrain['u_body_cam_rel_au'].write(body_cam_rel.tobytes())
                     if 'u_is_cloud_pass' in self.prog_terrain:
                         self.prog_terrain['u_is_cloud_pass'].value = False
                     if 'u_debug_tiles' in self.prog_terrain:
@@ -7094,7 +7107,7 @@ class App(InputHandlerMixin):
                             pack_cloud_patches_jit(
                                 self.terrain_cloud_staging, 0,
                                 cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi),
-                                bi_caster_idx
+                                bi_caster_idx, 0.0
                             )
                             self.hdr_resolve_fbo.use()
                             ctx.viewport = (0, 0, self.fb_width, self.fb_height)
@@ -7120,6 +7133,12 @@ class App(InputHandlerMixin):
                                 self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
                             if 'u_camera_pos' in self.prog_terrain:
                                 self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                            if 'u_body_cam_rel_au' in self.prog_terrain:
+                                cam_world_f8 = cam_origin + rel
+                                cloud_bpos = self.pos_snap_cmp[bi] if is_cmp else pos_snap_render[bi]
+                                cloud_cam_rel = np.zeros((8, 3), dtype=np.float32)
+                                cloud_cam_rel[0] = (cloud_bpos - cam_world_f8).astype(np.float32)
+                                self.prog_terrain['u_body_cam_rel_au'].write(cloud_cam_rel.tobytes())
                             if 'u_debug_tiles' in self.prog_terrain:
                                 self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
                             if 'u_hdr_enabled' in self.prog_terrain:

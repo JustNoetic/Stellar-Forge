@@ -3,6 +3,8 @@ in vec3 f_world_pos;
 in vec3 f_normal;
 in vec3 f_patch_pos_km;
 flat in float f_height_slot;
+in vec2 f_height_uv;
+flat in float f_elev_span_km;
 in vec2 f_tile_uv;
 in vec2 f_local_uv;
 flat in float f_tile_slot;
@@ -135,6 +137,60 @@ vec3 casterShadowTerm(float alpha, float beta, float gamma,
     return clamp(sh, vec3(0.0), vec3(1.0));
 }
 
+// Adaptive B-spline bicubic filter for magnified tiles:
+// Eliminates texel blockiness, bilinear creases, and stair-stepped diamond edges.
+// Dynamically blends to 1-tap standard bilinear when minified for maximum orbital performance.
+vec4 sample_tile_smooth(sampler2DArray tex, vec2 uv_coord, float slot) {
+    vec2 tex_size = vec2(textureSize(tex, 0).xy);
+    vec2 inv_tex_size = 1.0 / tex_size;
+
+    // Check pixel footprint in texel space
+    vec2 duv = max(abs(dFdx(uv_coord)), abs(dFdy(uv_coord))) * tex_size;
+    float max_duv = max(duv.x, duv.y);
+
+    // If minified (more than 1.5 texels per screen pixel), standard bilinear is already smooth and cheaper:
+    if (max_duv >= 1.5) {
+        return texture(tex, vec3(clamp(uv_coord, 0.0, 1.0), slot));
+    }
+
+    vec2 coord_grid = clamp(uv_coord, 0.0, 1.0) * tex_size - 0.5;
+    vec2 f = fract(coord_grid);
+    vec2 index = floor(coord_grid);
+
+    // Cubic B-spline weights (C2 continuous, zero ringing, smoothly rounded texel boundaries)
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = (1.0 / 6.0) * (1.0 - f) * (1.0 - f) * (1.0 - f);
+    vec2 w1 = (1.0 / 6.0) * (3.0 * f3 - 6.0 * f2 + 4.0);
+    vec2 w2 = (1.0 / 6.0) * (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0);
+    vec2 w3 = (1.0 / 6.0) * f3;
+
+    vec2 s0 = w0 + w1;
+    vec2 s1 = w2 + w3;
+
+    vec2 f0 = w1 / max(s0, vec2(1e-5));
+    vec2 f1 = w3 / max(s1, vec2(1e-5));
+
+    vec2 t0 = clamp((index - 1.0 + f0 + 0.5) * inv_tex_size, 0.0, 1.0);
+    vec2 t1 = clamp((index + 1.0 + f1 + 0.5) * inv_tex_size, 0.0, 1.0);
+
+    vec4 bicubic_sample = (
+        texture(tex, vec3(t0.x, t0.y, slot)) * (s0.x * s0.y) +
+        texture(tex, vec3(t1.x, t0.y, slot)) * (s1.x * s0.y) +
+        texture(tex, vec3(t0.x, t1.y, slot)) * (s0.x * s1.y) +
+        texture(tex, vec3(t1.x, t1.y, slot)) * (s1.x * s1.y)
+    );
+
+    // Smooth transition between bilinear and bicubic between 0.75 and 1.5 texels/pixel
+    if (max_duv > 0.75) {
+        float blend = smoothstep(0.75, 1.5, max_duv);
+        vec4 linear_sample = texture(tex, vec3(clamp(uv_coord, 0.0, 1.0), slot));
+        return mix(bicubic_sample, linear_sample, blend);
+    }
+
+    return bicubic_sample;
+}
+
 void main() {
     if (f_tile_slot < 0.0) {
         discard;
@@ -143,26 +199,12 @@ void main() {
     // Write logarithmic depth matching sphere and orbit shaders
     gl_FragDepth = log2(max(1e-6, 1.0 + f_clip_z * u_depth_C)) / log2(u_far * u_depth_C + 1.0);
 
-    // Sample from the tiled Texture2DArray
-    vec3 tile_coord = vec3(clamp(f_tile_uv, 0.0, 1.0), f_tile_slot);
-    vec4 tex_sample = texture(u_tile_array, tile_coord);
+    // Sample from the tiled Texture2DArray with adaptive smooth Bicubic B-spline filtering
+    vec4 tex_sample = sample_tile_smooth(u_tile_array, f_tile_uv, f_tile_slot);
 
     vec3 N = normalize(f_normal);
-    if (!u_is_cloud_pass && f_height_slot >= 0.0) {
-        // Match the physical triangle before refraction/lensing. Patch-relative
-        // km positions keep sub-pixel differences precise near the ground;
-        // subtracting the anchor here, AFTER interpolation, would be too late.
-        vec3 dx = dFdx(f_patch_pos_km);
-        vec3 dy = dFdy(f_patch_pos_km);
-        if (dot(dx, dx) > 0.0 && dot(dy, dy) > 0.0) {
-            vec3 face = cross(normalize(dx), normalize(dy));
-            if (dot(face, face) > 1e-12) {
-                face = normalize(face);
-                N = dot(face, N) < 0.0 ? -face : face;
-            }
-        }
-    }
-    vec3 V = normalize(u_camera_pos - f_world_pos);
+    // In camera-relative coordinates, f_world_pos is (P - eye), so the vector to the eye is -f_world_pos:
+    vec3 V = normalize(-f_world_pos);
 
     // =========================================================================
     // CLOUD PASS (Transparent Spherified Cube Quadtree Shell)
