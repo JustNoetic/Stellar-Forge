@@ -45,6 +45,7 @@ uniform float u_clip_atmo_radius; // host atmosphere's equatorial radius, AU
 uniform uint u_caster_mask_lo;
 uniform uint u_caster_mask_hi;
 uniform bool u_planetshine_enabled;
+uniform int u_planetshine_mode; // 0 = Analytical (Fast O(1)), 1 = Numerical (64 Samples)
 uniform float u_exposure;
 uniform bool u_hdr_enabled;
 uniform float u_caster_max_bend[64];
@@ -422,48 +423,112 @@ void main() {
     }
 
     vec3 total_planetshine = vec3(0.0);
-    if (u_planetshine_enabled && u_host_planet_radius>0.0) {
+    if (u_planetshine_enabled && u_host_planet_radius > 0.0) {
         float dist_host = length(hit_local);
-        vec3 L_center = -hit_local/max(dist_host,1e-10);
-        float sin_radius = min(u_host_planet_radius/max(dist_host,1e-10),0.999);
-        float eta = max(1.0,u_host_planet_pole_obl.w*u_host_planet_pole_obl.w);
-        vec3 O = hit_local;
-        float oq = dot(O,pole_n);
-        float c = dot(O,O)+(eta-1.0)*oq*oq-u_host_planet_radius*u_host_planet_radius;
-        for (int i=0; i<u_num_ring_planes; ++i) {
-            RingComponent material=ring_material(i,r,footprint);
-            if(material.tau<=0.0) continue;
-            for (int q=0; q<RING_DISK_SAMPLES; ++q) {
-                vec4 source = ring_disk_sample(L_center,N,sin_radius,q);
+        vec3 L_center = -hit_local / max(dist_host, 1e-10);
+        float sin_radius = min(u_host_planet_radius / max(dist_host, 1e-10), 0.999);
+        float obl_factor = 1.0 / max(1.0, u_host_planet_pole_obl.w);
+
+        if (u_planetshine_mode == 1) {
+            // Mode 1: Numerical 64-sample disk integration with ray-ellipsoid solve
+            float eta = max(1.0, u_host_planet_pole_obl.w * u_host_planet_pole_obl.w);
+            vec3 O = hit_local;
+            float oq = dot(O, pole_n);
+            float c = dot(O, O) + (eta - 1.0) * oq * oq - u_host_planet_radius * u_host_planet_radius;
+
+            for (int q = 0; q < RING_DISK_SAMPLES; ++q) {
+                vec4 source = ring_disk_sample(L_center, N, sin_radius, q);
                 vec3 D = source.xyz;
-                float dq = dot(D,pole_n);
-                float a = dot(D,D)+(eta-1.0)*dq*dq;
-                float b = dot(O,D)+(eta-1.0)*oq*dq;
-                float discriminant = b*b-a*c;
-                if (discriminant<=0.0) continue;
-                float distance_to_surface = (-b-sqrt(discriminant))/a;
-                if (distance_to_surface<=0.0) continue;
-                vec3 Q = O+distance_to_surface*D;
-                vec3 normal = normalize(Q+pole_n*((eta-1.0)*dot(Q,pole_n)));
-                float sun=dot(N,D);
-                float response=ring_radiance(total_tau,material.alpha,mu_v,sun,-dot(D,V),
-                    material.props,material.textured,cam_side*sun>=0.0);
-                vec3 ring_response=material.color*(material.tau/total_tau)*response;
-                // Ring output multiplies radiance by pi; it cancels the host's
-                // Lambertian 1/pi. Remaining weight is the exact disk dOmega.
-                float solid_angle_weight = PI*sin_radius*sin_radius*source.w;
-                for (int s=0; s<u_num_stars; ++s) {
-                    vec3 to_star = (u_stars_pos_radius[s].xyz-u_host_planet_pos)-Q;
-                    float distance_to_star = max(length(to_star),1e-10);
-                    vec3 L_host = to_star/distance_to_star;
-                    float incidence = max(0.0,dot(normal,L_host));
-                    if (incidence<=0.0) continue;
-                    float latitude = abs(dot(L_host,normalize(u_stars_poles_obl[s].xyz)));
-                    vec3 star_color = mix(u_stars_colors[s].rgb,u_stars_pole_colors[s].rgb,latitude);
-                    float star_lum = mix(u_stars_colors[s].a,u_stars_pole_colors[s].a,latitude);
-                    float flux = u_hdr_enabled ? star_lum/(distance_to_star*distance_to_star) : 1.0;
-                    total_planetshine += u_host_planet_color*star_color*flux*incidence
-                                        *ring_response*solid_angle_weight;
+                float dq = dot(D, pole_n);
+                float a = dot(D, D) + (eta - 1.0) * dq * dq;
+                float b = dot(O, D) + (eta - 1.0) * oq * dq;
+                float discriminant = b * b - a * c;
+                if (discriminant <= 0.0) continue;
+                float distance_to_surface = (-b - sqrt(discriminant)) / a;
+                if (distance_to_surface <= 0.0) continue;
+                vec3 Q = O + distance_to_surface * D;
+                vec3 normal = normalize(Q + pole_n * ((eta - 1.0) * dot(Q, pole_n)));
+
+                vec3 host_rad = vec3(0.0);
+                for (int s = 0; s < u_num_stars; ++s) {
+                    vec3 to_star = (u_stars_pos_radius[s].xyz - u_host_planet_pos) - Q;
+                    float distance_to_star = max(length(to_star), 1e-10);
+                    vec3 L_host = to_star / distance_to_star;
+                    float incidence = max(0.0, dot(normal, L_host));
+                    if (incidence <= 0.0) continue;
+                    float latitude = abs(dot(L_host, normalize(u_stars_poles_obl[s].xyz)));
+                    vec3 star_color = mix(u_stars_colors[s].rgb, u_stars_pole_colors[s].rgb, latitude);
+                    float star_lum = mix(u_stars_colors[s].a, u_stars_pole_colors[s].a, latitude);
+                    float flux = u_hdr_enabled ? star_lum / (distance_to_star * distance_to_star) : 1.0;
+                    host_rad += u_host_planet_color * star_color * flux * incidence;
+                }
+                if (dot(host_rad, host_rad) <= 0.0) continue;
+
+                float sun = dot(N, D);
+                float solid_angle_weight = PI * sin_radius * sin_radius * source.w;
+                for (int i = 0; i < u_num_ring_planes; ++i) {
+                    RingComponent material = ring_material(i, r, footprint);
+                    if (material.tau <= 0.0) continue;
+                    float response = ring_radiance(total_tau, material.alpha, mu_v, sun, -dot(D, V),
+                        material.props, material.textured, cam_side * sun >= 0.0);
+                    vec3 ring_response = material.color * (material.tau / total_tau) * response;
+                    total_planetshine += host_rad * ring_response * solid_angle_weight;
+                }
+            }
+        } else {
+            // Mode 0: Fast O(1) phase-aware analytical approximation
+            // Incorporates near-field view factor, horizon occlusion, lit crescent centroid, and lobe broadening.
+            float near_field_boost = 1.0 + sin_radius * (0.45 + 0.95 * sin_radius);
+            float solid_angle = PI * sin_radius * sin_radius * obl_factor * near_field_boost;
+            float theta_horiz = acos(min(sin_radius, 0.9999));
+            float alpha_max = max(0.001, 0.5 * PI + theta_horiz);
+            float g_broaden = 1.0 / (1.0 + 1.2 * sin_radius);
+            float eff_mu = (4.0 / (3.0 * PI)) * sin_radius;
+
+            for (int s = 0; s < u_num_stars; ++s) {
+                vec3 to_star = (u_stars_pos_radius[s].xyz - u_host_planet_pos);
+                float distance_to_star = max(length(to_star), 1e-10);
+                vec3 L_host = to_star / distance_to_star;
+                float cos_phase = clamp(dot(-L_center, L_host), -1.0, 1.0);
+                if (cos_phase <= -0.9999) continue;
+                float phase_angle = acos(cos_phase);
+
+                // Near-field horizon phase scaling
+                float alpha_norm = min(PI, phase_angle * (PI / alpha_max));
+                float sin_norm = sin(alpha_norm);
+                float phi = (sin_norm + (PI - alpha_norm) * cos(alpha_norm)) / PI;
+                float avg_incidence = (2.0 / 3.0) * max(0.0, phi);
+                if (avg_incidence <= 0.0) continue;
+
+                // Most representative direction: lit crescent centroid
+                vec3 u_star = L_host - L_center * dot(L_host, L_center);
+                float len_u = length(u_star);
+                vec3 lit_dir = len_u > 1e-5 ? (u_star / len_u) : vec3(0.0);
+                float shift = sin_radius * 0.45 * (1.0 - cos(alpha_norm));
+                vec3 D_lit = normalize(L_center + lit_dir * shift);
+
+                float sun_c = dot(N, D_lit);
+                float sun_up = sun_c + eff_mu;
+                float sun_down = sun_c - eff_mu;
+                float cos_theta = -dot(D_lit, V);
+
+                float latitude = abs(dot(L_host, normalize(u_stars_poles_obl[s].xyz)));
+                vec3 star_color = mix(u_stars_colors[s].rgb, u_stars_pole_colors[s].rgb, latitude);
+                float star_lum = mix(u_stars_colors[s].a, u_stars_pole_colors[s].a, latitude);
+                float flux = u_hdr_enabled ? star_lum / (distance_to_star * distance_to_star) : 1.0;
+                vec3 host_rad = u_host_planet_color * star_color * flux * avg_incidence;
+
+                for (int i = 0; i < u_num_ring_planes; ++i) {
+                    RingComponent material = ring_material(i, r, footprint);
+                    if (material.tau <= 0.0) continue;
+                    vec4 props_broad = vec4(material.props.r * g_broaden, material.props.g * g_broaden, material.props.b, material.props.a);
+                    float resp_up = ring_radiance(total_tau, material.alpha, mu_v, sun_up, cos_theta,
+                        props_broad, material.textured, cam_side * sun_up >= 0.0);
+                    float resp_down = ring_radiance(total_tau, material.alpha, mu_v, sun_down, cos_theta,
+                        props_broad, material.textured, cam_side * sun_down >= 0.0);
+                    float response = 0.5 * (resp_up + resp_down);
+                    vec3 ring_response = material.color * (material.tau / total_tau) * response;
+                    total_planetshine += host_rad * ring_response * solid_angle;
                 }
             }
         }

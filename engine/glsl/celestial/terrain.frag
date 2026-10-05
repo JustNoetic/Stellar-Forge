@@ -71,9 +71,15 @@ uniform float u_au_to_km;
 uniform sampler2D u_ring_gradients;
 uniform sampler2D u_ringshine_map;
 #include "common/ringshine_lookup.glsl"
+#include "common/ring_optics.glsl"
+#include "common/ringshine_monte_carlo.glsl"
 
 uniform bool u_planetshine_enabled;
 uniform bool u_ringshine_enabled;
+uniform int u_ringshine_mode; // 0 = Precomputed Map (Default), 1 = Per-Pixel Monte Carlo (Ground Truth)
+uniform int u_ringshine_mc_samples;
+uniform bool u_ringshine_mc_dither;
+uniform int u_frame_idx;
 
 #include "common/surface_ring_shadow.glsl"
 
@@ -400,8 +406,33 @@ void main() {
                     float y_prime = frag_elevation;
                     float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
-                    vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
-                    vec3 total_ring_irradiance = ringshine_sample(map_uv, k, s);
+                    vec3 total_ring_irradiance;
+                    if (u_ringshine_mode == 1) {
+                        float host_radius = host_caster_idx >= 0 ? u_casters[host_caster_idx].w : u_ring_params[k].w;
+                        float host_r_minor = host_caster_idx >= 0 ? u_caster_poles_obl[host_caster_idx].w : host_radius;
+                        vec3 host_pole = host_caster_idx >= 0 ? u_caster_poles_obl[host_caster_idx].xyz : ring_normal;
+                        total_ring_irradiance = ringshine_mc_irradiance(
+                            f_rel_pos,
+                            N,
+                            L,
+                            k,
+                            ring_center - f_body_center,
+                            ring_normal,
+                            inner_r,
+                            outer_r,
+                            u_ring_params[k].z,
+                            host_radius,
+                            host_r_minor,
+                            host_pole,
+                            u_ringshine_mc_samples,
+                            u_ringshine_mc_dither,
+                            u_frame_idx,
+                            gl_FragCoord.xy
+                        );
+                    } else {
+                        vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
+                        total_ring_irradiance = ringshine_sample(map_uv, k, s);
+                    }
 
                     float shine_intensity = 0.318309886; // 1 / PI
                     vec3 ring_tint = total_ring_irradiance;
@@ -643,8 +674,33 @@ void main() {
                 float y_prime = frag_elevation;
                 float elev_uv = sign(y_prime) * pow(abs(y_prime), 0.666666667) * 0.5 + 0.5;
 
-                vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
-                vec3 total_ring_irradiance = ringshine_sample(map_uv, k, s);
+                vec3 total_ring_irradiance;
+                if (u_ringshine_mode == 1) {
+                    float host_radius = host_caster_idx >= 0 ? u_casters[host_caster_idx].w : u_ring_params[k].w;
+                    float host_r_minor = host_caster_idx >= 0 ? u_caster_poles_obl[host_caster_idx].w : host_radius;
+                    vec3 host_pole = host_caster_idx >= 0 ? u_caster_poles_obl[host_caster_idx].xyz : ring_normal;
+                    total_ring_irradiance = ringshine_mc_irradiance(
+                        f_rel_pos,
+                        N,
+                        L,
+                        k,
+                        ring_center - f_body_center,
+                        ring_normal,
+                        inner_r,
+                        outer_r,
+                        u_ring_params[k].z,
+                        host_radius,
+                        host_r_minor,
+                        host_pole,
+                        u_ringshine_mc_samples,
+                        u_ringshine_mc_dither,
+                        u_frame_idx,
+                        gl_FragCoord.xy
+                    );
+                } else {
+                    vec2 map_uv = vec2(phi_uv, (float(k) + elev_uv) / 16.0);
+                    total_ring_irradiance = ringshine_sample(map_uv, k, s);
+                }
 
                 float shine_intensity = 0.318309886; // 1 / PI
                 vec3 ring_tint = total_ring_irradiance;

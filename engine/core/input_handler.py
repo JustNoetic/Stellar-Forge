@@ -72,7 +72,11 @@ class InputHandlerMixin:
                 "ephem_hide_outside": self.camera.get("ephem_hide_outside", True),
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
                 "planetshine_enabled": self.camera.get("planetshine_enabled", True),
+                "ring_planetshine_mode": self.camera.get("ring_planetshine_mode", 0),
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
+                "ringshine_mode": self.camera.get("ringshine_mode", 0),
+                "ringshine_mc_samples": self.camera.get("ringshine_mc_samples", 32),
+                "ringshine_mc_dither": self.camera.get("ringshine_mc_dither", False),
                 "ringshine_oblate_enabled": self.camera.get("ringshine_oblate_enabled", True),
                 "ringshine_band_count": self.camera.get("ringshine_band_count", 10),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
@@ -81,6 +85,7 @@ class InputHandlerMixin:
                 "tex_stream_threshold_px": self.camera.get("tex_stream_threshold_px", 500.0),
                 "screenshot_res_idx": self.camera.get("screenshot_res_idx", 1),
                 "movement_mode": self.camera.get("movement_mode", 0),
+                "comparison_force_keplerian": self.camera.get("comparison_force_keplerian", True),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)

@@ -194,31 +194,10 @@ void main() {
             surface_color *= (1.0 - blocked);
         }
     } else {
-        // Primary star reflection
-        vec3 star_pos = u_stars_pos_radius[0].xyz;
-        float star_lum = max(u_stars_colors[0].w, 1.0);
-        vec3 star_col = u_stars_colors[0].rgb;
-
-        vec3 L = star_pos - in_offset;
-        float dist_star = length(L);
-        vec3 L_dir = (dist_star > 1e-6) ? (L / dist_star) : vec3(0.0, 1.0, 0.0);
         vec3 V_dir = (dist > 1e-6) ? normalize(u_camera_pos - in_offset) : vec3(0.0, 0.0, 1.0);
-
-        // Lambertian sphere phase integral
-        float phase_cos = clamp(dot(V_dir, L_dir), -1.0, 1.0);
-        float phase_sin = sqrt(max(0.0, 1.0 - phase_cos * phase_cos));
-        float phase_angle = acos(phase_cos);
-        float phase_func = max(0.0, (phase_sin + (PI - phase_angle) * phase_cos) / PI);
 
         SurfaceMaterial material = u_surface_materials[inst_idx];
         bool hapke = material.grain.x > 0.5;
-        if (hapke) {
-            float stellar_radius = asin(clamp(u_stars_pos_radius[0].w/max(dist_star,1e-6),0.0,0.84));
-            phase_func = surface_disk_response(phase_cos,stellar_radius,material);
-        } else {
-            phase_func *= material.surface.w;
-        }
-        float star_irradiance = star_lum / max(dist_star * dist_star, 1e-6);
 
         // Geometric albedo: use true Top-Of-Atmosphere (TOA) color if body has an atmosphere
         // Hapke textures use the same cached linear mean as planetshine.
@@ -234,75 +213,105 @@ void main() {
                 break;
             }
         }
-        // Analytic shadow occlusion and atmospheric refraction (lunar/planetary eclipses)
-        float shadow_geom = 1.0;
-        vec3 shadow_refr = vec3(0.0);
-        float star_r = max(u_stars_pos_radius[0].w, 1e-6);
 
-        for (int j = 0; j < u_num_casters; j++) {
-            if (distance(u_casters[j].xyz, in_offset) < 1e-7) continue;
+        int active_stars = min(u_num_stars, 4);
+        float primary_shadow = 1.0;
 
-            vec3 to_caster = u_casters[j].xyz - in_offset;
-            float t_c = dot(to_caster, L_dir);
-            if (t_c <= 1e-6 || t_c >= dist_star) continue;
+        for (int s = 0; s < active_stars; s++) {
+            vec3 star_pos = u_stars_pos_radius[s].xyz;
+            float star_lum = max(u_stars_colors[s].w, 1.0);
+            vec3 star_col = u_stars_colors[s].rgb;
+            float star_r = max(u_stars_pos_radius[s].w, 1e-6);
 
-            float perp_sq = max(0.0, dot(to_caster, to_caster) - t_c * t_c);
-            float inv_tc = 1.0 / t_c;
-            float gamma = sqrt(perp_sq) * inv_tc;
-            float caster_r = u_casters[j].w;
-            float caster_r_minor = u_caster_poles_obl[j].w;
-            if (caster_r_minor > 1e-6 && caster_r_minor < caster_r - 1e-5) {
-                vec3 perp_vec = to_caster - t_c * L_dir;
-                caster_r = get_oblate_radius(caster_r, caster_r_minor, u_caster_poles_obl[j].xyz, L_dir, perp_vec);
+            vec3 L = star_pos - in_offset;
+            float dist_star = length(L);
+            if (dist_star < 1e-6) continue;
+            vec3 L_dir = L / dist_star;
+
+            // Lambertian sphere phase integral
+            float phase_cos = clamp(dot(V_dir, L_dir), -1.0, 1.0);
+            float phase_sin = sqrt(max(0.0, 1.0 - phase_cos * phase_cos));
+            float phase_angle = acos(phase_cos);
+            float phase_func = max(0.0, (phase_sin + (PI - phase_angle) * phase_cos) / PI);
+
+            if (hapke) {
+                float stellar_radius = asin(clamp(star_r / dist_star, 0.0, 0.84));
+                phase_func = surface_disk_response(phase_cos, stellar_radius, material);
+            } else {
+                phase_func *= material.surface.w;
             }
-            float beta = caster_r * inv_tc;
-            float alpha = star_r / dist_star;
-            float theta_b = in_radius * inv_tc;
+            float star_irradiance = star_lum / max(dist_star * dist_star, 1e-6);
 
-            float p_out = alpha + beta + theta_b;
-            if (gamma >= p_out) continue;
+            // Analytic shadow occlusion and atmospheric refraction (lunar/planetary eclipses)
+            float shadow_geom = 1.0;
+            vec3 shadow_refr = vec3(0.0);
 
-            float p_in = max(0.0, abs(beta - alpha) - theta_b);
-            float t_occ = clamp((p_out - gamma) / max(1e-6, p_out - p_in), 0.0, 1.0);
-            float occ = t_occ * t_occ * (3.0 - 2.0 * t_occ);
-            float max_occ = min(1.0, (beta * beta) / max(1e-12, alpha * alpha));
-            float geom_sh = pow(clamp(1.0 - max_occ * occ, 0.0, 1.0), 1.0 / 1.6);
-            shadow_geom *= geom_sh;
+            for (int j = 0; j < u_num_casters; j++) {
+                if (distance(u_casters[j].xyz, in_offset) < 1e-7) continue;
 
-            float caster_thick = u_caster_atmos[j].w;
-            if (caster_thick > 0.0 && beta > alpha) {
-                float H_scale = max(u_caster_colors[j].w, 0.1);
-                float d_km = t_c * u_au_to_km;
-                float req_bend = max(0.0, beta - gamma - 0.8 * alpha);
-                float max_bend = 0.035;
-                if (req_bend <= max_bend) {
-                    float radial_defocus = 1.0 / (1.0 + (d_km * max(req_bend, 1e-6)) / H_scale);
-                    float ring_intensity = ((2.0 * H_scale) / max(alpha * d_km, 1e-9)) * radial_defocus;
+                vec3 to_caster = u_casters[j].xyz - in_offset;
+                float t_c = dot(to_caster, L_dir);
+                if (t_c <= 1e-6 || t_c >= dist_star) continue;
 
-                    float atmo_depth = clamp(req_bend / max_bend, 0.0, 1.0);
-                    float z_km = -H_scale * log(max(atmo_depth, 1e-5));
-                    float caster_r_km = max(beta * d_km, 100.0);
-                    float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
-                    vec3 tau_R = u_caster_atmos[j].xyz * grazing_factor * atmo_depth;
-                    float sigma_z = max(0.707 * H_scale, 0.1);
-                    float z_diff = (z_km - u_caster_ozone[j].w) / sigma_z;
-                    vec3 tau_O3 = u_caster_ozone[j].xyz * exp(-0.5 * z_diff * z_diff);
-                    vec3 atmo_transmittance = exp(-(tau_R + tau_O3));
+                float perp_sq = max(0.0, dot(to_caster, to_caster) - t_c * t_c);
+                float inv_tc = 1.0 / t_c;
+                float gamma = sqrt(perp_sq) * inv_tc;
+                float caster_r = u_casters[j].w;
+                float caster_r_minor = u_caster_poles_obl[j].w;
+                if (caster_r_minor > 1e-6 && caster_r_minor < caster_r - 1e-5) {
+                    vec3 perp_vec = to_caster - t_c * L_dir;
+                    caster_r = get_oblate_radius(caster_r, caster_r_minor, u_caster_poles_obl[j].xyz, L_dir, perp_vec);
+                }
+                float beta = caster_r * inv_tc;
+                float alpha = star_r / dist_star;
+                float theta_b = in_radius * inv_tc;
 
-                    float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
-                    float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
-                    shadow_refr += atmo_transmittance * refraction_intensity * occ;
+                float p_out = alpha + beta + theta_b;
+                if (gamma >= p_out) continue;
+
+                float p_in = max(0.0, abs(beta - alpha) - theta_b);
+                float t_occ = clamp((p_out - gamma) / max(1e-6, p_out - p_in), 0.0, 1.0);
+                float occ = t_occ * t_occ * (3.0 - 2.0 * t_occ);
+                float max_occ = min(1.0, (beta * beta) / max(1e-12, alpha * alpha));
+                float geom_sh = pow(clamp(1.0 - max_occ * occ, 0.0, 1.0), 1.0 / 1.6);
+                shadow_geom *= geom_sh;
+
+                float caster_thick = u_caster_atmos[j].w;
+                if (caster_thick > 0.0 && beta > alpha) {
+                    float H_scale = max(u_caster_colors[j].w, 0.1);
+                    float d_km = t_c * u_au_to_km;
+                    float req_bend = max(0.0, beta - gamma - 0.8 * alpha);
+                    float max_bend = 0.035;
+                    if (req_bend <= max_bend) {
+                        float radial_defocus = 1.0 / (1.0 + (d_km * max(req_bend, 1e-6)) / H_scale);
+                        float ring_intensity = ((2.0 * H_scale) / max(alpha * d_km, 1e-9)) * radial_defocus;
+
+                        float atmo_depth = clamp(req_bend / max_bend, 0.0, 1.0);
+                        float z_km = -H_scale * log(max(atmo_depth, 1e-5));
+                        float caster_r_km = max(beta * d_km, 100.0);
+                        float grazing_factor = sqrt(2.0 * PI * caster_r_km / max(H_scale, 1e-3));
+                        vec3 tau_R = u_caster_atmos[j].xyz * grazing_factor * atmo_depth;
+                        float sigma_z = max(0.707 * H_scale, 0.1);
+                        float z_diff = (z_km - u_caster_ozone[j].w) / sigma_z;
+                        vec3 tau_O3 = u_caster_ozone[j].xyz * exp(-0.5 * z_diff * z_diff);
+                        vec3 atmo_transmittance = exp(-(tau_R + tau_O3));
+
+                        float body_surface_fade = smoothstep(1.0, 0.75, atmo_depth);
+                        float refraction_intensity = ring_intensity * (1.0 - atmo_depth * 0.7) * body_surface_fade;
+                        shadow_refr += atmo_transmittance * refraction_intensity * occ;
+                    }
                 }
             }
-        }
 
-        vec3 total_shadow = clamp(vec3(shadow_geom) + shadow_refr, 0.0, 1.0);
-        surface_color = star_col * albedo * (star_irradiance * phase_func) * total_shadow;
+            vec3 total_shadow = clamp(vec3(shadow_geom) + shadow_refr, 0.0, 1.0);
+            if (s == 0) primary_shadow = shadow_geom;
+            surface_color += star_col * albedo * (star_irradiance * phase_func) * total_shadow;
+        }
 
         // Secondary planetshine contribution if nearby (gated by eclipse shadow)
         vec3 planetshine_color = f5.xyz;
         if (dot(planetshine_color, planetshine_color) > 1e-12) {
-            surface_color += planetshine_color * 0.5 * total_shadow;
+            surface_color += planetshine_color * 0.5 * primary_shadow;
         }
     }
 

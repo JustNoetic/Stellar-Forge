@@ -134,8 +134,9 @@ void main() {
             total += star_scatter[st];
         }
     }
-    total += endpoint_secondary_light(a, b, T, instances[u_body_idx*7+4].xyz,
-        instances[u_body_idx*7+5].xyz, floatBitsToUint(instances[u_body_idx*7+3].w));
+    // Secondary light (planetshine and ringshine) is decoupled from the low-resolution Sky-View LUT
+    // and evaluated per-screen-fragment in atmo.frag to eliminate pixelation / stairstepping
+    // at sharp transitions (such as the edge-on equatorial ringshine dimming).
     out_color = vec4(total, dot(T, vec3(1.0/3.0)));
     out_transmittance = vec4(T, 1.0);
     out_star0 = vec4(star_scatter[0], 1.0); out_star1 = vec4(star_scatter[1], 1.0);

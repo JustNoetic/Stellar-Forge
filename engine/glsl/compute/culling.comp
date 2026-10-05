@@ -221,20 +221,29 @@ void main() {
             float surf_lum = star_lum / (star_r * star_r);
             apparent_flux = apparent_px * apparent_px * surf_lum;
         } else {
-            vec3 star_p = instances[u_star_idx * 7 + 0].xyz;
-            float d_star = length(star_p - pos);
-            float star_lum = max(instances[u_star_idx * 7 + 4].w, 1.0);
-            float star_flux = star_lum / max(d_star * d_star, 1e-4);
+            int num_st = (u_num_ring_stars > 0) ? min(u_num_ring_stars, 16) : 1;
+            float best_star_flux = 0.0;
+            vec3 best_L = vec3(0.0, 1.0, 0.0);
+            for (int st = 0; st < num_st; ++st) {
+                int s_i = (u_num_ring_stars > 0) ? u_ring_star_indices[st] : u_star_idx;
+                vec3 star_p = instances[s_i * 7 + 0].xyz;
+                float d_star = length(star_p - pos);
+                float star_lum = max(instances[s_i * 7 + 4].w, 1.0);
+                float s_flux = star_lum / max(d_star * d_star, 1e-4);
+                if (s_flux > best_star_flux) {
+                    best_star_flux = s_flux;
+                    best_L = (d_star > 1e-6) ? ((star_p - pos) / d_star) : vec3(0.0, 1.0, 0.0);
+                }
+            }
 
-            vec3 L = (d_star > 1e-6) ? ((star_p - pos) / d_star) : vec3(0.0, 1.0, 0.0);
             vec3 V = (cam_dist > 1e-6) ? ((u_camera_pos - pos) / cam_dist) : vec3(0.0, 0.0, 1.0);
-            float cos_alpha = clamp(dot(V, L), -1.0, 1.0);
+            float cos_alpha = clamp(dot(V, best_L), -1.0, 1.0);
             float alpha = acos(cos_alpha);
             float phase_func = max(0.0, (sin(alpha) + (3.14159265 - alpha) * cos_alpha) / 3.14159265);
 
             vec3 body_col = vec3(f0.w, f1.x, f1.y);
             float alb = clamp(dot(body_col, vec3(0.2126, 0.7152, 0.0722)), 0.04, 1.0);
-            apparent_flux = apparent_px * apparent_px * star_flux * alb * phase_func;
+            apparent_flux = apparent_px * apparent_px * best_star_flux * alb * phase_func;
         }
 
         // Peak pixel signal on sensor

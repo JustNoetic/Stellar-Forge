@@ -281,16 +281,20 @@ for name,value in {'u_ring_gradients':0,'u_ring_texture':4,'u_camera_pos':tuple(
                    'u_host_planet_radius':1.,'u_host_planet_color':(.8,.8,.8),
                    'u_planetshine_enabled':True,'u_hdr_enabled':False,'u_exposure':1}.items():
     if name in ring: ring[name].value=value
-day,_=render([{'alpha':.5}],(1,0,0))
-night,_=render([{'alpha':.5}],(-1,0,0))
-assert day[4,4,:3].min()>0
-assert night[4,4,:3].max()==0
-ring['u_host_planet_pole_obl'].value=(0,1,0,1.3)
-oblate,_=render([{'alpha':.5}],(1,0,0))
-assert 0<oblate[4,4,0]<day[4,4,0]
-metrics['planetshine_day_rgb']=day[4,4,:3].tolist()
-metrics['planetshine_night_rgb']=night[4,4,:3].tolist()
-print('Production planetshine: lit disk, hidden day side, and oblate host passed',flush=True)
+for mode in (0, 1):
+    if 'u_planetshine_mode' in ring: ring['u_planetshine_mode'].value = mode
+    day,_=render([{'alpha':.5}],(1,0,0))
+    night,_=render([{'alpha':.5}],(-1,0,0))
+    assert day[4,4,:3].min()>0
+    assert night[4,4,:3].max()==0
+    ring['u_host_planet_pole_obl'].value=(0,1,0,1.3)
+    oblate,_=render([{'alpha':.5}],(1,0,0))
+    assert 0<oblate[4,4,0]<day[4,4,0]
+    ring['u_host_planet_pole_obl'].value=(0,1,0,1)
+    if mode == 0:
+        metrics['planetshine_day_rgb']=day[4,4,:3].tolist()
+        metrics['planetshine_night_rgb']=night[4,4,:3].tolist()
+print('Production planetshine: lit disk, hidden day side, and oblate host passed (both analytical & numerical)',flush=True)
 ring,vao=saved_ring,saved_vao
 
 # Source quadrature convergence against a much denser independent disk integral.
@@ -317,11 +321,13 @@ import statistics
 large_target=ctx.texture((1024,256),4,dtype='f4')
 large_fbo=ctx.framebuffer([large_target])
 metrics['gpu_fragment_ms_1024x256']={}
-for name,planet,source_radius in (('direct_point',False,0.),('direct_finite',False,.005),
-                                  ('direct_and_planetshine',True,0.)):
+for name,planet,mode,source_radius in (('direct_point',False,0,0.),('direct_finite',False,0,.005),
+                                       ('direct_and_planetshine',True,0,0.),
+                                       ('direct_and_planetshine_numerical',True,1,0.)):
     ring['u_host_planet_radius'].value=1. if planet else 0.
     ring['u_host_planet_color'].value=(.8,.8,.8)
     ring['u_planetshine_enabled'].value=planet
+    if 'u_planetshine_mode' in ring: ring['u_planetshine_mode'].value=mode
     render([{'alpha':.5}],(1,0,0) if source_radius else (1,.3,.4),source_radius)
     large_fbo.use(); ctx.viewport=(0,0,1024,256)
     vao.render(vertices=3); ctx.finish()

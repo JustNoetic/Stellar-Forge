@@ -538,7 +538,11 @@ class App(InputHandlerMixin):
             "ephem_hide_outside": True,
             "show_habitable_zone": False,
             "planetshine_enabled": True,
+            "ring_planetshine_mode": 0,
             "ringshine_enabled": True,
+            "ringshine_mode": 0,
+            "ringshine_mc_samples": 32,
+            "ringshine_mc_dither": False,
             "ringshine_oblate_enabled": True,
             "ringshine_band_count": 10,
             "bloom_mode": 2,
@@ -564,6 +568,7 @@ class App(InputHandlerMixin):
             "screenshot_accum_target": 16,
             "movement_mode": 0,
             "terrain_patch_res": 32,
+            "comparison_force_keplerian": True,
         }
         self.time_ctrl = {
             "multiplier": 1.0,
@@ -781,7 +786,11 @@ class App(InputHandlerMixin):
                 "ephem_hide_outside": self.camera.get("ephem_hide_outside", True),
                 "show_habitable_zone": self.camera.get("show_habitable_zone", False),
                 "planetshine_enabled": self.camera.get("planetshine_enabled", True),
+                "ring_planetshine_mode": self.camera.get("ring_planetshine_mode", 0),
                 "ringshine_enabled": self.camera.get("ringshine_enabled", True),
+                "ringshine_mode": self.camera.get("ringshine_mode", 0),
+                "ringshine_mc_samples": self.camera.get("ringshine_mc_samples", 32),
+                "ringshine_mc_dither": self.camera.get("ringshine_mc_dither", False),
                 "ringshine_oblate_enabled": self.camera.get("ringshine_oblate_enabled", True),
                 "ringshine_band_count": self.camera.get("ringshine_band_count", 10),
                 "inspector_frame": self.camera.get("inspector_frame", 0),
@@ -807,6 +816,7 @@ class App(InputHandlerMixin):
                 "refraction_enabled": self.camera.get("refraction_enabled", True),
                 "grav_lensing_enabled": self.camera.get("grav_lensing_enabled", True),
                 "grav_lensing_multiplier": self.camera.get("grav_lensing_multiplier", 1.0),
+                "comparison_force_keplerian": self.camera.get("comparison_force_keplerian", True),
             }
             with open(settings_path, 'w') as f:
                 json.dump(saved, f, indent=4)
@@ -1570,6 +1580,10 @@ class App(InputHandlerMixin):
             "oblate_req": oblate_req_cmp if has_j2_cmp else None,
             "oblate_poles": oblate_poles_cmp if has_j2_cmp else None,
             "oblate_masses": oblate_masses_cmp if has_j2_cmp else None,
+            "ephemeris_mode": False,
+            "keplerian_mode": False,
+            "keplerian_reextract": False,
+            "keplerian_export": False,
             "system_switch_request": None,
             "system_switch_complete": False,
             "system_new_bundle": None,
@@ -2377,6 +2391,7 @@ class App(InputHandlerMixin):
         u_ring_caster_mask_lo_uni = prog_rings['u_caster_mask_lo']
         u_ring_caster_mask_hi_uni = prog_rings['u_caster_mask_hi']
         u_ring_planetshine_enabled = prog_rings.get('u_planetshine_enabled', None)
+        u_ring_planetshine_mode = prog_rings.get('u_planetshine_mode', None)
         u_ring_caster_max_bend = prog_rings.get('u_caster_max_bend', None)
 
         if 'u_ring_gradients' in prog_atmo:
@@ -4240,6 +4255,11 @@ class App(InputHandlerMixin):
                 all_instances[num_bodies:, 3:8] = self.visual_arr_cmp[:, 0:5]
                 all_instances[num_bodies:, 8] = self.is_star_arr_cmp
                 all_instances[num_bodies:, 9:12] = self.visual_arr_cmp[:, 5:8]
+                all_instances[num_bodies:, 12] = self.visual_arr_cmp[:, 8]
+                if self.visual_arr_cmp.shape[1] > 9:
+                    all_instances[num_bodies:, 13:16] = self.visual_arr_cmp[:, 9:12]
+                    all_instances[num_bodies:, 19] = self.visual_arr_cmp[:, 12]
+                    all_instances[num_bodies:, 23] = self.visual_arr_cmp[:, 13]
                 all_instances[num_bodies:, 24] = self.tex_idx_arr_cmp[:self.num_bodies_cmp]
                 cmp_t_sec = float(cmp_sim_t) * 31557600.0
                 all_instances[num_bodies:, 25] = body_spin_angles_cmp
@@ -4323,6 +4343,27 @@ class App(InputHandlerMixin):
                     all_instances[bi,19] = mean[0]
                     all_instances[bi,23] = mean[1]
                     all_instances[bi,27] = mean[2]
+
+            for i in range(total_render_bodies):
+                if all_instances[i, 8] > 0.5:
+                    if i < num_bodies:
+                        b_data = bodies_data[i]
+                    else:
+                        b_data = self.bodies_data_cmp[i - num_bodies]
+                    
+                    lum = 1.0
+                    if "star_props" in b_data and "lum" in b_data["star_props"]:
+                        lum = float(b_data["star_props"]["lum"])
+                    
+                    lum_eq = all_instances[i, 19]
+                    lum_pole = all_instances[i, 23]
+                    if lum_eq <= 0.0:
+                        lum_eq = float(b_data.get("lum_eq", lum))
+                    if lum_pole <= 0.0:
+                        lum_pole = float(b_data.get("lum_pole", lum))
+                    all_instances[i, 19] = lum_eq
+                    all_instances[i, 23] = lum_pole
+
             is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
             star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
             star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
@@ -4338,6 +4379,10 @@ class App(InputHandlerMixin):
                     _bd = self.bodies_data_cmp[_idx - num_bodies]
                 if "star_props" in _bd and "lum" in _bd["star_props"]:
                     star_lums[_k] = float(_bd["star_props"]["lum"])
+                elif "lum_eq" in _bd:
+                    star_lums[_k] = float(_bd["lum_eq"])
+                else:
+                    star_lums[_k] = all_instances[_idx, 19]
                     
             hdr_enabled = self.camera.get("hdr_enabled", True)
             planetshine_enabled = self.camera.get("planetshine_enabled", True)
@@ -5094,8 +5139,20 @@ class App(InputHandlerMixin):
             hdr_enabled = bool(self.camera.get("hdr_enabled", True))
             ps_enabled = bool(self.camera.get("planetshine_enabled", True))
             rs_enabled = bool(self.camera.get("ringshine_enabled", True))
+            rs_mode = int(self.camera.get("ringshine_mode", 0))
+            rs_mc_samples = int(self.camera.get("ringshine_mc_samples", 32))
+            rs_mc_dither = bool(self.camera.get("ringshine_mc_dither", False))
             rs_band_count = int(self.camera.get("ringshine_band_count", 10))
             rs_oblate = bool(self.camera.get("ringshine_oblate_enabled", True))
+            
+            is_accumulating = (
+                (self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)) or
+                (getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False))
+            )
+            if is_accumulating:
+                rs_frame_idx = int(getattr(self, "photo_accum_count", 0))
+            else:
+                rs_frame_idx = int(self.frame_counter % 65536) if rs_mc_dither else 0
             
             for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view, self.prog_terrain):
                 if prog is None: continue
@@ -5107,6 +5164,14 @@ class App(InputHandlerMixin):
                 if u is not None: u.value = ps_enabled
                 u = prog.get('u_ringshine_enabled', None)
                 if u is not None: u.value = rs_enabled
+                u = prog.get('u_ringshine_mode', None)
+                if u is not None: u.value = rs_mode
+                u = prog.get('u_ringshine_mc_samples', None)
+                if u is not None: u.value = rs_mc_samples
+                u = prog.get('u_ringshine_mc_dither', None)
+                if u is not None: u.value = rs_mc_dither
+                u = prog.get('u_frame_idx', None)
+                if u is not None: u.value = rs_frame_idx
                 u = prog.get('u_ringshine_band_count', None)
                 if u is not None: u.value = rs_band_count
                 u = prog.get('u_ringshine_oblate_enabled', None)
@@ -6718,6 +6783,8 @@ class App(InputHandlerMixin):
                 u_ring_clip_atmo_radius.value = clip_atmo_radius
                 if u_ring_planetshine_enabled is not None:
                     u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
+                if u_ring_planetshine_mode is not None:
+                    u_ring_planetshine_mode.value = int(self.camera.get("ring_planetshine_mode", 0))
                 ring_gradient_tex.use(location=0)
                 
                 bi = group['body_idx']
@@ -7383,6 +7450,10 @@ class App(InputHandlerMixin):
                     "old_star_idx": self.star_idx_cmp,
                     "new_bundle": new_bndl,
                 }
+                if self.shared_state.get("keplerian_mode", False) or (self.comparison_enabled and self.camera.get("comparison_force_keplerian", True)):
+                    self.shared_state_cmp["keplerian_mode"] = True
+                    with self.shared_state_cmp["lock"]:
+                        self.shared_state_cmp["keplerian_reextract"] = True
                 with self.shared_state_cmp["lock"]:
                     self.shared_state_cmp["system_switch_request"] = req
 

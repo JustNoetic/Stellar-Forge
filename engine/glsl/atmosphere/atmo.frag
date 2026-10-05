@@ -1278,6 +1278,25 @@ void main() {
 
         scattered = L_scatter;
         final_transmittance = T_lut;
+
+        // Decoupled per-fragment secondary light (planetshine & ringshine):
+        // Evaluated at native screen resolution to prevent bilinear stairstepping
+        // across sharp features (like edge-on equator ringshine dimming).
+        if ((u_ringshine_enabled || u_planetshine_enabled) && (u_ring_mask != 0u || dot(body_planetshine_color, body_planetshine_color) > 1e-12)) {
+            vec3 a = cam_local_sph + s_start * ray_dir_sph;
+            vec3 b = cam_local_sph + s_end * ray_dir_sph;
+            float r_b = length(b);
+            if (r_b < u_scattering_bottom_km && r_b > 1e-4) {
+                b *= (u_scattering_bottom_km / r_b);
+            }
+            vec3 sec_light = endpoint_secondary_light(a, b, final_transmittance,
+                body_planetshine_dir, body_planetshine_color, u_ring_mask);
+            if (!cam_inside && !is_ground) {
+                float limb_fade = clamp((1.0 - t_limb) * 128.0, 0.0, 1.0);
+                sec_light *= limb_fade;
+            }
+            scattered += sec_light;
+        }
         if (has_shadow && u_scattering_enabled) {
             for (int st = 0; st < min(u_num_stars, 4); ++st) {
                 star_baseline[st] = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;

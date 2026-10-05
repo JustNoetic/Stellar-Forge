@@ -66,6 +66,9 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
             else:
                 app.shared_state["ephemeris_mode"] = False
                 app.shared_state["keplerian_mode"] = False
+            if hasattr(app, "shared_state_cmp"):
+                app.shared_state_cmp["ephemeris_mode"] = False
+                app.shared_state_cmp["keplerian_mode"] = False
 
         clicked_kepler, _ = imgui.menu_item("Analytical Keplerian (Jacobi)", None, cur_mode == 1)
         if clicked_kepler and cur_mode != 1:
@@ -76,6 +79,11 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                 app.shared_state["keplerian_mode"] = True
                 with app.shared_state["lock"]:
                     app.shared_state["keplerian_reextract"] = True
+            if hasattr(app, "shared_state_cmp"):
+                app.shared_state_cmp["ephemeris_mode"] = False
+                app.shared_state_cmp["keplerian_mode"] = True
+                with app.shared_state_cmp["lock"]:
+                    app.shared_state_cmp["keplerian_reextract"] = True
 
         can_ephem = (active_system_name == SystemManager.SOLAR_SYSTEM_NAME or ephemeris_mode_active)
         if can_ephem:
@@ -108,6 +116,11 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
                 app.shared_state["keplerian_mode"] = False
                 with app.shared_state["lock"]:
                     app.shared_state["keplerian_export"] = True
+                if hasattr(app, "shared_state_cmp"):
+                    app.shared_state_cmp["ephemeris_mode"] = False
+                    app.shared_state_cmp["keplerian_mode"] = False
+                    with app.shared_state_cmp["lock"]:
+                        app.shared_state_cmp["keplerian_export"] = True
 
         if ephemeris_mode_active:
             if imgui.menu_item("Export to N-Body System")[0]:
@@ -185,11 +198,45 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
 
         c_ps, app.camera["planetshine_enabled"] = imgui.checkbox("Planetshine / Moonshine", app.camera.get("planetshine_enabled", True))
         if c_ps: settings_changed = True
+        if app.camera.get("planetshine_enabled", True):
+            imgui.indent()
+            ring_ps_modes = ["Analytical (Fast)", "Numerical (64 Samples)"]
+            curr_rm = app.camera.get("ring_planetshine_mode", 0)
+            curr_rm_idx = curr_rm if 0 <= curr_rm < len(ring_ps_modes) else 0
+            c_rm, new_rm = imgui.combo("Ring Planetshine", curr_rm_idx, ring_ps_modes)
+            if c_rm:
+                app.camera["ring_planetshine_mode"] = new_rm
+                settings_changed = True
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Analytical: Fast O(1) closed-form Lambertian phase model (high FPS).\nNumerical: 64-sample ray-traced disk quadrature (heavy GPU cost).")
+            imgui.unindent()
 
         c_rs, app.camera["ringshine_enabled"] = imgui.checkbox("Ringshine", app.camera.get("ringshine_enabled", True))
         if c_rs: settings_changed = True
         if app.camera.get("ringshine_enabled", True):
             imgui.indent()
+            rs_modes = ["Precomputed Map", "Monte Carlo (Ground Truth)"]
+            curr_rsm = app.camera.get("ringshine_mode", 0)
+            curr_rsm_idx = curr_rsm if 0 <= curr_rsm < len(rs_modes) else 0
+            c_rsm, new_rsm = imgui.combo("Ringshine Method", curr_rsm_idx, rs_modes)
+            if c_rsm:
+                app.camera["ringshine_mode"] = new_rsm
+                settings_changed = True
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Precomputed Map: Cached transfer map (high performance).\nMonte Carlo: Real-time per-pixel stochastic ray tracing (ground truth).")
+
+            if app.camera.get("ringshine_mode", 0) == 1:
+                mc_samples = int(app.camera.get("ringshine_mc_samples", 64))
+                c_mcs, mc_samples = imgui.slider_int("MC Samples", mc_samples, 16, 4096)
+                if c_mcs:
+                    app.camera["ringshine_mc_samples"] = mc_samples
+                    settings_changed = True
+                c_dith, app.camera["ringshine_mc_dither"] = imgui.checkbox("MC Dither (Noise)", app.camera.get("ringshine_mc_dither", False))
+                if c_dith:
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Disabled (default): Deterministic Quasi-Monte Carlo produces perfectly smooth, grain-free shading.\nEnabled: Adds per-pixel screen-space dithering, useful for temporal Pause/Screenshot Accumulation.")
+
             c_rso, app.camera["ringshine_oblate_enabled"] = imgui.checkbox("Oblate Ringshine", app.camera.get("ringshine_oblate_enabled", True))
             if c_rso: settings_changed = True
             imgui.unindent()
@@ -292,6 +339,40 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         imgui.separator()
         imgui.text_colored("System Comparison", 0.6, 0.9, 1.0)
         c_cmp, app.comparison_enabled = imgui.checkbox("Enable Comparison Mode", app.comparison_enabled)
+        if c_cmp and app.comparison_enabled and app.camera.get("comparison_force_keplerian", True):
+            if ephemeris_mode_active:
+                trigger_ephem_exit(to_keplerian=True)
+            else:
+                app.shared_state["ephemeris_mode"] = False
+                app.shared_state["keplerian_mode"] = True
+                with app.shared_state["lock"]:
+                    app.shared_state["keplerian_reextract"] = True
+            if hasattr(app, "shared_state_cmp"):
+                app.shared_state_cmp["ephemeris_mode"] = False
+                app.shared_state_cmp["keplerian_mode"] = True
+                with app.shared_state_cmp["lock"]:
+                    app.shared_state_cmp["keplerian_reextract"] = True
+
+        c_fk, force_kep = imgui.checkbox("Force Keplerian Mode##cmp_fk", app.camera.get("comparison_force_keplerian", True))
+        if c_fk:
+            app.camera["comparison_force_keplerian"] = force_kep
+            app.save_settings()
+            if force_kep and app.comparison_enabled:
+                if ephemeris_mode_active:
+                    trigger_ephem_exit(to_keplerian=True)
+                else:
+                    app.shared_state["ephemeris_mode"] = False
+                    app.shared_state["keplerian_mode"] = True
+                    with app.shared_state["lock"]:
+                        app.shared_state["keplerian_reextract"] = True
+                if hasattr(app, "shared_state_cmp"):
+                    app.shared_state_cmp["ephemeris_mode"] = False
+                    app.shared_state_cmp["keplerian_mode"] = True
+                    with app.shared_state_cmp["lock"]:
+                        app.shared_state_cmp["keplerian_reextract"] = True
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Automatically switch simulation to analytical Keplerian mode when enabling system comparison")
+
         if app.comparison_enabled:
             system_list = app.sys_mgr.list_systems()
             try:

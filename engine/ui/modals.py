@@ -321,20 +321,66 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                     imgui.set_tooltip("Deflection multiplier for the dominant nearby lens (1.0 = GR).\nBlack-hole shadows, Einstein arcs and star deflection are always physical.")
                 imgui.unindent()
 
-            # Planetshine & Ringshine
             changed_ps, app.camera["planetshine_enabled"] = imgui.checkbox("Enable Planetshine/Moonshine", app.camera.get("planetshine_enabled", True))
             if changed_ps: settings_changed = True
+
+            if app.camera.get("planetshine_enabled", True):
+                imgui.indent()
+                ring_ps_modes = ["Analytical (Fast)", "Numerical (64 Samples)"]
+                curr_rm = app.camera.get("ring_planetshine_mode", 0)
+                curr_rm_idx = curr_rm if 0 <= curr_rm < len(ring_ps_modes) else 0
+                changed_rm, new_rm = imgui.combo("Ring Planetshine Mode", curr_rm_idx, ring_ps_modes)
+                if changed_rm:
+                    app.camera["ring_planetshine_mode"] = new_rm
+                    settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Analytical: Fast O(1) closed-form Lambertian phase model (high FPS).\nNumerical: 64-sample ray-traced disk quadrature (heavy GPU cost).")
+                imgui.unindent()
 
             changed_rs, app.camera["ringshine_enabled"] = imgui.checkbox("Enable Ringshine", app.camera.get("ringshine_enabled", True))
             if changed_rs: settings_changed = True
 
             if app.camera.get("ringshine_enabled", True):
                 imgui.indent()
-                ringshine_bands = int(app.camera.get("ringshine_band_count", 10))
-                changed_rsb, ringshine_bands = imgui.slider_int("Ringshine Bands", ringshine_bands, 4, 1024)
-                if changed_rsb:
-                    app.camera["ringshine_band_count"] = ringshine_bands
+                rs_modes = ["Precomputed Map (Cached)", "Per-Pixel Monte Carlo (Ground Truth)"]
+                curr_rsm = app.camera.get("ringshine_mode", 0)
+                curr_rsm_idx = curr_rsm if 0 <= curr_rsm < len(rs_modes) else 0
+                changed_rsm, new_rsm = imgui.combo("Ringshine Method", curr_rsm_idx, rs_modes)
+                if changed_rsm:
+                    app.camera["ringshine_mode"] = new_rsm
                     settings_changed = True
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Precomputed Map: Cached 128x65 Gauss-Legendre transfer map (high performance).\nPer-Pixel Monte Carlo: Real-time per-pixel stochastic ray tracing (ground truth reference).")
+
+                if app.camera.get("ringshine_mode", 0) == 1:
+                    mc_samples = int(app.camera.get("ringshine_mc_samples", 64))
+                    changed_mcs, mc_samples = imgui.slider_int("MC Samples/Pixel", mc_samples, 16, 4096)
+                    if changed_mcs:
+                        app.camera["ringshine_mc_samples"] = mc_samples
+                        settings_changed = True
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Number of ray samples cast per surface pixel (16 to 4096).\nHigher values reduce grain/variance at the cost of framerate.")
+
+                    imgui.text("Presets:")
+                    imgui.same_line()
+                    for preset in [64, 128, 256, 512, 1024, 2048, 4096]:
+                        if imgui.small_button(f"{preset}##preset_mc"):
+                            app.camera["ringshine_mc_samples"] = preset
+                            settings_changed = True
+                        imgui.same_line()
+                    imgui.new_line()
+
+                    changed_dith, app.camera["ringshine_mc_dither"] = imgui.checkbox("Stochastic Dither (Noise)", app.camera.get("ringshine_mc_dither", False))
+                    if changed_dith:
+                        settings_changed = True
+                    if imgui.is_item_hovered():
+                        imgui.set_tooltip("Disabled (default): Deterministic Quasi-Monte Carlo produces perfectly smooth, grain-free shading.\nEnabled: Adds per-pixel screen-space dithering, useful for temporal Pause/Screenshot Accumulation.")
+                else:
+                    ringshine_bands = int(app.camera.get("ringshine_band_count", 10))
+                    changed_rsb, ringshine_bands = imgui.slider_int("Ringshine Bands", ringshine_bands, 4, 1024)
+                    if changed_rsb:
+                        app.camera["ringshine_band_count"] = ringshine_bands
+                        settings_changed = True
                 changed_rso, app.camera["ringshine_oblate_enabled"] = imgui.checkbox("Account for Host Oblateness", app.camera.get("ringshine_oblate_enabled", True))
                 if changed_rso:
                     settings_changed = True
@@ -429,6 +475,14 @@ def render_modals(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_
                         imgui.text_disabled(f"Resident Tiles: {res_cnt}/{cap} ({(res_cnt/cap)*100:.0f}%) | Patches: {p_cnt:,} | Tris: {t_cnt:,}")
                 imgui.unindent()
 
+            imgui.separator()
+            imgui.text_colored("System Comparison Settings", 0.6, 0.9, 1.0)
+            changed_fk, force_kep = imgui.checkbox("Force Keplerian Mode on Comparison", app.camera.get("comparison_force_keplerian", True))
+            if changed_fk:
+                app.camera["comparison_force_keplerian"] = force_kep
+                settings_changed = True
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Automatically switch simulation to analytical Keplerian mode when enabling system comparison.")
 
             if settings_changed:
                 app.save_settings()
