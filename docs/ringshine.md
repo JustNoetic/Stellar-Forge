@@ -1,17 +1,12 @@
 # Ringshine: ring-to-host surface illumination
 
-> **Implementation update (2026-10-05):** the detailed sections below describe the
-> earlier working-tree implementation. The optical response, material averaging,
-> finite-star treatment, and cache key have since changed. See
-> [Ring optical response](ring_optics.md) for the current contract. The host horizon,
-> oblate lit-arc geometry, radial/azimuth integration and atlas lookup described here
-> remain in use. The property atlas and averaging of phase parameters were removed.
-
 This document explains Stellar Forge's host-planet ringshine implementation: starlight scatters in a planetary ring, then illuminates the planet's surface. The ring acts as an extended, directionally scattering source. The renderer integrates that source into a reusable surface illumination map rather than evaluating the full ring integral at every visible fragment.
 
-**Scope:** the ring-to-host surface path, including ring material inputs, optical transfer, oblate geometry, numerical integration, map storage, caching, and surface lookup. Rendering the visible rings is covered only where it supplies inputs or explains a difference. Illumination of moons, atmospheric transport, and cloud shading are outside this document.
+Ringshine adheres to the unified optical contract defined in [Ring optical response](ring_optics.md), implemented on GPU in [`common/ring_optics.glsl`](../engine/glsl/common/ring_optics.glsl) (with extended source quadrature in [`common/ring_source.glsl`](../engine/glsl/common/ring_source.glsl)) and on CPU in [`engine/rendering/ring_optics.py`](../engine/rendering/ring_optics.py). The obsolete averaged phase-property atlas was removed: the host optical bake samples original segment rows directly from [`u_ring_gradients`](../engine/rendering/render_utils.py) and receives each layer's geometry and properties via uniform arrays, evaluating coplanar layers as a homogeneously mixed slab. Furthermore, the bake integrates over finite circular stellar disks when crossing the ring plane, maintaining continuous lighting across equinox.
 
-**Source baseline:** working-tree implementation inspected on 2026-10-05, with repository HEAD `e076904`. Equations below transcribe or derive the current implementation; they are not a proposal for a different renderer. “Exact” geometry means exact within the aligned spheroid, flat ring, and directional-star model. The integral and its stored reconstruction remain numerical approximations.
+**Scope:** the ring-to-host surface path, including ring material inputs, optical transfer, oblate geometry, numerical integration, map storage, caching, and surface lookup. Rendering the visible rings is covered only where it supplies inputs or explains a shared contract. Illumination of moons, atmospheric transport, and cloud shading are outside this document.
+
+**Source baseline:** production ring optics architecture following the unified optical contract. Equations below transcribe the implementation; they are not a proposal for a different renderer. “Exact” geometry means exact within the aligned spheroid, flat ring, and extended circular-star disk model. The integral and its stored reconstruction remain numerical approximations.
 
 ## 1. Technique overview
 
@@ -20,23 +15,23 @@ There are two different visibility questions for each ring element:
 1. Can the surface point see it above the planet's local horizon?
 2. Does the element receive sunlight, or is it inside the planet's shadow?
 
-For every ring element satisfying both conditions, the bake evaluates its radiance toward the surface. That radiance depends on opacity, viewing elevation, solar elevation, scattering angle, material, and which face of the ring the surface sees. The contribution is then weighted by the element's projected solid angle and the surface's incidence cosine.
+For every ring element satisfying both conditions, the bake evaluates its radiance toward the surface. That radiance depends on vertical optical depth, viewing elevation, solar elevation, scattering angle, individual layer materials, and which face of the ring the surface sees. The contribution is then weighted by the element's projected solid angle and the surface's incidence cosine.
 
 ~~~mermaid
 flowchart TD
-    A["Radial ring color, opacity, scattering properties"] --> C["Unified material profiles"]
-    B["Host shape and star elevation"] --> D["Host/star map bake"]
-    C --> D
-    D --> E["Clip horizon-visible arcs against host shadow"]
-    E --> F["Integrate slab radiance × projected solid angle"]
-    F --> G["Cached 128 × 65 RGB transfer tile"]
-    G --> H["Surface lookup by latitude and anti-solar azimuth"]
-    I["Current stellar color and flux"] --> J["Diffuse surface contribution"]
-    H --> J
-    K["Surface albedo"] --> J
+    A["Segment profiles in atlas (rows 16+) + segment uniforms"] --> D["Host/star map bake"]
+    B["Host shape, star elevation, star angular radius"] --> D
+    D --> E["Extended source quadrature (1 or 64 samples)"]
+    E --> F["Clip horizon-visible arcs against host shadow"]
+    F --> G["Integrate mixed-slab radiance × projected solid angle"]
+    G --> H["Cached 128 × 65 RGB transfer tile"]
+    H --> I["Surface lookup by latitude and anti-solar azimuth"]
+    J["Current stellar color and flux"] --> K["Diffuse surface contribution"]
+    I --> K
+    L["Surface albedo"] --> K
 ~~~
 
-The key reduction is rotational symmetry. With a radially varying ring and an axisymmetric host, a fixed star elevation produces a two-dimensional illumination field over the host. Changing stellar azimuth only rotates that field. Changing stellar brightness scales it. Neither change requires integrating the ring again.
+The key reduction is rotational symmetry. With a radially varying ring and an axisymmetric host, a fixed star elevation and stellar angular radius produce a two-dimensional illumination field over the host. Changing stellar azimuth only rotates that field. Changing stellar brightness scales it. Neither change requires integrating the ring again.
 
 This is deterministic quadrature into a cached texture. It is not screen-space illumination, a Monte Carlo path tracer, or a constant ambient tint.
 
@@ -46,18 +41,22 @@ Paths below are relative to the repository.
 
 | Responsibility | Source and symbols |
 | --- | --- |
-| Texture allocation, dirty keys, per-host/per-star bake scheduling | [ringshine.py](../engine/rendering/ringshine.py): `RingshineMap.__init__`, `update`, `release` |
-| Per-texel surface coordinates, radial quadrature, material sampling, output scaling | [ringshine_map.frag](../engine/glsl/post/ringshine_map.frag): `main` |
-| Slab response, phase functions, oblate horizon/shadow clipping, azimuth quadrature | [ringshine_integral.glsl](../engine/glsl/common/ringshine_integral.glsl): `ringshine_radiance`, `ringshine_arc`, `ringshine_band` |
+| Texture allocation, dirty keys, per-host/per-star bake scheduling | [ringshine.py](../engine/rendering/ringshine.py): `RingshineMap.__init__`, `update`, `release`, `build_secondary_ring_properties` |
+| Per-texel surface coordinates, radial quadrature, segment sampling, extended source loop | [ringshine_map.frag](../engine/glsl/post/ringshine_map.frag): `main`, `ringshine_material_radiance`, `u_segment_geometry`, `u_segment_props`, `u_segment_textured` |
+| Oblate horizon/shadow clipping, warped azimuth quadrature | [ringshine_integral.glsl](../engine/glsl/common/ringshine_integral.glsl): `ringshine_arc`, `ringshine_band` |
+| Shared optical response: slab transfer, phase functions, opposition surge | [ring_optics.glsl](../engine/glsl/common/ring_optics.glsl): `ring_tau`, `ring_hg`, `ring_cs`, `ring_phase`, `ring_transfer`, `ring_opposition`, `ring_radiance` |
+| Extended stellar disk quadrature (64 Gaussian/azimuth nodes) | [ring_source.glsl](../engine/glsl/common/ring_source.glsl): `ring_disk_sample`, `ring_resolve_disk`, `RING_DISK_SAMPLES` |
 | Tile-safe bilinear lookup | [ringshine_lookup.glsl](../engine/glsl/common/ringshine_lookup.glsl): `ringshine_sample` |
 | Full-screen bake vertex shader | [ringshine_map.vert](../engine/glsl/post/ringshine_map.vert) |
 | Radial profile preparation and host atlas rebuilds | [render_utils.py](../engine/rendering/render_utils.py): `generate_ring_shadow_grad`, `bake_unified_shadow_profile_jit`, `rebuild_ring_gradients_atlas` |
 | Runtime geometry, map updates, texture binding | [app.py](../engine/app.py): ring-buffer construction and `self.ringshine_maps.update(...)` |
 | Surface receivers | [sphere.frag](../engine/glsl/celestial/sphere.frag), [terrain.frag](../engine/glsl/celestial/terrain.frag): `// === Ringshine ===` blocks |
-| CPU counterpart of the optical response | [planetshine.py](../engine/rendering/planetshine.py): `ring_slab_response`, `ring_phase_radiance` |
+| CPU counterpart of the optical response and moon illumination | [ring_optics.py](../engine/rendering/ring_optics.py): `ring_tau`, `ring_hg`, `ring_cs`, `ring_phase`, `ring_transfer`, `ring_phase_radiance`, `ring_mixed_radiance` |
+| Oblate planetshine transport using shared ring optics | [planetshine.py](../engine/rendering/planetshine.py): `compute_planetshine_ring` |
+| Optical regression suite | [test_ring_optics.py](../scripts/test_ring_optics.py) |
 | User controls and persistence | [modals.py](../engine/ui/modals.py), [input_handler.py](../engine/core/input_handler.py) |
 
-The CPU optical functions are useful for understanding or checking the slab equations. **The host map is integrated on the GPU**; it does not call the CPU `ring_phase_radiance` function. Other functions in those modules serve paths outside this document.
+The host map is integrated on the GPU via `ringshine_map.frag` calling `ring_optics.glsl` and `ring_source.glsl`. The CPU functions in `ring_optics.py` maintain mathematical parity and evaluate the distant-moon lighting integral. The obsolete property atlas `u_ring_props` was removed; segment properties are passed directly via uniform arrays.
 
 ## 3. The transport integral and its normalization
 
@@ -67,34 +66,52 @@ Let $P$ be the receiving surface point, $Q$ a ring element, $d=\lVert Q-P\rVert$
 
 - $\mu_p=\max(0,N_p\cdot\omega)$: incidence cosine at the planet.
 - $\mu_v=|N_r\cdot(-\omega)|$: projected ring-area cosine toward the planet.
-- $L_r(Q\rightarrow P)$: outgoing ring radiance.
-- $V(P,Q)$: visibility, including both the host horizon and sunlight reaching the ring.
+- $L_r(Q\rightarrow P; S)$: outgoing ring radiance toward the receiver under incident starlight along unit direction $S$.
+- $V(P,Q,S)$: visibility, including both the host horizon and sunlight reaching the ring from direction $S$.
 
 The ring contribution has the area-integral form
 
 $$
 E_r(P)=\int_{\mathrm{ring}}
-L_r(Q\rightarrow P)\,
-V(P,Q)\,
-\frac{\mu_p\mu_v}{d^2}\,dA.
+\int_{\Omega_\star}
+L_r(Q\rightarrow P; S)\,
+V(P,Q,S)\,
+\frac{\mu_p\mu_v}{d^2}\,
+\frac{d\Omega_\star(S)}{\pi\sin^2 r_\star}
+\,dA.
 $$
 
-The $\mu_v/d^2$ factor converts source area to solid angle; $\mu_p$ then converts incident radiance to receiver irradiance. This is the standard extended-source change of integration measure described in [PBRT's Working with Radiometric Integrals](https://pbr-book.org/4ed/Radiometry,_Spectra,_and_Color/Working_with_Radiometric_Integrals).
+The $\mu_v/d^2$ factor converts source area to solid angle; $\mu_p$ converts incident radiance to receiver irradiance. This is the standard extended-source change of integration measure described in [PBRT's Working with Radiometric Integrals](https://pbr-book.org/4ed/Radiometry,_Spectra,_and_Color/Working_with_Radiometric_Integrals).
 
 For a flat annulus, $dA=r\,dr\,da$, where $a$ is ring azimuth. The implementation evaluates a color-valued, unit-stellar-input transfer
 
 $$
 K(P)=
 \int_{r_{\mathrm{first}}}^{r_o}
-C_{\mathrm{ring,lin}}(r)
-\int_{\mathcal A(r,P)}
-R(\mu_v,b,\chi,\alpha,\mathrm{material})
+\sum_{q=1}^{N_\star} w_{\star,q}
+\int_{\mathcal A(r,P,S_q)}
+L_r(Q\rightarrow P; S_q)
 \frac{\mu_p\mu_v}{d^2}\,r\,da\,dr.
 $$
 
-Here $R$ is the ring radiance response, $b$ is signed solar sine elevation, $\chi$ is the scattering-angle cosine, and $\mathcal A$ contains only visible, illuminated arcs. The geometry is normalized to the host's equatorial radius.
+Here $N_\star$ is 1 for point stars or 64 for resolved finite stellar disks, $w_{\star,q}$ is the source quadrature weight, $S_q$ is each sampled ray from the stellar disk, and $\mathcal A(r,P,S_q)$ contains only visible, illuminated arcs for that source sample. All geometry is normalized to the host's equatorial radius.
 
-**There is no extra solar cosine outside $R$.** The slab response already includes illumination and attenuation as functions of solar elevation.
+At each radial position $r$, coplanar layers are treated as a homogeneously mixed slab with total normal optical depth $\tau_{\mathrm{total}}=\sum_i \tau_i(r)$. Outgoing radiance combines each layer's response weighted by its optical depth fraction:
+
+$$
+L_r(Q\rightarrow P; S_q)=
+\sum_{i=1}^{M}
+C_{i,\mathrm{lin}}(r)\,
+\frac{\tau_i(r)}{\tau_{\mathrm{total}}(r)}
+\left[
+S_{\mathrm{lit/opp},i}\,p_i\,\Omega_i
++ S_{\mathrm{ms}}\,p_{\mathrm{ms},i}
+\right].
+$$
+
+Here $C_{i,\mathrm{lin}}=\max(C_{i,\mathrm{profile}},0)^{2.2}$, $p_i$ is layer $i$'s phase function, $p_{\mathrm{ms},i}$ is its multiple-scattering weight, $S_{\mathrm{lit/opp},i}$ and $S_{\mathrm{ms}}$ are the slab transfer terms, and $\Omega_i$ is the opposition multiplier on the lit face or $\max(0,\mathrm{unlit\_factor}_i)$ on the unlit face.
+
+**There is no extra solar cosine outside $L_r$.** The slab response already includes illumination and attenuation as functions of solar elevation.
 
 ### 3.2 What the texture actually stores
 
@@ -142,7 +159,7 @@ $$
 
 Although shader variables call the sample “irradiance,” the texture is specifically a **π-scaled normalized transfer map**, not an absolute irradiance measurement in physical units. The bake's π and the consumer's $1/\pi$ cancel in the implemented result. This fits the renderer's diffuse color convention; it should not be silently replaced by a differently normalized radiometric quantity.
 
-The map already includes ring color, ring opacity, surface incidence cosine, and projected solid angle. It excludes surface albedo, stellar RGB, stellar luminosity/falloff, and exposure.
+The map already includes ring color, layer opacities, surface incidence cosine, and projected solid angle. It excludes surface albedo, stellar RGB, stellar luminosity/falloff, and exposure.
 
 Consequently, a consumer must not multiply it again by ring area, ring opacity, $\mu_p$, $\mu_v$, or solar elevation.
 
@@ -163,91 +180,86 @@ Runtime ring and host radii share the renderer's AU units. Before integration, `
 | $s=|\ell|,\ c=\sqrt{1-s^2}$ | Folded latitude sine and cosine | `slat`, `clat` |
 | $\rho$ | Host surface radius at that geocentric latitude | `rho` |
 | $b=\sin B$ | Signed stellar elevation above the ring plane | `u_sun_elevation` / `sun` |
-| $\mu_0=|b|$ | Absolute incidence cosine at the ring | `mu_0` |
+| $r_\star$ | Stellar angular radius; $\sin r_\star$ clamped to $[0,0.999]$ | `u_sun_radius` |
+| $N_\star$ | Source quadrature sample count (1 point or 64 disk) | `sources` |
+| $w_{\star,q}$ | Quadrature weight of stellar disk sample $q$ | `source.w` |
+| $\mu_0=|b_q|$ | Absolute incidence cosine at the ring for sample $q$ | `abs(sun)` / `mu_0` |
 | $\phi$ | Surface azimuth relative to the projected anti-solar direction | `phi_center` / `phi` |
 | $a$ | Integration azimuth relative to the surface meridian, with shadow centered at $\phi$ | `a` |
-| $\chi$ | Cosine of scattering angle; not an angle in radians | `theta` |
-| $\alpha$ | Effective normal-incidence ring opacity | `alpha` |
-| $\tau=-\ln(1-\alpha)$ | Normal optical depth | `tau` |
+| $\chi=\mu$ | Phase cosine $-\operatorname{dot}(L,V)$; not an angle in radians | `theta` / `mu` |
+| $\alpha_i$ | Normal vertical extinction opacity of layer $i$, clamped to $[0,1-2^{-23}]$ | `layer_alpha[i]` |
+| $\tau_i$ | Normal optical depth of layer $i$, $-\ln(1-\alpha_i)$ with small-alpha series | `layer_tau[i]` |
+| $\tau_{\mathrm{total}}$ | Summed vertical normal optical depth of all active layers at radius $r$ | `material_tau` |
+| $g_f,g_b$ | Forward and backward lobe shape parameters, clamped to $\pm 0.99$ | `u_segment_props[i].xy` |
 
 Latitude is **geocentric**, obtained from the normalized position relative to the host center. It is not the latitude of the spheroid's surface normal. The integral separately constructs the correct oblate normal.
 
 Uniform rescaling of the host and ring leaves $K$ unchanged: physical source area contributes a factor $R_{\mathrm{eq}}^2$, and distance squared contributes its inverse. Actual star-distance changes still affect $F_j$ during shading.
 
-## 5. Ring material inputs: the necessary background
+## 5. Ring material inputs and homogeneous slab mixing
 
-The visible ring is rendered separately by [ring.frag](../engine/glsl/celestial/ring.frag). Ringshine does not read its screen image or rasterized brightness. It uses radial material profiles shared with the ring/shadow machinery and evaluates its own optical response.
+The visible ring is rendered separately by [ring.frag](../engine/glsl/celestial/ring.frag). Ringshine does not read its screen image or rasterized brightness. It uses radial material profiles shared with the ring/shadow machinery and evaluates the shared optical response.
 
-### 5.1 Segment profiles and overlap
+### 5.1 Segment profiles and atlas layout
 
 `generate_ring_shadow_grad` builds a 4096-sample RGBA profile per segment:
 
 - An opacity gradient supplies radial alpha, or alpha defaults to one.
 - For a textured segment, processed texture RGB is multiplied by its ring color; texture alpha is multiplied by the radial opacity gradient.
 - For an untextured segment, RGB is the supplied ring color and alpha comes from the gradient.
-- Texture cosmetic adjustments can already be present in the processed profile.
+- Texture cosmetic adjustments and tints are applied once in sRGB before linearization: $C_{\mathrm{lin}}=\max(C_{\mathrm{profile}},0)^{2.2}$.
 
-The host's unified profile spans the minimum inner radius through the maximum outer radius of **all defined segments**, including disabled ones. Disabling one segment therefore does not move the surviving material's radial coordinates.
+The texture atlas [`u_ring_gradients`](../engine/rendering/render_utils.py) has dimensions 4096 × 272 in RGBA float32:
 
-At each radius, segments are interpolated into the common domain. Segment opacity multiplies segment alpha once. Overlapping opacities combine as
-
-$$
-\alpha_{\mathrm{new}}
-=\alpha_{\mathrm{old}}+\alpha_{\mathrm{seg}}
--\alpha_{\mathrm{old}}\alpha_{\mathrm{seg}}
-=1-(1-\alpha_{\mathrm{old}})(1-\alpha_{\mathrm{seg}}).
-$$
-
-RGB and scattering properties use the implementation's sequential opacity-weighted blend:
-
-$$
-p_{\mathrm{new}}=
-\frac{
-p_{\mathrm{old}}\alpha_{\mathrm{old}}+
-p_{\mathrm{seg}}\alpha_{\mathrm{seg}}
-}{
-\alpha_{\mathrm{old}}+\alpha_{\mathrm{seg}}
-}.
-$$
-
-The opacity composition preserves the product of transmittances. The property mixture is an effective-material approximation; it is not a layered radiative-transfer solution. Because the accumulated alpha is itself composited, the sequential property blend can depend on segment order when several segments overlap.
-
-### 5.2 Material atlas layout
-
-| Texture | Dimensions / storage | Host data |
+| Rows | Contents | Usage |
 | --- | --- | --- |
-| `u_ring_gradients` | 4096 × 272, RGBA float32 | Rows 0–15: unified host RGB/alpha profiles |
-| Same texture | Remaining 256 rows | Per-segment profiles, starting at row 16 |
-| `u_ring_props` | 4096 × 32, RGBA float32 | Two rows per host |
+| 0–15 | Unified host extinction profiles | Used for fast shadow queries across the host |
+| 16–271 | Original per-segment profiles (up to 256 rows) | Sampled directly by visible rings, host ringshine, and CPU lighting |
 
-For host $k$, the property rows contain:
+**The obsolete averaged phase-property atlas (`u_ring_props`) is removed.** Phase parameters and material families are no longer blended or stored into intermediate texture rows.
 
-| Row/channel | Meaning |
-| --- | --- |
-| $2k$, R | Forward-lobe asymmetry `asymmetry`; default 0.7 |
-| $2k$, G | Backward-lobe asymmetry `backscatter`; default −0.3 |
-| $2k$, B | Procedural scattering balance `scatter`; default 1 |
-| $2k$, A | Opposite-face scale `unlit_factor`; default 1 |
-| $2k+1$, R | Effective `is_textured` flag |
+### 5.2 Direct segment uniforms
 
-Readers compute row centers using each texture's actual height. The host-material atlas is not a 16-row texture merely because it supports 16 hosts.
+The host optical bake receives segment geometry and properties directly via uniform arrays (supporting up to 16 active segment layers per host):
 
-The effective textured flag is blended with the other properties, then tested as `> 0.5` by the bake. Mixed overlaps therefore choose one phase-function family; they do not evaluate both families continuously.
+- `uniform int u_segment_count;`: number of defined segments for the host.
+- `uniform vec4 u_segment_geometry[16];`: packed $(r_{\mathrm{in}}/R_{\mathrm{eq}},\, r_{\mathrm{out}}/R_{\mathrm{eq}},\, \mathrm{opacity},\, \mathrm{row\_idx})$.
+- `uniform vec4 u_segment_props[16];`: packed $(g_f,\, g_b,\, \mathrm{scatter},\, \mathrm{unlit\_factor})$.
+- `uniform float u_segment_textured[16];`: boolean material family flag ($1.0$ for textured, $0.0$ for procedural).
 
-The host geometry's opacity field is normally a binary enable gate: one if any segment is active, otherwise zero. Segment opacity is already baked into profile alpha. The map shader forms
+### 5.3 Overlapping materials: homogeneously mixed slab
 
-$$
-\alpha=\operatorname{clamp}
-(\alpha_{\mathrm{profile}}\,\mathrm{hostEnable},0,0.9999999).
-$$
+Coplanar layers are modeled as a **homogeneously mixed slab**. They are not an averaged single effective material, nor are they a vertically ordered stack of physically separated layers.
 
-RGB is sampled first, then converted with
+At each radial quadrature node $r$:
 
-$$
-C_{\mathrm{ring,lin}}=\max(C_{\mathrm{profile}},0)^{2.2}.
-$$
+1. The shader iterates over all $M$ active segments ($i=0,\dots,M-1$).
+2. If $r$ lies outside $[r_{i,\mathrm{in}}, r_{i,\mathrm{out}}]$, layer $i$ contributes $\tau_i=0$.
+3. If $r$ is within bounds, the profile coordinate is $u=(r-r_{i,\mathrm{in}})/(r_{i,\mathrm{out}}-r_{i,\mathrm{in}})$. The shader samples row `geometry.w` of `u_ring_gradients`:
+   $$
+   \alpha_i=\operatorname{clamp}(\mathrm{tex.a}\times\mathrm{opacity}_i,\, 0,\, 1-2^{-23}),
+   $$
+   $$
+   \tau_i=\operatorname{ring\_tau}(\alpha_i),
+   \qquad
+   C_{i,\mathrm{lin}}=\max(\mathrm{tex.rgb},0)^{2.2}.
+   $$
+4. The total slab optical depth is the sum of layer normal optical depths:
+   $$
+   \tau_{\mathrm{total}}=\sum_{i=1}^M \tau_i.
+   $$
+   If $\tau_{\mathrm{total}}\le 0$, the radial node is transparent and skipped.
+5. In the inner azimuth quadrature, `ringshine_material_radiance` evaluates:
+   - Slab transfer $(S_{\mathrm{lit/opp}}, S_{\mathrm{ms}})$ using the shared $\tau_{\mathrm{total}}$, viewing cosine $\mu_v$, and solar incidence $\mu_0$.
+   - Lit-face opposition surge using $\tau_{\mathrm{total}}$ and phase cosine $\mu$.
+   - For each layer with $\tau_i>0$, its own phase function $p_i$ and multiple-scattering weight $p_{\mathrm{ms},i}$ from its own $\alpha_i$ and properties.
+   - Layers are summed with optical depth fraction weights:
+     $$
+     \sum_{i=1}^M C_{i,\mathrm{lin}}\left(\frac{\tau_i}{\tau_{\mathrm{total}}}\right)
+     \left[S_{\mathrm{single},i}\,p_i + S_{\mathrm{ms}}\,p_{\mathrm{ms},i}\right].
+     $$
 
-This is the code's power-law conversion, not the exact piecewise sRGB transfer function. Color mixing and radial interpolation occur before that conversion.
+Neither asymmetry nor material family is averaged before optical evaluation. Both Henyey–Greenstein and Cornette–Shanks layers coexist at the same radius and retain their distinct forward/backward lobes without mode switching or cancellation.
 
 ## 6. Oblate receiver geometry and the visible ring arc
 
@@ -404,42 +416,57 @@ This matters numerically: the shadow discontinuity becomes an integration bounda
 
 “Exact lit arcs” does **not** mean a closed-form radiometric solution. The arc endpoints are analytic; the radiance integral over them is numerical.
 
-The bake has no stellar-radius input. Its host shadow has a hard geometric edge, with no finite-star penumbra. External eclipsers are also absent from this integral.
+### 7.3 Extended source integration and equinox continuity
+
+The bake receives the stellar angular radius sine via `u_sun_radius` ($\sin r_\star$). When resolved (`ring_resolve_disk`: $\sin r_\star > 0$ and $(|b| < 2\sin r_\star \text{ or } \sin r_\star > 0.001)$), starlight is integrated as a uniform-radiance circular disk using 64 samples (4 Gauss nodes in projected radius squared $\times$ 16 symmetric azimuth nodes), implemented in [`common/ring_source.glsl`](../engine/glsl/common/ring_source.glsl).
+
+For each sample $q \in [0, 63]$:
+1. `ring_disk_sample` generates direction vector $S_q$, with signed elevation $b_q=S_{q,y}$ and azimuth shift $\Delta\phi_q=\operatorname{atan2}(-S_{q,z},-S_{q,x})$.
+2. The quadrature weight $w_{\star,q}=\frac{W_{\mathrm{row}}}{16\sqrt{1-r^2}}$ integrates $\frac{d\Omega}{\pi\sin^2 r_\star}$.
+3. `ringshine_band` evaluates the oblate host shadow and horizon-visible arcs for that sample direction $(b_q, \phi + \Delta\phi_q)$.
+4. When a star crosses the ring plane ($|b| < \sin r_\star$), individual samples have both positive and negative elevations. Starlight illuminates both faces of the ring simultaneously, each with its sampled elevation and phase.
+
+This removes the step discontinuity and blackout at equinox ($b=0$) present in a directional point-source model. Smaller stars away from the plane ($\sin r_\star \le 0.001$ and $|b| \ge 2\sin r_\star$) use the point limit ($N_\star=1$) at the disk center with $w_{\star,0}=1.0$.
+
+For each individual sample ray, the host shadow on the ring retains a hard geometric edge. Integrating 64 directional samples across the disk turns those hard edges into a smooth penumbra on the ring. External eclipsers remain outside this integral, and direct-light caster penumbrae retain their analytic approximation.
 
 ## 8. Ring radiance: finite-optical-depth slab transfer
 
 The ring is treated as an infinitesimally thin geometric sheet with a finite optical-depth slab response. Geometry supplies its projected area; optical depth supplies scattering and attenuation.
 
-### 8.1 Optical depth and the two faces
+### 8.1 Optical depth and continuous conversion
 
-The normal optical depth is
-
-$$
-\tau=-\ln\left[
-\max(10^{-7},1-\min(\alpha,0.9999999))
-\right].
-$$
-
-The slant depths are
+`alpha` is vertical extinction opacity, never camera-path opacity. In [`common/ring_optics.glsl`](../engine/glsl/common/ring_optics.glsl), `ring_tau(alpha)` clamps $\alpha$ to $[0, 1 - 2^{-23}]$ (`RING_MAX_ALPHA = 0.9999999`) and converts it continuously to normal optical depth:
 
 $$
-v=\frac{\tau}{\max(\mu_v,10^{-7})},
+\tau(\alpha)=
+\begin{cases}
+\alpha\left(1+\alpha\left(\frac12+\frac\alpha3\right)\right), & \alpha < 0.001,\\
+-\ln(1-\alpha), & \alpha \ge 0.001.
+\end{cases}
+$$
+
+The series expansion prevents floating-point cancellation for thin dust profiles in 32-bit arithmetic. On the CPU, [`ring_optics.py`](../engine/rendering/ring_optics.py) uses `-math.log1p(-alpha)`.
+
+For total optical depth $\tau_{\mathrm{total}}$ at radius $r$, the slant depths under viewing cosine $\mu_v$ and solar incidence cosine $\mu_0=|b|$ are:
+
+$$
+v=\frac{\tau_{\mathrm{total}}}{\max(\mu_v,10^{-7})},
 \qquad
-l=\frac{\tau}{\mu_0},
-\qquad \mu_0=|b|.
+l=\frac{\tau_{\mathrm{total}}}{\max(\mu_0,10^{-7})}.
 $$
 
-Zero opacity or $\mu_0<10^{-7}$ produces zero response.
+Zero opacity or $\mu_0\le 0$ produces zero response.
 
 The receiver sees the illuminated ring face when
 
 $$
-\ell b\ge0.
+\ell b\ge 0.
 $$
 
-This test concerns which side of the ring plane contains the star and receiver. It does not test whether the planet's surface point itself is in daylight.
+This tests which side of the ring plane contains the star sample and the receiver. It does not test whether the planet's surface point itself is in daylight.
 
-### 8.2 Illuminated-face single scattering
+### 8.2 Illuminated-face single scattering and opposition
 
 The illuminated-face slab factor is
 
@@ -450,16 +477,30 @@ S_{\mathrm{lit}}
 \left[1-e^{-(v+l)}\right].
 $$
 
-For small depth $x$, `ringshine_absorbed(x)` evaluates
+For small total slant depth $x=v+l$, `ring_absorbed(x)` evaluates
 
 $$
-1-e^{-x}\approx x\left(1-\frac{x}{2}+\frac{x^2}{6}\right)
+1-e^{-x}\approx x\left(1-x\left(\frac12-\frac{x}{6}\right)\right)
 \quad (x<0.001)
 $$
 
-to avoid cancellation.
+to avoid cancellation. At high optical depth, the illuminated-face factor saturates at $\mu_0/(\mu_v+\mu_0)$.
 
-At high optical depth, the illuminated-face factor saturates at $\mu_0/(\mu_v+\mu_0)$. Raising opacity is therefore not equivalent to linearly raising reflected brightness.
+Lit-face single scattering is multiplied by the authored opposition surge:
+
+$$
+\theta_{\mathrm{opp}}=\arccos(\operatorname{clamp}(-\mu,-1,1)),
+\qquad
+d_\tau=\operatorname{clamp}\left(\frac{\tau_{\mathrm{total}}}{1.5},0,1\right),
+$$
+
+$$
+\Omega(\mu,\tau_{\mathrm{total}})=
+\left(1+\frac{0.8 d_\tau}{1+\theta_{\mathrm{opp}}/0.07}\right)
+\left(1+0.3 d_\tau\,e^{-\theta_{\mathrm{opp}}/0.006}\right).
+$$
+
+This opposition term now applies consistently across visible rings, host ringshine maps, and CPU lighting.
 
 ### 8.3 Opposite-face single scattering
 
@@ -482,30 +523,26 @@ $$
 S_{\mathrm{opp}}=v e^{-v}\quad\text{when }v=l.
 $$
 
-The GPU uses
+The GPU evaluates the ratio stably as:
 
 $$
 \frac{1-e^{-\Delta}}{\Delta}
-\approx1-\frac{\Delta}{2}+\frac{\Delta^2}{6}
+\approx 1-\Delta\left(\frac12-\frac\Delta6\right)
 \quad(\Delta<0.001).
 $$
 
-This stable form handles coincident slant depths without a division singularity. The CPU equivalent uses `expm1` with an explicit equal-depth limit.
+The CPU equivalent uses `-math.expm1(-delta)/delta` with an explicit equal-depth limit. Opposite-face single scattering is scaled by the layer's `unlit_factor` (`max(0.0, props.a)`).
 
-The ring can therefore illuminate both hemispheres. The opposite face uses attenuated transmitted single scattering, scaled by `unlit_factor`. It receives no multiple-scattering addition in this implementation.
+### 8.4 Why layers and optical depth must not be averaged before transfer
 
-For a simple check, $\alpha=0.5$, $\mu_v=0.5$, and $\mu_0=0.2$ give $\tau=0.693147$, $S_{\mathrm{lit}}=0.283482$, and $S_{\mathrm{opp}}=0.145833$, before phase-function and color factors.
-
-### 8.4 Why alpha must not be averaged before transfer
-
-Opacity becomes optical depth through a logarithm, then enters exponential attenuation and, for textured rings, changes phase-function weights. Consequently,
+Opacity becomes optical depth through a logarithm, then enters exponential attenuation and nonlinear phase-function weighting:
 
 $$
 R(\operatorname{average}(\alpha))
 \ne \operatorname{average}(R(\alpha)).
 $$
 
-The bake samples material and evaluates transfer at **each radial quadrature node**, then sums the responses. It does not reduce an entire radial band to one averaged alpha.
+The model evaluates optical depth and phase response at each radial quadrature node independently. Furthermore, across overlapping coplanar layers, each layer evaluates its own phase response with its own $\alpha_i$ and properties, weighted by $\tau_i / \tau_{\mathrm{total}}$. Neither radial bands nor overlapping layers are reduced to an averaged effective material.
 
 ## 9. Phase functions and the multiple-scattering approximation
 
@@ -514,13 +551,13 @@ The bake samples material and evaluates transfer at **each radial quadrature nod
 The phase cosine compares the incoming photon travel direction with the outgoing direction from the ring to the surface:
 
 $$
-\chi=(-S)\cdot\frac{P-Q}{d}.
+\chi=\mu=(-S)\cdot\frac{P-Q}{d}=-\operatorname{dot}(L,V).
 $$
 
-Thus $\chi=1$ is forward scattering and $\chi=-1$ is backscattering. In the folded geometry, the shader evaluates
+Thus $\mu=1$ is forward scattering and $\mu=-1$ is backscattering. In the folded geometry, the shader evaluates
 
 $$
-\chi=
+\mu=
 \frac{
 (\rho c-r\cos a)C\cos\phi
 -r\sin a\,C\sin\phi
@@ -528,83 +565,81 @@ $$
 }{d},
 $$
 
-where $\sigma=-1$ on the illuminated face and $+1$ on the opposite face. It clamps the result to $[-1,1]$.
+where $\sigma=-1$ on the illuminated face and $+1$ on the opposite face, clamped to $[-1,1]$.
 
-The GLSL argument named `theta` is this **cosine**, not the scattering angle itself.
-
-Angle conventions matter when comparing formulas: [PBRT's Phase Functions](https://www.pbr-book.org/4ed/Volume_Scattering/Phase_Functions) uses two directions pointing away from the interaction and therefore writes the HG denominator with a different sign. Its discussion also explains normalized mixtures of phase-function lobes. The formula below uses this project's photon-travel convention.
+Angle conventions matter when comparing formulas: [PBRT's Phase Functions](https://www.pbr-book.org/4ed/Volume_Scattering/Phase_Functions) uses two directions pointing away from the interaction and therefore writes the HG denominator with a different sign. The formula below uses this project's photon-travel convention.
 
 ### 9.2 The two analytic lobes
 
-Henyey–Greenstein is implemented as
+Henyey–Greenstein (HG) is implemented as:
 
 $$
-p_{\mathrm{HG}}(g,\chi)
+p_{\mathrm{HG}}(g,\mu)
 =
 \frac{1-g^2}
-{4\pi(1+g^2-2g\chi)^{3/2}}.
+{4\pi d_g^{3/2}},
+\qquad
+d_g=(1-|g|)^2+2|g|(1-\operatorname{sgn}(g)\mu).
 $$
 
-Cornette–Shanks is implemented as
+Cornette–Shanks (CS) is implemented as:
 
 $$
-p_{\mathrm{CS}}(g,\chi)
+p_{\mathrm{CS}}(g,\mu)
 =
-p_{\mathrm{HG}}(g,\chi)
-\frac{3(1+\chi^2)}{2(2+g^2)}.
+p_{\mathrm{HG}}(g,\mu)
+\frac{3(1+\mu^2)}{2(2+g^2)}.
 $$
 
-Each asymmetry parameter is clamped to $[-0.99,0.99]$, and the base denominator is floored at $10^{-6}$. Positive $g$ favors forward scattering under the convention above.
+Both lobes integrate to exactly 1 over solid angle ($4\pi$). Both $g_f$ (`asymmetry`) and $g_b$ (`backscatter`) are shape parameters clamped to $[-0.99, 0.99]$. CS's $g$ is a shape parameter, not strictly its mean scattering cosine. The second parameter may be positive, allowing two forward lobes.
 
-The combined phase response is
+The combined phase response for a layer is:
 
 $$
-p=w_f\,p_f+(1-w_f)\,p_b.
+p_i = w_f\,p_f + (1-w_f)\,p_b.
 $$
 
-The two lobe weights sum to one. `backscatter` is the second lobe's asymmetry parameter, not its blend weight.
+The two lobe weights sum to one. `backscatter` is the second lobe's shape parameter, not its blend weight.
 
 ### 9.3 Textured and procedural material families
 
-For textured rings:
+For textured layers (`u_segment_textured[i] > 0.5`):
 
 $$
-t_{\mathrm{chunks}}=
-\operatorname{clamp}\left(\frac{\alpha-0.1}{0.5},0,1\right),
+t_{\mathrm{chunks}}=\operatorname{clamp}\left(\frac{\alpha_i-0.1}{0.5},0,1\right),
 $$
 
 $$
-w_f=0.95-0.45t_{\mathrm{chunks}},
+w_f=0.95-0.45 t_{\mathrm{chunks}},
 \qquad
 w_{\mathrm{ms}}=t_{\mathrm{chunks}}.
 $$
 
-Both lobes use HG. The model treats low-opacity material as forward-scattering dust and denser material as a mixture with more large-particle/backward response and more multiple scattering. That interpretation is an authored heuristic tied to opacity, not a measured particle-size distribution.
+Both lobes use Henyey–Greenstein. Low-opacity material behaves as forward-scattering dust, while denser material includes more large-particle/backward response and multiple scattering.
 
-For procedural/untextured rings:
+For procedural layers (`u_segment_textured[i] <= 0.5`):
 
 $$
 t_{\mathrm{balance}}=\operatorname{clamp}(\mathrm{scatter},0,1),
 $$
 
 $$
-w_f=0.1+0.8t_{\mathrm{balance}},
+w_f=0.1+0.8 t_{\mathrm{balance}},
 \qquad
-w_{\mathrm{ms}}=
-\operatorname{clamp}(1-0.7t_{\mathrm{balance}},0.1,1).
+w_{\mathrm{ms}}=\operatorname{clamp}(1-0.7 t_{\mathrm{balance}},0.1,1).
 $$
 
-Both lobes use Cornette–Shanks. Raising `scatter` changes the mixture and reduces the multiple-scattering weight; it is not simply a brightness multiplier. In the textured branch, this balance parameter is not used.
+Both lobes use Cornette–Shanks. In the textured branch, the `scatter` balance parameter is unused.
 
-### 9.4 Illuminated-face multiple scattering
+### 9.4 Multiple scattering and homogeneous mixture
 
-The implementation uses fixed $w_0=0.92$ and $\gamma=\sqrt{1-w_0}=\sqrt{0.08}$:
+The isotropic multiple-scattering approximation uses albedo $w_0=0.92$ and $\gamma=\sqrt{1-w_0}=\sqrt{0.08}$:
 
 $$
 H(\mu)=\frac{1+2\mu}{1+2\mu\gamma}.
 $$
 
-Its multiple-scattering approximation is
+The slab multiple-scattering transfer factor is:
 
 $$
 S_{\mathrm{ms}}
@@ -615,21 +650,29 @@ S_{\mathrm{ms}}
 \left[1-e^{-(v+l)}\right].
 $$
 
-The final scalar radiance response is
+At each radial node, the total radiance toward the receiver is accumulated over active layers:
 
 $$
-R=
+L_r(\mu_v,\mu_0,\mu)=
+\sum_{i=1}^M
+C_{i,\mathrm{lin}}
+\left(\frac{\tau_i}{\tau_{\mathrm{total}}}\right)
+\left[
+S_{\mathrm{single},i}\,p_i + S_{\mathrm{ms}}\,w_{\mathrm{ms},i}
+\right],
+$$
+
+where:
+
+$$
+S_{\mathrm{single},i}=
 \begin{cases}
-S_{\mathrm{lit}}p+w_{\mathrm{ms}}S_{\mathrm{ms}},
-& \ell b\ge0,\\
-S_{\mathrm{opp}}p\,\mathrm{unlitFactor},
-& \ell b<0.
+S_{\mathrm{lit}}\,\Omega(\mu,\tau_{\mathrm{total}}), & \ell b \ge 0,\\
+S_{\mathrm{opp}}\,\max(0,\mathrm{unlit\_factor}_i), & \ell b < 0.
 \end{cases}
 $$
 
-Ring RGB multiplies this response in the outer radial integration. The fixed ice-like albedo constant participates in the multiple-scattering term; the code does not apply an additional 0.92 multiplier to the single-scattering term.
-
-This is a real-time optical model with empirical material controls, not a complete solution for a particulate ring. In particular, the host map does not reproduce every visible-ring effect: the visible-ring shader has opposition-surge and other terms that are not called here.
+All paths (visible rings, host ringshine, and CPU moon illumination) evaluate this identical optical formulation. Single scattering uses the layer's own phase function and opacity, while both multiple scattering and lit-face opposition depend on total slab depth $\tau_{\mathrm{total}}$ and are weighted by each layer's optical depth fraction $\tau_i/\tau_{\mathrm{total}}$.
 
 ## 10. Numerical integration
 
@@ -724,21 +767,21 @@ t_{m,s}=\frac{m+T_s}{B},
 w_{r,m,s}=\frac{g(t_{m,s})L_gW_s}{B}.
 $$
 
-The profile coordinate is
+At each radial node $r(t_{m,s})$, the shader evaluates active segments from `u_segment_geometry`:
 
-$$
-u_r=\frac{r(t_{m,s})-r_i}{r_o-r_i}.
-$$
-
-At each node, the shader samples color, alpha, scattering properties, and the textured flag, evaluates the angular response, and accumulates
-
-$$
-K\approx
-\sum_{m=0}^{B-1}\sum_{s=0}^{3}
-C_{\mathrm{ring,lin}}(u_r)
-\,I_{\mathrm{visible,lit}}(r_{m,s})
-\,w_{r,m,s}.
-$$
+1. For each segment $i \in [0,\dots,M-1]$, if $r \in [r_{i,\mathrm{in}}, r_{i,\mathrm{out}}]$, it samples row `geometry.w` of `u_ring_gradients` at $u=(r-r_{i,\mathrm{in}})/(r_{i,\mathrm{out}}-r_{i,\mathrm{in}})$, extracting $\tau_i=\operatorname{ring\_tau}(\alpha_i)$ and linear RGB color.
+2. It sums $\tau_{\mathrm{total}}=\sum_i \tau_i$. If $\tau_{\mathrm{total}}\le 0$, the node is transparent and skipped.
+3. If `ring_resolve_disk(sun, u_sun_radius)` is true (64 samples), it iterates over disk samples; otherwise it uses the single center sample ($N_\star=1$):
+   $$
+   I_{\mathrm{node}}(r_{m,s})=\sum_{q=1}^{N_\star} w_{\star,q}\,I_{\mathrm{band}}(r_{m,s},S_q).
+   $$
+4. It weights the radial contribution:
+   $$
+   K\approx
+   \sum_{m=0}^{B-1}\sum_{s=0}^{3}
+   I_{\mathrm{node}}(r_{m,s})
+   \,w_{r,m,s}.
+   $$
 
 Logarithmic spacing in **distance from the host surface** puts radial effort near contact. Far from the host, it approaches log-radius spacing.
 
@@ -748,23 +791,32 @@ Bands are not aligned to every material discontinuity or ringlet. Four transfer 
 
 ~~~text
 for each texel of a dirty host/star tile:
-    decode geocentric sine latitude and anti-solar azimuth
+    decode geocentric sine latitude (slat) and anti-solar azimuth (phi)
+    sun = clamp(u_sun_elevation, -1.0, 1.0)
+    sources = ring_resolve_disk(sun, u_sun_radius) ? 64 : 1
     total = RGB(0)
 
-    for each logarithmic radial band:
-        for each of its four Gaussian nodes:
-            sample unified color, alpha, and optical properties
-            if transparent: continue
+    for each logarithmic radial band m in [0, B-1]:
+        for each Gaussian node s in [0, 3]:
+            compute radius r and profile coordinate u_i for each segment
+            sample u_ring_gradients segment rows: layer_alpha, layer_tau, layer_color
+            material_tau = sum(layer_tau)
+            if material_tau <= 0: continue
 
-            derive oblate surface position and normal
-            find the ring circle's horizon-visible interval
-            subtract the host's star-shadow interval
+            node_response = RGB(0)
+            for each source sample q in [0, sources-1]:
+                sample = sources == 1 ? center : ring_disk_sample(center, pole, radius, q)
+                sample_phi = phi + atan(-sample.z, -sample.x)
+                find ring circle's horizon-visible interval [-limit, limit]
+                find host shadow interval for sample.y and sample_phi
 
-            for each surviving illuminated arc:
-                integrate radiance × mu_p × mu_v / d² × r
-                using 16 geometrically warped Gaussian nodes
+                for each surviving illuminated arc:
+                    integrate ringshine_material_radiance × mu_p × mu_v / d² × r
+                    using 16 geometrically warped Gaussian nodes
 
-            total += linear_ring_color × arc_response × radial_weight
+                node_response += sample.w × arc_integral
+
+            total += node_response × dr_weight
 
     write RGB = pi × total
 ~~~
@@ -915,7 +967,8 @@ key = (
      host_enable,
      effective_flattening),
     clamped_band_count,
-    quantized_signed_solar_sine_elevation
+    quantized_signed_solar_sine_elevation,
+    quantized_stellar_angular_radius_sine
 )
 ~~~
 
@@ -931,28 +984,37 @@ then rounded to five decimal places and clamped to $[-1,1]$.
 
 Using world-space positions avoids camera-origin rebasing perturbing this key. The ring normal is expected to be a valid unit pole.
 
-The maximum rounding error is $5\times10^{-6}$ in **sine elevation**, not a fixed angular error. Near polar illumination, a given sine error corresponds to a larger angular change. Near the plane, very small elevations can quantize to exactly zero, producing the model's zero-illumination tile.
+The maximum rounding error is $5\times10^{-6}$ in **sine elevation**, not a fixed angular error.
+
+The stellar angular radius sine is computed as:
+
+$$
+\sin r_\star=\min\left(0.999,\max\left(0.0,\frac{R_\star}{\lVert X_\star-X_{\mathrm{host}}\rVert}\right)\right),
+$$
+
+then formatted to six significant digits (`.6g`). This relative quantization accurately captures small stellar disks near equinox while avoiding spurious rebakes from orbital floating-point noise.
 
 ### 13.2 What triggers a rebake?
 
 | Change | Effect |
 | --- | --- |
-| Radial material/profile edit and atlas rebuild | Global `profile_revision` changes; active tiles become dirty |
+| Segment profile, geometry, or optical property edit | Global `profile_revision` changes; active tiles become dirty |
 | Normalized inner/outer radius | Affected host's tiles become dirty |
 | Host enable state | Affected host's tiles become dirty |
 | Effective host flattening | Affected host's tiles become dirty |
 | Band count | Active tiles become dirty |
-| Star elevation crossing a quantization step | That host/star tile becomes dirty |
+| Star elevation crossing a quantization step ($5\times 10^{-6}$) | That host/star tile becomes dirty |
+| Stellar angular radius change ($\sin r_\star$) | That host/star tile becomes dirty |
 | Camera translation, orientation, or rebasing | Reuses the map |
 | Star azimuth at unchanged elevation | Reuses the map; lookup coordinates rotate |
 | Stellar color or luminosity | Reuses the map; applied during lookup |
-| Star distance with unchanged elevation | Reuses the map; falloff changes at lookup |
+| Star distance with unchanged elevation and $\sin r_\star$ | Reuses the map; falloff changes at lookup |
 | Host spin about its unchanged ring pole | Reuses the map; surface coordinates move through it |
 | Host/ring rescaling with unchanged normalized geometry | Reuses the map, subject to exact floating-point key equality |
 
 With the oblateness option disabled, the effective flattening is zero. A change to actual body flattening then has no effect on the bake's geometry key.
 
-The material revision is global, not per host. Even a localized edit can invalidate every active host/star tile. Geometry tuples are compared directly; solar elevation is the explicitly quantized component.
+The material revision is global, not per host. Even a localized edit can invalidate every active host/star tile. Geometry tuples are compared directly; solar elevation and stellar radius are the explicitly quantized components.
 
 Inactive tile keys are removed from the cache after an update. Their texture contents need not be cleared because active counts/indices determine what can be sampled; reactivated tiles without a retained key are rebaked.
 
@@ -960,7 +1022,7 @@ Inactive tile keys are removed from the cache after an update. Their texture con
 
 Dirty tiles are rendered into their own viewports through a framebuffer scope with `enable_only=0`. This disables blend/depth effects during the overwrite, preventing the caller's draw state from accumulating or rejecting bake results.
 
-The bake binds ring gradients to unit 0 and ring properties to unit 5. The runtime surface map is bound to unit 8. After the update, `app.py` restores the scene viewport and HDR resolve framebuffer.
+The bake binds `u_ring_gradients` to texture unit 0. The obsolete property texture (`u_ring_props`) is removed. The shader receives segment geometry (`u_segment_geometry`), phase/optical properties (`u_segment_props`), textured flags (`u_segment_textured`), active segment count (`u_segment_count`), stellar angular radius (`u_sun_radius`), host parameters (`u_host_params`), solar elevation (`u_sun_elevation`), and band count via uniform writes. After the update, `app.py` restores the scene viewport and HDR resolve framebuffer.
 
 `last_update_count` reports the number of tiles actually drawn by the most recent `update` call. It is useful for detecting unnecessary rebakes. The GPU timing region in `app.py` is named `gpu_ringshine_map`.
 
@@ -976,14 +1038,19 @@ The default settings are:
 
 The band count controls **radial** quadrature only. It does not increase tile dimensions or the 16-node azimuth rule.
 
-A tile has 8,320 texels. For one surviving illuminated arc per radial node, the basic quadrature workload is
+A tile has 8,320 texels. For point stars ($N_\star=1$), the basic quadrature workload is:
 
 $$
-8320\times B\times4\times16
-=532{,}480B
+8320\times B\times 4\times 16 = 532{,}480B
 $$
 
-node evaluations per tile. At the default $B=10$, that is about 5.32 million evaluations before early-outs. Split lit arcs can add work; transparent nodes, horizon rejection, equatorial/polar rows, and zero illumination remove work. This is an operation-count estimate, not a measured timing.
+node evaluations per tile. When the star's finite disk is resolved at equinox or for large sources ($N_\star=64$), the workload is:
+
+$$
+8320\times B\times 4\times 64\times 16 \approx 34{,}078{,}720B
+$$
+
+node evaluations per tile before early-outs. Split lit arcs can add work; transparent nodes, horizon rejection, equatorial/polar rows, and zero illumination remove work. This is an operation-count estimate, not a measured timing.
 
 Steady-state shading uses one bilinearly filtered texture sample per applicable host/star pair, plus coordinate and stellar-factor calculations. The expensive integration is paid when keys change. Continuously varying stellar elevation can still force rebakes at successive quantization steps.
 
@@ -994,6 +1061,8 @@ Typical qualitative behavior follows directly from the model:
 - Ringshine can illuminate the planet's night side because the ring is an extended source.
 - The host shadow removes some of that source, so the anti-solar pattern is not a uniform glow.
 - The same-side and opposite-side hemispheres have different optical responses.
+- Finite stellar disk quadrature removes the sharp equinox blackout ($b=0$); both faces of the ring are illuminated continuously across equinox.
+- Multiple overlapping segments preserve distinct forward/backward lobes and material colors via homogeneous mixing without averaging artifacts.
 - The exact equator and poles have zero geometric contribution in this thin-ring surface model.
 - A gap changes illumination through its location, visibility, and material response, not merely its missing area.
 - Flattening changes where the ring is visible as well as how much illumination arrives.
@@ -1048,10 +1117,10 @@ That closest element has favorable geometric weight but lies inside the host sha
 | Infinitesimally thin planar ring | Exactly zero equatorial projected area; no finite-thickness illumination path |
 | Ring and oblate host share a pole | Tilted rings relative to the host's figure are not represented by this derivation |
 | Smooth convex reference spheroid | No local terrain horizon, height-dependent transfer, or normal-map response |
-| Directional incident starlight | No finite-star penumbra or full near-star spatial variation over the ring |
+| Extended circular stellar disk quadrature | 64 samples when crossing the ring plane or $\sin r_\star > 0.001$; point limit otherwise. Direct-light caster penumbrae retain analytic approximation |
 | Host-only analytic occlusion in the bake | External eclipsers and other ring systems are not integrated into this source visibility |
-| Effective material for overlapping segments | No independent stacked-slab transport through overlapping materials |
-| Fixed phase families and multiple-scattering approximation | Not a measured spectral or fully energy-calibrated particulate-ring solution |
+| Homogeneously mixed slab for overlapping segments | Coplanar layers evaluate individual phase responses with $\tau_i/\tau_{\mathrm{total}}$ weights; no property atlas |
+| Authored phase families, opposition surge, and multiple scattering | Evaluated consistently across all paths using shared ring optics contract; not a measured spectral solution |
 | Fixed angular quadrature and finite texture resolution | Increasing radial bands alone cannot remove every integration/interpolation error |
 | 16 hosts and 16 stellar columns | Capacity is fixed across CPU allocation, viewport layout, and lookup conventions |
 | Diffuse surface receiver | No directional Hapke/specular ringshine response |
@@ -1062,13 +1131,14 @@ The texture's 128 × 65 dimensions are hardcoded in the bake's angular decoding 
 
 ## 17. Validation and debugging notes
 
-The documentation's oblate incidence formula and shadow half-width were independently checked over 100,000 randomized configurations:
+The shared optical contract and ringshine implementation are verified by [`scripts/test_ring_optics.py`](../scripts/test_ring_optics.py):
 
-- The incidence cosine agreed with a directly constructed spheroid-gradient normal dotted against the receiver-to-ring direction.
-- Shadow interval membership agreed with a forward ray–spheroid quadratic intersection test.
-- The $3/2$ angular warp and $2/3$ inverse round-tripped within floating-point precision.
-
-The maximum double-precision incidence-cosine difference in that check was approximately $1.8\times10^{-14}$. These checks validate the algebra presented here; they do not measure GPU float32 error, rendered image quality, or quadrature convergence. No interactive rendering or GPU benchmark was performed for this documentation task.
+- **GPU/CPU parity:** tests 144 optical combinations (extinction depths, viewing cosines, solar elevations, and material families) between GLSL and Numba CPU functions, asserting agreement within $4\times 10^{-5}$ relative tolerance.
+- **Normalization:** both Henyey–Greenstein and Cornette–Shanks phase families integrate to exactly 1 over solid angle across extreme shape parameters ($\pm 0.99$).
+- **Equinox continuity:** finite stellar disk quadrature crossing the ring plane agrees with dense numerical quadrature within 0.81%, eliminating edge-on step discontinuities.
+- **Mixed slab CPU evaluation:** compiled Numba moon-lighting entry point (`ring_mixed_radiance`) preserves distinct forward/backward lobes under distant-body area quadrature.
+- **Oblate geometry:** oblate horizon visibility and shadow half-width agree with direct spheroid-gradient normals and forward quadratic intersection tests.
+- **Atlas assembly and cache invalidation:** atlas rebuild retains segment lobes without property averaging, and cache keys correctly invalidate upon stellar radius or profile revision updates.
 
 For implementation work, the following checks distinguish different failure classes:
 
@@ -1077,7 +1147,8 @@ For implementation work, the following checks distinguish different failure clas
 | Nearly constant glow instead of an anti-solar pattern | Verify $\phi$, the anti-stellar projection, and per-star tile selection |
 | Too much or too little light by a nearly constant factor | Trace `M = pi * K` and the consumer's `1 / pi`; check for duplicated opacity or solar-cosine factors |
 | Cross-contamination between hosts/stars | Verify tile indices and half-texel lookup margins |
-| Stale appearance after a material edit | Confirm atlas rebuild increments `profile_revision` and uploads property rows |
+| Stale appearance after a material edit | Confirm atlas rebuild increments `profile_revision` and uploads segment arrays |
+| Equinox flash or blackout | Verify `u_sun_radius`, `ring_resolve_disk`, and 64-sample disk quadrature |
 | Expensive rebakes while moving only the camera | Inspect `last_update_count` and world-space elevation inputs |
 | Sharp-profile convergence changes with bands | Compare several radial band counts at fixed geometry and exposure |
 | Near-contact error unchanged by more bands | Inspect the fixed azimuth quadrature and surface-map resolution |
@@ -1085,17 +1156,19 @@ For implementation work, the following checks distinguish different failure clas
 | Opposite-face NaNs or discontinuity | Check the coincident-depth limit of $(1-e^{-\Delta})/\Delta$ |
 | Oblateness comparison looks like a simple gain | Verify that $\rho$, the surface normal, horizon, and shadow all use the same flattening |
 
-Useful invariants for future validation include: transparent profiles yield zero; mirrored receiver latitude and star elevation preserve the response; each stellar contribution is additive after lookup; a pure azimuth change at fixed elevation reuses a tile; and changing material with a new revision invalidates it.
+Useful invariants for future validation include: transparent profiles yield zero; mirrored receiver latitude and star elevation preserve the response; each stellar contribution is additive after lookup; a pure azimuth change at fixed elevation reuses a tile; changing material revision invalidates all active tiles; and changing stellar angular radius invalidates the tile.
 
 The source-of-truth route for future changes is:
 
 ~~~text
-radial profile construction
-    → RingshineMap.update cache key
-    → ringshine_map.frag radial integration
-    → ringshine_band horizon and shadow
-    → ringshine_arc angular quadrature
-    → ringshine_radiance optical response
+segment profiles & uniform arrays
+    → RingshineMap.update cache key (includes sin_radius)
+    → ringshine_map.frag radial quadrature
+    → ring_resolve_disk (1 or 64 samples)
+    → ring_disk_sample quadrature rays
+    → ringshine_band oblate horizon & shadow
+    → ringshine_arc warped azimuth quadrature
+    → ringshine_material_radiance (shared ring_optics.glsl)
     → ringshine_sample tile lookup
     → surface albedo × stellar factors × M / pi
 ~~~
