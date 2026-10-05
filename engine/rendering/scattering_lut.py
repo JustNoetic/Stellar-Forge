@@ -12,8 +12,50 @@ class ScatteringLUTCache:
     def __init__(self, ctx, capacity=4, size=(48, 128, 32, 12), steps=96):
         self.ctx, self.capacity, self.size, self.steps = ctx, capacity, size, steps
         self.entries = OrderedDict()
+        self.optical_entries = OrderedDict()
+        self.optical_program = None
         self.tau_program = ctx.compute_shader(load_shader("atmosphere/scattering_tau.comp"))
         self.scattering_program = ctx.compute_shader(load_shader("atmosphere/scattering_lut.comp"))
+
+    def get_optical_depth(self, parameters):
+        """High mode caches extinction only; its ray budget samples lighting.
+
+        Optical depth is stored before exponentiation so opaque horizons and
+        finite view segments never require dividing tiny transmittances.
+        """
+        names = ('u_planet_radius_km', 'u_atmo_radius_km', 'u_scattering_bottom_km',
+                 'u_h_rayleigh', 'u_h_mie', 'u_beta_rayleigh', 'u_beta_mie',
+                 'u_beta_abs_mixed', 'u_beta_abs_layered', 'u_ozone_peak_km',
+                 'u_ozone_width_km')
+        key = tuple((name, parameters[name]) for name in names)
+        if key in self.optical_entries:
+            self.optical_entries.move_to_end(key)
+            return self.optical_entries[key]
+        if self.optical_program is None:
+            source = load_shader("atmosphere/scattering_tau.comp")
+            version, rest = source.split('\n', 1)
+            self.optical_program = self.ctx.compute_shader(
+                version + '\n#define SCATTERING_TAU_ONLY\n' + rest)
+        program = self.optical_program
+        for name, value in key:
+            if name in program:
+                program[name].value = value
+        program['u_scattering_steps'].value = self.steps
+        texture = self.ctx.texture((512, 256), 4, dtype='f4')
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        texture.repeat_x = texture.repeat_y = False
+        try:
+            texture.bind_to_image(0, read=False, write=True)
+            program.run(64, 32)
+            self.ctx.memory_barrier()
+        except Exception:
+            texture.release()
+            raise
+        while len(self.optical_entries) >= self.capacity:
+            _, old = self.optical_entries.popitem(last=False)
+            old.release()
+        self.optical_entries[key] = texture
+        return texture
 
     @staticmethod
     def _release(entry):
@@ -122,5 +164,11 @@ class ScatteringLUTCache:
     def release(self):
         for entry in self.entries.values(): self._release(entry)
         self.entries.clear()
+        for texture in self.optical_entries.values():
+            texture.release()
+        self.optical_entries.clear()
+        if self.optical_program is not None:
+            self.optical_program.release()
+            self.optical_program = None
         self.tau_program.release()
         self.scattering_program.release()

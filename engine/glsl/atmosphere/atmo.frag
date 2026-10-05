@@ -164,6 +164,7 @@ uniform vec2 u_lowres_size;
 uniform mat4 u_inv_proj;
 uniform mat4 u_inv_view;
 
+uniform bool u_atmo_optical_enabled; // High mode: extinction independent of ray-step budget
 uniform bool u_temporal_accum;
 uniform bool u_history_valid;
 uniform float u_temporal_alpha;
@@ -252,6 +253,15 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
             if ((coplanar_mask & (1u << ring_idx)) == 0u) continue;
             float inner_r = u_ring_params[ring_idx].x;
             float outer_r = u_ring_params[ring_idx].y;
+
+            if (u_atmo_quality >= 2) {
+                float inv_mu = 1.0 / max(1e-4, abs(denom));
+                float filtered_footprint = min(R_eff, (outer_r - inner_r) * 0.5);
+                plane_occlusion += surface_ring_profile_occlusion(ring_idx, d * u_au_to_km,
+                    inner_r * u_au_to_km, outer_r * u_au_to_km,
+                    u_ring_params[ring_idx].z, inv_mu, filtered_footprint * u_au_to_km);
+                continue;
+            }
 
             float overlap_min = max(inner_r, d - R_eff);
             float overlap_max = min(outer_r, d + R_eff);
@@ -435,78 +445,15 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
             }
         }
 
-        if (u_num_active_casters > 0) {
-            for (int c = 0; c < u_num_active_casters && c < 4; c++) {
-                vec3 pos = u_active_casters[c].xyz;
-                float base_rad_au = u_active_casters[c].w;
-                float atmo_km = u_active_caster_atmos[c].w;
-                float caster_r_minor_au = u_active_caster_R_minor[c];
-                vec3 pole = u_active_caster_poles_obl[c].xyz;
-
-                vec3 D = (pos - planet_center_render) * u_au_to_km - frag_local;
-                float t0 = dot(D, L_mid);
-                float t1 = -dot(V, L_mid);
-
-                vec3 A = D - t0 * L_mid;
-                vec3 B = -V - t1 * L_mid;
-
-                float qa = dot(B, B);
-                float qb = 2.0 * dot(A, B);
-                float qc = dot(A, A);
-
-                float s_mid_local = (s_start + s_end) * 0.5;
-                vec3 perp_mid_km = A + s_mid_local * B;
-
-                float r_au = base_rad_au;
-                if (caster_r_minor_au < base_rad_au - 1e-5) {
-                    r_au = get_oblate_radius(base_rad_au, caster_r_minor_au, pole, L_mid, perp_mid_km);
-                }
-                float r_km = r_au * u_au_to_km;
-                float eff_r_km = r_km + (atmo_km > 0.0 ? atmo_km * 4.0 : 0.0);
-
-                float directional_star_r_au = star_radius;
-                if (u_stars_poles_obl[s].w < star_radius - 1e-5) {
-                    directional_star_r_au = get_oblate_radius(star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz, L_mid, perp_mid_km);
-                }
-                float alpha_star = directional_star_r_au / max(dist_mid_star, 1e-6);
-
-                float dist_approx_min_km = max(0.0, t0 + s_start * t1);
-                float dist_approx_max_km = max(0.0, t0 + s_end * t1);
-                float r_penumbra_max_km = eff_r_km + max(dist_approx_min_km, dist_approx_max_km) * alpha_star;
-
-                float s_valid_min = s_start;
-                float s_valid_max = s_end;
-
-                if (qa > 1e-8) {
-                    float det = qb * qb - 4.0 * qa * (qc - r_penumbra_max_km * r_penumbra_max_km);
-                    if (det >= 0.0) {
-                        float sqrt_det = sqrt(det);
-                        float s_c1 = (-qb - sqrt_det) / (2.0 * qa);
-                        float s_c2 = (-qb + sqrt_det) / (2.0 * qa);
-
-                        s_valid_min = max(s_start, min(s_c1, s_c2));
-                        s_valid_max = min(s_end, max(s_c1, s_c2));
-
-                        if (s_valid_min <= s_valid_max) {
-                            float s_mid_valid = (s_valid_min + s_valid_max) * 0.5;
-                            float t_proj_mid = t0 + s_mid_valid * t1;
-                            if (t_proj_mid > 0.0) {
-                                out_sh_min = min(out_sh_min, s_valid_min);
-                                out_sh_max = max(out_sh_max, s_valid_max);
-                                has_hit = true;
-                            }
-                        }
-                    }
-                } else {
-                    if (qc <= r_penumbra_max_km * r_penumbra_max_km) {
-                        float t_proj_mid = t0 + s_mid_local * t1;
-                        if (t_proj_mid > 0.0) {
-                            out_sh_min = min(out_sh_min, s_start);
-                            out_sh_max = max(out_sh_max, s_end);
-                            has_hit = true;
-                        }
-                    }
-                }
+        for (int c = 0; c < min(u_num_active_casters, 8); ++c) {
+            vec3 D = (u_active_casters[c].xyz - planet_center_render) * u_au_to_km - frag_local;
+            float first = s_start, last = s_end;
+            // Equatorial radii conservatively contain every oblate projection.
+            if (caster_shadow_interval(D, V, L_mid, u_active_casters[c].w * u_au_to_km,
+                    star_radius / max(dist_mid_star, 1e-6), first, last)) {
+                out_sh_min = min(out_sh_min, first);
+                out_sh_max = max(out_sh_max, last);
+                has_hit = true;
             }
         }
     }
@@ -518,58 +465,95 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
     return false;
 }
 
-void march_unshadowed_segment(
-    float seg_start, float seg_end,
-    vec3 cam_sph, vec3 dir_sph, vec3 dir_world,
-    vec3 b_R, vec3 b_M, vec3 b_M_abs, vec3 b_A_mix, vec3 b_A_lay,
-    float inv_h_r, float inv_h_m, float inv_oz_w,
-    out vec3 out_L, out vec3 out_T
-) {
-    out_T = vec3(1.0);
-    out_L = vec3(0.0);
-    float seg_len = seg_end - seg_start;
-    if (seg_len <= 0.001) return;
+// A segment entirely above the table's reference radius shares one view-ray
+// family. Cache its initial optical depth instead of querying it in every cell.
+bool atmo_regular_segment(vec3 a, vec3 b) {
+    vec3 v = normalize(b - a);
+    float closest = clamp(-dot(a, v), 0.0, length(b - a));
+    return length(a + closest * v) >= u_scattering_bottom_km - 0.001;
+}
 
-    const int UN_STEPS = 8;
-    float step_sz = seg_len / float(UN_STEPS);
-    float inv_atmo_thick = 1.0 / max(1e-4, u_atmo_radius_km - u_planet_radius_km);
-
-    for (int p_i = 0; p_i < UN_STEPS; ++p_i) {
-        float cur_s = seg_start + (float(p_i) + 0.5) * step_sz;
-        vec3 p_sph = cam_sph + cur_s * dir_sph;
-        float s_len = max(length(p_sph), 1e-3);
-        float alt = max(0.0, s_len - u_planet_radius_km);
-        float r_R = exp(-alt * inv_h_r);
-        float r_M = exp(-alt * inv_h_m);
-        float t_oz = (alt - u_ozone_peak_km) * inv_oz_w;
-        float r_O = exp(-t_oz * t_oz);
-        vec3 st_ext = b_R * r_R + b_M * r_M + b_M_abs * r_M + b_A_mix * r_R + b_A_lay * r_O;
-        vec3 st_T = exp(-st_ext * step_sz);
-        vec3 factor = (vec3(1.0) - st_T) / max(st_ext, vec3(1e-6));
-        float h_n = clamp(alt * inv_atmo_thick, 0.0, 1.0);
-
-        for (int st = 0; st < min(u_num_stars, 4); ++st) {
-            vec3 sun_d = u_star_dir_sph_eff[st].xyz;
-            if (dot(sun_d, sun_d) <= 1e-8) continue;
-            float l_cos = dot(p_sph, sun_d) / s_len;
-            float sin_p = u_planet_radius_km / max(s_len, u_planet_radius_km + 0.01);
-            float cos_p = sqrt(max(0.0, 1.0 - sin_p * sin_p));
-            float eff_rad = u_star_pos_local[st].w;
-            float cos_s_eff = (eff_rad > 0.0) ? u_star_dir_sph_eff[st].w : 0.9999;
-            vec2 tm = sun_terminator(l_cos, sin_p, cos_p, eff_rad, cos_s_eff);
-            vec3 T_sun = (tm.x > 1e-4) ? get_transmittance_precomputed(sqrt(h_n), tm.y) : vec3(0.0);
-            vec3 att = out_T * T_sun * tm.x;
-            float cos_th = clamp(dot(dir_world, sun_d / max(1e-4, length(sun_d))), -1.0, 1.0);
-            float ph_R = (3.0 / (16.0 * PI)) * (1.0 + cos_th * cos_th);
-            float ph_M = u_precomp_mie.x * (1.0 + cos_th * cos_th) / pow(max(1e-4, u_precomp_mie.y - u_precomp_mie.z * cos_th), 1.5);
-            float ms_u = 0.5 + 0.5 * sign(l_cos) * sqrt(abs(l_cos));
-            vec3 psi = textureLod(u_multi_scatter_lut, vec2(ms_u, sqrt(h_n)), 0.0).rgb;
-            vec3 st_I = u_star_color_irrad[st].rgb;
-            out_L += st_I * (ph_R * b_R * r_R + ph_M * b_M * r_M) * att * factor
-                   + st_I * (b_R * r_R + b_M * r_M) * psi * out_T * factor;
-        }
-        out_T *= st_T;
+vec3 atmo_view_transmittance(vec3 a, vec3 p, vec3 v, vec3 initial_tau,
+                            bool ground, bool regular) {
+    if (!regular) return endpoint_transmittance(a, p);
+    vec3 tau = max(vec3(0.0), initial_tau - endpoint_tau(p, v, ground));
+    float distance = length(p - a);
+    if (distance < max(0.001, min(u_h_rayleigh, u_h_mie)) * 0.5) {
+        // Avoid cancellation in the optical-depth table for meter-scale paths.
+        vec3 R, M, extinction;
+        endpoint_medium(0.5 * (a + p), R, M, extinction);
+        tau = mix(extinction * distance, tau, endpoint_long_weight(distance));
     }
+    return exp(-tau);
+}
+
+// Estimate the fraction of each star's light removed inside the shadow hull.
+// Endpoint tables supply the hull's unshadowed energy and view extinction.
+// Normalizing the sampled weights preserves both zero-shadow and full-shadow
+// limits at any step count. Secondary light is not shadowed by the solar caster.
+vec3 march_shadow_deficit(float first, float last, float ray_start, float ray_end,
+        vec3 cam_sph, vec3 dir_sph, vec3 dir_world, int steps, float jitter,
+        vec3 star_baseline[4]) {
+    vec3 a = cam_sph + first * dir_sph;
+    vec3 b = cam_sph + last * dir_sph;
+    vec3 ray_a = cam_sph + ray_start * dir_sph;
+    bool full_hull = first == ray_start && last == ray_end;
+    vec3 hull_T = full_hull ? vec3(1.0) : endpoint_transmittance(a, b);
+    vec3 before_T = full_hull ? vec3(1.0) : endpoint_transmittance(ray_a, a);
+    vec3 view_direction = normalize(dir_sph);
+    bool regular = atmo_regular_segment(a, b);
+    bool ground = dot(a, view_direction) / length(a)
+        < scattering_horizon(max(length(a), u_scattering_bottom_km));
+    vec3 initial_tau = regular ? endpoint_tau(a, view_direction, ground) : vec3(0.0);
+    float closest = clamp(-dot(cam_sph, dir_sph) / dot(dir_sph, dir_sph), first, last);
+    vec3 deficit = vec3(0.0);
+    for (int st = 0; st < min(u_num_stars, 4); ++st) {
+        vec3 sun = u_star_dir_sph_eff[st].xyz;
+        if (dot(sun, sun) < 1e-8) continue;
+        sun = normalize(sun);
+        vec3 hull_light = full_hull ? star_baseline[st]
+            : before_T * endpoint_radiance_star(a, b, sun, hull_T,
+                st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
+        if (all(lessThan(hull_light, vec3(1e-20)))) continue;
+        vec3 L = normalize(u_star_pos_local[st].xyz);
+        float nu = clamp(dot(dir_world, L), -1.0, 1.0);
+        float phase_R = 3.0 / (16.0 * PI) * (1.0 + nu * nu);
+        float phase_M = u_precomp_mie.x * (1.0 + nu * nu)
+            / pow(max(1e-4, u_precomp_mie.y - u_precomp_mie.z * nu), 1.5);
+        vec3 energy = vec3(0.0), loss = vec3(0.0);
+        float haze;
+        vec3 boost;
+        eval_polar_winter(0.5 * (a + b), u_star_solstice[st].xy, u_ring_mask != 0u ? 1.0 : 0.0,
+            u_precomp_mie.w, haze, boost);
+        for (int i = 0; i < steps; ++i) {
+            float s0 = map_t_to_s(float(i) / float(steps), first, last, closest, 2.0);
+            float s1 = map_t_to_s(float(i + 1) / float(steps), first, last, closest, 2.0);
+            float station = mix(s0, s1, jitter);
+            vec3 p = cam_sph + station * dir_sph;
+            float r = max(length(p), 1e-6), mus = dot(p, sun) / r;
+            vec3 R, M, extinction;
+            endpoint_medium(p, R, M, extinction);
+            float sin_p = u_planet_radius_km / max(r, u_planet_radius_km + 0.01);
+            vec2 term = sun_terminator(mus, sin_p, sqrt(max(0.0, 1.0 - sin_p * sin_p)),
+                u_star_pos_local[st].w, u_star_dir_sph_eff[st].w);
+            float h = sqrt(clamp((r - u_planet_radius_km)
+                / (u_atmo_radius_km - u_planet_radius_km), 0.0, 1.0));
+            vec3 solar_T = term.x > 1e-4 ? get_transmittance_precomputed(h, term.y) * term.x : vec3(0.0);
+            vec3 psi = textureLod(u_multi_scatter_lut, vec2(scattering_sun_coord(mus), h), 0.0).rgb;
+            vec3 weight = atmo_view_transmittance(a, p, view_direction, initial_tau, ground, regular)
+                * max(0.0, s1 - s0)
+                * ((R * boost * phase_R + M * haze * phase_M) * solar_T + (R + M) * psi);
+            vec3 world_p = u_body_offset + fromSphericalSpace(p, u_pole_obl) / u_au_to_km;
+            vec3 shadow = compute_shadow(world_p, L, u_star_solstice[st].z,
+                u_body_offset, u_star_solstice[st].w,
+                u_stars_poles_obl[st].w, u_stars_poles_obl[st].xyz);
+            energy += weight;
+            loss += weight * (1.0 - shadow);
+        }
+        vec3 fraction = clamp(loss / max(energy, vec3(1e-20)), 0.0, 1.0);
+        deficit += min(star_baseline[st], hull_light * fraction);
+    }
+    return deficit;
 }
 
 void main() {
@@ -970,7 +954,7 @@ void main() {
     vec3 beta_A_layered = u_beta_abs_layered * 1000.0;
 
     float ray_len = s_end - s_start;
-    float s_closest = clamp(-dot(cam_local_sph, ray_dir_sph), s_start, s_end);
+    float s_closest = clamp(-dot(cam_local_sph, ray_dir_sph) / dot(ray_dir_sph, ray_dir_sph), s_start, s_end);
     float min_altitude = max(0.0, length(cam_local_sph + s_closest * ray_dir_sph) - u_planet_radius_km);
 
     vec3 pole_dir_norm = length(u_pole_obl.xyz) > 1e-4 ? normalize(u_pole_obl.xyz) : vec3(0.0, 1.0, 0.0);
@@ -979,23 +963,19 @@ void main() {
     float inv_h_mie = u_precomp_opt.y;
     float inv_ozone_width = u_precomp_opt.z;
 
-    // Optical depth awareness: compute peak extinction along this ray to set non-linear grading
-    float peak_rho_R = exp(-min_altitude * inv_h_rayleigh);
-    float peak_rho_M = exp(-min_altitude * inv_h_mie);
-    float peak_ext = dot(beta_R, vec3(0.333333)) * peak_rho_R + dot(beta_M_ext, vec3(0.333333)) * peak_rho_M;
-    float tau_ray_approx = peak_ext * min(ray_len, 2.0 * sqrt(max(0.0, 2.0 * u_planet_radius_km * u_h_rayleigh + u_h_rayleigh * u_h_rayleigh)));
-
-    // Spherical limb geometry already concentrates path length quadratically near closest approach (h ~ h_min + s^2 / 2R).
-    // Applying power grading (p > 1) on limb rays distorts altitude as u^(2p) (e.g. u^5 for p=2.5), which over-concentrates
-    // steps in the core and stretches outer steps to >1,000 km, ruining numerical convergence and color stability.
-    // Therefore, limb rays use linear distance spacing (p = 1.0).
-    // Only surface-intersecting rays (where altitude varies towards the planetary surface) benefit from
-    // exponential grading towards the planetary surface.
-    bool is_surface_ray = hits_surface;
-
-    float grade_p = 1.0;
-    if (is_surface_ray && tau_ray_approx > 1.0) {
-        grade_p = clamp(1.0 + 0.5 * log(tau_ray_approx), 1.0, 2.0);
+    // Grade cell boundaries towards dense gas, then sample uniformly inside
+    // each physical cell. Jitter must not pass through the grading function.
+    float grade_p = 2.0;
+    if (u_atmo_quality == 1) {
+        // Keep Low's original cell distribution for its cheaper cell integral.
+        float peak_rho_R = exp(-min_altitude * inv_h_rayleigh);
+        float peak_rho_M = exp(-min_altitude * inv_h_mie);
+        float peak_ext = dot(beta_R, vec3(0.333333)) * peak_rho_R
+                       + dot(beta_M_ext, vec3(0.333333)) * peak_rho_M;
+        float tau_ray = peak_ext * min(ray_len, 2.0 * sqrt(max(0.0,
+            2.0 * u_planet_radius_km * u_h_rayleigh + u_h_rayleigh * u_h_rayleigh)));
+        grade_p = hits_surface && tau_ray > 1.0
+            ? clamp(1.0 + 0.5 * log(tau_ray), 1.0, 2.0) : 1.0;
     }
 
     float sh_min = s_start;
@@ -1021,17 +1001,14 @@ void main() {
     }
 
     int integration_quality = u_atmo_quality;
-    if (u_atmo_quality == 3 && has_shadow) {
-        integration_quality = 2;
-    }
 
     float jitter = 0.5;
-    if (integration_quality != 3 && u_stochastic_noise) {
+    if ((integration_quality != 3 || has_shadow) && u_stochastic_noise) {
         jitter = get_stochastic_jitter(gl_FragCoord.xy, u_frame_counter);
     }
 
     int steps = u_num_samples;
-    if (integration_quality != 3 && u_atmo_adaptive_steps) {
+    if ((integration_quality != 3 || has_shadow) && u_atmo_adaptive_steps) {
         float base_steps = float(u_num_samples);
         float max_adaptive = max(base_steps, u_max_adaptive_steps > 0.0 ? u_max_adaptive_steps : 128.0);
         float min_steps = clamp(base_steps * 0.15, 3.0, 8.0);
@@ -1076,15 +1053,27 @@ void main() {
         steps = max(1, min(steps, int(base_bounded + step_dither + 0.5)));
     }
 
-    float march_s_closest = clamp(-dot(cam_local_sph, ray_dir_sph), march_start, march_end);
+    float march_s_closest = clamp(-dot(cam_local_sph, ray_dir_sph) / dot(ray_dir_sph, ray_dir_sph), march_start, march_end);
     float march_grade_p = (use_bounded && march_end < s_end - 0.1) ? 1.0 : grade_p;
 
     vec3 scattered = vec3(0.0);
     vec3 final_transmittance = vec3(1.0);
-    vec3 L_pre = vec3(0.0);
-    vec3 T_pre = vec3(1.0);
-    vec3 L_post = vec3(0.0);
-    vec3 T_post = vec3(1.0);
+    vec3 star_baseline[4];
+    for (int st = 0; st < 4; ++st) star_baseline[st] = vec3(0.0);
+    vec3 view_a = cam_local_sph + s_start * ray_dir_sph;
+    vec3 view_b = cam_local_sph + s_end * ray_dir_sph;
+    vec3 view_direction = normalize(ray_dir_sph);
+    bool view_regular = false, view_ground = false;
+    vec3 view_initial_tau = vec3(0.0);
+    vec3 high_transmittance = vec3(1.0);
+    if (integration_quality == 2 && u_atmo_optical_enabled) {
+        view_regular = atmo_regular_segment(view_a, view_b);
+        view_ground = dot(view_a, view_direction) / length(view_a)
+            < scattering_horizon(max(length(view_a), u_scattering_bottom_km));
+        if (view_regular) view_initial_tau = endpoint_tau(view_a, view_direction, view_ground);
+        high_transmittance = atmo_view_transmittance(view_a, view_b, view_direction,
+            view_initial_tau, view_ground, view_regular);
+    }
 
     if (integration_quality == 3 && u_scattering_enabled
         && (has_scene_surface || u_atmo_clip_mode != 0 || scene_limit < s_atmo.y)) {
@@ -1107,9 +1096,10 @@ void main() {
             final_transmittance = endpoint_transmittance(a, b);
             for (int st = 0; st < min(u_num_stars, 4); ++st) {
                 if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8) {
-                    scattered += endpoint_radiance_star(a, b,
+                    star_baseline[st] = endpoint_radiance_star(a, b,
                         normalize(u_star_dir_sph_eff[st].xyz), final_transmittance,
                         st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
+                    scattered += star_baseline[st];
                 }
             }
             scattered += endpoint_secondary_light(a, b, final_transmittance,
@@ -1117,6 +1107,15 @@ void main() {
             if (used_volume) {
                 scattered = mix(scattered, volume_L, volume_weight);
                 final_transmittance = mix(final_transmittance, volume_T, volume_weight);
+            }
+        }
+        if (has_shadow && used_volume && volume_weight >= 1.0) {
+            vec3 direct_T = endpoint_transmittance(a, b);
+            for (int st = 0; st < min(u_num_stars, 4); ++st) {
+                if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8)
+                    star_baseline[st] = endpoint_radiance_star(a, b,
+                        normalize(u_star_dir_sph_eff[st].xyz), direct_T,
+                        st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
             }
         }
     } else if (integration_quality == 3) {
@@ -1227,41 +1226,14 @@ void main() {
 
         scattered = L_scatter;
         final_transmittance = T_lut;
-    } else {
-        if (use_bounded) {
-            if (march_start > s_start + 0.1) {
-                vec3 a1 = cam_local_sph + s_start * ray_dir_sph;
-                vec3 b1 = cam_local_sph + march_start * ray_dir_sph;
-                march_unshadowed_segment(
-                    s_start, march_start,
-                    cam_local_sph, ray_dir_sph, ray_dir,
-                    beta_R, beta_M, beta_M_abs, beta_A_mixed, beta_A_layered,
-                    inv_h_rayleigh, inv_h_mie, inv_ozone_width,
-                    L_pre, T_pre
-                );
-                if ((u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
-                    L_pre += endpoint_subsurface_secondary_light(a1, b1,
-                        body_planetshine_dir, body_planetshine_color, u_ring_mask);
-                }
-            }
-
-            if (s_end > march_end + 0.1) {
-                vec3 a3 = cam_local_sph + march_end * ray_dir_sph;
-                vec3 b3 = cam_local_sph + s_end * ray_dir_sph;
-                march_unshadowed_segment(
-                    march_end, s_end,
-                    cam_local_sph, ray_dir_sph, ray_dir,
-                    beta_R, beta_M, beta_M_abs, beta_A_mixed, beta_A_layered,
-                    inv_h_rayleigh, inv_h_mie, inv_ozone_width,
-                    L_post, T_post
-                );
-                if ((u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
-                    L_post += endpoint_subsurface_secondary_light(a3, b3,
-                        body_planetshine_dir, body_planetshine_color, u_ring_mask);
-                }
+        if (has_shadow && u_scattering_enabled) {
+            for (int st = 0; st < min(u_num_stars, 4); ++st) {
+                star_baseline[st] = texture(u_sky_view_star_lut[st], vec2(u_lut, v_lut)).rgb;
+                if (!cam_inside && !is_ground)
+                    star_baseline[st] *= clamp((1.0 - t_limb) * 128.0, 0.0, 1.0);
             }
         }
-
+    } else {
         for (int s = 0; s < u_num_stars; s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = (s < 4) ? u_star_solstice[s].w : u_stars_pos_radius[s].w;
@@ -1295,14 +1267,9 @@ void main() {
         vec4 ring_r_star_proj = vec4(0.0);
         vec4 ring_inv_denom = vec4(1.0);
 
-        int opt_caster_count = 0;
+        bool has_body_shadow = false;
         int ring_count = 0;
-        vec4 c_p0[4];
-        vec4 c_p1[4];
-        vec4 c_p2[4];
-        vec4 c_p3[4];
-        vec2 c_p4[4];
-        vec4 c_p5[4];
+
 
         float s_mid = (march_start + march_end) * 0.5;
         vec3 mid_pos = frag_local + s_mid * ray_dir;
@@ -1392,88 +1359,16 @@ void main() {
                     }
                 }
 
-                opt_caster_count = 0;
-                if (u_num_active_casters > 0) {
-                    for (int c = 0; c < u_num_active_casters && opt_caster_count < 4; c++) {
-                        vec3 pos = u_active_casters[c].xyz;
-                        float base_rad_au = u_active_casters[c].w;
-                        float atmo_km = u_active_caster_atmos[c].w;
-                        float caster_r_minor_au = u_active_caster_R_minor[c];
-                        vec3 pole = u_active_caster_poles_obl[c].xyz;
-
-                        vec3 D = (pos - planet_center_render) * u_au_to_km - frag_local;
-                        float t0 = dot(D, L_mid);
-                        float t1 = -dot(V, L_mid);
-
-                        vec3 A = D - t0 * L_mid;
-                        vec3 B = -V - t1 * L_mid;
-
-                        float qa = dot(B, B);
-                        float qb = 2.0 * dot(A, B);
-                        float qc = dot(A, A);
-
-                        float s_mid_local = (march_start + march_end) * 0.5;
-                        vec3 perp_mid_km = A + s_mid_local * B;
-
-                        float r_au = base_rad_au;
-                        if (caster_r_minor_au < base_rad_au - 1e-5) {
-                            r_au = get_oblate_radius(base_rad_au, caster_r_minor_au, pole, L_mid, perp_mid_km);
-                        }
-                        float r_km = r_au * u_au_to_km;
-                        float eff_r_km = r_km + (atmo_km > 0.0 ? atmo_km * 4.0 : 0.0);
-
-                        float directional_star_r_au = star_radius;
-                        if (u_stars_poles_obl[s].w < star_radius - 1e-5) {
-                            directional_star_r_au = get_oblate_radius(star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz, L_mid, perp_mid_km);
-                        }
-                        float alpha_star = directional_star_r_au / max(dist_mid_star, 1e-6);
-
-                        float dist_approx_min_km = max(0.0, t0 + march_start * t1);
-                        float dist_approx_max_km = max(0.0, t0 + march_end * t1);
-                        float r_penumbra_max_km = eff_r_km + max(dist_approx_min_km, dist_approx_max_km) * alpha_star;
-
-                        float s_valid_min = march_start;
-                        float s_valid_max = march_end;
-
-                        if (qa > 1e-8) {
-                            float det = qb * qb - 4.0 * qa * (qc - r_penumbra_max_km * r_penumbra_max_km);
-                            if (det < 0.0) continue;
-
-                            float sqrt_det = sqrt(det);
-                            float s_c1 = (-qb - sqrt_det) / (2.0 * qa);
-                            float s_c2 = (-qb + sqrt_det) / (2.0 * qa);
-
-                            s_valid_min = max(march_start, min(s_c1, s_c2));
-                            s_valid_max = min(march_end, max(s_c1, s_c2));
-
-                            if (s_valid_min > s_valid_max) continue;
-                        } else {
-                            if (qc > r_penumbra_max_km * r_penumbra_max_km) continue;
-                        }
-
-                        float s_mid_valid = (s_valid_min + s_valid_max) * 0.5;
-                        float t_proj_mid = t0 + s_mid_valid * t1;
-                        if (t_proj_mid <= 0.0) continue;
-
-                        float perp_sq_mid = qa * s_mid_valid * s_mid_valid + qb * s_mid_valid + qc;
-                        float dist_to_caster_mid = sqrt(max(0.0, perp_sq_mid) + t_proj_mid * t_proj_mid);
-                        float footprint_km = alpha_star * dist_to_caster_mid;
-                        float outer_km = r_km + footprint_km;
-
-                        c_p0[opt_caster_count] = vec4(qa, qb, qc, outer_km * outer_km);
-                        c_p1[opt_caster_count] = vec4(footprint_km, r_km,
-                            u_active_scale_height[c], dist_to_caster_mid);
-                        c_p2[opt_caster_count] = vec4(0.0, 0.0, u_active_max_bend[c], 0.0);
-                        c_p3[opt_caster_count] = vec4(u_active_caster_atmos[c].xyz,
-                            1.0 / max(base_rad_au * u_au_to_km, 100.0));
-                        c_p4[opt_caster_count] = vec2(s_valid_min, s_valid_max);
-                        c_p5[opt_caster_count] = u_active_caster_ozone[c];
-
-                        opt_caster_count++;
+                for (int c = 0; c < min(u_num_active_casters, 8); ++c) {
+                    vec3 D = (u_active_casters[c].xyz - planet_center_render) * u_au_to_km - frag_local;
+                    float first = march_start, last = march_end;
+                    if (caster_shadow_interval(D, V, L_mid, u_active_casters[c].w * u_au_to_km,
+                            star_radius / max(dist_mid_star, 1e-6), first, last)) {
+                        has_body_shadow = true;
+                        break;
                     }
                 }
-
-                if (opt_caster_count == 0 && ring_count == 0) skip_volumetric_shadow = true;
+                if (!has_body_shadow && ring_count == 0) skip_volumetric_shadow = true;
             }
         }
 
@@ -1511,12 +1406,14 @@ void main() {
         for (int i = 0; i < steps; i++) {
             float t0 = float(i) / float(steps);
             float t1 = float(i + 1) / float(steps);
-            float tj = (float(i) + jitter) / float(steps);
 
             float s0 = map_t_to_s(t0, march_start, march_end, march_s_closest, march_grade_p);
             float s1 = map_t_to_s(t1, march_start, march_end, march_s_closest, march_grade_p);
-            float current_s = map_t_to_s(tj, march_start, march_end, march_s_closest, march_grade_p);
-            float step_size = max(1e-4, s1 - s0);
+            float current_s = mix(s0, s1, jitter);
+            if (integration_quality == 1)
+                current_s = map_t_to_s((float(i) + jitter) / float(steps),
+                    march_start, march_end, march_s_closest, march_grade_p);
+            float step_size = max(0.0, s1 - s0);
 
             vec3 current_pos_sph = cam_local_sph + current_s * ray_dir_sph;
             float sample_len = length(current_pos_sph);
@@ -1529,8 +1426,18 @@ void main() {
 
             // Extinction uses physical beta_R to prevent artificial limb color fringing
             vec3 step_extinction = beta_R * rho_R + beta_M * rho_M + beta_M_abs * rho_M + beta_A_mixed * rho_R + beta_A_layered * rho_O;
-            vec3 step_transmittance = exp(-step_extinction * step_size);
-            vec3 int_factor = (vec3(1.0) - step_transmittance) / max(step_extinction, 1e-6);
+            vec3 step_transmittance = vec3(1.0);
+            vec3 int_factor = vec3(step_size);
+            if (integration_quality == 2 && u_atmo_optical_enabled) {
+                // This is a stratified integral of the actual attenuated source.
+                // Extinction is deterministic; it is not exponentiated from the
+                // same random density sample that estimates the light source.
+                current_transmittance = atmo_view_transmittance(view_a, current_pos_sph,
+                    view_direction, view_initial_tau, view_ground, view_regular);
+            } else {
+                step_transmittance = exp(-step_extinction * step_size);
+                int_factor = (vec3(1.0) - step_transmittance) / max(step_extinction, 1e-6);
+            }
 
             vec3 sun_dir_sph = sun_dir_sph_const;
             float light_cos_theta = dot(current_pos_sph, sun_dir_sph) / sample_len;
@@ -1573,24 +1480,10 @@ void main() {
                 }
                 // === End Mode 2 shared ring transmission ===
 
-                if (opt_caster_count > 0) {
-                    for (int c = 0; c < 4; c++) {
-                        if (c >= opt_caster_count) break;
-
-                        vec2 s_bounds = c_p4[c];
-                        if (current_s >= s_bounds.x && current_s <= s_bounds.y) {
-                            vec4 p0 = c_p0[c];
-                            float perp_sq = p0.x * current_s * current_s + p0.y * current_s + p0.z;
-                            if (perp_sq < p0.w) {
-                                vec4 p1 = c_p1[c];
-                                float perpendicular_km = sqrt(max(0.0, perp_sq));
-                                vec4 p2 = c_p2[c];
-
-                                vec3 sh = casterShadowTerm(p1.x, p1.y, perpendicular_km, p2.z, c_p3[c], c_p5[c], p1.z, p1.w, 1.0);
-                                sample_shadow *= sh;
-                            }
-                        }
-                    }
+                if (has_body_shadow) {
+                    vec3 world_p = planet_center_render + fromSphericalSpace(current_pos_sph, u_pole_obl) / u_au_to_km;
+                    sample_shadow *= compute_caster_shadow(world_p, L_mid, dist_mid_star,
+                        star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
                 }
             }
 
@@ -1636,8 +1529,10 @@ void main() {
                 total_ms_rs += (beta_R * rho_R + beta_M * rho_M) * psi_rs * rs_attenuation * int_factor;
             }
 
-            current_transmittance *= step_transmittance;
-            if (all(lessThan(current_transmittance, vec3(1e-6)))) {
+            if (!(integration_quality == 2 && u_atmo_optical_enabled))
+                current_transmittance *= step_transmittance;
+            if (!(integration_quality == 2 && u_atmo_optical_enabled)
+                && all(lessThan(current_transmittance, vec3(1e-6)))) {
                 current_transmittance = vec3(0.0);
                 break;
             }
@@ -1718,13 +1613,16 @@ void main() {
             );
         }
 
-        final_transmittance = current_transmittance;
+        final_transmittance = (integration_quality == 2 && u_atmo_optical_enabled)
+            ? high_transmittance
+            : current_transmittance;
     }
     }
 
-    if (use_bounded) {
-        scattered = L_pre + T_pre * (scattered + final_transmittance * L_post);
-        final_transmittance = T_pre * final_transmittance * T_post;
+    if (u_atmo_quality == 3 && u_scattering_enabled && has_shadow) {
+        vec3 deficit = march_shadow_deficit(march_start, march_end, s_start, s_end,
+            cam_local_sph, ray_dir_sph, ray_dir, max(1, steps), jitter, star_baseline);
+        scattered = max(vec3(0.0), scattered - deficit);
     }
 
     vec3 transmittance = final_transmittance;

@@ -94,30 +94,12 @@ def _ellipsoid_surface_radius(r_eq, f, pole, u):
         return b
     return math.sqrt((r_eq * r_eq * b * b) / denom)
 
-_ICOSPHERE_SAG_CACHE = {}
-
 _STATION_GRID_BYTES_CACHE = {}
 for _k in range(2, 65):
     _g = np.zeros((9, 4), dtype='f4')
     _nb = min(_k + 1, _g.size)
     _g.ravel()[:_nb] = np.linspace(0.0, 1.0, _nb)
     _STATION_GRID_BYTES_CACHE[_k] = _g.tobytes()
-
-def _icosphere_max_sag(subdivisions):
-    """Max inward sag of the tessellated icosphere from its circumsphere,
-    as a fraction of the radius (1 - inradius/circumradius)."""
-    if subdivisions not in _ICOSPHERE_SAG_CACHE:
-        mesh_verts, mesh_idx = create_icosphere_mesh(subdivisions=subdivisions)
-        v3 = mesh_verts.reshape(-1, 6)[:, 0:3]
-        i3 = mesh_idx.reshape(-1, 3)
-        a = v3[i3[:, 0]]
-        b_v = v3[i3[:, 1]]
-        c_v = v3[i3[:, 2]]
-        nrm = np.cross(b_v - a, c_v - a)
-        denom = np.maximum(np.linalg.norm(nrm, axis=1), 1e-12)
-        d = np.abs(np.einsum('ij,ij->i', a, nrm)) / denom
-        _ICOSPHERE_SAG_CACHE[subdivisions] = float(1.0 - d.min())
-    return _ICOSPHERE_SAG_CACHE[subdivisions]
 
 def _camera_rot_axis(axis, angle):
     """Rodrigues 3x3 rotation matrix about unit `axis` by `angle` radians."""
@@ -4377,6 +4359,14 @@ class App(InputHandlerMixin):
                 self._ps_ring_material_key = ps_material_key
             ps_ring_params, ps_ring_normals, ps_ring_colors, ps_ring_scattering = self._ps_ring_materials
 
+            if getattr(self, '_ps_is_moon_key', None) != (total_render_bodies, len(bodies_data)):
+                self._ps_is_moon = np.array(
+                    [b.get('type') == 'Moon' or b.get('is_moon', False) for b in material_bodies],
+                    dtype=np.bool_
+                )
+                self._ps_is_moon_key = (total_render_bodies, len(bodies_data))
+            is_moon_arr = self._ps_is_moon
+
             planetshine_dirs, planetshine_colors = compute_planetshine_numba(
                 all_instances[:total_render_bodies, 0:3],
                 all_instances[:total_render_bodies, 6],
@@ -4394,7 +4384,8 @@ class App(InputHandlerMixin):
                 ringshine_enabled,
                 ps_ring_scattering,
                 surface_materials,
-                surface_phases
+                surface_phases,
+                is_moon_arr
             )
             all_instances[:total_render_bodies, 16:19] = planetshine_dirs
             all_instances[:total_render_bodies, 20:23] = planetshine_colors
@@ -6228,21 +6219,18 @@ class App(InputHandlerMixin):
                                                   float(props.get('ozone_width_km', 8.0)),
                                                   0.0, float(self.camera.get('atmo_adaptive_steps_max', 128))]  # pad to 736 bytes
 
-                    # Inner clip radius for the atmosphere march: the planet is an
-                    # icosphere whose flat faces sag below the analytic ellipsoid,
-                    # leaving an empty band between the surface and the atmosphere
-                    # bottom at the limb.  Shrink the clip sphere by the max sag of
-                    # the mesh LOD that body actually renders with (same rule as the
-                    # culling compute shader) so the atmosphere covers the polyhedron.
-                    _atmo_rad_au = self.body_radii_cmp[bi] if is_cmp else body_radii[bi]
-                    _apparent_px = (float(_atmo_rad_au) / max(dist_to_body, 1e-12)) * self.window_height * fov_factor
-                    if _apparent_px >= 300.0:
-                        _lod_subdiv = 6
-                    elif _apparent_px >= 40.0:
-                        _lod_subdiv = 4
-                    else:
-                        _lod_subdiv = 1
-                    self.atmo_staging[182] = float(atmo['planet_radius_km']) * (1.0 - _icosphere_max_sag(_lod_subdiv))
+                    # Surface shaders raytrace the ellipsoid independently of mesh LOD.
+                    # Only a camera inside active terrain needs a below-datum floor;
+                    # scene depth then supplies the actual terrain endpoint.
+                    _clip_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
+                    _clip_radius = float(atmo['planet_radius_km'])
+                    if not is_cmp and bi in active_terrain_body_indices:
+                        _clip_cam = (cam_pos - body_pos_rel) * AU_TO_KM
+                        _clip_pole = all_instances[body_idx_in_unified, 9:12]
+                        _clip_cam = _clip_cam + np.dot(_clip_cam, _clip_pole) * (f_scale - 1.0) * _clip_pole
+                        if np.linalg.norm(_clip_cam) <= float(atmo['atmo_radius_km']):
+                            _clip_radius += min(0.0, float(_clip_body.get('height_range_km', [0.0])[0])) * f_scale - 0.05
+                    self.atmo_staging[182] = max(1e-3, _clip_radius)
 
                     # Precomputed optical constants
                     _inv_h_r = 1.0 / max(1e-3, float(props['scale_height_km']))
@@ -6346,7 +6334,9 @@ class App(InputHandlerMixin):
                     _endpoint_enabled = atmo_quality == 3
                     if 'u_scattering_enabled' in cur_prog:
                         cur_prog['u_scattering_enabled'].value = _endpoint_enabled
-                    if _endpoint_enabled:
+                    if 'u_atmo_optical_enabled' in cur_prog:
+                        cur_prog['u_atmo_optical_enabled'].value = atmo_quality >= 2
+                    if atmo_quality >= 2:
                         if self.scattering_lut_cache is None:
                             self.scattering_lut_cache = ScatteringLUTCache(ctx)
                         _endpoint_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
@@ -6375,16 +6365,19 @@ class App(InputHandlerMixin):
                             'u_ground_albedo': tuple(float(x) for x in self.visual_arr_cmp[bi, 0:3])
                                 if is_cmp else tuple(float(x) for x in visual_arr[bi, 0:3]),
                         }
-                        _endpoint_textures = self.scattering_lut_cache.get(
-                            _endpoint_parameters, atmo['lut_multi_scatter'])
-                        self.scattering_lut_cache.bind(_endpoint_textures)
-                        # Distinct stellar angular sizes share medium/shine tables,
-                        # with their own cached solar response and no raymarch fallback.
-                        for _slot in range(1, min(num_stars, 4)):
-                            _star_parameters = dict(_endpoint_parameters,
-                                u_scattering_sun_radius=max(0.0, round(float(self.atmo_staging[227 + 4 * _slot]), 4)))
-                            _star_tables = self.scattering_lut_cache.get(_star_parameters, atmo['lut_multi_scatter'])
-                            self.scattering_lut_cache.bind_star(_star_tables, _slot)
+                        if _endpoint_enabled:
+                            _endpoint_textures = self.scattering_lut_cache.get(
+                                _endpoint_parameters, atmo['lut_multi_scatter'])
+                            self.scattering_lut_cache.bind(_endpoint_textures)
+                            # Distinct stellar angular sizes share medium/shine tables,
+                            # with their own cached solar response and no raymarch fallback.
+                            for _slot in range(1, min(num_stars, 4)):
+                                _star_parameters = dict(_endpoint_parameters,
+                                    u_scattering_sun_radius=max(0.0, round(float(self.atmo_staging[227 + 4 * _slot]), 4)))
+                                _star_tables = self.scattering_lut_cache.get(_star_parameters, atmo['lut_multi_scatter'])
+                                self.scattering_lut_cache.bind_star(_star_tables, _slot)
+                        else:
+                            self.scattering_lut_cache.get_optical_depth(_endpoint_parameters).use(20)
                         if 'u_scattering_terrain_bottom_km' in cur_prog:
                             cur_prog['u_scattering_terrain_bottom_km'].value = _terrain_bottom
                         if 'u_scattering_bottom_km' in cur_prog:
@@ -6393,10 +6386,11 @@ class App(InputHandlerMixin):
                             cur_prog['u_scattering_sun_radius'].value = _eff_sun
                         if 'u_scattering_azimuth_count' in cur_prog:
                             cur_prog['u_scattering_azimuth_count'].value = self.scattering_lut_cache.size[3]
-                        for _name, _value in (('u_scattering_bottom_km', _bottom),
-                                ('u_scattering_sun_radius', _eff_sun),
-                                ('u_scattering_azimuth_count', self.scattering_lut_cache.size[3])):
-                            if _name in self.prog_sky_view: self.prog_sky_view[_name].value = _value
+                        if _endpoint_enabled:
+                            for _name, _value in (('u_scattering_bottom_km', _bottom),
+                                    ('u_scattering_sun_radius', _eff_sun),
+                                    ('u_scattering_azimuth_count', self.scattering_lut_cache.size[3])):
+                                if _name in self.prog_sky_view: self.prog_sky_view[_name].value = _value
 
                     # Mode 3: Analytical Sky-View LUT pass
                     if atmo_quality == 3 and self.prog_sky_view is not None:

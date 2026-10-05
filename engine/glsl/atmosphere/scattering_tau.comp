@@ -1,8 +1,10 @@
 #version 460 core
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(rgba32f, binding = 0) writeonly uniform image2D u_tau_output;
+#ifndef SCATTERING_TAU_ONLY
 layout(rgba32f, binding = 1) writeonly uniform image2D u_ambient_rayleigh_output;
 layout(rgba32f, binding = 2) writeonly uniform image2D u_ambient_mie_output;
+#endif
 #include "common/scattering_bake.glsl"
 
 void main() {
@@ -25,15 +27,19 @@ void main() {
         vec3 rayleigh, mie, extinction;
         scattering_medium(altitude_radius, rayleigh, mie, extinction);
         float ds = b - a;
+#ifndef SCATTERING_TAU_ONLY
         vec3 cell_T = exp(-extinction * ds);
         vec3 factor = mix((1.0 - cell_T) / max(extinction, vec3(1e-20)),
                           vec3(ds), lessThan(extinction * ds, vec3(1e-4)));
         R += T * factor * rayleigh;
         M += T * factor * mie;
         T *= cell_T;
+#endif
         tau += extinction * ds;
     }
     imageStore(u_tau_output, pixel, vec4(tau, 1.0));
+#ifndef SCATTERING_TAU_ONLY
     imageStore(u_ambient_rayleigh_output, pixel, vec4(R, 1.0));
     imageStore(u_ambient_mie_output, pixel, vec4(M, 1.0));
+#endif
 }

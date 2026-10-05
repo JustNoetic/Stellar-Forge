@@ -331,7 +331,8 @@ def compute_planetshine_numba(
     pos, radii, colors, is_star, star_positions, star_colors, star_lums, star_radii, hdr_enabled,
     ring_params=None, ring_normals=None, ring_colors=None,
     planetshine_enabled=True, ringshine_enabled=True, ring_scattering=None,
-    surface_materials=None, surface_phases=None
+    surface_materials=None, surface_phases=None,
+    is_moon=None
 ):
     N = len(pos)
     num_stars = len(star_positions)
@@ -413,8 +414,15 @@ def compute_planetshine_numba(
         total_color_r, total_color_g, total_color_b = 0.0, 0.0, 0.0
         total_weight = 0.0
         
+        skip_moon_casters = False
+        if is_moon is not None:
+            if is_moon[i]:
+                skip_moon_casters = True
+
         for j in range(N):
             if i == j or is_star[j] > 0.5:
+                continue
+            if skip_moon_casters and is_moon[j]:
                 continue
                 
             pos_j = pos[j]

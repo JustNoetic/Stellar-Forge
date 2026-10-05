@@ -49,6 +49,37 @@ float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_
 // Inputs are per-caster quantities already resolved by the caller.
 #include "eclipse_shadow.glsl"
 
+// Conservative support of casterShadowTerm along a view segment, in km.
+// Its optics are confined to the solid radius + stellar footprint; atmosphere
+// thickness does not expand that support. Use endpoint distances to bound the
+// changing footprint, and clip to the half-space behind the caster first.
+bool caster_shadow_interval(vec3 D, vec3 V, vec3 L, float radius_km,
+                            float star_ratio, inout float first, inout float last) {
+    float axial = dot(D, L), slope = -dot(V, L);
+    if (abs(slope) < 1e-8) {
+        if (axial <= 0.0) return false;
+    } else {
+        float crossing = -axial / slope;
+        if (slope > 0.0) first = max(first, crossing);
+        else last = min(last, crossing);
+    }
+    if (first >= last) return false;
+    float distance_max = max(length(D - first * V), length(D - last * V));
+    float outer = radius_km + distance_max * star_ratio;
+    vec3 A = D - axial * L;
+    vec3 B = -V - slope * L;
+    float qa = dot(B, B);
+    if (qa < 1e-12) return dot(A, A) <= outer * outer;
+    float closest = -dot(A, B) / qa;
+    vec3 perpendicular = A + closest * B;
+    float delta = outer * outer - dot(perpendicular, perpendicular);
+    if (delta < 0.0) return false;
+    float half_width = sqrt(delta / qa);
+    first = max(first, closest - half_width);
+    last = min(last, closest + half_width);
+    return first < last;
+}
+
 // Product of per-caster eclipse attenuation for a parcel at eval_render_pos
 // (render frame, AU) lit by a star along L_dir. Oblate casters and oblate
 // stars are projected along the light direction. Ring-plane occlusion is
@@ -61,7 +92,6 @@ vec3 compute_caster_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star,
         if ((caster_mask & (1u << i)) == 0u) continue;
         vec3 caster_pos = u_active_casters[i].xyz;
         float caster_r = u_active_casters[i].w;
-        float atmo_h = u_active_caster_atmos[i].w;
 
         vec3 s_to_c = caster_pos - eval_render_pos;
         float t_proj = dot(s_to_c, L_dir);
@@ -87,8 +117,7 @@ vec3 compute_caster_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star,
         }
         float local_star_radius_over_dist = directional_star_r / max(dist_to_star, 1e-6);
 
-        float effective_r = caster_r + (atmo_h > 0.0 ? atmo_h * (4.0 / u_au_to_km) : 0.0);
-        float r_penumbra = effective_r + dist_to_caster * local_star_radius_over_dist;
+        float r_penumbra = caster_r + dist_to_caster * local_star_radius_over_dist;
         if (perp_sq > r_penumbra * r_penumbra) continue;
 
         vec4 grazing = vec4(u_active_caster_atmos[i].xyz,
