@@ -207,10 +207,10 @@ vec3 fromSphericalSpace(vec3 p_sph, vec4 pole_scale) {
 // shared include so the Mode 3 Sky-View LUT bake uses identical eclipse math.
 #include "common/caster_shadow.glsl"
 #include "common/ring_shadow_filter.glsl"
-vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius, float star_obl, vec3 star_pole) {
+vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 planet_center_render, float star_radius, float star_obl, vec3 star_pole, uint caster_mask) {
     // Spherical-body (moon/planet) eclipse casters: shared with the Mode 3
     // Sky-View LUT bake via common/caster_shadow.glsl.
-    vec3 shadow = compute_caster_shadow(eval_render_pos, L_dir, dist_to_star, star_radius, star_obl, star_pole);
+    vec3 shadow = compute_caster_shadow(eval_render_pos, L_dir, dist_to_star, star_radius, star_obl, star_pole, caster_mask);
 
     uint processed_mask = 0u;
     for (int k = 0; k < u_num_ring_planes; k++) {
@@ -287,6 +287,12 @@ vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star, vec3 p
         shadow *= vec3(1.0 - min(plane_occlusion, 1.0));
     }
     return shadow;
+}
+
+vec3 compute_shadow(vec3 eval_render_pos, vec3 L_dir, float dist_to_star,
+                    vec3 planet_center_render, float star_radius, float star_obl, vec3 star_pole) {
+    return compute_shadow(eval_render_pos, L_dir, dist_to_star, planet_center_render,
+        star_radius, star_obl, star_pole, 0xFFFFFFFFu);
 }
 
 vec2 raySphereIntersect(vec3 origin, vec3 dir, float radius) {
@@ -368,18 +374,41 @@ bool ring_shadow_interval(vec3 A, vec3 B, float inner_r, float outer_r,
     return lo < hi;
 }
 
-bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 frag_local, vec3 planet_center_render, out float out_sh_min, out float out_sh_max) {
+// Pad ring-shadow selection by three degrees of atmospheric latitude. This
+// expands the sampled region only; the optical ring profile stays unchanged.
+const float RING_SHADOW_ANGLE_PADDING = 0.05235987755983;
+
+bool ring_plane_guard_interval(vec3 origin, vec3 direction, vec3 normal,
+        float half_height, inout float first, inout float last) {
+    float height = dot(origin, normal), slope = dot(direction, normal);
+    if (abs(slope) < 1e-8) return abs(height) <= half_height;
+    vec2 crossings = (vec2(-half_height, half_height) - height) / slope;
+    first = max(first, min(crossings.x, crossings.y));
+    last = min(last, max(crossings.x, crossings.y));
+    return first < last;
+}
+
+bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 frag_local, vec3 planet_center_render, out float out_sh_min, out float out_sh_max, out uint out_caster_masks) {
     out_sh_min = 1e9;
     out_sh_max = -1e9;
+    out_caster_masks = 0u;
     if (s_start >= s_end) return false;
     bool has_hit = false;
     vec3 V = ray_dir;
+    float ring_angle_padding_km = u_atmo_radius_km * sin(RING_SHADOW_ANGLE_PADDING);
     for (int s = 0; s < min(u_num_stars, 4); s++) {
         vec3 star_pos = u_stars_pos_radius[s].xyz;
         float star_radius = (s < 4) ? u_star_solstice[s].w : u_stars_pos_radius[s].w;
         float dist_mid_star = (s < 4) ? u_star_solstice[s].z : length(star_pos - planet_center_render);
         vec3 sun_pos_local = (s < 4) ? u_star_pos_local[s].xyz : ((star_pos - planet_center_render) * u_au_to_km);
         vec3 L_mid = (length(sun_pos_local) > 1e-6) ? normalize(sun_pos_local) : vec3(0.0, 1.0, 0.0);
+
+        // Pack four eight-caster masks before the lighting integrator, keeping
+        // its sample loop free of irrelevant casters and mask-building locals.
+        uint caster_mask = u_num_active_casters == 1 ? 1u
+            : caster_shadow_ray_mask(planet_center_render + frag_local / u_au_to_km,
+                V, s_start, s_end, L_mid, star_radius / max(dist_mid_star, 1e-6));
+        out_caster_masks |= caster_mask << uint(s * 8);
 
         if (u_num_ring_planes > 0 && u_ring_mask != 0u) {
             uint processed_mask = 0u;
@@ -389,9 +418,38 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
 
                 vec3 N = u_ring_normal[k];
                 float denom = dot(L_mid, N);
-                if (abs(denom) < 1e-8) continue;
-
                 vec3 ring_center_local_km = (u_ring_center[k] - planet_center_render) * u_au_to_km;
+                uint coplanar_mask = u_ring_coplanar_mask[k];
+                processed_mask |= coplanar_mask;
+                float alpha_star = star_radius / max(dist_mid_star, 1e-6);
+
+                if (abs(denom) < 1e-4) {
+                    // At equinox the projected annulus is singular. A plane
+                    // slab keeps the angular guard finite on both sides.
+                    vec3 origin = frag_local - ring_center_local_km;
+                    float distance_max = max(length(origin + s_start * V),
+                                             length(origin + s_end * V));
+                    for (int ring_idx = k; ring_idx < u_num_ring_planes; ++ring_idx) {
+                        if ((coplanar_mask & (1u << ring_idx)) == 0u) continue;
+                        float inner_r = u_ring_params[ring_idx].x * u_au_to_km;
+                        float outer_r = u_ring_params[ring_idx].y * u_au_to_km;
+                        if (outer_r <= inner_r || u_ring_params[ring_idx].z <= 0.0) continue;
+                        float half_height = ring_angle_padding_km
+                            + (distance_max + outer_r) * (abs(denom) + alpha_star);
+                        float first = s_start, last = s_end;
+                        if (ring_plane_guard_interval(origin, V, N, half_height, first, last)) {
+                            out_sh_min = min(out_sh_min, first);
+                            out_sh_max = max(out_sh_max, last);
+                            has_hit = true;
+                        }
+                    }
+                    continue;
+                }
+
+                // Match compute_shadow's grazing footprint instead of capping
+                // the selection at 20x while the filter continues to expand.
+                float inv_denom = 1.0 / abs(denom);
+                float guard_distance = ring_angle_padding_km * inv_denom;
 
                 float ra_km = dot(ring_center_local_km - frag_local, N) / denom;
                 float rb_km = -dot(ray_dir, N) / denom;
@@ -399,9 +457,9 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
                 float ring_s_valid_min = -1e9;
                 float ring_s_valid_max = 1e9;
                 if (abs(rb_km) < 1e-8) {
-                    if (ra_km <= 0.0) { ring_s_valid_min = 1e9; ring_s_valid_max = -1e9; }
+                    if (ra_km + guard_distance <= 0.0) { ring_s_valid_min = 1e9; ring_s_valid_max = -1e9; }
                 } else {
-                    float s_cross = -ra_km / rb_km;
+                    float s_cross = -(ra_km + guard_distance) / rb_km;
                     if (rb_km < 0.0) {
                         ring_s_valid_max = s_cross;
                     } else {
@@ -418,13 +476,9 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
                 // The midpoint footprint can under-bound the far penumbra.
                 float t_max_km = max(0.0, max(ra_km + ring_s_valid_min * rb_km,
                                              ra_km + ring_s_valid_max * rb_km));
-                float alpha_star = star_radius / max(dist_mid_star, 1e-6);
                 float r_star_proj_km = alpha_star * t_max_km;
-                float inv_denom_clamped = min(1.0 / max(1e-4, abs(denom)), 20.0);
-                float R_eff_max_km = r_star_proj_km * inv_denom_clamped;
+                float R_eff_max_km = r_star_proj_km * inv_denom;
 
-                uint coplanar_mask = u_ring_coplanar_mask[k];
-                processed_mask |= coplanar_mask;
                 for (int ring_idx = k; ring_idx < u_num_ring_planes; ring_idx++) {
                     if ((coplanar_mask & (1u << ring_idx)) == 0u) continue;
                     float inner_r_km = u_ring_params[ring_idx].x * u_au_to_km;
@@ -432,7 +486,8 @@ bool check_ray_intersects_shadow(float s_start, float s_end, vec3 ray_dir, vec3 
                     float opacity = u_ring_params[ring_idx].z;
                     if (outer_r_km <= inner_r_km || opacity <= 0.0) continue;
 
-                    float R_eff_clamped = min(R_eff_max_km, (outer_r_km - inner_r_km) * 0.5);
+                    float R_eff_clamped = min(R_eff_max_km, (outer_r_km - inner_r_km) * 0.5)
+                        + guard_distance;
                     float inter_min = ring_s_valid_min, inter_max = ring_s_valid_max;
                     if (ring_shadow_interval(A_prime_km, B_km,
                             max(0.0, inner_r_km - R_eff_clamped), outer_r_km + R_eff_clamped,
@@ -493,7 +548,7 @@ vec3 atmo_view_transmittance(vec3 a, vec3 p, vec3 v, vec3 initial_tau,
 // limits at any step count. Secondary light is not shadowed by the solar caster.
 vec3 march_shadow_deficit(float first, float last, float ray_start, float ray_end,
         vec3 cam_sph, vec3 dir_sph, vec3 dir_world, int steps, float jitter,
-        vec3 star_baseline[4]) {
+        vec3 star_baseline[4], uint caster_masks) {
     vec3 a = cam_sph + first * dir_sph;
     vec3 b = cam_sph + last * dir_sph;
     vec3 ray_a = cam_sph + ray_start * dir_sph;
@@ -516,6 +571,8 @@ vec3 march_shadow_deficit(float first, float last, float ray_start, float ray_en
                 st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
         if (all(lessThan(hull_light, vec3(1e-20)))) continue;
         vec3 L = normalize(u_star_pos_local[st].xyz);
+        uint body_shadow_mask = (caster_masks >> uint(st * 8)) & 0xffu;
+        if (body_shadow_mask == 0u && (u_num_ring_planes == 0 || u_ring_mask == 0u)) continue;
         float nu = clamp(dot(dir_world, L), -1.0, 1.0);
         float phase_R = 3.0 / (16.0 * PI) * (1.0 + nu * nu);
         float phase_M = u_precomp_mie.x * (1.0 + nu * nu)
@@ -546,7 +603,7 @@ vec3 march_shadow_deficit(float first, float last, float ray_start, float ray_en
             vec3 world_p = u_body_offset + fromSphericalSpace(p, u_pole_obl) / u_au_to_km;
             vec3 shadow = compute_shadow(world_p, L, u_star_solstice[st].z,
                 u_body_offset, u_star_solstice[st].w,
-                u_stars_poles_obl[st].w, u_stars_poles_obl[st].xyz);
+                u_stars_poles_obl[st].w, u_stars_poles_obl[st].xyz, body_shadow_mask);
             energy += weight;
             loss += weight * (1.0 - shadow);
         }
@@ -981,10 +1038,11 @@ void main() {
     float sh_min = s_start;
     float sh_max = s_end;
     bool has_shadow = false;
+    uint caster_masks = 0u;
     if (u_atmo_quality == 3 && ((u_num_ring_planes > 0 && u_ring_mask != 0u)
                                || u_num_active_casters > 0)) {
         has_shadow = check_ray_intersects_shadow(s_start, s_end, ray_dir,
-            frag_local, planet_center_render, sh_min, sh_max);
+            frag_local, planet_center_render, sh_min, sh_max, caster_masks);
     }
 
     bool use_bounded = (u_atmo_quality == 3 && u_bounded_shadows && u_scattering_enabled && has_shadow);
@@ -1088,7 +1146,10 @@ void main() {
             b *= (u_scattering_bottom_km / r_b);
         }
         float volume_weight = 0.0;
-        bool used_volume = u_atmo_clip_mode == 0
+        // Shadow deficits are marched against exact per-star baselines. A
+        // coarse aerial baseline can leave false light after subtraction,
+        // so rays selected for shadow marching bypass the volume entirely.
+        bool used_volume = !has_shadow && u_atmo_clip_mode == 0
             && aerial_lookup(a, b, ray_dir, scattered, final_transmittance, volume_weight);
         if (!used_volume || volume_weight < 1.0) {
             vec3 volume_L = scattered, volume_T = final_transmittance;
@@ -1107,15 +1168,6 @@ void main() {
             if (used_volume) {
                 scattered = mix(scattered, volume_L, volume_weight);
                 final_transmittance = mix(final_transmittance, volume_T, volume_weight);
-            }
-        }
-        if (has_shadow && used_volume && volume_weight >= 1.0) {
-            vec3 direct_T = endpoint_transmittance(a, b);
-            for (int st = 0; st < min(u_num_stars, 4); ++st) {
-                if (dot(u_star_dir_sph_eff[st].xyz, u_star_dir_sph_eff[st].xyz) > 1e-8)
-                    star_baseline[st] = endpoint_radiance_star(a, b,
-                        normalize(u_star_dir_sph_eff[st].xyz), direct_T,
-                        st, u_star_pos_local[st].w) * u_star_color_irrad[st].rgb;
             }
         }
     } else if (integration_quality == 3) {
@@ -1267,7 +1319,7 @@ void main() {
         vec4 ring_r_star_proj = vec4(0.0);
         vec4 ring_inv_denom = vec4(1.0);
 
-        bool has_body_shadow = false;
+        uint body_shadow_mask = 0u;
         int ring_count = 0;
 
 
@@ -1359,19 +1411,25 @@ void main() {
                     }
                 }
 
-                for (int c = 0; c < min(u_num_active_casters, 8); ++c) {
-                    vec3 D = (u_active_casters[c].xyz - planet_center_render) * u_au_to_km - frag_local;
+                if (u_num_active_casters == 1) {
+                    // Preserve High's existing cheap single-caster ray test.
+                    vec3 D = (u_active_casters[0].xyz - planet_center_render) * u_au_to_km - frag_local;
                     float first = march_start, last = march_end;
-                    if (caster_shadow_interval(D, V, L_mid, u_active_casters[c].w * u_au_to_km,
-                            star_radius / max(dist_mid_star, 1e-6), first, last)) {
-                        has_body_shadow = true;
-                        break;
-                    }
+                    if (caster_shadow_interval(D, V, L_mid, u_active_casters[0].w * u_au_to_km,
+                            star_radius / max(dist_mid_star, 1e-6), first, last)) body_shadow_mask = 1u;
+                } else {
+                    body_shadow_mask = caster_shadow_ray_mask(O, V, march_start, march_end,
+                        L_mid, star_radius / max(dist_mid_star, 1e-6));
                 }
-                if (!has_body_shadow && ring_count == 0) skip_volumetric_shadow = true;
+                if (body_shadow_mask == 0u && ring_count == 0) skip_volumetric_shadow = true;
             }
         }
 
+        // Match the final contribution gates before doing secondary-light work.
+        // Planetshine is consumed only by the first stellar iteration.
+        bool march_planetshine = s == 0 && (u_planetshine_enabled || u_ringshine_enabled)
+            && dot(body_planetshine_color, body_planetshine_color) > 1e-12;
+        bool march_ringshine = u_ringshine_enabled && u_num_ring_planes > 0 && u_ring_mask != 0u;
         vec3 ring_normal_vec = pole_dir_norm;
         for (int k = 0; k < u_num_ring_planes; k++) {
             if ((u_ring_mask & (1u << k)) != 0u) {
@@ -1480,10 +1538,10 @@ void main() {
                 }
                 // === End Mode 2 shared ring transmission ===
 
-                if (has_body_shadow) {
+                if (body_shadow_mask != 0u) {
                     vec3 world_p = planet_center_render + fromSphericalSpace(current_pos_sph, u_pole_obl) / u_au_to_km;
                     sample_shadow *= compute_caster_shadow(world_p, L_mid, dist_mid_star,
-                        star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz);
+                        star_radius, u_stars_poles_obl[s].w, u_stars_poles_obl[s].xyz, body_shadow_mask);
                 }
             }
 
@@ -1501,7 +1559,7 @@ void main() {
             vec3 ms_shadow = sample_shadow;
             total_ms += (beta_R * rho_R + beta_M * rho_M) * psi * current_transmittance * ms_shadow * int_factor;
 
-            if (u_planetshine_enabled || u_ringshine_enabled) {
+            if (march_planetshine) {
                 float light_cos_theta_ps = dot(current_pos_sph, body_planetshine_dir) / sample_len;
                 float vis_fraction_ps = smoothstep(-cos_planet - 0.05, -cos_planet + 0.05, light_cos_theta_ps);
                 vec3 transmittance_to_ps = get_transmittance_precomputed(v_norm, light_cos_theta_ps);
@@ -1515,7 +1573,7 @@ void main() {
                 total_ms_ps += (beta_R * rho_R + beta_M * rho_M) * psi_ps * ps_attenuation * int_factor;
             }
 
-            if (u_ringshine_enabled) {
+            if (march_ringshine) {
                 vec3 rs_attenuation = current_transmittance;
                 total_rayleigh_rs += rho_R * rs_attenuation * int_factor;
                 total_mie_rs      += rho_M * rs_attenuation * int_factor;
@@ -1552,7 +1610,7 @@ void main() {
             total_ms
         );
 
-        if (s == 0 && (u_planetshine_enabled || u_ringshine_enabled) && dot(body_planetshine_color, body_planetshine_color) > 1e-12) {
+        if (march_planetshine) {
             float cos_theta_ps = dot(ray_dir, body_planetshine_dir);
             float phase_R_ps = (3.0 / (16.0 * PI)) * (1.0 + cos_theta_ps * cos_theta_ps);
             float phase_M_ps_scalar = u_precomp_mie.x * (1.0 + cos_theta_ps * cos_theta_ps)
@@ -1566,7 +1624,7 @@ void main() {
             );
         }
 
-        if (u_ringshine_enabled && u_num_ring_planes > 0 && u_ring_mask != 0u) {
+        if (march_ringshine) {
             vec3 ringshine_irradiance = vec3(0.0);
             vec3 P_dir = normalize(mid_pos);
             vec3 L_dir = L_mid;
@@ -1621,7 +1679,7 @@ void main() {
 
     if (u_atmo_quality == 3 && u_scattering_enabled && has_shadow) {
         vec3 deficit = march_shadow_deficit(march_start, march_end, s_start, s_end,
-            cam_local_sph, ray_dir_sph, ray_dir, max(1, steps), jitter, star_baseline);
+            cam_local_sph, ray_dir_sph, ray_dir, max(1, steps), jitter, star_baseline, caster_masks);
         scattered = max(vec3(0.0), scattered - deficit);
     }
 

@@ -10,7 +10,7 @@ import OpenGL
 OpenGL.ERROR_CHECKING = False
 import glfw
 import moderngl
-from engine.rendering.ringshine import (RingshineMap, RING_PROFILE_ROWS, RING_PROPERTY_ROWS,
+from engine.rendering.ringshine import (RingshineMap, RING_PROFILE_ROWS,
     build_secondary_ring_properties)
 if not hasattr(moderngl.Program, '__contains__'):
     moderngl.Program.__contains__ = lambda self, name: self.get(name, None) is not None
@@ -2124,12 +2124,6 @@ class App(InputHandlerMixin):
         ring_gradient_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
         ring_gradient_tex.repeat_x = False
         ring_gradient_tex.repeat_y = False
-        ring_props_tex = ctx.texture((4096, RING_PROPERTY_ROWS), 4, dtype='f4')
-        ring_props_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        ring_props_tex.repeat_x = False
-        ring_props_tex.repeat_y = False
-        ring_gradient_tex.props_tex = ring_props_tex
-        self.ring_props_tex = ring_props_tex
         ring_shadow_tex = ctx.texture((4096, 1), 4, dtype='f4')
         ring_shadow_tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
         ring_shadow_tex.repeat_x = False
@@ -4349,8 +4343,8 @@ class App(InputHandlerMixin):
             planetshine_enabled = self.camera.get("planetshine_enabled", True)
             ringshine_enabled = self.camera.get("ringshine_enabled", True)
 
-            # Distant-body material averages use the same profiles as host
-            # lighting, and only change when the profile atlas is rebuilt.
+            # Distant-body radial samples preserve each original material lobe
+            # and only change when the profile atlas is rebuilt.
             ps_material_key = (ring_gradient_tex.profile_revision, total_render_bodies)
             if getattr(self, '_ps_ring_material_key', None) != ps_material_key:
                 self._ps_ring_materials = build_secondary_ring_properties(
@@ -5071,8 +5065,6 @@ class App(InputHandlerMixin):
             uniform_orbit_depth_C.value = depth_C
     
             ring_gradient_tex.use(location=0)
-            if hasattr(self, 'ring_props_tex') and self.ring_props_tex is not None:
-                self.ring_props_tex.use(location=5)
             if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
                 # Use world-space float64 positions: camera rebasing must not
                 # invalidate maps or perturb stellar elevations.
@@ -5088,9 +5080,9 @@ class App(InputHandlerMixin):
                                      ring_params_buf[index], flattening))
                 rs_stars = rs_positions[star_indices_numba[:num_stars]]
                 _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
-                self.ringshine_maps.update(ring_gradient_tex, self.ring_props_tex,
+                self.ringshine_maps.update(ring_gradient_tex,
                     rs_hosts, rs_stars, self.camera.get("ringshine_band_count", 10),
-                    self.camera.get("ringshine_oblate_enabled", True))
+                    self.camera.get("ringshine_oblate_enabled", True), star_radii[:num_stars])
                 _perf_gpu_end(_gq)
                 ctx.viewport = (0, 0, self.fb_width, self.fb_height)
                 self.hdr_resolve_fbo.use()
@@ -6446,12 +6438,12 @@ class App(InputHandlerMixin):
                             self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
                             self.sky_view_baked_key = current_bake_key
 
-                        # A small frustum volume amortizes terrain endpoint queries.
-                        # Split ring passes and distant planets retain exact
-                        # endpoints; the lookup also rejects mixed limb cells.
+                        # Horizon-focused sampling amortizes grazing terrain
+                        # endpoint queries. Outside observers use the sky-view
+                        # boundary, so there is no terrain volume to consume.
                         _use_aerial = (self.camera.get("atmo_aerial_volume", True)
                                        and clip_mode == 0
-                                       and np.linalg.norm(cam_sph_km) < 4.0 * atmo['atmo_radius_km'])
+                                       and np.linalg.norm(cam_sph_km) <= atmo['atmo_radius_km'])
                         cur_prog['u_aerial_enabled'].value = False
                         if _use_aerial:
                             if self.aerial_volume is None:
@@ -6462,7 +6454,9 @@ class App(InputHandlerMixin):
                                 current_bake_key, cam_sph_km, _terrain_bottom,
                                 _endpoint_parameters, self.scattering_lut_cache.size[3],
                                 inv_proj_bytes, inv_view_bytes, n_ring_planes,
-                                ring_normals_buf, ps_enabled, rs_enabled)
+                                ring_normals_buf, ps_enabled, rs_enabled,
+                                pole_obl=tuple(self.atmo_staging[24:28]),
+                                viewport_size=(self.fb_width, self.fb_height))
                             self.aerial_volume.bind(cur_prog, cam_sph_km, _terrain_bottom)
 
                         # Restore framebuffer and raster state for atmosphere polyhedron rendering

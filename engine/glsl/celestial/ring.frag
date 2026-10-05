@@ -70,8 +70,8 @@ vec3 hsv2rgb(vec3 c) {
 vec3 adjust_hsba(vec3 color, float hue_shift, float saturation, float brightness) {
     vec3 hsv = rgb2hsv(color);
     hsv.x = fract(hsv.x + hue_shift);
-    hsv.y = clamp(hsv.y * saturation, 0.0, 2.0);
-    hsv.z = hsv.z * brightness;
+    hsv.y = clamp(hsv.y * saturation, 0.0, 1.0);
+    hsv.z = clamp(hsv.z * brightness, 0.0, 1.0);
     return hsv2rgb(hsv);
 }
 
@@ -103,92 +103,42 @@ const float PI = 3.14159265358979323846;
 uniform bool u_is_textured;
 uniform sampler2D u_ring_texture;
 
-float HenyeyGreensteinPhaseFunction(float eccentricity, float viewDirDotLight) {
-    float g = eccentricity;
-    return (1.0 - g * g) / (4.0 * 3.14159265359 * pow(max(1e-6, 1.0 + g * g - 2.0 * g * viewDirDotLight), 1.5));
-}
+#include "common/ring_optics.glsl"
+#include "common/ring_source.glsl"
 
-vec2 GetRingPhaseFunctionStrengths(float alpha) {
-    // Optical depth affects particle size dominance. 
-    // Thin rings (dust) are highly forward-scattering.
-    // Thick rings (large chunks) are more isotropic / back-scattering.
-    float dust_to_chunks = clamp((alpha - 0.1) / 0.5, 0.0, 1.0);
-    // Weights must sum to 1.0 for physical energy conservation.
-    return mix(vec2(0.95, 0.05), vec2(0.5, 0.5), dust_to_chunks);
-}
-
-vec2 GetRingPhaseFunctionsUnweighted(float dotLight, float asym, float back_asym) {
-    return vec2(HenyeyGreensteinPhaseFunction(asym, dotLight), HenyeyGreensteinPhaseFunction(back_asym, dotLight));
-}
-
-float GetRingPhaseFunctions(float dotLight, float alpha, float asym, float back_asym) {
-    vec2 phaseFunctions = GetRingPhaseFunctionsUnweighted(dotLight, asym, back_asym) * GetRingPhaseFunctionStrengths(alpha);
-    return phaseFunctions.x + phaseFunctions.y;
-}
-
-float CornetteShanksPhaseFunction(float eccentricity, float viewDirDotLight) {
-    float g = eccentricity;
-    float g2 = g * g;
-    float mu = viewDirDotLight;
-    float denom = pow(max(1e-6, 1.0 + g2 - 2.0 * g * mu), 1.5);
-    // Normalized to integrate to 1.0 over 4PI steradians
-    return (1.5 * (1.0 + mu * mu) * (1.0 - g2)) / ((2.0 + g2) * denom * 12.566370614);
-}
-
-float OppositionSurge(float cos_phase, float columnDensity) {
-    // cos_phase = dot(V, L) where V points to camera, L points to star
-    // At opposition: V ~ L -> cos_phase ~ 1 -> phase_angle ~ 0
-    float phase_angle = acos(clamp(cos_phase, -1.0, 1.0));
-
-    // Scale surge with optical depth: dense rings have more inter-particle shadowing
-    float density_scale = clamp(columnDensity / 1.5, 0.0, 1.0);
-
-    // SHOE: Shadow Hiding Opposition Effect (broad, ~4 degrees)
-    float shoe_width = 0.07;
-    float shoe_amp = 0.8 * density_scale;
-    float shoe = 1.0 + shoe_amp / (1.0 + phase_angle / shoe_width);
-
-    // CBOE: Coherent Backscatter Opposition Effect (narrow, ~0.35 degrees)
-    float cboe_width = 0.006;
-    float cboe_amp = 0.3 * density_scale;
-    float cboe = 1.0 + cboe_amp * exp(-phase_angle / cboe_width);
-
-    return shoe * cboe;
-}
-
-float HapkeHFunction(float mu, float gamma) {
-    return (1.0 + 2.0 * mu) / (1.0 + 2.0 * mu * gamma);
-}
-
-float AnalyticMultipleScattering(float mu_v, float mu_0, float tau, bool onLitSide) {
-    float w0 = 0.92; // Single-scattering albedo of ring ice particles (water-ice rings)
-    float gamma = sqrt(max(1e-4, 1.0 - w0));
-    float Hv = HapkeHFunction(mu_v, gamma);
-    float H0 = HapkeHFunction(mu_0, gamma);
-
-    float path_term = 1.0 - exp(-tau * (1.0 / max(1e-4, mu_v) + 1.0 / max(1e-4, mu_0)));
-    float mu_ratio = mu_0 / max(1e-4, mu_v + mu_0);
-
-    // Normalized by 1 / (4 * PI) to match single scattering phase function scale
-    float inv_4pi = 1.0 / (4.0 * 3.14159265358979);
-
-    if (onLitSide) {
-        float ms_lit = w0 * mu_ratio * (Hv * H0 - 1.0) * path_term * inv_4pi;
-        return max(0.0, ms_lit);
+struct RingComponent {
+    vec3 color;
+    vec4 props;
+    float alpha;
+    float tau;
+    bool textured;
+};
+RingComponent ring_material(int i, float r, float footprint) {
+    RingComponent c;
+    c.color=vec3(0.0); c.props=vec4(0.0); c.alpha=0.0; c.tau=0.0; c.textured=false;
+    float inner_r=u_ring_planes[i].inner_r,outer_r=u_ring_planes[i].outer_r;
+    float dr=min(footprint*0.75,(outer_r-inner_r)*0.05);
+    if(r<inner_r-dr || r>outer_r+dr) return c;
+    float t=clamp((r-inner_r)/max(1e-6,outer_r-inner_r),0.0,1.0);
+    c.textured=u_is_textured && u_ring_planes[i].is_textured>0.5;
+    vec4 material;
+    if(c.textured) {
+        material=texture(u_ring_texture,vec2(t,0.5));
+        material.rgb=adjust_hsba(material.rgb,u_ring_planes[i].hue_shift,
+                               u_ring_planes[i].saturation,u_ring_planes[i].brightness);
+        if(material.a>1e-5) material.a=pow(material.a,1.0/max(0.01,u_ring_planes[i].alpha_boost));
+        material.rgb*=u_ring_planes[i].color;
     } else {
-        float ms_unlit = w0 * mu_ratio * (Hv * H0) * exp(-gamma * tau) * path_term * inv_4pi;
-        return max(0.0, ms_unlit);
+        float row=(float(u_ring_planes[i].row_idx)+0.5)/float(textureSize(u_ring_gradients,0).y);
+        material=texture(u_ring_gradients,vec2(t,row));
     }
+    c.color=pow(max(material.rgb,vec3(0.0)),vec3(2.2));
+    c.props=vec4(u_ring_planes[i].asymmetry,u_ring_planes[i].backscatter,
+                 u_ring_planes[i].scatter,u_ring_planes[i].unlit_factor);
+    c.alpha=clamp(material.a*u_ring_planes[i].opacity,0.0,RING_MAX_ALPHA);
+    c.tau=ring_tau(c.alpha);
+    return c;
 }
-
-float AnalyticalSelfShadowing(float sun_side_abs) {
-    // Incident solar flux scale: mu_0 = |N . L| = sin(solar elevation)
-    // Radiative transfer (scatteredLight & AnalyticMultipleScattering) already accounts for
-    // line-of-sight self-absorption (1/mu_v) and solar path extinction (1/mu_0) inside the slab.
-    float mu_0 = max(0.001, sun_side_abs);
-    return clamp(mu_0 / 0.45, 0.0, 1.0);
-}
-
 
 float get_oblate_radius(float r_eq, float r_minor, vec3 pole, vec3 L, vec3 perp_vec) {
     if (r_minor < 1e-6 || r_eq < 1e-6) return r_eq;
@@ -299,80 +249,18 @@ void main() {
 
     float r = length(hit_local);
 
-    vec3 total_color = vec3(0.0);
     float total_tau = 0.0;
     float total_faded_tau = 0.0;
-    float total_scatter = 0.0;
-    float total_asym = 0.0;
-    float total_backscatter = 0.0;
-    float total_textured_tau = 0.0;
-    float total_unlit_factor = 0.0;
 
-    for (int i=0; i<u_num_ring_planes; i++) {
-        float inner_r = u_ring_planes[i].inner_r;
-        float outer_r = u_ring_planes[i].outer_r;
-        float dr = min(fwidth(r) * 0.75, (outer_r - inner_r) * 0.05);
-
-        if (r >= inner_r - dr && r <= outer_r + dr) {
-            float t = (r - inner_r) / max(1e-6, outer_r - inner_r);
-            vec4 tex_val;
-            bool plane_is_textured = u_is_textured && (u_ring_planes[i].is_textured > 0.5);
-            if (plane_is_textured) {
-                tex_val = texture(u_ring_texture, vec2(clamp(t, 0.0, 1.0), 0.5));
-            } else {
-                tex_val = texture(u_ring_gradients, vec2(clamp(t, 0.0, 1.0), (float(u_ring_planes[i].row_idx) + 0.5) / float(textureSize(u_ring_gradients, 0).y)));
-            }
-            tex_val.rgb = pow(tex_val.rgb, vec3(2.2));
-
-            float layer_hue = u_ring_planes[i].hue_shift;
-            float layer_sat = u_ring_planes[i].saturation;
-            float layer_bri = u_ring_planes[i].brightness;
-            float layer_boost = u_ring_planes[i].alpha_boost;
-            if (plane_is_textured && (abs(layer_hue) > 1e-4 || abs(layer_sat - 1.0) > 1e-4 || abs(layer_bri - 1.0) > 1e-4)) {
-                tex_val.rgb = adjust_hsba(tex_val.rgb, layer_hue, layer_sat, layer_bri);
-            }
-
-            float alpha = tex_val.a;
-            if (plane_is_textured && alpha > 1e-5 && abs(layer_boost - 1.0) > 1e-4) {
-                alpha = clamp(pow(alpha, 1.0 / max(0.01, layer_boost)), 0.0, 1.0);
-            }
-            vec3 r_color = tex_val.rgb;
-
-            float edge_alpha = smoothstep(inner_r - dr, inner_r + dr, r) * (1.0 - smoothstep(outer_r - dr, outer_r + dr, r));
-
-            vec3 plane_color = u_ring_planes[i].color;
-            float plane_opacity = u_ring_planes[i].opacity;
-
-            float raw_a_physical = alpha * plane_opacity;
-            float raw_a_faded = raw_a_physical * edge_alpha;
-
-            float tau = 0.0;
-            if (raw_a_physical >= 0.999) {
-                tau = 100.0;
-            } else if (raw_a_physical > 1e-6) {
-                tau = -log(1.0 - raw_a_physical);
-            }
-
-            float tau_faded = 0.0;
-            if (raw_a_faded >= 0.999) {
-                tau_faded = 100.0;
-            } else if (raw_a_faded > 1e-6) {
-                tau_faded = -log(1.0 - raw_a_faded);
-            }
-
-            if (tau > 0.0) {
-                total_color += plane_color * r_color * tau;
-                total_scatter += u_ring_planes[i].scatter * tau;
-                total_asym += u_ring_planes[i].asymmetry * tau;
-                total_backscatter += u_ring_planes[i].backscatter * tau;
-                total_tau += tau;
-                total_faded_tau += tau_faded;
-                total_unlit_factor += u_ring_planes[i].unlit_factor * tau;
-                if (plane_is_textured) {
-                    total_textured_tau += tau;
-                }
-            }
-        }
+    float footprint=fwidth(r);
+    for (int i=0; i<u_num_ring_planes; ++i) {
+        RingComponent c=ring_material(i,r,footprint);
+        if(c.tau<=0.0) continue;
+        float inner_r=u_ring_planes[i].inner_r,outer_r=u_ring_planes[i].outer_r;
+        float dr=min(footprint*0.75,(outer_r-inner_r)*0.05);
+        float fade=smoothstep(inner_r-dr,inner_r+dr,r)*(1.0-smoothstep(outer_r-dr,outer_r+dr,r));
+        total_tau+=c.tau;
+        total_faded_tau+=ring_tau(c.alpha*fade);
     }
 
     if (total_tau <= 1e-6) {
@@ -383,20 +271,9 @@ void main() {
     vec3 N = normalize(f_normal);
     float cam_side = dot(N, V);
 
-    float min_cam_mu = 0.01;
-    float cosViewRayVertical = max(abs(cam_side), min_cam_mu);
-
-    float physical_alpha = 1.0 - exp(-total_tau / cosViewRayVertical);
-    float faded_alpha = 1.0 - exp(-total_faded_tau / cosViewRayVertical);
-
-    vec3 f_color_rgb = total_color / max(1e-6, total_tau);
-    vec4 f_color = vec4(f_color_rgb, physical_alpha);
-    float f_scatter = total_scatter / max(1e-6, total_tau);
-    float f_asymmetry = total_asym / max(1e-6, total_tau);
-    float f_backscatter = total_backscatter / max(1e-6, total_tau);
-    float f_unlit_factor = total_tau > 0.0 ? (total_unlit_factor / total_tau) : 1.0;
-
-    bool is_textured_ring = (total_textured_tau > 0.5 * total_tau);
+    float mu_v = max(abs(cam_side),1e-7);
+    float physical_alpha = ring_absorbed(total_tau/mu_v);
+    float faded_alpha = ring_absorbed(total_faded_tau/mu_v);
 
     vec3 total_direct_illum_color = vec3(0.0);
 
@@ -419,95 +296,25 @@ void main() {
         vec3 star_color = mix(eq_color, pole_color, star_sin_lat);
         float star_lum = mix(eq_lum, pole_lum, star_sin_lat);
 
-        float cos_theta = -dot(L, V);
-
-        float sun_side = dot(N, L);
-
-        float star_ang_radius = star_radius / dist_to_star;
-        float sin_alpha_local = clamp(star_ang_radius, 1e-6, 1.0);
-        float alpha = sin_alpha_local;
-
-        float effective_sun_side = sqrt(sun_side * sun_side + 0.180126 * alpha * alpha);
-        float solar_elevation = max(0.02, effective_sun_side);
-
-        float v_star = clamp(sun_side / sin_alpha_local, -1.0, 1.0);
-        float f_top = (v_star * sqrt(max(0.0, 1.0 - v_star*v_star)) + asin(v_star)) / 3.14159265358979 + 0.5;
-        float same_side = (cam_side > 0.0) ? f_top : (1.0 - f_top);
-
-        float direct_illum_s = 0.0;
-        float min_cam_mu = 0.01;
-        float cosViewRayVertical  = max(abs(cam_side),  min_cam_mu);
-        float cosLightRayVertical = max(abs(sun_side), 1e-5);
-        float columnDensity = total_tau;
-        float viewDensity = columnDensity / cosViewRayVertical;
-        float lightDensity = columnDensity / cosLightRayVertical;
-        float scatteredLight = 0.0;
-        bool onLitSide = (cam_side * sun_side) >= 0.0;
-
-        if (onLitSide) {
-            scatteredLight = viewDensity / (viewDensity + lightDensity) * (1.0 - exp(-viewDensity - lightDensity));
-        } else {
-            float denominator = lightDensity - viewDensity;
-            if (abs(denominator) > 1e-6) {
-                scatteredLight = (exp(-viewDensity) - exp(-lightDensity)) * viewDensity / (lightDensity - viewDensity);
-            } else {
-                scatteredLight = viewDensity * exp(-viewDensity);
+        float sun_side = dot(N,L);
+        float star_ang_radius = clamp(star_radius/dist_to_star,0.0,0.999);
+        int source_samples = ring_resolve_disk(sun_side,star_ang_radius) ? RING_DISK_SAMPLES : 1;
+        vec3 direct_illum = vec3(0.0);
+        for (int i=0; i<u_num_ring_planes; ++i) {
+            RingComponent c = ring_material(i,r,footprint);
+            if (c.tau<=0.0) continue;
+            float material_response = 0.0;
+            for (int q=0; q<source_samples; ++q) {
+                vec4 source = source_samples==1 ? vec4(L,1.0)
+                    : ring_disk_sample(L,N,star_ang_radius,q);
+                float sun = dot(N,source.xyz);
+                float mu = clamp(-dot(source.xyz,V),-1.0,1.0);
+                material_response += source.w*ring_radiance(total_tau,c.alpha,mu_v,sun,mu,
+                    c.props,c.textured,cam_side*sun>=0.0);
             }
+            direct_illum += c.color*(c.tau/total_tau)*material_response;
         }
-
-        float single_scatter_s = 0.0;
-        float ms_s = 0.0;
-
-        if (is_textured_ring) {
-            float phase_func = GetRingPhaseFunctions(cos_theta, f_color.a, f_asymmetry, f_backscatter);
-            float unlit_mult = onLitSide ? 1.0 : f_unlit_factor;
-            single_scatter_s = scatteredLight * phase_func * unlit_mult;
-            
-            // Multiple scattering transmits poorly through macroscopic chunks on the unlit side.
-            // Additionally, thin dust rings (low alpha) are highly forward-scattering and do not isotropize light effectively.
-            float dust_to_chunks = clamp((f_color.a - 0.1) / 0.5, 0.0, 1.0);
-            ms_s = onLitSide ? (AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * dust_to_chunks) : 0.0;
-
-            if (onLitSide) {
-                float cos_phase = -cos_theta;
-                single_scatter_s *= OppositionSurge(cos_phase, columnDensity);
-            }
-        } else {
-            // Double Cornette-Shanks phase function using the ring's own parameters
-            float pf_forward = CornetteShanksPhaseFunction(f_asymmetry, cos_theta);
-            float pf_backward = CornetteShanksPhaseFunction(f_backscatter, cos_theta);
-            // f_scatter controls forward/backward balance (0 = backward dominant, 1 = forward dominant)
-            float balance = clamp(f_scatter, 0.0, 1.0);
-            // Two-lobed mixture: never completely extinguish the backscattering or forward-scattering lobe
-            // (prevents lit side from going pitch black when balance is high)
-            float w_fwd = mix(0.10, 0.90, balance);
-            float w_back = 1.0 - w_fwd;
-            float phaseFunc = w_back * pf_backward + w_fwd * pf_forward;
-
-            float unlit_mult = onLitSide ? 1.0 : f_unlit_factor;
-            single_scatter_s = scatteredLight * phaseFunc * unlit_mult;
-            
-            // Isotropic multiple scattering applies to backscattering chunks with optical depth
-            float ms_chunk_weight = clamp(1.0 - balance * 0.7, 0.1, 1.0);
-            ms_s = onLitSide ? (AnalyticMultipleScattering(cosViewRayVertical, cosLightRayVertical, columnDensity, onLitSide) * ms_chunk_weight * unlit_mult) : 0.0;
-
-            // Opposition surge: brightening at low phase angles on single scattering (lit side only)
-            if (onLitSide) {
-                float cos_phase = -cos_theta; // dot(V, L)
-                single_scatter_s *= OppositionSurge(cos_phase, columnDensity);
-            }
-        }
-
-        direct_illum_s = single_scatter_s + ms_s;
-
-        // Inverse-square falloff
-        if (u_hdr_enabled) {
-            direct_illum_s *= star_lum / (dist_to_star * dist_to_star);
-        }
-
-        // Multiply by PI to convert the physically exact radiance to the 
-        // engine's Lambertian surface BRDF convention (which drops the 1/PI).
-        direct_illum_s *= 3.14159265358979;
+        direct_illum *= PI*(u_hdr_enabled ? star_lum/(dist_to_star*dist_to_star) : 1.0);
 
         vec3 shadow_s = vec3(1.0);
         float star_radius_over_dist = star_ang_radius;
@@ -611,133 +418,54 @@ void main() {
             }
         }
 
-        total_direct_illum_color += star_color * f_color.rgb * direct_illum_s * shadow_s;
+        total_direct_illum_color += star_color * direct_illum * shadow_s;
     }
 
     vec3 total_planetshine = vec3(0.0);
-    if (u_host_planet_radius > 0.0) {
-        vec3 frag_to_host = -hit_local;
-        float dist_host_sq = dot(frag_to_host, frag_to_host);
-        float dist_host = sqrt(dist_host_sq);
-
-        // Exact angular radius & spherical cap solid angle of planet as seen from this ring radius
-        float sin_alpha_planet = clamp(u_host_planet_radius / max(dist_host, 1e-5), 0.0, 1.0);
-        float cos_alpha_planet = sqrt(max(0.0, 1.0 - sin_alpha_planet * sin_alpha_planet));
-        float solid_angle = 2.0 * (1.0 - cos_alpha_planet); // Exact solid angle Omega(r) = 2pi(1 - cos alpha)
-
-        // Effective elevation of the 3D spherical planet disk above/below the 2D ring plane
-        float planet_elevation = max(0.5 * sin_alpha_planet, 0.05);
-
-        vec3 active_shine_color = f_color.rgb;
-
-        for (int s = 0; s < u_num_stars; s++) {
-            vec3 star_pos = u_stars_pos_radius[s].xyz;
-            vec3 host_to_star = star_pos - u_host_planet_pos;
-            float dist_host_star = length(host_to_star);
-            vec3 L_host = host_to_star / max(dist_host_star, 1e-6);
-
-            // Crescent-shifted effective direction from ring point to illuminated region of planet
-            vec3 frag_to_lit_planet = frag_to_host + L_host * (u_host_planet_radius * 0.5);
-            vec3 L_planet = normalize(frag_to_lit_planet);
-
-            float cos_theta_p = -dot(L_planet, V);
-
-            float pf_p = 0.0;
-            if (is_textured_ring) {
-                float pf_ref_p = GetRingPhaseFunctions(1.0, f_color.a, f_asymmetry, f_backscatter);
-                float pf_curr_p = GetRingPhaseFunctions(cos_theta_p, f_color.a, f_asymmetry, f_backscatter);
-                pf_p = pf_curr_p / max(1e-4, pf_ref_p);
-            } else {
-                float pf_forward_p = CornetteShanksPhaseFunction(f_asymmetry, cos_theta_p);
-                float pf_backward_p = CornetteShanksPhaseFunction(f_backscatter, cos_theta_p);
-                float balance_p = clamp(f_scatter, 0.0, 1.0);
-                pf_p = mix(pf_backward_p, pf_forward_p, balance_p);
-            }
-
-            float columnDensity_p = -log(max(1.0 - f_color.a, 1e-5));
-            float lightDensity_p = columnDensity_p / max(0.04, planet_elevation);
-            float scattered_opacity_p = 1.0 - exp(-lightDensity_p);
-
-            float ring_planet_response = pf_p * scattered_opacity_p;
-
-            vec3 pole_dir = normalize(u_stars_poles_obl[s].xyz);
-            float star_sin_lat = abs(dot(L_host, pole_dir));
-
-            vec3 eq_color = u_stars_colors[s].rgb;
-            float eq_lum = u_stars_colors[s].a;
-            vec3 pole_color = u_stars_pole_colors[s].rgb;
-            float pole_lum = u_stars_pole_colors[s].a;
-
-            vec3 star_color = mix(eq_color, pole_color, star_sin_lat);
-            float star_lum = mix(eq_lum, pole_lum, star_sin_lat);
-
-            float irradiance = u_hdr_enabled ? (star_lum / max(dist_host_star * dist_host_star, 1e-8)) : 1.0;
-
-            // Illuminated phase of planet as seen from the ring point
-            vec3 L_center = frag_to_host / max(dist_host, 1e-6);
-            float cos_a_p = clamp(dot(L_host, -L_center), -1.0, 1.0);
-            float a_p = acos(cos_a_p);
-            float planet_phase = (sin(a_p) + (3.141592653589793 - a_p) * cos_a_p) / 3.141592653589793;
-
-            // Gate planetshine by the host planet's own shadow. Inside the
-            // planet's umbra the Sun is hidden behind the planet, so from the
-            // ring point only the planet's night hemisphere is visible: the
-            // illuminated day side (the sole source of planetshine) is on the far
-            // side and cannot light the ring. The Lambertian phase term above only
-            // vanishes at the exact anti-solar point, so without this gate
-            // planetshine bleeds past the terminator into the planet's shadow on
-            // the rings. This mirrors the direct-illumination host-shadow block:
-            // 0 in umbra, 1 outside, smooth through the penumbra, with the
-            // atmospheric-refraction limb glow preserved (grazing refracted
-            // sunlight through the planet's atmosphere may still faintly reach
-            // the ring).
-            vec3 host_shadow = vec3(1.0);
-            {
-                float t_proj = dot(frag_to_host, L_host);
-                if (t_proj > 0.0) {
-                    vec3 cross_vec = cross(frag_to_host, L_host);
-                    float perp_sq = dot(cross_vec, cross_vec);
-
-                    float star_radius = u_stars_pos_radius[s].w;
-                    float star_radius_over_dist = star_radius / max(dist_host_star, 1e-6);
-
-                    float host_r = u_host_planet_radius;
-                    float host_atmo_h = u_host_planet_atmo.w;
-                    float host_r_minor = u_host_planet_R_minor;
-
-                    float max_effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * (4.0 / u_au_to_km) : 0.0);
-                    float max_r_penumbra = max_effective_r + dist_host * star_radius_over_dist;
-                    if (perp_sq <= max_r_penumbra * max_r_penumbra) {
-                        vec3 perp_vec = frag_to_host - t_proj * L_host;
-                        if (host_r_minor < host_r - 1e-5) {
-                            host_r = get_oblate_radius(host_r, host_r_minor, u_host_planet_pole_obl.xyz, L_host, perp_vec);
-                        }
-                        float directional_star_r = star_radius;
-                        float star_r_minor = u_stars_poles_obl[s].w;
-                        if (star_r_minor < star_radius - 1e-5) {
-                            directional_star_r = get_oblate_radius(star_radius, star_r_minor, u_stars_poles_obl[s].xyz, L_host, perp_vec);
-                        }
-                        float local_star_radius_over_dist = directional_star_r / max(dist_host_star, 1e-6);
-                        float effective_r = host_r + (host_atmo_h > 0.0 ? host_atmo_h * (4.0 / u_au_to_km) : 0.0);
-                        float r_penumbra = effective_r + dist_host * local_star_radius_over_dist;
-                        if (perp_sq <= r_penumbra * r_penumbra) {
-                            float max_bend = u_host_planet_max_bend > 0.0
-                                ? u_host_planet_max_bend
-                                : (host_atmo_h > 0.0
-                                    ? clamp(2.0 * max(u_host_planet_refractivity, 0.0) * sqrt(3.14159265359 * host_r * u_au_to_km / max(1e-6, u_host_planet_shadow.w * 2.0)), 0.001, 0.10)
-                                    : 0.0);
-                            host_shadow = casterShadowTerm(local_star_radius_over_dist * dist_host, host_r, sqrt(perp_sq),
-                            max_bend, vec4(u_host_planet_shadow.xyz, 1.0 / max(u_host_planet_radius * u_au_to_km, 100.0)),
-                            u_host_planet_ozone, u_host_planet_shadow.w, dist_host, u_au_to_km);
-                        }
-                    }
+    if (u_planetshine_enabled && u_host_planet_radius>0.0) {
+        float dist_host = length(hit_local);
+        vec3 L_center = -hit_local/max(dist_host,1e-10);
+        float sin_radius = min(u_host_planet_radius/max(dist_host,1e-10),0.999);
+        float eta = max(1.0,u_host_planet_pole_obl.w*u_host_planet_pole_obl.w);
+        vec3 O = hit_local;
+        float oq = dot(O,pole_n);
+        float c = dot(O,O)+(eta-1.0)*oq*oq-u_host_planet_radius*u_host_planet_radius;
+        for (int i=0; i<u_num_ring_planes; ++i) {
+            RingComponent material=ring_material(i,r,footprint);
+            if(material.tau<=0.0) continue;
+            for (int q=0; q<RING_DISK_SAMPLES; ++q) {
+                vec4 source = ring_disk_sample(L_center,N,sin_radius,q);
+                vec3 D = source.xyz;
+                float dq = dot(D,pole_n);
+                float a = dot(D,D)+(eta-1.0)*dq*dq;
+                float b = dot(O,D)+(eta-1.0)*oq*dq;
+                float discriminant = b*b-a*c;
+                if (discriminant<=0.0) continue;
+                float distance_to_surface = (-b-sqrt(discriminant))/a;
+                if (distance_to_surface<=0.0) continue;
+                vec3 Q = O+distance_to_surface*D;
+                vec3 normal = normalize(Q+pole_n*((eta-1.0)*dot(Q,pole_n)));
+                float sun=dot(N,D);
+                float response=ring_radiance(total_tau,material.alpha,mu_v,sun,-dot(D,V),
+                    material.props,material.textured,cam_side*sun>=0.0);
+                vec3 ring_response=material.color*(material.tau/total_tau)*response;
+                // Ring output multiplies radiance by pi; it cancels the host's
+                // Lambertian 1/pi. Remaining weight is the exact disk dOmega.
+                float solid_angle_weight = PI*sin_radius*sin_radius*source.w;
+                for (int s=0; s<u_num_stars; ++s) {
+                    vec3 to_star = (u_stars_pos_radius[s].xyz-u_host_planet_pos)-Q;
+                    float distance_to_star = max(length(to_star),1e-10);
+                    vec3 L_host = to_star/distance_to_star;
+                    float incidence = max(0.0,dot(normal,L_host));
+                    if (incidence<=0.0) continue;
+                    float latitude = abs(dot(L_host,normalize(u_stars_poles_obl[s].xyz)));
+                    vec3 star_color = mix(u_stars_colors[s].rgb,u_stars_pole_colors[s].rgb,latitude);
+                    float star_lum = mix(u_stars_colors[s].a,u_stars_pole_colors[s].a,latitude);
+                    float flux = u_hdr_enabled ? star_lum/(distance_to_star*distance_to_star) : 1.0;
+                    total_planetshine += u_host_planet_color*star_color*flux*incidence
+                                        *ring_response*solid_angle_weight;
                 }
             }
-
-            // Planetshine flux reaching the ring point: Lambertian sphere illumination
-            vec3 planetshine_irradiance = u_host_planet_color * star_color * irradiance * planet_phase * (solid_angle * 0.6666667);
-
-            total_planetshine += planetshine_irradiance * active_shine_color * ring_planet_response * host_shadow;
         }
     }
 

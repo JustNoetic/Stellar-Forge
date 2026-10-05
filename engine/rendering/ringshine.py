@@ -5,50 +5,61 @@ import numpy as np
 MAX_RING_HOSTS = 16
 MAX_RING_SEGMENTS = MAX_RING_HOSTS * 16
 RING_PROFILE_ROWS = MAX_RING_HOSTS + MAX_RING_SEGMENTS
-RING_PROPERTY_ROWS = MAX_RING_HOSTS * 2
 RINGSHINE_TILE_SIZE = (128, 65)
 
 
 def build_secondary_ring_properties(rings, gradient, indices, body_count):
-    """Area/opacity-weighted linear material for the distant-body approximation."""
-    params = np.zeros((body_count, 4), dtype='f4')
-    normals = np.zeros((body_count, 3), dtype='f4')
-    colors = np.zeros((body_count, 3), dtype='f4')
-    scattering = np.zeros((body_count, 4), dtype='f4')
+    """Preserve material lobes at radial nodes in the distant-annulus model.
+
+    params[:,3] is a one-based slot into the compact host sample array.
+    Geometry remains a distant annulus; optical response is integrated before
+    averaging, with shared extinction at overlapping radial nodes.
+    """
+    from engine.rendering.ring_optics import RING_MAX_ALPHA
+    params = np.zeros((body_count,4),dtype='f4')
+    normals = np.zeros((body_count,3),dtype='f4')
+    colors = np.ones((body_count,3),dtype='f4')
     if indices is None:
-        indices = {body: index for index, body in enumerate(dict.fromkeys(r['body_idx'] for r in rings))}
-    for body, index in indices.items():
-        if body >= body_count:
+        indices = {body:index for index,body in enumerate(dict.fromkeys(r['body_idx'] for r in rings))}
+    scattering = np.zeros((len(indices),64,16,12),dtype='f4')
+    nodes,weights = np.polynomial.legendre.leggauss(64)
+    for slot,body in enumerate(indices):
+        if body>=body_count:
             continue
-        segments = [ring for ring in rings if ring['body_idx'] == body]
+        segments = [ring for ring in rings if ring['body_idx']==body]
+        if len(segments)>16:
+            raise ValueError("A ring host supports at most 16 material layers")
         if not segments:
             continue
         inner = min(ring['inner_r'] for ring in segments)
         outer = max(ring['outer_r'] for ring in segments)
-        if gradient is None:
-            # Comparison rings have their own geometry rather than a primary
-            # atlas row. Preserve their secondary lighting with the same bake.
-            from engine.rendering.render_utils import bake_unified_shadow_profile
-            segments = [dict(ring, is_textured=ring.get('is_textured', ring.get('tex_sampled') is not None))
-                        for ring in segments]
-            profile, props, extra = bake_unified_shadow_profile(segments, inner, outer)
-        else:
-            profile = gradient.atlas_data[index]
-            props = gradient.property_data[index * 2]
-            extra = gradient.property_data[index * 2 + 1]
-        weights = np.linspace(inner, outer, len(profile), dtype='f8')
-        weights[[0, -1]] *= 0.5
-        flux = weights * profile[:, 3]
-        total = float(flux.sum())
-        if total <= 0.0 or outer <= inner:
+        if outer<=inner:
             continue
-        params[body] = (inner, outer, total / weights.sum(),
-                        np.sum(props[:, 3] * flux) / total)
-        colors[body] = np.sum(np.maximum(profile[:, :3], 0.0)**2.2 * flux[:, None], axis=0) / total
-        scattering[body, :3] = np.sum(props[:, :3] * flux[:, None], axis=0) / total
-        scattering[body, 3] = np.sum(extra[:, 0] * flux) / total
+        # Uniform projected annulus area: r^2 is the quadrature coordinate.
+        radii = np.sqrt(inner*inner+(nodes+1)*.5*(outer*outer-inner*inner))
+        area_weights = weights*.5
+        layer_taus = np.zeros((64,len(segments)),dtype='f8')
+        for m,ring in enumerate(segments):
+            valid = (radii>=ring['inner_r']) & (radii<=ring['outer_r'])
+            profile = ring['shadow_grad']
+            u = (radii-ring['inner_r'])/max(1e-12,ring['outer_r']-ring['inner_r'])
+            xp = np.linspace(0,1,len(profile))
+            alpha = np.where(valid,np.clip(np.interp(u,xp,profile[:,3])*ring['opacity'],0,RING_MAX_ALPHA),0)
+            tau = -np.log1p(-alpha)
+            layer_taus[:,m] = tau
+            scattering[slot,:,m,1] = alpha
+            scattering[slot,:,m,2:7] = (ring.get('asymmetry',.7),ring.get('backscatter',-.3),
+                ring.get('scatter',1),float(ring.get('is_textured',ring.get('tex_sampled') is not None)),
+                ring.get('unlit_factor',1))
+            for c in range(3):
+                scattering[slot,:,m,7+c] = np.maximum(np.interp(u,xp,profile[:,c]),0)**2.2
+        total_tau = layer_taus.sum(axis=1)
+        scattering[slot,:,:len(segments),0] = total_tau[:,None]
+        scattering[slot,:,:len(segments),11] = area_weights[:,None]*layer_taus/np.maximum(total_tau[:,None],1e-30)
+        opacity = float(np.dot(area_weights,-np.expm1(-total_tau)))
+        params[body] = (inner,outer,opacity,slot+1)
         normals[body] = segments[0]['pole']
-    return params, normals, colors, scattering
+    return params,normals,colors,scattering
 
 
 class RingshineMap:
@@ -61,17 +72,16 @@ class RingshineMap:
         self.framebuffer = ctx.framebuffer(color_attachments=[self.texture])
         self.program = ctx.program(vertex_shader=vertex_shader, fragment_shader=fragment_shader)
         self.program['u_ring_gradients'].value = 0
-        self.program['u_ring_props'].value = 5
         self.vao = ctx.vertex_array(self.program, [(quad_vbo, '2f', 'in_position')])
         self.cache = {}
         self.last_update_count = 0
 
-    def update(self, gradient, properties, hosts, star_positions, bands, oblate):
+    def update(self, gradient, hosts, star_positions, bands, oblate, star_radii=None):
         """Rebake changed tiles. Camera, azimuth, flux and color are lookup inputs.
 
         Elevation is quantized in sine space to 1e-5 (maximum error 5e-6).
-        Atlas revisions invalidate material changes immediately. Exactly
-        edge-on sunlight contributes zero in this thin-slab model.
+        Atlas revisions invalidate material changes immediately. Finite stellar
+        disks contribute to both faces when their centers cross the ring plane.
         """
         bands = max(4, min(1024, int(bands)))
         revision = getattr(gradient, 'profile_revision', 0)
@@ -79,9 +89,11 @@ class RingshineMap:
         active = set()
         dirty = []
         width, height = RINGSHINE_TILE_SIZE
+        geometry_radius = {}
         for index, center, normal, params, flattening in hosts:
             inner, outer, opacity, radius = map(float, params)
             radius = max(radius, 1e-12)
+            geometry_radius[index] = radius
             flattening = min(0.95, max(0.0, float(flattening))) if oblate else 0.0
             geometry = (inner / radius, outer / radius, opacity, flattening)
             for star, position in enumerate(star_positions[:16]):
@@ -91,22 +103,38 @@ class RingshineMap:
                 elevation = min(1.0, max(-1.0, round(elevation, 5)))
                 tile = (index, star)
                 active.add(tile)
-                key = (revision, geometry, bands, elevation)
+                sin_radius = min(.999,max(0.0,float(star_radii[star])/distance)) if star_radii is not None and distance>1e-12 else 0.0
+                # Relative quantization preserves small stellar disks at equinox.
+                sin_radius = float(format(sin_radius,'.6g'))
+                key = (revision, geometry, bands, elevation, sin_radius)
                 if self.cache.get(tile) == key:
                     continue
-                dirty.append((tile, key, geometry, elevation))
+                dirty.append((tile, key, geometry, elevation, sin_radius))
         if dirty:
             # Bake an overwrite, independent of the caller's blend/depth state.
             with self.ctx.scope(framebuffer=self.framebuffer, enable_only=0):
                 self.framebuffer.use()
                 gradient.use(0)
-                properties.use(5)
-                for tile, key, geometry, elevation in dirty:
+                for tile, key, geometry, elevation, sin_radius in dirty:
                     index, star = tile
                     self.framebuffer.viewport = (star * width, index * height, width, height)
-                    self.program['u_ring_index'].value = index
                     self.program['u_host_params'].value = geometry
                     self.program['u_sun_elevation'].value = elevation
+                    self.program['u_sun_radius'].value = sin_radius
+                    segments = gradient.host_segments[index]
+                    self.program['u_segment_count'].value = len(segments)
+                    segment_geometry = np.zeros((16,4),dtype='f4')
+                    segment_props = np.zeros((16,4),dtype='f4')
+                    families = np.zeros(16,dtype='f4')
+                    for m,segment in enumerate(segments):
+                        segment_geometry[m] = (segment['inner_r']/geometry_radius[index],
+                            segment['outer_r']/geometry_radius[index],segment['opacity'],segment['row_idx'])
+                        segment_props[m] = (segment.get('asymmetry',.7),segment.get('backscatter',-.3),
+                            segment.get('scatter',1),segment.get('unlit_factor',1))
+                        families[m] = float(segment.get('is_textured',False))
+                    self.program['u_segment_geometry'].write(segment_geometry.tobytes())
+                    self.program['u_segment_props'].write(segment_props.tobytes())
+                    self.program['u_segment_textured'].write(families.tobytes())
                     self.program['u_ringshine_band_count'].value = bands
                     self.vao.render(moderngl.TRIANGLE_STRIP)
                     self.cache[tile] = key
