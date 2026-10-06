@@ -7,6 +7,7 @@ uniform float u_bloom_intensity;
 uniform sampler2D u_conv_bloom_texture;
 uniform float u_conv_bloom_intensity;
 uniform vec2 u_conv_bloom_scale;
+uniform bool u_size_comparator;
 
 // ACES Tone Mapping
 vec3 ACESFilm(vec3 x) {
@@ -20,6 +21,11 @@ vec3 ACESFilm(vec3 x) {
 
 void main() {
     vec3 hdr_color = texture(u_main_texture, v_texcoord).rgb;
+    if (u_size_comparator) {
+        // Display-referred colors: no exposure, ACES, bloom, or glare.
+        out_color = vec4(pow(clamp(hdr_color, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+        return;
+    }
     vec3 bloom_color = texture(u_bloom_texture, v_texcoord).rgb;
     vec3 conv_color = vec3(0.0);
     if (u_conv_bloom_intensity > 0.0) {

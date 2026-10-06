@@ -1,17 +1,43 @@
 import math
 import imgui
 from engine.rendering.render_utils import format_flight_speed
+from engine.ui.workspace import workspace
 from engine.core.constants import MAX_FLIGHT_SPEED_AU_S
 
 def render_viewport_hud(app, bodies_data):
     """Render minimal floating HUD over the 3D viewport (camera info pill)."""
     # ── Floating Camera / Navigation Pill (Top-Left under Menu Bar when Outliner is closed) ──
-    if not getattr(app, "show_outliner", True):
+    layout = workspace(app)
+    comparator = app.camera.get("scene_mode") == "size_comparator"
+    if comparator:
+        from engine.rendering.size_comparator import comparator_view
+        x = layout.left
+        imgui.set_next_window_position(x, layout.top, imgui.ALWAYS)
+        imgui.set_next_window_size(min(380 * layout.scale, max(180, layout.right - layout.left)), 110 * layout.scale, imgui.ALWAYS)
+        flags = imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE
+        imgui.begin("##size_comparator_pill", False, flags)
+        imgui.text_colored("Size Comparator · Relative Scale", 0.6, 0.9, 1.0)
+        imgui.text_wrapped("Left drag: pan   Scroll: zoom   Click: select")
+        if imgui.button("Fit All"):
+            comparator_view(app.camera)["fit"] = True
+        sources = getattr(app,'_comparator_sources',[])
+        selected = app.camera.get('size_comparator_selected')
+        index = next((i for i,s in enumerate(sources) if list(s[:2]) == selected),None)
+        if index is None and selected is None:
+            role = 'comparison' if app.camera.get('inspected_is_cmp') else 'primary'
+            index = next((i for i,s in enumerate(sources)
+                          if s[2] == role and s[1] == app.camera.get('inspected_idx')),None)
+        if index is not None:
+            imgui.same_line()
+            if imgui.button("Focus Selected"):
+                app.camera["size_comparator_focus"] = index
+        imgui.end()
+    if not comparator and not getattr(app, "show_outliner", True):
         move_mode = app.camera.get("movement_mode", 0)
-        pill_w = 260
-        pill_h = 58 if move_mode == 0 else 38
+        pill_w = min(380 * layout.scale, max(180, layout.right - layout.left))
+        pill_h = 90 * layout.scale if move_mode == 0 else 65 * layout.scale
 
-        imgui.set_next_window_position(12, 36, imgui.ALWAYS)
+        imgui.set_next_window_position(layout.left, layout.top, imgui.ALWAYS)
         imgui.set_next_window_size(pill_w, pill_h, imgui.ALWAYS)
         flags = imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SCROLLBAR
         imgui.begin("##camera_pill", False, flags)
@@ -45,12 +71,10 @@ def render_viewport_hud(app, bodies_data):
         sphere_tris = getattr(app, "sphere_last_triangle_count", 0)
         patches = getattr(app, "terrain_last_patch_count", 0)
 
-        x_pos = 12
-        y_pos = 100 if not getattr(app, "show_outliner", True) else 36
-        if getattr(app, "show_outliner", True):
-            x_pos = 285
+        x_pos = layout.left
+        y_pos = layout.top + (120 * layout.scale if comparator else (100 * layout.scale if not getattr(app, "show_outliner", True) else 0))
 
-        imgui.set_next_window_position(x_pos, y_pos, imgui.FIRST_USE_EVER)
+        imgui.set_next_window_position(x_pos, y_pos, imgui.ALWAYS)
         flags = imgui.WINDOW_NO_RESIZE | imgui.WINDOW_ALWAYS_AUTO_RESIZE
         expanded, opened = imgui.begin("Geometry Statistics###geom_stats", True, flags)
         if not opened:

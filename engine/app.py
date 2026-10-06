@@ -452,6 +452,7 @@ from engine.rendering.planetshine import (
     compute_planetshine_numba
 )
 from engine.rendering.texture_baker import apply_hsba_np, bake_and_export_ring_textures
+from engine.rendering.size_comparator import SizeComparatorRenderer, SIZE_SCALE
 from engine.core.input_handler import InputHandlerMixin
 from engine.physics.refraction import get_apparent_look_direction
 
@@ -464,6 +465,7 @@ class App(InputHandlerMixin):
         self.impl = None
         self.pick_request = None
         self.camera = {
+            "scene_mode": "simulation",
             "target": np.array([0.0, 0.0, 0.0], dtype='f8'),
             # Camera offset (AU, f8) from the tracked pivot (body / barycenter / target).
             # Default eye pose reproduces the legacy 45 AU orbit view (yaw -90, pitch 25).
@@ -739,6 +741,11 @@ class App(InputHandlerMixin):
             os.makedirs(get_external_path("data"), exist_ok=True)
             settings_path = get_external_path("data", "graphics_settings.json")
             saved = {
+                "ui_aligned_panels": self.camera.get("ui_aligned_panels", True),
+                "ui_outliner_width": self.camera.get("ui_outliner_width", 260),
+                "ui_inspector_width": self.camera.get("ui_inspector_width", 420),
+                "ui_scale": self.camera.get("ui_scale", 1.0),
+                "show_gaia_stars": self.camera.get("show_gaia_stars", True),
                 "atmo_quality": self.camera.get("atmo_quality", 2),
                 "atmo_resolution": self.camera.get("atmo_resolution", 1.0),
                 "atmo_vrs_threshold_px": self.camera.get("atmo_vrs_threshold_px", 100.0),
@@ -908,6 +915,13 @@ class App(InputHandlerMixin):
     def scroll_callback(self, window, xoffset, yoffset):
         if self.impl: self.impl.scroll_callback(window, xoffset, yoffset)
         if imgui.get_io().want_capture_mouse: return 
+        if self.camera.get("scene_mode") == "size_comparator":
+            from engine.rendering.size_comparator import comparator_view, zoom_view
+            x, y = glfw.get_cursor_pos(window)
+            zoom_view(comparator_view(self.camera), yoffset, x, y,
+                      self.window_width, self.window_height)
+            return
+
         
         is_shift = glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS
         
@@ -931,6 +945,10 @@ class App(InputHandlerMixin):
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)
+        # Always end a drag, even if its release lands over an ImGui panel.
+        if action == glfw.RELEASE:
+            if button == glfw.MOUSE_BUTTON_LEFT: self.camera["left_dragging"] = False
+            if button == glfw.MOUSE_BUTTON_RIGHT: self.camera["right_dragging"] = False
         if imgui.get_io().want_capture_mouse: return 
         
         x, y = glfw.get_cursor_pos(window)
@@ -958,6 +976,13 @@ class App(InputHandlerMixin):
         dx = xpos - self.camera["last_x"]
         dy = ypos - self.camera["last_y"]
         
+        if self.camera.get("scene_mode") == "size_comparator":
+            if self.camera.get("left_dragging", False):
+                from engine.rendering.size_comparator import comparator_view, pan_view
+                pan_view(comparator_view(self.camera), dx, dy, self.window_height)
+            self.camera["last_x"], self.camera["last_y"] = xpos, ypos
+            return
+
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
         movement_mode = self.camera.get("movement_mode", 0)
         
@@ -1007,6 +1032,9 @@ class App(InputHandlerMixin):
         # WASD: track held state for free-flight / surface walking
         flight_keys = {glfw.KEY_W: "w", glfw.KEY_A: "a", glfw.KEY_S: "s", glfw.KEY_D: "d"}
         if key in flight_keys:
+            if self.camera.get("scene_mode") == "size_comparator":
+                self.camera["keys"][flight_keys[key]] = False
+                return
             self.camera["keys"][flight_keys[key]] = (action != glfw.RELEASE)
             if action == glfw.PRESS:
                 self.camera["centered_idx"] = None
@@ -3414,6 +3442,12 @@ class App(InputHandlerMixin):
             
             glfw.poll_events()
             
+            comparator_active = self.camera.get("scene_mode") == "size_comparator"
+            if getattr(self, '_last_scene_mode', None) != comparator_active:
+                self.photo_accum_count = 0
+                self.photo_accum_last_cam = None
+                self.atmo_history_valid = {mode: False for mode in (0, 1, 2)}
+                self._last_scene_mode = comparator_active
             self.impl.process_inputs()
             imgui.new_frame()
             
@@ -4172,7 +4206,7 @@ class App(InputHandlerMixin):
             frustum_planes = extract_frustum_planes(vp_matrix_f8).astype(np.float32)
             vp_matrix = view @ projection
             
-            if self.pick_request is not None:
+            if self.pick_request is not None and not comparator_active:
                 px, py = self.pick_request
                 self.pick_request = None
                 
@@ -4264,24 +4298,48 @@ class App(InputHandlerMixin):
                 cmp_t_sec = float(cmp_sim_t) * 31557600.0
                 all_instances[num_bodies:, 25] = body_spin_angles_cmp
                 
+            if comparator_active:
+                from engine.rendering.comparator_systems import ComparatorSystems
+                if not hasattr(self, 'comparator_systems'):
+                    self.comparator_systems = ComparatorSystems()
+                def comparator_data(start, stop, bodies, parents, rings, atmospheres, masses):
+                    instances = all_instances[start:stop]
+                    return dict(bodies=bodies, parents=parents, rings=rings,
+                        atmospheres=atmospheres, masses=masses,
+                        visuals=np.column_stack((instances[:,3:8],instances[:,9:13])),
+                        tex_indices=instances[:,24], spins=instances[:,25])
+                live_systems = {active_system_name: ('primary', comparator_data(
+                    0,num_bodies,bodies_data,parent_snap,ring_precomputed,atmo_bodies,mass_snap))}
+                if self.comparison_enabled and self.comparison_system_name not in live_systems:
+                    live_systems[self.comparison_system_name] = ('comparison', comparator_data(
+                        num_bodies,total_render_bodies,self.bodies_data_cmp,self.parent_snap_cmp,
+                        self.ring_precomputed_cmp,self.atmo_bodies_cmp,self.mass_snap_cmp))
+                comparator_data_all = self.comparator_systems.collect(self,live_systems)
+
             # --- Dynamic Texture Streaming: evaluate apparent pixel sizes & process completed uploads ---
             stream_thresh_px = float(self.camera.get("tex_stream_threshold_px", 500.0))
             cur_fov_factor = 1.0 / math.tan(math.radians(max(1.0, self.camera["fov"]) / 2.0))
             
             # Check apparent size for each body to trigger high-res streaming
-            for b_i in range(num_bodies):
-                t_slice = int(self.tex_idx_arr[b_i])
+            stream_bodies = comparator_data_all['bodies'] if comparator_active else bodies_data
+            stream_indices = comparator_data_all['tex_indices'] if comparator_active else self.tex_idx_arr
+            stream_radii = comparator_data_all['visuals'][:,3] if comparator_active else body_radii
+            for b_i in range(len(stream_bodies)):
+                t_slice = int(stream_indices[b_i])
                 if t_slice <= 0:
                     continue
-                b_name_lower = bodies_data[b_i].get('name', '').lower()
-                b_pos_world = pos_snap_render[b_i]
-                b_rad = float(body_radii[b_i])
-                cam_d = float(np.linalg.norm((cam_origin + rel) - b_pos_world))
-                apparent_px = (b_rad / max(1e-12, cam_d)) * self.fb_height * cur_fov_factor
+                b_name_lower = stream_bodies[b_i].get('name', '').lower()
+                b_rad = float(stream_radii[b_i])
+                if comparator_active:
+                    view_height = self.camera.get('size_comparator_view', {}).get('height', 20.0)
+                    apparent_px = b_rad * SIZE_SCALE * self.fb_height / max(view_height, 1e-8)
+                else:
+                    cam_d = float(np.linalg.norm((cam_origin + rel) - pos_snap_render[b_i]))
+                    apparent_px = (b_rad / max(1e-12, cam_d)) * self.fb_height * cur_fov_factor
                 
                 if apparent_px >= stream_thresh_px and self.active_res_level.get(t_slice) != 'high':
                     # If Terrain LOD is active and this body has baked tiles, skip legacy 21.6K monolithic load to prevent stutter
-                    if self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
+                    if not comparator_active and self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
                         body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name_lower)
                         if os.path.isdir(body_tiles_dir):
                             continue
@@ -4292,7 +4350,7 @@ class App(InputHandlerMixin):
             for res in decoded_results:
                 r_idx = res['idx']
                 b_name_lower = res.get('name_lower', '')
-                if self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
+                if not comparator_active and self.camera.get("terrain_lod_enabled", False) and getattr(self, 'terrain_streamer', None) is not None:
                     body_tiles_dir = os.path.join(self.terrain_streamer.tiles_base_dir, b_name_lower)
                     if os.path.isdir(body_tiles_dir):
                         self.active_res_level[r_idx] = 'high'
@@ -4364,2948 +4422,2961 @@ class App(InputHandlerMixin):
                     all_instances[i, 19] = lum_eq
                     all_instances[i, 23] = lum_pole
 
-            is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
-            star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
-            star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
-            star_radii = all_instances[:total_render_bodies][is_star_mask, 6] # Added star radii
-            star_indices_numba = np.where(is_star_mask[:total_render_bodies])[0]
-            star_lums = np.ones(len(star_indices_numba), dtype=np.float32)
-            
-            for _k in range(len(star_indices_numba)):
-                _idx = star_indices_numba[_k]
-                if _idx < num_bodies:
-                    _bd = bodies_data[_idx]
-                else:
-                    _bd = self.bodies_data_cmp[_idx - num_bodies]
-                if "star_props" in _bd and "lum" in _bd["star_props"]:
-                    star_lums[_k] = float(_bd["star_props"]["lum"])
-                elif "lum_eq" in _bd:
-                    star_lums[_k] = float(_bd["lum_eq"])
-                else:
-                    star_lums[_k] = all_instances[_idx, 19]
-                    
-            hdr_enabled = self.camera.get("hdr_enabled", True)
-            planetshine_enabled = self.camera.get("planetshine_enabled", True)
-            ringshine_enabled = self.camera.get("ringshine_enabled", True)
-
-            # Distant-body radial samples preserve each original material lobe
-            # and only change when the profile atlas is rebuilt.
-            ps_material_key = (ring_gradient_tex.profile_revision, total_render_bodies)
-            if getattr(self, '_ps_ring_material_key', None) != ps_material_key:
-                self._ps_ring_materials = build_secondary_ring_properties(
-                    ring_precomputed, ring_gradient_tex, self.body_ring_indices,
-                    total_render_bodies)
-                self._ps_ring_material_key = ps_material_key
-            ps_ring_params, ps_ring_normals, ps_ring_colors, ps_ring_scattering = self._ps_ring_materials
-
-            if getattr(self, '_ps_is_moon_key', None) != (total_render_bodies, len(bodies_data)):
-                self._ps_is_moon = np.array(
-                    [b.get('type') == 'Moon' or b.get('is_moon', False) for b in material_bodies],
-                    dtype=np.bool_
-                )
-                self._ps_is_moon_key = (total_render_bodies, len(bodies_data))
-            is_moon_arr = self._ps_is_moon
-
-            planetshine_dirs, planetshine_colors = compute_planetshine_numba(
-                all_instances[:total_render_bodies, 0:3],
-                all_instances[:total_render_bodies, 6],
-                ps_surface_colors,
-                all_instances[:total_render_bodies, 8],
-                star_positions,
-                star_colors,
-                star_lums,
-                star_radii, # Pass radii to Numba
-                hdr_enabled,
-                ps_ring_params,
-                ps_ring_normals,
-                ps_ring_colors,
-                planetshine_enabled,
-                ringshine_enabled,
-                ps_ring_scattering,
-                surface_materials,
-                surface_phases,
-                is_moon_arr
-            )
-            all_instances[:total_render_bodies, 16:19] = planetshine_dirs
-            all_instances[:total_render_bodies, 20:23] = planetshine_colors
-            
-            all_instances_buffer.write(all_instances[:total_render_bodies].tobytes())
-            
-            cmds_data = np.array([
-                len(quad_idx), 0, 0, 0, 0,
-                len(mesh_lo_idx), 0, 0, 0, 0,
-                len(mesh_hi_idx), 0, 0, 0, 0,
-                len(mesh_ultra_idx), 0, 0, 0, 0,
-            ], dtype=np.uint32)
-            draw_cmds_buffer.write(cmds_data.tobytes())
-            
-            focused_mask_buffer.write(focused_mask[:total_render_bodies].view(np.uint8).astype(np.uint32).tobytes())
-            
-            prog_culling_compute['u_num_bodies'].value = total_render_bodies
-            prog_culling_compute['u_star_idx'].value = star_idx
-            ring_star_indices = np.zeros(16, dtype=np.int32)
-            ring_star_count = min(len(star_indices_numba), 16)
-            ring_star_indices[:ring_star_count] = star_indices_numba[:ring_star_count]
-            prog_culling_compute['u_num_ring_stars'].value = ring_star_count
-            prog_culling_compute['u_ring_star_indices'].write(ring_star_indices.tobytes())
-            prog_culling_compute['u_n_casters'].value = n_casters_fixed
-            
-            c_idx_arr = np.zeros(64, dtype=np.int32)
-            if n_casters_fixed > 0:
-                c_idx_arr[:n_casters_fixed] = caster_indices[:n_casters_fixed]
-            prog_culling_compute['u_caster_indices'].write(c_idx_arr.tobytes())
-            self.caster_idx_map = {int(caster_indices[i_c]): i_c for i_c in range(n_casters_fixed)} if n_casters_fixed > 0 else {}
-            
-            prog_culling_compute['u_frustum_planes'].write(frustum_planes.astype(np.float32).tobytes())
-                
-            prog_culling_compute['u_n_rings'].value = n_ring_planes
-            if n_ring_planes > 0:
-                prog_culling_compute['u_ring_centers'].write(ring_centers_buf.astype(np.float32).tobytes())
-                prog_culling_compute['u_ring_normals'].write(ring_normals_buf.astype(np.float32).tobytes())
-                r_out_arr = np.zeros(16, dtype=np.float32)
-                r_out_arr[:n_ring_planes] = ring_params_buf[:n_ring_planes, 1]
-                prog_culling_compute['u_ring_outer_radii'].write(r_out_arr.tobytes())
-                
-            tracking_idx_uni = -1
-            if self.camera["tracking_idx"] is not None:
-                if self.camera.get("tracking_is_cmp", False):
-                    tracking_idx_uni = num_bodies + self.camera["tracking_idx"]
-                else:
-                    tracking_idx_uni = self.camera["tracking_idx"]
-            prog_culling_compute['u_tracking_idx'].value = tracking_idx_uni
-
-            # Identify active bodies for terrain Quadtree LOD
-            active_terrain_bodies = []
-            terrain_enabled = bool(self.camera.get("terrain_lod_enabled", False))
-
-            if terrain_enabled and getattr(self, 'terrain_streamer', None) is not None:
-                fov_fac = float(1.0 / math.tan(math.radians(max(0.001, self.camera["fov"]) / 2.0)))
-                max_terrain_bodies = 4
-
-                # Apparent-size test first (cheap numpy), tiles-dir existence
-                # cached once per body — os.path.isdir() per body per frame is a
-                # syscall storm on the render thread.
-                tiles_base = self.terrain_streamer.tiles_base_dir
-                tiles_dir_cache = getattr(self, "_terrain_tiles_dir_cache", None)
-                if tiles_dir_cache is None:
-                    tiles_dir_cache = self._terrain_tiles_dir_cache = {}
-
-                prev_active_terrain_indices = getattr(self, "_prev_active_terrain_indices", set())
-                cam_world_pos_f8 = cam_origin + rel
-                candidates = []
-
-                for b_i in range(total_render_bodies):
-                    b_r = all_instances[b_i, 6]
-                    if b_i < num_bodies:
-                        b_pos_world = pos_snap_render[b_i]
-                        b_name = bodies_data[b_i]["name"].lower()
-                    else:
-                        b_pos_world = self.pos_snap_cmp[b_i - num_bodies] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                        b_name = self.bodies_data_cmp[b_i - num_bodies]["name"].lower()
-
-                    d_cam = float(np.linalg.norm(b_pos_world - cam_world_pos_f8))
-                    apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
-
-                    # Hysteresis: keep terrain LOD active until the body shrinks below
-                    # the GPU's lo-mesh threshold (apparent_px < 2.0 in culling.comp),
-                    # so the terrain pass renders the surface all the way down to the
-                    # point-light transition — the icosphere proxy never shows.
-                    # Minimal 1px hysteresis prevents quadtree-traversal thrashing
-                    # at the subpixel boundary without showing the icosphere.
-                    min_px_thresh = 2.0 if b_i in prev_active_terrain_indices else 3.0
-                    if apparent_px < min_px_thresh:
-                        continue
-
-                    has_tiles = tiles_dir_cache.get(b_i)
-                    if has_tiles is None:
-                        has_tiles = os.path.isdir(os.path.join(tiles_base, b_name))
-                        tiles_dir_cache[b_i] = has_tiles
-                    if not has_tiles:
-                        continue
-
-                    b_pos = all_instances[b_i, 0:3]
-                    r_cull = b_r * (1.5 if d_cam > b_r else 5.0)
-                    if is_sphere_in_frustum(b_pos, r_cull, frustum_planes):
-                        candidates.append((b_i, b_name, apparent_px))
-
-                # Purely determined by object size on screen (descending apparent_px):
-                candidates.sort(key=lambda c: c[2], reverse=True)
-                active_terrain_bodies = [(c[0], c[1]) for c in candidates[:max_terrain_bodies]]
-                self._prev_active_terrain_indices = {tb[0] for tb in active_terrain_bodies}
-
-                # Preload low/intermediate LOD 2 tiles for the largest dominant visible terrain body on screen
-                if active_terrain_bodies:
-                    dominant_b_i, dominant_b_name = active_terrain_bodies[0]
-                    dominant_px = candidates[0][2]
-                    if dominant_px >= 300.0 and getattr(self, '_last_preloaded_lod2_body', None) != dominant_b_i:
-                        self._last_preloaded_lod2_body = dominant_b_i
-                        self.terrain_streamer.preload_body_lod(dominant_b_name, map_types=("diffuse", "clouds"), target_lod=2)
-
-            active_terrain_body_idx = -1
-            active_terrain_body_name = None
-            active_terrain_body_indices = []
-
-            if active_terrain_bodies:
-                active_terrain_body_idx = active_terrain_bodies[0][0]
-                active_terrain_body_name = active_terrain_bodies[0][1]
-                active_terrain_body_indices = [tb[0] for tb in active_terrain_bodies]
-                self._cull_terrain_suppression_on = True
-
-                if 'u_terrain_body_idx' in prog_culling_compute:
-                    prog_culling_compute['u_terrain_body_idx'].value = active_terrain_body_idx
-                if 'u_num_terrain_bodies' in prog_culling_compute:
-                    prog_culling_compute['u_num_terrain_bodies'].value = len(active_terrain_body_indices)
-                if 'u_terrain_body_indices' in prog_culling_compute:
-                    indices_padded = active_terrain_body_indices[:16] + [0] * max(0, 16 - len(active_terrain_body_indices))
-                    prog_culling_compute['u_terrain_body_indices'].value = tuple(indices_padded)
+            cam_world_pos_f8 = cam_origin + rel
+            if comparator_active:
+                if not hasattr(self, 'size_comparator_renderer'):
+                    self.size_comparator_renderer = SizeComparatorRenderer(ctx, vbo_hi, ibo_hi)
+                self._comparator_primary_count = num_bodies
+                data = comparator_data_all
+                self.hdr_resolve_fbo.use()
+                self.size_comparator_renderer.render(self,data['bodies'],data['visuals'],
+                    data['parents'],data['tex_indices'],data['spins'],data['rings'],ring_gradient_tex,
+                    atmospheres=data['atmospheres'],masses=data['masses'],body_sources=data['sources'])
+                # Orthographic navigation cannot reuse perspective atmosphere history.
+                self.atmo_history_valid = {mode: False for mode in (0, 1, 2)}
             else:
-                # Keep the culling compute shader's terrain suppression off when
-                # no terrain body is active — but only write the uniforms when
-                # the enabled-state changed, instead of per frame.
-                if self._cull_terrain_suppression_on:
-                    self._cull_terrain_suppression_on = False
-                    if 'u_terrain_body_idx' in prog_culling_compute:
-                        prog_culling_compute['u_terrain_body_idx'].value = -1
-                    if 'u_num_terrain_bodies' in prog_culling_compute:
-                        prog_culling_compute['u_num_terrain_bodies'].value = 0
-                    if 'u_terrain_body_indices' in prog_culling_compute:
-                        prog_culling_compute['u_terrain_body_indices'].value = tuple([0] * 16)
+                is_star_mask = all_instances[:total_render_bodies, 8] > 0.5
+                star_positions = all_instances[:total_render_bodies][is_star_mask, 0:3]
+                star_colors = all_instances[:total_render_bodies][is_star_mask, 3:6]
+                star_radii = all_instances[:total_render_bodies][is_star_mask, 6] # Added star radii
+                star_indices_numba = np.where(is_star_mask[:total_render_bodies])[0]
+                star_lums = np.ones(len(star_indices_numba), dtype=np.float32)
 
-            if 'u_camera_pos' in prog_culling_compute:
-                prog_culling_compute['u_camera_pos'].value = tuple(cam_pos)
-            if 'u_screen_height' in prog_culling_compute:
-                prog_culling_compute['u_screen_height'].value = float(self.fb_height)
-            if 'u_fov_factor' in prog_culling_compute:
-                prog_culling_compute['u_fov_factor'].value = float(1.0 / math.tan(math.radians(self.camera["fov"] / 2.0)))
-            if 'u_lod_thresh_ultra' in prog_culling_compute:
-                prog_culling_compute['u_lod_thresh_ultra'].value = 300.0
-            if 'u_lod_thresh_hi' in prog_culling_compute:
-                prog_culling_compute['u_lod_thresh_hi'].value = 40.0
-            if 'u_exposure' in prog_culling_compute:
-                prog_culling_compute['u_exposure'].value = float(self.camera.get("exposure", 1.0))
-            
-            all_instances_buffer.bind_to_storage_buffer(binding=2)
-            vis_point_buffer.bind_to_storage_buffer(binding=3)
-            vis_lo_buffer.bind_to_storage_buffer(binding=4)
-            vis_hi_buffer.bind_to_storage_buffer(binding=5)
-            vis_ultra_buffer.bind_to_storage_buffer(binding=6)
-            draw_cmds_buffer.bind_to_storage_buffer(binding=7)
-            focused_mask_buffer.bind_to_storage_buffer(binding=8)
-            
-            _gq = _perf_gpu_begin(ctx, "gpu_culling")
-            prog_culling_compute.run((total_render_bodies + 255) // 256, 1, 1)
-            ctx.memory_barrier()
-            _perf_gpu_end(_gq)
-    
-            if not show_orbits:
-                n_orbits = 0
-                n_orbits_hi = 0
-                n_orbits_med = 0
-                n_orbits_low = 0
-                self.n_orbits_cmp = 0
-                self.n_orbits_hi_cmp = 0
-                self.n_orbits_med_cmp = 0
-                self.n_orbits_low_cmp = 0
-                last_orbit_pos_snap = None
-                last_orbit_pos_snap_cmp = None
-            else:
-                recompute_orbits = True
-                if last_orbit_pos_snap is not None and self.time_ctrl.get("paused"):
-                    if np.array_equal(pos_snap_render, last_orbit_pos_snap):
-                        recompute_orbits = False
-                
-                if recompute_orbits:
-                    lod_levels = np.full(num_bodies, 2.0, dtype=np.float64)
-                    for i in range(num_bodies):
-                        if parent_snap[i] == star_idx:
-                            lod_levels[i] = 1.0
-                    
-                    t_idx = self.camera.get("tracking_idx")
-                    primary_idx = None
-                    if not self.camera.get("tracking_is_cmp", False) and t_idx is not None and t_idx != star_idx and t_idx < num_bodies:
-                        primary_idx = t_idx
-                        if parent_snap[t_idx] >= 0 and parent_snap[parent_snap[t_idx]] == star_idx:
-                            primary_idx = parent_snap[t_idx]
-                    elif num_bodies > 0:
-                        dists_to_cam = np.linalg.norm(pos_snap_render - cam_origin, axis=1)
-                        nearest_idx = int(np.argmin(dists_to_cam))
-                        if dists_to_cam[nearest_idx] < 0.2:
-                            primary_idx = nearest_idx
-                            if parent_snap[nearest_idx] >= 0 and parent_snap[parent_snap[nearest_idx]] == star_idx:
-                                primary_idx = parent_snap[nearest_idx]
-
-                    if primary_idx is not None:
-                        lod_levels[primary_idx] = 0.0
-                        if t_idx is not None and t_idx < num_bodies:
-                            lod_levels[t_idx] = 0.0
-                        for i in range(num_bodies):
-                            if parent_snap[i] == primary_idx:
-                                lod_levels[i] = 0.0
-                                
-                    parent_snap_render = parent_snap.copy()
-                    if ephemeris_mode_active:
-                        parent_snap_render[~spice_valid_mask] = -1
-                        for bi in range(num_bodies):
-                            if bodies_data[bi].get("is_spacecraft", False) or bodies_data[bi].get("type") == "Spacecraft":
-                                parent_snap_render[bi] = -1
-
-                    if getattr(self, "is_generic_ephemeris", False):
-                        n_orbits = 0
+                for _k in range(len(star_indices_numba)):
+                    _idx = star_indices_numba[_k]
+                    if _idx < num_bodies:
+                        _bd = bodies_data[_idx]
                     else:
-                        n_orbits = compute_all_orbits_batch(
-                            pos_snap_render, vel_snap_render, mass_snap, parent_snap_render,
-                            subsys_pos_buf, subsys_vel_buf, subsys_mass_buf,
-                            visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels,
-                            np.zeros(3, dtype='f8'))
-                        last_orbit_pos_snap = pos_snap_render.copy()
+                        _bd = self.bodies_data_cmp[_idx - num_bodies]
+                    if "star_props" in _bd and "lum" in _bd["star_props"]:
+                        star_lums[_k] = float(_bd["star_props"]["lum"])
+                    elif "lum_eq" in _bd:
+                        star_lums[_k] = float(_bd["lum_eq"])
+                    else:
+                        star_lums[_k] = all_instances[_idx, 19]
 
-                    ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
-                    fade_mode = int(self.camera.get("ephem_orbit_mode", 0))
-                    trail_sec = float(self.camera.get("ephem_trail_days", 30.0)) * 86400.0
-                    lead_sec = float(self.camera.get("ephem_lead_days", 10.0)) * 86400.0
-                    need_reload_ephem = (
-                        not getattr(self, "_ephem_trajectories_loaded", False) or
-                        getattr(self, "_ephem_trajectories_pts_count", 0) != ephem_pts_count
+                hdr_enabled = self.camera.get("hdr_enabled", True)
+                planetshine_enabled = self.camera.get("planetshine_enabled", True)
+                ringshine_enabled = self.camera.get("ringshine_enabled", True)
+
+                # Distant-body radial samples preserve each original material lobe
+                # and only change when the profile atlas is rebuilt.
+                ps_material_key = (ring_gradient_tex.profile_revision, total_render_bodies)
+                if getattr(self, '_ps_ring_material_key', None) != ps_material_key:
+                    self._ps_ring_materials = build_secondary_ring_properties(
+                        ring_precomputed, ring_gradient_tex, self.body_ring_indices,
+                        total_render_bodies)
+                    self._ps_ring_material_key = ps_material_key
+                ps_ring_params, ps_ring_normals, ps_ring_colors, ps_ring_scattering = self._ps_ring_materials
+
+                if getattr(self, '_ps_is_moon_key', None) != (total_render_bodies, len(bodies_data)):
+                    self._ps_is_moon = np.array(
+                        [b.get('type') == 'Moon' or b.get('is_moon', False) for b in material_bodies],
+                        dtype=np.bool_
                     )
-                    if sys_mgr_spice.kernels_loaded and need_reload_ephem:
-                        if hasattr(self, "_ephem_spacecraft_trajectories"):
-                            for t in self._ephem_spacecraft_trajectories:
-                                try:
-                                    t["vbo"].release()
-                                    t["vao"].release()
-                                except Exception:
-                                    pass
-                        self._ephem_spacecraft_trajectories = []
-                        mapping = getattr(self, "_ephem_mapping", [])
-                        
-                        init_et = 0.0
+                    self._ps_is_moon_key = (total_render_bodies, len(bodies_data))
+                is_moon_arr = self._ps_is_moon
+
+                planetshine_dirs, planetshine_colors = compute_planetshine_numba(
+                    all_instances[:total_render_bodies, 0:3],
+                    all_instances[:total_render_bodies, 6],
+                    ps_surface_colors,
+                    all_instances[:total_render_bodies, 8],
+                    star_positions,
+                    star_colors,
+                    star_lums,
+                    star_radii, # Pass radii to Numba
+                    hdr_enabled,
+                    ps_ring_params,
+                    ps_ring_normals,
+                    ps_ring_colors,
+                    planetshine_enabled,
+                    ringshine_enabled,
+                    ps_ring_scattering,
+                    surface_materials,
+                    surface_phases,
+                    is_moon_arr
+                )
+                all_instances[:total_render_bodies, 16:19] = planetshine_dirs
+                all_instances[:total_render_bodies, 20:23] = planetshine_colors
+
+                all_instances_buffer.write(all_instances[:total_render_bodies].tobytes())
+
+                cmds_data = np.array([
+                    len(quad_idx), 0, 0, 0, 0,
+                    len(mesh_lo_idx), 0, 0, 0, 0,
+                    len(mesh_hi_idx), 0, 0, 0, 0,
+                    len(mesh_ultra_idx), 0, 0, 0, 0,
+                ], dtype=np.uint32)
+                draw_cmds_buffer.write(cmds_data.tobytes())
+
+                focused_mask_buffer.write(focused_mask[:total_render_bodies].view(np.uint8).astype(np.uint32).tobytes())
+
+                prog_culling_compute['u_num_bodies'].value = total_render_bodies
+                prog_culling_compute['u_star_idx'].value = star_idx
+                ring_star_indices = np.zeros(16, dtype=np.int32)
+                ring_star_count = min(len(star_indices_numba), 16)
+                ring_star_indices[:ring_star_count] = star_indices_numba[:ring_star_count]
+                prog_culling_compute['u_num_ring_stars'].value = ring_star_count
+                prog_culling_compute['u_ring_star_indices'].write(ring_star_indices.tobytes())
+                prog_culling_compute['u_n_casters'].value = n_casters_fixed
+
+                c_idx_arr = np.zeros(64, dtype=np.int32)
+                if n_casters_fixed > 0:
+                    c_idx_arr[:n_casters_fixed] = caster_indices[:n_casters_fixed]
+                prog_culling_compute['u_caster_indices'].write(c_idx_arr.tobytes())
+                self.caster_idx_map = {int(caster_indices[i_c]): i_c for i_c in range(n_casters_fixed)} if n_casters_fixed > 0 else {}
+
+                prog_culling_compute['u_frustum_planes'].write(frustum_planes.astype(np.float32).tobytes())
+
+                prog_culling_compute['u_n_rings'].value = n_ring_planes
+                if n_ring_planes > 0:
+                    prog_culling_compute['u_ring_centers'].write(ring_centers_buf.astype(np.float32).tobytes())
+                    prog_culling_compute['u_ring_normals'].write(ring_normals_buf.astype(np.float32).tobytes())
+                    r_out_arr = np.zeros(16, dtype=np.float32)
+                    r_out_arr[:n_ring_planes] = ring_params_buf[:n_ring_planes, 1]
+                    prog_culling_compute['u_ring_outer_radii'].write(r_out_arr.tobytes())
+
+                tracking_idx_uni = -1
+                if self.camera["tracking_idx"] is not None:
+                    if self.camera.get("tracking_is_cmp", False):
+                        tracking_idx_uni = num_bodies + self.camera["tracking_idx"]
+                    else:
+                        tracking_idx_uni = self.camera["tracking_idx"]
+                prog_culling_compute['u_tracking_idx'].value = tracking_idx_uni
+
+                # Identify active bodies for terrain Quadtree LOD
+                active_terrain_bodies = []
+                terrain_enabled = bool(self.camera.get("terrain_lod_enabled", False))
+
+                if terrain_enabled and getattr(self, 'terrain_streamer', None) is not None:
+                    fov_fac = float(1.0 / math.tan(math.radians(max(0.001, self.camera["fov"]) / 2.0)))
+                    max_terrain_bodies = 4
+
+                    # Apparent-size test first (cheap numpy), tiles-dir existence
+                    # cached once per body — os.path.isdir() per body per frame is a
+                    # syscall storm on the render thread.
+                    tiles_base = self.terrain_streamer.tiles_base_dir
+                    tiles_dir_cache = getattr(self, "_terrain_tiles_dir_cache", None)
+                    if tiles_dir_cache is None:
+                        tiles_dir_cache = self._terrain_tiles_dir_cache = {}
+
+                    prev_active_terrain_indices = getattr(self, "_prev_active_terrain_indices", set())
+                    cam_world_pos_f8 = cam_origin + rel
+                    candidates = []
+
+                    for b_i in range(total_render_bodies):
+                        b_r = all_instances[b_i, 6]
+                        if b_i < num_bodies:
+                            b_pos_world = pos_snap_render[b_i]
+                            b_name = bodies_data[b_i]["name"].lower()
+                        else:
+                            b_pos_world = self.pos_snap_cmp[b_i - num_bodies] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                            b_name = self.bodies_data_cmp[b_i - num_bodies]["name"].lower()
+
+                        d_cam = float(np.linalg.norm(b_pos_world - cam_world_pos_f8))
+                        apparent_px = (b_r / max(1e-6, d_cam)) * float(self.fb_height) * fov_fac
+
+                        # Hysteresis: keep terrain LOD active until the body shrinks below
+                        # the GPU's lo-mesh threshold (apparent_px < 2.0 in culling.comp),
+                        # so the terrain pass renders the surface all the way down to the
+                        # point-light transition — the icosphere proxy never shows.
+                        # Minimal 1px hysteresis prevents quadtree-traversal thrashing
+                        # at the subpixel boundary without showing the icosphere.
+                        min_px_thresh = 2.0 if b_i in prev_active_terrain_indices else 3.0
+                        if apparent_px < min_px_thresh:
+                            continue
+
+                        has_tiles = tiles_dir_cache.get(b_i)
+                        if has_tiles is None:
+                            has_tiles = os.path.isdir(os.path.join(tiles_base, b_name))
+                            tiles_dir_cache[b_i] = has_tiles
+                        if not has_tiles:
+                            continue
+
+                        b_pos = all_instances[b_i, 0:3]
+                        r_cull = b_r * (1.5 if d_cam > b_r else 5.0)
+                        if is_sphere_in_frustum(b_pos, r_cull, frustum_planes):
+                            candidates.append((b_i, b_name, apparent_px))
+
+                    # Purely determined by object size on screen (descending apparent_px):
+                    candidates.sort(key=lambda c: c[2], reverse=True)
+                    active_terrain_bodies = [(c[0], c[1]) for c in candidates[:max_terrain_bodies]]
+                    self._prev_active_terrain_indices = {tb[0] for tb in active_terrain_bodies}
+
+                    # Preload low/intermediate LOD 2 tiles for the largest dominant visible terrain body on screen
+                    if active_terrain_bodies:
+                        dominant_b_i, dominant_b_name = active_terrain_bodies[0]
+                        dominant_px = candidates[0][2]
+                        if dominant_px >= 300.0 and getattr(self, '_last_preloaded_lod2_body', None) != dominant_b_i:
+                            self._last_preloaded_lod2_body = dominant_b_i
+                            self.terrain_streamer.preload_body_lod(dominant_b_name, map_types=("diffuse", "clouds"), target_lod=2)
+
+                active_terrain_body_idx = -1
+                active_terrain_body_name = None
+                active_terrain_body_indices = []
+
+                if active_terrain_bodies:
+                    active_terrain_body_idx = active_terrain_bodies[0][0]
+                    active_terrain_body_name = active_terrain_bodies[0][1]
+                    active_terrain_body_indices = [tb[0] for tb in active_terrain_bodies]
+                    self._cull_terrain_suppression_on = True
+
+                    if 'u_terrain_body_idx' in prog_culling_compute:
+                        prog_culling_compute['u_terrain_body_idx'].value = active_terrain_body_idx
+                    if 'u_num_terrain_bodies' in prog_culling_compute:
+                        prog_culling_compute['u_num_terrain_bodies'].value = len(active_terrain_body_indices)
+                    if 'u_terrain_body_indices' in prog_culling_compute:
+                        indices_padded = active_terrain_body_indices[:16] + [0] * max(0, 16 - len(active_terrain_body_indices))
+                        prog_culling_compute['u_terrain_body_indices'].value = tuple(indices_padded)
+                else:
+                    # Keep the culling compute shader's terrain suppression off when
+                    # no terrain body is active — but only write the uniforms when
+                    # the enabled-state changed, instead of per frame.
+                    if self._cull_terrain_suppression_on:
+                        self._cull_terrain_suppression_on = False
+                        if 'u_terrain_body_idx' in prog_culling_compute:
+                            prog_culling_compute['u_terrain_body_idx'].value = -1
+                        if 'u_num_terrain_bodies' in prog_culling_compute:
+                            prog_culling_compute['u_num_terrain_bodies'].value = 0
+                        if 'u_terrain_body_indices' in prog_culling_compute:
+                            prog_culling_compute['u_terrain_body_indices'].value = tuple([0] * 16)
+
+                if 'u_camera_pos' in prog_culling_compute:
+                    prog_culling_compute['u_camera_pos'].value = tuple(cam_pos)
+                if 'u_screen_height' in prog_culling_compute:
+                    prog_culling_compute['u_screen_height'].value = float(self.fb_height)
+                if 'u_fov_factor' in prog_culling_compute:
+                    prog_culling_compute['u_fov_factor'].value = float(1.0 / math.tan(math.radians(self.camera["fov"] / 2.0)))
+                if 'u_lod_thresh_ultra' in prog_culling_compute:
+                    prog_culling_compute['u_lod_thresh_ultra'].value = 300.0
+                if 'u_lod_thresh_hi' in prog_culling_compute:
+                    prog_culling_compute['u_lod_thresh_hi'].value = 40.0
+                if 'u_exposure' in prog_culling_compute:
+                    prog_culling_compute['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+
+                all_instances_buffer.bind_to_storage_buffer(binding=2)
+                vis_point_buffer.bind_to_storage_buffer(binding=3)
+                vis_lo_buffer.bind_to_storage_buffer(binding=4)
+                vis_hi_buffer.bind_to_storage_buffer(binding=5)
+                vis_ultra_buffer.bind_to_storage_buffer(binding=6)
+                draw_cmds_buffer.bind_to_storage_buffer(binding=7)
+                focused_mask_buffer.bind_to_storage_buffer(binding=8)
+
+                _gq = _perf_gpu_begin(ctx, "gpu_culling")
+                prog_culling_compute.run((total_render_bodies + 255) // 256, 1, 1)
+                ctx.memory_barrier()
+                _perf_gpu_end(_gq)
+
+                if not show_orbits:
+                    n_orbits = 0
+                    n_orbits_hi = 0
+                    n_orbits_med = 0
+                    n_orbits_low = 0
+                    self.n_orbits_cmp = 0
+                    self.n_orbits_hi_cmp = 0
+                    self.n_orbits_med_cmp = 0
+                    self.n_orbits_low_cmp = 0
+                    last_orbit_pos_snap = None
+                    last_orbit_pos_snap_cmp = None
+                else:
+                    recompute_orbits = True
+                    if last_orbit_pos_snap is not None and self.time_ctrl.get("paused"):
+                        if np.array_equal(pos_snap_render, last_orbit_pos_snap):
+                            recompute_orbits = False
+
+                    if recompute_orbits:
+                        lod_levels = np.full(num_bodies, 2.0, dtype=np.float64)
+                        for i in range(num_bodies):
+                            if parent_snap[i] == star_idx:
+                                lod_levels[i] = 1.0
+
+                        t_idx = self.camera.get("tracking_idx")
+                        primary_idx = None
+                        if not self.camera.get("tracking_is_cmp", False) and t_idx is not None and t_idx != star_idx and t_idx < num_bodies:
+                            primary_idx = t_idx
+                            if parent_snap[t_idx] >= 0 and parent_snap[parent_snap[t_idx]] == star_idx:
+                                primary_idx = parent_snap[t_idx]
+                        elif num_bodies > 0:
+                            dists_to_cam = np.linalg.norm(pos_snap_render - cam_origin, axis=1)
+                            nearest_idx = int(np.argmin(dists_to_cam))
+                            if dists_to_cam[nearest_idx] < 0.2:
+                                primary_idx = nearest_idx
+                                if parent_snap[nearest_idx] >= 0 and parent_snap[parent_snap[nearest_idx]] == star_idx:
+                                    primary_idx = parent_snap[nearest_idx]
+
+                        if primary_idx is not None:
+                            lod_levels[primary_idx] = 0.0
+                            if t_idx is not None and t_idx < num_bodies:
+                                lod_levels[t_idx] = 0.0
+                            for i in range(num_bodies):
+                                if parent_snap[i] == primary_idx:
+                                    lod_levels[i] = 0.0
+
+                        parent_snap_render = parent_snap.copy()
                         if ephemeris_mode_active:
-                            et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
-                            if et_epoch is None:
-                                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-                                et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
-                            init_et = et_epoch + display_t * 365.25 * 86400.0
+                            parent_snap_render[~spice_valid_mask] = -1
+                            for bi in range(num_bodies):
+                                if bodies_data[bi].get("is_spacecraft", False) or bodies_data[bi].get("type") == "Spacecraft":
+                                    parent_snap_render[bi] = -1
 
-                        for bi, b in enumerate(bodies_data):
-                            if b.get("is_spacecraft", False) or b.get("type") == "Spacecraft":
-                                sp_id = b.get("spice_id")
-                                if sp_id is None and bi < len(mapping):
-                                    sp_id = mapping[bi]
-                                if sp_id is None:
-                                    continue
-                                
-                                p_idx = None
-                                p_spice_id = 0
-                                p_name = b.get("parentId")
-                                if p_name:
-                                    for pbi, pb in enumerate(bodies_data):
-                                        if pb.get("name") == p_name:
-                                            p_idx = pbi
-                                            p_spice_id = pb.get("spice_id", 0)
-                                            break
-                                
-                                buf_trail = trail_sec * 2.0
-                                buf_lead = lead_sec * 2.0
-                                samp_start = (init_et - buf_trail) if fade_mode == 0 else None
-                                samp_end = (init_et + buf_lead) if fade_mode == 0 else None
-                                res = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=ephem_pts_count, return_times=True, et_start=samp_start, et_end=samp_end)
-                                if res is None and fade_mode == 0:
-                                    res = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=ephem_pts_count, return_times=True)
-                                if res is not None:
-                                    pts, times, et_cov = res
-                                    if len(pts) >= 2:
-                                        pts_4d = np.column_stack((pts, times)).astype(np.float32)
-                                        vbo = ctx.buffer(pts_4d.tobytes())
-                                        vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f 1f', 'in_pos', 'in_time')])
-                                        col = b.get("color", "#00ffff")
-                                        if isinstance(col, str):
-                                            col_rgb = hex_to_rgb(col)
-                                        else:
-                                            col_rgb = tuple(col[:3])
-                                        self._ephem_spacecraft_trajectories.append({
-                                            "name": b.get("name", "Spacecraft"),
-                                            "vbo": vbo,
-                                            "vao": vao,
-                                            "count": len(pts),
-                                            "color": col_rgb,
-                                            "parent_idx": p_idx,
-                                            "spice_id": sp_id,
-                                            "observer_id": p_spice_id,
-                                            "et_start": float(et_cov[0]),
-                                            "et_end": float(et_cov[1]),
-                                            "last_sample_center": init_et,
-                                            "last_fade_mode": fade_mode,
-                                            "last_pts_count": ephem_pts_count,
-                                            "last_trail_sec": trail_sec,
-                                            "last_lead_sec": lead_sec,
-                                            "last_resample_wall_time": time.time(),
-                                            "future": None
-                                        })
-                        self._ephem_trajectories_loaded = True
-                        self._ephem_trajectories_pts_count = ephem_pts_count
-                    
-                    if n_orbits > 0:
-                        valid_orbits = orbit_data_buf[:n_orbits]
-                        lod_col = valid_orbits[:, 19]
-                        
-                        mask_hi = lod_col == 0.0
-                        mask_med = lod_col == 1.0
-                        mask_low = lod_col == 2.0
-                        
-                        orbits_hi = valid_orbits[mask_hi]
-                        orbits_med = valid_orbits[mask_med]
-                        orbits_low = valid_orbits[mask_low]
-                        
-                        n_orbits_hi = len(orbits_hi)
-                        n_orbits_med = len(orbits_med)
-                        n_orbits_low = len(orbits_low)
-                        
-                if self.comparison_enabled:
-                    recompute_orbits_cmp = True
-                    if last_orbit_pos_snap_cmp is not None and self.time_ctrl_cmp.get("paused"):
-                        if np.array_equal(self.pos_snap_cmp, last_orbit_pos_snap_cmp):
-                            if last_comparison_offset_au is not None and self.comparison_offset_au == last_comparison_offset_au:
-                                recompute_orbits_cmp = False
-                                
-                    if recompute_orbits_cmp:
-                        lod_levels_cmp = np.full(self.num_bodies_cmp, 2.0, dtype=np.float64)
-                        for i in range(self.num_bodies_cmp):
-                            if self.parent_snap_cmp[i] == self.star_idx_cmp:
-                                lod_levels_cmp[i] = 1.0
-                                
-                        t_idx_cmp = self.camera.get("tracking_idx")
-                        primary_idx_cmp = None
-                        if self.camera.get("tracking_is_cmp", False) and t_idx_cmp is not None and t_idx_cmp != self.star_idx_cmp and t_idx_cmp < self.num_bodies_cmp:
-                            primary_idx_cmp = t_idx_cmp
-                            if self.parent_snap_cmp[t_idx_cmp] >= 0 and self.parent_snap_cmp[self.parent_snap_cmp[t_idx_cmp]] == self.star_idx_cmp:
-                                primary_idx_cmp = self.parent_snap_cmp[t_idx_cmp]
-                        elif self.num_bodies_cmp > 0:
-                            cam_origin_cmp_pre = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                            dists_to_cam_cmp = np.linalg.norm(self.pos_snap_cmp - cam_origin_cmp_pre, axis=1)
-                            nearest_idx_cmp = int(np.argmin(dists_to_cam_cmp))
-                            if dists_to_cam_cmp[nearest_idx_cmp] < 0.2:
-                                primary_idx_cmp = nearest_idx_cmp
-                                if self.parent_snap_cmp[nearest_idx_cmp] >= 0 and self.parent_snap_cmp[self.parent_snap_cmp[nearest_idx_cmp]] == self.star_idx_cmp:
-                                    primary_idx_cmp = self.parent_snap_cmp[nearest_idx_cmp]
+                        if getattr(self, "is_generic_ephemeris", False):
+                            n_orbits = 0
+                        else:
+                            n_orbits = compute_all_orbits_batch(
+                                pos_snap_render, vel_snap_render, mass_snap, parent_snap_render,
+                                subsys_pos_buf, subsys_vel_buf, subsys_mass_buf,
+                                visual_colors_f8, cam_origin, G, max_orbits, orbit_data_buf, lod_levels,
+                                np.zeros(3, dtype='f8'))
+                            last_orbit_pos_snap = pos_snap_render.copy()
 
-                        if primary_idx_cmp is not None:
-                            lod_levels_cmp[primary_idx_cmp] = 0.0
-                            if t_idx_cmp is not None and t_idx_cmp < self.num_bodies_cmp:
-                                lod_levels_cmp[t_idx_cmp] = 0.0
+                        ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
+                        fade_mode = int(self.camera.get("ephem_orbit_mode", 0))
+                        trail_sec = float(self.camera.get("ephem_trail_days", 30.0)) * 86400.0
+                        lead_sec = float(self.camera.get("ephem_lead_days", 10.0)) * 86400.0
+                        need_reload_ephem = (
+                            not getattr(self, "_ephem_trajectories_loaded", False) or
+                            getattr(self, "_ephem_trajectories_pts_count", 0) != ephem_pts_count
+                        )
+                        if sys_mgr_spice.kernels_loaded and need_reload_ephem:
+                            if hasattr(self, "_ephem_spacecraft_trajectories"):
+                                for t in self._ephem_spacecraft_trajectories:
+                                    try:
+                                        t["vbo"].release()
+                                        t["vao"].release()
+                                    except Exception:
+                                        pass
+                            self._ephem_spacecraft_trajectories = []
+                            mapping = getattr(self, "_ephem_mapping", [])
+
+                            init_et = 0.0
+                            if ephemeris_mode_active:
+                                et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
+                                if et_epoch is None:
+                                    epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                                    et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                                init_et = et_epoch + display_t * 365.25 * 86400.0
+
+                            for bi, b in enumerate(bodies_data):
+                                if b.get("is_spacecraft", False) or b.get("type") == "Spacecraft":
+                                    sp_id = b.get("spice_id")
+                                    if sp_id is None and bi < len(mapping):
+                                        sp_id = mapping[bi]
+                                    if sp_id is None:
+                                        continue
+
+                                    p_idx = None
+                                    p_spice_id = 0
+                                    p_name = b.get("parentId")
+                                    if p_name:
+                                        for pbi, pb in enumerate(bodies_data):
+                                            if pb.get("name") == p_name:
+                                                p_idx = pbi
+                                                p_spice_id = pb.get("spice_id", 0)
+                                                break
+
+                                    buf_trail = trail_sec * 2.0
+                                    buf_lead = lead_sec * 2.0
+                                    samp_start = (init_et - buf_trail) if fade_mode == 0 else None
+                                    samp_end = (init_et + buf_lead) if fade_mode == 0 else None
+                                    res = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=ephem_pts_count, return_times=True, et_start=samp_start, et_end=samp_end)
+                                    if res is None and fade_mode == 0:
+                                        res = sys_mgr_spice.get_trajectory_polyline(sp_id, observer_id=p_spice_id, num_samples=ephem_pts_count, return_times=True)
+                                    if res is not None:
+                                        pts, times, et_cov = res
+                                        if len(pts) >= 2:
+                                            pts_4d = np.column_stack((pts, times)).astype(np.float32)
+                                            vbo = ctx.buffer(pts_4d.tobytes())
+                                            vao = ctx.vertex_array(prog_ephem_orbits, [(vbo, '3f 1f', 'in_pos', 'in_time')])
+                                            col = b.get("color", "#00ffff")
+                                            if isinstance(col, str):
+                                                col_rgb = hex_to_rgb(col)
+                                            else:
+                                                col_rgb = tuple(col[:3])
+                                            self._ephem_spacecraft_trajectories.append({
+                                                "name": b.get("name", "Spacecraft"),
+                                                "vbo": vbo,
+                                                "vao": vao,
+                                                "count": len(pts),
+                                                "color": col_rgb,
+                                                "parent_idx": p_idx,
+                                                "spice_id": sp_id,
+                                                "observer_id": p_spice_id,
+                                                "et_start": float(et_cov[0]),
+                                                "et_end": float(et_cov[1]),
+                                                "last_sample_center": init_et,
+                                                "last_fade_mode": fade_mode,
+                                                "last_pts_count": ephem_pts_count,
+                                                "last_trail_sec": trail_sec,
+                                                "last_lead_sec": lead_sec,
+                                                "last_resample_wall_time": time.time(),
+                                                "future": None
+                                            })
+                            self._ephem_trajectories_loaded = True
+                            self._ephem_trajectories_pts_count = ephem_pts_count
+
+                        if n_orbits > 0:
+                            valid_orbits = orbit_data_buf[:n_orbits]
+                            lod_col = valid_orbits[:, 19]
+
+                            mask_hi = lod_col == 0.0
+                            mask_med = lod_col == 1.0
+                            mask_low = lod_col == 2.0
+
+                            orbits_hi = valid_orbits[mask_hi]
+                            orbits_med = valid_orbits[mask_med]
+                            orbits_low = valid_orbits[mask_low]
+
+                            n_orbits_hi = len(orbits_hi)
+                            n_orbits_med = len(orbits_med)
+                            n_orbits_low = len(orbits_low)
+
+                    if self.comparison_enabled:
+                        recompute_orbits_cmp = True
+                        if last_orbit_pos_snap_cmp is not None and self.time_ctrl_cmp.get("paused"):
+                            if np.array_equal(self.pos_snap_cmp, last_orbit_pos_snap_cmp):
+                                if last_comparison_offset_au is not None and self.comparison_offset_au == last_comparison_offset_au:
+                                    recompute_orbits_cmp = False
+
+                        if recompute_orbits_cmp:
+                            lod_levels_cmp = np.full(self.num_bodies_cmp, 2.0, dtype=np.float64)
                             for i in range(self.num_bodies_cmp):
-                                if self.parent_snap_cmp[i] == primary_idx_cmp:
-                                    lod_levels_cmp[i] = 0.0
-                        
-                        cam_origin_cmp = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                        offset_vec = np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
-                        self.n_orbits_cmp = compute_all_orbits_batch(
-                            self.pos_snap_cmp, self.vel_snap_cmp, self.mass_snap_cmp, self.parent_snap_cmp,
-                            self.subsys_pos_buf_cmp, self.subsys_vel_buf_cmp, self.subsys_mass_buf_cmp,
-                            self.visual_colors_f8_cmp, cam_origin_cmp, G, max_orbits, self.orbit_data_buf_cmp, lod_levels_cmp,
-                            offset_vec)
-                        last_orbit_pos_snap_cmp = self.pos_snap_cmp.copy()
-                        last_comparison_offset_au = self.comparison_offset_au
-                        
-                        if self.n_orbits_cmp > 0:
-                            valid_orbits_cmp = self.orbit_data_buf_cmp[:self.n_orbits_cmp]
-                            lod_col_cmp = valid_orbits_cmp[:, 19]
-                            
-                            mask_hi_cmp = lod_col_cmp == 0.0
-                            mask_med_cmp = lod_col_cmp == 1.0
-                            mask_low_cmp = lod_col_cmp == 2.0
-                            
-                            orbits_hi_cmp = valid_orbits_cmp[mask_hi_cmp]
-                            orbits_med_cmp = valid_orbits_cmp[mask_med_cmp]
-                            orbits_low_cmp = valid_orbits_cmp[mask_low_cmp]
-                            
-                            self.n_orbits_hi_cmp = len(orbits_hi_cmp)
-                            self.n_orbits_med_cmp = len(orbits_med_cmp)
-                            self.n_orbits_low_cmp = len(orbits_low_cmp)
-                
-            # Gather all active stars in the unified scene (both primary and comparison)
-            stars_pos_radius = []
-            stars_colors = []
-            stars_poles_obl = []
-            stars_pole_colors = []
-            
-            for i in range(total_render_bodies):
-                if all_instances[i, 8] > 0.5:
-                    pos = all_instances[i, 0:3]
-                    radius = all_instances[i, 6]
-                    color = all_instances[i, 3:6]
-                    
-                    lum = 1.0
-                    if i < num_bodies:
-                        b_data = bodies_data[i]
-                    else:
-                        b_data = self.bodies_data_cmp[i - num_bodies]
-                        
-                    if "star_props" in b_data and "lum" in b_data["star_props"]:
-                        lum = float(b_data["star_props"]["lum"])
-                        
-                    lum_eq = all_instances[i, 19]
-                    lum_pole = all_instances[i, 23]
-                    
-                    if lum_eq == 0.0:
-                        lum_eq = lum
-                    if lum_pole == 0.0:
-                        lum_pole = lum
-                        
-                    stars_pos_radius.append([pos[0], pos[1], pos[2], radius])
-                    stars_colors.append([color[0], color[1], color[2], lum_eq])
-                    
-                    pole = all_instances[i, 9:12]
-                    obl = all_instances[i, 12]
-                    pole_color = all_instances[i, 13:16]
-                    if pole_color[0] == 0.0 and pole_color[1] == 0.0 and pole_color[2] == 0.0:
-                        pole_color = color # fallback
-                        
-                    # Calculate star R_minor relative to target_pos
-                    track_idx = self.camera.get("tracking_idx")
-                    if track_idx is not None and track_idx < total_render_bodies:
-                        target_pos = all_instances[track_idx, 0:3]
-                    else:
-                        target_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-                    
-                    to_target = pos - target_pos
-                    dist = np.linalg.norm(to_target)
-                    if dist > 1e-6:
-                        L = to_target / dist
+                                if self.parent_snap_cmp[i] == self.star_idx_cmp:
+                                    lod_levels_cmp[i] = 1.0
+
+                            t_idx_cmp = self.camera.get("tracking_idx")
+                            primary_idx_cmp = None
+                            if self.camera.get("tracking_is_cmp", False) and t_idx_cmp is not None and t_idx_cmp != self.star_idx_cmp and t_idx_cmp < self.num_bodies_cmp:
+                                primary_idx_cmp = t_idx_cmp
+                                if self.parent_snap_cmp[t_idx_cmp] >= 0 and self.parent_snap_cmp[self.parent_snap_cmp[t_idx_cmp]] == self.star_idx_cmp:
+                                    primary_idx_cmp = self.parent_snap_cmp[t_idx_cmp]
+                            elif self.num_bodies_cmp > 0:
+                                cam_origin_cmp_pre = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                                dists_to_cam_cmp = np.linalg.norm(self.pos_snap_cmp - cam_origin_cmp_pre, axis=1)
+                                nearest_idx_cmp = int(np.argmin(dists_to_cam_cmp))
+                                if dists_to_cam_cmp[nearest_idx_cmp] < 0.2:
+                                    primary_idx_cmp = nearest_idx_cmp
+                                    if self.parent_snap_cmp[nearest_idx_cmp] >= 0 and self.parent_snap_cmp[self.parent_snap_cmp[nearest_idx_cmp]] == self.star_idx_cmp:
+                                        primary_idx_cmp = self.parent_snap_cmp[nearest_idx_cmp]
+
+                            if primary_idx_cmp is not None:
+                                lod_levels_cmp[primary_idx_cmp] = 0.0
+                                if t_idx_cmp is not None and t_idx_cmp < self.num_bodies_cmp:
+                                    lod_levels_cmp[t_idx_cmp] = 0.0
+                                for i in range(self.num_bodies_cmp):
+                                    if self.parent_snap_cmp[i] == primary_idx_cmp:
+                                        lod_levels_cmp[i] = 0.0
+
+                            cam_origin_cmp = cam_origin - np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                            offset_vec = np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                            self.n_orbits_cmp = compute_all_orbits_batch(
+                                self.pos_snap_cmp, self.vel_snap_cmp, self.mass_snap_cmp, self.parent_snap_cmp,
+                                self.subsys_pos_buf_cmp, self.subsys_vel_buf_cmp, self.subsys_mass_buf_cmp,
+                                self.visual_colors_f8_cmp, cam_origin_cmp, G, max_orbits, self.orbit_data_buf_cmp, lod_levels_cmp,
+                                offset_vec)
+                            last_orbit_pos_snap_cmp = self.pos_snap_cmp.copy()
+                            last_comparison_offset_au = self.comparison_offset_au
+
+                            if self.n_orbits_cmp > 0:
+                                valid_orbits_cmp = self.orbit_data_buf_cmp[:self.n_orbits_cmp]
+                                lod_col_cmp = valid_orbits_cmp[:, 19]
+
+                                mask_hi_cmp = lod_col_cmp == 0.0
+                                mask_med_cmp = lod_col_cmp == 1.0
+                                mask_low_cmp = lod_col_cmp == 2.0
+
+                                orbits_hi_cmp = valid_orbits_cmp[mask_hi_cmp]
+                                orbits_med_cmp = valid_orbits_cmp[mask_med_cmp]
+                                orbits_low_cmp = valid_orbits_cmp[mask_low_cmp]
+
+                                self.n_orbits_hi_cmp = len(orbits_hi_cmp)
+                                self.n_orbits_med_cmp = len(orbits_med_cmp)
+                                self.n_orbits_low_cmp = len(orbits_low_cmp)
+
+                # Gather all active stars in the unified scene (both primary and comparison)
+                stars_pos_radius = []
+                stars_colors = []
+                stars_poles_obl = []
+                stars_pole_colors = []
+
+                for i in range(total_render_bodies):
+                    if all_instances[i, 8] > 0.5:
+                        pos = all_instances[i, 0:3]
+                        radius = all_instances[i, 6]
+                        color = all_instances[i, 3:6]
+
+                        lum = 1.0
+                        if i < num_bodies:
+                            b_data = bodies_data[i]
+                        else:
+                            b_data = self.bodies_data_cmp[i - num_bodies]
+
+                        if "star_props" in b_data and "lum" in b_data["star_props"]:
+                            lum = float(b_data["star_props"]["lum"])
+
+                        lum_eq = all_instances[i, 19]
+                        lum_pole = all_instances[i, 23]
+
+                        if lum_eq == 0.0:
+                            lum_eq = lum
+                        if lum_pole == 0.0:
+                            lum_pole = lum
+
+                        stars_pos_radius.append([pos[0], pos[1], pos[2], radius])
+                        stars_colors.append([color[0], color[1], color[2], lum_eq])
+
+                        pole = all_instances[i, 9:12]
+                        obl = all_instances[i, 12]
+                        pole_color = all_instances[i, 13:16]
+                        if pole_color[0] == 0.0 and pole_color[1] == 0.0 and pole_color[2] == 0.0:
+                            pole_color = color # fallback
+
+                        # Calculate star R_minor relative to target_pos
+                        track_idx = self.camera.get("tracking_idx")
+                        if track_idx is not None and track_idx < total_render_bodies:
+                            target_pos = all_instances[track_idx, 0:3]
+                        else:
+                            target_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+                        to_target = pos - target_pos
+                        dist = np.linalg.norm(to_target)
+                        if dist > 1e-6:
+                            L = to_target / dist
+                        else:
+                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                        p_dot_L = np.dot(pole, L)
+                        p_proj_sq = 1.0 - p_dot_L**2
+                        f_factor = 1.0 - obl
+                        r_minor = radius * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+
+                        stars_poles_obl.append([pole[0], pole[1], pole[2], r_minor])
+                        stars_pole_colors.append([pole_color[0], pole_color[1], pole_color[2], lum_pole])
+
+                num_stars = len(stars_pos_radius)
+                num_stars = min(num_stars, 16)
+                stars_pos_radius = stars_pos_radius[:num_stars]
+                stars_colors = stars_colors[:num_stars]
+                stars_poles_obl = stars_poles_obl[:num_stars]
+                stars_pole_colors = stars_pole_colors[:num_stars]
+
+                if num_stars == 0:
+                    num_stars = 1
+                    stars_pos_radius = [[0.0, 0.0, 0.0, SOLAR_RADII_TO_AU]]
+                    stars_colors = [[1.0, 1.0, 1.0, 1.0]]
+                    stars_poles_obl = [[0.0, 1.0, 0.0, 0.0]]
+                    stars_pole_colors = [[1.0, 1.0, 1.0, 1.0]]
+
+                caster_data_buf[:n_casters_fixed, 0:3] = pos_rel_all[caster_indices[:n_casters_fixed]]
+                caster_data_buf[:n_casters_fixed, 3] = body_radii[caster_indices[:n_casters_fixed]]
+                if n_casters_fixed < 64:
+                    caster_data_buf[n_casters_fixed:] = 0
+
+                for i_c in range(n_casters_fixed):
+                    b_idx = caster_indices[i_c]
+                    pos_c = pos_rel_all[b_idx]
+                    r_eq = body_radii[b_idx]
+                    pole = all_instances[b_idx, 9:12]
+                    f = all_instances[b_idx, 12]
+
+                    pos_star = pos_rel_all[star_idx]
+                    to_star = pos_star - pos_c
+                    dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                    if dist_s > 1e-6:
+                        L = to_star / dist_s
                     else:
                         L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                    
+
                     p_dot_L = np.dot(pole, L)
                     p_proj_sq = 1.0 - p_dot_L**2
-                    f_factor = 1.0 - obl
-                    r_minor = radius * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
-                    
-                    stars_poles_obl.append([pole[0], pole[1], pole[2], r_minor])
-                    stars_pole_colors.append([pole_color[0], pole_color[1], pole_color[2], lum_pole])
-                    
-            num_stars = len(stars_pos_radius)
-            num_stars = min(num_stars, 16)
-            stars_pos_radius = stars_pos_radius[:num_stars]
-            stars_colors = stars_colors[:num_stars]
-            stars_poles_obl = stars_poles_obl[:num_stars]
-            stars_pole_colors = stars_pole_colors[:num_stars]
-            
-            if num_stars == 0:
-                num_stars = 1
-                stars_pos_radius = [[0.0, 0.0, 0.0, SOLAR_RADII_TO_AU]]
-                stars_colors = [[1.0, 1.0, 1.0, 1.0]]
-                stars_poles_obl = [[0.0, 1.0, 0.0, 0.0]]
-                stars_pole_colors = [[1.0, 1.0, 1.0, 1.0]]
-            
-            caster_data_buf[:n_casters_fixed, 0:3] = pos_rel_all[caster_indices[:n_casters_fixed]]
-            caster_data_buf[:n_casters_fixed, 3] = body_radii[caster_indices[:n_casters_fixed]]
-            if n_casters_fixed < 64:
-                caster_data_buf[n_casters_fixed:] = 0
-                
-            for i_c in range(n_casters_fixed):
-                b_idx = caster_indices[i_c]
-                pos_c = pos_rel_all[b_idx]
-                r_eq = body_radii[b_idx]
-                pole = all_instances[b_idx, 9:12]
-                f = all_instances[b_idx, 12]
-                
-                pos_star = pos_rel_all[star_idx]
-                to_star = pos_star - pos_c
-                dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                if dist_s > 1e-6:
-                    L = to_star / dist_s
-                else:
-                    L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                
-                p_dot_L = np.dot(pole, L)
-                p_proj_sq = 1.0 - p_dot_L**2
-                f_factor = 1.0 - f
-                r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
-                
-                caster_poles_obl_buf[i_c, 0:3] = pole
-                caster_poles_obl_buf[i_c, 3] = r_minor
-                
-            caster_colors_buf[:n_casters_fixed, 0:3] = body_colors[caster_indices[:n_casters_fixed]]
-            caster_colors_buf[:n_casters_fixed, 3] = 1.0
-            if n_casters_fixed < 64:
-                caster_colors_buf[n_casters_fixed:] = 0
-                
-            # Build atmosphere lookup dict once per frame to avoid expensive generator allocations inside the loop
-            atmo_by_body = {a['body_idx']: a for a in atmo_bodies}
-            
-            # Calibrated Top-Of-Atmosphere appearance colors for planets & moons with atmospheres
-            ATMO_TOA_COLORS = {
-                'titan': (0.85, 0.55, 0.18),    # Dense orange-amber Tholin photochemical smog
-                'venus': (0.96, 0.93, 0.82),    # Thick yellowish-white sulfuric acid cloud tops
-                'earth': (0.35, 0.55, 0.90),    # Rayleigh blue + cloud tops + ocean reflection
-                'mars': (0.55, 0.35, 0.22),     # Airborne dust haze + rusty surface
-                'jupiter': (0.82, 0.74, 0.60),  # Ammonia cloud bands
-                'saturn': (0.84, 0.77, 0.58),   # Pale gold ammonia/methane haze
-                'uranus': (0.55, 0.84, 0.88),   # Pale cyan methane atmosphere
-                'neptune': (0.28, 0.55, 0.95),  # Deep azure methane atmosphere
-                'io': (0.95, 0.85, 0.30),       # Sulfur frost & volcanic haze
-            }
-            
-            for i_c in range(n_casters_fixed):
-                b_idx = caster_indices[i_c]
-                atmo = atmo_by_body.get(b_idx)
-                if atmo:
-                    props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
-                    thick_km = float(atmo.get('atmo_radius_km', 0.0) - atmo.get('planet_radius_km', 0.0))
-                    scale_height_km = float(props.get('scale_height_km', 8.5))
-                    caster_atmos_buf[i_c, 0:3] = props.get('tau_vertical', trans)
-                    caster_atmos_buf[i_c, 3] = thick_km
-                    caster_colors_buf[i_c, 3] = scale_height_km
-                    shadow_radius_km = max(float(body_radii[b_idx]) * AU_TO_KM, 100.0)
-                    grazing_factor = math.sqrt(2.0 * math.pi * shadow_radius_km / max(scale_height_km, 0.1))
-                    caster_grazing_buf[i_c, :3] = caster_atmos_buf[i_c, :3] * grazing_factor
-                    caster_grazing_buf[i_c, 3] = 1.0 / shadow_radius_km
-                    # Split Mie component for per-species cloud-altitude attenuation.
-                    # Falls back to total-minus-Rm if cached props predate the split.
-                    _tau_m = props.get('tau_vert_mie', None)
-                    if _tau_m is None:
-                        _tau_rm = props.get('tau_vert_rm', None)
-                        _tau_tot = props.get('tau_vertical', trans)
-                        try:
-                            _tau_m = (np.asarray(_tau_tot, dtype=np.float32)
-                                      - np.asarray(_tau_rm, dtype=np.float32)) if _tau_rm is not None else np.zeros(3, dtype=np.float32)
-                        except Exception:
-                            _tau_m = np.zeros(3, dtype=np.float32)
-                    caster_mie_buf[i_c, 0:3] = _tau_m
-                    caster_mie_buf[i_c, 3] = float(props.get('h_mie_km', float(atmo.get('h_mie', 1.2))))
-                    
-                    b_rad_km = float(bodies_data[b_idx].get('req_km', body_radii[b_idx] * 149597870.7)) if bodies_data is not None and b_idx < len(bodies_data) else 6371.0
-                    path_len_m = math.sqrt(2.0 * math.pi * b_rad_km * 1000.0 * scale_height_km * 1000.0)
-                    tau_o3_peak = props.get('beta_abs_layered', np.zeros(3)) * path_len_m
-                    z_peak_km = float(props.get('ozone_peak_km', 25.0))
-                    caster_ozone_buf[i_c, 0:3] = tau_o3_peak
-                    caster_ozone_buf[i_c, 3] = z_peak_km
-                    # Vertical ozone column for the surface direct-beam
-                    # extinction (Chappuis band); w carries the layer width.
-                    caster_ozone_vert_buf[i_c, 0:3] = props.get('tau_o3_vert', np.zeros(3, dtype=np.float32))
-                    caster_ozone_vert_buf[i_c, 3] = float(props.get('o3_width_km', 6.0))
+                    f_factor = 1.0 - f
+                    r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
 
-                    # Provide true Top-of-Atmosphere color for subpixel point light appearance
-                    b_name = bodies_data[b_idx].get('name', '').lower() if (bodies_data is not None and b_idx < len(bodies_data)) else ''
-                    if b_name in ATMO_TOA_COLORS:
-                        caster_colors_buf[i_c, 0:3] = ATMO_TOA_COLORS[b_name]
-                    elif b_name in self.texture_mean_colors:
-                        caster_colors_buf[i_c, 0:3] = self.texture_mean_colors[b_name]
-                    
-                    caster_max_bend_buf[i_c] = compute_max_bend(
-                        body_radii[b_idx], scale_height_km,
-                        float(props.get('refractivity', 0.00029)),
-                        beta_ext=props.get('beta_rayleigh'))
-                else:
-                    caster_atmos_buf[i_c] = 0.0
-                    caster_grazing_buf[i_c] = 0.0
-                    caster_ozone_buf[i_c] = 0.0
-                    caster_ozone_vert_buf[i_c] = 0.0
-                    caster_max_bend_buf[i_c] = 0.0
-                    caster_mie_buf[i_c] = 0.0
-            if n_casters_fixed < 64:
-                caster_atmos_buf[n_casters_fixed:] = 0
-                caster_grazing_buf[n_casters_fixed:] = 0
-                caster_ozone_buf[n_casters_fixed:] = 0
-                caster_ozone_vert_buf[n_casters_fixed:] = 0
-                caster_max_bend_buf[n_casters_fixed:] = 0
-                caster_mie_buf[n_casters_fixed:] = 0
-    
-            ubo_staging[0:16] = projection.ravel()
-            ubo_staging[16:32] = view.ravel()
-            
-            # Write num stars
-            ubo_num_stars_int_view[0] = num_stars
-            ubo_staging[33:36] = 0.0 # padding
-            
-            # Write stars arrays
-            stars_pos_radius_flat = np.zeros(64, dtype=np.float32)
-            stars_colors_flat = np.zeros(64, dtype=np.float32)
-            stars_poles_obl_flat = np.zeros(64, dtype=np.float32)
-            stars_pole_colors_flat = np.zeros(64, dtype=np.float32)
-            for s_idx in range(num_stars):
-                stars_pos_radius_flat[s_idx*4 : (s_idx+1)*4] = stars_pos_radius[s_idx]
-                stars_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_colors[s_idx]
-                stars_poles_obl_flat[s_idx*4 : (s_idx+1)*4] = stars_poles_obl[s_idx]
-                stars_pole_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_pole_colors[s_idx]
-                
-            ubo_staging[36:100] = stars_pos_radius_flat
-            ubo_staging[100:164] = stars_colors_flat
-            ubo_staging[164:228] = stars_poles_obl_flat
-            ubo_staging[228:292] = stars_pole_colors_flat
-            
-            ubo_staging[292] = far
-            ubo_staging[293] = depth_C
-            ubo_casters_int_view = ubo_staging[294:295].view(np.int32)
-            ubo_casters_int_view[0] = n_casters_fixed
-            # Note: ubo_casters_int_view maps to ubo_staging[294:295]
-            ubo_staging[295] = 0.0 # padding
-            
-            ubo_staging[296:552] = caster_data_buf.ravel()
-            ubo_staging[552:808] = caster_poles_obl_buf.ravel()
-            ubo_staging[808:1064] = caster_colors_buf.ravel()
-            ubo_staging[1064:1320] = caster_atmos_buf.ravel()
-            ubo_staging[1320:1576] = caster_ozone_buf.ravel()
-            ubo_staging[1576:1832] = caster_ozone_vert_buf.ravel()
-            ubo_staging[1832:2088] = caster_grazing_buf.ravel()
-            
-            scene_ubo.write(ubo_staging.tobytes())
-            
-            fov_factor = 1.0 / math.tan(math.radians(self.camera["fov"] / 2.0))
-            uniform_screen_height.value = self.fb_height
-            uniform_fov_factor.value = fov_factor
-            uniform_num_ring_planes.value = n_ring_planes
-            if getattr(self, 'uniform_terrain_num_ring_planes', None) is not None:
-                self.uniform_terrain_num_ring_planes.value = n_ring_planes
-            if getattr(self, 'uniform_terrain_au_to_km', None) is not None:
-                self.uniform_terrain_au_to_km.value = 149597870.7
-            if 'u_camera_pos' in prog_spheres:
-                prog_spheres['u_camera_pos'].value = tuple(cam_pos)
-            if 'u_camera_pos' in prog_point_celestial:
-                prog_point_celestial['u_camera_pos'].value = tuple(cam_pos)
-            if 'screen_height' in prog_point_celestial:
-                prog_point_celestial['screen_height'].value = float(self.fb_height)
-            if 'fov_factor' in prog_point_celestial:
-                prog_point_celestial['fov_factor'].value = float(fov_factor)
-            if uniform_caster_max_bend is not None:
-                uniform_caster_max_bend.write(caster_max_bend_buf)
-            if getattr(self, 'uniform_terrain_caster_max_bend', None) is not None:
-                self.uniform_terrain_caster_max_bend.write(caster_max_bend_buf)
-            if uniform_caster_mie is not None:
-                try:
-                    uniform_caster_mie.write(caster_mie_buf)
-                except Exception:
-                    pass
-            if u_ring_caster_max_bend is not None:
-                u_ring_caster_max_bend.write(caster_max_bend_buf)
-            if n_ring_planes > 0:
-                uniform_ring_centers.write(ring_centers_buf)
-                uniform_ring_normals.write(ring_normals_buf)
-                uniform_ring_params.write(ring_params_buf)
-                if uniform_ring_colors:
-                    uniform_ring_colors.write(ring_colors_buf)
-                if uniform_ring_5colors:
-                    uniform_ring_5colors.write(ring_5colors_buf)
-                if uniform_ring_coplanar_mask is not None:
-                    uniform_ring_coplanar_mask.write(ring_coplanar_mask_buf)
-                if getattr(self, 'uniform_terrain_ring_centers', None) is not None:
-                    self.uniform_terrain_ring_centers.write(ring_centers_buf)
-                if getattr(self, 'uniform_terrain_ring_normals', None) is not None:
-                    self.uniform_terrain_ring_normals.write(ring_normals_buf)
-                if getattr(self, 'uniform_terrain_ring_params', None) is not None:
-                    self.uniform_terrain_ring_params.write(ring_params_buf)
-                if getattr(self, 'uniform_terrain_ring_coplanar_mask', None) is not None:
-                    self.uniform_terrain_ring_coplanar_mask.write(ring_coplanar_mask_buf)
-            
-            view_rot = view.copy()
-            view_rot[3, 0:3] = 0.0
-    
-            uniform_orbit_proj.write(projection)
-            uniform_orbit_view_rot.write(view_rot)
-            
-            cam_world_pos_f8 = cam_origin + cam_pos_f8
-            cam_pos_dvec4 = np.array([cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 0.0], dtype='f8')
-            uniform_orbit_cam_pos.write(cam_pos_dvec4)
-            
-            uniform_orbit_far.value = far
-            uniform_orbit_depth_C.value = depth_C
-    
-            ring_gradient_tex.use(location=0)
-            if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
-                # Use world-space float64 positions: camera rebasing must not
-                # invalidate maps or perturb stellar elevations.
-                rs_positions = pos_snap_render
-                if self.comparison_enabled and total_render_bodies > num_bodies:
-                    rs_positions = np.vstack((pos_snap_render,
-                        self.pos_snap_cmp + np.array([self.comparison_offset_au, 0.0, 0.0])))
-                rs_hosts = []
-                for bi, index in self.body_ring_indices.items():
-                    bd = bodies_data[bi] if bi < num_bodies else self.bodies_data_cmp[bi-num_bodies]
-                    flattening = float(bd.get('oblateness', bd.get('f', 0.0)))
-                    rs_hosts.append((index, rs_positions[bi], ring_normals_buf[index],
-                                     ring_params_buf[index], flattening))
-                rs_stars = rs_positions[star_indices_numba[:num_stars]]
-                _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
-                self.ringshine_maps.update(ring_gradient_tex,
-                    rs_hosts, rs_stars, self.camera.get("ringshine_band_count", 10),
-                    self.camera.get("ringshine_oblate_enabled", True), star_radii[:num_stars])
-                _perf_gpu_end(_gq)
-                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                self.hdr_resolve_fbo.use()
+                    caster_poles_obl_buf[i_c, 0:3] = pole
+                    caster_poles_obl_buf[i_c, 3] = r_minor
 
-            self.ringshine_map_tex.use(location=8)
-            
-            # Pass Exposure and HDR setting to shaders
-            exposure = float(self.camera.get("exposure", 1.0))
-            hdr_enabled = bool(self.camera.get("hdr_enabled", True))
-            ps_enabled = bool(self.camera.get("planetshine_enabled", True))
-            rs_enabled = bool(self.camera.get("ringshine_enabled", True))
-            rs_mode = int(self.camera.get("ringshine_mode", 0))
-            rs_mc_samples = int(self.camera.get("ringshine_mc_samples", 32))
-            rs_mc_dither = bool(self.camera.get("ringshine_mc_dither", False))
-            rs_band_count = int(self.camera.get("ringshine_band_count", 10))
-            rs_oblate = bool(self.camera.get("ringshine_oblate_enabled", True))
-            
-            is_accumulating = (
-                (self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)) or
-                (getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False))
-            )
-            if is_accumulating:
-                rs_frame_idx = int(getattr(self, "photo_accum_count", 0))
-            else:
-                rs_frame_idx = int(self.frame_counter % 65536) if rs_mc_dither else 0
-            
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view, self.prog_terrain):
-                if prog is None: continue
-                u = prog.get('u_exposure', None)
-                if u is not None: u.value = exposure
-                u = prog.get('u_hdr_enabled', None)
-                if u is not None: u.value = hdr_enabled
-                u = prog.get('u_planetshine_enabled', None)
-                if u is not None: u.value = ps_enabled
-                u = prog.get('u_ringshine_enabled', None)
-                if u is not None: u.value = rs_enabled
-                u = prog.get('u_ringshine_mode', None)
-                if u is not None: u.value = rs_mode
-                u = prog.get('u_ringshine_mc_samples', None)
-                if u is not None: u.value = rs_mc_samples
-                u = prog.get('u_ringshine_mc_dither', None)
-                if u is not None: u.value = rs_mc_dither
-                u = prog.get('u_frame_idx', None)
-                if u is not None: u.value = rs_frame_idx
-                u = prog.get('u_ringshine_band_count', None)
-                if u is not None: u.value = rs_band_count
-                u = prog.get('u_ringshine_oblate_enabled', None)
-                if u is not None: u.value = rs_oblate
+                caster_colors_buf[:n_casters_fixed, 0:3] = body_colors[caster_indices[:n_casters_fixed]]
+                caster_colors_buf[:n_casters_fixed, 3] = 1.0
+                if n_casters_fixed < 64:
+                    caster_colors_buf[n_casters_fixed:] = 0
 
-            inv_proj_bytes = np.linalg.inv(projection).astype('f4').tobytes()
-            inv_view_bytes = np.linalg.inv(view).astype('f4').tobytes()
-            for prog in (prog_atmo, prog_atmo_lowres):
-                if 'u_inv_proj' in prog:
-                    prog['u_inv_proj'].write(inv_proj_bytes)
-                if 'u_inv_view' in prog:
-                    prog['u_inv_view'].write(inv_view_bytes)
-            # --- Prepare and sort atmosphere bodies ---
-            sorted_atmos = []
-            if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
-                atmo_dists = []
-                if atmo_bodies:
-                    for atmo in atmo_bodies:
-                        dx = pos_rel_all[atmo['body_idx'], 0] - cam_pos[0]
-                        dy = pos_rel_all[atmo['body_idx'], 1] - cam_pos[1]
-                        dz = pos_rel_all[atmo['body_idx'], 2] - cam_pos[2]
-                        atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, False))
-                        
-                if self.comparison_enabled and self.atmo_bodies_cmp:
-                    for atmo in self.atmo_bodies_cmp:
-                        bi_cmp = atmo['body_idx']
-                        dx = cmp_pos_rel[bi_cmp, 0] - cam_pos[0]
-                        dy = cmp_pos_rel[bi_cmp, 1] - cam_pos[1]
-                        dz = cmp_pos_rel[bi_cmp, 2] - cam_pos[2]
-                        atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, True))
-                    
-                sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
-                
-            if sorted_atmos:
-                # Ensure all visible atmospheres have their LUTs built with a clean OpenGL state
-                # This prevents issues where 'build_atmo_lut' inherits incorrect culling or blending states.
-                ctx.disable(moderngl.BLEND)
-                ctx.disable(moderngl.CULL_FACE)
-                ctx.disable(moderngl.DEPTH_TEST)
-                ctx.depth_mask = False
-                
-                for sq_dist, atmo, is_cmp in sorted_atmos:
-                    dist_to_body = math.sqrt(sq_dist)
-                    apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
-                    if apparent_px >= 2.0:
-                        bi_curr = atmo['body_idx']
-                        mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
-                        if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
-                            build_atmo_lut(atmo, mass_sm_curr, is_cmp)
+                # Build atmosphere lookup dict once per frame to avoid expensive generator allocations inside the loop
+                atmo_by_body = {a['body_idx']: a for a in atmo_bodies}
 
-            # --- Active Refraction & Lens Uniform Setup ---
-            cam_world_pos_now = cam_origin + rel
-            refract_params, grav_lens_params = self._get_active_refraction_and_lens_params(
-                cam_world_pos_now,
-                atmo_bodies=atmo_bodies,
-                pos_snap_render=pos_snap_render,
-                mass_snap=mass_snap,
-                bodies_data=bodies_data,
-                num_bodies=num_bodies,
-            )
+                # Calibrated Top-Of-Atmosphere appearance colors for planets & moons with atmospheres
+                ATMO_TOA_COLORS = {
+                    'titan': (0.85, 0.55, 0.18),    # Dense orange-amber Tholin photochemical smog
+                    'venus': (0.96, 0.93, 0.82),    # Thick yellowish-white sulfuric acid cloud tops
+                    'earth': (0.35, 0.55, 0.90),    # Rayleigh blue + cloud tops + ocean reflection
+                    'mars': (0.55, 0.35, 0.22),     # Airborne dust haze + rusty surface
+                    'jupiter': (0.82, 0.74, 0.60),  # Ammonia cloud bands
+                    'saturn': (0.84, 0.77, 0.58),   # Pale gold ammonia/methane haze
+                    'uranus': (0.55, 0.84, 0.88),   # Pale cyan methane atmosphere
+                    'neptune': (0.28, 0.55, 0.95),  # Deep azure methane atmosphere
+                    'io': (0.95, 0.85, 0.30),       # Sulfur frost & volcanic haze
+                }
 
-            refract_center = (0.0, 0.0, 0.0)
-            refract_radius_km = 0.0
-            refract_max_bend = 0.0
-            refract_scale_height = 1.0
-            refract_pole = (0.0, 1.0, 0.0)
-            refract_oblateness = 0.0
-            au_to_km_val = 149597870.7
+                for i_c in range(n_casters_fixed):
+                    b_idx = caster_indices[i_c]
+                    atmo = atmo_by_body.get(b_idx)
+                    if atmo:
+                        props, trans, thickness = get_cached_atmosphere_properties(atmo, mass_snap[b_idx])
+                        thick_km = float(atmo.get('atmo_radius_km', 0.0) - atmo.get('planet_radius_km', 0.0))
+                        scale_height_km = float(props.get('scale_height_km', 8.5))
+                        caster_atmos_buf[i_c, 0:3] = props.get('tau_vertical', trans)
+                        caster_atmos_buf[i_c, 3] = thick_km
+                        caster_colors_buf[i_c, 3] = scale_height_km
+                        shadow_radius_km = max(float(body_radii[b_idx]) * AU_TO_KM, 100.0)
+                        grazing_factor = math.sqrt(2.0 * math.pi * shadow_radius_km / max(scale_height_km, 0.1))
+                        caster_grazing_buf[i_c, :3] = caster_atmos_buf[i_c, :3] * grazing_factor
+                        caster_grazing_buf[i_c, 3] = 1.0 / shadow_radius_km
+                        # Split Mie component for per-species cloud-altitude attenuation.
+                        # Falls back to total-minus-Rm if cached props predate the split.
+                        _tau_m = props.get('tau_vert_mie', None)
+                        if _tau_m is None:
+                            _tau_rm = props.get('tau_vert_rm', None)
+                            _tau_tot = props.get('tau_vertical', trans)
+                            try:
+                                _tau_m = (np.asarray(_tau_tot, dtype=np.float32)
+                                          - np.asarray(_tau_rm, dtype=np.float32)) if _tau_rm is not None else np.zeros(3, dtype=np.float32)
+                            except Exception:
+                                _tau_m = np.zeros(3, dtype=np.float32)
+                        caster_mie_buf[i_c, 0:3] = _tau_m
+                        caster_mie_buf[i_c, 3] = float(props.get('h_mie_km', float(atmo.get('h_mie', 1.2))))
 
-            if refract_params is not None:
-                rc_rel = refract_params['center_world'] - cam_origin
-                refract_center = (float(rc_rel[0]), float(rc_rel[1]), float(rc_rel[2]))
-                refract_radius_km = float(refract_params['radius_km'])
-                refract_max_bend = float(refract_params['max_bend'])
-                refract_scale_height = float(refract_params['scale_height_km'])
-                refract_pole = tuple(float(x) for x in refract_params['pole'])
-                refract_oblateness = float(refract_params['oblateness'])
+                        b_rad_km = float(bodies_data[b_idx].get('req_km', body_radii[b_idx] * 149597870.7)) if bodies_data is not None and b_idx < len(bodies_data) else 6371.0
+                        path_len_m = math.sqrt(2.0 * math.pi * b_rad_km * 1000.0 * scale_height_km * 1000.0)
+                        tau_o3_peak = props.get('beta_abs_layered', np.zeros(3)) * path_len_m
+                        z_peak_km = float(props.get('ozone_peak_km', 25.0))
+                        caster_ozone_buf[i_c, 0:3] = tau_o3_peak
+                        caster_ozone_buf[i_c, 3] = z_peak_km
+                        # Vertical ozone column for the surface direct-beam
+                        # extinction (Chappuis band); w carries the layer width.
+                        caster_ozone_vert_buf[i_c, 0:3] = props.get('tau_o3_vert', np.zeros(3, dtype=np.float32))
+                        caster_ozone_vert_buf[i_c, 3] = float(props.get('o3_width_km', 6.0))
 
-            grav_lens_center = (0.0, 0.0, 0.0)
-            grav_lens_rs = 0.0
-            grav_lens_radius = 0.0
-            grav_lens_type = 0
-            grav_lens_enabled = bool(self.camera.get("grav_lensing_enabled", True))
-            grav_lens_strength = float(self.camera.get("grav_lensing_multiplier", 1.0))
-            grav_lens_spin = 0.0
-            grav_lens_pole = (0.0, 1.0, 0.0)
+                        # Provide true Top-of-Atmosphere color for subpixel point light appearance
+                        b_name = bodies_data[b_idx].get('name', '').lower() if (bodies_data is not None and b_idx < len(bodies_data)) else ''
+                        if b_name in ATMO_TOA_COLORS:
+                            caster_colors_buf[i_c, 0:3] = ATMO_TOA_COLORS[b_name]
+                        elif b_name in self.texture_mean_colors:
+                            caster_colors_buf[i_c, 0:3] = self.texture_mean_colors[b_name]
 
-            if grav_lens_params is not None:
-                gl_rel = grav_lens_params['center_world'] - cam_origin
-                grav_lens_center = (float(gl_rel[0]), float(gl_rel[1]), float(gl_rel[2]))
-                grav_lens_rs = float(grav_lens_params['rs_km'])
-                grav_lens_radius = float(grav_lens_params['radius_km'])
-                grav_lens_type = int(grav_lens_params['lens_type'])
-                grav_lens_enabled = bool(grav_lens_params['enabled'])
-                grav_lens_strength = float(grav_lens_params['strength'])
-                grav_lens_spin = float(grav_lens_params['spin'])
-                grav_lens_pole = tuple(float(x) for x in grav_lens_params['pole'])
-
-            for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_starfield, prog_culling_compute, getattr(self, 'prog_hz', None), getattr(self, 'prog_terrain', None)):
-                if prog is not None:
-                    if 'u_refract_center' in prog:
-                        prog['u_refract_center'].value = refract_center
-                    if 'u_refract_radius' in prog:
-                        prog['u_refract_radius'].value = refract_radius_km
-                    if 'u_refract_max_bend' in prog:
-                        prog['u_refract_max_bend'].value = refract_max_bend
-                    if 'u_refract_scale_height' in prog:
-                        prog['u_refract_scale_height'].value = refract_scale_height
-                    if 'u_refract_pole' in prog:
-                        prog['u_refract_pole'].value = refract_pole
-                    if 'u_refract_oblateness' in prog:
-                        prog['u_refract_oblateness'].value = refract_oblateness
-                    if 'u_grav_lens_center' in prog:
-                        prog['u_grav_lens_center'].value = grav_lens_center
-                    if 'u_grav_lens_rs' in prog:
-                        prog['u_grav_lens_rs'].value = grav_lens_rs
-                    if 'u_grav_lens_radius' in prog:
-                        prog['u_grav_lens_radius'].value = grav_lens_radius
-                    if 'u_grav_lens_type' in prog:
-                        prog['u_grav_lens_type'].value = grav_lens_type
-                    if 'u_grav_lens_enabled' in prog:
-                        prog['u_grav_lens_enabled'].value = grav_lens_enabled
-                    if 'u_grav_lens_strength' in prog:
-                        prog['u_grav_lens_strength'].value = grav_lens_strength
-                    if 'u_grav_lens_spin' in prog:
-                        prog['u_grav_lens_spin'].value = float(grav_lens_spin)
-                    if 'u_grav_lens_pole' in prog:
-                        prog['u_grav_lens_pole'].value = grav_lens_pole
-                    if 'u_au_to_km' in prog:
-                        prog['u_au_to_km'].value = au_to_km_val
-
-            if 'u_is_cloud_pass' in prog_spheres:
-                prog_spheres['u_is_cloud_pass'].value = False
-
-            ctx.enable(moderngl.DEPTH_TEST)
-            ctx.disable(moderngl.CULL_FACE)
-            ctx.enable(moderngl.BLEND)
-            ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-
-            # Pass 1: High/Ultra & Low resolved 3D meshes write opaque depth
-            _gq = _perf_gpu_begin(ctx, "gpu_spheres")
-            ctx.depth_mask = True
-            vis_hi_buffer.bind_to_storage_buffer(binding=3)
-            vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
-            
-            vis_ultra_buffer.bind_to_storage_buffer(binding=3)
-            vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=3)
-
-            vis_lo_buffer.bind_to_storage_buffer(binding=3)
-            vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
-
-            # Helper to check if a body has a cloud layer texture
-            def _body_has_clouds(bi, is_cmp=False):
-                if not self.camera.get("clouds_enabled", True):
-                    return False
-                if 'u_is_cloud_pass' not in prog_spheres or getattr(self, 'body_textures_ssbo', None) is None:
-                    return False
-                bdata = bodies_data_cmp if is_cmp else bodies_data
-                if bi >= len(bdata):
-                    return False
-                bname = bdata[bi].get('name', '').lower()
-                cached = self._clouds_exist_cache.get(bname)
-                if cached is not None:
-                    return cached
-                manifest_entry = getattr(self.texture_streamer, 'file_manifest', {}).get(bname, {}) if hasattr(self, 'texture_streamer') and self.texture_streamer else {}
-                c_path = manifest_entry.get('clouds')
-                has_cloud = False
-                if c_path and os.path.exists(c_path):
-                    has_cloud = True
-                elif bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
-                    has_cloud = True
-                elif hasattr(self, 'terrain_streamer') and self.terrain_streamer:
-                    b_clouds_dir = os.path.join(self.terrain_streamer.tiles_base_dir, bname, "clouds")
-                    if os.path.isdir(b_clouds_dir):
-                        has_cloud = True
-                self._clouds_exist_cache[bname] = has_cloud
-                return has_cloud
-
-            # Pass 1b: Terrain Quadtree LOD (SpaceEngine style) - Multi-Body with Local Frustum Culling
-            prev_active_body_patches = getattr(self, 'terrain_active_body_patches', {})
-            self.terrain_active_body_patches = {}
-            self.terrain_active_cloud_patches = {}
-            self.terrain_last_cloud_patch_count = 0
-            total_patches_rendered = 0
-
-            if active_terrain_bodies and getattr(self, 'terrain_streamer', None) is not None:
-                patch_res = int(self.camera.get("terrain_patch_res", 32))
-                res_scale = max(0.6, patch_res / 32.0)
-                split_fac = float(self.camera.get("terrain_lod_split_factor", 1.0)) * res_scale
-                max_d = int(self.camera.get("terrain_max_depth", 10))
-                cam_world_pos_f8 = cam_origin + rel
-
-                for slot_idx, (b_i, b_name) in enumerate(active_terrain_bodies):
-                    rem_budget = MAX_TERRAIN_PATCHES - total_patches_rendered
-                    if rem_budget <= 0:
-                        break
-
-                    b_r_au = float(all_instances[b_i, 6])
-                    b_r_km = b_r_au * AU_TO_KM
-                    if b_i not in self.planet_quadtrees:
-                        self.planet_quadtrees[b_i] = PlanetQuadtree(b_r_km)
-                    p_quadtree = self.planet_quadtrees[b_i]
-                    p_quadtree.update_radius(b_r_km)
-
-                    if b_i < num_bodies:
-                        b_pos_world = pos_snap_render[b_i]
+                        caster_max_bend_buf[i_c] = compute_max_bend(
+                            body_radii[b_idx], scale_height_km,
+                            float(props.get('refractivity', 0.00029)),
+                            beta_ext=props.get('beta_rayleigh'))
                     else:
-                        b_pos_world = self.pos_snap_cmp[b_i - num_bodies] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+                        caster_atmos_buf[i_c] = 0.0
+                        caster_grazing_buf[i_c] = 0.0
+                        caster_ozone_buf[i_c] = 0.0
+                        caster_ozone_vert_buf[i_c] = 0.0
+                        caster_max_bend_buf[i_c] = 0.0
+                        caster_mie_buf[i_c] = 0.0
+                if n_casters_fixed < 64:
+                    caster_atmos_buf[n_casters_fixed:] = 0
+                    caster_grazing_buf[n_casters_fixed:] = 0
+                    caster_ozone_buf[n_casters_fixed:] = 0
+                    caster_ozone_vert_buf[n_casters_fixed:] = 0
+                    caster_max_bend_buf[n_casters_fixed:] = 0
+                    caster_mie_buf[n_casters_fixed:] = 0
 
-                    # Compute relative camera vector in double precision (float64) to eliminate
-                    # float32 truncation error regardless of what body is tracked or where cam_origin is!
-                    cam_rel_world_au = cam_world_pos_f8 - b_pos_world
-                    cam_rel_km = (cam_rel_world_au * AU_TO_KM).astype(np.float32)
-                    b_pos_rel_f8 = b_pos_world - cam_origin
+                ubo_staging[0:16] = projection.ravel()
+                ubo_staging[16:32] = view.ravel()
 
-                    pole = all_instances[b_i, 9:12]
-                    pole_norm = float(np.linalg.norm(pole))
-                    pole_n = (pole / max(1e-6, pole_norm)).astype(np.float32)
-                    ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                    if abs(float(np.dot(pole_n, ref))) > 0.999:
-                        ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-                    tangent = np.cross(pole_n, ref)
-                    tangent /= max(1e-6, float(np.linalg.norm(tangent)))
-                    bitangent = np.cross(pole_n, tangent)
-                    b_norm = float(np.linalg.norm(bitangent))
-                    if b_norm > 0:
-                        bitangent /= b_norm
+                # Write num stars
+                ubo_num_stars_int_view[0] = num_stars
+                ubo_staging[33:36] = 0.0 # padding
 
-                    p_local_x = float(np.dot(cam_rel_km, tangent))
-                    p_local_y = float(np.dot(cam_rel_km, pole_n))
-                    p_local_z = float(np.dot(cam_rel_km, bitangent))
+                # Write stars arrays
+                stars_pos_radius_flat = np.zeros(64, dtype=np.float32)
+                stars_colors_flat = np.zeros(64, dtype=np.float32)
+                stars_poles_obl_flat = np.zeros(64, dtype=np.float32)
+                stars_pole_colors_flat = np.zeros(64, dtype=np.float32)
+                for s_idx in range(num_stars):
+                    stars_pos_radius_flat[s_idx*4 : (s_idx+1)*4] = stars_pos_radius[s_idx]
+                    stars_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_colors[s_idx]
+                    stars_poles_obl_flat[s_idx*4 : (s_idx+1)*4] = stars_poles_obl[s_idx]
+                    stars_pole_colors_flat[s_idx*4 : (s_idx+1)*4] = stars_pole_colors[s_idx]
 
-                    rot_angle = float(all_instances[b_i, 25])
-                    s_r = math.sin(-rot_angle)
-                    c_r = math.cos(-rot_angle)
-                    cam_pos_local = np.array([
-                        p_local_x * c_r - p_local_z * s_r,
-                        p_local_y,
-                        p_local_x * s_r + p_local_z * c_r
-                    ], dtype=np.float32)
+                ubo_staging[36:100] = stars_pos_radius_flat
+                ubo_staging[100:164] = stars_colors_flat
+                ubo_staging[164:228] = stars_poles_obl_flat
+                ubo_staging[228:292] = stars_pole_colors_flat
 
-                    # Transform world frustum planes into planet local space (km)
-                    R_rot = np.array([
-                        [c_r, 0.0, -s_r],
-                        [0.0, 1.0,  0.0],
-                        [s_r, 0.0,  c_r]
-                    ], dtype=np.float64)
-                    R_frame = np.vstack([tangent, pole_n, bitangent]).astype(np.float64)
-                    R_mat = R_rot @ R_frame # (3, 3)
+                ubo_staging[292] = far
+                ubo_staging[293] = depth_C
+                ubo_casters_int_view = ubo_staging[294:295].view(np.int32)
+                ubo_casters_int_view[0] = n_casters_fixed
+                # Note: ubo_casters_int_view maps to ubo_staging[294:295]
+                ubo_staging[295] = 0.0 # padding
 
-                    N_world = frustum_planes[:, :3].astype(np.float64)
-                    D_world = frustum_planes[:, 3].astype(np.float64)
-                    N_local = N_world @ R_mat.T
-                    D_local = AU_TO_KM * (np.dot(N_world, b_pos_rel_f8) + D_world)
+                ubo_staging[296:552] = caster_data_buf.ravel()
+                ubo_staging[552:808] = caster_poles_obl_buf.ravel()
+                ubo_staging[808:1064] = caster_colors_buf.ravel()
+                ubo_staging[1064:1320] = caster_atmos_buf.ravel()
+                ubo_staging[1320:1576] = caster_ozone_buf.ravel()
+                ubo_staging[1576:1832] = caster_ozone_vert_buf.ravel()
+                ubo_staging[1832:2088] = caster_grazing_buf.ravel()
 
-                    # Widen side frustum planes ONLY if line of sight to body passes through refracting atmosphere or gravitational lens
-                    d_cam_body_km = float(np.linalg.norm(cam_rel_world_au)) * AU_TO_KM
-                    dist_cb_au = float(np.linalg.norm(cam_rel_world_au))
-                    ray_dir = -cam_rel_world_au / max(1e-9, dist_cb_au)
+                scene_ubo.write(ubo_staging.tobytes())
 
-                    is_b_cmp = (b_i >= num_bodies)
-                    b_local_idx = (b_i - num_bodies) if is_b_cmp else b_i
-                    is_refract_host = (refract_params is not None and 
-                                       b_local_idx == refract_params.get('body_idx') and 
-                                       is_b_cmp == refract_params.get('is_cmp', False))
-                    is_grav_host = (grav_lens_params is not None and 
-                                    b_local_idx == grav_lens_params.get('body_idx') and 
-                                    is_b_cmp == grav_lens_params.get('is_cmp', False))
+                fov_factor = 1.0 / math.tan(math.radians(self.camera["fov"] / 2.0))
+                uniform_screen_height.value = self.fb_height
+                uniform_fov_factor.value = fov_factor
+                uniform_num_ring_planes.value = n_ring_planes
+                if getattr(self, 'uniform_terrain_num_ring_planes', None) is not None:
+                    self.uniform_terrain_num_ring_planes.value = n_ring_planes
+                if getattr(self, 'uniform_terrain_au_to_km', None) is not None:
+                    self.uniform_terrain_au_to_km.value = 149597870.7
+                if 'u_camera_pos' in prog_spheres:
+                    prog_spheres['u_camera_pos'].value = tuple(cam_pos)
+                if 'u_camera_pos' in prog_point_celestial:
+                    prog_point_celestial['u_camera_pos'].value = tuple(cam_pos)
+                if 'screen_height' in prog_point_celestial:
+                    prog_point_celestial['screen_height'].value = float(self.fb_height)
+                if 'fov_factor' in prog_point_celestial:
+                    prog_point_celestial['fov_factor'].value = float(fov_factor)
+                if uniform_caster_max_bend is not None:
+                    uniform_caster_max_bend.write(caster_max_bend_buf)
+                if getattr(self, 'uniform_terrain_caster_max_bend', None) is not None:
+                    self.uniform_terrain_caster_max_bend.write(caster_max_bend_buf)
+                if uniform_caster_mie is not None:
+                    try:
+                        uniform_caster_mie.write(caster_mie_buf)
+                    except Exception:
+                        pass
+                if u_ring_caster_max_bend is not None:
+                    u_ring_caster_max_bend.write(caster_max_bend_buf)
+                if n_ring_planes > 0:
+                    uniform_ring_centers.write(ring_centers_buf)
+                    uniform_ring_normals.write(ring_normals_buf)
+                    uniform_ring_params.write(ring_params_buf)
+                    if uniform_ring_colors:
+                        uniform_ring_colors.write(ring_colors_buf)
+                    if uniform_ring_5colors:
+                        uniform_ring_5colors.write(ring_5colors_buf)
+                    if uniform_ring_coplanar_mask is not None:
+                        uniform_ring_coplanar_mask.write(ring_coplanar_mask_buf)
+                    if getattr(self, 'uniform_terrain_ring_centers', None) is not None:
+                        self.uniform_terrain_ring_centers.write(ring_centers_buf)
+                    if getattr(self, 'uniform_terrain_ring_normals', None) is not None:
+                        self.uniform_terrain_ring_normals.write(ring_normals_buf)
+                    if getattr(self, 'uniform_terrain_ring_params', None) is not None:
+                        self.uniform_terrain_ring_params.write(ring_params_buf)
+                    if getattr(self, 'uniform_terrain_ring_coplanar_mask', None) is not None:
+                        self.uniform_terrain_ring_coplanar_mask.write(ring_coplanar_mask_buf)
 
-                    if refract_max_bend > 1e-6 and not is_refract_host:
-                        refract_pos_world = refract_params['center_world']
-                        v_cr = refract_pos_world - cam_world_pos_f8
-                        t_cr = float(np.dot(v_cr, ray_dir))
-                        if t_cr < dist_cb_au:
-                            t_fwd = max(0.0, t_cr)
-                            d_perp_km = float(np.linalg.norm(v_cr - t_fwd * ray_dir)) * AU_TO_KM
-                            if d_perp_km < (refract_radius_km + 15.0 * refract_scale_height):
-                                D_local[:4] += (d_cam_body_km * math.tan(refract_max_bend) * 1.5)
+                view_rot = view.copy()
+                view_rot[3, 0:3] = 0.0
 
-                    if grav_lens_enabled and grav_lens_rs > 1e-6 and not is_grav_host:
-                        grav_pos_world = grav_lens_params['center_world']
-                        v_gl = grav_pos_world - cam_world_pos_f8
-                        t_gl = float(np.dot(v_gl, ray_dir))
-                        if t_gl < dist_cb_au:
-                            t_fwd_gl = max(0.0, t_gl)
-                            d_perp_gl_km = float(np.linalg.norm(v_gl - t_fwd_gl * ray_dir)) * AU_TO_KM
-                            if d_perp_gl_km < max(grav_lens_radius * 20.0, grav_lens_rs * 100.0):
-                                D_local[:4] += (d_cam_body_km * 0.15)
+                uniform_orbit_proj.write(projection)
+                uniform_orbit_view_rot.write(view_rot)
 
-                    local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float32)
+                cam_world_pos_f8 = cam_origin + cam_pos_f8
+                cam_pos_dvec4 = np.array([cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 0.0], dtype='f8')
+                uniform_orbit_cam_pos.write(cam_pos_dvec4)
 
-                    obl = float(all_instances[b_i, 12])
-                    terrain_body_data = bodies_data[b_i] if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]
-                    elev_min_km, elev_max_km = terrain_body_data.get("height_range_km", [0.0, 8.848])
-                    elev_min_km, elev_max_km = float(elev_min_km), float(elev_max_km)
-                    if not (math.isfinite(elev_min_km) and math.isfinite(elev_max_km) and elev_max_km >= elev_min_km):
-                        elev_min_km, elev_max_km = 0.0, 8.848
-                    elev_span_km = elev_max_km - elev_min_km
-                    has_height = self.terrain_streamer.get_max_lod(b_name, "height") >= 0
-                    height_max_km = max(abs(elev_min_km), abs(elev_max_km)) if has_height else 0.0
-                    alt_km = max(0.0, d_cam_body_km - b_r_km)
-                    # Ground LOD closeness: smoothly adapts the LOD transition distance near the surface.
-                    # alt_factor = 0.0 at ground level, 1.0 at 50 km altitude and above.
-                    alt_factor = min(1.0, alt_km / 50.0)
-                    default_global_dist = 1.0 / max(0.1, float(self.camera.get("terrain_lod_split_factor", 1.0))) if "terrain_lod_distance" not in self.camera else 1.0
-                    global_dist = float(self.camera.get("terrain_lod_distance", default_global_dist))
-                    ground_dist = float(self.camera.get("terrain_ground_lod_distance", 1.0))
-                    # Effective distance multiplier: near the ground, lower ground_dist brings high-quality LOD patches closer to the camera
-                    effective_dist = global_dist * (ground_dist + (1.0 - ground_dist) * alt_factor)
-                    effective_dist = max(0.15, min(5.0, effective_dist))
-                    split_fac = (1.0 / effective_dist) * res_scale
+                uniform_orbit_far.value = far
+                uniform_orbit_depth_C.value = depth_C
 
-                    body_max_lod = max_d
+                ring_gradient_tex.use(location=0)
+                if self.camera.get("ringshine_enabled", True) and n_ring_planes > 0:
+                    # Use world-space float64 positions: camera rebasing must not
+                    # invalidate maps or perturb stellar elevations.
+                    rs_positions = pos_snap_render
+                    if self.comparison_enabled and total_render_bodies > num_bodies:
+                        rs_positions = np.vstack((pos_snap_render,
+                            self.pos_snap_cmp + np.array([self.comparison_offset_au, 0.0, 0.0])))
+                    rs_hosts = []
+                    for bi, index in self.body_ring_indices.items():
+                        bd = bodies_data[bi] if bi < num_bodies else self.bodies_data_cmp[bi-num_bodies]
+                        flattening = float(bd.get('oblateness', bd.get('f', 0.0)))
+                        rs_hosts.append((index, rs_positions[bi], ring_normals_buf[index],
+                                         ring_params_buf[index], flattening))
+                    rs_stars = rs_positions[star_indices_numba[:num_stars]]
+                    _gq = _perf_gpu_begin(ctx, "gpu_ringshine_map")
+                    self.ringshine_maps.update(ring_gradient_tex,
+                        rs_hosts, rs_stars, self.camera.get("ringshine_band_count", 10),
+                        self.camera.get("ringshine_oblate_enabled", True), star_radii[:num_stars])
+                    _perf_gpu_end(_gq)
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    self.hdr_resolve_fbo.use()
 
-                    b_cloud_alt_km = 0.0
-                    if _body_has_clouds(b_i, is_cmp=False):
-                        _c_varr = visual_arr
-                        b_cloud_alt_km = float(_c_varr[b_i, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[b_i, 12] > 0 else 3.5
+                self.ringshine_map_tex.use(location=8)
 
-                    body_refract_bend = refract_max_bend if is_refract_host else 0.0
+                # Pass Exposure and HDR setting to shaders
+                exposure = float(self.camera.get("exposure", 1.0))
+                hdr_enabled = bool(self.camera.get("hdr_enabled", True))
+                ps_enabled = bool(self.camera.get("planetshine_enabled", True))
+                rs_enabled = bool(self.camera.get("ringshine_enabled", True))
+                rs_mode = int(self.camera.get("ringshine_mode", 0))
+                rs_mc_samples = int(self.camera.get("ringshine_mc_samples", 32))
+                rs_mc_dither = bool(self.camera.get("ringshine_mc_dither", False))
+                rs_band_count = int(self.camera.get("ringshine_band_count", 10))
+                rs_oblate = bool(self.camera.get("ringshine_oblate_enabled", True))
 
-                    raw_patches = p_quadtree.traverse_raw(
-                        cam_pos_local,
-                        fov_deg=float(self.camera["fov"]),
-                        screen_height=float(self.fb_height),
-                        max_lod=body_max_lod,
-                        split_factor=split_fac,
-                        obl=obl,
-                        max_patches=rem_budget,
-                        frustum_planes=local_frustum_planes,
-                        cloud_alt_km=0.0,
-                        refract_bend=body_refract_bend, height_max_km=height_max_km
-                    )
-                    num_p = len(raw_patches)
+                is_accumulating = (
+                    (self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)) or
+                    (getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False))
+                )
+                if is_accumulating:
+                    rs_frame_idx = int(getattr(self, "photo_accum_count", 0))
+                else:
+                    rs_frame_idx = int(self.frame_counter % 65536) if rs_mc_dither else 0
 
-                    if num_p == 0 and rem_budget > 0:
-                        # Fallback: if frustum culling rejected all patches but the sphere is on-screen,
-                        # traverse without frustum planes at LOD 0 to ensure the body never disappears.
+                for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_point_celestial, prog_starfield, self.prog_sky_view, self.prog_terrain):
+                    if prog is None: continue
+                    u = prog.get('u_exposure', None)
+                    if u is not None: u.value = exposure
+                    u = prog.get('u_hdr_enabled', None)
+                    if u is not None: u.value = hdr_enabled
+                    u = prog.get('u_planetshine_enabled', None)
+                    if u is not None: u.value = ps_enabled
+                    u = prog.get('u_ringshine_enabled', None)
+                    if u is not None: u.value = rs_enabled
+                    u = prog.get('u_ringshine_mode', None)
+                    if u is not None: u.value = rs_mode
+                    u = prog.get('u_ringshine_mc_samples', None)
+                    if u is not None: u.value = rs_mc_samples
+                    u = prog.get('u_ringshine_mc_dither', None)
+                    if u is not None: u.value = rs_mc_dither
+                    u = prog.get('u_frame_idx', None)
+                    if u is not None: u.value = rs_frame_idx
+                    u = prog.get('u_ringshine_band_count', None)
+                    if u is not None: u.value = rs_band_count
+                    u = prog.get('u_ringshine_oblate_enabled', None)
+                    if u is not None: u.value = rs_oblate
+
+                inv_proj_bytes = np.linalg.inv(projection).astype('f4').tobytes()
+                inv_view_bytes = np.linalg.inv(view).astype('f4').tobytes()
+                for prog in (prog_atmo, prog_atmo_lowres):
+                    if 'u_inv_proj' in prog:
+                        prog['u_inv_proj'].write(inv_proj_bytes)
+                    if 'u_inv_view' in prog:
+                        prog['u_inv_view'].write(inv_view_bytes)
+                # --- Prepare and sort atmosphere bodies ---
+                sorted_atmos = []
+                if atmo_quality > 0 and (atmo_bodies or (self.comparison_enabled and self.atmo_bodies_cmp)):
+                    atmo_dists = []
+                    if atmo_bodies:
+                        for atmo in atmo_bodies:
+                            dx = pos_rel_all[atmo['body_idx'], 0] - cam_pos[0]
+                            dy = pos_rel_all[atmo['body_idx'], 1] - cam_pos[1]
+                            dz = pos_rel_all[atmo['body_idx'], 2] - cam_pos[2]
+                            atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, False))
+
+                    if self.comparison_enabled and self.atmo_bodies_cmp:
+                        for atmo in self.atmo_bodies_cmp:
+                            bi_cmp = atmo['body_idx']
+                            dx = cmp_pos_rel[bi_cmp, 0] - cam_pos[0]
+                            dy = cmp_pos_rel[bi_cmp, 1] - cam_pos[1]
+                            dz = cmp_pos_rel[bi_cmp, 2] - cam_pos[2]
+                            atmo_dists.append((dx*dx + dy*dy + dz*dz, atmo, True))
+
+                    sorted_atmos = sorted(atmo_dists, key=lambda x: x[0], reverse=True)
+
+                if sorted_atmos:
+                    # Ensure all visible atmospheres have their LUTs built with a clean OpenGL state
+                    # This prevents issues where 'build_atmo_lut' inherits incorrect culling or blending states.
+                    ctx.disable(moderngl.BLEND)
+                    ctx.disable(moderngl.CULL_FACE)
+                    ctx.disable(moderngl.DEPTH_TEST)
+                    ctx.depth_mask = False
+
+                    for sq_dist, atmo, is_cmp in sorted_atmos:
+                        dist_to_body = math.sqrt(sq_dist)
+                        apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
+                        if apparent_px >= 2.0:
+                            bi_curr = atmo['body_idx']
+                            mass_sm_curr = self.mass_snap_cmp[bi_curr] if is_cmp else mass_snap[bi_curr]
+                            if 'lut_tex' not in atmo or atmo.get('lut_mass') != mass_sm_curr:
+                                build_atmo_lut(atmo, mass_sm_curr, is_cmp)
+
+                # --- Active Refraction & Lens Uniform Setup ---
+                cam_world_pos_now = cam_origin + rel
+                refract_params, grav_lens_params = self._get_active_refraction_and_lens_params(
+                    cam_world_pos_now,
+                    atmo_bodies=atmo_bodies,
+                    pos_snap_render=pos_snap_render,
+                    mass_snap=mass_snap,
+                    bodies_data=bodies_data,
+                    num_bodies=num_bodies,
+                )
+
+                refract_center = (0.0, 0.0, 0.0)
+                refract_radius_km = 0.0
+                refract_max_bend = 0.0
+                refract_scale_height = 1.0
+                refract_pole = (0.0, 1.0, 0.0)
+                refract_oblateness = 0.0
+                au_to_km_val = 149597870.7
+
+                if refract_params is not None:
+                    rc_rel = refract_params['center_world'] - cam_origin
+                    refract_center = (float(rc_rel[0]), float(rc_rel[1]), float(rc_rel[2]))
+                    refract_radius_km = float(refract_params['radius_km'])
+                    refract_max_bend = float(refract_params['max_bend'])
+                    refract_scale_height = float(refract_params['scale_height_km'])
+                    refract_pole = tuple(float(x) for x in refract_params['pole'])
+                    refract_oblateness = float(refract_params['oblateness'])
+
+                grav_lens_center = (0.0, 0.0, 0.0)
+                grav_lens_rs = 0.0
+                grav_lens_radius = 0.0
+                grav_lens_type = 0
+                grav_lens_enabled = bool(self.camera.get("grav_lensing_enabled", True))
+                grav_lens_strength = float(self.camera.get("grav_lensing_multiplier", 1.0))
+                grav_lens_spin = 0.0
+                grav_lens_pole = (0.0, 1.0, 0.0)
+
+                if grav_lens_params is not None:
+                    gl_rel = grav_lens_params['center_world'] - cam_origin
+                    grav_lens_center = (float(gl_rel[0]), float(gl_rel[1]), float(gl_rel[2]))
+                    grav_lens_rs = float(grav_lens_params['rs_km'])
+                    grav_lens_radius = float(grav_lens_params['radius_km'])
+                    grav_lens_type = int(grav_lens_params['lens_type'])
+                    grav_lens_enabled = bool(grav_lens_params['enabled'])
+                    grav_lens_strength = float(grav_lens_params['strength'])
+                    grav_lens_spin = float(grav_lens_params['spin'])
+                    grav_lens_pole = tuple(float(x) for x in grav_lens_params['pole'])
+
+                for prog in (prog_spheres, prog_rings, prog_atmo, prog_atmo_lowres, prog_gpu_orbits, prog_ephem_orbits, prog_point_celestial, prog_starfield, prog_culling_compute, getattr(self, 'prog_hz', None), getattr(self, 'prog_terrain', None)):
+                    if prog is not None:
+                        if 'u_refract_center' in prog:
+                            prog['u_refract_center'].value = refract_center
+                        if 'u_refract_radius' in prog:
+                            prog['u_refract_radius'].value = refract_radius_km
+                        if 'u_refract_max_bend' in prog:
+                            prog['u_refract_max_bend'].value = refract_max_bend
+                        if 'u_refract_scale_height' in prog:
+                            prog['u_refract_scale_height'].value = refract_scale_height
+                        if 'u_refract_pole' in prog:
+                            prog['u_refract_pole'].value = refract_pole
+                        if 'u_refract_oblateness' in prog:
+                            prog['u_refract_oblateness'].value = refract_oblateness
+                        if 'u_grav_lens_center' in prog:
+                            prog['u_grav_lens_center'].value = grav_lens_center
+                        if 'u_grav_lens_rs' in prog:
+                            prog['u_grav_lens_rs'].value = grav_lens_rs
+                        if 'u_grav_lens_radius' in prog:
+                            prog['u_grav_lens_radius'].value = grav_lens_radius
+                        if 'u_grav_lens_type' in prog:
+                            prog['u_grav_lens_type'].value = grav_lens_type
+                        if 'u_grav_lens_enabled' in prog:
+                            prog['u_grav_lens_enabled'].value = grav_lens_enabled
+                        if 'u_grav_lens_strength' in prog:
+                            prog['u_grav_lens_strength'].value = grav_lens_strength
+                        if 'u_grav_lens_spin' in prog:
+                            prog['u_grav_lens_spin'].value = float(grav_lens_spin)
+                        if 'u_grav_lens_pole' in prog:
+                            prog['u_grav_lens_pole'].value = grav_lens_pole
+                        if 'u_au_to_km' in prog:
+                            prog['u_au_to_km'].value = au_to_km_val
+
+                if 'u_is_cloud_pass' in prog_spheres:
+                    prog_spheres['u_is_cloud_pass'].value = False
+
+                ctx.enable(moderngl.DEPTH_TEST)
+                ctx.disable(moderngl.CULL_FACE)
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+
+                # Pass 1: High/Ultra & Low resolved 3D meshes write opaque depth
+                _gq = _perf_gpu_begin(ctx, "gpu_spheres")
+                ctx.depth_mask = True
+                vis_hi_buffer.bind_to_storage_buffer(binding=3)
+                vao_hi.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=2)
+
+                vis_ultra_buffer.bind_to_storage_buffer(binding=3)
+                vao_ultra.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=3)
+
+                vis_lo_buffer.bind_to_storage_buffer(binding=3)
+                vao_lo.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=1)
+
+                # Helper to check if a body has a cloud layer texture
+                def _body_has_clouds(bi, is_cmp=False):
+                    if not self.camera.get("clouds_enabled", True):
+                        return False
+                    if 'u_is_cloud_pass' not in prog_spheres or getattr(self, 'body_textures_ssbo', None) is None:
+                        return False
+                    bdata = bodies_data_cmp if is_cmp else bodies_data
+                    if bi >= len(bdata):
+                        return False
+                    bname = bdata[bi].get('name', '').lower()
+                    cached = self._clouds_exist_cache.get(bname)
+                    if cached is not None:
+                        return cached
+                    manifest_entry = getattr(self.texture_streamer, 'file_manifest', {}).get(bname, {}) if hasattr(self, 'texture_streamer') and self.texture_streamer else {}
+                    c_path = manifest_entry.get('clouds')
+                    has_cloud = False
+                    if c_path and os.path.exists(c_path):
+                        has_cloud = True
+                    elif bdata[bi].get('clouds') or bdata[bi].get('cloud_map'):
+                        has_cloud = True
+                    elif hasattr(self, 'terrain_streamer') and self.terrain_streamer:
+                        b_clouds_dir = os.path.join(self.terrain_streamer.tiles_base_dir, bname, "clouds")
+                        if os.path.isdir(b_clouds_dir):
+                            has_cloud = True
+                    self._clouds_exist_cache[bname] = has_cloud
+                    return has_cloud
+
+                # Pass 1b: Terrain Quadtree LOD (SpaceEngine style) - Multi-Body with Local Frustum Culling
+                prev_active_body_patches = getattr(self, 'terrain_active_body_patches', {})
+                self.terrain_active_body_patches = {}
+                self.terrain_active_cloud_patches = {}
+                self.terrain_last_cloud_patch_count = 0
+                total_patches_rendered = 0
+
+                if active_terrain_bodies and getattr(self, 'terrain_streamer', None) is not None:
+                    patch_res = int(self.camera.get("terrain_patch_res", 32))
+                    res_scale = max(0.6, patch_res / 32.0)
+                    split_fac = float(self.camera.get("terrain_lod_split_factor", 1.0)) * res_scale
+                    max_d = int(self.camera.get("terrain_max_depth", 10))
+                    cam_world_pos_f8 = cam_origin + rel
+
+                    for slot_idx, (b_i, b_name) in enumerate(active_terrain_bodies):
+                        rem_budget = MAX_TERRAIN_PATCHES - total_patches_rendered
+                        if rem_budget <= 0:
+                            break
+
+                        b_r_au = float(all_instances[b_i, 6])
+                        b_r_km = b_r_au * AU_TO_KM
+                        if b_i not in self.planet_quadtrees:
+                            self.planet_quadtrees[b_i] = PlanetQuadtree(b_r_km)
+                        p_quadtree = self.planet_quadtrees[b_i]
+                        p_quadtree.update_radius(b_r_km)
+
+                        if b_i < num_bodies:
+                            b_pos_world = pos_snap_render[b_i]
+                        else:
+                            b_pos_world = self.pos_snap_cmp[b_i - num_bodies] + np.array([self.comparison_offset_au, 0.0, 0.0], dtype='f8')
+
+                        # Compute relative camera vector in double precision (float64) to eliminate
+                        # float32 truncation error regardless of what body is tracked or where cam_origin is!
+                        cam_rel_world_au = cam_world_pos_f8 - b_pos_world
+                        cam_rel_km = (cam_rel_world_au * AU_TO_KM).astype(np.float32)
+                        b_pos_rel_f8 = b_pos_world - cam_origin
+
+                        pole = all_instances[b_i, 9:12]
+                        pole_norm = float(np.linalg.norm(pole))
+                        pole_n = (pole / max(1e-6, pole_norm)).astype(np.float32)
+                        ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        if abs(float(np.dot(pole_n, ref))) > 0.999:
+                            ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                        tangent = np.cross(pole_n, ref)
+                        tangent /= max(1e-6, float(np.linalg.norm(tangent)))
+                        bitangent = np.cross(pole_n, tangent)
+                        b_norm = float(np.linalg.norm(bitangent))
+                        if b_norm > 0:
+                            bitangent /= b_norm
+
+                        p_local_x = float(np.dot(cam_rel_km, tangent))
+                        p_local_y = float(np.dot(cam_rel_km, pole_n))
+                        p_local_z = float(np.dot(cam_rel_km, bitangent))
+
+                        rot_angle = float(all_instances[b_i, 25])
+                        s_r = math.sin(-rot_angle)
+                        c_r = math.cos(-rot_angle)
+                        cam_pos_local = np.array([
+                            p_local_x * c_r - p_local_z * s_r,
+                            p_local_y,
+                            p_local_x * s_r + p_local_z * c_r
+                        ], dtype=np.float32)
+
+                        # Transform world frustum planes into planet local space (km)
+                        R_rot = np.array([
+                            [c_r, 0.0, -s_r],
+                            [0.0, 1.0,  0.0],
+                            [s_r, 0.0,  c_r]
+                        ], dtype=np.float64)
+                        R_frame = np.vstack([tangent, pole_n, bitangent]).astype(np.float64)
+                        R_mat = R_rot @ R_frame # (3, 3)
+
+                        N_world = frustum_planes[:, :3].astype(np.float64)
+                        D_world = frustum_planes[:, 3].astype(np.float64)
+                        N_local = N_world @ R_mat.T
+                        D_local = AU_TO_KM * (np.dot(N_world, b_pos_rel_f8) + D_world)
+
+                        # Widen side frustum planes ONLY if line of sight to body passes through refracting atmosphere or gravitational lens
+                        d_cam_body_km = float(np.linalg.norm(cam_rel_world_au)) * AU_TO_KM
+                        dist_cb_au = float(np.linalg.norm(cam_rel_world_au))
+                        ray_dir = -cam_rel_world_au / max(1e-9, dist_cb_au)
+
+                        is_b_cmp = (b_i >= num_bodies)
+                        b_local_idx = (b_i - num_bodies) if is_b_cmp else b_i
+                        is_refract_host = (refract_params is not None and
+                                           b_local_idx == refract_params.get('body_idx') and
+                                           is_b_cmp == refract_params.get('is_cmp', False))
+                        is_grav_host = (grav_lens_params is not None and
+                                        b_local_idx == grav_lens_params.get('body_idx') and
+                                        is_b_cmp == grav_lens_params.get('is_cmp', False))
+
+                        if refract_max_bend > 1e-6 and not is_refract_host:
+                            refract_pos_world = refract_params['center_world']
+                            v_cr = refract_pos_world - cam_world_pos_f8
+                            t_cr = float(np.dot(v_cr, ray_dir))
+                            if t_cr < dist_cb_au:
+                                t_fwd = max(0.0, t_cr)
+                                d_perp_km = float(np.linalg.norm(v_cr - t_fwd * ray_dir)) * AU_TO_KM
+                                if d_perp_km < (refract_radius_km + 15.0 * refract_scale_height):
+                                    D_local[:4] += (d_cam_body_km * math.tan(refract_max_bend) * 1.5)
+
+                        if grav_lens_enabled and grav_lens_rs > 1e-6 and not is_grav_host:
+                            grav_pos_world = grav_lens_params['center_world']
+                            v_gl = grav_pos_world - cam_world_pos_f8
+                            t_gl = float(np.dot(v_gl, ray_dir))
+                            if t_gl < dist_cb_au:
+                                t_fwd_gl = max(0.0, t_gl)
+                                d_perp_gl_km = float(np.linalg.norm(v_gl - t_fwd_gl * ray_dir)) * AU_TO_KM
+                                if d_perp_gl_km < max(grav_lens_radius * 20.0, grav_lens_rs * 100.0):
+                                    D_local[:4] += (d_cam_body_km * 0.15)
+
+                        local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float32)
+
+                        obl = float(all_instances[b_i, 12])
+                        terrain_body_data = bodies_data[b_i] if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]
+                        elev_min_km, elev_max_km = terrain_body_data.get("height_range_km", [0.0, 8.848])
+                        elev_min_km, elev_max_km = float(elev_min_km), float(elev_max_km)
+                        if not (math.isfinite(elev_min_km) and math.isfinite(elev_max_km) and elev_max_km >= elev_min_km):
+                            elev_min_km, elev_max_km = 0.0, 8.848
+                        elev_span_km = elev_max_km - elev_min_km
+                        has_height = self.terrain_streamer.get_max_lod(b_name, "height") >= 0
+                        height_max_km = max(abs(elev_min_km), abs(elev_max_km)) if has_height else 0.0
+                        alt_km = max(0.0, d_cam_body_km - b_r_km)
+                        # Ground LOD closeness: smoothly adapts the LOD transition distance near the surface.
+                        # alt_factor = 0.0 at ground level, 1.0 at 50 km altitude and above.
+                        alt_factor = min(1.0, alt_km / 50.0)
+                        default_global_dist = 1.0 / max(0.1, float(self.camera.get("terrain_lod_split_factor", 1.0))) if "terrain_lod_distance" not in self.camera else 1.0
+                        global_dist = float(self.camera.get("terrain_lod_distance", default_global_dist))
+                        ground_dist = float(self.camera.get("terrain_ground_lod_distance", 1.0))
+                        # Effective distance multiplier: near the ground, lower ground_dist brings high-quality LOD patches closer to the camera
+                        effective_dist = global_dist * (ground_dist + (1.0 - ground_dist) * alt_factor)
+                        effective_dist = max(0.15, min(5.0, effective_dist))
+                        split_fac = (1.0 / effective_dist) * res_scale
+
+                        body_max_lod = max_d
+
+                        b_cloud_alt_km = 0.0
+                        if _body_has_clouds(b_i, is_cmp=False):
+                            _c_varr = visual_arr
+                            b_cloud_alt_km = float(_c_varr[b_i, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[b_i, 12] > 0 else 3.5
+
+                        body_refract_bend = refract_max_bend if is_refract_host else 0.0
+
                         raw_patches = p_quadtree.traverse_raw(
                             cam_pos_local,
                             fov_deg=float(self.camera["fov"]),
                             screen_height=float(self.fb_height),
-                            max_lod=0,
+                            max_lod=body_max_lod,
                             split_factor=split_fac,
                             obl=obl,
-                            max_patches=min(rem_budget, 6),
-                            frustum_planes=None,
+                            max_patches=rem_budget,
+                            frustum_planes=local_frustum_planes,
                             cloud_alt_km=0.0,
                             refract_bend=body_refract_bend, height_max_km=height_max_km
                         )
                         num_p = len(raw_patches)
 
-                    if num_p > 0:
-                        st = total_patches_rendered
-                        en = st + num_p
-                        b_caster_idx = float(self.caster_idx_map.get(b_i, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
-                        # Batched tile residency lookup: resolve each unique
-                        # tile once instead of one Python call per patch.
-                        slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch_multi(
-                            b_name, ["diffuse", "height"],
-                            raw_patches[:, 4], raw_patches[:, 5],
-                            raw_patches[:, 6], raw_patches[:, 7]
-                        )
-
-                        pack_terrain_patches_jit(
-                            self.terrain_patch_staging, st, raw_patches,
-                            uvs[0], ox_arr[0], oy_arr[0], slots[0], float(b_i),
-                            uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km,
-                            b_caster_idx, float(slot_idx)
-                        )
-
-                        self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
-                        total_patches_rendered += num_p
-
-                    # Decoupled Cloud Quadtree LOD Traversal
-                    if _body_has_clouds(b_i, is_cmp=False) and bool(self.camera.get("clouds_enabled", True)):
-                        max_cloud_disk_lod = self.terrain_streamer.get_max_lod(b_name, "clouds")
-                        if max_cloud_disk_lod >= 0:
-                            cloud_max_d = int(self.camera.get("cloud_max_depth", 3))
-                            cloud_split_fac = float(self.camera.get("cloud_lod_split_factor", 1.0)) * res_scale
-                            cloud_target_lod = min(cloud_max_d, max_cloud_disk_lod)
-                            cloud_r_km = b_r_km + b_cloud_alt_km
-
-                            if b_i not in self.planet_cloud_quadtrees:
-                                self.planet_cloud_quadtrees[b_i] = PlanetQuadtree(cloud_r_km)
-                            p_cloud_quadtree = self.planet_cloud_quadtrees[b_i]
-                            p_cloud_quadtree.update_radius(cloud_r_km)
-
-                            cloud_raw_patches = p_cloud_quadtree.traverse_raw(
+                        if num_p == 0 and rem_budget > 0:
+                            # Fallback: if frustum culling rejected all patches but the sphere is on-screen,
+                            # traverse without frustum planes at LOD 0 to ensure the body never disappears.
+                            raw_patches = p_quadtree.traverse_raw(
                                 cam_pos_local,
                                 fov_deg=float(self.camera["fov"]),
                                 screen_height=float(self.fb_height),
-                                max_lod=cloud_target_lod,
-                                split_factor=cloud_split_fac,
+                                max_lod=0,
+                                split_factor=split_fac,
                                 obl=obl,
-                                max_patches=MAX_TERRAIN_PATCHES,
-                                frustum_planes=local_frustum_planes,
+                                max_patches=min(rem_budget, 6),
+                                frustum_planes=None,
                                 cloud_alt_km=0.0,
-                                refract_bend=body_refract_bend,
-                                height_max_km=0.0
+                                refract_bend=body_refract_bend, height_max_km=height_max_km
                             )
-                            num_cloud_p = len(cloud_raw_patches)
-                            if num_cloud_p == 0:
+                            num_p = len(raw_patches)
+
+                        if num_p > 0:
+                            st = total_patches_rendered
+                            en = st + num_p
+                            b_caster_idx = float(self.caster_idx_map.get(b_i, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
+                            # Batched tile residency lookup: resolve each unique
+                            # tile once instead of one Python call per patch.
+                            slots, uvs, ox_arr, oy_arr = self.terrain_streamer.resolve_tiles_batch_multi(
+                                b_name, ["diffuse", "height"],
+                                raw_patches[:, 4], raw_patches[:, 5],
+                                raw_patches[:, 6], raw_patches[:, 7]
+                            )
+
+                            pack_terrain_patches_jit(
+                                self.terrain_patch_staging, st, raw_patches,
+                                uvs[0], ox_arr[0], oy_arr[0], slots[0], float(b_i),
+                                uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km,
+                                b_caster_idx, float(slot_idx)
+                            )
+
+                            self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
+                            total_patches_rendered += num_p
+
+                        # Decoupled Cloud Quadtree LOD Traversal
+                        if _body_has_clouds(b_i, is_cmp=False) and bool(self.camera.get("clouds_enabled", True)):
+                            max_cloud_disk_lod = self.terrain_streamer.get_max_lod(b_name, "clouds")
+                            if max_cloud_disk_lod >= 0:
+                                cloud_max_d = int(self.camera.get("cloud_max_depth", 3))
+                                cloud_split_fac = float(self.camera.get("cloud_lod_split_factor", 1.0)) * res_scale
+                                cloud_target_lod = min(cloud_max_d, max_cloud_disk_lod)
+                                cloud_r_km = b_r_km + b_cloud_alt_km
+
+                                if b_i not in self.planet_cloud_quadtrees:
+                                    self.planet_cloud_quadtrees[b_i] = PlanetQuadtree(cloud_r_km)
+                                p_cloud_quadtree = self.planet_cloud_quadtrees[b_i]
+                                p_cloud_quadtree.update_radius(cloud_r_km)
+
                                 cloud_raw_patches = p_cloud_quadtree.traverse_raw(
                                     cam_pos_local,
                                     fov_deg=float(self.camera["fov"]),
                                     screen_height=float(self.fb_height),
-                                    max_lod=0,
+                                    max_lod=cloud_target_lod,
                                     split_factor=cloud_split_fac,
                                     obl=obl,
-                                    max_patches=6,
-                                    frustum_planes=None,
+                                    max_patches=MAX_TERRAIN_PATCHES,
+                                    frustum_planes=local_frustum_planes,
                                     cloud_alt_km=0.0,
                                     refract_bend=body_refract_bend,
                                     height_max_km=0.0
                                 )
                                 num_cloud_p = len(cloud_raw_patches)
+                                if num_cloud_p == 0:
+                                    cloud_raw_patches = p_cloud_quadtree.traverse_raw(
+                                        cam_pos_local,
+                                        fov_deg=float(self.camera["fov"]),
+                                        screen_height=float(self.fb_height),
+                                        max_lod=0,
+                                        split_factor=cloud_split_fac,
+                                        obl=obl,
+                                        max_patches=6,
+                                        frustum_planes=None,
+                                        cloud_alt_km=0.0,
+                                        refract_bend=body_refract_bend,
+                                        height_max_km=0.0
+                                    )
+                                    num_cloud_p = len(cloud_raw_patches)
 
-                            if num_cloud_p > 0:
-                                c_slots, c_uvs, c_ox, c_oy = self.terrain_streamer.resolve_tiles_batch(
-                                    b_name, "clouds",
-                                    cloud_raw_patches[:, 4], cloud_raw_patches[:, 5],
-                                    cloud_raw_patches[:, 6], cloud_raw_patches[:, 7]
-                                )
-                                self.terrain_active_cloud_patches[b_i] = (cloud_raw_patches, c_slots, c_uvs, c_ox, c_oy, num_cloud_p)
+                                if num_cloud_p > 0:
+                                    c_slots, c_uvs, c_ox, c_oy = self.terrain_streamer.resolve_tiles_batch(
+                                        b_name, "clouds",
+                                        cloud_raw_patches[:, 4], cloud_raw_patches[:, 5],
+                                        cloud_raw_patches[:, 6], cloud_raw_patches[:, 7]
+                                    )
+                                    self.terrain_active_cloud_patches[b_i] = (cloud_raw_patches, c_slots, c_uvs, c_ox, c_oy, num_cloud_p)
 
-                self.terrain_last_patch_count = total_patches_rendered
-                self.terrain_last_cloud_patch_count = sum(info[5] for info in self.terrain_active_cloud_patches.values())
-                self.terrain_last_triangle_count = (total_patches_rendered + self.terrain_last_cloud_patch_count) * self.terrain_triangles_per_patch
+                    self.terrain_last_patch_count = total_patches_rendered
+                    self.terrain_last_cloud_patch_count = sum(info[5] for info in self.terrain_active_cloud_patches.values())
+                    self.terrain_last_triangle_count = (total_patches_rendered + self.terrain_last_cloud_patch_count) * self.terrain_triangles_per_patch
 
-                if total_patches_rendered > 0:
-                    first_b_i = active_terrain_bodies[0][0]
-                    self.terrain_current_raw_patches = self.terrain_active_body_patches.get(first_b_i, (None,))[0]
-                    self.terrain_current_body_name = active_terrain_bodies[0][1]
-                    self.terrain_current_body_idx = first_b_i
+                    if total_patches_rendered > 0:
+                        first_b_i = active_terrain_bodies[0][0]
+                        self.terrain_current_raw_patches = self.terrain_active_body_patches.get(first_b_i, (None,))[0]
+                        self.terrain_current_body_name = active_terrain_bodies[0][1]
+                        self.terrain_current_body_idx = first_b_i
 
-                    terrain_patch_ssbo.write(self.terrain_patch_staging[:total_patches_rendered].tobytes())
-                    terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
-                    all_instances_buffer.bind_to_storage_buffer(binding=2)
+                        terrain_patch_ssbo.write(self.terrain_patch_staging[:total_patches_rendered].tobytes())
+                        terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
+                        all_instances_buffer.bind_to_storage_buffer(binding=2)
 
-                    self.terrain_streamer.use(location=14)
-                    self.terrain_geometry_cache.prepare(
-                        self.terrain_patch_staging[:total_patches_rendered],
-                        all_instances, dict(active_terrain_bodies),
-                        self.terrain_streamer, patch_res)
-                    self.prog_terrain['u_geometry_cache_enabled'].value = True
-                    self.prog_terrain['u_cache_grid_resolution'].value = patch_res
+                        self.terrain_streamer.use(location=14)
+                        self.terrain_geometry_cache.prepare(
+                            self.terrain_patch_staging[:total_patches_rendered],
+                            all_instances, dict(active_terrain_bodies),
+                            self.terrain_streamer, patch_res)
+                        self.prog_terrain['u_geometry_cache_enabled'].value = True
+                        self.prog_terrain['u_cache_grid_resolution'].value = patch_res
 
-                    ring_gradient_tex.use(location=0)
-                    self.ringshine_map_tex.use(location=8)
-                    self.terrain_streamer.use(location=14)
-                    if 'u_camera_pos' in self.prog_terrain:
-                        self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
-                    if 'u_body_cam_rel_au' in self.prog_terrain:
-                        self._upload_terrain_camera(
-                            [item[0] for item in active_terrain_bodies],
-                            pos_snap_render, cam_origin, rel)
-                    if 'u_is_cloud_pass' in self.prog_terrain:
-                        self.prog_terrain['u_is_cloud_pass'].value = False
-                    if 'u_debug_tiles' in self.prog_terrain:
-                        self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
-                    if 'u_hdr_enabled' in self.prog_terrain:
-                        self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
-                    if 'u_exposure' in self.prog_terrain:
-                        self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+                        ring_gradient_tex.use(location=0)
+                        self.ringshine_map_tex.use(location=8)
+                        self.terrain_streamer.use(location=14)
+                        if 'u_camera_pos' in self.prog_terrain:
+                            self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                        if 'u_body_cam_rel_au' in self.prog_terrain:
+                            self._upload_terrain_camera(
+                                [item[0] for item in active_terrain_bodies],
+                                pos_snap_render, cam_origin, rel)
+                        if 'u_is_cloud_pass' in self.prog_terrain:
+                            self.prog_terrain['u_is_cloud_pass'].value = False
+                        if 'u_debug_tiles' in self.prog_terrain:
+                            self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
+                        if 'u_hdr_enabled' in self.prog_terrain:
+                            self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
+                        if 'u_exposure' in self.prog_terrain:
+                            self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
 
-                    cmd_arr = np.array([self.terrain_triangles_per_patch * 3, total_patches_rendered, 0, 0, 0], dtype=np.uint32)
-                    self.terrain_draw_cmds_buf.write(cmd_arr.tobytes())
-                    self.vao_terrain.render_indirect(self.terrain_draw_cmds_buf, moderngl.TRIANGLES)
+                        cmd_arr = np.array([self.terrain_triangles_per_patch * 3, total_patches_rendered, 0, 0, 0], dtype=np.uint32)
+                        self.terrain_draw_cmds_buf.write(cmd_arr.tobytes())
+                        self.vao_terrain.render_indirect(self.terrain_draw_cmds_buf, moderngl.TRIANGLES)
+                    else:
+                        self.terrain_current_raw_patches = None
+                        self.terrain_current_body_name = None
+                        self.terrain_current_body_idx = -1
                 else:
                     self.terrain_current_raw_patches = None
                     self.terrain_current_body_name = None
                     self.terrain_current_body_idx = -1
-            else:
-                self.terrain_current_raw_patches = None
-                self.terrain_current_body_name = None
-                self.terrain_current_body_idx = -1
-                self.terrain_last_patch_count = 0
-                self.terrain_last_triangle_count = 0
+                    self.terrain_last_patch_count = 0
+                    self.terrain_last_triangle_count = 0
 
 
-            # Pass 2: Dedicated Subpixel / Point Light Pass (apparent_px < 2.5)
-            # Tests depth against scene, blends light, does not write depth
-            ctx.depth_mask = False
-            vis_point_buffer.bind_to_storage_buffer(binding=3)
-            vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
-            _perf_gpu_end(_gq)
+                # Pass 2: Dedicated Subpixel / Point Light Pass (apparent_px < 2.5)
+                # Tests depth against scene, blends light, does not write depth
+                ctx.depth_mask = False
+                vis_point_buffer.bind_to_storage_buffer(binding=3)
+                vao_point.render_indirect(draw_cmds_buffer, moderngl.TRIANGLES, first=0)
+                _perf_gpu_end(_gq)
 
-            # GPU draw-command readback is a full pipeline sync; only pay it
-            # while the triangle HUD is shown — throttled to every 15 frames (~4-10 Hz)
-            # so it never stalls the pipeline on every frame.
-            if self.camera.get("show_triangle_count", False):
-                if not hasattr(self, '_tri_count_frame_counter'):
-                    self._tri_count_frame_counter = 0
-                self._tri_count_frame_counter += 1
-                if self._tri_count_frame_counter % 15 == 0:
-                    try:
-                        raw_cmds = np.frombuffer(draw_cmds_buffer.read(), dtype=np.uint32).reshape((4, 5))
-                        self.sphere_last_triangle_count = int(
-                            raw_cmds[1, 1] * self.sphere_lo_triangles +
-                            raw_cmds[2, 1] * self.sphere_hi_triangles +
-                            raw_cmds[3, 1] * self.sphere_ultra_triangles +
-                            raw_cmds[0, 1] * 2
-                        )
-                    except Exception:
-                        self.sphere_last_triangle_count = 0
-            else:
-                self.sphere_last_triangle_count = 0
-            self.total_last_triangle_count = self.sphere_last_triangle_count + self.terrain_last_triangle_count
+                # GPU draw-command readback is a full pipeline sync; only pay it
+                # while the triangle HUD is shown — throttled to every 15 frames (~4-10 Hz)
+                # so it never stalls the pipeline on every frame.
+                if self.camera.get("show_triangle_count", False):
+                    if not hasattr(self, '_tri_count_frame_counter'):
+                        self._tri_count_frame_counter = 0
+                    self._tri_count_frame_counter += 1
+                    if self._tri_count_frame_counter % 15 == 0:
+                        try:
+                            raw_cmds = np.frombuffer(draw_cmds_buffer.read(), dtype=np.uint32).reshape((4, 5))
+                            self.sphere_last_triangle_count = int(
+                                raw_cmds[1, 1] * self.sphere_lo_triangles +
+                                raw_cmds[2, 1] * self.sphere_hi_triangles +
+                                raw_cmds[3, 1] * self.sphere_ultra_triangles +
+                                raw_cmds[0, 1] * 2
+                            )
+                        except Exception:
+                            self.sphere_last_triangle_count = 0
+                else:
+                    self.sphere_last_triangle_count = 0
+                self.total_last_triangle_count = self.sphere_last_triangle_count + self.terrain_last_triangle_count
 
-            # --- Pass 2: Orbit Lines ---
-            ctx.enable(moderngl.BLEND)
-            ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-            ctx.enable(moderngl.DEPTH_TEST)
-            ctx.depth_mask = True
-            
-            _gq = _perf_gpu_begin(ctx, "gpu_orbits")
-            def draw_orbits():
-                if n_orbits > 0:
-                    orbit_ssbo.bind_to_storage_buffer(binding=0)
-                    orbit_ssbo_out.bind_to_storage_buffer(binding=1)
-                    
-                    if n_orbits_hi > 0:
-                        orbit_ssbo.write(orbits_hi.tobytes(), offset=0)
-                        prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
-                        prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
-                        prog_orbit_compute['u_orbit_res'].value = 4000
-                        prog_orbit_compute['u_base_instance'].value = 0
-                        prog_orbit_compute['u_max_instances'].value = n_orbits_hi
-                        prog_orbit_compute['u_vertex_base_offset'].value = 0
-                        prog_orbit_compute.run((n_orbits_hi * 4000 + 255) // 256, 1, 1)
-                        
-                    if n_orbits_med > 0:
-                        orbit_ssbo.write(orbits_med.tobytes(), offset=n_orbits_hi * 160)
-                        prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
-                        prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
-                        prog_orbit_compute['u_orbit_res'].value = 500
-                        prog_orbit_compute['u_base_instance'].value = n_orbits_hi
-                        prog_orbit_compute['u_max_instances'].value = n_orbits_med
-                        prog_orbit_compute['u_vertex_base_offset'].value = n_orbits_hi * 4000
-                        prog_orbit_compute.run((n_orbits_med * 500 + 255) // 256, 1, 1)
-                        
-                    if n_orbits_low > 0:
-                        orbit_ssbo.write(orbits_low.tobytes(), offset=(n_orbits_hi + n_orbits_med) * 160)
-                        prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
-                        prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
-                        prog_orbit_compute['u_orbit_res'].value = 100
-                        prog_orbit_compute['u_base_instance'].value = n_orbits_hi + n_orbits_med
-                        prog_orbit_compute['u_max_instances'].value = n_orbits_low
-                        prog_orbit_compute['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
-                        prog_orbit_compute.run((n_orbits_low * 100 + 255) // 256, 1, 1)
+                # --- Pass 2: Orbit Lines ---
+                ctx.enable(moderngl.BLEND)
+                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                ctx.enable(moderngl.DEPTH_TEST)
+                ctx.depth_mask = True
 
-                    ctx.memory_barrier()
+                _gq = _perf_gpu_begin(ctx, "gpu_orbits")
+                def draw_orbits():
+                    if n_orbits > 0:
+                        orbit_ssbo.bind_to_storage_buffer(binding=0)
+                        orbit_ssbo_out.bind_to_storage_buffer(binding=1)
 
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    
-                    if n_orbits_hi > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 4000
-                        prog_gpu_orbits['u_base_instance'].value = 0
-                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
-                        
-                    if n_orbits_med > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 500
-                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
-                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
-                        
-                    if n_orbits_low > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 100
-                        prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
-                        prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
+                        if n_orbits_hi > 0:
+                            orbit_ssbo.write(orbits_hi.tobytes(), offset=0)
+                            prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
+                            prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
+                            prog_orbit_compute['u_orbit_res'].value = 4000
+                            prog_orbit_compute['u_base_instance'].value = 0
+                            prog_orbit_compute['u_max_instances'].value = n_orbits_hi
+                            prog_orbit_compute['u_vertex_base_offset'].value = 0
+                            prog_orbit_compute.run((n_orbits_hi * 4000 + 255) // 256, 1, 1)
 
-                render_ephem_trajs = None
-                is_gen = getattr(self, "is_generic_ephemeris", False) and getattr(self, "_generic_ephem_trajectories", None)
-                is_spc = getattr(self, "_ephem_spacecraft_trajectories", None) and len(self._ephem_spacecraft_trajectories) > 0
-                center_key = "center_idx" if is_gen else "parent_idx"
-                if is_gen:
-                    render_ephem_trajs = self._generic_ephem_trajectories
-                elif is_spc:
-                    render_ephem_trajs = self._ephem_spacecraft_trajectories
+                        if n_orbits_med > 0:
+                            orbit_ssbo.write(orbits_med.tobytes(), offset=n_orbits_hi * 160)
+                            prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
+                            prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
+                            prog_orbit_compute['u_orbit_res'].value = 500
+                            prog_orbit_compute['u_base_instance'].value = n_orbits_hi
+                            prog_orbit_compute['u_max_instances'].value = n_orbits_med
+                            prog_orbit_compute['u_vertex_base_offset'].value = n_orbits_hi * 4000
+                            prog_orbit_compute.run((n_orbits_med * 500 + 255) // 256, 1, 1)
 
-                if render_ephem_trajs:
-                    if 'projection' in prog_ephem_orbits:
-                        prog_ephem_orbits['projection'].write(projection)
-                    if 'view_rot' in prog_ephem_orbits:
-                        prog_ephem_orbits['view_rot'].write(view_rot)
-                    if 'u_cam_pos_double' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    if 'u_far' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_far'].value = far
-                    if 'u_depth_C' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_depth_C'].value = depth_C
+                        if n_orbits_low > 0:
+                            orbit_ssbo.write(orbits_low.tobytes(), offset=(n_orbits_hi + n_orbits_med) * 160)
+                            prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
+                            prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
+                            prog_orbit_compute['u_orbit_res'].value = 100
+                            prog_orbit_compute['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                            prog_orbit_compute['u_max_instances'].value = n_orbits_low
+                            prog_orbit_compute['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
+                            prog_orbit_compute.run((n_orbits_low * 100 + 255) // 256, 1, 1)
 
-                    # Current simulation ET
-                    cur_et = 0.0
-                    if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
-                        et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
-                        if et_epoch is None:
-                            epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
-                            et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
-                        cur_et = et_epoch + display_t * 365.25 * 86400.0
-                    elif getattr(self, "is_generic_ephemeris", False):
-                        et_epoch = getattr(sys_mgr_spice, "active_epoch_et", 0.0)
-                        cur_et = et_epoch + display_t * 365.25 * 86400.0
+                        ctx.memory_barrier()
 
-                    trail_sec = float(self.camera.get("ephem_trail_days", 30.0)) * 86400.0
-                    lead_sec = float(self.camera.get("ephem_lead_days", 10.0)) * 86400.0
-                    fade_mode = int(self.camera.get("ephem_orbit_mode", 0))
-                    hide_outside = 1 if self.camera.get("ephem_hide_outside", True) else 0
-                    ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
+                        prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
 
-                    if 'u_current_et' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_current_et'].value = float(cur_et)
-                    if 'u_trail_sec' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_trail_sec'].value = float(trail_sec)
-                    if 'u_lead_sec' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_lead_sec'].value = float(lead_sec)
-                    if 'u_fade_mode' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_fade_mode'].value = int(fade_mode)
-                    if 'u_hide_outside' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_hide_outside'].value = int(hide_outside)
+                        if n_orbits_hi > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 4000
+                            prog_gpu_orbits['u_base_instance'].value = 0
+                            prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=n_orbits_hi)
 
-                    now_wall = time.time()
-                    for traj in render_ephem_trajs:
-                        sp_id = traj.get("spice_id")
-                        obs_id = traj.get("observer_id", 0)
-                        et_start = traj.get("et_start", -1e20)
-                        et_end = traj.get("et_end", 1e20)
+                        if n_orbits_med > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 500
+                            prog_gpu_orbits['u_base_instance'].value = n_orbits_hi
+                            prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=n_orbits_med)
 
-                        is_outside = (et_start < et_end) and (cur_et < et_start or cur_et > et_end)
-                        if is_outside and hide_outside:
-                            continue
+                        if n_orbits_low > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 100
+                            prog_gpu_orbits['u_base_instance'].value = n_orbits_hi + n_orbits_med
+                            prog_gpu_orbits['u_vertex_base_offset'].value = n_orbits_hi * 4000 + n_orbits_med * 500
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=n_orbits_low)
 
-                        def _update_traj_vbo(t_obj, s_start, s_end, f_mode):
-                            try:
-                                res = sys_mgr_spice.get_trajectory_polyline(
-                                    sp_id, observer_id=obs_id, num_samples=ephem_pts_count,
-                                    return_times=True, et_start=s_start, et_end=s_end
-                                )
-                                if res is not None:
-                                    pts, times, _ = res
-                                    if len(pts) >= 2:
-                                        pts_4d = np.column_stack((pts, times)).astype(np.float32)
-                                        raw_b = pts_4d.tobytes()
-                                        if t_obj.get("count") == len(pts):
-                                            t_obj["vbo"].write(raw_b)
-                                        else:
-                                            try:
-                                                t_obj["vbo"].release()
-                                                t_obj["vao"].release()
-                                            except Exception:
-                                                pass
-                                            t_obj["vbo"] = ctx.buffer(raw_b)
-                                            t_obj["vao"] = ctx.vertex_array(prog_ephem_orbits, [(t_obj["vbo"], '3f 1f', 'in_pos', 'in_time')])
-                                            t_obj["count"] = len(pts)
-                                        t_obj["last_sample_center"] = cur_et
-                                        t_obj["last_fade_mode"] = f_mode
-                                        t_obj["last_pts_count"] = ephem_pts_count
-                                        t_obj["last_trail_sec"] = trail_sec
-                                        t_obj["last_lead_sec"] = lead_sec
-                                        t_obj["last_resample_wall_time"] = now_wall
-                            except Exception as e:
-                                print(f"[Ephem] Polyline resample error: {e}")
+                    render_ephem_trajs = None
+                    is_gen = getattr(self, "is_generic_ephemeris", False) and getattr(self, "_generic_ephem_trajectories", None)
+                    is_spc = getattr(self, "_ephem_spacecraft_trajectories", None) and len(self._ephem_spacecraft_trajectories) > 0
+                    center_key = "center_idx" if is_gen else "parent_idx"
+                    if is_gen:
+                        render_ephem_trajs = self._generic_ephem_trajectories
+                    elif is_spc:
+                        render_ephem_trajs = self._ephem_spacecraft_trajectories
 
-                        # Dynamic sliding window / full mission sampling
-                        if fade_mode == 0:
-                            # 2x buffered window margin to minimize resample frequency
-                            buf_trail = trail_sec * 2.0
-                            buf_lead = lead_sec * 2.0
-                            samp_start = max(et_start, cur_et - buf_trail) if et_start < et_end else (cur_et - buf_trail)
-                            samp_end = min(et_end, cur_et + buf_lead) if et_start < et_end else (cur_et + buf_lead)
+                    if render_ephem_trajs:
+                        if 'projection' in prog_ephem_orbits:
+                            prog_ephem_orbits['projection'].write(projection)
+                        if 'view_rot' in prog_ephem_orbits:
+                            prog_ephem_orbits['view_rot'].write(view_rot)
+                        if 'u_cam_pos_double' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+                        if 'u_far' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_far'].value = far
+                        if 'u_depth_C' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_depth_C'].value = depth_C
 
-                            if samp_start >= samp_end:
+                        # Current simulation ET
+                        cur_et = 0.0
+                        if ephemeris_mode_active and sys_mgr_spice.kernels_loaded:
+                            et_epoch = getattr(sys_mgr_spice, "active_epoch_et", None)
+                            if et_epoch is None:
+                                epoch_dt = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+                                et_epoch = sys_mgr_spice.datetime_to_et(epoch_dt)
+                            cur_et = et_epoch + display_t * 365.25 * 86400.0
+                        elif getattr(self, "is_generic_ephemeris", False):
+                            et_epoch = getattr(sys_mgr_spice, "active_epoch_et", 0.0)
+                            cur_et = et_epoch + display_t * 365.25 * 86400.0
+
+                        trail_sec = float(self.camera.get("ephem_trail_days", 30.0)) * 86400.0
+                        lead_sec = float(self.camera.get("ephem_lead_days", 10.0)) * 86400.0
+                        fade_mode = int(self.camera.get("ephem_orbit_mode", 0))
+                        hide_outside = 1 if self.camera.get("ephem_hide_outside", True) else 0
+                        ephem_pts_count = int(self.camera.get("ephem_orbit_points", 5000))
+
+                        if 'u_current_et' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_current_et'].value = float(cur_et)
+                        if 'u_trail_sec' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_trail_sec'].value = float(trail_sec)
+                        if 'u_lead_sec' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_lead_sec'].value = float(lead_sec)
+                        if 'u_fade_mode' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_fade_mode'].value = int(fade_mode)
+                        if 'u_hide_outside' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_hide_outside'].value = int(hide_outside)
+
+                        now_wall = time.time()
+                        for traj in render_ephem_trajs:
+                            sp_id = traj.get("spice_id")
+                            obs_id = traj.get("observer_id", 0)
+                            et_start = traj.get("et_start", -1e20)
+                            et_end = traj.get("et_end", 1e20)
+
+                            is_outside = (et_start < et_end) and (cur_et < et_start or cur_et > et_end)
+                            if is_outside and hide_outside:
                                 continue
 
-                            needs_resample = False
-                            if traj.get("last_fade_mode") != 0:
-                                needs_resample = True
-                            elif traj.get("last_pts_count") != ephem_pts_count:
-                                needs_resample = True
-                            elif traj.get("last_trail_sec") != trail_sec or traj.get("last_lead_sec") != lead_sec:
-                                needs_resample = True
-                            elif traj.get("last_sample_center") is None:
-                                needs_resample = True
+                            def _update_traj_vbo(t_obj, s_start, s_end, f_mode):
+                                try:
+                                    res = sys_mgr_spice.get_trajectory_polyline(
+                                        sp_id, observer_id=obs_id, num_samples=ephem_pts_count,
+                                        return_times=True, et_start=s_start, et_end=s_end
+                                    )
+                                    if res is not None:
+                                        pts, times, _ = res
+                                        if len(pts) >= 2:
+                                            pts_4d = np.column_stack((pts, times)).astype(np.float32)
+                                            raw_b = pts_4d.tobytes()
+                                            if t_obj.get("count") == len(pts):
+                                                t_obj["vbo"].write(raw_b)
+                                            else:
+                                                try:
+                                                    t_obj["vbo"].release()
+                                                    t_obj["vao"].release()
+                                                except Exception:
+                                                    pass
+                                                t_obj["vbo"] = ctx.buffer(raw_b)
+                                                t_obj["vao"] = ctx.vertex_array(prog_ephem_orbits, [(t_obj["vbo"], '3f 1f', 'in_pos', 'in_time')])
+                                                t_obj["count"] = len(pts)
+                                            t_obj["last_sample_center"] = cur_et
+                                            t_obj["last_fade_mode"] = f_mode
+                                            t_obj["last_pts_count"] = ephem_pts_count
+                                            t_obj["last_trail_sec"] = trail_sec
+                                            t_obj["last_lead_sec"] = lead_sec
+                                            t_obj["last_resample_wall_time"] = now_wall
+                                except Exception as e:
+                                    print(f"[Ephem] Polyline resample error: {e}")
+
+                            # Dynamic sliding window / full mission sampling
+                            if fade_mode == 0:
+                                # 2x buffered window margin to minimize resample frequency
+                                buf_trail = trail_sec * 2.0
+                                buf_lead = lead_sec * 2.0
+                                samp_start = max(et_start, cur_et - buf_trail) if et_start < et_end else (cur_et - buf_trail)
+                                samp_end = min(et_end, cur_et + buf_lead) if et_start < et_end else (cur_et + buf_lead)
+
+                                if samp_start >= samp_end:
+                                    continue
+
+                                needs_resample = False
+                                if traj.get("last_fade_mode") != 0:
+                                    needs_resample = True
+                                elif traj.get("last_pts_count") != ephem_pts_count:
+                                    needs_resample = True
+                                elif traj.get("last_trail_sec") != trail_sec or traj.get("last_lead_sec") != lead_sec:
+                                    needs_resample = True
+                                elif traj.get("last_sample_center") is None:
+                                    needs_resample = True
+                                else:
+                                    shift = cur_et - traj["last_sample_center"]
+                                    if shift > 0.4 * lead_sec or shift < -0.4 * trail_sec:
+                                        if now_wall - traj.get("last_resample_wall_time", 0.0) >= 0.08:
+                                            needs_resample = True
+
+                                if needs_resample and sp_id is not None:
+                                    _update_traj_vbo(traj, samp_start, samp_end, 0)
+                            elif fade_mode == 1:
+                                needs_resample = False
+                                if traj.get("last_fade_mode") != 1:
+                                    needs_resample = True
+                                elif traj.get("last_pts_count") != ephem_pts_count:
+                                    needs_resample = True
+                                elif traj.get("last_sample_center") is None:
+                                    needs_resample = True
+
+                                if needs_resample and sp_id is not None:
+                                    _update_traj_vbo(traj, None, None, 1)
+
+                            if traj.get("count", 0) < 2:
+                                continue
+
+                            c_pos_cam = np.zeros(3, dtype=np.float32)
+                            c_idx = traj.get(center_key)
+                            if c_idx is not None and 0 <= c_idx < num_bodies:
+                                c_pos_cam = (pos_snap_render[c_idx] - cam_world_pos_f8).astype(np.float32)
                             else:
-                                shift = cur_et - traj["last_sample_center"]
-                                if shift > 0.4 * lead_sec or shift < -0.4 * trail_sec:
-                                    if now_wall - traj.get("last_resample_wall_time", 0.0) >= 0.08:
-                                        needs_resample = True
+                                c_pos_cam = (-cam_world_pos_f8).astype(np.float32)
 
-                            if needs_resample and sp_id is not None:
-                                _update_traj_vbo(traj, samp_start, samp_end, 0)
-                        elif fade_mode == 1:
-                            needs_resample = False
-                            if traj.get("last_fade_mode") != 1:
-                                needs_resample = True
-                            elif traj.get("last_pts_count") != ephem_pts_count:
-                                needs_resample = True
-                            elif traj.get("last_sample_center") is None:
-                                needs_resample = True
+                            if 'u_bary_rel_cam' in prog_ephem_orbits:
+                                prog_ephem_orbits['u_bary_rel_cam'].value = tuple(c_pos_cam)
+                            if 'u_color' in prog_ephem_orbits:
+                                prog_ephem_orbits['u_color'].value = tuple(traj["color"][:3])
+                            if 'u_mission_start_et' in prog_ephem_orbits:
+                                prog_ephem_orbits['u_mission_start_et'].value = float(traj.get("et_start", -1e20))
+                            if 'u_mission_end_et' in prog_ephem_orbits:
+                                prog_ephem_orbits['u_mission_end_et'].value = float(traj.get("et_end", 1e20))
+                            traj["vao"].render(moderngl.LINE_STRIP, vertices=traj["count"])
 
-                            if needs_resample and sp_id is not None:
-                                _update_traj_vbo(traj, None, None, 1)
+                    if self.comparison_enabled and self.n_orbits_cmp > 0:
+                        orbit_ssbo.bind_to_storage_buffer(binding=0)
+                        orbit_ssbo_out.bind_to_storage_buffer(binding=1)
 
-                        if traj.get("count", 0) < 2:
+                        if self.n_orbits_hi_cmp > 0:
+                            orbit_ssbo.write(orbits_hi_cmp.tobytes(), offset=0)
+                            prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
+                            prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
+                            prog_orbit_compute['u_orbit_res'].value = 4000
+                            prog_orbit_compute['u_base_instance'].value = 0
+                            prog_orbit_compute['u_max_instances'].value = self.n_orbits_hi_cmp
+                            prog_orbit_compute['u_vertex_base_offset'].value = 0
+                            prog_orbit_compute.run((self.n_orbits_hi_cmp * 4000 + 255) // 256, 1, 1)
+
+                        if self.n_orbits_med_cmp > 0:
+                            orbit_ssbo.write(orbits_med_cmp.tobytes(), offset=self.n_orbits_hi_cmp * 160)
+                            prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
+                            prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
+                            prog_orbit_compute['u_orbit_res'].value = 500
+                            prog_orbit_compute['u_base_instance'].value = self.n_orbits_hi_cmp
+                            prog_orbit_compute['u_max_instances'].value = self.n_orbits_med_cmp
+                            prog_orbit_compute['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
+                            prog_orbit_compute.run((self.n_orbits_med_cmp * 500 + 255) // 256, 1, 1)
+
+                        if self.n_orbits_low_cmp > 0:
+                            orbit_ssbo.write(orbits_low_cmp.tobytes(), offset=(self.n_orbits_hi_cmp + self.n_orbits_med_cmp) * 160)
+                            prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
+                            prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
+                            prog_orbit_compute['u_orbit_res'].value = 100
+                            prog_orbit_compute['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
+                            prog_orbit_compute['u_max_instances'].value = self.n_orbits_low_cmp
+                            prog_orbit_compute['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
+                            prog_orbit_compute.run((self.n_orbits_low_cmp * 100 + 255) // 256, 1, 1)
+
+                        ctx.memory_barrier()
+
+                        prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
+
+                        if self.n_orbits_hi_cmp > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 4000
+                            prog_gpu_orbits['u_base_instance'].value = 0
+                            prog_gpu_orbits['u_vertex_base_offset'].value = 0
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
+
+                        if self.n_orbits_med_cmp > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 500
+                            prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
+                            prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
+
+                        if self.n_orbits_low_cmp > 0:
+                            prog_gpu_orbits['u_orbit_res'].value = 100
+                            prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
+                            prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
+                            vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
+
+                has_spacecraft_orbits = len(getattr(self, "_ephem_spacecraft_trajectories", [])) > 0
+                has_generic_orbits = getattr(self, "is_generic_ephemeris", False) and len(getattr(self, "_generic_ephem_trajectories", [])) > 0
+                if show_orbits and (n_orbits > 0 or has_spacecraft_orbits or has_generic_orbits or (self.comparison_enabled and self.n_orbits_cmp > 0)):
+                    if self.orbit_msaa_fbo is not None:
+                        # Orbit lines get their own MSAA buffer; the resolved result is
+                        # blended back over the (non-MSAA) scene afterwards.
+                        self.orbit_msaa_fbo.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.clear(0.0, 0.0, 0.0, 0.0)
+                        if self.depth_texture:
+                            self.depth_texture.use(location=9)
+                        prog_gpu_orbits['u_manual_occlusion'].value = 1
+                        if 'u_manual_occlusion' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_manual_occlusion'].value = 1
+                        draw_orbits()
+                        ctx.copy_framebuffer(self.orbit_resolve_fbo, self.orbit_msaa_fbo)
+                        self.hdr_resolve_fbo.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.disable(moderngl.DEPTH_TEST)
+                        self.orbit_resolved_tex.use(location=2)
+                        self.prog_atmo_composite['u_atmo_texture'].value = 2
+                        self.quad_vao_atmo_comp.render(moderngl.TRIANGLE_STRIP)
+                        ctx.enable(moderngl.DEPTH_TEST)
+                    else:
+                        prog_gpu_orbits['u_manual_occlusion'].value = 0
+                        if 'u_manual_occlusion' in prog_ephem_orbits:
+                            prog_ephem_orbits['u_manual_occlusion'].value = 0
+                        draw_orbits()
+                _perf_gpu_end(_gq)
+
+                def render_atmosphere_pass(clip_mode, atmos_to_render, is_lowres=False):
+                    if not atmos_to_render:
+                        return
+                    if not is_lowres:
+                        ctx.enable(moderngl.BLEND)
+                        gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+                    else:
+                        ctx.disable(moderngl.BLEND)
+                    ctx.depth_func = '<='
+                    ctx.enable(moderngl.CULL_FACE)
+                    ctx.cull_face = 'front'
+                    ctx.disable(moderngl.DEPTH_TEST)
+                    ctx.depth_mask = False
+
+                    cur_prog = prog_atmo_lowres if is_lowres else prog_atmo
+                    cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
+
+                    if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
+                    if 'u_aerial_enabled' in cur_prog: cur_prog['u_aerial_enabled'].value = False
+                    if 'u_atmo_shadow_method' in cur_prog:
+                        cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
+                    if 'u_bounded_shadows' in cur_prog:
+                        cur_prog['u_bounded_shadows'].value = bool(self.camera.get("atmo_bounded_shadows", True))
+                    if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
+                        shadow_method = int(self.camera.get("atmo_shadow_method", 1))
+                        if shadow_method in (1, 2):
+                            K_def = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
+                        else:
+                            # Default station grid (uniform in u); ringed bodies override per-draw below.
+                            K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
+                        grid_bytes = _STATION_GRID_BYTES_CACHE.get(K_def)
+                        if grid_bytes is None:
+                            _g = np.zeros((9, 4), dtype='f4')
+                            _nb = min(K_def + 1, _g.size)
+                            _g.ravel()[:_nb] = np.linspace(0.0, 1.0, _nb)
+                            grid_bytes = _g.tobytes()
+                            _STATION_GRID_BYTES_CACHE[K_def] = grid_bytes
+                        if 'u_ring_station_cells' in cur_prog:
+                            cur_prog['u_ring_station_cells'].write(grid_bytes)
+                        cur_prog['u_ring_station_count'].value = K_def
+                    if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
+                    if 'u_atmo_noise_type' in cur_prog: cur_prog['u_atmo_noise_type'].value = int(self.camera.get("atmo_noise_type", 0))
+                    if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
+
+                    is_temporal = self.camera.get("atmo_temporal_accum", True) and getattr(self, "prev_atmo_view_proj", None) is not None
+                    hist_valid = is_temporal and self.atmo_history_valid.get(clip_mode, False)
+                    temporal_alpha = 1.0 - float(self.camera.get("atmo_temporal_blend", 0.90))
+
+                    if 'u_temporal_accum' in cur_prog: cur_prog['u_temporal_accum'].value = is_temporal
+                    if 'u_history_valid' in cur_prog: cur_prog['u_history_valid'].value = hist_valid
+                    if 'u_temporal_alpha' in cur_prog: cur_prog['u_temporal_alpha'].value = temporal_alpha
+                    if 'u_prev_exposure' in cur_prog: cur_prog['u_prev_exposure'].value = float(getattr(self, "prev_atmo_exposure", self.camera.get("exposure", 1.0)))
+                    if 'u_exposure' in cur_prog: cur_prog['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+                    if 'u_prev_view_proj' in cur_prog and getattr(self, "prev_atmo_view_proj", None) is not None:
+                        cur_prog['u_prev_view_proj'].write(self.prev_atmo_view_proj)
+
+                    if 'u_num_ring_planes' in cur_prog: cur_prog['u_num_ring_planes'].value = n_ring_planes
+                    if n_ring_planes > 0:
+                        if 'u_ring_center' in cur_prog: cur_prog['u_ring_center'].write(ring_centers_buf)
+                        if 'u_ring_normal' in cur_prog: cur_prog['u_ring_normal'].write(ring_normals_buf)
+                        if 'u_ring_params' in cur_prog: cur_prog['u_ring_params'].write(ring_params_buf)
+                        if 'u_ring_coplanar_mask' in cur_prog: cur_prog['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
+                        ring_gradient_tex.use(location=0)
+                        if atmo_quality in (2, 3):
+                            self.surface_ring_shadow_filter.bind()
+                        if ring_shadow_tex is not None:
+                            ring_shadow_tex.use(location=13)
+
+                    if self.stbn_tex is not None:
+                        self.stbn_tex.use(location=19)
+
+                    if 'u_atmo_clip_mode' in cur_prog:
+                        cur_prog['u_atmo_clip_mode'].value = clip_mode
+                    self.atmo_ssbo.bind_to_storage_buffer(binding=8)
+
+                    # Reuse pre-built lookup table
+                    atmo_lookup = atmo_by_body
+                    atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
+
+                    # Reuse persistent scratch arrays
+                    active_casters_buf = self._atmo_active_casters_buf
+                    active_poles_obl_buf = self._atmo_active_poles_obl_buf
+                    active_caster_r_minor_buf = self._atmo_active_caster_r_minor_buf
+                    active_atmos_buf = self._atmo_active_atmos_buf
+                    active_scale_height_buf = self._atmo_active_scale_height_buf
+                    active_max_bend_buf = self._atmo_active_max_bend_buf
+                    active_caster_ozone_buf = self._atmo_active_caster_ozone_buf
+
+                    for sq_dist, atmo, is_cmp in atmos_to_render:
+                        bi = atmo['body_idx']
+                        if is_cmp:
+                            body_pos_rel = cmp_pos_rel[bi].astype('f4')
+                            body_idx_in_unified = num_bodies + bi
+                            prev_offset = self.prev_atmo_body_offsets_cmp.get(bi, body_pos_rel)
+                        else:
+                            body_pos_rel = pos_rel_all[bi]
+                            body_idx_in_unified = bi
+                            prev_offset = self.prev_atmo_body_offsets.get(bi, body_pos_rel)
+                        if 'u_prev_body_offset' in cur_prog:
+                            cur_prog['u_prev_body_offset'].write(prev_offset.astype('f4'))
+
+                        dist_to_body = math.sqrt(sq_dist)
+                        apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
+                        if apparent_px < 2.0:
                             continue
 
-                        c_pos_cam = np.zeros(3, dtype=np.float32)
-                        c_idx = traj.get(center_key)
-                        if c_idx is not None and 0 <= c_idx < num_bodies:
-                            c_pos_cam = (pos_snap_render[c_idx] - cam_world_pos_f8).astype(np.float32)
+                        if atmo_quality == 1:
+                            n_samples = max(4, self.camera.get("atmo_steps_max", 32) // 2)
                         else:
-                            c_pos_cam = (-cam_world_pos_f8).astype(np.float32)
+                            n_samples = self.camera.get("atmo_steps_max", 32)
 
-                        if 'u_bary_rel_cam' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_bary_rel_cam'].value = tuple(c_pos_cam)
-                        if 'u_color' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_color'].value = tuple(traj["color"][:3])
-                        if 'u_mission_start_et' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_mission_start_et'].value = float(traj.get("et_start", -1e20))
-                        if 'u_mission_end_et' in prog_ephem_orbits:
-                            prog_ephem_orbits['u_mission_end_et'].value = float(traj.get("et_end", 1e20))
-                        traj["vao"].render(moderngl.LINE_STRIP, vertices=traj["count"])
+                        if is_cmp:
+                            mass_sm = self.mass_snap_cmp[atmo['body_idx']]
+                        else:
+                            mass_sm = mass_snap[atmo['body_idx']]
 
-                if self.comparison_enabled and self.n_orbits_cmp > 0:
-                    orbit_ssbo.bind_to_storage_buffer(binding=0)
-                    orbit_ssbo_out.bind_to_storage_buffer(binding=1)
+                        # LUT should already be built cleanly before the pass
+                        if 'lut_tex' in atmo and atmo['lut_tex']:
+                            atmo['lut_tex'].use(location=1)
+                        if 'lut_multi_scatter' in atmo:
+                            atmo['lut_multi_scatter'].use(location=3)
 
-                    if self.n_orbits_hi_cmp > 0:
-                        orbit_ssbo.write(orbits_hi_cmp.tobytes(), offset=0)
-                        prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
-                        prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
-                        prog_orbit_compute['u_orbit_res'].value = 4000
-                        prog_orbit_compute['u_base_instance'].value = 0
-                        prog_orbit_compute['u_max_instances'].value = self.n_orbits_hi_cmp
-                        prog_orbit_compute['u_vertex_base_offset'].value = 0
-                        prog_orbit_compute.run((self.n_orbits_hi_cmp * 4000 + 255) // 256, 1, 1)
+                        props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
+                        scaled_intensity = atmo['intensity']
+                        beta_mie_val = atmo.get('beta_mie', 2.0e-6)
+                        beta_mie_coeffs = compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4')
 
-                    if self.n_orbits_med_cmp > 0:
-                        orbit_ssbo.write(orbits_med_cmp.tobytes(), offset=self.n_orbits_hi_cmp * 160)
-                        prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
-                        prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
-                        prog_orbit_compute['u_orbit_res'].value = 500
-                        prog_orbit_compute['u_base_instance'].value = self.n_orbits_hi_cmp
-                        prog_orbit_compute['u_max_instances'].value = self.n_orbits_med_cmp
-                        prog_orbit_compute['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
-                        prog_orbit_compute.run((self.n_orbits_med_cmp * 500 + 255) // 256, 1, 1)
+                        f = float(all_instances[body_idx_in_unified, 12])
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
 
-                    if self.n_orbits_low_cmp > 0:
-                        orbit_ssbo.write(orbits_low_cmp.tobytes(), offset=(self.n_orbits_hi_cmp + self.n_orbits_med_cmp) * 160)
-                        prog_orbit_compute['u_fade_dir'].value = orbit_fade_dir
-                        prog_orbit_compute['u_min_alpha'].value = orbit_min_alpha
-                        prog_orbit_compute['u_orbit_res'].value = 100
-                        prog_orbit_compute['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
-                        prog_orbit_compute['u_max_instances'].value = self.n_orbits_low_cmp
-                        prog_orbit_compute['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
-                        prog_orbit_compute.run((self.n_orbits_low_cmp * 100 + 255) // 256, 1, 1)
-                        
-                    ctx.memory_barrier()
+                        # CPU-side active neighbor culling (parent and children)
+                        active_indices = []
+                        if is_cmp:
+                            p_snap = self.parent_snap_cmp
+                            p_idx = int(p_snap[bi]) if bi < len(p_snap) else -1
+                            if p_idx >= 0 and p_idx != self.star_idx_cmp:
+                                active_indices.append(num_bodies + p_idx)
+                            for child_bi in range(self.num_bodies_cmp):
+                                if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
+                                    active_indices.append(num_bodies + child_bi)
+                        else:
+                            p_snap = parent_snap
+                            p_idx = int(p_snap[bi]) if bi < len(p_snap) else -1
+                            if p_idx >= 0 and p_idx != star_idx:
+                                active_indices.append(p_idx)
+                            for child_bi in range(num_bodies):
+                                if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
+                                    active_indices.append(child_bi)
 
-                    prog_gpu_orbits['u_cam_pos_double'].value = (cam_world_pos_f8[0], cam_world_pos_f8[1], cam_world_pos_f8[2], 1.0)
-                    
-                    if self.n_orbits_hi_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 4000
-                        prog_gpu_orbits['u_base_instance'].value = 0
-                        prog_gpu_orbits['u_vertex_base_offset'].value = 0
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=4000, instances=self.n_orbits_hi_cmp)
-                        
-                    if self.n_orbits_med_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 500
-                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp
-                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=500, instances=self.n_orbits_med_cmp)
-                        
-                    if self.n_orbits_low_cmp > 0:
-                        prog_gpu_orbits['u_orbit_res'].value = 100
-                        prog_gpu_orbits['u_base_instance'].value = self.n_orbits_hi_cmp + self.n_orbits_med_cmp
-                        prog_gpu_orbits['u_vertex_base_offset'].value = self.n_orbits_hi_cmp * 4000 + self.n_orbits_med_cmp * 500
-                        vao_gpu_orbits.render(moderngl.LINE_STRIP, vertices=100, instances=self.n_orbits_low_cmp)
+                        # CPU-side geometric eclipse culling: only keep casters that can geometrically
+                        # cast an eclipse on this atmosphere. A caster is kept if it can eclipse ANY of
+                        # the (up to 4) baked stars, so multi-star systems don't lose secondary-star
+                        # eclipses (Mode 3's Sky-View LUT bake consumes all star slots).
+                        if active_indices:
+                            atmo_rad_au = float(atmo['atmo_radius_au'])
+                            _any_star_valid = False
+                            filtered_active = []
+                            for idx_u in active_indices:
+                                is_c_cmp = (idx_u >= num_bodies)
+                                c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
+                                pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
+                                rad_c = float(self.body_radii_cmp[c_local_idx] if is_cmp else body_radii[c_local_idx])
 
-            has_spacecraft_orbits = len(getattr(self, "_ephem_spacecraft_trajectories", [])) > 0
-            has_generic_orbits = getattr(self, "is_generic_ephemeris", False) and len(getattr(self, "_generic_ephem_trajectories", [])) > 0
-            if show_orbits and (n_orbits > 0 or has_spacecraft_orbits or has_generic_orbits or (self.comparison_enabled and self.n_orbits_cmp > 0)):
-                if self.orbit_msaa_fbo is not None:
-                    # Orbit lines get their own MSAA buffer; the resolved result is
-                    # blended back over the (non-MSAA) scene afterwards.
-                    self.orbit_msaa_fbo.use()
-                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                    ctx.clear(0.0, 0.0, 0.0, 0.0)
-                    if self.depth_texture:
-                        self.depth_texture.use(location=9)
-                    prog_gpu_orbits['u_manual_occlusion'].value = 1
-                    if 'u_manual_occlusion' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_manual_occlusion'].value = 1
-                    draw_orbits()
-                    ctx.copy_framebuffer(self.orbit_resolve_fbo, self.orbit_msaa_fbo)
-                    self.hdr_resolve_fbo.use()
-                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                    ctx.disable(moderngl.DEPTH_TEST)
-                    self.orbit_resolved_tex.use(location=2)
-                    self.prog_atmo_composite['u_atmo_texture'].value = 2
-                    self.quad_vao_atmo_comp.render(moderngl.TRIANGLE_STRIP)
-                    ctx.enable(moderngl.DEPTH_TEST)
-                else:
-                    prog_gpu_orbits['u_manual_occlusion'].value = 0
-                    if 'u_manual_occlusion' in prog_ephem_orbits:
-                        prog_ephem_orbits['u_manual_occlusion'].value = 0
-                    draw_orbits()
-            _perf_gpu_end(_gq)
+                                D = pos_c - body_pos_rel
+                                d_sq = float(D[0]**2 + D[1]**2 + D[2]**2)
 
-            def render_atmosphere_pass(clip_mode, atmos_to_render, is_lowres=False):
-                if not atmos_to_render:
-                    return
-                if not is_lowres:
-                    ctx.enable(moderngl.BLEND)
-                    gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
-                else:
-                    ctx.disable(moderngl.BLEND)
-                ctx.depth_func = '<='
-                ctx.enable(moderngl.CULL_FACE)
-                ctx.cull_face = 'front'
-                ctx.disable(moderngl.DEPTH_TEST)
-                ctx.depth_mask = False
-                
-                cur_prog = prog_atmo_lowres if is_lowres else prog_atmo
-                cur_vao = vao_atmo_lowres if is_lowres else vao_atmo
-    
-                if 'u_atmo_quality' in cur_prog: cur_prog['u_atmo_quality'].value = atmo_quality
-                if 'u_aerial_enabled' in cur_prog: cur_prog['u_aerial_enabled'].value = False
-                if 'u_atmo_shadow_method' in cur_prog:
-                    cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
-                if 'u_bounded_shadows' in cur_prog:
-                    cur_prog['u_bounded_shadows'].value = bool(self.camera.get("atmo_bounded_shadows", True))
-                if atmo_quality == 3 and 'u_ring_station_count' in cur_prog:
-                    shadow_method = int(self.camera.get("atmo_shadow_method", 1))
-                    if shadow_method in (1, 2):
-                        K_def = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
-                    else:
-                        # Default station grid (uniform in u); ringed bodies override per-draw below.
-                        K_def = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
-                    grid_bytes = _STATION_GRID_BYTES_CACHE.get(K_def)
-                    if grid_bytes is None:
-                        _g = np.zeros((9, 4), dtype='f4')
-                        _nb = min(K_def + 1, _g.size)
-                        _g.ravel()[:_nb] = np.linspace(0.0, 1.0, _nb)
-                        grid_bytes = _g.tobytes()
-                        _STATION_GRID_BYTES_CACHE[K_def] = grid_bytes
-                    if 'u_ring_station_cells' in cur_prog:
-                        cur_prog['u_ring_station_cells'].write(grid_bytes)
-                    cur_prog['u_ring_station_count'].value = K_def
-                if 'u_stochastic_noise' in cur_prog: cur_prog['u_stochastic_noise'].value = self.camera.get("atmo_stochastic", True)
-                if 'u_atmo_noise_type' in cur_prog: cur_prog['u_atmo_noise_type'].value = int(self.camera.get("atmo_noise_type", 0))
-                if 'u_camera_pos' in cur_prog: cur_prog['u_camera_pos'].write(cam_pos)
-                
-                is_temporal = self.camera.get("atmo_temporal_accum", True) and getattr(self, "prev_atmo_view_proj", None) is not None
-                hist_valid = is_temporal and self.atmo_history_valid.get(clip_mode, False)
-                temporal_alpha = 1.0 - float(self.camera.get("atmo_temporal_blend", 0.90))
+                                keep = False
+                                for _st in stars_pos_radius[:4]:
+                                    to_star = np.asarray(_st[0:3], dtype=np.float64) - body_pos_rel
+                                    dist_s_sq = float(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                                    if dist_s_sq <= 1e-12:
+                                        continue
+                                    _any_star_valid = True
+                                    dist_s = math.sqrt(dist_s_sq)
+                                    L_star = to_star / dist_s
+                                    star_tan = float(_st[3]) / max(dist_s, 1e-6)
 
-                if 'u_temporal_accum' in cur_prog: cur_prog['u_temporal_accum'].value = is_temporal
-                if 'u_history_valid' in cur_prog: cur_prog['u_history_valid'].value = hist_valid
-                if 'u_temporal_alpha' in cur_prog: cur_prog['u_temporal_alpha'].value = temporal_alpha
-                if 'u_prev_exposure' in cur_prog: cur_prog['u_prev_exposure'].value = float(getattr(self, "prev_atmo_exposure", self.camera.get("exposure", 1.0)))
-                if 'u_exposure' in cur_prog: cur_prog['u_exposure'].value = float(self.camera.get("exposure", 1.0))
-                if 'u_prev_view_proj' in cur_prog and getattr(self, "prev_atmo_view_proj", None) is not None:
-                    cur_prog['u_prev_view_proj'].write(self.prev_atmo_view_proj)
-            
-                if 'u_num_ring_planes' in cur_prog: cur_prog['u_num_ring_planes'].value = n_ring_planes
-                if n_ring_planes > 0:
-                    if 'u_ring_center' in cur_prog: cur_prog['u_ring_center'].write(ring_centers_buf)
-                    if 'u_ring_normal' in cur_prog: cur_prog['u_ring_normal'].write(ring_normals_buf)
-                    if 'u_ring_params' in cur_prog: cur_prog['u_ring_params'].write(ring_params_buf)
-                    if 'u_ring_coplanar_mask' in cur_prog: cur_prog['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
-                    ring_gradient_tex.use(location=0)
-                    if atmo_quality in (2, 3):
-                        self.surface_ring_shadow_filter.bind()
-                    if ring_shadow_tex is not None:
-                        ring_shadow_tex.use(location=13)
-                
-                if self.stbn_tex is not None:
-                    self.stbn_tex.use(location=19)
-                
-                if 'u_atmo_clip_mode' in cur_prog:
-                    cur_prog['u_atmo_clip_mode'].value = clip_mode
-                self.atmo_ssbo.bind_to_storage_buffer(binding=8)
-    
-                # Reuse pre-built lookup table
-                atmo_lookup = atmo_by_body
-                atmo_lookup_cmp = {a['body_idx']: a for a in self.atmo_bodies_cmp} if self.comparison_enabled else {}
+                                    t_proj = float(D[0] * L_star[0] + D[1] * L_star[1] + D[2] * L_star[2])
+                                    if t_proj <= 0.0:
+                                        continue # Caster is on the night side of planet for this star
 
-                # Reuse persistent scratch arrays
-                active_casters_buf = self._atmo_active_casters_buf
-                active_poles_obl_buf = self._atmo_active_poles_obl_buf
-                active_caster_r_minor_buf = self._atmo_active_caster_r_minor_buf
-                active_atmos_buf = self._atmo_active_atmos_buf
-                active_scale_height_buf = self._atmo_active_scale_height_buf
-                active_max_bend_buf = self._atmo_active_max_bend_buf
-                active_caster_ozone_buf = self._atmo_active_caster_ozone_buf
+                                    perp_sq = max(0.0, d_sq - t_proj * t_proj)
+                                    r_penumbra_max = rad_c * 1.5 + atmo_rad_au + t_proj * star_tan * 1.5
+                                    if perp_sq <= r_penumbra_max * r_penumbra_max:
+                                        keep = True
+                                        break
+                                if keep:
+                                    filtered_active.append(idx_u)
+                            # Preserve legacy behavior: if no star geometry was usable, don't cull.
+                            active_indices = filtered_active if _any_star_valid else active_indices
 
-                for sq_dist, atmo, is_cmp in atmos_to_render:
-                    bi = atmo['body_idx']
-                    if is_cmp:
-                        body_pos_rel = cmp_pos_rel[bi].astype('f4')
-                        body_idx_in_unified = num_bodies + bi
-                        prev_offset = self.prev_atmo_body_offsets_cmp.get(bi, body_pos_rel)
-                    else:
-                        body_pos_rel = pos_rel_all[bi]
-                        body_idx_in_unified = bi
-                        prev_offset = self.prev_atmo_body_offsets.get(bi, body_pos_rel)
-                    if 'u_prev_body_offset' in cur_prog:
-                        cur_prog['u_prev_body_offset'].write(prev_offset.astype('f4'))
-    
-                    dist_to_body = math.sqrt(sq_dist)
-                    apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
-                    if apparent_px < 2.0:
-                        continue
-    
-                    if atmo_quality == 1:
-                        n_samples = max(4, self.camera.get("atmo_steps_max", 32) // 2)
-                    else:
-                        n_samples = self.camera.get("atmo_steps_max", 32)
-                            
-                    if is_cmp:
-                        mass_sm = self.mass_snap_cmp[atmo['body_idx']]
-                    else:
-                        mass_sm = mass_snap[atmo['body_idx']]
-                    
-                    # LUT should already be built cleanly before the pass
-                    if 'lut_tex' in atmo and atmo['lut_tex']:
-                        atmo['lut_tex'].use(location=1)
-                    if 'lut_multi_scatter' in atmo:
-                        atmo['lut_multi_scatter'].use(location=3)
-                    
-                    props, _, _ = get_cached_atmosphere_properties(atmo, mass_sm)
-                    scaled_intensity = atmo['intensity']
-                    beta_mie_val = atmo.get('beta_mie', 2.0e-6)
-                    beta_mie_coeffs = compute_mie_coefficients(beta_mie_val, atmo.get('mie_angstrom', None)).astype('f4')
-                    
-                    f = float(all_instances[body_idx_in_unified, 12])
-                    f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+                        n_active = min(len(active_indices), 8)
+                        active_indices = active_indices[:n_active]
 
-                    # CPU-side active neighbor culling (parent and children)
-                    active_indices = []
-                    if is_cmp:
-                        p_snap = self.parent_snap_cmp
-                        p_idx = int(p_snap[bi]) if bi < len(p_snap) else -1
-                        if p_idx >= 0 and p_idx != self.star_idx_cmp:
-                            active_indices.append(num_bodies + p_idx)
-                        for child_bi in range(self.num_bodies_cmp):
-                            if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
-                                active_indices.append(num_bodies + child_bi)
-                    else:
-                        p_snap = parent_snap
-                        p_idx = int(p_snap[bi]) if bi < len(p_snap) else -1
-                        if p_idx >= 0 and p_idx != star_idx:
-                            active_indices.append(p_idx)
-                        for child_bi in range(num_bodies):
-                            if child_bi < len(p_snap) and int(p_snap[child_bi]) == bi:
-                                active_indices.append(child_bi)
-                                
-                    # CPU-side geometric eclipse culling: only keep casters that can geometrically
-                    # cast an eclipse on this atmosphere. A caster is kept if it can eclipse ANY of
-                    # the (up to 4) baked stars, so multi-star systems don't lose secondary-star
-                    # eclipses (Mode 3's Sky-View LUT bake consumes all star slots).
-                    if active_indices:
-                        atmo_rad_au = float(atmo['atmo_radius_au'])
-                        _any_star_valid = False
-                        filtered_active = []
-                        for idx_u in active_indices:
+                        # Clear scratch buffers in-place
+                        active_casters_buf[:] = 0.0
+                        active_poles_obl_buf[:] = 0.0
+                        active_caster_r_minor_buf[:] = 0.0
+                        active_atmos_buf[:] = 0.0
+                        active_scale_height_buf[:] = 0.0
+                        active_max_bend_buf[:] = 0.0
+                        active_caster_ozone_buf[:] = 0.0
+
+                        for i_ac, idx_u in enumerate(active_indices):
                             is_c_cmp = (idx_u >= num_bodies)
                             c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
+
                             pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
-                            rad_c = float(self.body_radii_cmp[c_local_idx] if is_cmp else body_radii[c_local_idx])
+                            rad_c = self.body_radii_cmp[c_local_idx] if is_c_cmp else body_radii[c_local_idx]
 
-                            D = pos_c - body_pos_rel
-                            d_sq = float(D[0]**2 + D[1]**2 + D[2]**2)
+                            active_casters_buf[i_ac, 0:3] = pos_c
+                            active_casters_buf[i_ac, 3] = rad_c
 
-                            keep = False
-                            for _st in stars_pos_radius[:4]:
-                                to_star = np.asarray(_st[0:3], dtype=np.float64) - body_pos_rel
-                                dist_s_sq = float(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                                if dist_s_sq <= 1e-12:
-                                    continue
-                                _any_star_valid = True
-                                dist_s = math.sqrt(dist_s_sq)
-                                L_star = to_star / dist_s
-                                star_tan = float(_st[3]) / max(dist_s, 1e-6)
+                            fc = all_instances[idx_u, 12]
+                            fc_scale = 1.0 / (1.0 - fc) if fc < 1.0 else 1.0
+                            active_poles_obl_buf[i_ac, 0:3] = all_instances[idx_u, 9:12]
+                            active_poles_obl_buf[i_ac, 3] = fc_scale
 
-                                t_proj = float(D[0] * L_star[0] + D[1] * L_star[1] + D[2] * L_star[2])
-                                if t_proj <= 0.0:
-                                    continue # Caster is on the night side of planet for this star
+                            pos_star = cmp_pos_rel[self.star_idx_cmp] if is_c_cmp else pos_rel_all[star_idx]
+                            to_star = pos_star - pos_c
+                            dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                            if dist_s > 1e-6:
+                                L = to_star / dist_s
+                            else:
+                                L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
-                                perp_sq = max(0.0, d_sq - t_proj * t_proj)
-                                r_penumbra_max = rad_c * 1.5 + atmo_rad_au + t_proj * star_tan * 1.5
-                                if perp_sq <= r_penumbra_max * r_penumbra_max:
-                                    keep = True
-                                    break
-                            if keep:
-                                filtered_active.append(idx_u)
-                        # Preserve legacy behavior: if no star geometry was usable, don't cull.
-                        active_indices = filtered_active if _any_star_valid else active_indices
+                            p_dot_L = np.dot(all_instances[idx_u, 9:12], L)
+                            p_proj_sq = 1.0 - p_dot_L**2
+                            fc_factor = 1.0 - fc
+                            r_minor = rad_c * np.sqrt(max(0.0, p_dot_L**2 + (fc_factor**2) * p_proj_sq))
+                            active_caster_r_minor_buf[i_ac] = r_minor
 
-                    n_active = min(len(active_indices), 8)
-                    active_indices = active_indices[:n_active]
-                    
-                    # Clear scratch buffers in-place
-                    active_casters_buf[:] = 0.0
-                    active_poles_obl_buf[:] = 0.0
-                    active_caster_r_minor_buf[:] = 0.0
-                    active_atmos_buf[:] = 0.0
-                    active_scale_height_buf[:] = 0.0
-                    active_max_bend_buf[:] = 0.0
-                    active_caster_ozone_buf[:] = 0.0
-                    
-                    for i_ac, idx_u in enumerate(active_indices):
-                        is_c_cmp = (idx_u >= num_bodies)
-                        c_local_idx = idx_u - num_bodies if is_c_cmp else idx_u
-                        
-                        pos_c = cmp_pos_rel[c_local_idx] if is_c_cmp else pos_rel_all[c_local_idx]
-                        rad_c = self.body_radii_cmp[c_local_idx] if is_c_cmp else body_radii[c_local_idx]
-                        
-                        active_casters_buf[i_ac, 0:3] = pos_c
-                        active_casters_buf[i_ac, 3] = rad_c
-                        
-                        fc = all_instances[idx_u, 12]
-                        fc_scale = 1.0 / (1.0 - fc) if fc < 1.0 else 1.0
-                        active_poles_obl_buf[i_ac, 0:3] = all_instances[idx_u, 9:12]
-                        active_poles_obl_buf[i_ac, 3] = fc_scale
-                        
-                        pos_star = cmp_pos_rel[self.star_idx_cmp] if is_c_cmp else pos_rel_all[star_idx]
-                        to_star = pos_star - pos_c
+                            lookup = atmo_lookup_cmp if is_c_cmp else atmo_lookup
+                            atmo_info = lookup.get(c_local_idx)
+                            if atmo_info:
+                                mass_sm_c = self.mass_snap_cmp[c_local_idx] if is_c_cmp else mass_snap[c_local_idx]
+                                props_c, trans_c, thick_c = get_cached_atmosphere_properties(atmo_info, mass_sm_c)
+                                thick_km = float(atmo_info.get('atmo_radius_km', 0.0) - atmo_info.get('planet_radius_km', 0.0))
+                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                                r_c_km = float(atmo_info.get('planet_radius_km', rad_c * 149597870.7))
+                                # Precompute grazing tau at the equatorial radius. Shared
+                                # shadow optics only adjust it for projected oblate limbs.
+                                # Thickness and scale height have independent buffer fields.
+                                tau_vert_c = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                                grazing_factor_c = math.sqrt(2.0 * math.pi * max(rad_c * AU_TO_KM, 100.0) / max(scale_height_km, 0.1))
+                                active_atmos_buf[i_ac, 0:3] = tau_vert_c * grazing_factor_c
+                                active_atmos_buf[i_ac, 3] = thick_km
+                                active_scale_height_buf[i_ac] = scale_height_km
+                                active_max_bend_buf[i_ac] = compute_max_bend(
+                                    rad_c, scale_height_km,
+                                    float(props_c.get('refractivity', 0.00029)),
+                                    beta_ext=props_c.get('beta_rayleigh'))
+                                path_len_m_c = math.sqrt(2.0 * math.pi * r_c_km * 1000.0 * scale_height_km * 1000.0)
+                                tau_o3_c = props_c.get('beta_abs_layered', np.zeros(3)) * path_len_m_c
+                                active_caster_ozone_buf[i_ac, 0:3] = tau_o3_c
+                                active_caster_ozone_buf[i_ac, 3] = float(props_c.get('ozone_peak_km', 25.0))
+
+                        # Write all per-body atmosphere parameters into self.atmo_staging (std430 alignment)
+                        self.atmo_staging[0:3] = body_pos_rel
+                        self.atmo_staging[3] = float(atmo['atmo_radius_au'])
+                        self.atmo_staging[4:7] = props['beta_rayleigh']
+                        self.atmo_staging[7] = props['scale_height_km']
+                        self.atmo_staging[8:11] = beta_mie_coeffs
+                        self.atmo_staging[11] = atmo.get('h_mie', 1.2)
+                        self.atmo_staging[12:15] = props['beta_abs_mixed']
+                        self.atmo_staging[15] = atmo.get('mie_g', 0.758)
+                        self.atmo_staging[16:19] = props['beta_abs_layered']
+                        self.atmo_staging[19] = scaled_intensity
+                        self.atmo_staging[20] = float(atmo['planet_radius_km'])
+                        self.atmo_staging[21] = float(atmo['atmo_radius_km'])
+                        self.atmo_staging[22] = AU_TO_KM
+                        self.atmo_staging_int_view[23] = n_samples
+                        self.atmo_staging[24:27] = all_instances[body_idx_in_unified, 9:12]
+                        self.atmo_staging[27] = f_scale
+                        self.atmo_staging_int_view[28] = n_active
+                        self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
+                        self.atmo_staging_int_view[30] = body_idx_in_unified
+                        self.atmo_staging[31] = float(self.frame_counter % 1024)
+                        self.atmo_staging[32:35] = np.asarray(atmo.get('mie_albedo', [1.0, 1.0, 1.0]), dtype=np.float32)
+                        # index 35: u_refractivity (surface n_mix - 1, drives eclipse refraction)
+                        self.atmo_staging[35] = float(props.get('refractivity', 0.00029))
+                        self.atmo_staging[36:68] = active_casters_buf.ravel()
+                        self.atmo_staging[68:100] = active_poles_obl_buf.ravel()
+                        self.atmo_staging[100:108] = active_caster_r_minor_buf
+                        self.atmo_staging[108:140] = active_atmos_buf.ravel()
+                        self.atmo_staging[140:148] = active_max_bend_buf
+                        self.atmo_staging[148:180] = active_caster_ozone_buf.ravel()
+                        self.atmo_staging[256:264] = active_scale_height_buf
+                        self.atmo_staging[180:184] = [float(props.get('ozone_peak_km', 25.0)),
+                                                      float(props.get('ozone_width_km', 8.0)),
+                                                      0.0, float(self.camera.get('atmo_adaptive_steps_max', 128))]  # pad to 736 bytes
+
+                        # Surface shaders raytrace the ellipsoid independently of mesh LOD.
+                        # Only a camera inside active terrain needs a below-datum floor;
+                        # scene depth then supplies the actual terrain endpoint.
+                        _clip_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
+                        _clip_radius = float(atmo['planet_radius_km'])
+                        if not is_cmp and bi in active_terrain_body_indices:
+                            _clip_cam = (cam_pos - body_pos_rel) * AU_TO_KM
+                            _clip_pole = all_instances[body_idx_in_unified, 9:12]
+                            _clip_cam = _clip_cam + np.dot(_clip_cam, _clip_pole) * (f_scale - 1.0) * _clip_pole
+                            if np.linalg.norm(_clip_cam) <= float(atmo['atmo_radius_km']):
+                                _clip_radius += min(0.0, float(_clip_body.get('height_range_km', [0.0])[0])) * f_scale - 0.05
+                        self.atmo_staging[182] = max(1e-3, _clip_radius)
+
+                        # Precomputed optical constants
+                        _inv_h_r = 1.0 / max(1e-3, float(props['scale_height_km']))
+                        _inv_h_m = 1.0 / max(1e-3, float(atmo.get('h_mie', 1.2)))
+                        _inv_oz = 1.0 / max(1e-3, float(props.get('ozone_width_km', 8.0)))
+                        _max_b = compute_max_bend(
+                            float(atmo['planet_radius_km']) / AU_TO_KM,
+                            float(props['scale_height_km']),
+                            float(props.get('refractivity', 0.00029)),
+                            beta_ext=props.get('beta_rayleigh'))
+                        self.atmo_staging[184:188] = [_inv_h_r, _inv_h_m, _inv_oz, _max_b]
+
+                        # Precomputed Henyey-Greenstein Mie phase constants
+                        _g = float(np.clip(float(atmo.get('mie_g', 0.758)), 0.0, 0.88))
+                        _g2 = _g * _g
+                        _c1 = (3.0 / (8.0 * math.pi)) * ((1.0 - _g2) / (2.0 + _g2))
+                        _c2 = 1.0 + _g2
+                        _c3 = 2.0 * _g
+                        _has_methane = 1.0 if atmo.get('composition', {}).get('CH4', 0.0) > 1e-4 else 0.0
+                        _cur_body_data = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
+                        _has_rings = 1.0 if len(_cur_body_data.get('rings', [])) > 0 else 0.0
+                        self.atmo_staging[188:192] = [_c1, _c2, _c3, _has_methane]
+
+                        # Precomputed star parameters (up to 4 stars)
+                        self.atmo_staging[192:256] = 0.0
+                        _b_pole_raw = all_instances[body_idx_in_unified, 9:12]
+                        _b_pole_len = float(np.linalg.norm(_b_pole_raw))
+                        _p_pole_norm = _b_pole_raw / _b_pole_len if _b_pole_len > 1e-4 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                        _star0_s_dir_sph = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        _star0_comb_int = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+                        _n_stars_to_precomp = min(len(stars_pos_radius), 4)
+                        for _s in range(_n_stars_to_precomp):
+                            _s_pos = np.array(stars_pos_radius[_s][0:3], dtype=np.float32)
+                            _s_rad = float(stars_pos_radius[_s][3])
+
+                            _f_to_s = _s_pos - body_pos_rel
+                            _d_star = float(np.linalg.norm(_f_to_s))
+                            _L_star = _f_to_s / _d_star if _d_star > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                            _pole_s = np.array(stars_poles_obl[_s][0:3], dtype=np.float32)
+                            _pole_s_len = float(np.linalg.norm(_pole_s))
+                            _pole_s_dir = _pole_s / _pole_s_len if _pole_s_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                            _star_sin_lat = abs(float(np.dot(_L_star, _pole_s_dir)))
+
+                            _eq_col = np.array(stars_colors[_s][0:3], dtype=np.float32)
+                            _eq_lum = float(stars_colors[_s][3])
+                            _pol_col = np.array(stars_pole_colors[_s][0:3], dtype=np.float32)
+                            _pol_lum = float(stars_pole_colors[_s][3])
+
+                            _star_col = _eq_col * (1.0 - _star_sin_lat) + _pol_col * _star_sin_lat
+                            _star_lum = _eq_lum * (1.0 - _star_sin_lat) + _pol_lum * _star_sin_lat
+
+                            _sin_s = _s_rad / max(_d_star, _s_rad + 1e-6)
+                            _eff_s_rad = _sin_s + _max_b
+                            _cos_s_eff = math.sqrt(max(0.0, 1.0 - _eff_s_rad * _eff_s_rad))
+
+                            _irrad = _star_lum / max(_d_star * _d_star, 1e-8)
+                            _comb_int = _star_col * (_irrad * scaled_intensity * math.pi)
+
+                            _sun_pos_loc = _f_to_s * AU_TO_KM
+
+                            # toSphericalSpace of L
+                            _p_proj = float(np.dot(_L_star, _p_pole_norm))
+                            _p_perp = _L_star - _p_proj * _p_pole_norm
+                            _s_dir_sph = _p_perp + (_p_proj * f_scale) * _p_pole_norm
+                            _s_dir_sph_len = float(np.linalg.norm(_s_dir_sph))
+                            _s_dir_sph = _s_dir_sph / _s_dir_sph_len if _s_dir_sph_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+                            _s_pole_dot = float(np.dot(_s_dir_sph, _p_pole_norm))
+                            _cosPhi = abs(_s_pole_dot)
+                            _tanPhi = _cosPhi / math.sqrt(max(1.0 - _cosPhi * _cosPhi, 1e-4))
+                            _solstice_f = float(np.clip(_tanPhi * 1.8, 0.0, 1.0)) * _has_methane * _has_rings
+
+                            if _s == 0:
+                                _star0_s_dir_sph = _s_dir_sph
+                                _star0_comb_int = _comb_int
+
+                            # Pack into staging buffer
+                            _b_idx = 192 + _s * 4
+                            self.atmo_staging[_b_idx : _b_idx + 3] = _comb_int
+                            self.atmo_staging[_b_idx + 3] = _sin_s
+
+                            _b_idx = 208 + _s * 4
+                            self.atmo_staging[_b_idx : _b_idx + 3] = _s_dir_sph
+                            self.atmo_staging[_b_idx + 3] = _cos_s_eff
+
+                            _b_idx = 224 + _s * 4
+                            self.atmo_staging[_b_idx : _b_idx + 3] = _sun_pos_loc
+                            self.atmo_staging[_b_idx + 3] = _eff_s_rad
+
+                            _b_idx = 240 + _s * 4
+                            self.atmo_staging[_b_idx : _b_idx + 4] = [_solstice_f, _s_pole_dot, _d_star, _s_rad]
+
+                        # Single buffer upload per atmosphere body (must precede Sky-View LUT pass)
+                        self.atmo_ssbo.write(self.atmo_staging.tobytes())
+
+                        # Mode 3 uses position-queryable tables for sky and terrain.
+                        # Four cached atmospheres bound VRAM;
+                        # comparison bodies follow the same rendering path.
+                        _endpoint_enabled = atmo_quality == 3
+                        if 'u_scattering_enabled' in cur_prog:
+                            cur_prog['u_scattering_enabled'].value = _endpoint_enabled
+                        if 'u_atmo_optical_enabled' in cur_prog:
+                            cur_prog['u_atmo_optical_enabled'].value = atmo_quality >= 2
+                        if atmo_quality >= 2:
+                            if self.scattering_lut_cache is None:
+                                self.scattering_lut_cache = ScatteringLUTCache(ctx)
+                            _endpoint_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
+                            _height_min = min(0.0, float(_endpoint_body.get('height_range_km', [0.0, 8.848])[0]))
+                            _terrain_bottom = max(1e-3, float(atmo['planet_radius_km']) + _height_min * f_scale - 0.05)
+                            # Reference-radius tables avoid subtracting imaginary
+                            # ocean-floor columns from above-datum terrain haze.
+                            _bottom = float(atmo['planet_radius_km'])
+                            _eff_sun = max(0.0, round(float(self.atmo_staging[227]), 4))
+                            _endpoint_parameters = {
+                                'u_planet_radius_km': float(atmo['planet_radius_km']),
+                                'u_atmo_radius_km': float(atmo['atmo_radius_km']),
+                                'u_scattering_bottom_km': _bottom,
+                                'u_scattering_sun_radius': _eff_sun,
+                                'u_h_rayleigh': float(props['scale_height_km']),
+                                'u_h_mie': float(atmo.get('h_mie', 1.2)),
+                                'u_beta_rayleigh': tuple(float(x) for x in props['beta_rayleigh']),
+                                'u_beta_mie': tuple(float(x) for x in beta_mie_coeffs),
+                                'u_beta_abs_mixed': tuple(float(x) for x in props['beta_abs_mixed']),
+                                'u_beta_abs_layered': tuple(float(x) for x in props['beta_abs_layered']),
+                                'u_mie_albedo': tuple(float(x) for x in np.broadcast_to(atmo.get('mie_albedo', 1.0), (3,))),
+                                'u_ozone_peak_km': float(props.get('ozone_peak_km', 25.0)),
+                                'u_ozone_width_km': float(props.get('ozone_width_km', 8.0)),
+                                # Also key the MS inputs, including ground albedo.
+                                'u_mie_g': float(atmo.get('mie_g', 0.8)),
+                                'u_ground_albedo': tuple(float(x) for x in self.visual_arr_cmp[bi, 0:3])
+                                    if is_cmp else tuple(float(x) for x in visual_arr[bi, 0:3]),
+                            }
+                            if _endpoint_enabled:
+                                _endpoint_textures = self.scattering_lut_cache.get(
+                                    _endpoint_parameters, atmo['lut_multi_scatter'])
+                                self.scattering_lut_cache.bind(_endpoint_textures)
+                                # Distinct stellar angular sizes share medium/shine tables,
+                                # with their own cached solar response and no raymarch fallback.
+                                for _slot in range(1, min(num_stars, 4)):
+                                    _star_parameters = dict(_endpoint_parameters,
+                                        u_scattering_sun_radius=max(0.0, round(float(self.atmo_staging[227 + 4 * _slot]), 4)))
+                                    _star_tables = self.scattering_lut_cache.get(_star_parameters, atmo['lut_multi_scatter'])
+                                    self.scattering_lut_cache.bind_star(_star_tables, _slot)
+                            else:
+                                self.scattering_lut_cache.get_optical_depth(_endpoint_parameters).use(20)
+                            if 'u_scattering_terrain_bottom_km' in cur_prog:
+                                cur_prog['u_scattering_terrain_bottom_km'].value = _terrain_bottom
+                            if 'u_scattering_bottom_km' in cur_prog:
+                                cur_prog['u_scattering_bottom_km'].value = _bottom
+                            if 'u_scattering_sun_radius' in cur_prog:
+                                cur_prog['u_scattering_sun_radius'].value = _eff_sun
+                            if 'u_scattering_azimuth_count' in cur_prog:
+                                cur_prog['u_scattering_azimuth_count'].value = self.scattering_lut_cache.size[3]
+                            if _endpoint_enabled:
+                                for _name, _value in (('u_scattering_bottom_km', _bottom),
+                                        ('u_scattering_sun_radius', _eff_sun),
+                                        ('u_scattering_azimuth_count', self.scattering_lut_cache.size[3])):
+                                    if _name in self.prog_sky_view: self.prog_sky_view[_name].value = _value
+
+                        # Mode 3: Analytical Sky-View LUT pass
+                        if atmo_quality == 3 and self.prog_sky_view is not None:
+                            _sv_res_idx = max(0, min(len(SKY_VIEW_RESOLUTIONS) - 1, int(self.camera.get("atmo_sky_view_res", 0))))
+                            _target_w, _target_h = SKY_VIEW_RESOLUTIONS[_sv_res_idx]
+                            if self.sky_view_width != _target_w or self.sky_view_height != _target_h:
+                                self.resize_sky_view_lut(_target_w, _target_h)
+
+                            current_bake_key = (self.frame_counter, body_idx_in_unified)
+                            cam_rel_au = cam_pos - body_pos_rel
+                            cam_rel_km = cam_rel_au * AU_TO_KM
+                            if f_scale > 1.00001:
+                                h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
+                                cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
+                            else:
+                                cam_sph_km = cam_rel_km
+
+                            if self.sky_view_baked_key != current_bake_key:
+                                if 'lut_tex' in atmo and atmo['lut_tex']:
+                                    atmo['lut_tex'].use(location=1)
+                                if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
+                                    atmo['lut_multi_scatter'].use(location=3)
+
+                                # Ring plane data + ringshine irradiance map for the baked
+                                # ringshine term (Stage 2) and external ring shadow evaluation;
+                                # instance SSBO (planetshine dir/color, ring mask) is globally bound at binding 2.
+                                if 'u_num_ring_planes' in self.prog_sky_view:
+                                    self.prog_sky_view['u_num_ring_planes'].value = n_ring_planes
+                                if n_ring_planes > 0:
+                                    if 'u_ring_center' in self.prog_sky_view:
+                                        self.prog_sky_view['u_ring_center'].write(ring_centers_buf)
+                                    if 'u_ring_normal' in self.prog_sky_view:
+                                        self.prog_sky_view['u_ring_normal'].write(ring_normals_buf)
+                                    if 'u_ring_params' in self.prog_sky_view:
+                                        self.prog_sky_view['u_ring_params'].write(ring_params_buf)
+                                    if 'u_ring_coplanar_mask' in self.prog_sky_view:
+                                        self.prog_sky_view['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
+                                    if ring_gradient_tex:
+                                        ring_gradient_tex.use(location=0)
+                                self.ringshine_map_tex.use(location=8)
+
+                                self.sky_view_fbo.use()
+                                ctx.viewport = (0, 0, self.sky_view_width, self.sky_view_height)
+                                ctx.disable(moderngl.DEPTH_TEST)
+                                ctx.disable(moderngl.BLEND)
+                                ctx.disable(moderngl.CULL_FACE)
+
+                                self.prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km.astype(np.float32))
+                                self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
+                                if 'u_atmo_shadow_method' in self.prog_sky_view:
+                                    self.prog_sky_view['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
+
+                                self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
+                                self.sky_view_baked_key = current_bake_key
+
+                            # Horizon-focused sampling amortizes grazing terrain
+                            # endpoint queries. Outside observers use the sky-view
+                            # boundary, so there is no terrain volume to consume.
+                            _use_aerial = (self.camera.get("atmo_aerial_volume", True)
+                                           and clip_mode == 0
+                                           and np.linalg.norm(cam_sph_km) <= atmo['atmo_radius_km'])
+                            cur_prog['u_aerial_enabled'].value = False
+                            if _use_aerial:
+                                if self.aerial_volume is None:
+                                    self.aerial_volume = AerialPerspectiveVolume(ctx)
+                                atmo['lut_multi_scatter'].use(location=3)
+                                self.ringshine_map_tex.use(location=8)
+                                self.aerial_volume.update(
+                                    current_bake_key, cam_sph_km, _terrain_bottom,
+                                    _endpoint_parameters, self.scattering_lut_cache.size[3],
+                                    inv_proj_bytes, inv_view_bytes, n_ring_planes,
+                                    ring_normals_buf, ps_enabled, rs_enabled,
+                                    pole_obl=tuple(self.atmo_staging[24:28]),
+                                    viewport_size=(self.fb_width, self.fb_height))
+                                self.aerial_volume.bind(cur_prog, cam_sph_km, _terrain_bottom)
+
+                            # Restore framebuffer and raster state for atmosphere polyhedron rendering
+                            if is_lowres:
+                                target_fbo = self.atmo_lowres_fbo[clip_mode][self.atmo_ping_pong_idx.get(clip_mode, 0)]
+                                target_fbo.use()
+                                ctx.viewport = (0, 0, target_fbo.width, target_fbo.height)
+                            else:
+                                self.hdr_resolve_fbo.use()
+                                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                                ctx.enable(moderngl.BLEND)
+                                gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+
+                            ctx.depth_func = '<='
+                            ctx.enable(moderngl.CULL_FACE)
+                            ctx.cull_face = 'front'
+                            ctx.disable(moderngl.DEPTH_TEST)
+                            ctx.depth_mask = False
+
+                            self.sky_view_tex.use(location=12)
+                            self.sky_view_trans_tex.use(location=14)
+                            for _sv_i, _sv_t in enumerate(self.sky_view_star_tex):
+                                _sv_t.use(location=15 + _sv_i)
+                            if ring_shadow_tex is not None:
+                                if hasattr(self, "body_ring_indices") and bi in self.body_ring_indices:
+                                    u_idx = self.body_ring_indices[bi]
+                                    if getattr(ring_shadow_tex, 'current_body_idx', None) != u_idx and hasattr(ring_gradient_tex, 'atlas_data'):
+                                        ring_shadow_tex.write(ring_gradient_tex.atlas_data[u_idx, :, :].tobytes())
+                                        ring_shadow_tex.build_mipmaps()
+                                        ring_shadow_tex.current_body_idx = u_idx
+                                ring_shadow_tex.use(location=13)
+                            if n_ring_planes > 0:
+                                self.surface_ring_shadow_filter.bind()
+                            if 'u_atmo_shadow_method' in cur_prog:
+                                cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
+                            shadow_method = int(self.camera.get("atmo_shadow_method", 1))
+                            if shadow_method in (1, 2):
+                                if 'u_ring_station_count' in cur_prog:
+                                    cur_prog['u_ring_station_count'].value = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
+                            else:
+                                # Station-cell grid baked from this body's ring profile (edges snapped
+                                # to ring discontinuities); replaces the uniform-in-s slice grid whose
+                                # phase quantization caused step banding. Lazy-baked per (body, K).
+                                if ('u_ring_station_count' in cur_prog and hasattr(ring_gradient_tex, 'station_cells')
+                                        and hasattr(self, "body_ring_indices") and bi in self.body_ring_indices):
+                                    u_idx = self.body_ring_indices[bi]
+                                    K = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
+                                    bounds = ring_gradient_tex.station_cells.get((bi, K))
+                                    if bounds is None:
+                                        bounds = bake_station_cells(ring_gradient_tex.atlas_data[u_idx, :, 3], max_cells=K)
+                                        ring_gradient_tex.station_cells[(bi, K)] = bounds
+                                    grid = np.zeros(36, dtype='f4')
+                                    grid[:len(bounds)] = bounds
+                                    cur_prog['u_ring_station_cells'].write(grid.tobytes())
+                                    cur_prog['u_ring_station_count'].value = max(2, len(bounds) - 1)
+
+                        cur_vao.render(moderngl.TRIANGLES)
+
+                    ctx.depth_mask = True
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.enable(moderngl.CULL_FACE)
+                    ctx.cull_face = 'back'
+                    ctx.depth_func = '<'
+                    ctx.disable(moderngl.BLEND)
+
+                # --- GAIA starfield point pass (render-only catalog layer) ---
+                # GPU-side packing: static attributes + two uniforms per frame.
+                if star_vao is not None and self.camera.get("show_gaia_stars", True):
+                    prog_starfield['u_origin'].value = (float(cam_origin[0]), float(cam_origin[1]), float(cam_origin[2]))
+                    prog_starfield['u_t'].value = float(display_t)
+                    prog_starfield['projection'].write(projection.astype('f4').tobytes())
+                    prog_starfield['view'].write(view.astype('f4').tobytes())
+                    # Eye position relative to the frame origin — drives the
+                    # per-star inverse-square flux falloff in starfield.vert.
+                    prog_starfield['u_eye'].value = (float(cam_pos_f8[0]), float(cam_pos_f8[1]), float(cam_pos_f8[2]))
+                    prog_starfield['u_far'].value = float(far)
+                    prog_starfield['screen_height'].value = float(self.fb_height)
+                    prog_starfield['u_point_base'].value = float(self.camera.get("star_point_size", 2.0))
+                    # Physical HDR calibration: anchor the catalog flux scale to the
+                    # system star's radiance units (mesh luminance 0.8333*L/R^2,
+                    # irradiance L/d^2, solar constant at 1 AU = 1.0). A solar star
+                    # (M_G = 4.67) at 1 AU must peak exactly like the system sun's
+                    # subpixel point sprite: 0.8333*(h*fov)^2/4 * L/d^2. Solving
+                    # against the sprite's flux-conserving normalization
+                    # (1 / (size^2 * 0.2524)) gives u_cal = 3.879*(h*fov)^2*size^2/1e13.
+                    _star_size_px = min(10.0, max(2.0, float(self.camera.get("star_point_size", 2.0)) * (self.fb_height / 1080.0)))
+                    prog_starfield['u_flux_calib'].value = float(
+                        3.879 * (self.fb_height * fov_factor) ** 2 * _star_size_px * _star_size_px / 1.0e13)
+                    prog_starfield['u_max_point_px'].value = 10.0
+                    # 2 px sprite floor: a 1 px point samples the PSF Gaussian at a
+                    # single fragment whose PointCoord depends on the star's subpixel
+                    # position, so stars blink/shimmer as the camera moves.
+                    prog_starfield['u_min_point_px'].value = 2.0
+                    prog_starfield['u_intensity_scale'].value = float(self.camera.get("star_intensity", 1.0))
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.depth_mask = False
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+                    star_vao.render(moderngl.POINTS)
+                    ctx.depth_mask = True
+                    ctx.disable(moderngl.BLEND)
+
+                def execute_atmosphere_pass(clip_mode, target_list=None):
+                    if not self.camera.get("atmo_enabled", True):
+                        return
+                    atmos_to_march = sorted_atmos if target_list is None else target_list
+                    if not atmos_to_march:
+                        return
+                    atmo_res = 1.0 if getattr(self, "_screenshot_capturing", False) else float(self.camera.get("atmo_resolution", 1.0))
+                    temporal_accum = self.camera.get("atmo_temporal_accum", True)
+                    has_atmo_fbos = (
+                        isinstance(self.atmo_lowres_fbo, dict) and
+                        self.atmo_lowres_fbo.get(clip_mode, [None])[0] is not None
+                    )
+                    use_vrs = (atmo_res < 0.999 or temporal_accum) and has_atmo_fbos and (atmo_quality != 3)
+
+                    pending_lowres_atmos = []
+
+                    def flush_lowres():
+                        if not pending_lowres_atmos:
+                            return
+
+                        curr_idx = self.atmo_ping_pong_idx.get(clip_mode, 0)
+                        prev_idx = 1 - curr_idx
+                        target_fbo = self.atmo_lowres_fbo[clip_mode][curr_idx]
+
+                        # 1. Low-Res / Atmosphere Buffer Pass (Inner Region)
+                        target_fbo.use()
+                        ctx.viewport = (0, 0, target_fbo.width, target_fbo.height)
+                        target_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
+
+                        low_size = (float(target_fbo.width), float(target_fbo.height))
+                        if 'u_lowres_size' in prog_atmo_lowres:
+                            prog_atmo_lowres['u_lowres_size'].value = low_size
+                        if 'u_lowres_size' in prog_atmo:
+                            prog_atmo['u_lowres_size'].value = low_size
+                        if 'u_screen_res' in prog_atmo_lowres:
+                            prog_atmo_lowres['u_screen_res'].value = low_size
+                        if self.depth_texture:
+                            self.depth_texture.use(location=9)
+
+                        # Bind previous history textures for temporal reprojection
+                        if self.atmo_lowres_scatter_tex[clip_mode][prev_idx]:
+                            self.atmo_lowres_scatter_tex[clip_mode][prev_idx].use(location=10)
+                        if self.atmo_lowres_trans_tex[clip_mode][prev_idx]:
+                            self.atmo_lowres_trans_tex[clip_mode][prev_idx].use(location=11)
+
+                        render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=True)
+
+                        # 2. Masked Upsample Pass (Composites inner region to high-res FBO)
+                        self.hdr_resolve_fbo.use()
+                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                        ctx.enable(moderngl.BLEND)
+                        gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
+                        ctx.disable(moderngl.DEPTH_TEST)
+                        ctx.depth_mask = False
+
+                        self.atmo_lowres_scatter_tex[clip_mode][curr_idx].use(location=0)
+                        self.atmo_lowres_trans_tex[clip_mode][curr_idx].use(location=1)
+                        if self.depth_texture:
+                            self.depth_texture.use(location=9)
+
+                        if 'u_depth_C' in self.prog_atmo_upsample:
+                            self.prog_atmo_upsample['u_depth_C'].value = depth_C
+                        if 'u_far' in self.prog_atmo_upsample:
+                            self.prog_atmo_upsample['u_far'].value = far
+                        if 'u_lowres_size' in self.prog_atmo_upsample:
+                            self.prog_atmo_upsample['u_lowres_size'].value = (float(target_fbo.width), float(target_fbo.height))
+                        if 'u_vrs_enabled' in self.prog_atmo_upsample:
+                            self.prog_atmo_upsample['u_vrs_enabled'].value = (atmo_res < 0.999)
+
+                        self.quad_vao_atmo_upsample.render(moderngl.TRIANGLE_STRIP)
+
+                        if 'u_vrs_enabled' in self.prog_atmo_upsample:
+                            self.prog_atmo_upsample['u_vrs_enabled'].value = False
+
+                        # 3. High-Res Pass (Edge Region only when VRS downsampling is active)
+                        if atmo_res < 0.999:
+                            self.atmo_lowres_trans_tex[clip_mode][curr_idx].use(location=2)
+                            if 'u_lowres_trans' in prog_atmo:
+                                prog_atmo['u_lowres_trans'].value = 2
+                            if 'u_vrs_highres_pass' in prog_atmo:
+                                prog_atmo['u_vrs_highres_pass'].value = True
+                            if 'u_screen_res' in prog_atmo:
+                                prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+
+                            render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=False)
+
+                            if 'u_vrs_highres_pass' in prog_atmo:
+                                prog_atmo['u_vrs_highres_pass'].value = False
+
+                        ctx.depth_mask = True
+                        ctx.enable(moderngl.DEPTH_TEST)
+                        ctx.disable(moderngl.BLEND)
+
+                        # Advance ping-pong index and mark history valid for this clip mode
+                        self.atmo_ping_pong_idx[clip_mode] = 1 - self.atmo_ping_pong_idx[clip_mode]
+                        self.atmo_history_valid[clip_mode] = True
+
+                        pending_lowres_atmos.clear()
+
+                    for sq_dist, atmo, is_cmp in atmos_to_march:
+                        dist_to_body = math.sqrt(sq_dist)
+                        apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
+
+                        vrs_threshold = float(self.camera.get("atmo_vrs_threshold_px", 100.0)) if atmo_res < 0.999 else 0.0
+                        is_this_lowres = use_vrs and apparent_px >= vrs_threshold
+
+                        if is_this_lowres:
+                            pending_lowres_atmos.append((sq_dist, atmo, is_cmp))
+                        else:
+                            flush_lowres()
+
+                            # Render entirely at high-res
+                            self.hdr_resolve_fbo.use()
+                            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                            if 'u_screen_res' in prog_atmo:
+                                prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
+                            if 'u_vrs_highres_pass' in prog_atmo:
+                                prog_atmo['u_vrs_highres_pass'].value = False
+                            if self.depth_texture:
+                                self.depth_texture.use(location=9)
+
+                            render_atmosphere_pass(clip_mode, [(sq_dist, atmo, is_cmp)], is_lowres=False)
+
+                    flush_lowres()
+
+                # Partition atmospheres into those requiring ring clipping vs ringless
+                def _body_needs_ring_clip(entry):
+                    if n_ring_planes == 0:
+                        return False
+                    _sq, _a, _is_c = entry
+                    _bi = _a['body_idx']
+                    if _is_c:
+                        if any(g.get('body_idx') == _bi for g in getattr(self, 'ring_render_groups_cmp', [])):
+                            return True
+                    else:
+                        if _bi in self.body_ring_indices:
+                            return True
+                    _b_pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                    _a_rad = float(_a['atmo_radius_au'])
+                    for _k in range(n_ring_planes):
+                        _c_ring = ring_centers_buf[_k, 0:3]
+                        _d_vec = _b_pos - _c_ring
+                        _d_sq = float(_d_vec[0]**2 + _d_vec[1]**2 + _d_vec[2]**2)
+                        _r_outer = float(ring_params_buf[_k, 1])
+                        _reach = _r_outer + _a_rad * 2.0
+                        if _d_sq < _reach * _reach:
+                            return True
+                    return False
+
+                def render_single_ring_group(group, is_cmp=False, clip_mode=0, clip_atmo_radius=0.0):
+                    ctx.disable(moderngl.CULL_FACE)
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
+                    u_ring_camera_pos.write(cam_pos)
+                    ctx.depth_mask = False
+                    u_ring_clip_mode.value = clip_mode
+                    u_ring_clip_atmo_radius.value = clip_atmo_radius
+                    if u_ring_planetshine_enabled is not None:
+                        u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
+                    if u_ring_planetshine_mode is not None:
+                        u_ring_planetshine_mode.value = int(self.camera.get("ring_planetshine_mode", 0))
+                    ring_gradient_tex.use(location=0)
+
+                    bi = group['body_idx']
+                    if not is_cmp:
+                        body_pos_rel = pos_rel_all[bi]
+                        u_ring_body_offset.write(body_pos_rel)
+                        u_ring_host_pos.write(body_pos_rel)
+                        u_ring_host_radius.value = float(body_radii[bi])
+                        if u_ring_host_color is not None:
+                            u_ring_host_color.value = tuple(float(c) for c in body_colors[bi])
+                        f = float(all_instances[bi, 12])
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+                        u_ring_host_pole_obl.value = (
+                            float(all_instances[bi, 9]),
+                            float(all_instances[bi, 10]),
+                            float(all_instances[bi, 11]),
+                            float(f_scale)
+                        )
+
+                        pos_host = pos_rel_all[bi]
+                        r_eq = float(body_radii[bi])
+                        pole = all_instances[bi, 9:12]
+                        pos_star = pos_rel_all[star_idx]
+                        to_star = pos_star - pos_host
                         dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
                         if dist_s > 1e-6:
                             L = to_star / dist_s
                         else:
                             L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                        
-                        p_dot_L = np.dot(all_instances[idx_u, 9:12], L)
+                        p_dot_L = np.dot(pole, L)
                         p_proj_sq = 1.0 - p_dot_L**2
-                        fc_factor = 1.0 - fc
-                        r_minor = rad_c * np.sqrt(max(0.0, p_dot_L**2 + (fc_factor**2) * p_proj_sq))
-                        active_caster_r_minor_buf[i_ac] = r_minor
-                        
-                        lookup = atmo_lookup_cmp if is_c_cmp else atmo_lookup
-                        atmo_info = lookup.get(c_local_idx)
-                        if atmo_info:
-                            mass_sm_c = self.mass_snap_cmp[c_local_idx] if is_c_cmp else mass_snap[c_local_idx]
-                            props_c, trans_c, thick_c = get_cached_atmosphere_properties(atmo_info, mass_sm_c)
-                            thick_km = float(atmo_info.get('atmo_radius_km', 0.0) - atmo_info.get('planet_radius_km', 0.0))
-                            scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                            r_c_km = float(atmo_info.get('planet_radius_km', rad_c * 149597870.7))
-                            # Precompute grazing tau at the equatorial radius. Shared
-                            # shadow optics only adjust it for projected oblate limbs.
-                            # Thickness and scale height have independent buffer fields.
-                            tau_vert_c = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                            grazing_factor_c = math.sqrt(2.0 * math.pi * max(rad_c * AU_TO_KM, 100.0) / max(scale_height_km, 0.1))
-                            active_atmos_buf[i_ac, 0:3] = tau_vert_c * grazing_factor_c
-                            active_atmos_buf[i_ac, 3] = thick_km
-                            active_scale_height_buf[i_ac] = scale_height_km
-                            active_max_bend_buf[i_ac] = compute_max_bend(
-                                rad_c, scale_height_km,
-                                float(props_c.get('refractivity', 0.00029)),
-                                beta_ext=props_c.get('beta_rayleigh'))
-                            path_len_m_c = math.sqrt(2.0 * math.pi * r_c_km * 1000.0 * scale_height_km * 1000.0)
-                            tau_o3_c = props_c.get('beta_abs_layered', np.zeros(3)) * path_len_m_c
-                            active_caster_ozone_buf[i_ac, 0:3] = tau_o3_c
-                            active_caster_ozone_buf[i_ac, 3] = float(props_c.get('ozone_peak_km', 25.0))
-                            
-                    # Write all per-body atmosphere parameters into self.atmo_staging (std430 alignment)
-                    self.atmo_staging[0:3] = body_pos_rel
-                    self.atmo_staging[3] = float(atmo['atmo_radius_au'])
-                    self.atmo_staging[4:7] = props['beta_rayleigh']
-                    self.atmo_staging[7] = props['scale_height_km']
-                    self.atmo_staging[8:11] = beta_mie_coeffs
-                    self.atmo_staging[11] = atmo.get('h_mie', 1.2)
-                    self.atmo_staging[12:15] = props['beta_abs_mixed']
-                    self.atmo_staging[15] = atmo.get('mie_g', 0.758)
-                    self.atmo_staging[16:19] = props['beta_abs_layered']
-                    self.atmo_staging[19] = scaled_intensity
-                    self.atmo_staging[20] = float(atmo['planet_radius_km'])
-                    self.atmo_staging[21] = float(atmo['atmo_radius_km'])
-                    self.atmo_staging[22] = AU_TO_KM
-                    self.atmo_staging_int_view[23] = n_samples
-                    self.atmo_staging[24:27] = all_instances[body_idx_in_unified, 9:12]
-                    self.atmo_staging[27] = f_scale
-                    self.atmo_staging_int_view[28] = n_active
-                    self.atmo_staging_int_view[29] = 1 if self.camera.get("atmo_adaptive_steps", True) else 0
-                    self.atmo_staging_int_view[30] = body_idx_in_unified
-                    self.atmo_staging[31] = float(self.frame_counter % 1024)
-                    self.atmo_staging[32:35] = np.asarray(atmo.get('mie_albedo', [1.0, 1.0, 1.0]), dtype=np.float32)
-                    # index 35: u_refractivity (surface n_mix - 1, drives eclipse refraction)
-                    self.atmo_staging[35] = float(props.get('refractivity', 0.00029))
-                    self.atmo_staging[36:68] = active_casters_buf.ravel()
-                    self.atmo_staging[68:100] = active_poles_obl_buf.ravel()
-                    self.atmo_staging[100:108] = active_caster_r_minor_buf
-                    self.atmo_staging[108:140] = active_atmos_buf.ravel()
-                    self.atmo_staging[140:148] = active_max_bend_buf
-                    self.atmo_staging[148:180] = active_caster_ozone_buf.ravel()
-                    self.atmo_staging[256:264] = active_scale_height_buf
-                    self.atmo_staging[180:184] = [float(props.get('ozone_peak_km', 25.0)),
-                                                  float(props.get('ozone_width_km', 8.0)),
-                                                  0.0, float(self.camera.get('atmo_adaptive_steps_max', 128))]  # pad to 736 bytes
+                        f_factor = 1.0 - f
+                        host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                        if u_ring_host_R_minor is not None:
+                            u_ring_host_R_minor.value = float(host_r_minor)
+                        if u_ring_host_atmo is not None:
+                            atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
+                            if atmo is not None:
+                                props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
+                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                                # Keep thickness km separate from scale height and grazing tau.
+                                _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                                _thickness_km = max(0.0, float(atmo['atmo_radius_km']) - float(atmo['planet_radius_km']))
+                                _shadow_radius_km = max(float(body_radii[bi]) * AU_TO_KM, 100.0)
+                                _grazing_tau = _tau_v * math.sqrt(2.0 * math.pi * _shadow_radius_km / max(scale_height_km, 0.1))
+                                u_ring_host_atmo.value = (*map(float, _tau_v), _thickness_km)
+                                if u_ring_host_shadow is not None:
+                                    u_ring_host_shadow.value = (*map(float, _grazing_tau), scale_height_km)
+                                if u_ring_host_ozone is not None:
+                                    _ozone_tau = props_c.get('beta_abs_layered', np.zeros(3)) * math.sqrt(2.0 * math.pi * _shadow_radius_km * scale_height_km) * 1000.0
+                                    u_ring_host_ozone.value = (*map(float, _ozone_tau), float(props_c.get('ozone_peak_km', 25.0)))
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = compute_max_bend(body_radii[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
+                            else:
+                                u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_shadow is not None:
+                                    u_ring_host_shadow.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_ozone is not None:
+                                    u_ring_host_ozone.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = 0.0
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = 0.0
+                        k = self.body_ring_indices.get(bi)
+                        if k is not None:
+                            u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
+                            u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
 
-                    # Surface shaders raytrace the ellipsoid independently of mesh LOD.
-                    # Only a camera inside active terrain needs a below-datum floor;
-                    # scene depth then supplies the actual terrain endpoint.
-                    _clip_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
-                    _clip_radius = float(atmo['planet_radius_km'])
-                    if not is_cmp and bi in active_terrain_body_indices:
-                        _clip_cam = (cam_pos - body_pos_rel) * AU_TO_KM
-                        _clip_pole = all_instances[body_idx_in_unified, 9:12]
-                        _clip_cam = _clip_cam + np.dot(_clip_cam, _clip_pole) * (f_scale - 1.0) * _clip_pole
-                        if np.linalg.norm(_clip_cam) <= float(atmo['atmo_radius_km']):
-                            _clip_radius += min(0.0, float(_clip_body.get('height_range_km', [0.0])[0])) * f_scale - 0.05
-                    self.atmo_staging[182] = max(1e-3, _clip_radius)
+                        body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                        prog_rings['u_num_ring_planes'].value = len(body_rings)
+                        b_name = bodies_data[bi]['name']
+                        name_lower = b_name.lower()
+                        is_textured = name_lower in self.ring_textures
+                        if 'u_is_textured' in prog_rings:
+                            prog_rings['u_is_textured'].value = is_textured
+                        if is_textured:
+                            if name_lower in self.ring_gl_textures:
+                                self.ring_gl_textures[name_lower].use(location=4)
+                        for idx, r in enumerate(body_rings):
+                            if idx >= 16: break
+                            prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
+                            prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
+                            prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
+                            prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
+                            prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
+                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
+                            prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                            prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                            prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
+                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
+                    else:
+                        body_pos_rel = cmp_pos_rel[bi].astype('f4')
+                        u_ring_body_offset.write(body_pos_rel)
+                        u_ring_host_pos.write(body_pos_rel)
+                        u_ring_host_radius.value = float(self.body_radii_cmp[bi])
+                        if u_ring_host_color is not None:
+                            u_ring_host_color.value = tuple(float(c) for c in self.body_colors_cmp[bi])
 
-                    # Precomputed optical constants
-                    _inv_h_r = 1.0 / max(1e-3, float(props['scale_height_km']))
-                    _inv_h_m = 1.0 / max(1e-3, float(atmo.get('h_mie', 1.2)))
-                    _inv_oz = 1.0 / max(1e-3, float(props.get('ozone_width_km', 8.0)))
-                    _max_b = compute_max_bend(
-                        float(atmo['planet_radius_km']) / AU_TO_KM,
-                        float(props['scale_height_km']),
-                        float(props.get('refractivity', 0.00029)),
-                        beta_ext=props.get('beta_rayleigh'))
-                    self.atmo_staging[184:188] = [_inv_h_r, _inv_h_m, _inv_oz, _max_b]
+                        body_idx_in_unified = num_bodies + bi
+                        f = float(all_instances[body_idx_in_unified, 12])
+                        f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
+                        u_ring_host_pole_obl.value = (
+                            float(all_instances[body_idx_in_unified, 9]),
+                            float(all_instances[body_idx_in_unified, 10]),
+                            float(all_instances[body_idx_in_unified, 11]),
+                            float(f_scale)
+                        )
 
-                    # Precomputed Henyey-Greenstein Mie phase constants
-                    _g = float(np.clip(float(atmo.get('mie_g', 0.758)), 0.0, 0.88))
-                    _g2 = _g * _g
-                    _c1 = (3.0 / (8.0 * math.pi)) * ((1.0 - _g2) / (2.0 + _g2))
-                    _c2 = 1.0 + _g2
-                    _c3 = 2.0 * _g
-                    _has_methane = 1.0 if atmo.get('composition', {}).get('CH4', 0.0) > 1e-4 else 0.0
-                    _cur_body_data = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
-                    _has_rings = 1.0 if len(_cur_body_data.get('rings', [])) > 0 else 0.0
-                    self.atmo_staging[188:192] = [_c1, _c2, _c3, _has_methane]
-
-                    # Precomputed star parameters (up to 4 stars)
-                    self.atmo_staging[192:256] = 0.0
-                    _b_pole_raw = all_instances[body_idx_in_unified, 9:12]
-                    _b_pole_len = float(np.linalg.norm(_b_pole_raw))
-                    _p_pole_norm = _b_pole_raw / _b_pole_len if _b_pole_len > 1e-4 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
-
-                    _star0_s_dir_sph = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                    _star0_comb_int = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-                    _n_stars_to_precomp = min(len(stars_pos_radius), 4)
-                    for _s in range(_n_stars_to_precomp):
-                        _s_pos = np.array(stars_pos_radius[_s][0:3], dtype=np.float32)
-                        _s_rad = float(stars_pos_radius[_s][3])
-
-                        _f_to_s = _s_pos - body_pos_rel
-                        _d_star = float(np.linalg.norm(_f_to_s))
-                        _L_star = _f_to_s / _d_star if _d_star > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
-
-                        _pole_s = np.array(stars_poles_obl[_s][0:3], dtype=np.float32)
-                        _pole_s_len = float(np.linalg.norm(_pole_s))
-                        _pole_s_dir = _pole_s / _pole_s_len if _pole_s_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                        _star_sin_lat = abs(float(np.dot(_L_star, _pole_s_dir)))
-
-                        _eq_col = np.array(stars_colors[_s][0:3], dtype=np.float32)
-                        _eq_lum = float(stars_colors[_s][3])
-                        _pol_col = np.array(stars_pole_colors[_s][0:3], dtype=np.float32)
-                        _pol_lum = float(stars_pole_colors[_s][3])
-
-                        _star_col = _eq_col * (1.0 - _star_sin_lat) + _pol_col * _star_sin_lat
-                        _star_lum = _eq_lum * (1.0 - _star_sin_lat) + _pol_lum * _star_sin_lat
-
-                        _sin_s = _s_rad / max(_d_star, _s_rad + 1e-6)
-                        _eff_s_rad = _sin_s + _max_b
-                        _cos_s_eff = math.sqrt(max(0.0, 1.0 - _eff_s_rad * _eff_s_rad))
-
-                        _irrad = _star_lum / max(_d_star * _d_star, 1e-8)
-                        _comb_int = _star_col * (_irrad * scaled_intensity * math.pi)
-
-                        _sun_pos_loc = _f_to_s * AU_TO_KM
-
-                        # toSphericalSpace of L
-                        _p_proj = float(np.dot(_L_star, _p_pole_norm))
-                        _p_perp = _L_star - _p_proj * _p_pole_norm
-                        _s_dir_sph = _p_perp + (_p_proj * f_scale) * _p_pole_norm
-                        _s_dir_sph_len = float(np.linalg.norm(_s_dir_sph))
-                        _s_dir_sph = _s_dir_sph / _s_dir_sph_len if _s_dir_sph_len > 1e-6 else np.array([0.0, 1.0, 0.0], dtype=np.float32)
-
-                        _s_pole_dot = float(np.dot(_s_dir_sph, _p_pole_norm))
-                        _cosPhi = abs(_s_pole_dot)
-                        _tanPhi = _cosPhi / math.sqrt(max(1.0 - _cosPhi * _cosPhi, 1e-4))
-                        _solstice_f = float(np.clip(_tanPhi * 1.8, 0.0, 1.0)) * _has_methane * _has_rings
-
-                        if _s == 0:
-                            _star0_s_dir_sph = _s_dir_sph
-                            _star0_comb_int = _comb_int
-
-                        # Pack into staging buffer
-                        _b_idx = 192 + _s * 4
-                        self.atmo_staging[_b_idx : _b_idx + 3] = _comb_int
-                        self.atmo_staging[_b_idx + 3] = _sin_s
-
-                        _b_idx = 208 + _s * 4
-                        self.atmo_staging[_b_idx : _b_idx + 3] = _s_dir_sph
-                        self.atmo_staging[_b_idx + 3] = _cos_s_eff
-
-                        _b_idx = 224 + _s * 4
-                        self.atmo_staging[_b_idx : _b_idx + 3] = _sun_pos_loc
-                        self.atmo_staging[_b_idx + 3] = _eff_s_rad
-
-                        _b_idx = 240 + _s * 4
-                        self.atmo_staging[_b_idx : _b_idx + 4] = [_solstice_f, _s_pole_dot, _d_star, _s_rad]
-
-                    # Single buffer upload per atmosphere body (must precede Sky-View LUT pass)
-                    self.atmo_ssbo.write(self.atmo_staging.tobytes())
-
-                    # Mode 3 uses position-queryable tables for sky and terrain.
-                    # Four cached atmospheres bound VRAM;
-                    # comparison bodies follow the same rendering path.
-                    _endpoint_enabled = atmo_quality == 3
-                    if 'u_scattering_enabled' in cur_prog:
-                        cur_prog['u_scattering_enabled'].value = _endpoint_enabled
-                    if 'u_atmo_optical_enabled' in cur_prog:
-                        cur_prog['u_atmo_optical_enabled'].value = atmo_quality >= 2
-                    if atmo_quality >= 2:
-                        if self.scattering_lut_cache is None:
-                            self.scattering_lut_cache = ScatteringLUTCache(ctx)
-                        _endpoint_body = bodies_data_cmp[bi] if is_cmp else bodies_data[bi]
-                        _height_min = min(0.0, float(_endpoint_body.get('height_range_km', [0.0, 8.848])[0]))
-                        _terrain_bottom = max(1e-3, float(atmo['planet_radius_km']) + _height_min * f_scale - 0.05)
-                        # Reference-radius tables avoid subtracting imaginary
-                        # ocean-floor columns from above-datum terrain haze.
-                        _bottom = float(atmo['planet_radius_km'])
-                        _eff_sun = max(0.0, round(float(self.atmo_staging[227]), 4))
-                        _endpoint_parameters = {
-                            'u_planet_radius_km': float(atmo['planet_radius_km']),
-                            'u_atmo_radius_km': float(atmo['atmo_radius_km']),
-                            'u_scattering_bottom_km': _bottom,
-                            'u_scattering_sun_radius': _eff_sun,
-                            'u_h_rayleigh': float(props['scale_height_km']),
-                            'u_h_mie': float(atmo.get('h_mie', 1.2)),
-                            'u_beta_rayleigh': tuple(float(x) for x in props['beta_rayleigh']),
-                            'u_beta_mie': tuple(float(x) for x in beta_mie_coeffs),
-                            'u_beta_abs_mixed': tuple(float(x) for x in props['beta_abs_mixed']),
-                            'u_beta_abs_layered': tuple(float(x) for x in props['beta_abs_layered']),
-                            'u_mie_albedo': tuple(float(x) for x in np.broadcast_to(atmo.get('mie_albedo', 1.0), (3,))),
-                            'u_ozone_peak_km': float(props.get('ozone_peak_km', 25.0)),
-                            'u_ozone_width_km': float(props.get('ozone_width_km', 8.0)),
-                            # Also key the MS inputs, including ground albedo.
-                            'u_mie_g': float(atmo.get('mie_g', 0.8)),
-                            'u_ground_albedo': tuple(float(x) for x in self.visual_arr_cmp[bi, 0:3])
-                                if is_cmp else tuple(float(x) for x in visual_arr[bi, 0:3]),
-                        }
-                        if _endpoint_enabled:
-                            _endpoint_textures = self.scattering_lut_cache.get(
-                                _endpoint_parameters, atmo['lut_multi_scatter'])
-                            self.scattering_lut_cache.bind(_endpoint_textures)
-                            # Distinct stellar angular sizes share medium/shine tables,
-                            # with their own cached solar response and no raymarch fallback.
-                            for _slot in range(1, min(num_stars, 4)):
-                                _star_parameters = dict(_endpoint_parameters,
-                                    u_scattering_sun_radius=max(0.0, round(float(self.atmo_staging[227 + 4 * _slot]), 4)))
-                                _star_tables = self.scattering_lut_cache.get(_star_parameters, atmo['lut_multi_scatter'])
-                                self.scattering_lut_cache.bind_star(_star_tables, _slot)
+                        pos_host = cmp_pos_rel[bi]
+                        r_eq = float(self.body_radii_cmp[bi])
+                        pole = all_instances[body_idx_in_unified, 9:12]
+                        pos_star = cmp_pos_rel[self.star_idx_cmp]
+                        to_star = pos_star - pos_host
+                        dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
+                        if dist_s > 1e-6:
+                            L = to_star / dist_s
                         else:
-                            self.scattering_lut_cache.get_optical_depth(_endpoint_parameters).use(20)
-                        if 'u_scattering_terrain_bottom_km' in cur_prog:
-                            cur_prog['u_scattering_terrain_bottom_km'].value = _terrain_bottom
-                        if 'u_scattering_bottom_km' in cur_prog:
-                            cur_prog['u_scattering_bottom_km'].value = _bottom
-                        if 'u_scattering_sun_radius' in cur_prog:
-                            cur_prog['u_scattering_sun_radius'].value = _eff_sun
-                        if 'u_scattering_azimuth_count' in cur_prog:
-                            cur_prog['u_scattering_azimuth_count'].value = self.scattering_lut_cache.size[3]
-                        if _endpoint_enabled:
-                            for _name, _value in (('u_scattering_bottom_km', _bottom),
-                                    ('u_scattering_sun_radius', _eff_sun),
-                                    ('u_scattering_azimuth_count', self.scattering_lut_cache.size[3])):
-                                if _name in self.prog_sky_view: self.prog_sky_view[_name].value = _value
+                            L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                        p_dot_L = np.dot(pole, L)
+                        p_proj_sq = 1.0 - p_dot_L**2
+                        f_factor = 1.0 - f
+                        host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
+                        if u_ring_host_R_minor is not None:
+                            u_ring_host_R_minor.value = float(host_r_minor)
+                        if u_ring_host_atmo is not None:
+                            atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
+                            if atmo is not None:
+                                props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
+                                scale_height_km = float(props_c.get('scale_height_km', 8.5))
+                                # Keep thickness km separate from scale height and grazing tau.
+                                _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
+                                _thickness_km = max(0.0, float(atmo['atmo_radius_km']) - float(atmo['planet_radius_km']))
+                                _shadow_radius_km = max(float(self.body_radii_cmp[bi]) * AU_TO_KM, 100.0)
+                                _grazing_tau = _tau_v * math.sqrt(2.0 * math.pi * _shadow_radius_km / max(scale_height_km, 0.1))
+                                u_ring_host_atmo.value = (*map(float, _tau_v), _thickness_km)
+                                if u_ring_host_shadow is not None:
+                                    u_ring_host_shadow.value = (*map(float, _grazing_tau), scale_height_km)
+                                if u_ring_host_ozone is not None:
+                                    _ozone_tau = props_c.get('beta_abs_layered', np.zeros(3)) * math.sqrt(2.0 * math.pi * _shadow_radius_km * scale_height_km) * 1000.0
+                                    u_ring_host_ozone.value = (*map(float, _ozone_tau), float(props_c.get('ozone_peak_km', 25.0)))
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = compute_max_bend(self.body_radii_cmp[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
+                            else:
+                                u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_shadow is not None:
+                                    u_ring_host_shadow.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_ozone is not None:
+                                    u_ring_host_ozone.value = (0.0, 0.0, 0.0, 0.0)
+                                if u_ring_host_refractivity is not None:
+                                    u_ring_host_refractivity.value = 0.0
+                                if u_ring_host_max_bend is not None:
+                                    u_ring_host_max_bend.value = 0.0
+                        u_ring_caster_mask_lo_uni.value = 0
+                        u_ring_caster_mask_hi_uni.value = 0
+                        body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
+                        prog_rings['u_num_ring_planes'].value = len(body_rings)
+                        b_name = self.bodies_data_cmp[bi]['name']
+                        name_lower = b_name.lower()
+                        is_textured = name_lower in self.ring_textures
+                        if 'u_is_textured' in prog_rings:
+                            prog_rings['u_is_textured'].value = is_textured
+                        if is_textured:
+                            if name_lower in self.ring_gl_textures:
+                                self.ring_gl_textures[name_lower].use(location=4)
+                        for idx, r in enumerate(body_rings):
+                            if idx >= 16: break
+                            prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
+                            prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
+                            prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
+                            prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
+                            prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
+                            prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
+                            prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
+                            prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
+                            prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
+                            prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
+                            prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
+                            prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
+                        group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
 
-                    # Mode 3: Analytical Sky-View LUT pass
-                    if atmo_quality == 3 and self.prog_sky_view is not None:
-                        _sv_res_idx = max(0, min(len(SKY_VIEW_RESOLUTIONS) - 1, int(self.camera.get("atmo_sky_view_res", 0))))
-                        _target_w, _target_h = SKY_VIEW_RESOLUTIONS[_sv_res_idx]
-                        if self.sky_view_width != _target_w or self.sky_view_height != _target_h:
-                            self.resize_sky_view_lut(_target_w, _target_h)
-
-                        current_bake_key = (self.frame_counter, body_idx_in_unified)
-                        cam_rel_au = cam_pos - body_pos_rel
-                        cam_rel_km = cam_rel_au * AU_TO_KM
-                        if f_scale > 1.00001:
-                            h_pole = float(np.dot(cam_rel_km, _p_pole_norm))
-                            cam_sph_km = cam_rel_km + (h_pole * (f_scale - 1.0)) * _p_pole_norm
-                        else:
-                            cam_sph_km = cam_rel_km
-
-                        if self.sky_view_baked_key != current_bake_key:
-                            if 'lut_tex' in atmo and atmo['lut_tex']:
-                                atmo['lut_tex'].use(location=1)
-                            if 'lut_multi_scatter' in atmo and atmo['lut_multi_scatter']:
-                                atmo['lut_multi_scatter'].use(location=3)
-
-                            # Ring plane data + ringshine irradiance map for the baked
-                            # ringshine term (Stage 2) and external ring shadow evaluation;
-                            # instance SSBO (planetshine dir/color, ring mask) is globally bound at binding 2.
-                            if 'u_num_ring_planes' in self.prog_sky_view:
-                                self.prog_sky_view['u_num_ring_planes'].value = n_ring_planes
-                            if n_ring_planes > 0:
-                                if 'u_ring_center' in self.prog_sky_view:
-                                    self.prog_sky_view['u_ring_center'].write(ring_centers_buf)
-                                if 'u_ring_normal' in self.prog_sky_view:
-                                    self.prog_sky_view['u_ring_normal'].write(ring_normals_buf)
-                                if 'u_ring_params' in self.prog_sky_view:
-                                    self.prog_sky_view['u_ring_params'].write(ring_params_buf)
-                                if 'u_ring_coplanar_mask' in self.prog_sky_view:
-                                    self.prog_sky_view['u_ring_coplanar_mask'].write(ring_coplanar_mask_buf.tobytes())
-                                if ring_gradient_tex:
-                                    ring_gradient_tex.use(location=0)
-                            self.ringshine_map_tex.use(location=8)
-
-                            self.sky_view_fbo.use()
-                            ctx.viewport = (0, 0, self.sky_view_width, self.sky_view_height)
-                            ctx.disable(moderngl.DEPTH_TEST)
-                            ctx.disable(moderngl.BLEND)
-                            ctx.disable(moderngl.CULL_FACE)
-
-                            self.prog_sky_view['u_cam_pos'].value = tuple(cam_sph_km.astype(np.float32))
-                            self.prog_sky_view['u_sun_dir'].value = tuple(_star0_s_dir_sph.astype(np.float32))
-                            if 'u_atmo_shadow_method' in self.prog_sky_view:
-                                self.prog_sky_view['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
-
-                            self.quad_vao_sky_view.render(moderngl.TRIANGLE_STRIP)
-                            self.sky_view_baked_key = current_bake_key
-
-                        # Horizon-focused sampling amortizes grazing terrain
-                        # endpoint queries. Outside observers use the sky-view
-                        # boundary, so there is no terrain volume to consume.
-                        _use_aerial = (self.camera.get("atmo_aerial_volume", True)
-                                       and clip_mode == 0
-                                       and np.linalg.norm(cam_sph_km) <= atmo['atmo_radius_km'])
-                        cur_prog['u_aerial_enabled'].value = False
-                        if _use_aerial:
-                            if self.aerial_volume is None:
-                                self.aerial_volume = AerialPerspectiveVolume(ctx)
-                            atmo['lut_multi_scatter'].use(location=3)
-                            self.ringshine_map_tex.use(location=8)
-                            self.aerial_volume.update(
-                                current_bake_key, cam_sph_km, _terrain_bottom,
-                                _endpoint_parameters, self.scattering_lut_cache.size[3],
-                                inv_proj_bytes, inv_view_bytes, n_ring_planes,
-                                ring_normals_buf, ps_enabled, rs_enabled,
-                                pole_obl=tuple(self.atmo_staging[24:28]),
-                                viewport_size=(self.fb_width, self.fb_height))
-                            self.aerial_volume.bind(cur_prog, cam_sph_km, _terrain_bottom)
-
-                        # Restore framebuffer and raster state for atmosphere polyhedron rendering
-                        if is_lowres:
-                            target_fbo = self.atmo_lowres_fbo[clip_mode][self.atmo_ping_pong_idx.get(clip_mode, 0)]
-                            target_fbo.use()
-                            ctx.viewport = (0, 0, target_fbo.width, target_fbo.height)
-                        else:
-                            self.hdr_resolve_fbo.use()
-                            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                            ctx.enable(moderngl.BLEND)
-                            gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
-
-                        ctx.depth_func = '<='
-                        ctx.enable(moderngl.CULL_FACE)
-                        ctx.cull_face = 'front'
-                        ctx.disable(moderngl.DEPTH_TEST)
-                        ctx.depth_mask = False
-
-                        self.sky_view_tex.use(location=12)
-                        self.sky_view_trans_tex.use(location=14)
-                        for _sv_i, _sv_t in enumerate(self.sky_view_star_tex):
-                            _sv_t.use(location=15 + _sv_i)
-                        if ring_shadow_tex is not None:
-                            if hasattr(self, "body_ring_indices") and bi in self.body_ring_indices:
-                                u_idx = self.body_ring_indices[bi]
-                                if getattr(ring_shadow_tex, 'current_body_idx', None) != u_idx and hasattr(ring_gradient_tex, 'atlas_data'):
-                                    ring_shadow_tex.write(ring_gradient_tex.atlas_data[u_idx, :, :].tobytes())
-                                    ring_shadow_tex.build_mipmaps()
-                                    ring_shadow_tex.current_body_idx = u_idx
-                            ring_shadow_tex.use(location=13)
-                        if n_ring_planes > 0:
-                            self.surface_ring_shadow_filter.bind()
-                        if 'u_atmo_shadow_method' in cur_prog:
-                            cur_prog['u_atmo_shadow_method'].value = int(self.camera.get("atmo_shadow_method", 1))
-                        shadow_method = int(self.camera.get("atmo_shadow_method", 1))
-                        if shadow_method in (1, 2):
-                            if 'u_ring_station_count' in cur_prog:
-                                cur_prog['u_ring_station_count'].value = max(4, min(64, int(self.camera.get("atmo_shadow_steps", 24))))
-                        else:
-                            # Station-cell grid baked from this body's ring profile (edges snapped
-                            # to ring discontinuities); replaces the uniform-in-s slice grid whose
-                            # phase quantization caused step banding. Lazy-baked per (body, K).
-                            if ('u_ring_station_count' in cur_prog and hasattr(ring_gradient_tex, 'station_cells')
-                                    and hasattr(self, "body_ring_indices") and bi in self.body_ring_indices):
-                                u_idx = self.body_ring_indices[bi]
-                                K = max(2, min(32, int(self.camera.get("atmo_slicing_steps", 8))))
-                                bounds = ring_gradient_tex.station_cells.get((bi, K))
-                                if bounds is None:
-                                    bounds = bake_station_cells(ring_gradient_tex.atlas_data[u_idx, :, 3], max_cells=K)
-                                    ring_gradient_tex.station_cells[(bi, K)] = bounds
-                                grid = np.zeros(36, dtype='f4')
-                                grid[:len(bounds)] = bounds
-                                cur_prog['u_ring_station_cells'].write(grid.tobytes())
-                                cur_prog['u_ring_station_count'].value = max(2, len(bounds) - 1)
-
-                    cur_vao.render(moderngl.TRIANGLES)
-    
-                ctx.depth_mask = True
-                ctx.enable(moderngl.DEPTH_TEST)
-                ctx.enable(moderngl.CULL_FACE)
-                ctx.cull_face = 'back'
-                ctx.depth_func = '<'
-                ctx.disable(moderngl.BLEND)
-
-            # --- GAIA starfield point pass (render-only catalog layer) ---
-            # GPU-side packing: static attributes + two uniforms per frame.
-            if star_vao is not None and self.camera.get("show_gaia_stars", True):
-                prog_starfield['u_origin'].value = (float(cam_origin[0]), float(cam_origin[1]), float(cam_origin[2]))
-                prog_starfield['u_t'].value = float(display_t)
-                prog_starfield['projection'].write(projection.astype('f4').tobytes())
-                prog_starfield['view'].write(view.astype('f4').tobytes())
-                # Eye position relative to the frame origin — drives the
-                # per-star inverse-square flux falloff in starfield.vert.
-                prog_starfield['u_eye'].value = (float(cam_pos_f8[0]), float(cam_pos_f8[1]), float(cam_pos_f8[2]))
-                prog_starfield['u_far'].value = float(far)
-                prog_starfield['screen_height'].value = float(self.fb_height)
-                prog_starfield['u_point_base'].value = float(self.camera.get("star_point_size", 2.0))
-                # Physical HDR calibration: anchor the catalog flux scale to the
-                # system star's radiance units (mesh luminance 0.8333*L/R^2,
-                # irradiance L/d^2, solar constant at 1 AU = 1.0). A solar star
-                # (M_G = 4.67) at 1 AU must peak exactly like the system sun's
-                # subpixel point sprite: 0.8333*(h*fov)^2/4 * L/d^2. Solving
-                # against the sprite's flux-conserving normalization
-                # (1 / (size^2 * 0.2524)) gives u_cal = 3.879*(h*fov)^2*size^2/1e13.
-                _star_size_px = min(10.0, max(2.0, float(self.camera.get("star_point_size", 2.0)) * (self.fb_height / 1080.0)))
-                prog_starfield['u_flux_calib'].value = float(
-                    3.879 * (self.fb_height * fov_factor) ** 2 * _star_size_px * _star_size_px / 1.0e13)
-                prog_starfield['u_max_point_px'].value = 10.0
-                # 2 px sprite floor: a 1 px point samples the PSF Gaussian at a
-                # single fragment whose PointCoord depends on the star's subpixel
-                # position, so stars blink/shimmer as the camera moves.
-                prog_starfield['u_min_point_px'].value = 2.0
-                prog_starfield['u_intensity_scale'].value = float(self.camera.get("star_intensity", 1.0))
-                ctx.enable(moderngl.DEPTH_TEST)
-                ctx.depth_mask = False
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-                star_vao.render(moderngl.POINTS)
-                ctx.depth_mask = True
-                ctx.disable(moderngl.BLEND)
-
-            def execute_atmosphere_pass(clip_mode, target_list=None):
-                if not self.camera.get("atmo_enabled", True):
-                    return
-                atmos_to_march = sorted_atmos if target_list is None else target_list
-                if not atmos_to_march:
-                    return
-                atmo_res = 1.0 if getattr(self, "_screenshot_capturing", False) else float(self.camera.get("atmo_resolution", 1.0))
-                temporal_accum = self.camera.get("atmo_temporal_accum", True)
-                has_atmo_fbos = (
-                    isinstance(self.atmo_lowres_fbo, dict) and 
-                    self.atmo_lowres_fbo.get(clip_mode, [None])[0] is not None
-                )
-                use_vrs = (atmo_res < 0.999 or temporal_accum) and has_atmo_fbos and (atmo_quality != 3)
-                
-                pending_lowres_atmos = []
-                
-                def flush_lowres():
-                    if not pending_lowres_atmos:
-                        return
-                        
-                    curr_idx = self.atmo_ping_pong_idx.get(clip_mode, 0)
-                    prev_idx = 1 - curr_idx
-                    target_fbo = self.atmo_lowres_fbo[clip_mode][curr_idx]
-                        
-                    # 1. Low-Res / Atmosphere Buffer Pass (Inner Region)
-                    target_fbo.use()
-                    ctx.viewport = (0, 0, target_fbo.width, target_fbo.height)
-                    target_fbo.clear(color=(0.0, 0.0, 0.0, 0.0))
-                    
-                    low_size = (float(target_fbo.width), float(target_fbo.height))
-                    if 'u_lowres_size' in prog_atmo_lowres:
-                        prog_atmo_lowres['u_lowres_size'].value = low_size
-                    if 'u_lowres_size' in prog_atmo:
-                        prog_atmo['u_lowres_size'].value = low_size
-                    if 'u_screen_res' in prog_atmo_lowres:
-                        prog_atmo_lowres['u_screen_res'].value = low_size
-                    if self.depth_texture:
-                        self.depth_texture.use(location=9)
-                    
-                    # Bind previous history textures for temporal reprojection
-                    if self.atmo_lowres_scatter_tex[clip_mode][prev_idx]:
-                        self.atmo_lowres_scatter_tex[clip_mode][prev_idx].use(location=10)
-                    if self.atmo_lowres_trans_tex[clip_mode][prev_idx]:
-                        self.atmo_lowres_trans_tex[clip_mode][prev_idx].use(location=11)
-                        
-                    render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=True)
-                    
-                    # 2. Masked Upsample Pass (Composites inner region to high-res FBO)
-                    self.hdr_resolve_fbo.use()
-                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                    ctx.enable(moderngl.BLEND)
-                    gl.glBlendFunc(gl.GL_ONE, gl.GL_SRC1_COLOR)
-                    ctx.disable(moderngl.DEPTH_TEST)
-                    ctx.depth_mask = False
-                    
-                    self.atmo_lowres_scatter_tex[clip_mode][curr_idx].use(location=0)
-                    self.atmo_lowres_trans_tex[clip_mode][curr_idx].use(location=1)
-                    if self.depth_texture:
-                        self.depth_texture.use(location=9)
-                        
-                    if 'u_depth_C' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_depth_C'].value = depth_C
-                    if 'u_far' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_far'].value = far
-                    if 'u_lowres_size' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_lowres_size'].value = (float(target_fbo.width), float(target_fbo.height))
-                    if 'u_vrs_enabled' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_vrs_enabled'].value = (atmo_res < 0.999)
-                        
-                    self.quad_vao_atmo_upsample.render(moderngl.TRIANGLE_STRIP)
-                    
-                    if 'u_vrs_enabled' in self.prog_atmo_upsample:
-                        self.prog_atmo_upsample['u_vrs_enabled'].value = False
-                        
-                    # 3. High-Res Pass (Edge Region only when VRS downsampling is active)
-                    if atmo_res < 0.999:
-                        self.atmo_lowres_trans_tex[clip_mode][curr_idx].use(location=2)
-                        if 'u_lowres_trans' in prog_atmo:
-                            prog_atmo['u_lowres_trans'].value = 2
-                        if 'u_vrs_highres_pass' in prog_atmo:
-                            prog_atmo['u_vrs_highres_pass'].value = True
-                        if 'u_screen_res' in prog_atmo:
-                            prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
-                            
-                        render_atmosphere_pass(clip_mode, pending_lowres_atmos, is_lowres=False)
-                        
-                        if 'u_vrs_highres_pass' in prog_atmo:
-                            prog_atmo['u_vrs_highres_pass'].value = False
-                        
                     ctx.depth_mask = True
-                    ctx.enable(moderngl.DEPTH_TEST)
-                    ctx.disable(moderngl.BLEND)
-                    
-                    # Advance ping-pong index and mark history valid for this clip mode
-                    self.atmo_ping_pong_idx[clip_mode] = 1 - self.atmo_ping_pong_idx[clip_mode]
-                    self.atmo_history_valid[clip_mode] = True
-                    
-                    pending_lowres_atmos.clear()
+                    u_ring_clip_mode.value = 0
 
-                for sq_dist, atmo, is_cmp in atmos_to_march:
-                    dist_to_body = math.sqrt(sq_dist)
-                    apparent_px = (atmo['atmo_radius_au'] / max(dist_to_body, 1e-12)) * self.fb_height * fov_factor
-                    
-                    vrs_threshold = float(self.camera.get("atmo_vrs_threshold_px", 100.0)) if atmo_res < 0.999 else 0.0
-                    is_this_lowres = use_vrs and apparent_px >= vrs_threshold
-                    
-                    if is_this_lowres:
-                        pending_lowres_atmos.append((sq_dist, atmo, is_cmp))
-                    else:
-                        flush_lowres()
-                        
-                        # Render entirely at high-res
-                        self.hdr_resolve_fbo.use()
-                        ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                        if 'u_screen_res' in prog_atmo:
-                            prog_atmo['u_screen_res'].value = (float(self.fb_width), float(self.fb_height))
-                        if 'u_vrs_highres_pass' in prog_atmo:
-                            prog_atmo['u_vrs_highres_pass'].value = False
-                        if self.depth_texture:
-                            self.depth_texture.use(location=9)
-                            
-                        render_atmosphere_pass(clip_mode, [(sq_dist, atmo, is_cmp)], is_lowres=False)
-                        
-                flush_lowres()
+                def render_habitable_zone():
+                    if not (self.camera.get("show_habitable_zone", False) and self.hz_vao is not None):
+                        return
+                    ctx.disable(moderngl.CULL_FACE)
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                    ctx.depth_mask = False
 
-            # Partition atmospheres into those requiring ring clipping vs ringless
-            def _body_needs_ring_clip(entry):
-                if n_ring_planes == 0:
-                    return False
-                _sq, _a, _is_c = entry
-                _bi = _a['body_idx']
-                if _is_c:
-                    if any(g.get('body_idx') == _bi for g in getattr(self, 'ring_render_groups_cmp', [])):
-                        return True
-                else:
-                    if _bi in self.body_ring_indices:
-                        return True
-                _b_pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
-                _a_rad = float(_a['atmo_radius_au'])
-                for _k in range(n_ring_planes):
-                    _c_ring = ring_centers_buf[_k, 0:3]
-                    _d_vec = _b_pos - _c_ring
-                    _d_sq = float(_d_vec[0]**2 + _d_vec[1]**2 + _d_vec[2]**2)
-                    _r_outer = float(ring_params_buf[_k, 1])
-                    _reach = _r_outer + _a_rad * 2.0
-                    if _d_sq < _reach * _reach:
-                        return True
-                return False
+                    self.prog_hz['view'].write(view.astype('f4').tobytes())
+                    self.prog_hz['projection'].write(projection.astype('f4').tobytes())
+                    self.prog_hz['u_depth_C'].value = depth_C
+                    self.prog_hz['u_far'].value = far
+                    self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
 
-            def render_single_ring_group(group, is_cmp=False, clip_mode=0, clip_atmo_radius=0.0):
-                ctx.disable(moderngl.CULL_FACE)
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA)
-                u_ring_camera_pos.write(cam_pos)
-                ctx.depth_mask = False
-                u_ring_clip_mode.value = clip_mode
-                u_ring_clip_atmo_radius.value = clip_atmo_radius
-                if u_ring_planetshine_enabled is not None:
-                    u_ring_planetshine_enabled.value = self.camera.get("planetshine_enabled", True)
-                if u_ring_planetshine_mode is not None:
-                    u_ring_planetshine_mode.value = int(self.camera.get("ring_planetshine_mode", 0))
-                ring_gradient_tex.use(location=0)
-                
-                bi = group['body_idx']
-                if not is_cmp:
-                    body_pos_rel = pos_rel_all[bi]
-                    u_ring_body_offset.write(body_pos_rel)
-                    u_ring_host_pos.write(body_pos_rel)
-                    u_ring_host_radius.value = float(body_radii[bi])
-                    if u_ring_host_color is not None:
-                        u_ring_host_color.value = tuple(float(c) for c in body_colors[bi])
-                    f = float(all_instances[bi, 12])
-                    f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
-                    u_ring_host_pole_obl.value = (
-                        float(all_instances[bi, 9]),
-                        float(all_instances[bi, 10]),
-                        float(all_instances[bi, 11]),
-                        float(f_scale)
-                    )
-                    
-                    pos_host = pos_rel_all[bi]
-                    r_eq = float(body_radii[bi])
-                    pole = all_instances[bi, 9:12]
-                    pos_star = pos_rel_all[star_idx]
-                    to_star = pos_star - pos_host
-                    dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                    if dist_s > 1e-6:
-                        L = to_star / dist_s
-                    else:
-                        L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                    p_dot_L = np.dot(pole, L)
-                    p_proj_sq = 1.0 - p_dot_L**2
-                    f_factor = 1.0 - f
-                    host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
-                    if u_ring_host_R_minor is not None:
-                        u_ring_host_R_minor.value = float(host_r_minor)
-                    if u_ring_host_atmo is not None:
-                        atmo = next((a for a in atmo_bodies if a['body_idx'] == bi), None)
-                        if atmo is not None:
-                            props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, mass_snap[bi])
-                            scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                            # Keep thickness km separate from scale height and grazing tau.
-                            _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                            _thickness_km = max(0.0, float(atmo['atmo_radius_km']) - float(atmo['planet_radius_km']))
-                            _shadow_radius_km = max(float(body_radii[bi]) * AU_TO_KM, 100.0)
-                            _grazing_tau = _tau_v * math.sqrt(2.0 * math.pi * _shadow_radius_km / max(scale_height_km, 0.1))
-                            u_ring_host_atmo.value = (*map(float, _tau_v), _thickness_km)
-                            if u_ring_host_shadow is not None:
-                                u_ring_host_shadow.value = (*map(float, _grazing_tau), scale_height_km)
-                            if u_ring_host_ozone is not None:
-                                _ozone_tau = props_c.get('beta_abs_layered', np.zeros(3)) * math.sqrt(2.0 * math.pi * _shadow_radius_km * scale_height_km) * 1000.0
-                                u_ring_host_ozone.value = (*map(float, _ozone_tau), float(props_c.get('ozone_peak_km', 25.0)))
-                            if u_ring_host_refractivity is not None:
-                                u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
-                            if u_ring_host_max_bend is not None:
-                                u_ring_host_max_bend.value = compute_max_bend(body_radii[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
-                        else:
-                            u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
-                            if u_ring_host_shadow is not None:
-                                u_ring_host_shadow.value = (0.0, 0.0, 0.0, 0.0)
-                            if u_ring_host_ozone is not None:
-                                u_ring_host_ozone.value = (0.0, 0.0, 0.0, 0.0)
-                            if u_ring_host_refractivity is not None:
-                                u_ring_host_refractivity.value = 0.0
-                            if u_ring_host_max_bend is not None:
-                                u_ring_host_max_bend.value = 0.0
-                    k = self.body_ring_indices.get(bi)
-                    if k is not None:
-                        u_ring_caster_mask_lo_uni.value = int(cull_ring_caster_lo[k])
-                        u_ring_caster_mask_hi_uni.value = int(cull_ring_caster_hi[k])
-                    
-                    body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
-                    prog_rings['u_num_ring_planes'].value = len(body_rings)
-                    b_name = bodies_data[bi]['name']
-                    name_lower = b_name.lower()
-                    is_textured = name_lower in self.ring_textures
-                    if 'u_is_textured' in prog_rings:
-                        prog_rings['u_is_textured'].value = is_textured
-                    if is_textured:
-                        if name_lower in self.ring_gl_textures:
-                            self.ring_gl_textures[name_lower].use(location=4)
-                    for idx, r in enumerate(body_rings):
-                        if idx >= 16: break
-                        prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
-                        prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
-                        prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
-                        prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
-                        prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
-                        prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
-                        prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
-                        prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
-                        prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
-                        prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
-                        prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
-                        prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
-                        prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
-                        prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
-                    group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
-                else:
-                    body_pos_rel = cmp_pos_rel[bi].astype('f4')
-                    u_ring_body_offset.write(body_pos_rel)
-                    u_ring_host_pos.write(body_pos_rel)
-                    u_ring_host_radius.value = float(self.body_radii_cmp[bi])
-                    if u_ring_host_color is not None:
-                        u_ring_host_color.value = tuple(float(c) for c in self.body_colors_cmp[bi])
-                    
-                    body_idx_in_unified = num_bodies + bi
-                    f = float(all_instances[body_idx_in_unified, 12])
-                    f_scale = 1.0 / (1.0 - f) if f < 1.0 else 1.0
-                    u_ring_host_pole_obl.value = (
-                        float(all_instances[body_idx_in_unified, 9]),
-                        float(all_instances[body_idx_in_unified, 10]),
-                        float(all_instances[body_idx_in_unified, 11]),
-                        float(f_scale)
-                    )
-                    
-                    pos_host = cmp_pos_rel[bi]
-                    r_eq = float(self.body_radii_cmp[bi])
-                    pole = all_instances[body_idx_in_unified, 9:12]
-                    pos_star = cmp_pos_rel[self.star_idx_cmp]
-                    to_star = pos_star - pos_host
-                    dist_s = math.sqrt(to_star[0]**2 + to_star[1]**2 + to_star[2]**2)
-                    if dist_s > 1e-6:
-                        L = to_star / dist_s
-                    else:
-                        L = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                    p_dot_L = np.dot(pole, L)
-                    p_proj_sq = 1.0 - p_dot_L**2
-                    f_factor = 1.0 - f
-                    host_r_minor = r_eq * np.sqrt(max(0.0, p_dot_L**2 + (f_factor**2) * p_proj_sq))
-                    if u_ring_host_R_minor is not None:
-                        u_ring_host_R_minor.value = float(host_r_minor)
-                    if u_ring_host_atmo is not None:
-                        atmo = next((a for a in self.atmo_bodies_cmp if a['body_idx'] == bi), None)
-                        if atmo is not None:
-                            props_c, trans_c, _ = get_cached_atmosphere_properties(atmo, self.mass_snap_cmp[bi])
-                            scale_height_km = float(props_c.get('scale_height_km', 8.5))
-                            # Keep thickness km separate from scale height and grazing tau.
-                            _tau_v = np.asarray(props_c.get('tau_vertical', trans_c), dtype=np.float32)
-                            _thickness_km = max(0.0, float(atmo['atmo_radius_km']) - float(atmo['planet_radius_km']))
-                            _shadow_radius_km = max(float(self.body_radii_cmp[bi]) * AU_TO_KM, 100.0)
-                            _grazing_tau = _tau_v * math.sqrt(2.0 * math.pi * _shadow_radius_km / max(scale_height_km, 0.1))
-                            u_ring_host_atmo.value = (*map(float, _tau_v), _thickness_km)
-                            if u_ring_host_shadow is not None:
-                                u_ring_host_shadow.value = (*map(float, _grazing_tau), scale_height_km)
-                            if u_ring_host_ozone is not None:
-                                _ozone_tau = props_c.get('beta_abs_layered', np.zeros(3)) * math.sqrt(2.0 * math.pi * _shadow_radius_km * scale_height_km) * 1000.0
-                                u_ring_host_ozone.value = (*map(float, _ozone_tau), float(props_c.get('ozone_peak_km', 25.0)))
-                            if u_ring_host_refractivity is not None:
-                                u_ring_host_refractivity.value = float(props_c.get('refractivity', 0.00029))
-                            if u_ring_host_max_bend is not None:
-                                u_ring_host_max_bend.value = compute_max_bend(self.body_radii_cmp[bi], scale_height_km, float(props_c.get('refractivity', 0.00029)), beta_ext=props_c.get('beta_rayleigh'))
-                        else:
-                            u_ring_host_atmo.value = (0.0, 0.0, 0.0, 0.0)
-                            if u_ring_host_shadow is not None:
-                                u_ring_host_shadow.value = (0.0, 0.0, 0.0, 0.0)
-                            if u_ring_host_ozone is not None:
-                                u_ring_host_ozone.value = (0.0, 0.0, 0.0, 0.0)
-                            if u_ring_host_refractivity is not None:
-                                u_ring_host_refractivity.value = 0.0
-                            if u_ring_host_max_bend is not None:
-                                u_ring_host_max_bend.value = 0.0
-                    u_ring_caster_mask_lo_uni.value = 0
-                    u_ring_caster_mask_hi_uni.value = 0
-                    body_rings = [r for r in ring_precomputed if r['body_idx'] == bi]
-                    prog_rings['u_num_ring_planes'].value = len(body_rings)
-                    b_name = self.bodies_data_cmp[bi]['name']
-                    name_lower = b_name.lower()
-                    is_textured = name_lower in self.ring_textures
-                    if 'u_is_textured' in prog_rings:
-                        prog_rings['u_is_textured'].value = is_textured
-                    if is_textured:
-                        if name_lower in self.ring_gl_textures:
-                            self.ring_gl_textures[name_lower].use(location=4)
-                    for idx, r in enumerate(body_rings):
-                        if idx >= 16: break
-                        prog_rings[f'u_ring_planes[{idx}].color'].value = tuple(float(c) for c in r['raw_color'])
-                        prog_rings[f'u_ring_planes[{idx}].inner_r'].value = float(r['inner_r'])
-                        prog_rings[f'u_ring_planes[{idx}].outer_r'].value = float(r['outer_r'])
-                        prog_rings[f'u_ring_planes[{idx}].opacity'].value = float(r['opacity'])
-                        prog_rings[f'u_ring_planes[{idx}].scatter'].value = float(r['scatter'])
-                        prog_rings[f'u_ring_planes[{idx}].asymmetry'].value = float(r['asymmetry'])
-                        prog_rings[f'u_ring_planes[{idx}].backscatter'].value = float(r['backscatter'])
-                        prog_rings[f'u_ring_planes[{idx}].row_idx'].value = int(r['row_idx'])
-                        prog_rings[f'u_ring_planes[{idx}].is_textured'].value = 1.0 if r.get('is_textured', False) else 0.0
-                        prog_rings[f'u_ring_planes[{idx}].unlit_factor'].value = float(r.get('unlit_factor', 1.0))
-                        prog_rings[f'u_ring_planes[{idx}].saturation'].value = float(r.get('saturation', 1.0))
-                        prog_rings[f'u_ring_planes[{idx}].hue_shift'].value = float(r.get('hue_shift', 0.0))
-                        prog_rings[f'u_ring_planes[{idx}].brightness'].value = float(r.get('brightness', 1.0))
-                        prog_rings[f'u_ring_planes[{idx}].alpha_boost'].value = float(r.get('alpha_boost', 1.0))
-                    group['vao'].render(moderngl.TRIANGLES, vertices=group['num_indices'])
-
-                ctx.depth_mask = True
-                u_ring_clip_mode.value = 0
-
-            def render_habitable_zone():
-                if not (self.camera.get("show_habitable_zone", False) and self.hz_vao is not None):
-                    return
-                ctx.disable(moderngl.CULL_FACE)
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                ctx.depth_mask = False
-                
-                self.prog_hz['view'].write(view.astype('f4').tobytes())
-                self.prog_hz['projection'].write(projection.astype('f4').tobytes())
-                self.prog_hz['u_depth_C'].value = depth_C
-                self.prog_hz['u_far'].value = far
-                self.prog_hz['u_color'].value = (0.15, 0.65, 0.25, 0.12)
-                
-                for i in range(num_bodies):
-                    body = bodies_data[i]
-                    if body.get('type') == 'Star':
-                        sp = body.get('star_props', {})
-                        lum = sp.get('lum', 1.0)
-                        
-                        hz_inner = math.sqrt(lum / 1.78)
-                        hz_outer = math.sqrt(lum / 0.32)
-                        
-                        self.prog_hz['u_inner_r'].value = hz_inner
-                        self.prog_hz['u_outer_r'].value = hz_outer
-                        self.prog_hz['u_body_offset'].write(pos_rel_all[i].astype('f4'))
-                        
-                        self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
-
-                if self.comparison_enabled:
-                    for i in range(num_bodies_cmp):
-                        body = self.bodies_data_cmp[i]
+                    for i in range(num_bodies):
+                        body = bodies_data[i]
                         if body.get('type') == 'Star':
                             sp = body.get('star_props', {})
                             lum = sp.get('lum', 1.0)
-                            
+
                             hz_inner = math.sqrt(lum / 1.78)
                             hz_outer = math.sqrt(lum / 0.32)
-                            
+
                             self.prog_hz['u_inner_r'].value = hz_inner
                             self.prog_hz['u_outer_r'].value = hz_outer
-                            self.prog_hz['u_body_offset'].write(cmp_pos_rel[i].astype('f4'))
-                            
+                            self.prog_hz['u_body_offset'].write(pos_rel_all[i].astype('f4'))
+
                             self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
-                
-                ctx.depth_mask = True
-                ctx.disable(moderngl.BLEND)
 
-            def render_body_clouds(bi, is_cmp=False):
-                if not _body_has_clouds(bi, is_cmp=is_cmp):
-                    return
+                    if self.comparison_enabled:
+                        for i in range(num_bodies_cmp):
+                            body = self.bodies_data_cmp[i]
+                            if body.get('type') == 'Star':
+                                sp = body.get('star_props', {})
+                                lum = sp.get('lum', 1.0)
 
-                # If this body has active terrain LOD cloud patches, render clouds using the high-performance Quadtree LOD shell
-                body_cloud_info = self.terrain_active_cloud_patches.get(bi) if (not is_cmp and hasattr(self, 'terrain_active_cloud_patches')) else None
-                if (body_cloud_info is not None and getattr(self, 'terrain_streamer', None) is not None):
-                    cloud_raw_p, c_slots, c_uvs, c_ox, c_oy, num_p = body_cloud_info
-                    if num_p > 0:
-                        cloud_staged_count = int(np.count_nonzero(c_slots >= 0.0))
-                        if cloud_staged_count > 0:
-                            bi_caster_idx = float(self.caster_idx_map.get(bi, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
-                            pack_cloud_patches_jit(
-                                self.terrain_cloud_staging, 0,
-                                cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi),
-                                bi_caster_idx, 0.0
-                            )
-                            self.hdr_resolve_fbo.use()
-                            ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                            ctx.enable(moderngl.BLEND)
-                            ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                            ctx.enable(moderngl.DEPTH_TEST)
-                            ctx.depth_func = '<='
-                            ctx.disable(moderngl.CULL_FACE)
-                            ctx.depth_mask = False
+                                hz_inner = math.sqrt(lum / 1.78)
+                                hz_outer = math.sqrt(lum / 0.32)
 
-                            self.terrain_cloud_ssbo.write(self.terrain_cloud_staging[:num_p].tobytes())
-                            self.terrain_cloud_ssbo.bind_to_storage_buffer(binding=4)
-                            all_instances_buffer.bind_to_storage_buffer(binding=2)
+                                self.prog_hz['u_inner_r'].value = hz_inner
+                                self.prog_hz['u_outer_r'].value = hz_outer
+                                self.prog_hz['u_body_offset'].write(cmp_pos_rel[i].astype('f4'))
 
-                            ring_gradient_tex.use(location=0)
-                            self.ringshine_map_tex.use(location=8)
-                            self.terrain_streamer.use(location=14)
-                            if 'u_is_cloud_pass' in self.prog_terrain:
-                                self.prog_terrain['u_is_cloud_pass'].value = True
-                            if 'u_cloud_altitude_km' in self.prog_terrain:
-                                _c_varr = self.visual_arr_cmp if is_cmp and hasattr(self, 'visual_arr_cmp') else visual_arr
-                                cloud_alt = float(_c_varr[bi, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[bi, 12] > 0 else 3.5
-                                self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
-                            if 'u_camera_pos' in self.prog_terrain:
-                                self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
-                            if 'u_body_cam_rel_au' in self.prog_terrain:
-                                self._upload_terrain_camera(
-                                    [num_bodies + bi if is_cmp else bi],
-                                    pos_snap_render, cam_origin, rel)
-                            if 'u_debug_tiles' in self.prog_terrain:
-                                self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
-                            if 'u_hdr_enabled' in self.prog_terrain:
-                                self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
-                            if 'u_exposure' in self.prog_terrain:
-                                self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
+                                self.hz_vao.render(moderngl.TRIANGLE_STRIP, vertices=self.hz_num_vertices)
 
-                            cloud_cmd_arr = np.array([self.terrain_triangles_per_patch * 3, num_p, 0, 0, 0], dtype=np.uint32)
-                            self.terrain_cloud_draw_cmds_buf.write(cloud_cmd_arr.tobytes())
-                            self.vao_terrain.render_indirect(self.terrain_cloud_draw_cmds_buf, moderngl.TRIANGLES)
+                    ctx.depth_mask = True
+                    ctx.disable(moderngl.BLEND)
 
-                            if 'u_is_cloud_pass' in self.prog_terrain:
-                                self.prog_terrain['u_is_cloud_pass'].value = False
+                def render_body_clouds(bi, is_cmp=False):
+                    if not _body_has_clouds(bi, is_cmp=is_cmp):
+                        return
 
-                            self.terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
-                            ctx.depth_mask = True
-                            ctx.depth_func = '<'
-                            return
+                    # If this body has active terrain LOD cloud patches, render clouds using the high-performance Quadtree LOD shell
+                    body_cloud_info = self.terrain_active_cloud_patches.get(bi) if (not is_cmp and hasattr(self, 'terrain_active_cloud_patches')) else None
+                    if (body_cloud_info is not None and getattr(self, 'terrain_streamer', None) is not None):
+                        cloud_raw_p, c_slots, c_uvs, c_ox, c_oy, num_p = body_cloud_info
+                        if num_p > 0:
+                            cloud_staged_count = int(np.count_nonzero(c_slots >= 0.0))
+                            if cloud_staged_count > 0:
+                                bi_caster_idx = float(self.caster_idx_map.get(bi, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
+                                pack_cloud_patches_jit(
+                                    self.terrain_cloud_staging, 0,
+                                    cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi),
+                                    bi_caster_idx, 0.0
+                                )
+                                self.hdr_resolve_fbo.use()
+                                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                                ctx.enable(moderngl.BLEND)
+                                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                                ctx.enable(moderngl.DEPTH_TEST)
+                                ctx.depth_func = '<='
+                                ctx.disable(moderngl.CULL_FACE)
+                                ctx.depth_mask = False
 
-                inst_idx = bi if not is_cmp else (num_bodies + bi)
-                self.single_cloud_body_buf.write(struct.pack('I', int(inst_idx)))
-                
-                self.hdr_resolve_fbo.use()
-                ctx.viewport = (0, 0, self.fb_width, self.fb_height)
-                ctx.enable(moderngl.BLEND)
-                ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-                ctx.enable(moderngl.DEPTH_TEST)
-                ctx.depth_func = '<='
-                ctx.disable(moderngl.CULL_FACE)
-                ctx.depth_mask = False
-                
-                prog_spheres['u_is_cloud_pass'].value = True
-                self.single_cloud_body_buf.bind_to_storage_buffer(binding=3)
-                vao_ultra.render(moderngl.TRIANGLES, instances=1)
-                prog_spheres['u_is_cloud_pass'].value = False
-                ctx.depth_mask = True
-                ctx.depth_func = '<'
+                                self.terrain_cloud_ssbo.write(self.terrain_cloud_staging[:num_p].tobytes())
+                                self.terrain_cloud_ssbo.bind_to_storage_buffer(binding=4)
+                                all_instances_buffer.bind_to_storage_buffer(binding=2)
 
-            # Assemble unified back-to-front queue of all transparent objects (atmospheres, rings, clouds, and habitable zone)
-            atmos_by_key = {(a['body_idx'], is_cmp): (sq_dist, a, is_cmp) for sq_dist, a, is_cmp in sorted_atmos}
-            rings_by_key = {}
-            if ring_render_groups:
-                for g in ring_render_groups:
-                    rings_by_key.setdefault((g['body_idx'], False), []).append(g)
-            if self.comparison_enabled and getattr(self, 'ring_render_groups_cmp', None):
-                for g in self.ring_render_groups_cmp:
-                    rings_by_key.setdefault((g['body_idx'], True), []).append(g)
+                                ring_gradient_tex.use(location=0)
+                                self.ringshine_map_tex.use(location=8)
+                                self.terrain_streamer.use(location=14)
+                                if 'u_is_cloud_pass' in self.prog_terrain:
+                                    self.prog_terrain['u_is_cloud_pass'].value = True
+                                if 'u_cloud_altitude_km' in self.prog_terrain:
+                                    _c_varr = self.visual_arr_cmp if is_cmp and hasattr(self, 'visual_arr_cmp') else visual_arr
+                                    cloud_alt = float(_c_varr[bi, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[bi, 12] > 0 else 3.5
+                                    self.prog_terrain['u_cloud_altitude_km'].value = cloud_alt
+                                if 'u_camera_pos' in self.prog_terrain:
+                                    self.prog_terrain['u_camera_pos'].value = tuple(cam_pos)
+                                if 'u_body_cam_rel_au' in self.prog_terrain:
+                                    self._upload_terrain_camera(
+                                        [num_bodies + bi if is_cmp else bi],
+                                        pos_snap_render, cam_origin, rel)
+                                if 'u_debug_tiles' in self.prog_terrain:
+                                    self.prog_terrain['u_debug_tiles'].value = bool(self.camera.get("terrain_debug_tiles", False))
+                                if 'u_hdr_enabled' in self.prog_terrain:
+                                    self.prog_terrain['u_hdr_enabled'].value = bool(self.camera.get("hdr_enabled", True))
+                                if 'u_exposure' in self.prog_terrain:
+                                    self.prog_terrain['u_exposure'].value = float(self.camera.get("exposure", 1.0))
 
-            cloud_keys = set()
-            for _b_i in range(len(bodies_data)):
-                if _body_has_clouds(_b_i, is_cmp=False):
-                    cloud_keys.add((_b_i, False))
-            if self.comparison_enabled:
-                for _b_i in range(len(bodies_data_cmp)):
-                    if _body_has_clouds(_b_i, is_cmp=True):
-                        cloud_keys.add((_b_i, True))
+                                cloud_cmd_arr = np.array([self.terrain_triangles_per_patch * 3, num_p, 0, 0, 0], dtype=np.uint32)
+                                self.terrain_cloud_draw_cmds_buf.write(cloud_cmd_arr.tobytes())
+                                self.vao_terrain.render_indirect(self.terrain_cloud_draw_cmds_buf, moderngl.TRIANGLES)
 
-            all_trans_keys = list(set(atmos_by_key.keys()) | set(rings_by_key.keys()) | cloud_keys)
+                                if 'u_is_cloud_pass' in self.prog_terrain:
+                                    self.prog_terrain['u_is_cloud_pass'].value = False
 
-            def _get_key_sq_dist(key):
-                if key in atmos_by_key:
-                    return atmos_by_key[key][0]
-                _bi, _is_c = key
-                _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
-                return float((_pos[0] - cam_pos[0])**2 + (_pos[1] - cam_pos[1])**2 + (_pos[2] - cam_pos[2])**2)
+                                self.terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
+                                ctx.depth_mask = True
+                                ctx.depth_func = '<'
+                                return
 
-            # CPU Frustum and Distance Culling for transparent entities (atmospheres, rings, clouds)
-            visible_trans_keys = []
-            tracking_bi = self.camera.get("tracking_idx")
-            tracking_is_cmp = bool(self.camera.get("tracking_is_cmp", False))
+                    inst_idx = bi if not is_cmp else (num_bodies + bi)
+                    self.single_cloud_body_buf.write(struct.pack('I', int(inst_idx)))
 
-            for key in all_trans_keys:
-                _bi, _is_c = key
-                # Rule 1: Always keep currently tracked body
-                if _bi == tracking_bi and _is_c == tracking_is_cmp:
-                    visible_trans_keys.append(key)
-                    continue
+                    self.hdr_resolve_fbo.use()
+                    ctx.viewport = (0, 0, self.fb_width, self.fb_height)
+                    ctx.enable(moderngl.BLEND)
+                    ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+                    ctx.enable(moderngl.DEPTH_TEST)
+                    ctx.depth_func = '<='
+                    ctx.disable(moderngl.CULL_FACE)
+                    ctx.depth_mask = False
 
-                _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
-                dx = float(_pos[0] - cam_pos[0])
-                dy = float(_pos[1] - cam_pos[1])
-                dz = float(_pos[2] - cam_pos[2])
-                dist_sq = dx * dx + dy * dy + dz * dz
+                    prog_spheres['u_is_cloud_pass'].value = True
+                    self.single_cloud_body_buf.bind_to_storage_buffer(binding=3)
+                    vao_ultra.render(moderngl.TRIANGLES, instances=1)
+                    prog_spheres['u_is_cloud_pass'].value = False
+                    ctx.depth_mask = True
+                    ctx.depth_func = '<'
 
-                # Maximum bounding radius of this entity (atmo, rings, or body)
-                _atmo_rad = float(atmos_by_key[key][1]['atmo_radius_au']) if key in atmos_by_key else 0.0
-                _body_rad = float(self.body_radii_cmp[_bi] if _is_c else body_radii[_bi]) if _bi < (len(self.body_radii_cmp) if _is_c else len(body_radii)) else 0.0
-                _ring_rad = 0.0
-                if not _is_c and _bi in self.body_ring_indices:
-                    _u_idx = self.body_ring_indices[_bi]
-                    _ring_rad = float(ring_params_buf[_u_idx, 1])
-                elif _is_c and hasattr(self, 'body_ring_indices_cmp') and _bi in getattr(self, 'body_ring_indices_cmp', {}):
-                    _u_idx = self.body_ring_indices_cmp[_bi]
-                    _ring_rad = float(ring_params_buf[_u_idx, 1])
+                # Assemble unified back-to-front queue of all transparent objects (atmospheres, rings, clouds, and habitable zone)
+                atmos_by_key = {(a['body_idx'], is_cmp): (sq_dist, a, is_cmp) for sq_dist, a, is_cmp in sorted_atmos}
+                rings_by_key = {}
+                if ring_render_groups:
+                    for g in ring_render_groups:
+                        rings_by_key.setdefault((g['body_idx'], False), []).append(g)
+                if self.comparison_enabled and getattr(self, 'ring_render_groups_cmp', None):
+                    for g in self.ring_render_groups_cmp:
+                        rings_by_key.setdefault((g['body_idx'], True), []).append(g)
 
-                bound_r = max(_atmo_rad, _body_rad, _ring_rad)
-                if bound_r <= 0.0:
-                    continue
+                cloud_keys = set()
+                for _b_i in range(len(bodies_data)):
+                    if _body_has_clouds(_b_i, is_cmp=False):
+                        cloud_keys.add((_b_i, False))
+                if self.comparison_enabled:
+                    for _b_i in range(len(bodies_data_cmp)):
+                        if _body_has_clouds(_b_i, is_cmp=True):
+                            cloud_keys.add((_b_i, True))
 
-                # Rule 2: Observer inside or in close vicinity of bounding sphere (never cull)
-                if dist_sq <= (bound_r * 2.0) ** 2:
-                    visible_trans_keys.append(key)
-                    continue
+                all_trans_keys = list(set(atmos_by_key.keys()) | set(rings_by_key.keys()) | cloud_keys)
 
-                # Rule 3: Subpixel culling (< 2 px)
-                dist_to_cam = math.sqrt(dist_sq)
-                apparent_px = (bound_r / max(dist_to_cam, 1e-12)) * self.fb_height * fov_factor
-                if apparent_px < 2.0:
-                    continue
+                def _get_key_sq_dist(key):
+                    if key in atmos_by_key:
+                        return atmos_by_key[key][0]
+                    _bi, _is_c = key
+                    _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                    return float((_pos[0] - cam_pos[0])**2 + (_pos[1] - cam_pos[1])**2 + (_pos[2] - cam_pos[2])**2)
 
-                # Rule 4: Frustum test with 25% safety margin for atmospheric refraction & ring glints
-                if is_sphere_in_frustum(_pos, bound_r * 1.25, frustum_planes):
-                    visible_trans_keys.append(key)
+                # CPU Frustum and Distance Culling for transparent entities (atmospheres, rings, clouds)
+                visible_trans_keys = []
+                tracking_bi = self.camera.get("tracking_idx")
+                tracking_is_cmp = bool(self.camera.get("tracking_is_cmp", False))
 
-            sorted_trans_keys = sorted(visible_trans_keys, key=_get_key_sq_dist, reverse=True)
-            visible_trans_keys_set = set(visible_trans_keys)
+                for key in all_trans_keys:
+                    _bi, _is_c = key
+                    # Rule 1: Always keep currently tracked body
+                    if _bi == tracking_bi and _is_c == tracking_is_cmp:
+                        visible_trans_keys.append(key)
+                        continue
 
-            # Insert Habitable Zone visualizer at star distance if active
-            has_hz = self.camera.get("show_habitable_zone", False) and self.hz_vao is not None
-            if has_hz:
-                star_pos = pos_rel_all[star_idx]
-                star_sq_dist = float((star_pos[0] - cam_pos[0])**2 + (star_pos[1] - cam_pos[1])**2 + (star_pos[2] - cam_pos[2])**2)
-                ins_idx = len(sorted_trans_keys)
-                for i_k, k_item in enumerate(sorted_trans_keys):
-                    if _get_key_sq_dist(k_item) < star_sq_dist:
-                        ins_idx = i_k
-                        break
-                sorted_trans_keys.insert(ins_idx, ('__hz__', False))
+                    _pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                    dx = float(_pos[0] - cam_pos[0])
+                    dy = float(_pos[1] - cam_pos[1])
+                    dz = float(_pos[2] - cam_pos[2])
+                    dist_sq = dx * dx + dy * dy + dz * dz
 
-            # Render all transparent passes back-to-front
-            _gq = _perf_gpu_begin(ctx, "gpu_transparents")
-            rendered_cloud_bodies = set()
-            for key in sorted_trans_keys:
-                if key[0] == '__hz__':
-                    render_habitable_zone()
-                    continue
+                    # Maximum bounding radius of this entity (atmo, rings, or body)
+                    _atmo_rad = float(atmos_by_key[key][1]['atmo_radius_au']) if key in atmos_by_key else 0.0
+                    _body_rad = float(self.body_radii_cmp[_bi] if _is_c else body_radii[_bi]) if _bi < (len(self.body_radii_cmp) if _is_c else len(body_radii)) else 0.0
+                    _ring_rad = 0.0
+                    if not _is_c and _bi in self.body_ring_indices:
+                        _u_idx = self.body_ring_indices[_bi]
+                        _ring_rad = float(ring_params_buf[_u_idx, 1])
+                    elif _is_c and hasattr(self, 'body_ring_indices_cmp') and _bi in getattr(self, 'body_ring_indices_cmp', {}):
+                        _u_idx = self.body_ring_indices_cmp[_bi]
+                        _ring_rad = float(ring_params_buf[_u_idx, 1])
 
-                _bi, _is_c = key
-                atmo_entry = atmos_by_key.get(key)
-                body_ring_groups = rings_by_key.get(key, [])
+                    bound_r = max(_atmo_rad, _body_rad, _ring_rad)
+                    if bound_r <= 0.0:
+                        continue
 
-                # Determine if camera is below the cloud shell (ground / low-altitude observer)
-                _b_pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
-                _inst_idx = _bi if not _is_c else (num_bodies + _bi)
-                _cam_rel_au = cam_pos - _b_pos
-                _cam_d_km = math.sqrt(float(_cam_rel_au[0]**2 + _cam_rel_au[1]**2 + _cam_rel_au[2]**2)) * 149597870.7
-                _b_r_au = float(self.body_radii_cmp[_bi] if _is_c else body_radii[_bi]) if _bi < (len(self.body_radii_cmp) if _is_c else len(body_radii)) else 0.0
-                _b_r_km = _b_r_au * 149597870.7
-                _varr = visual_arr_cmp if _is_c and hasattr(self, 'visual_arr_cmp') else visual_arr
-                _c_alt_km = float(_varr[_bi, 12] * 0.35) if _varr.shape[1] > 12 and _varr[_bi, 12] > 0 else 3.5
+                    # Rule 2: Observer inside or in close vicinity of bounding sphere (never cull)
+                    if dist_sq <= (bound_r * 2.0) ** 2:
+                        visible_trans_keys.append(key)
+                        continue
 
-                _obl = float(_varr[_bi, 8]) if _varr.shape[1] > 8 else 0.0
-                _pole = _varr[_bi, 5:8] if _varr.shape[1] >= 8 else np.array([0.0, 1.0, 0.0])
-                _cloud_r_km = _ellipsoid_surface_radius(_b_r_km + _c_alt_km, _obl, _pole, _cam_rel_au)
-                is_below_clouds = _cam_d_km < _cloud_r_km
+                    # Rule 3: Subpixel culling (< 2 px)
+                    dist_to_cam = math.sqrt(dist_sq)
+                    apparent_px = (bound_r / max(dist_to_cam, 1e-12)) * self.fb_height * fov_factor
+                    if apparent_px < 2.0:
+                        continue
 
-                if atmo_entry is not None and body_ring_groups:
-                    if _body_needs_ring_clip(atmo_entry):
-                        if atmo_quality == 3:
-                            # Per-fragment atmosphere entry handles both inside
-                            # and outside observers, including oblate envelopes.
-                            _a_r_au = float(atmo_entry[1]['atmo_radius_au'])
-                            for rg in body_ring_groups:
-                                render_single_ring_group(rg, is_cmp=_is_c, clip_mode=1, clip_atmo_radius=_a_r_au)
-                            if is_below_clouds:
-                                execute_atmosphere_pass(0, [atmo_entry])
-                                render_body_clouds(_bi, is_cmp=_is_c)
+                    # Rule 4: Frustum test with 25% safety margin for atmospheric refraction & ring glints
+                    if is_sphere_in_frustum(_pos, bound_r * 1.25, frustum_planes):
+                        visible_trans_keys.append(key)
+
+                sorted_trans_keys = sorted(visible_trans_keys, key=_get_key_sq_dist, reverse=True)
+                visible_trans_keys_set = set(visible_trans_keys)
+
+                # Insert Habitable Zone visualizer at star distance if active
+                has_hz = self.camera.get("show_habitable_zone", False) and self.hz_vao is not None
+                if has_hz:
+                    star_pos = pos_rel_all[star_idx]
+                    star_sq_dist = float((star_pos[0] - cam_pos[0])**2 + (star_pos[1] - cam_pos[1])**2 + (star_pos[2] - cam_pos[2])**2)
+                    ins_idx = len(sorted_trans_keys)
+                    for i_k, k_item in enumerate(sorted_trans_keys):
+                        if _get_key_sq_dist(k_item) < star_sq_dist:
+                            ins_idx = i_k
+                            break
+                    sorted_trans_keys.insert(ins_idx, ('__hz__', False))
+
+                # Render all transparent passes back-to-front
+                _gq = _perf_gpu_begin(ctx, "gpu_transparents")
+                rendered_cloud_bodies = set()
+                for key in sorted_trans_keys:
+                    if key[0] == '__hz__':
+                        render_habitable_zone()
+                        continue
+
+                    _bi, _is_c = key
+                    atmo_entry = atmos_by_key.get(key)
+                    body_ring_groups = rings_by_key.get(key, [])
+
+                    # Determine if camera is below the cloud shell (ground / low-altitude observer)
+                    _b_pos = cmp_pos_rel[_bi] if _is_c else pos_rel_all[_bi]
+                    _inst_idx = _bi if not _is_c else (num_bodies + _bi)
+                    _cam_rel_au = cam_pos - _b_pos
+                    _cam_d_km = math.sqrt(float(_cam_rel_au[0]**2 + _cam_rel_au[1]**2 + _cam_rel_au[2]**2)) * 149597870.7
+                    _b_r_au = float(self.body_radii_cmp[_bi] if _is_c else body_radii[_bi]) if _bi < (len(self.body_radii_cmp) if _is_c else len(body_radii)) else 0.0
+                    _b_r_km = _b_r_au * 149597870.7
+                    _varr = visual_arr_cmp if _is_c and hasattr(self, 'visual_arr_cmp') else visual_arr
+                    _c_alt_km = float(_varr[_bi, 12] * 0.35) if _varr.shape[1] > 12 and _varr[_bi, 12] > 0 else 3.5
+
+                    _obl = float(_varr[_bi, 8]) if _varr.shape[1] > 8 else 0.0
+                    _pole = _varr[_bi, 5:8] if _varr.shape[1] >= 8 else np.array([0.0, 1.0, 0.0])
+                    _cloud_r_km = _ellipsoid_surface_radius(_b_r_km + _c_alt_km, _obl, _pole, _cam_rel_au)
+                    is_below_clouds = _cam_d_km < _cloud_r_km
+
+                    if atmo_entry is not None and body_ring_groups:
+                        if _body_needs_ring_clip(atmo_entry):
+                            if atmo_quality == 3:
+                                # Per-fragment atmosphere entry handles both inside
+                                # and outside observers, including oblate envelopes.
+                                _a_r_au = float(atmo_entry[1]['atmo_radius_au'])
+                                for rg in body_ring_groups:
+                                    render_single_ring_group(rg, is_cmp=_is_c, clip_mode=1, clip_atmo_radius=_a_r_au)
+                                if is_below_clouds:
+                                    execute_atmosphere_pass(0, [atmo_entry])
+                                    render_body_clouds(_bi, is_cmp=_is_c)
+                                else:
+                                    render_body_clouds(_bi, is_cmp=_is_c)
+                                    execute_atmosphere_pass(0, [atmo_entry])
+                                rendered_cloud_bodies.add(key)
+                                for rg in body_ring_groups:
+                                    render_single_ring_group(rg, is_cmp=_is_c, clip_mode=2, clip_atmo_radius=_a_r_au)
                             else:
-                                render_body_clouds(_bi, is_cmp=_is_c)
-                                execute_atmosphere_pass(0, [atmo_entry])
-                            rendered_cloud_bodies.add(key)
-                            for rg in body_ring_groups:
-                                render_single_ring_group(rg, is_cmp=_is_c, clip_mode=2, clip_atmo_radius=_a_r_au)
+                                if is_below_clouds:
+                                    execute_atmosphere_pass(1, [atmo_entry])
+                                    for rg in body_ring_groups:
+                                        render_single_ring_group(rg, is_cmp=_is_c)
+                                    execute_atmosphere_pass(2, [atmo_entry])
+                                    render_body_clouds(_bi, is_cmp=_is_c)
+                                    rendered_cloud_bodies.add(key)
+                                else:
+                                    render_body_clouds(_bi, is_cmp=_is_c)
+                                    rendered_cloud_bodies.add(key)
+                                    execute_atmosphere_pass(1, [atmo_entry])
+                                    for rg in body_ring_groups:
+                                        render_single_ring_group(rg, is_cmp=_is_c)
+                                    execute_atmosphere_pass(2, [atmo_entry])
                         else:
                             if is_below_clouds:
-                                execute_atmosphere_pass(1, [atmo_entry])
+                                execute_atmosphere_pass(0, [atmo_entry])
                                 for rg in body_ring_groups:
                                     render_single_ring_group(rg, is_cmp=_is_c)
-                                execute_atmosphere_pass(2, [atmo_entry])
                                 render_body_clouds(_bi, is_cmp=_is_c)
                                 rendered_cloud_bodies.add(key)
                             else:
                                 render_body_clouds(_bi, is_cmp=_is_c)
                                 rendered_cloud_bodies.add(key)
-                                execute_atmosphere_pass(1, [atmo_entry])
+                                execute_atmosphere_pass(0, [atmo_entry])
                                 for rg in body_ring_groups:
                                     render_single_ring_group(rg, is_cmp=_is_c)
-                                execute_atmosphere_pass(2, [atmo_entry])
-                    else:
+                    elif atmo_entry is not None:
                         if is_below_clouds:
                             execute_atmosphere_pass(0, [atmo_entry])
-                            for rg in body_ring_groups:
-                                render_single_ring_group(rg, is_cmp=_is_c)
                             render_body_clouds(_bi, is_cmp=_is_c)
                             rendered_cloud_bodies.add(key)
                         else:
                             render_body_clouds(_bi, is_cmp=_is_c)
                             rendered_cloud_bodies.add(key)
                             execute_atmosphere_pass(0, [atmo_entry])
-                            for rg in body_ring_groups:
-                                render_single_ring_group(rg, is_cmp=_is_c)
-                elif atmo_entry is not None:
-                    if is_below_clouds:
-                        execute_atmosphere_pass(0, [atmo_entry])
+                    elif body_ring_groups:
                         render_body_clouds(_bi, is_cmp=_is_c)
                         rendered_cloud_bodies.add(key)
+                        for rg in body_ring_groups:
+                            render_single_ring_group(rg, is_cmp=_is_c)
                     else:
                         render_body_clouds(_bi, is_cmp=_is_c)
                         rendered_cloud_bodies.add(key)
-                        execute_atmosphere_pass(0, [atmo_entry])
-                elif body_ring_groups:
-                    render_body_clouds(_bi, is_cmp=_is_c)
-                    rendered_cloud_bodies.add(key)
-                    for rg in body_ring_groups:
-                        render_single_ring_group(rg, is_cmp=_is_c)
-                else:
-                    render_body_clouds(_bi, is_cmp=_is_c)
-                    rendered_cloud_bodies.add(key)
 
-            # Render any remaining visible cloud bodies not covered in sorted_trans_keys
-            for _ck in cloud_keys:
-                if _ck in visible_trans_keys_set and _ck not in rendered_cloud_bodies:
-                    render_body_clouds(_ck[0], is_cmp=_ck[1])
-                    rendered_cloud_bodies.add(_ck)
+                # Render any remaining visible cloud bodies not covered in sorted_trans_keys
+                for _ck in cloud_keys:
+                    if _ck in visible_trans_keys_set and _ck not in rendered_cloud_bodies:
+                        render_body_clouds(_ck[0], is_cmp=_ck[1])
+                        rendered_cloud_bodies.add(_ck)
 
-            _perf_gpu_end(_gq)
+                _perf_gpu_end(_gq)
 
-            # Update temporal reprojection history state for next frame
-            self.prev_atmo_view_proj = np.copy(vp_matrix.astype('f4'))
-            self.prev_atmo_cam_pos = np.copy(cam_pos)
-            self.prev_atmo_exposure = float(self.camera.get("exposure", 1.0))
-            self.prev_atmo_body_offsets = {a['body_idx']: np.copy(pos_rel_all[a['body_idx']]) for a in atmo_bodies}
-            if self.comparison_enabled:
-                self.prev_atmo_body_offsets_cmp = {a['body_idx']: np.copy(cmp_pos_rel[a['body_idx']]) for a in self.atmo_bodies_cmp}
+                # Update temporal reprojection history state for next frame
+                self.prev_atmo_view_proj = np.copy(vp_matrix.astype('f4'))
+                self.prev_atmo_cam_pos = np.copy(cam_pos)
+                self.prev_atmo_exposure = float(self.camera.get("exposure", 1.0))
+                self.prev_atmo_body_offsets = {a['body_idx']: np.copy(pos_rel_all[a['body_idx']]) for a in atmo_bodies}
+                if self.comparison_enabled:
+                    self.prev_atmo_body_offsets_cmp = {a['body_idx']: np.copy(cmp_pos_rel[a['body_idx']]) for a in self.atmo_bodies_cmp}
 
 
 
@@ -7575,8 +7646,8 @@ class App(InputHandlerMixin):
                 switch_triggers=switch_triggers
             )
     
-            is_pause_accum = self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)
-            is_ss_accum = getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False)
+            is_pause_accum = not comparator_active and self.time_ctrl.get("paused", False) and self.camera.get("photo_accum_enabled", False)
+            is_ss_accum = not comparator_active and getattr(self, "_screenshot_capturing", False) and self.camera.get("screenshot_accum_enabled", False)
             
             if is_pause_accum or is_ss_accum:
                 cam_state_current = (
@@ -7619,8 +7690,8 @@ class App(InputHandlerMixin):
 
             # --- Post Processing ---
             bloom_mode = self.camera.get("bloom_mode", 2)  # 0: Gaussian, 1: Spikes, 2: Hybrid
-            conv_bloom_enabled = (bloom_mode in (1, 2))
-            gaussian_bloom_enabled = (bloom_mode in (0, 2))
+            conv_bloom_enabled = not comparator_active and (bloom_mode in (1, 2))
+            gaussian_bloom_enabled = not comparator_active and (bloom_mode in (0, 2))
 
             # Bloom Downsample & Upsample
             _gq = _perf_gpu_begin(ctx, "gpu_bloom")
@@ -7710,6 +7781,7 @@ class App(InputHandlerMixin):
             bloom_intensity_val = self.camera.get("bloom_intensity", 0.05) if gaussian_bloom_enabled else 0.0
             conv_intensity_val = self.camera.get("conv_bloom_intensity", 0.5) if conv_bloom_enabled else 0.0
 
+            self.prog_composite['u_size_comparator'].value = comparator_active
             # Final Composite
             ctx.disable(moderngl.BLEND)
             
@@ -7718,7 +7790,7 @@ class App(InputHandlerMixin):
             if getattr(self, "_accum_save_request", False):
                 save_now = True
             elif getattr(self, "_screenshot_capturing", False):
-                if self.camera.get("screenshot_accum_enabled", False):
+                if not comparator_active and self.camera.get("screenshot_accum_enabled", False):
                     if getattr(self, "photo_accum_count", 0) >= self.camera.get("screenshot_accum_target", 16):
                         save_now = True
                 else:
@@ -7822,8 +7894,14 @@ class App(InputHandlerMixin):
                 _toast_elapsed = time.time() - _toast_time
                 if self._screenshot_saving or _toast_elapsed < 4.0:
                     _toast_alpha = 1.0 if self._screenshot_saving or _toast_elapsed < 3.0 else max(0.0, 1.0 - (_toast_elapsed - 3.0))
-                    imgui.set_next_window_position(self.fb_width - 340, self.fb_height - 50, imgui.ALWAYS)
-                    imgui.set_next_window_size(330, 40)
+                    from engine.ui.workspace import workspace
+                    _toast_layout = workspace(self)
+                    _toast_width = min(330 * _toast_layout.scale, _toast_layout.width - 2 * _toast_layout.gap)
+                    _toast_right = _toast_layout.right if self.ui_visible else _toast_layout.width - _toast_layout.gap
+                    _toast_bottom = _toast_layout.bottom if self.ui_visible else _toast_layout.height - _toast_layout.gap
+                    imgui.set_next_window_position(max(_toast_layout.gap, _toast_right - _toast_width),
+                                                   max(_toast_layout.top, _toast_bottom - 50 * _toast_layout.scale), imgui.ALWAYS)
+                    imgui.set_next_window_size(_toast_width, 40 * _toast_layout.scale)
                     imgui.set_next_window_bg_alpha(0.75 * _toast_alpha)
                     imgui.push_style_var(imgui.STYLE_ALPHA, _toast_alpha)
                     imgui.begin("##screenshot_toast", False, imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_SCROLLBAR | imgui.WINDOW_NO_INPUTS)
@@ -7869,6 +7947,7 @@ class App(InputHandlerMixin):
             self.scattering_lut_cache.release()
         if self.aerial_volume is not None:
             self.aerial_volume.release()
+        if hasattr(self, 'size_comparator_renderer'): self.size_comparator_renderer.release()
         atmo_programs.release()
         self.impl.shutdown()
         glfw.terminate()

@@ -27,6 +27,11 @@ class InputHandlerMixin:
             os.makedirs(get_external_path("data"), exist_ok=True)
             settings_path = get_external_path("data", "graphics_settings.json")
             saved = {
+                "ui_aligned_panels": self.camera.get("ui_aligned_panels", True),
+                "ui_outliner_width": self.camera.get("ui_outliner_width", 260),
+                "ui_inspector_width": self.camera.get("ui_inspector_width", 420),
+                "ui_scale": self.camera.get("ui_scale", 1.0),
+                "show_gaia_stars": self.camera.get("show_gaia_stars", True),
                 "atmo_quality": self.camera.get("atmo_quality", 1),
                 "atmo_steps_max": self.camera.get("atmo_steps_max", 32),
                 "atmo_adaptive_steps": self.camera.get("atmo_adaptive_steps", True),
@@ -95,6 +100,13 @@ class InputHandlerMixin:
     def scroll_callback(self, window, xoffset, yoffset):
         if self.impl: self.impl.scroll_callback(window, xoffset, yoffset)
         if imgui.get_io().want_capture_mouse: return 
+        if self.camera.get("scene_mode") == "size_comparator":
+            from engine.rendering.size_comparator import comparator_view, zoom_view
+            x, y = glfw.get_cursor_pos(window)
+            zoom_view(comparator_view(self.camera), yoffset, x, y,
+                      self.window_width, self.window_height)
+            return
+
         
         is_shift = glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS
         
@@ -118,6 +130,10 @@ class InputHandlerMixin:
     
     def mouse_button_callback(self, window, button, action, mods):
         if self.impl: self.impl.mouse_callback(window, button, action, mods)
+        # Always end a drag, even if its release lands over an ImGui panel.
+        if action == glfw.RELEASE:
+            if button == glfw.MOUSE_BUTTON_LEFT: self.camera["left_dragging"] = False
+            if button == glfw.MOUSE_BUTTON_RIGHT: self.camera["right_dragging"] = False
         if imgui.get_io().want_capture_mouse: return 
         
         x, y = glfw.get_cursor_pos(window)
@@ -145,6 +161,13 @@ class InputHandlerMixin:
         dx = xpos - self.camera["last_x"]
         dy = ypos - self.camera["last_y"]
         
+        if self.camera.get("scene_mode") == "size_comparator":
+            if self.camera.get("left_dragging", False):
+                from engine.rendering.size_comparator import comparator_view, pan_view
+                pan_view(comparator_view(self.camera), dx, dy, self.window_height)
+            self.camera["last_x"], self.camera["last_y"] = xpos, ypos
+            return
+
         fov_ratio = max(0.0001, min(1.0, self.camera.get("fov", 45.0) / 45.0))
         movement_mode = self.camera.get("movement_mode", 0)
 
@@ -192,6 +215,9 @@ class InputHandlerMixin:
         # WASD: track held state for free-flight / surface walking
         flight_keys = {glfw.KEY_W: "w", glfw.KEY_A: "a", glfw.KEY_S: "s", glfw.KEY_D: "d"}
         if key in flight_keys:
+            if self.camera.get("scene_mode") == "size_comparator":
+                self.camera["keys"][flight_keys[key]] = False
+                return
             self.camera["keys"][flight_keys[key]] = (action != glfw.RELEASE)
             if action == glfw.PRESS:
                 self.camera["centered_idx"] = None
@@ -471,4 +497,3 @@ def _camera_orbit_apply(cam, dx, dy, sensitivity):
 
     cam["cam_pos_rel"] = rel_new.tolist()
     cam["up"] = up_new.tolist()
-

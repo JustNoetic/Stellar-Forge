@@ -1,5 +1,6 @@
 import imgui
 import math
+from engine.ui.workspace import workspace, ACCENT, AMBER, open_settings, reset_workspace, SETTINGS_SECTIONS
 from engine.ephemeris.system_manager import SystemManager
 
 def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies, star_idx, cur_y, cur_m, cur_d, display_t, switch_triggers, cur_h=0, cur_mn=0, cur_s=0, cur_tz="UTC"):
@@ -14,6 +15,11 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
 
     if not imgui.begin_main_menu_bar():
         return
+
+    layout = workspace(app)
+    if layout.width > 1050 * layout.scale:
+        imgui.text_colored("STELLAR FORGE", *ACCENT)
+        imgui.same_line(spacing=18)
 
     # ── Systems Menu ──
     if imgui.begin_menu("Systems"):
@@ -133,6 +139,22 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
 
     # ── View & Camera Menu ──
     if imgui.begin_menu("View"):
+        comparator = app.camera.get("scene_mode") == "size_comparator"
+        if imgui.menu_item("Scene: Simulation", None, not comparator)[0]:
+            app.camera["scene_mode"] = "simulation"
+            app.camera["left_dragging"] = app.camera["right_dragging"] = False
+            app.pick_request = None
+        if imgui.menu_item("Scene: Size Comparator", None, comparator)[0]:
+            app.camera["scene_mode"] = "size_comparator"
+            app.camera["left_dragging"] = app.camera["right_dragging"] = False
+            app.camera["keys"] = {}
+            app.camera["approach_delta"] = 0.0
+            app.pick_request = None
+        if comparator:
+            if imgui.menu_item("Fit All Bodies")[0]:
+                from engine.rendering.size_comparator import comparator_view
+                comparator_view(app.camera)["fit"] = True
+        imgui.separator()
         move_mode = app.camera.get("movement_mode", 0)
         if imgui.menu_item("Camera: Free Flight", None, move_mode == 0)[0]:
             app.camera["movement_mode"] = 0
@@ -165,152 +187,25 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         if changed_stc:
             app.save_settings()
 
+        if imgui.menu_item("Reset Workspace Layout")[0]:
+            reset_workspace(app)
         imgui.separator()
         if imgui.menu_item("Toggle Full UI (H)")[0]:
             app.ui_visible = not getattr(app, "ui_visible", True)
 
         imgui.end_menu()
 
-    # ── Render & Quality Menu ──
+    # Quality controls live in one categorized workspace.
     if imgui.begin_menu("Render"):
-        settings_changed = False
-
-        c_so, app.camera["show_orbits"] = imgui.checkbox("Show Orbits", app.camera.get("show_orbits", True))
-        c_gaia, app.camera["show_gaia_stars"] = imgui.checkbox("GAIA Starfield", app.camera.get("show_gaia_stars", True))
-        if c_gaia and app.star_catalog is not None and not app.star_catalog.loaded:
-            imgui.text_colored("Run scripts/fetch_gaia.py to build data/gaia/stars.bin", 1.0, 0.7, 0.3, 1.0)
-        if c_so: settings_changed = True
-
-        c_hz, app.camera["show_habitable_zone"] = imgui.checkbox("Show Habitable Zones", app.camera.get("show_habitable_zone", False))
-        if c_hz: settings_changed = True
-
-        c_atmo, app.camera["atmo_enabled"] = imgui.checkbox("Volumetric Atmosphere", app.camera.get("atmo_enabled", True))
-        if c_atmo: settings_changed = True
-
-        c_clouds, app.camera["clouds_enabled"] = imgui.checkbox("Dynamic Clouds", app.camera.get("clouds_enabled", True))
-        if c_clouds: settings_changed = True
-
-        c_stoch, app.camera["atmo_stochastic"] = imgui.checkbox("Stochastic Raymarching", app.camera.get("atmo_stochastic", True))
-        if c_stoch: settings_changed = True
-
-        c_refr, app.camera["refraction_enabled"] = imgui.checkbox("Atmospheric Refraction", app.camera.get("refraction_enabled", True))
-        if c_refr: settings_changed = True
-
-        c_ps, app.camera["planetshine_enabled"] = imgui.checkbox("Planetshine / Moonshine", app.camera.get("planetshine_enabled", True))
-        if c_ps: settings_changed = True
-        if app.camera.get("planetshine_enabled", True):
-            imgui.indent()
-            ring_ps_modes = ["Analytical (Fast)", "Numerical (64 Samples)"]
-            curr_rm = app.camera.get("ring_planetshine_mode", 0)
-            curr_rm_idx = curr_rm if 0 <= curr_rm < len(ring_ps_modes) else 0
-            c_rm, new_rm = imgui.combo("Ring Planetshine", curr_rm_idx, ring_ps_modes)
-            if c_rm:
-                app.camera["ring_planetshine_mode"] = new_rm
-                settings_changed = True
-            if imgui.is_item_hovered():
-                imgui.set_tooltip("Analytical: Fast O(1) closed-form Lambertian phase model (high FPS).\nNumerical: 64-sample ray-traced disk quadrature (heavy GPU cost).")
-            imgui.unindent()
-
-        c_rs, app.camera["ringshine_enabled"] = imgui.checkbox("Ringshine", app.camera.get("ringshine_enabled", True))
-        if c_rs: settings_changed = True
-        if app.camera.get("ringshine_enabled", True):
-            imgui.indent()
-            rs_modes = ["Precomputed Map", "Monte Carlo (Ground Truth)"]
-            curr_rsm = app.camera.get("ringshine_mode", 0)
-            curr_rsm_idx = curr_rsm if 0 <= curr_rsm < len(rs_modes) else 0
-            c_rsm, new_rsm = imgui.combo("Ringshine Method", curr_rsm_idx, rs_modes)
-            if c_rsm:
-                app.camera["ringshine_mode"] = new_rsm
-                settings_changed = True
-            if imgui.is_item_hovered():
-                imgui.set_tooltip("Precomputed Map: Cached transfer map (high performance).\nMonte Carlo: Real-time per-pixel stochastic ray tracing (ground truth).")
-
-            if app.camera.get("ringshine_mode", 0) == 1:
-                mc_samples = int(app.camera.get("ringshine_mc_samples", 64))
-                c_mcs, mc_samples = imgui.slider_int("MC Samples", mc_samples, 16, 4096)
-                if c_mcs:
-                    app.camera["ringshine_mc_samples"] = mc_samples
-                    settings_changed = True
-                c_dith, app.camera["ringshine_mc_dither"] = imgui.checkbox("MC Dither (Noise)", app.camera.get("ringshine_mc_dither", False))
-                if c_dith:
-                    settings_changed = True
-                if imgui.is_item_hovered():
-                    imgui.set_tooltip("Disabled (default): Deterministic Quasi-Monte Carlo produces perfectly smooth, grain-free shading.\nEnabled: Adds per-pixel screen-space dithering, useful for temporal Pause/Screenshot Accumulation.")
-
-            c_rso, app.camera["ringshine_oblate_enabled"] = imgui.checkbox("Oblate Ringshine", app.camera.get("ringshine_oblate_enabled", True))
-            if c_rso: settings_changed = True
-            imgui.unindent()
-
-        imgui.separator()
-        c_hdr, app.camera["hdr_enabled"] = imgui.checkbox("HDR Mode", app.camera.get("hdr_enabled", True))
-        if c_hdr: settings_changed = True
-
-        if app.camera.get("hdr_enabled", True):
-            c_exp, app.camera["exposure"] = imgui.slider_float("Exposure", app.camera.get("exposure", 1.0), 0.0001, 10000.0, "%.4f", imgui.SLIDER_FLAGS_LOGARITHMIC)
-            if c_exp: settings_changed = True
-
-        bloom_modes = ["Gaussian Blur", "Diffraction Spikes", "Hybrid (Spikes + Haze)"]
-        curr_bm = app.camera.get("bloom_mode", 2)
-        curr_bm_idx = curr_bm if 0 <= curr_bm < len(bloom_modes) else 2
-        c_bm, new_bm = imgui.combo("Bloom Mode", curr_bm_idx, bloom_modes)
-        if c_bm:
-            app.camera["bloom_mode"] = new_bm
-            settings_changed = True
-
-        if app.camera.get("bloom_mode", 2) in (1, 2):
-            spike_counts = [4, 6, 8]
-            spike_labels = ["4 Spikes (Cross)", "6 Spikes (JWST / Newtonian)", "8 Spikes (Octagram)"]
-            curr_sc = app.camera.get("spike_count", 6)
-            sc_idx = spike_counts.index(curr_sc) if curr_sc in spike_counts else 1
-            c_sc, new_sc_idx = imgui.combo("Spike Pattern", sc_idx, spike_labels)
-            if c_sc:
-                app.camera["spike_count"] = spike_counts[new_sc_idx]
-                settings_changed = True
-
-            c_cbi, app.camera["conv_bloom_intensity"] = imgui.slider_float("Spikes Intensity", app.camera.get("conv_bloom_intensity", 0.5), 0.0, 5.0, "%.2f")
-            if c_cbi: settings_changed = True
-            c_sl, app.camera["spike_length"] = imgui.slider_float("Spikes Length", app.camera.get("spike_length", 1.0), 0.2, 3.0, "%.2f")
-            if c_sl: settings_changed = True
-            c_sa, app.camera["spike_angle"] = imgui.slider_float("Spikes Angle", app.camera.get("spike_angle", 0.0), 0.0, 180.0, "%.1f deg")
-            if c_sa: settings_changed = True
-            c_srl, app.camera["spike_roll_lock"] = imgui.checkbox("Lock Spikes to Camera Roll", app.camera.get("spike_roll_lock", True))
-            if c_srl: settings_changed = True
-            c_sd, app.camera["spike_dispersion"] = imgui.slider_float("Dispersion (Rainbow)", app.camera.get("spike_dispersion", 0.015), 0.0, 0.05, "%.3f")
-            if c_sd: settings_changed = True
-            spike_res_opts = [0, 1]
-            spike_res_labels = ["Quarter Res (Fast - 0.1ms)", "Half Res (Ultra)"]
-            curr_sq = app.camera.get("spike_quality", 0)
-            sq_idx = curr_sq if 0 <= curr_sq < len(spike_res_opts) else 0
-            c_sq, new_sq_idx = imgui.combo("Spikes Resolution", sq_idx, spike_res_labels)
-            if c_sq:
-                app.camera["spike_quality"] = spike_res_opts[new_sq_idx]
-                app.last_fb_size = (0, 0)
-                settings_changed = True
-
-            c_cds, app.camera["conv_bloom_dynamic_scale"] = imgui.checkbox("Dynamic Spikes Shrink", app.camera.get("conv_bloom_dynamic_scale", True))
-            if c_cds: settings_changed = True
-        if app.camera.get("bloom_mode", 2) in (0, 2):
-            c_bi, app.camera["bloom_intensity"] = imgui.slider_float("Haze Intensity", app.camera.get("bloom_intensity", 0.05), 0.0, 1.0, "%.3f")
-            if c_bi: settings_changed = True
-            c_bt, app.camera["bloom_threshold"] = imgui.slider_float("Bloom Threshold", app.camera.get("bloom_threshold", 1.0), 0.0, 10.0, "%.2f")
-            if c_bt: settings_changed = True
-
-        msaa_opts = [0, 2, 4, 8]
-        msaa_labels = ["Off", "2x", "4x", "8x"]
-        curr_msaa = app.camera.get("msaa_samples", 4)
-        curr_idx = msaa_opts.index(curr_msaa) if curr_msaa in msaa_opts else 2
-        c_msaa, new_msaa_idx = imgui.combo("Orbit MSAA", curr_idx, msaa_labels)
-        if c_msaa:
-            app.camera["msaa_samples"] = msaa_opts[new_msaa_idx]
-            settings_changed = True
-
-        if settings_changed:
+        changed, app.camera["show_gaia_stars"] = imgui.checkbox("GAIA Starfield", app.camera.get("show_gaia_stars", True))
+        if changed:
             app.save_settings()
-
+        if app.camera.get("show_gaia_stars", True) and app.star_catalog is not None and not app.star_catalog.loaded:
+            imgui.text_wrapped("Run scripts/fetch_gaia.py to build the star catalog.")
         imgui.separator()
-        if imgui.menu_item("All Graphics & Quality Settings...")[0]:
-            app.camera["show_settings_modal"] = True
-
+        for index, label in enumerate(SETTINGS_SECTIONS):
+            if imgui.menu_item(label + " Settings...")[0]:
+                open_settings(app, index)
         imgui.end_menu()
 
     # ── Tools Menu ──
@@ -413,19 +308,20 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
         badge_color = (1.0, 0.8, 0.2)
 
     # Right align controls
-    cursor_x = imgui.get_window_width() - 360
+    cursor_x = imgui.get_window_width() - 360 * layout.scale
     if cursor_x > imgui.get_cursor_pos_x():
         imgui.set_cursor_pos_x(cursor_x)
 
-    imgui.text_colored(badge_label, *badge_color)
-    imgui.same_line(spacing=15)
+    if layout.width > 900 * layout.scale:
+        imgui.text_colored(badge_label, *badge_color)
+        imgui.same_line(spacing=15)
 
     # Screenshot quick button
     _ss_can_capture = not getattr(app, "_screenshot_capturing", False) and not getattr(app, "_screenshot_saving", False)
     if not _ss_can_capture:
         imgui.push_style_var(imgui.STYLE_ALPHA, 0.5)
 
-    if imgui.button("Screenshot (F12)"):
+    if imgui.button("Capture" if layout.width < 1100 * layout.scale else "Capture (F12)"):
         if _ss_can_capture:
             _ss_presets = [(3840, 2160), (7680, 4320), (15360, 8640)]
             _ss_idx = max(0, min(len(_ss_presets) - 1, app.camera.get("screenshot_res_idx", 1)))
@@ -446,6 +342,6 @@ def render_main_menu_bar(app, bodies_data, visual_data, atmo_bodies, ring_bodies
 
     imgui.same_line(spacing=10)
     if imgui.button("Settings"):
-        app.camera["show_settings_modal"] = not app.camera.get("show_settings_modal", False)
+        open_settings(app)
 
     imgui.end_main_menu_bar()

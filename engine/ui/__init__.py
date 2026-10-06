@@ -10,6 +10,7 @@ Organized into modular components:
 - viewport_hud: Viewport Overlay & Toasts
 """
 
+from engine.ui.workspace import apply_theme
 from engine.ui.menu_bar import render_main_menu_bar
 from engine.ui.time_hud import render_time_hud
 from engine.ui.outliner import render_system_outliner
@@ -47,6 +48,8 @@ def render_ui(
     """Main orchestrator for rendering all ImGui interface layers in Stellar-Forge."""
     if not getattr(app, "ui_visible", True):
         return
+
+    apply_theme(app)
 
     active_system_name = getattr(app, "active_system_name", "Solar System")
     keplerian_mode_active = app.shared_state.get("keplerian_mode", False)

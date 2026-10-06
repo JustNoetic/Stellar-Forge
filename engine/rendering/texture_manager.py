@@ -1062,8 +1062,12 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
     avail_w = imgui.get_content_region_available_width()
 
     # ── 1. Texture Layer Selector Sub-Tabs ──
-    btn_w = int((avail_w - 32) / len(TEXTURE_LAYERS))
-    for layer_k, layer_meta in TEXTURE_LAYERS.items():
+    # Keep every map-layer label legible when the inspector is narrow or scaled.
+    spacing = imgui.get_style().item_spacing.x
+    minimum_tab_width = imgui.calc_text_size("Specular *")[0] + imgui.get_style().frame_padding.x * 2
+    column_count = min(len(TEXTURE_LAYERS), max(1, int((avail_w + spacing) / (minimum_tab_width + spacing))))
+    btn_w = max(1, int((avail_w - spacing * (column_count - 1)) / column_count))
+    for layer_index, (layer_k, layer_meta) in enumerate(TEXTURE_LAYERS.items()):
         is_active = (cur_layer == layer_k)
         has_tex = _has_layer_texture(app, name_lower, layer_k)
 
@@ -1089,7 +1093,7 @@ def render_texture_management_ui(app, ctx, insp_idx, body_info, visual_arr, acti
             cur_layer = layer_k
 
         imgui.pop_style_color(2)
-        if layer_k != 'height':
+        if layer_index < len(TEXTURE_LAYERS) - 1 and (layer_index + 1) % column_count:
             imgui.same_line()
 
     imgui.spacing()

@@ -1,6 +1,7 @@
 import random
 import imgui
 from engine.ephemeris.system_manager import SystemManager
+from engine.ui.workspace import panel, ACCENT
 
 def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices_snap, tree_depths_snap, spice_valid_mask, ephemeris_mode_active, active_system_name, switch_triggers):
     """Render the left-side System Outliner panel (celestial body hierarchy)."""
@@ -9,20 +10,8 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
 
     trigger_system_switch = switch_triggers["switch_system"]
 
-    outliner_w = 300
-    outliner_x = 10
-    outliner_y = 32
-    # Leave room for bottom time HUD
-    bottom_space = 70 if getattr(app, "show_time_hud", True) else 15
-    outliner_h = max(200, app.fb_height - outliner_y - bottom_space)
-
-    force_layout = getattr(app, "_last_fb_width", 0) != app.fb_width or getattr(app, "_last_fb_height", 0) != app.fb_height
-    cond = imgui.ALWAYS if force_layout else imgui.ONCE
-
-    imgui.set_next_window_position(outliner_x, outliner_y, cond)
-    imgui.set_next_window_size(outliner_w, outliner_h, cond)
-
-    expanded, opened = imgui.begin("System Outliner###outliner", True)
+    layout, flags = panel(app, "left")
+    expanded, opened = imgui.begin("System Outliner###outliner", True, flags)
     if not opened:
         app.show_outliner = False
         imgui.end()
@@ -32,8 +21,49 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
         imgui.end()
         return
 
+    if app.camera.get('scene_mode') == 'size_comparator':
+        from engine.rendering.comparator_systems import selected_systems
+        from engine.rendering.size_comparator import comparator_view
+        names = selected_systems(app)
+        imgui.text_colored('Systems to compare',0.6,0.9,1.0)
+        imgui.text_wrapped('Check systems to show their bodies at the same scale.')
+        imgui.separator()
+        available = app.sys_mgr.list_systems()
+        if active_system_name not in available:
+            available.append(active_system_name)
+        for name in available:
+            changed, checked = imgui.checkbox(name, name in names)
+            if changed:
+                if checked:
+                    names.append(name)
+                else:
+                    names.remove(name)
+                app.camera.pop('size_comparator_selected',None)
+                app.camera.pop('size_comparator_focus',None)
+                app.camera['inspected_idx'] = None
+                comparator_view(app.camera)['fit'] = True
+            error = getattr(getattr(app,'comparator_systems',None),'errors',{}).get(name)
+            if error:
+                imgui.text_wrapped(f'Could not load: {error}')
+        if not names:
+            imgui.text_disabled('Check a system to begin.')
+        imgui.separator()
+        if imgui.button('Fit All'):
+            comparator_view(app.camera)['fit'] = True
+        selected = app.camera.get('size_comparator_selected')
+        sources = getattr(app,'_comparator_sources',[])
+        if selected is not None:
+            bi = next((i for i,s in enumerate(sources) if list(s[:2]) == selected),None)
+            if bi is not None:
+                imgui.separator()
+                imgui.text_wrapped(f"{selected[0]}: {app._comparator_bodies[bi]['name']}")
+                if imgui.button('Focus Selected'):
+                    app.camera['size_comparator_focus'] = bi
+        imgui.end()
+        return
+
     # ── Header: Active System & Actions ──
-    imgui.text_colored(f"System: {active_system_name}", 0.6, 0.9, 1.0)
+    imgui.text_colored("ACTIVE SYSTEM", *ACCENT)
     
     # System switch dropdown
     system_list = app.sys_mgr.list_systems()
@@ -42,7 +72,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
     except ValueError:
         cur_sys_idx = 0
 
-    imgui.push_item_width(170)
+    imgui.push_item_width(max(70, imgui.get_content_region_available()[0] - 72))
     c_sys, new_sys_idx = imgui.combo("##sys_select", cur_sys_idx, system_list)
     if c_sys and system_list[new_sys_idx] != active_system_name:
         trigger_system_switch(system_list[new_sys_idx])
@@ -77,6 +107,8 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
         }
 
     # ── Search / Filter Bar ──
+    imgui.spacing()
+    imgui.text_disabled("Search bodies")
     search_query = getattr(app, "_ui_search_query", "")
     imgui.push_item_width(-35 if search_query else -1)
     changed_search, search_query = imgui.input_text("##body_search", search_query, 64)
@@ -90,11 +122,15 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
             app._ui_search_query = ""
             search_query = ""
 
+    imgui.spacing()
     imgui.separator()
+    imgui.text_disabled(f"CELESTIAL BODIES / {num_bodies}")
+    imgui.begin_child("body_tree", 0, 0)
 
     # ── Primary System Hierarchy Tree ──
     filter_text = search_query.strip().lower()
 
+    visible_count = 0
     for k in range(len(tree_indices_snap)):
         idx = int(tree_indices_snap[k])
         if ephemeris_mode_active and not spice_valid_mask[idx]:
@@ -104,6 +140,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
         if filter_text and filter_text not in body_name.lower():
             continue
 
+        visible_count += 1
         depth = int(tree_depths_snap[k])
         indent = depth * 14
         if indent > 0:
@@ -139,9 +176,9 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
                 app.camera["inspect_bary"] = False
                 app.show_inspector = True
 
-        if show_buttons:
+        if show_buttons or is_inspected:
             imgui.same_line()
-            imgui.set_cursor_pos_x(imgui.get_window_width() - 55)
+            imgui.set_cursor_pos_x(max(0, imgui.get_window_content_region_max()[0] - 42))
             imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 0))
             cur_y_btn = imgui.get_cursor_pos_y()
             imgui.set_cursor_pos_y(cur_y_btn - 2)
@@ -204,6 +241,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
             if filter_text and filter_text not in b_name.lower():
                 continue
 
+            visible_count += 1
             depth = int(app.tree_depths_snap_cmp[k])
             indent = depth * 14
             if indent > 0:
@@ -235,4 +273,7 @@ def render_system_outliner(app, bodies_data, num_bodies, mass_snap, tree_indices
             if indent > 0:
                 imgui.unindent(indent)
 
+    if filter_text and not visible_count:
+        imgui.text_disabled("No matching bodies.")
+    imgui.end_child()
     imgui.end()

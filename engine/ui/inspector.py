@@ -33,6 +33,8 @@ from engine.rendering.render_utils import (
 )
 from engine.rendering.planetshine import get_cached_atmosphere_properties
 from engine.rendering.surface_materials import resolve_material, material_albedos
+from engine.ui.workspace import panel, ACCENT
+from engine.ui.inspector_widgets import metric_text, value_row, section, field
 from engine.ui.surface_material_editor import render_surface_material_editor
 from engine.rendering.texture_baker import bake_and_export_ring_textures, apply_procedural_ring_to_body
 from engine.rendering.ring_generator import RING_PRESETS
@@ -431,7 +433,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     cur_subsys_vel_buf = app.subsys_vel_buf_cmp if insp_is_cmp else subsys_vel_buf
     cur_pos_snap_render = app.pos_snap_cmp if insp_is_cmp else pos_snap_render
     cur_vel_snap_render = app.vel_snap_cmp if insp_is_cmp else vel_snap_render
-    cur_visual_arr = app.visual_data_cmp if insp_is_cmp else visual_arr
+    cur_visual_arr = app.visual_arr_cmp if insp_is_cmp else visual_arr
 
     body_info = cur_bodies_data[insp_idx]
     body_name = body_info['name']
@@ -442,14 +444,8 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     else:
         win_title = f"{body_name}###inspector"
 
-    insp_w = 350
-    insp_x = app.fb_width - insp_w - 10
-    insp_y = 32
-    bottom_space = 70 if getattr(app, "show_time_hud", True) else 15
-    insp_h = max(200, app.fb_height - insp_y - bottom_space)
-
-    force_layout = getattr(app, "_last_fb_width", 0) != app.fb_width or getattr(app, "_last_fb_height", 0) != app.fb_height
-    cond = imgui.ALWAYS if force_layout else imgui.ONCE
+    layout, flags = panel(app, "right")
+    insp_w = layout.inspector_width
 
     # Reset edit mode if inspected body changed
     last_insp = app.camera.get("_last_inspected_idx")
@@ -459,10 +455,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         app.camera["_last_inspected_idx"] = insp_idx
         app.camera["_last_inspected_is_cmp"] = insp_is_cmp
 
-    imgui.set_next_window_position(insp_x, insp_y, cond)
-    imgui.set_next_window_size(insp_w, insp_h, cond)
-
-    expanded, opened = imgui.begin(win_title, True)
+    expanded, opened = imgui.begin(win_title, True, flags)
     if not opened:
         app.camera["inspected_idx"] = None
         app.camera["inspect_bary"] = False
@@ -479,9 +472,10 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         imgui.text_colored("Mode: Barycenter", 0.6, 0.9, 1.0)
     else:
         obj_type = body_info.get('type', 'Unknown')
-        imgui.text_colored(f"Type: {obj_type}", 0.7, 0.8, 1.0)
+        imgui.text_colored(obj_type, 0.7, 0.8, 1.0)
         if not insp_is_cmp:
-            imgui.same_line(spacing=15)
+            if imgui.get_content_region_available()[0] > imgui.calc_text_size(obj_type)[0] + imgui.calc_text_size("Edit Mode")[0] + 40 * layout.scale:
+                imgui.same_line(spacing=15)
             changed_edit, app.camera["edit_mode"] = imgui.checkbox("Edit Mode", app.camera.get("edit_mode", False))
             if changed_edit:
                 if app.camera["edit_mode"]:
@@ -529,163 +523,131 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
         r_au = (body_r_km / 149597870.7)
         target_d = max(r_au * 3.5, 1e-6) if r_au > 0 else 0.01
 
-    # ── Action Buttons: Track, Center, Go To, Barycenter ──
-    is_tracked = (app.camera["tracking_idx"] == insp_idx and
-                  app.camera.get("tracking_is_cmp", False) == insp_is_cmp and
-                  app.camera.get("tracking_bary", False) == inspect_bary)
+    # Prioritize editable fields in short panels; navigation remains in a popup.
+    compact_editing = (not insp_is_cmp and not inspect_bary and app.camera.get("edit_mode", False)
+                       and layout.panel_height < 400 * layout.scale)
+    navigation_open = True
+    if compact_editing:
+        if imgui.button("Navigation...", width=-1):
+            imgui.open_popup("inspector_navigation")
+        imgui.set_next_window_size(min(320 * layout.scale, layout.width - 32), 0, imgui.ALWAYS)
+        navigation_open = imgui.begin_popup("inspector_navigation")
+    if navigation_open:
+        # ── Action Buttons: Track, Center, Go To, Barycenter ──
+        is_tracked = (app.camera["tracking_idx"] == insp_idx and
+                      app.camera.get("tracking_is_cmp", False) == insp_is_cmp and
+                      app.camera.get("tracking_bary", False) == inspect_bary)
+        available_width = imgui.get_content_region_available()[0]
+        action_gap = 6 * layout.scale
+        widest_action = max(imgui.calc_text_size(label)[0] for label in ('Tracking', 'Centered', 'Go To', 'Barycenter')) + imgui.get_style().frame_padding.x * 2
+        action_columns = 4 if available_width >= widest_action * 4 + action_gap * 3 else 2
+        action_width = (available_width - action_gap * (action_columns - 1)) / action_columns
 
-    # 1. Track Button
-    track_btn_label = "Tracking" if is_tracked else "Track"
-    if is_tracked:
-        imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
-    if imgui.button(f"{track_btn_label}##track_btn"):
+        # 1. Track Button
+        track_btn_label = "Tracking" if is_tracked else "Track"
         if is_tracked:
-            app.camera["target"] = cam_world_pos_f8.copy()
-            app.camera["cam_pos_rel"] = np.zeros(3, dtype='f8')
-            app.camera["cam_pos_rel_prev"] = np.zeros(3, dtype='f8')
-            app.camera["tracking_idx"] = None
-            app.camera["cam_look"] = "free"
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.16, 0.38, 0.43)
+        if imgui.button(f"{track_btn_label}##track_btn", width=action_width):
+            if is_tracked:
+                app.camera["target"] = cam_world_pos_f8.copy()
+                app.camera["cam_pos_rel"] = np.zeros(3, dtype='f8')
+                app.camera["cam_pos_rel_prev"] = np.zeros(3, dtype='f8')
+                app.camera["tracking_idx"] = None
+                app.camera["cam_look"] = "free"
+                app.camera["centered_idx"] = None
+            else:
+                app.camera["tracking_idx"] = insp_idx
+                app.camera["tracking_is_cmp"] = insp_is_cmp
+                app.camera["tracking_bary"] = inspect_bary
+                app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
+                app.camera["cam_pos_rel"] = (cam_world_pos_f8 - target_pos).copy()
+                app.camera["cam_look"] = "aim"
+                app.camera["approach_delta"] = 0.0
+                app.camera["centered_idx"] = None
+        if is_tracked:
+            imgui.pop_style_color()
+
+        # 2. Center Object Button
+        is_centered = (app.camera.get("centered_idx") == insp_idx and
+                       app.camera.get("centered_is_cmp", False) == insp_is_cmp and
+                       app.camera.get("centered_bary", False) == inspect_bary)
+        imgui.same_line(spacing=action_gap)
+        center_btn_label = "Centered" if is_centered else "Center"
+        if is_centered:
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.16, 0.38, 0.43)
+        if imgui.button(f"{center_btn_label}##center_btn", width=action_width):
+            if is_centered:
+                app.camera["centered_idx"] = None
+            else:
+                app.camera["centered_idx"] = insp_idx
+                app.camera["centered_is_cmp"] = insp_is_cmp
+                app.camera["centered_bary"] = inspect_bary
+
+                # Immediately align view to center the object
+                refract_params, grav_lens_params = app._get_active_refraction_and_lens_params(
+                    cam_world_pos_f8,
+                    atmo_bodies=atmo_bodies,
+                    pos_snap_render=pos_snap_render,
+                    mass_snap=mass_snap,
+                    bodies_data=bodies_data,
+                    num_bodies=num_bodies,
+                )
+                fwd_t = get_apparent_look_direction(
+                    cam_world_pos_f8,
+                    target_pos,
+                    refract_params=refract_params,
+                    grav_lens_params=grav_lens_params,
+                    target_body_idx=insp_idx,
+                    target_is_cmp=insp_is_cmp,
+                )
+                y_t, p_t = _camera_yaw_pitch_from(fwd_t)
+                app.camera["yaw"] = app.camera["yaw_actual"] = y_t
+                app.camera["pitch"] = app.camera["pitch_actual"] = p_t
+                cur_up = _camera_get_up(app.camera, fwd_t)
+                app.camera["up"] = cur_up.tolist()
+                app.camera["cam_look"] = "free"
+                app.camera["approach_delta"] = 0.0
+        if is_centered:
+            imgui.pop_style_color()
+
+        # 3. Go To Planet / Object Button
+        if action_columns == 4:
+            imgui.same_line(spacing=action_gap)
+        if imgui.button("Go To##goto_btn", width=action_width):
             app.camera["centered_idx"] = None
-        else:
             app.camera["tracking_idx"] = insp_idx
             app.camera["tracking_is_cmp"] = insp_is_cmp
             app.camera["tracking_bary"] = inspect_bary
             app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
-            app.camera["cam_pos_rel"] = (cam_world_pos_f8 - target_pos).copy()
             app.camera["cam_look"] = "aim"
+
+            delta = cam_world_pos_f8 - target_pos
+            d = np.linalg.norm(delta)
+            if d > 1e-12:
+                app.camera["cam_pos_rel"] = (delta / d) * target_d
+            else:
+                app.camera["cam_pos_rel"] = np.array([0.0, 0.0, target_d], dtype='f8')
             app.camera["approach_delta"] = 0.0
-            app.camera["centered_idx"] = None
-    if is_tracked:
-        imgui.pop_style_color()
 
-    # 2. Center Object Button
-    is_centered = (app.camera.get("centered_idx") == insp_idx and
-                   app.camera.get("centered_is_cmp", False) == insp_is_cmp and
-                   app.camera.get("centered_bary", False) == inspect_bary)
-    imgui.same_line(spacing=6)
-    center_btn_label = "Centered" if is_centered else "Center"
-    if is_centered:
-        imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
-    if imgui.button(f"{center_btn_label}##center_btn"):
-        if is_centered:
-            app.camera["centered_idx"] = None
-        else:
-            app.camera["centered_idx"] = insp_idx
-            app.camera["centered_is_cmp"] = insp_is_cmp
-            app.camera["centered_bary"] = inspect_bary
+            if app.camera.get("movement_mode", 0) == 0:
+                app.camera["flight_speed"] = max(target_d * 0.05, 1e-10)
 
-            # Immediately align view to center the object
-            refract_params, grav_lens_params = app._get_active_refraction_and_lens_params(
-                cam_world_pos_f8,
-                atmo_bodies=atmo_bodies,
-                pos_snap_render=pos_snap_render,
-                mass_snap=mass_snap,
-                bodies_data=bodies_data,
-                num_bodies=num_bodies,
-            )
-            fwd_t = get_apparent_look_direction(
-                cam_world_pos_f8,
-                target_pos,
-                refract_params=refract_params,
-                grav_lens_params=grav_lens_params,
-                target_body_idx=insp_idx,
-                target_is_cmp=insp_is_cmp,
-            )
-            y_t, p_t = _camera_yaw_pitch_from(fwd_t)
-            app.camera["yaw"] = app.camera["yaw_actual"] = y_t
-            app.camera["pitch"] = app.camera["pitch_actual"] = p_t
-            cur_up = _camera_get_up(app.camera, fwd_t)
-            app.camera["up"] = cur_up.tolist()
-            app.camera["cam_look"] = "free"
-            app.camera["approach_delta"] = 0.0
-    if is_centered:
-        imgui.pop_style_color()
+        # 4. Barycenter / Body Mode Toggle
+        imgui.same_line(spacing=action_gap)
+        bary_btn_label = "Barycenter" if not inspect_bary else "Body"
+        if imgui.button(f"{bary_btn_label}##toggle_bary_btn", width=action_width):
+            app.camera["inspect_bary"] = not inspect_bary
+            if app.camera["tracking_idx"] == insp_idx and app.camera.get("tracking_is_cmp", False) == insp_is_cmp:
+                app.camera["tracking_bary"] = app.camera["inspect_bary"]
+                app.camera["tracking_mode"] = "bary" if app.camera["inspect_bary"] else "body"
+            if app.camera.get("centered_idx") == insp_idx and app.camera.get("centered_is_cmp", False) == insp_is_cmp:
+                app.camera["centered_bary"] = app.camera["inspect_bary"]
 
-    # 3. Go To Planet / Object Button
-    imgui.same_line(spacing=6)
-    if imgui.button("Go To##goto_btn"):
-        app.camera["centered_idx"] = None
-        app.camera["tracking_idx"] = insp_idx
-        app.camera["tracking_is_cmp"] = insp_is_cmp
-        app.camera["tracking_bary"] = inspect_bary
-        app.camera["tracking_mode"] = "bary" if inspect_bary else "body"
-        app.camera["cam_look"] = "aim"
+    if compact_editing and navigation_open:
+        imgui.end_popup()
 
-        delta = cam_world_pos_f8 - target_pos
-        d = np.linalg.norm(delta)
-        if d > 1e-12:
-            app.camera["cam_pos_rel"] = (delta / d) * target_d
-        else:
-            app.camera["cam_pos_rel"] = np.array([0.0, 0.0, target_d], dtype='f8')
-        app.camera["approach_delta"] = 0.0
-
-        if app.camera.get("movement_mode", 0) == 0:
-            app.camera["flight_speed"] = max(target_d * 0.05, 1e-10)
-
-    # 4. Barycenter / Body Mode Toggle
-    imgui.same_line(spacing=6)
-    bary_btn_label = "Barycenter" if not inspect_bary else "Body"
-    if imgui.button(f"{bary_btn_label}##toggle_bary_btn"):
-        app.camera["inspect_bary"] = not inspect_bary
-        if app.camera["tracking_idx"] == insp_idx and app.camera.get("tracking_is_cmp", False) == insp_is_cmp:
-            app.camera["tracking_bary"] = app.camera["inspect_bary"]
-            app.camera["tracking_mode"] = "bary" if app.camera["inspect_bary"] else "body"
-        if app.camera.get("centered_idx") == insp_idx and app.camera.get("centered_is_cmp", False) == insp_is_cmp:
-            app.camera["centered_bary"] = app.camera["inspect_bary"]
-
-    # Altitude & Distance Readout
+    # Camera-distance units used by Overview and Orbit.
     thresh_au = app.camera.get("ly_threshold_au", DEFAULT_LY_THRESHOLD_AU)
-    if dist_to_center_km > 1.49597e7:
-        imgui.text(f"Distance: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
-    else:
-        imgui.text(f"Distance: {dist_to_center_km:,.0f} km")
-    if imgui.is_item_hovered():
-        imgui.set_tooltip("Distance from the camera to the center of the body.")
-
-    if not inspect_bary and body_r_km > 0.0:
-        f_oblate = float(body_info.get("oblateness", 0.0))
-        if not insp_is_cmp and app.camera.get("edit_mode", False) and "edit_data" in app.camera:
-            ed = app.camera["edit_data"]
-            if "oblateness" in ed:
-                f_oblate = float(ed["oblateness"])
-        if f_oblate <= 0.0 and cur_visual_arr is not None and len(cur_visual_arr) > insp_idx:
-            f_oblate = float(cur_visual_arr[insp_idx, 8])
-        if f_oblate <= 0.0:
-            sp = body_info.get('star_props', {})
-            if sp and sp.get('r_eq') and sp.get('r_pole') and float(sp['r_eq']) > 0:
-                f_oblate = max(0.0, 1.0 - float(sp['r_pole']) / float(sp['r_eq']))
-
-        if cur_visual_arr is not None and len(cur_visual_arr) > insp_idx:
-            body_pole = cur_visual_arr[insp_idx, 5:8]
-        elif hasattr(app, "pole_n_arr") and app.pole_n_arr is not None and len(app.pole_n_arr) > insp_idx:
-            body_pole = app.pole_n_arr_cmp[insp_idx] if insp_is_cmp else app.pole_n_arr[insp_idx]
-        else:
-            pole_ra = body_info.get('pole_ra')
-            pole_dec = body_info.get('pole_dec')
-            if pole_ra is not None and pole_dec is not None:
-                p_ecl = pole_to_ecliptic(float(pole_ra), float(pole_dec))
-                body_pole = np.array([p_ecl[0], p_ecl[2], -p_ecl[1]], dtype='f8')
-            else:
-                body_pole = np.array([0.0, 1.0, 0.0], dtype='f8')
-
-        active_r_km = float(app.camera["edit_data"].get("radius", body_r_km)) if (not insp_is_cmp and app.camera.get("edit_mode", False) and "edit_data" in app.camera) else body_r_km
-        surf_r_km = _ellipsoid_surface_radius(active_r_km, f_oblate, body_pole, cam_rel)
-        alt_km = dist_to_center_km - surf_r_km
-        alt_au = alt_km / 149597870.7
-        imgui.text(f"Altitude: {format_altitude(alt_km, alt_au, threshold_au=thresh_au)}")
-        if imgui.is_item_hovered():
-            if f_oblate > 0.0:
-                r_pole_km = active_r_km * (1.0 - f_oblate)
-                imgui.set_tooltip(
-                    f"Camera altitude above the oblate spheroid surface along line of sight.\n"
-                    f"Local surface radius: {surf_r_km:,.1f} km (Flattening f = {f_oblate:.4f})\n"
-                    f"Equatorial: {active_r_km:,.1f} km | Polar: {r_pole_km:,.1f} km"
-                )
-            else:
-                imgui.set_tooltip(
-                    f"Camera altitude above the surface along line of sight.\n"
-                    f"Surface radius: {surf_r_km:,.1f} km"
-                )
 
 
     imgui.separator()
@@ -764,40 +726,52 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
     has_atmo = (body_info.get('atmosphere') is not None)
     has_rings = (body_info.get('rings') is not None and len(body_info.get('rings', [])) > 0)
 
-    if imgui.begin_tab_bar("InspectorTabBar"):
+    physical_editing = not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary
+    footer_height = 110 * layout.scale if physical_editing else 0
+    if physical_editing:
+        ed_footer = app.camera["edit_data"]
+        proposed_mass = float(ed_footer.get("mass", body_mass))
+        proposed_radius = float(ed_footer.get("radius", body_r_km))
+        proposed_periapsis = float(ed_footer.get("a", oe_a)) * (1.0 - float(ed_footer.get("e", oe_e)))
+        proposed_roche = 2.44 * proposed_radius * ((cur_mass_snap[parent_idx] / proposed_mass)**(1.0 / 3.0)) / AU_TO_KM if has_parent and proposed_mass > 0 and proposed_radius > 0 else 0
+        if proposed_periapsis >= proposed_roche:
+            footer_height = 60 * layout.scale
+    if imgui.begin_tab_bar("InspectorTabBar", imgui.TAB_BAR_FITTING_POLICY_SCROLL):
         # ── Tab 1: Overview & Physical ──
         if imgui.begin_tab_item("Overview")[0]:
-            imgui.text_colored("Physical Properties", 1.0, 0.85, 0.4)
+            imgui.begin_child("inspector_details", 0, -footer_height if physical_editing else 0)
+            imgui.push_item_width(max(85, imgui.get_content_region_available()[0] * 0.48))
+            section("Physical properties", "Proposed values" if physical_editing else None)
             if inspect_bary:
                 bary_mass = cur_subsys_mass_buf[insp_idx]
                 if bary_mass > 1e-4:
-                    imgui.text(f"  System Mass: {bary_mass:.6e} M\u2609")
+                    metric_text(f"  System Mass: {bary_mass:.6e} M\u2609")
                 else:
                     m_earth = bary_mass / 3.003e-6
-                    imgui.text(f"  System Mass: {m_earth:.4f} M\u2295")
+                    metric_text(f"  System Mass: {m_earth:.4f} M\u2295")
             elif not insp_is_cmp and app.camera.get("edit_mode", False):
                 ed = app.camera["edit_data"]
                 types_list = ["Star", "Terrestrial", "Gas Giant", "Ice Giant", "Dwarf Planet", "Moon"]
                 if "type" not in ed: ed["type"] = body_info.get("type", "Moon")
                 type_idx = types_list.index(ed["type"]) if ed["type"] in types_list else 1
-                changed_t, type_idx = imgui.combo("Type", type_idx, types_list)
+                changed_t, type_idx = field(imgui.combo, "Type", type_idx, types_list)
                 if changed_t: ed["type"] = types_list[type_idx]
 
                 if ed["type"] == "Star":
-                    changed_m, mode_idx = imgui.combo("Star Mode", 0 if ed.get("star_mode", "evolution")=="evolution" else 1, ["Evolution Track", "Surface Physics"])
+                    changed_m, mode_idx = field(imgui.combo, "Star Mode", 0 if ed.get("star_mode", "evolution")=="evolution" else 1, ["Evolution Track", "Surface Physics"])
                     if changed_m: ed["star_mode"] = ["evolution", "surface"][mode_idx]
 
                     if ed["star_mode"] == "evolution":
-                        _, ed["mass"] = imgui.drag_float(u"Mass (M\u2609)", ed["mass"], 0.01, 0.01, 300.0, format="%.4f")
-                        _, ed["metallicity"] = imgui.drag_float("[Fe/H] (dex)", ed.get("metallicity", 0.0), 0.01, -4.0, 1.0, format="%.3f")
-                        _, ed["age_pct"] = imgui.drag_float("Life Cycle (%)", ed.get("age_pct", 46.0), 0.1, -5.0, 120.0, format="%.1f%%")
+                        _, ed["mass"] = field(imgui.drag_float, u"Mass (M\u2609)", ed["mass"], 0.01, 0.01, 300.0, format="%.4f")
+                        _, ed["metallicity"] = field(imgui.drag_float, "[Fe/H] (dex)", ed.get("metallicity", 0.0), 0.01, -4.0, 1.0, format="%.3f")
+                        _, ed["age_pct"] = field(imgui.drag_float, "Life Cycle (%)", ed.get("age_pct", 46.0), 0.1, -5.0, 120.0, format="%.1f%%")
 
                         if ed["mass"] >= 45.0:
                             imgui.text_colored("Humphreys-Davidson Limit Reached", 1.0, 0.5, 0.2)
                             ed["evo_path"] = "stripping"
                         elif ed["mass"] >= 25.0:
                             if "evo_path" not in ed: ed["evo_path"] = "standard"
-                            changed_p, p_idx = imgui.combo("Evolution Branch", 0 if ed["evo_path"]=="standard" else 1, ["Red Supergiant", "LBV -> Wolf-Rayet"])
+                            changed_p, p_idx = field(imgui.combo, "Evolution Branch", 0 if ed["evo_path"]=="standard" else 1, ["Red Supergiant", "LBV -> Wolf-Rayet"])
                             if changed_p: ed["evo_path"] = ["standard", "stripping"][p_idx]
                         else:
                             ed["evo_path"] = "standard"
@@ -815,9 +789,9 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         if "locked_lum" not in ed: ed["locked_lum"] = False
                         num_locked = ed["locked_rad"] + ed["locked_temp"] + ed["locked_lum"]
 
-                        c1, ed["locked_rad"] = imgui.checkbox("##lr", ed["locked_rad"]); imgui.same_line(); _, ed["s_rad"] = imgui.drag_float(u"Radius (R\u2609)", ed.get("s_rad", 1.0), 0.05, 0.01, 2500.0, format="%.4f")
-                        c2, ed["locked_temp"] = imgui.checkbox("##lt", ed["locked_temp"]); imgui.same_line(); _, ed["s_temp"] = imgui.drag_float("Temp (K)", ed.get("s_temp", 5778.0), 10.0, 1000.0, 100000.0, format="%.0f")
-                        c3, ed["locked_lum"] = imgui.checkbox("##ll", ed["locked_lum"]); imgui.same_line(); _, ed["s_lum"] = imgui.drag_float(u"Luminosity (L\u2609)", ed.get("s_lum", 1.0), 0.01, 0.0001, 2000000.0, format="%.4f")
+                        c1, ed["locked_rad"] = imgui.checkbox("##lr", ed["locked_rad"]); imgui.same_line(); _, ed["s_rad"] = field(imgui.drag_float, u"Radius (R\u2609)", ed.get("s_rad", 1.0), 0.05, 0.01, 2500.0, format="%.4f")
+                        c2, ed["locked_temp"] = imgui.checkbox("##lt", ed["locked_temp"]); imgui.same_line(); _, ed["s_temp"] = field(imgui.drag_float, "Temp (K)", ed.get("s_temp", 5778.0), 10.0, 1000.0, 100000.0, format="%.0f")
+                        c3, ed["locked_lum"] = imgui.checkbox("##ll", ed["locked_lum"]); imgui.same_line(); _, ed["s_lum"] = field(imgui.drag_float, u"Luminosity (L\u2609)", ed.get("s_lum", 1.0), 0.01, 0.0001, 2000000.0, format="%.4f")
 
                         if c1 and ed["locked_rad"] and num_locked == 2:
                             if ed["locked_temp"] and not c2: ed["locked_temp"] = False
@@ -847,8 +821,8 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     edit_mass = ed["mass"]
                     edit_r_km = ed["radius"]
                 else:
-                    _, ed["mass"] = imgui.input_double(u"Mass (M\u2609)", ed["mass"], format="%e")
-                    _, ed["radius"] = imgui.input_double("Radius (km)", ed["radius"], format="%.1f")
+                    _, ed["mass"] = field(imgui.input_double, u"Mass (M\u2609)", ed["mass"], format="%e")
+                    _, ed["radius"] = field(imgui.input_double, "Radius (km)", ed["radius"], format="%.1f")
 
                     is_locked = False
                     if has_parent:
@@ -865,9 +839,9 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                                 ed["rotation_period"] = p_years * 365.25 * 24.0
 
                     if is_locked:
-                        imgui.text(f"  Rot Period: {ed['rotation_period']:.4f} hours [Tidally Locked]")
+                        metric_text(f"  Rot Period: {ed['rotation_period']:.4f} hours [Tidally Locked]")
                     else:
-                        _, ed["rotation_period"] = imgui.input_double("Rot Period (hours)", ed["rotation_period"], format="%.4f")
+                        _, ed["rotation_period"] = field(imgui.input_double, "Rot Period (hours)", ed["rotation_period"], format="%.4f")
                     edit_mass = ed["mass"]
                     edit_r_km = ed["radius"]
 
@@ -875,39 +849,42 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                     g_m_s2 = (1.32712440018e14 * edit_mass) / (edit_r_km ** 2)
                     g_earth = g_m_s2 / 9.80665
                     if g_m_s2 >= 1e-4:
-                        imgui.text(f"  Surface G: {g_m_s2:.3f} m/s² ({g_earth:.3f} g)")
+                        metric_text(f"  Surface G: {g_m_s2:.3f} m/s² ({g_earth:.3f} g)")
                     else:
-                        imgui.text(f"  Surface G: {g_m_s2:.3e} m/s² ({g_earth:.3e} g)")
+                        metric_text(f"  Surface G: {g_m_s2:.3e} m/s² ({g_earth:.3e} g)")
             else:
                 if body_mass > 1e-4:
-                    imgui.text(f"  Mass:    {body_mass:.6e} M\u2609")
+                    metric_text(f"  Mass:    {body_mass:.6e} M\u2609")
                 elif body_mass > 1e-10:
                     m_earth = body_mass / 3.003e-6
-                    imgui.text(f"  Mass:    {m_earth:.6f} M\u2295")
+                    metric_text(f"  Mass:    {m_earth:.6f} M\u2295")
                 else:
                     m_lunar = body_mass / 3.694e-8
-                    imgui.text(f"  Mass:    {m_lunar:.4e} M\u263E")
+                    metric_text(f"  Mass:    {m_lunar:.4e} M\u263E")
 
                 if body_r_km > 100:
-                    imgui.text(f"  Radius:  {body_r_km:,.0f} km")
+                    metric_text(f"  Radius:  {body_r_km:,.0f} km")
                 elif body_r_km > 0.1:
-                    imgui.text(f"  Radius:  {body_r_km:.1f} km")
+                    metric_text(f"  Radius:  {body_r_km:.1f} km")
 
                 if body_r_km > 0.0:
                     g_m_s2 = (1.32712440018e14 * body_mass) / (body_r_km ** 2)
                     g_earth = g_m_s2 / 9.80665
                     if g_m_s2 >= 1e-4:
-                        imgui.text(f"  Surface G: {g_m_s2:.3f} m/s² ({g_earth:.3f} g)")
+                        metric_text(f"  Surface G: {g_m_s2:.3f} m/s² ({g_earth:.3f} g)")
                     else:
-                        imgui.text(f"  Surface G: {g_m_s2:.3e} m/s² ({g_earth:.3e} g)")
+                        metric_text(f"  Surface G: {g_m_s2:.3e} m/s² ({g_earth:.3e} g)")
 
+                section("Rotation & shape")
                 rot_p = float(body_info.get("rotation_period", 0.0))
                 if rot_p != 0.0:
-                    imgui.text(f"  Rot Period: {rot_p:,.2f} hours")
+                    metric_text(f"  Rot Period: {rot_p:,.2f} hours")
 
+                if axial_tilt_deg is not None:
+                    value_row("Axial tilt", f"{axial_tilt_deg:.2f}°" + (" / retrograde" if axial_tilt_deg > 90 else ""))
                 f_oblate = float(body_info.get("oblateness", 0.0))
                 if f_oblate > 0.0:
-                    imgui.text(f"  Oblateness (f): {f_oblate:.4f}")
+                    metric_text(f"  Oblateness (f): {f_oblate:.4f}")
                     if imgui.is_item_hovered():
                         r_pole_km = body_r_km * (1.0 - f_oblate)
                         imgui.set_tooltip(
@@ -921,102 +898,113 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 ed_pr = app.camera.get("edit_data", {}).get("_preview") if (not insp_is_cmp and app.camera.get("edit_mode", False)) else None
                 sp = body_info.get('star_props', {})
                 imgui.separator()
-                imgui.text_colored("Stellar Properties", 1.0, 0.85, 0.4)
+                section("Stellar properties", "Evolution / surface model preview" if ed_pr else "Stored stellar model")
                 if ed_pr:
-                    imgui.text(f"  Temperature: {ed_pr['physical']['temp_k']:,.0f} K")
-                    imgui.text(f"  Luminosity:  {ed_pr['physical']['lum_lsun']:.4f} L\u2609")
-                    imgui.text(f"  Spectral Cl: {ed_pr['classification']['fullDesignation']}")
-                    imgui.text(f"  Stage:       {ed_pr['evolution']['phase']}")
+                    metric_text(f"  Temperature: {ed_pr['physical']['temp_k']:,.0f} K")
+                    metric_text(f"  Luminosity:  {ed_pr['physical']['lum_lsun']:.4f} L\u2609")
+                    metric_text(f"  Spectral Cl: {ed_pr['classification']['fullDesignation']}")
+                    metric_text(f"  Stage:       {ed_pr['evolution']['phase']}")
                 else:
-                    imgui.text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
-                    imgui.text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
-                    imgui.text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
-                    imgui.text(f"  Stage:       {sp.get('stage', 'Unknown')}")
+                    metric_text(f"  Temperature: {sp.get('temp', 0.0):,.0f} K")
+                    metric_text(f"  Luminosity:  {sp.get('lum', 0.0):.4f} L\u2609")
+                    metric_text(f"  Spectral Cl: {sp.get('class', 'Unknown')}")
+                    metric_text(f"  Stage:       {sp.get('stage', 'Unknown')}")
 
                 hz_lum = ed_pr['physical']['lum_lsun'] if ed_pr else sp.get('lum', 0.0)
                 if math.isfinite(hz_lum) and hz_lum > 0:
-                    imgui.text("  Habitable Zone (optimistic):")
-                    imgui.text(f"    Inner: {format_distance_au(math.sqrt(hz_lum / 1.78), threshold_au=thresh_au, precision=5)}")
-                    imgui.text(f"    Outer: {format_distance_au(math.sqrt(hz_lum / 0.32), threshold_au=thresh_au, precision=5)}")
+                    metric_text("  Habitable Zone (optimistic):")
+                    metric_text(f"    Inner: {format_distance_au(math.sqrt(hz_lum / 1.78), threshold_au=thresh_au, precision=5)}")
+                    metric_text(f"    Outer: {format_distance_au(math.sqrt(hz_lum / 0.32), threshold_au=thresh_au, precision=5)}")
                     if imgui.is_item_hovered():
                         imgui.set_tooltip("Luminosity-based boundaries matching the habitable-zone overlay.\nNot a prediction of an individual planet's climate.")
 
                 mode_val = app.camera.get("edit_data", {}).get("star_mode", sp.get('mode', 'evolution')) if (not insp_is_cmp and app.camera.get("edit_mode", False)) else sp.get('mode', 'evolution')
                 if mode_val == 'evolution':
                     met_val = app.camera.get("edit_data", {}).get("metallicity", sp.get('metallicity', 0.0)) if (not insp_is_cmp and app.camera.get("edit_mode", False)) else sp.get('metallicity', 0.0)
-                    imgui.text(f"  Metallicity: {met_val:.3f}")
+                    metric_text(f"  Metallicity: {met_val:.3f}")
                     if ed_pr:
                         age_gyr = ed_pr['evolution']['age_gyr']
                     else:
                         age_gyr = sp.get('age', 0.0)
                     if age_gyr < 0.1:
-                        imgui.text(f"  Age:         {age_gyr * 1000.0:,.1f} Myr")
+                        metric_text(f"  Age:         {age_gyr * 1000.0:,.1f} Myr")
                     else:
-                        imgui.text(f"  Age:         {age_gyr:,.3f} Gyr")
+                        metric_text(f"  Age:         {age_gyr:,.3f} Gyr")
             elif not inspect_bary:
                 # Albedos & Observational
                 A_g, A_b, q_val, _ = compute_body_albedos(app, body_info, insp_idx, insp_is_cmp, visual_arr, atmo_bodies, cur_mass_snap)
                 imgui.separator()
-                imgui.text_colored("Observational Dynamics", 1.0, 0.85, 0.4)
-                imgui.text(f"  Geom Albedo: {A_g:.3f}")
-                imgui.text(f"  Bond Albedo: {A_b:.3f} (q = {q_val:.2f})")
+                section("Reflectance", "Estimated from the current surface and atmosphere model.")
+                metric_text(f"  Geom Albedo: {A_g:.3f}")
+                metric_text(f"  Bond Albedo: {A_b:.3f} (q = {q_val:.2f})")
 
+            section("Camera position", "Distances from the camera to the inspected body.")
+            if dist_to_center_km > 1.49597e7:
+                metric_text(f"Distance: {format_distance_au(dist_to_center_au, threshold_au=thresh_au)}")
+            else:
+                metric_text(f"Distance: {dist_to_center_km:,.0f} km")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Distance from the camera to the center of the body.")
+
+            if not inspect_bary and body_r_km > 0.0:
+                f_oblate = float(body_info.get("oblateness", 0.0))
+                if not insp_is_cmp and app.camera.get("edit_mode", False) and "edit_data" in app.camera:
+                    ed = app.camera["edit_data"]
+                    if "oblateness" in ed:
+                        f_oblate = float(ed["oblateness"])
+                if f_oblate <= 0.0 and cur_visual_arr is not None and len(cur_visual_arr) > insp_idx:
+                    f_oblate = float(cur_visual_arr[insp_idx, 8])
+                if f_oblate <= 0.0:
+                    sp = body_info.get('star_props', {})
+                    if sp and sp.get('r_eq') and sp.get('r_pole') and float(sp['r_eq']) > 0:
+                        f_oblate = max(0.0, 1.0 - float(sp['r_pole']) / float(sp['r_eq']))
+
+                if cur_visual_arr is not None and len(cur_visual_arr) > insp_idx:
+                    body_pole = cur_visual_arr[insp_idx, 5:8]
+                elif hasattr(app, "pole_n_arr") and app.pole_n_arr is not None and len(app.pole_n_arr) > insp_idx:
+                    body_pole = app.pole_n_arr_cmp[insp_idx] if insp_is_cmp else app.pole_n_arr[insp_idx]
+                else:
+                    pole_ra = body_info.get('pole_ra')
+                    pole_dec = body_info.get('pole_dec')
+                    if pole_ra is not None and pole_dec is not None:
+                        p_ecl = pole_to_ecliptic(float(pole_ra), float(pole_dec))
+                        body_pole = np.array([p_ecl[0], p_ecl[2], -p_ecl[1]], dtype='f8')
+                    else:
+                        body_pole = np.array([0.0, 1.0, 0.0], dtype='f8')
+
+                active_r_km = float(app.camera["edit_data"].get("radius", body_r_km)) if (not insp_is_cmp and app.camera.get("edit_mode", False) and "edit_data" in app.camera) else body_r_km
+                surf_r_km = _ellipsoid_surface_radius(active_r_km, f_oblate, body_pole, cam_rel)
+                alt_km = dist_to_center_km - surf_r_km
+                alt_au = alt_km / 149597870.7
+                metric_text(f"Altitude: {format_altitude(alt_km, alt_au, threshold_au=thresh_au)}")
+                if imgui.is_item_hovered():
+                    if f_oblate > 0.0:
+                        r_pole_km = active_r_km * (1.0 - f_oblate)
+                        imgui.set_tooltip(
+                            f"Camera altitude above the oblate spheroid surface along line of sight.\n"
+                            f"Local surface radius: {surf_r_km:,.1f} km (Flattening f = {f_oblate:.4f})\n"
+                            f"Equatorial: {active_r_km:,.1f} km | Polar: {r_pole_km:,.1f} km"
+                        )
+                    else:
+                        imgui.set_tooltip(
+                            f"Camera altitude above the surface along line of sight.\n"
+                            f"Surface radius: {surf_r_km:,.1f} km"
+                        )
+
+            imgui.pop_item_width()
+            imgui.end_child()
             imgui.end_tab_item()
 
         # ── Tab 2: Orbit & Dynamics ──
         if imgui.begin_tab_item("Orbit")[0]:
+            imgui.begin_child("inspector_details", 0, -footer_height if physical_editing else 0)
+            imgui.push_item_width(max(85, imgui.get_content_region_available()[0] * 0.48))
             if not has_parent:
-                imgui.text_colored("Primary Central Body (No Parent Orbit)", 0.6, 0.9, 1.0)
+                imgui.text_wrapped("Primary central body / no parent orbit.")
             else:
                 parent_name = cur_bodies_data[parent_idx]['name'] if 0 <= parent_idx < len(cur_bodies_data) else "Barycenter"
-                imgui.text_colored(f"Parent: {parent_name}", 0.6, 0.9, 1.0)
-                imgui.separator()
-
-                if axial_tilt_deg is not None:
-                    if axial_tilt_deg > 90.0:
-                        imgui.text(f"  Axial Tilt: {axial_tilt_deg:.2f}° (Retrograde)")
-                    else:
-                        imgui.text(f"  Axial Tilt: {axial_tilt_deg:.2f}°")
-
-                app.camera.setdefault("inspector_frame", 0)
-                changed_frame, app.camera["inspector_frame"] = imgui.combo("Reference Frame", app.camera["inspector_frame"], ["Ecliptic", "Equatorial"])
-                if changed_frame:
-                    app.save_settings()
-                    if not insp_is_cmp and app.camera.get("edit_mode", False):
-                        app.camera["edit_data"]["init_orbit"] = True
-
-                if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
-                    ed = app.camera["edit_data"]
-                    imgui.separator()
-                    imgui.text_colored("Edit Orbit", 0.5, 0.8, 1.0)
-                    _, ed["a"] = imgui.input_double("Semi-Major Axis (AU)", ed.get("a", oe_a), format="%.6f")
-                    _, ed["e"] = imgui.input_double("Eccentricity", ed.get("e", oe_e), format="%.6f")
-                    _, ed["inc"] = imgui.input_double("Inclination (deg)", ed.get("inc", oe_inc), format="%.3f")
-                    _, ed["Omega"] = imgui.input_double(u"\u03A9 (Long Asc Node)", ed.get("Omega", oe_Omega), format="%.3f")
-                    _, ed["omega"] = imgui.input_double(u"\u03C9 (Arg Periapsis)", ed.get("omega", oe_omega), format="%.3f")
-                    _, ed["M"] = imgui.input_double("Mean Anomaly (deg)", ed.get("M", oe_M), format="%.3f")
-
-                else:
-                    use_km = oe_a < 0.01
-                    if use_km:
-                        imgui.text(f"  Semi-major (a): {oe_a * AU_TO_KM:,.0f} km")
-                    else:
-                        imgui.text(f"  Semi-major (a): {format_distance_au(oe_a, threshold_au=thresh_au, precision=6)}")
-                    imgui.text(f"  Eccentricity (e): {oe_e:.6f}")
-                    imgui.text(f"  Inclination (i):  {oe_inc:.3f}°")
-                    imgui.text(f"  Long Asc Node (Ω):{oe_Omega:.3f}°")
-                    imgui.text(f"  Arg Periapsis (ω):{oe_omega:.3f}°")
-                    imgui.text(f"  True Anomaly (ν): {oe_nu:.3f}°")
-                    imgui.text(f"  Mean Anomaly (M): {oe_M:.3f}°")
-
-                imgui.separator()
-                imgui.text_colored("Derived Quantities", 1.0, 0.85, 0.4)
-                if oe_P > 0:
-                    if oe_P < 730:
-                        imgui.text(f"  Period:      {oe_P:.3f} days")
-                    else:
-                        imgui.text(f"  Period:      {oe_P/365.25:.4f} years")
-
+                value_row("Parent", parent_name)
+                section("Live orbit", "Current state relative to the parent. Elements are osculating values in the selected reference frame.")
                 active_a = ed["a"] if (not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary) else oe_a
                 active_e = ed["e"] if (not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary) else oe_e
                 periapsis = active_a * (1.0 - active_e)
@@ -1025,82 +1013,133 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 vel_au_yr = math.sqrt(rel_v[0]**2 + rel_v[1]**2 + rel_v[2]**2)
                 vel_km_s = vel_au_yr * 4.7405
 
-                use_km = active_a < 0.01
-                if use_km:
-                    imgui.text(f"  Periapsis:   {periapsis * AU_TO_KM:,.0f} km")
-                    imgui.text(f"  Apoapsis:    {apoapsis * AU_TO_KM:,.0f} km")
-                    imgui.text(f"  Distance:    {dist_au * AU_TO_KM:,.0f} km")
+                if oe_P > 0:
+                    value_row("Period", f"{oe_P:.3f} days" if oe_P < 730 else f"{oe_P / 365.25:.4f} years")
                 else:
-                    imgui.text(f"  Periapsis:   {format_distance_au(periapsis, threshold_au=thresh_au, precision=6)}")
-                    imgui.text(f"  Apoapsis:    {format_distance_au(apoapsis, threshold_au=thresh_au, precision=6)}")
-                    imgui.text(f"  Distance:    {format_distance_au(dist_au, threshold_au=thresh_au, precision=6)}")
-                imgui.text(f"  Velocity:    {vel_km_s:.3f} km/s")
+                    value_row("Period", "N/A / unbound or undefined")
+                value_row("Distance to parent", format_distance_au(dist_au, threshold_au=thresh_au, precision=6) if dist_au >= 0.01 else f"{dist_au * AU_TO_KM:,.0f} km")
+                value_row("Speed relative to parent", f"{vel_km_s:.3f} km/s")
+                live_periapsis = oe_a * (1.0 - oe_e)
+                live_apoapsis = oe_a * (1.0 + oe_e)
+                value_row("Periapsis", format_distance_au(live_periapsis, threshold_au=thresh_au, precision=6) if abs(oe_a) >= 0.01 else f"{live_periapsis * AU_TO_KM:,.0f} km")
+                if oe_a > 0 and oe_e < 1:
+                    value_row("Apoapsis", format_distance_au(live_apoapsis, threshold_au=thresh_au, precision=6) if oe_a >= 0.01 else f"{live_apoapsis * AU_TO_KM:,.0f} km")
+                else:
+                    value_row("Apoapsis", "N/A / open orbit")
+                if axial_tilt_deg is not None:
+                    value_row("Axial tilt", f"{axial_tilt_deg:.2f}°" + (" / retrograde" if axial_tilt_deg > 90 else ""))
+                imgui.spacing()
+                app.camera.setdefault("inspector_frame", 0)
+                changed_frame, app.camera["inspector_frame"] = field(imgui.combo, "Reference Frame", app.camera["inspector_frame"], ["Ecliptic", "Equatorial"])
+                if changed_frame:
+                    app.save_settings()
+                    if not insp_is_cmp and app.camera.get("edit_mode", False):
+                        app.camera["edit_data"]["init_orbit"] = True
 
-                if not inspect_bary:
-                    imgui.separator()
-                    imgui.text_colored("Gravitational Limits", 1.0, 0.85, 0.4)
-                    parent_mass = cur_mass_snap[parent_idx]
-                    if parent_mass > 0 and body_mass > 0 and dist_au > 0:
-                        # Match the instantaneous radius used by hierarchy selection.
-                        hill_au = dist_au * (body_mass / (3.0 * parent_mass)) ** (1.0 / 3.0)
-                        imgui.text(f"  Hill Radius (now): {format_distance_au(hill_au, threshold_au=thresh_au, precision=5)}")
-                        if imgui.is_item_hovered():
-                            imgui.set_tooltip("Approximate sphere of influence around this body, at its current distance from its parent.\nUses the live state, not unapplied edits; not a guaranteed stable satellite orbit.\nThe approximation assumes this body is much less massive than its parent.")
+                if physical_editing:
+                    imgui.set_next_item_open(True, imgui.ALWAYS)
+                elements_open, _ = imgui.collapsing_header("Orbital elements###orbit_elements")
+                if elements_open:
+                    if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
+                        ed = app.camera["edit_data"]
+                        imgui.separator()
+                        imgui.text_colored("Edit Orbit", 0.5, 0.8, 1.0)
+                        _, ed["a"] = field(imgui.input_double, "Semi-Major Axis (AU)", ed.get("a", oe_a), format="%.6f")
+                        _, ed["e"] = field(imgui.input_double, "Eccentricity", ed.get("e", oe_e), format="%.6f")
+                        _, ed["inc"] = field(imgui.input_double, "Inclination (deg)", ed.get("inc", oe_inc), format="%.3f")
+                        _, ed["Omega"] = field(imgui.input_double, u"\u03A9 (Long Asc Node)", ed.get("Omega", oe_Omega), format="%.3f")
+                        _, ed["omega"] = field(imgui.input_double, u"\u03C9 (Arg Periapsis)", ed.get("omega", oe_omega), format="%.3f")
+                        _, ed["M"] = field(imgui.input_double, "Mean Anomaly (deg)", ed.get("M", oe_M), format="%.3f")
+
                     else:
-                        imgui.text_disabled("  Hill Radius: N/A")
+                        use_km = oe_a < 0.01
+                        if use_km:
+                            metric_text(f"  Semi-major (a): {oe_a * AU_TO_KM:,.0f} km")
+                        else:
+                            metric_text(f"  Semi-major (a): {format_distance_au(oe_a, threshold_au=thresh_au, precision=6)}")
+                        metric_text(f"  Eccentricity (e): {oe_e:.6f}")
+                        metric_text(f"  Inclination (i):  {oe_inc:.3f}°")
+                        metric_text(f"  Long Asc Node (Ω):{oe_Omega:.3f}°")
+                        metric_text(f"  Arg Periapsis (ω):{oe_omega:.3f}°")
+                        metric_text(f"  True Anomaly (ν): {oe_nu:.3f}°")
+                        metric_text(f"  Mean Anomaly (M): {oe_M:.3f}°")
 
-                    editing = not insp_is_cmp and app.camera.get("edit_mode", False)
-                    limit_mass = float(ed.get("mass", body_mass)) if editing else body_mass
-                    limit_radius = float(ed.get("radius", body_r_km)) if editing else body_r_km
-                    if parent_mass > 0 and limit_mass > 0 and limit_radius > 0:
-                        roche_au = 2.44 * limit_radius / AU_TO_KM * (parent_mass / limit_mass) ** (1.0 / 3.0)
-                        imgui.text(f"  Roche Limit (fluid): {format_distance_au(roche_au, threshold_au=thresh_au, precision=5)}")
-                        if imgui.is_item_hovered():
-                            imgui.set_tooltip("Distance from the parent's center below which this body may be tidally disrupted.\nFluid, strengthless-body approximation using this body's mass and radius.\nUses proposed mass, radius and periapsis in Edit Mode.")
-                        if periapsis < roche_au:
-                            imgui.text_colored("  Periapsis is inside Roche limit", 1.0, 0.3, 0.3)
-                    else:
-                        imgui.text_disabled("  Roche Limit: N/A")
+                    if physical_editing:
+                        section("Proposed orbital range")
+                        value_row("Periapsis", format_distance_au(periapsis, threshold_au=thresh_au, precision=6))
+                        value_row("Apoapsis", format_distance_au(apoapsis, threshold_au=thresh_au, precision=6) if active_a > 0 and active_e < 1 else "N/A / open orbit")
+                limits_open, _ = imgui.collapsing_header("Gravitational limits###orbit_limits")
+                if limits_open:
+                    imgui.text_wrapped("Approximate limits. Hill radius uses the live state; Roche limit uses proposed mass and radius while editing.")
+                    if not inspect_bary:
+                        parent_mass = cur_mass_snap[parent_idx]
+                        if parent_mass > 0 and body_mass > 0 and dist_au > 0:
+                            # Match the instantaneous radius used by hierarchy selection.
+                            hill_au = dist_au * (body_mass / (3.0 * parent_mass)) ** (1.0 / 3.0)
+                            metric_text(f"  Hill Radius (now): {format_distance_au(hill_au, threshold_au=thresh_au, precision=5)}")
+                            if imgui.is_item_hovered():
+                                imgui.set_tooltip("Approximate sphere of influence around this body, at its current distance from its parent.\nUses the live state, not unapplied edits; not a guaranteed stable satellite orbit.\nThe approximation assumes this body is much less massive than its parent.")
+                        else:
+                            imgui.text_disabled("  Hill Radius: N/A")
 
-                if oe_a > 0 and oe_e < 1.0 and not inspect_bary:
-                    imgui.separator()
-                    imgui.text_colored("Precession (arcsec/cy)", 1.0, 0.85, 0.4)
-                    c2 = C_AU_YR * C_AU_YR
-                    p_param = oe_a * (1.0 - oe_e * oe_e)
-                    if p_param > 0:
-                        gr_rad_per_orbit = 3.0 * mu / (oe_a * c2 * (1.0 - oe_e*oe_e))
-                        orbits_per_century = 36525.0 / oe_P if oe_P > 0 else 0
-                        gr_arcsec_cy = gr_rad_per_orbit * orbits_per_century * (180.0/math.pi) * 3600.0
-                        imgui.text(f"  GR (apsidal):  {gr_arcsec_cy:.2f}")
-                    else:
-                        imgui.text("  GR (apsidal):  0.00")
+                        editing = not insp_is_cmp and app.camera.get("edit_mode", False)
+                        limit_mass = float(ed.get("mass", body_mass)) if editing else body_mass
+                        limit_radius = float(ed.get("radius", body_r_km)) if editing else body_r_km
+                        if parent_mass > 0 and limit_mass > 0 and limit_radius > 0:
+                            roche_au = 2.44 * limit_radius / AU_TO_KM * (parent_mass / limit_mass) ** (1.0 / 3.0)
+                            metric_text(f"  Roche Limit (fluid): {format_distance_au(roche_au, threshold_au=thresh_au, precision=5)}")
+                            if imgui.is_item_hovered():
+                                imgui.set_tooltip("Distance from the parent's center below which this body may be tidally disrupted.\nFluid, strengthless-body approximation using this body's mass and radius.\nUses proposed mass, radius and periapsis in Edit Mode.")
+                            if periapsis < roche_au:
+                                imgui.text_colored("  Periapsis is inside Roche limit", 1.0, 0.3, 0.3)
+                        else:
+                            imgui.text_disabled("  Roche Limit: N/A")
 
-                    j2_apsidal = 0.0
-                    j2_nodal = 0.0
-                    parent_j2 = cur_bodies_data[parent_idx].get('J2', 0.0)
-                    if parent_j2 > 0 and oe_P > 0:
-                        parent_r_au = cur_bodies_data[parent_idx].get('r', 0.0) * SOLAR_RADII_TO_AU
-                        n_mean = 2.0 * math.pi / (oe_P / 365.25)
+                precession_open, _ = imgui.collapsing_header("Precession estimates###orbit_precession")
+                if precession_open:
+                    if oe_a > 0 and oe_e < 1.0 and not inspect_bary:
+                        imgui.text_wrapped("Analytical estimates in arcseconds per century; these are not measured simulation rates.")
+                        c2 = C_AU_YR * C_AU_YR
+                        p_param = oe_a * (1.0 - oe_e * oe_e)
                         if p_param > 0:
-                            ratio2 = (parent_r_au / p_param) ** 2
-                            j2_apsidal_rad_yr = 1.5 * n_mean * parent_j2 * ratio2
-                            j2_nodal_rad_yr = -j2_apsidal_rad_yr * math.cos(math.radians(oe_inc))
-                            j2_apsidal = j2_apsidal_rad_yr * 100.0 * (180.0/math.pi) * 3600.0
-                            j2_nodal = j2_nodal_rad_yr * 100.0 * (180.0/math.pi) * 3600.0
+                            gr_rad_per_orbit = 3.0 * mu / (oe_a * c2 * (1.0 - oe_e*oe_e))
+                            orbits_per_century = 36525.0 / oe_P if oe_P > 0 else 0
+                            gr_arcsec_cy = gr_rad_per_orbit * orbits_per_century * (180.0/math.pi) * 3600.0
+                            metric_text(f"  GR (apsidal):  {gr_arcsec_cy:.2f}")
+                        else:
+                            metric_text("  GR (apsidal):  0.00")
 
-                    imgui.text(f"  J2 (apsidal):  {j2_apsidal:.2f}")
-                    imgui.text(f"  J2 (nodal):    {j2_nodal:.2f}")
+                        j2_apsidal = 0.0
+                        j2_nodal = 0.0
+                        parent_j2 = cur_bodies_data[parent_idx].get('J2', 0.0)
+                        if parent_j2 > 0 and oe_P > 0:
+                            parent_r_au = cur_bodies_data[parent_idx].get('r', 0.0) * SOLAR_RADII_TO_AU
+                            n_mean = 2.0 * math.pi / (oe_P / 365.25)
+                            if p_param > 0:
+                                ratio2 = (parent_r_au / p_param) ** 2
+                                j2_apsidal_rad_yr = 1.5 * n_mean * parent_j2 * ratio2
+                                j2_nodal_rad_yr = -j2_apsidal_rad_yr * math.cos(math.radians(oe_inc))
+                                j2_apsidal = j2_apsidal_rad_yr * 100.0 * (180.0/math.pi) * 3600.0
+                                j2_nodal = j2_nodal_rad_yr * 100.0 * (180.0/math.pi) * 3600.0
 
+                        metric_text(f"  J2 (apsidal):  {j2_apsidal:.2f}")
+                        metric_text(f"  J2 (nodal):    {j2_nodal:.2f}")
+
+            imgui.pop_item_width()
+            imgui.end_child()
             imgui.end_tab_item()
 
         # ── Tab 3: Atmosphere ──
         if not inspect_bary and imgui.begin_tab_item("Atmosphere")[0]:
+            imgui.begin_child("inspector_details", 0, -footer_height if physical_editing else 0)
+            imgui.push_item_width(max(85, imgui.get_content_region_available()[0] * 0.48))
             cur_atmo_bodies = app.atmo_bodies_cmp if insp_is_cmp else atmo_bodies
             atmo_item = next((a for a in cur_atmo_bodies if a['body_idx'] == insp_idx), None)
             mass_val = cur_mass_snap[insp_idx] if len(cur_mass_snap) > insp_idx else 3.0e-6
             R_km = atmo_item.get('planet_radius_km', body_r_km) if atmo_item else body_r_km
 
             if atmo_item:
+                section("Properties", "Calculated values use the existing atmosphere model. Edits here update the rendered atmosphere immediately.")
                 # Compute T_eq for the planet
                 star_idx_local = -1
                 for k, b in enumerate(cur_bodies_data):
@@ -1154,9 +1193,9 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 v_c_atmo = app.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
                 _, A_surf_atmo, surf_src_atmo = compute_surface_albedo(body_info, getattr(app, 'texture_mean_colors', None), v_c_atmo)
                 src_label_atmo = "texture map" if surf_src_atmo == 'texture' else ("albedo scale" if surf_src_atmo == 'albedo_scale' else "base color")
-                imgui.text(f"Surface Albedo: {A_surf_atmo:.3f} ({src_label_atmo})")
-                imgui.text(f"Bond Albedo (A_b): {albedo:.3f} (q = {q_val:.2f})")
-                imgui.text(f"Equilibrium Temperature: {t_eq_atmo:.1f} K")
+                metric_text(f"Surface Albedo: {A_surf_atmo:.3f} ({src_label_atmo})")
+                metric_text(f"Bond Albedo (A_b): {albedo:.3f} (q = {q_val:.2f})")
+                metric_text(f"Equilibrium Temperature: {t_eq_atmo:.1f} K")
                 if imgui.is_item_hovered():
                     imgui.set_tooltip("Before greenhouse warming; uses the existing atmospheric model's orbital distance and Bond albedo.")
 
@@ -1191,11 +1230,11 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                 body_info['atmosphere']['height'] = atmo_h_km
 
                 current_height = atmo_item['atmo_radius_km'] - R_km
-                imgui.text(f"Atmosphere Height: {current_height:,.1f} km")
-                imgui.text(f"Gas Scale Height: {props['scale_height_km']:.2f} km")
-                imgui.text(f"Mean Molar Mass: {props['molar_mass'] * 1000.0:.2f} g/mol")
+                metric_text(f"Atmosphere Height: {current_height:,.1f} km")
+                metric_text(f"Gas Scale Height: {props['scale_height_km']:.2f} km")
+                metric_text(f"Mean Molar Mass: {props['molar_mass'] * 1000.0:.2f} g/mol")
 
-                changed_p, new_p = imgui.drag_float("Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
+                changed_p, new_p = field(imgui.drag_float, "Surface Pressure (atm)", atmo_item.get('surface_pressure', 1.0), 0.01, 0.0, 100.0)
                 if changed_p:
                     atmo_item['surface_pressure'] = new_p
                     atmo_item['_dirty'] = True
@@ -1203,12 +1242,14 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         atmo_item['lut_tex'].release()
                         del atmo_item['lut_tex']
 
-                imgui.text("Temperature: {:.1f} K ({:+.1f} °C) [Calculated]".format(atmo_item['temperature'], atmo_item['temperature'] - 273.15))
+                metric_text("Temperature: {:.1f} K ({:+.1f} °C) [Calculated]".format(atmo_item['temperature'], atmo_item['temperature'] - 273.15))
 
+                section("Composition")
                 comp = atmo_item.get('composition', {"N2": 0.78, "O2": 0.21})
-                if imgui.tree_node("Composition"):
+                if imgui.tree_node("Gas mixture", flags=imgui.TREE_NODE_DEFAULT_OPEN):
                     comp_keys = list(comp.keys())
                     gas_changed = False
+                    imgui.push_item_width(max(60, imgui.get_content_region_available()[0] - 100 * layout.scale))
                     for gas in comp_keys:
                         changed, new_pct = imgui.slider_float(f"{gas}##slider", comp[gas] * 100.0, 0.0, 100.0, "%.1f%%")
                         if changed:
@@ -1220,6 +1261,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                             del comp[gas]
                             gas_changed = True
 
+                    imgui.pop_item_width()
                     total_pct = sum(comp.values()) * 100.0
                     imgui.text_disabled(f"Total: {total_pct:.1f}%  (auto-normalized)")
 
@@ -1229,10 +1271,12 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                             atmo_item['selected_gas'] = 0
 
                         atmo_item['selected_gas'] = min(atmo_item['selected_gas'], len(available_gases) - 1)
+                        imgui.push_item_width(max(60, imgui.get_content_region_available()[0] - 90 * layout.scale))
                         changed, new_idx = imgui.combo("##AddGasCombo", atmo_item['selected_gas'], available_gases)
                         if changed:
                             atmo_item['selected_gas'] = new_idx
 
+                        imgui.pop_item_width()
                         imgui.same_line()
                         if imgui.button("Add Gas"):
                             comp[available_gases[atmo_item['selected_gas']]] = 0.10
@@ -1246,62 +1290,66 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                             del atmo_item['lut_tex']
                     imgui.tree_pop()
 
-                changed_m, b_mie = imgui.drag_float("Aerosol Beta (x10^-6)", atmo_item.get('beta_mie', 2.0e-6)*1e6, 0.1)
-                if changed_m:
-                    atmo_item['beta_mie'] = b_mie * 1e-6
-                    atmo_item['_dirty'] = True
-                    if 'lut_tex' in atmo_item:
-                        atmo_item['lut_tex'].release()
-                        del atmo_item['lut_tex']
-                changed_hm, new_hm = imgui.drag_float("Aerosol Scale (km)", atmo_item.get('h_mie', 1.2), 0.1, 0.1, 1000.0)
-                if changed_hm:
-                    atmo_item['h_mie'] = new_hm
-                    atmo_item['_dirty'] = True
-                    if 'lut_tex' in atmo_item:
-                        atmo_item['lut_tex'].release()
-                        del atmo_item['lut_tex']
-                changed_mg, new_mg = imgui.slider_float("Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
-                if changed_mg:
-                    atmo_item['mie_g'] = new_mg
-                    atmo_item['_dirty'] = True
-                    if 'lut_tex' in atmo_item:
-                        atmo_item['lut_tex'].release()
-                        del atmo_item['lut_tex']
-
-                cur_alb = atmo_item.get('mie_albedo', None)
-                cur_alb_val = 1.0 if cur_alb is None else float(np.mean(cur_alb))
-                changed_alb, new_alb = imgui.slider_float("Aerosol Albedo (w0)", cur_alb_val, 0.0, 1.0)
-                if changed_alb:
-                    atmo_item['mie_albedo'] = np.array([new_alb, new_alb, new_alb], dtype=np.float32)
-                    atmo_item['_dirty'] = True
-                    if 'lut_tex' in atmo_item:
-                        atmo_item['lut_tex'].release()
-                        del atmo_item['lut_tex']
-
-                is_manual = ('mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None)
-                changed_mode, use_manual = imgui.checkbox("Manual Angstrom Exponent", is_manual)
-                if changed_mode:
-                    atmo_item['mie_angstrom'] = 1.2 if use_manual else None
-                    atmo_item['_dirty'] = True
-                    if 'lut_tex' in atmo_item:
-                        atmo_item['lut_tex'].release()
-                        del atmo_item['lut_tex']
-
-                if 'mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None:
-                    changed_ang, new_ang = imgui.slider_float("Aerosol Angstrom", atmo_item['mie_angstrom'], 0.0, 5.0)
-                    if changed_ang:
-                        atmo_item['mie_angstrom'] = new_ang
+                section("Scattering")
+                scatter_open, _ = imgui.collapsing_header("Aerosol controls###atmo_scattering")
+                if scatter_open:
+                    changed_m, b_mie = field(imgui.drag_float, "Aerosol Beta (x10^-6)", atmo_item.get('beta_mie', 2.0e-6)*1e6, 0.1)
+                    if changed_m:
+                        atmo_item['beta_mie'] = b_mie * 1e-6
                         atmo_item['_dirty'] = True
                         if 'lut_tex' in atmo_item:
                             atmo_item['lut_tex'].release()
                             del atmo_item['lut_tex']
-                else:
-                    auto_val = 1.2 * math.exp(-atmo_item.get('beta_mie', 2.0e-6) / 5.0e-6)
-                    imgui.text(f"  Auto Angstrom Exponent: {auto_val:.3f} (based on Beta)")
+                    changed_hm, new_hm = field(imgui.drag_float, "Aerosol Scale (km)", atmo_item.get('h_mie', 1.2), 0.1, 0.1, 1000.0)
+                    if changed_hm:
+                        atmo_item['h_mie'] = new_hm
+                        atmo_item['_dirty'] = True
+                        if 'lut_tex' in atmo_item:
+                            atmo_item['lut_tex'].release()
+                            del atmo_item['lut_tex']
+                    changed_mg, new_mg = field(imgui.slider_float, "Aerosol Asymmetry", atmo_item.get('mie_g', 0.758), 0.0, 0.999)
+                    if changed_mg:
+                        atmo_item['mie_g'] = new_mg
+                        atmo_item['_dirty'] = True
+                        if 'lut_tex' in atmo_item:
+                            atmo_item['lut_tex'].release()
+                            del atmo_item['lut_tex']
 
-                _, atmo_item['intensity'] = imgui.drag_float("Intensity", atmo_item.get('intensity', 1.0), 0.5, 0.0, 1000.0)
+                    cur_alb = atmo_item.get('mie_albedo', None)
+                    cur_alb_val = 1.0 if cur_alb is None else float(np.mean(cur_alb))
+                    changed_alb, new_alb = field(imgui.slider_float, "Aerosol Albedo (w0)", cur_alb_val, 0.0, 1.0)
+                    if changed_alb:
+                        atmo_item['mie_albedo'] = np.array([new_alb, new_alb, new_alb], dtype=np.float32)
+                        atmo_item['_dirty'] = True
+                        if 'lut_tex' in atmo_item:
+                            atmo_item['lut_tex'].release()
+                            del atmo_item['lut_tex']
+
+                    is_manual = ('mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None)
+                    changed_mode, use_manual = imgui.checkbox("Manual Angstrom Exponent", is_manual)
+                    if changed_mode:
+                        atmo_item['mie_angstrom'] = 1.2 if use_manual else None
+                        atmo_item['_dirty'] = True
+                        if 'lut_tex' in atmo_item:
+                            atmo_item['lut_tex'].release()
+                            del atmo_item['lut_tex']
+
+                    if 'mie_angstrom' in atmo_item and atmo_item['mie_angstrom'] is not None:
+                        changed_ang, new_ang = field(imgui.slider_float, "Aerosol Angstrom", atmo_item['mie_angstrom'], 0.0, 5.0)
+                        if changed_ang:
+                            atmo_item['mie_angstrom'] = new_ang
+                            atmo_item['_dirty'] = True
+                            if 'lut_tex' in atmo_item:
+                                atmo_item['lut_tex'].release()
+                                del atmo_item['lut_tex']
+                    else:
+                        auto_val = 1.2 * math.exp(-atmo_item.get('beta_mie', 2.0e-6) / 5.0e-6)
+                        metric_text(f"  Auto Angstrom Exponent: {auto_val:.3f} (based on Beta)")
+
+                    _, atmo_item['intensity'] = field(imgui.drag_float, "Intensity", atmo_item.get('intensity', 1.0), 0.5, 0.0, 1000.0)
 
                 imgui.separator()
+                section("Atmosphere actions")
                 if imgui.button("Remove Atmosphere", width=-1):
                     if 'lut_tex' in atmo_item:
                         try:
@@ -1349,175 +1397,55 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         imgui.set_tooltip("Saves atmosphere changes directly to master data/system.json.")
                     else:
                         imgui.set_tooltip(f"Saves atmosphere changes directly to data/systems/{active_system_name}/system.json.")
+            imgui.pop_item_width()
+            imgui.end_child()
             imgui.end_tab_item()
 
         # ── Tab 4: Rings ──
         if not inspect_bary and imgui.begin_tab_item("Rings")[0]:
+            imgui.begin_child("inspector_details", 0, -footer_height if physical_editing else 0)
+            imgui.push_item_width(max(85, imgui.get_content_region_available()[0] * 0.48))
             rings = [r for r in ring_precomputed if r['body_idx'] == insp_idx]
 
-            # ── Procedural Ring Generator (SpaceEngine Style) ──
-            proc_open, _ = imgui.collapsing_header("Procedural Ring Generator (SpaceEngine Style)##proc_hdr", flags=imgui.TREE_NODE_DEFAULT_OPEN if not rings else 0)
-            if proc_open:
-                imgui.text_colored("Synthesize 1D multi-octave fBm ring textures & resonance gaps", 0.5, 0.8, 1.0)
-                imgui.spacing()
-
-                proc_state = app.camera.setdefault("proc_ring_state", {
-                    "preset_idx": 0,
-                    "seed": 42,
-                    "band_count": 4,
-                    "gap_count": 3,
-                    "striation_freq": 160.0,
-                    "contrast": 1.7,
-                    "base_density": 2.2,
-                    "core_boost": 2.5,
-                    "inner_mult": 1.20,
-                    "outer_mult": 2.30,
-                    "tint": [1.0, 1.0, 1.0],
-                    "opacity": 1.0,
-                })
-
-                preset_names = list(RING_PRESETS.keys())
-                cur_preset_idx = min(proc_state.get("preset_idx", 0), len(preset_names) - 1)
-                
-                changed_p, new_p_idx = imgui.combo("Ring Preset##proc", cur_preset_idx, preset_names)
-                if changed_p:
-                    proc_state["preset_idx"] = new_p_idx
-                    p_name = preset_names[new_p_idx]
-                    p_cfg = RING_PRESETS[p_name]
-                    proc_state["band_count"] = p_cfg["band_count"]
-                    proc_state["gap_count"] = p_cfg["gap_count"]
-                    proc_state["striation_freq"] = p_cfg["striation_freq"]
-                    proc_state["contrast"] = p_cfg["contrast"]
-                    proc_state["base_density"] = p_cfg["base_density"]
-                    proc_state["core_boost"] = p_cfg.get("core_boost", 2.5)
-                    proc_state["inner_mult"] = p_cfg["inner_radius_ratio"]
-                    proc_state["outer_mult"] = p_cfg["outer_radius_ratio"]
-                    proc_state["opacity"] = p_cfg["opacity"]
-
-                # Seed & Randomize
-                imgui.push_item_width(imgui.get_content_region_available_width() - 85)
-                changed_seed, new_seed = imgui.drag_int("Seed##proc", proc_state.get("seed", 42), 1.0, 0, 999999)
-                if changed_seed:
-                    proc_state["seed"] = new_seed
-                imgui.pop_item_width()
-                imgui.same_line()
-                if imgui.button("Random##proc", width=75):
-                    proc_state["seed"] = int(np.random.randint(1, 999999))
-
-                # Sliders
-                changed_b, new_b = imgui.slider_int("Bands##proc", proc_state.get("band_count", 4), 1, 8)
-                if changed_b: proc_state["band_count"] = new_b
-
-                changed_g, new_g = imgui.slider_int("Gaps##proc", proc_state.get("gap_count", 3), 0, 6)
-                if changed_g: proc_state["gap_count"] = new_g
-
-                changed_sf, new_sf = imgui.slider_float("Striations##proc", proc_state.get("striation_freq", 160.0), 20.0, 300.0, "%.0f")
-                if changed_sf: proc_state["striation_freq"] = new_sf
-
-                changed_ct, new_ct = imgui.slider_float("Sharpness##proc", proc_state.get("contrast", 1.7), 0.5, 3.5, "%.2f")
-                if changed_ct: proc_state["contrast"] = new_ct
-
-                changed_bd, new_bd = imgui.slider_float("Density (Tau)##proc", proc_state.get("base_density", 2.2), 0.05, 8.0, "%.2f")
-                if changed_bd: proc_state["base_density"] = new_bd
-
-                changed_cb, new_cb = imgui.slider_float("Core Opacity##proc", proc_state.get("core_boost", 2.5), 0.5, 5.0, "%.2f")
-                if changed_cb: proc_state["core_boost"] = new_cb
-
-                changed_in_m, new_in_m = imgui.slider_float("Inner (Req)##proc", proc_state.get("inner_mult", 1.20), 1.05, 4.0, "%.2f")
-                if changed_in_m: proc_state["inner_mult"] = new_in_m
-
-                min_out = proc_state.get("inner_mult", 1.20) + 0.05
-                changed_out_m, new_out_m = imgui.slider_float("Outer (Req)##proc", max(min_out, proc_state.get("outer_mult", 2.30)), min_out, 8.0, "%.2f")
-                if changed_out_m: proc_state["outer_mult"] = new_out_m
-
-                changed_col, new_col = imgui.color_edit3("Tint Color##proc", *proc_state.get("tint", [1.0, 1.0, 1.0]))
-                if changed_col: proc_state["tint"] = list(new_col)
-
-                changed_op_p, new_op_p = imgui.slider_float("Opacity##proc", proc_state.get("opacity", 1.0), 0.05, 1.0, "%.2f")
-                if changed_op_p: proc_state["opacity"] = new_op_p
-
-                imgui.spacing()
-                
-                # Buttons
-                if imgui.button("Generate & Apply Rings##proc", width=-1):
-                    custom_params = {
-                        'band_count': proc_state["band_count"],
-                        'gap_count': proc_state["gap_count"],
-                        'striation_freq': proc_state["striation_freq"],
-                        'contrast': proc_state["contrast"],
-                        'base_density': proc_state["base_density"],
-                        'core_boost': proc_state.get("core_boost", 2.5),
-                        'inner_radius_ratio': proc_state["inner_mult"],
-                        'outer_radius_ratio': proc_state["outer_mult"],
-                        'tint_color': tuple(proc_state["tint"]),
-                        'opacity': proc_state["opacity"]
-                    }
-                    selected_preset = preset_names[proc_state["preset_idx"]]
-                    apply_procedural_ring_to_body(
-                        app, insp_idx, preset=selected_preset,
-                        seed=proc_state["seed"], custom_params=custom_params,
-                        bake_to_disk=False,
-                        bodies_data=cur_bodies_data,
-                        visual_arr=visual_arr,
-                        ring_precomputed=ring_precomputed,
-                        ring_render_groups=ring_render_groups,
-                        ring_gradient_tex=ring_gradient_tex,
-                        prog_rings=prog_rings,
-                        ctx=ctx
-                    )
-
-                if imgui.button("Bake & Save to System Disk##proc", width=-1):
-                    custom_params = {
-                        'band_count': proc_state["band_count"],
-                        'gap_count': proc_state["gap_count"],
-                        'striation_freq': proc_state["striation_freq"],
-                        'contrast': proc_state["contrast"],
-                        'base_density': proc_state["base_density"],
-                        'core_boost': proc_state.get("core_boost", 2.5),
-                        'inner_radius_ratio': proc_state["inner_mult"],
-                        'outer_radius_ratio': proc_state["outer_mult"],
-                        'tint_color': tuple(proc_state["tint"]),
-                        'opacity': proc_state["opacity"]
-                    }
-                    selected_preset = preset_names[proc_state["preset_idx"]]
-                    apply_procedural_ring_to_body(
-                        app, insp_idx, preset=selected_preset,
-                        seed=proc_state["seed"], custom_params=custom_params,
-                        bake_to_disk=True,
-                        bodies_data=cur_bodies_data,
-                        visual_arr=visual_arr,
-                        ring_precomputed=ring_precomputed,
-                        ring_render_groups=ring_render_groups,
-                        ring_gradient_tex=ring_gradient_tex,
-                        prog_rings=prog_rings,
-                        ctx=ctx
-                    )
-                    _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
-
-                imgui.separator()
-
-            if rings:
-                imgui.text_colored("Active Ring Layers", 1.0, 0.85, 0.4)
+            section("Ring layers", "Select a layer to edit its geometry, appearance and scattering. Changes take effect immediately.")
+            selection_key = (insp_is_cmp, insp_idx)
+            selections = getattr(app, "_ui_ring_selection", {})
+            app._ui_ring_selection = selections
+            selected_layer = selections.get(selection_key)
+            if not any(id(r) == selected_layer for r in rings):
+                selected_layer = id(rings[0]) if rings else None
+            for layer_index, layer in enumerate(rings):
+                kind = "Textured" if layer.get('is_textured', False) else "Color"
+                title = f"Layer {layer_index + 1} / {kind}##ring_select_{layer_index}"
+                if imgui.selectable(title, id(layer) == selected_layer)[0]:
+                    selected_layer = id(layer)
+                value_row("Radius range", f"{layer['inner_r'] * AU_TO_KM:,.0f} - {layer['outer_r'] * AU_TO_KM:,.0f} km")
+            selections[selection_key] = selected_layer
+            if not rings:
+                imgui.text_disabled("No ring layers. Add a layer or use the generator below.")
 
             for i, ring_item in enumerate(rings):
                 is_tex_layer = ring_item.get('is_textured', False)
                 node_title = f"Textured Ring Layer {i}" if is_tex_layer else f"Ring Layer {i}"
-                if imgui.tree_node(node_title):
-                    changed_in, new_in = imgui.drag_float(f"Inner Radius (km)##{i}", ring_item['inner_r'] * 149597870.7, 10.0, body_r_km, ring_item['outer_r'] * 149597870.7 - 10)
-                    changed_out, new_out = imgui.drag_float(f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
-                    changed_col, new_col = imgui.color_edit3(f"Color##{i}", *ring_item['raw_color'])
-                    changed_op, new_op = imgui.drag_float(f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 2.0, "%.4f")
+                if id(ring_item) == selected_layer:
+                    imgui.push_id(node_title)
+                    section(f"Layer {i + 1} / geometry & appearance")
+                    changed_in, new_in = field(imgui.drag_float, f"Inner Radius (km)##{i}", ring_item['inner_r'] * 149597870.7, 10.0, body_r_km, ring_item['outer_r'] * 149597870.7 - 10)
+                    changed_out, new_out = field(imgui.drag_float, f"Outer Radius (km)##{i}", ring_item['outer_r'] * 149597870.7, 10.0, ring_item['inner_r'] * 149597870.7 + 10, body_r_km * 50.0)
+                    changed_col, new_col = field(imgui.color_edit3, f"Color##{i}", *ring_item['raw_color'])
+                    changed_op, new_op = field(imgui.drag_float, f"Opacity##{i}", ring_item['opacity'], 0.005, 0.0, 2.0, "%.4f")
 
+                    section("Light scattering")
                     changed_scat = False
                     if not is_tex_layer:
-                        changed_scat, new_scat = imgui.drag_float(f"Phase Balance (Back <-> Fwd)##{i}", ring_item.get('scatter', 1.0), 0.005, 0.0, 1.0, "%.4f")
+                        changed_scat, new_scat = field(imgui.drag_float, f"Phase Balance (Back <-> Fwd)##{i}", ring_item.get('scatter', 1.0), 0.005, 0.0, 1.0, "%.4f")
 
-                    changed_asym, new_asym = imgui.drag_float(f"Forward Scatter Asym##{i}", ring_item.get('asymmetry', 0.7), 0.005, -0.99, 0.99, "%.4f")
-                    changed_bks, new_bks = imgui.drag_float(f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.99, 0.99, "%.4f")
+                    changed_asym, new_asym = field(imgui.drag_float, f"Forward Scatter Asym##{i}", ring_item.get('asymmetry', 0.7), 0.005, -0.99, 0.99, "%.4f")
+                    changed_bks, new_bks = field(imgui.drag_float, f"Backscatter##{i}", ring_item.get('backscatter', -0.3), 0.005, -0.99, 0.99, "%.4f")
 
                     changed_unlit = False
                     if not is_tex_layer:
-                        changed_unlit, new_unlit = imgui.drag_float(f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
+                        changed_unlit, new_unlit = field(imgui.drag_float, f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
 
                     changed_sat = False
                     changed_hue = False
@@ -1527,11 +1455,11 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
                     if is_tex_layer:
                         if imgui.tree_node(f"Texture Editor##{i}"):
-                            changed_unlit, new_unlit = imgui.drag_float(f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
-                            changed_sat, new_sat = imgui.drag_float(f"Saturation##{i}", ring_item.get('saturation', 1.0), 0.01, 0.0, 3.0, "%.2f")
-                            changed_hue, new_hue = imgui.drag_float(f"Hue Shift##{i}", ring_item.get('hue_shift', 0.0), 0.005, -1.0, 1.0, "%.3f")
-                            changed_bri, new_bri = imgui.drag_float(f"Brightness##{i}", ring_item.get('brightness', 1.0), 0.01, 0.0, 3.0, "%.2f")
-                            changed_boost, new_boost = imgui.drag_float(f"Alpha Boost##{i}", ring_item.get('alpha_boost', 1.0), 0.01, 0.1, 5.0, "%.2f")
+                            changed_unlit, new_unlit = field(imgui.drag_float, f"Unlit Side Multiplier##{i}", ring_item.get('unlit_factor', 1.0), 0.01, 0.0, 2.0, "%.3f")
+                            changed_sat, new_sat = field(imgui.drag_float, f"Saturation##{i}", ring_item.get('saturation', 1.0), 0.01, 0.0, 3.0, "%.2f")
+                            changed_hue, new_hue = field(imgui.drag_float, f"Hue Shift##{i}", ring_item.get('hue_shift', 0.0), 0.005, -1.0, 1.0, "%.3f")
+                            changed_bri, new_bri = field(imgui.drag_float, f"Brightness##{i}", ring_item.get('brightness', 1.0), 0.01, 0.0, 3.0, "%.2f")
+                            changed_boost, new_boost = field(imgui.drag_float, f"Alpha Boost##{i}", ring_item.get('alpha_boost', 1.0), 0.01, 0.1, 5.0, "%.2f")
                             if imgui.button(f"Reset Edits##{i}"):
                                 ring_item['unlit_factor'] = 1.0
                                 ring_item['saturation'] = 1.0
@@ -1555,7 +1483,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
                         stops_to_remove = []
                         for j, stop in enumerate(grad):
-                            imgui.push_item_width(100)
+                            imgui.push_item_width(max(30, (imgui.get_content_region_available()[0] - 95 * layout.scale) / 2))
                             changed_p, n_p = imgui.drag_float(f"Pos##{i}_{id(stop)}", stop['p'], 0.005, 0.0, 1.0, "%.4f")
                             if imgui.is_item_deactivated_after_edit():
                                 grad_sort_needed = True
@@ -1641,7 +1569,7 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                                     except Exception:
                                         pass
 
-                    imgui.tree_pop()
+                    imgui.pop_id()
 
             if imgui.button("Add Ring Layer", width=-1):
                 if len(rings) < 16:
@@ -1665,6 +1593,149 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         'row_idx': len(ring_precomputed)
                     })
                     app.body_ring_indices = rebuild_ring_render_group(insp_idx, ctx, prog_rings, ring_precomputed, ring_render_groups, ring_gradient_tex)
+            section("Generate a ring profile")
+            # ── Procedural Ring Generator (SpaceEngine Style) ──
+            proc_open, _ = imgui.collapsing_header("Procedural generator##proc_hdr", flags=imgui.TREE_NODE_DEFAULT_OPEN if not rings else 0)
+            if proc_open:
+                imgui.text_wrapped("Generate a new ring profile from a preset, then apply or bake it.")
+                imgui.spacing()
+
+                proc_state = app.camera.setdefault("proc_ring_state", {
+                    "preset_idx": 0,
+                    "seed": 42,
+                    "band_count": 4,
+                    "gap_count": 3,
+                    "striation_freq": 160.0,
+                    "contrast": 1.7,
+                    "base_density": 2.2,
+                    "core_boost": 2.5,
+                    "inner_mult": 1.20,
+                    "outer_mult": 2.30,
+                    "tint": [1.0, 1.0, 1.0],
+                    "opacity": 1.0,
+                })
+
+                preset_names = list(RING_PRESETS.keys())
+                cur_preset_idx = min(proc_state.get("preset_idx", 0), len(preset_names) - 1)
+
+                changed_p, new_p_idx = field(imgui.combo, "Ring Preset##proc", cur_preset_idx, preset_names)
+                if changed_p:
+                    proc_state["preset_idx"] = new_p_idx
+                    p_name = preset_names[new_p_idx]
+                    p_cfg = RING_PRESETS[p_name]
+                    proc_state["band_count"] = p_cfg["band_count"]
+                    proc_state["gap_count"] = p_cfg["gap_count"]
+                    proc_state["striation_freq"] = p_cfg["striation_freq"]
+                    proc_state["contrast"] = p_cfg["contrast"]
+                    proc_state["base_density"] = p_cfg["base_density"]
+                    proc_state["core_boost"] = p_cfg.get("core_boost", 2.5)
+                    proc_state["inner_mult"] = p_cfg["inner_radius_ratio"]
+                    proc_state["outer_mult"] = p_cfg["outer_radius_ratio"]
+                    proc_state["opacity"] = p_cfg["opacity"]
+
+                # Seed & Randomize
+                metric_text("Seed")
+                imgui.push_item_width(imgui.get_content_region_available_width() - 85)
+                changed_seed, new_seed = imgui.drag_int("##Seed##proc", proc_state.get("seed", 42), 1.0, 0, 999999)
+                if changed_seed:
+                    proc_state["seed"] = new_seed
+                imgui.pop_item_width()
+                imgui.same_line()
+                if imgui.button("Random##proc", width=75):
+                    proc_state["seed"] = int(np.random.randint(1, 999999))
+
+                # Sliders
+                changed_b, new_b = field(imgui.slider_int, "Bands##proc", proc_state.get("band_count", 4), 1, 8)
+                if changed_b: proc_state["band_count"] = new_b
+
+                changed_g, new_g = field(imgui.slider_int, "Gaps##proc", proc_state.get("gap_count", 3), 0, 6)
+                if changed_g: proc_state["gap_count"] = new_g
+
+                changed_sf, new_sf = field(imgui.slider_float, "Striations##proc", proc_state.get("striation_freq", 160.0), 20.0, 300.0, "%.0f")
+                if changed_sf: proc_state["striation_freq"] = new_sf
+
+                changed_ct, new_ct = field(imgui.slider_float, "Sharpness##proc", proc_state.get("contrast", 1.7), 0.5, 3.5, "%.2f")
+                if changed_ct: proc_state["contrast"] = new_ct
+
+                changed_bd, new_bd = field(imgui.slider_float, "Density (Tau)##proc", proc_state.get("base_density", 2.2), 0.05, 8.0, "%.2f")
+                if changed_bd: proc_state["base_density"] = new_bd
+
+                changed_cb, new_cb = field(imgui.slider_float, "Core Opacity##proc", proc_state.get("core_boost", 2.5), 0.5, 5.0, "%.2f")
+                if changed_cb: proc_state["core_boost"] = new_cb
+
+                changed_in_m, new_in_m = field(imgui.slider_float, "Inner (Req)##proc", proc_state.get("inner_mult", 1.20), 1.05, 4.0, "%.2f")
+                if changed_in_m: proc_state["inner_mult"] = new_in_m
+
+                min_out = proc_state.get("inner_mult", 1.20) + 0.05
+                changed_out_m, new_out_m = field(imgui.slider_float, "Outer (Req)##proc", max(min_out, proc_state.get("outer_mult", 2.30)), min_out, 8.0, "%.2f")
+                if changed_out_m: proc_state["outer_mult"] = new_out_m
+
+                changed_col, new_col = field(imgui.color_edit3, "Tint Color##proc", *proc_state.get("tint", [1.0, 1.0, 1.0]))
+                if changed_col: proc_state["tint"] = list(new_col)
+
+                changed_op_p, new_op_p = field(imgui.slider_float, "Opacity##proc", proc_state.get("opacity", 1.0), 0.05, 1.0, "%.2f")
+                if changed_op_p: proc_state["opacity"] = new_op_p
+
+                imgui.spacing()
+
+                # Buttons
+                if imgui.button("Generate & Apply Rings##proc", width=-1):
+                    custom_params = {
+                        'band_count': proc_state["band_count"],
+                        'gap_count': proc_state["gap_count"],
+                        'striation_freq': proc_state["striation_freq"],
+                        'contrast': proc_state["contrast"],
+                        'base_density': proc_state["base_density"],
+                        'core_boost': proc_state.get("core_boost", 2.5),
+                        'inner_radius_ratio': proc_state["inner_mult"],
+                        'outer_radius_ratio': proc_state["outer_mult"],
+                        'tint_color': tuple(proc_state["tint"]),
+                        'opacity': proc_state["opacity"]
+                    }
+                    selected_preset = preset_names[proc_state["preset_idx"]]
+                    apply_procedural_ring_to_body(
+                        app, insp_idx, preset=selected_preset,
+                        seed=proc_state["seed"], custom_params=custom_params,
+                        bake_to_disk=False,
+                        bodies_data=cur_bodies_data,
+                        visual_arr=visual_arr,
+                        ring_precomputed=ring_precomputed,
+                        ring_render_groups=ring_render_groups,
+                        ring_gradient_tex=ring_gradient_tex,
+                        prog_rings=prog_rings,
+                        ctx=ctx
+                    )
+
+                if imgui.button("Bake & Save to System Disk##proc", width=-1):
+                    custom_params = {
+                        'band_count': proc_state["band_count"],
+                        'gap_count': proc_state["gap_count"],
+                        'striation_freq': proc_state["striation_freq"],
+                        'contrast': proc_state["contrast"],
+                        'base_density': proc_state["base_density"],
+                        'core_boost': proc_state.get("core_boost", 2.5),
+                        'inner_radius_ratio': proc_state["inner_mult"],
+                        'outer_radius_ratio': proc_state["outer_mult"],
+                        'tint_color': tuple(proc_state["tint"]),
+                        'opacity': proc_state["opacity"]
+                    }
+                    selected_preset = preset_names[proc_state["preset_idx"]]
+                    apply_procedural_ring_to_body(
+                        app, insp_idx, preset=selected_preset,
+                        seed=proc_state["seed"], custom_params=custom_params,
+                        bake_to_disk=True,
+                        bodies_data=cur_bodies_data,
+                        visual_arr=visual_arr,
+                        ring_precomputed=ring_precomputed,
+                        ring_render_groups=ring_render_groups,
+                        ring_gradient_tex=ring_gradient_tex,
+                        prog_rings=prog_rings,
+                        ctx=ctx
+                    )
+                    _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
+
+                imgui.separator()
+
             if not insp_is_cmp:
                 imgui.separator()
                 btn_lbl = "Save Ring Changes (Master)" if active_system_name == SystemManager.SOLAR_SYSTEM_NAME else "Save Ring Changes"
@@ -1675,12 +1746,15 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         imgui.set_tooltip("Saves ring changes directly to master data/system.json.")
                     else:
                         imgui.set_tooltip(f"Saves ring changes directly to data/systems/{active_system_name}/system.json.")
+            imgui.pop_item_width()
+            imgui.end_child()
             imgui.end_tab_item()
 
         # ── Tab 5: Cosmetics ──
-        if not inspect_bary and imgui.begin_tab_item("Cosmetics")[0]:
-            imgui.text_colored("Cosmetics & Surface Texture", 1.0, 0.85, 0.4)
-            imgui.separator()
+        if not inspect_bary and imgui.begin_tab_item("Surface###Cosmetics")[0]:
+            imgui.begin_child("inspector_details", 0, -footer_height if physical_editing else 0)
+            imgui.push_item_width(max(85, imgui.get_content_region_available()[0] * 0.48))
+            section("Textures", "Select a map layer to preview, import or bake. Surface changes take effect immediately.")
 
             # Interactive Texture Preview & Management
             render_texture_management_ui(
@@ -1693,15 +1767,20 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
 
 
             if obj_type != 'Star':
-                render_surface_material_editor(body_info)
+                section("Material")
+                value_row("Surface model", resolve_material(body_info)['model'].upper())
+                material_open, _ = imgui.collapsing_header("Material controls###surface_materials")
+                if material_open:
+                    render_surface_material_editor(body_info)
                 imgui.separator()
 
+            section("Color & reflectance")
             # Convert linear albedo to sRGB for the color picker
             if insp_is_cmp:
                 srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in app.visual_arr_cmp[insp_idx, 0:3]]
             else:
                 srgb_c = [pow(c, 1.0/2.2) if c > 0 else 0.0 for c in visual_arr[insp_idx, 0:3]]
-            changed_c, new_c = imgui.color_edit3("Base Color (sRGB)", *srgb_c)
+            changed_c, new_c = field(imgui.color_edit3, "Base Color (sRGB)", *srgb_c)
             if changed_c:
                 linear_c = [pow(c, 2.2) if c > 0 else 0.0 for c in new_c]
                 if insp_is_cmp:
@@ -1723,10 +1802,11 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
             v_c_cosmetic = app.visual_arr_cmp[insp_idx, 0:3] if insp_is_cmp else visual_arr[insp_idx, 0:3]
             _, A_surf_c, surf_src_c = compute_surface_albedo(body_info, getattr(app, 'texture_mean_colors', None), v_c_cosmetic)
             src_lbl = "texture map" if surf_src_c == 'texture' else ("albedo scale" if surf_src_c == 'albedo_scale' else "base color")
-            imgui.text(f"Surface Albedo: {A_surf_c:.3f} ({src_lbl})")
+            metric_text(f"Surface Albedo: {A_surf_c:.3f} ({src_lbl})")
 
             imgui.separator()
             if not insp_is_cmp:
+                section("Save & export", "Save writes the current appearance to the system. Export creates a body appearance JSON.")
                 btn_label = "Save to Master Cosmetics" if active_system_name == SystemManager.SOLAR_SYSTEM_NAME else "Save System Cosmetics"
                 if imgui.button(btn_label, width=-1):
                     _save_system_cosmetics(app, cur_bodies_data, visual_arr, atmo_bodies, ring_precomputed, active_system_name)
@@ -1797,42 +1877,46 @@ def render_body_inspector(app, ctx, bodies_data, num_bodies, parent_snap, mass_s
                         json.dump(exp, f, indent=4, cls=NumpyEncoder)
                     print(f"[Cosmetics] Exported cosmetics to {filename}")
                     app._screenshot_toast = (f"Exported to {filename}", time.time())
+            imgui.pop_item_width()
+            imgui.end_child()
             imgui.end_tab_item()
 
         imgui.end_tab_bar()
 
-        # ── Edit Mode Action Bar ──
-        if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
-            imgui.separator()
-            ed = app.camera.get("edit_data", {})
-            roche_violates = False
-            if has_parent:
-                parent_m = cur_mass_snap[parent_idx]
-                body_m = float(ed.get("mass", body_mass))
-                r_km = float(ed.get("radius", body_r_km))
-                a_val = float(ed.get("a", oe_a))
-                e_val = float(ed.get("e", oe_e))
-                if body_m > 0 and r_km > 0:
-                    d_roche_km = 2.44 * r_km * ((parent_m / body_m)**(1.0/3.0))
-                    d_roche_au = d_roche_km / AU_TO_KM
-                    periapsis_au = a_val * (1.0 - e_val)
-                    if periapsis_au < d_roche_au:
-                        roche_violates = True
+    # ── Edit Mode Action Bar ──
+    if not insp_is_cmp and app.camera.get("edit_mode", False) and not inspect_bary:
+        imgui.begin_child("inspector_edit_footer", 0, 0, flags=imgui.WINDOW_NO_SCROLLBAR)
+        imgui.separator()
+        imgui.text_disabled("Unapplied edits")
+        ed = app.camera.get("edit_data", {})
+        roche_violates = False
+        if has_parent:
+            parent_m = cur_mass_snap[parent_idx]
+            body_m = float(ed.get("mass", body_mass))
+            r_km = float(ed.get("radius", body_r_km))
+            a_val = float(ed.get("a", oe_a))
+            e_val = float(ed.get("e", oe_e))
+            if body_m > 0 and r_km > 0:
+                d_roche_km = 2.44 * r_km * ((parent_m / body_m)**(1.0/3.0))
+                d_roche_au = d_roche_km / AU_TO_KM
+                periapsis_au = a_val * (1.0 - e_val)
+                if periapsis_au < d_roche_au:
+                    roche_violates = True
 
-            if roche_violates:
-                imgui.text_colored("Warning: Orbit violates Roche limit!", 1.0, 0.3, 0.3)
-                imgui.text_colored("[Apply Changes Disabled]", 0.5, 0.5, 0.5)
-                if imgui.button("Cancel##edit_cancel_disabled", width=-1):
-                    app.camera["edit_mode"] = False
-            else:
-                half_w = (insp_w - 30) // 2
-                imgui.push_style_color(imgui.COLOR_BUTTON, 0.2, 0.6, 0.3)
-                if imgui.button("Apply Changes##apply_edits", width=half_w):
-                    _apply_body_edits(app, insp_idx, body_info, parent_idx, cur_mass_snap, cur_pos_snap_render, cur_vel_snap_render, cur_visual_arr)
-                imgui.pop_style_color()
-                imgui.same_line(spacing=10)
-                if imgui.button("Cancel##edit_cancel", width=half_w):
-                    app.camera["edit_mode"] = False
+        if roche_violates:
+            imgui.text_wrapped("Periapsis inside Roche limit. Apply disabled.")
+            if imgui.button("Cancel##edit_cancel_disabled", width=-1):
+                app.camera["edit_mode"] = False
+        else:
+            half_w = max(60, (imgui.get_content_region_available()[0] - 10) / 2)
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.16, 0.38, 0.43)
+            if imgui.button("Apply Changes##apply_edits", width=half_w):
+                _apply_body_edits(app, insp_idx, body_info, parent_idx, cur_mass_snap, cur_pos_snap_render, cur_vel_snap_render, cur_visual_arr)
+            imgui.pop_style_color()
+            imgui.same_line(spacing=10)
+            if imgui.button("Cancel##edit_cancel", width=half_w):
+                app.camera["edit_mode"] = False
 
+        imgui.end_child()
     imgui.end()
 

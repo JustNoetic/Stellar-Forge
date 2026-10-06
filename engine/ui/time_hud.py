@@ -1,5 +1,6 @@
 import imgui
 import math
+from engine.ui.workspace import workspace, ACCENT
 from engine.rendering.render_utils import format_time_speed, sim_time_from_date
 from engine.ephemeris.spk_exporter import export_timeline_spk_async
 
@@ -11,10 +12,11 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     scrub_index = getattr(app, "scrub_index", [0])
     jump_date = getattr(app, "jump_date", [cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s])
 
-    bar_w = min(960, app.fb_width - 40)
-    bar_h = 58 if is_scrubbing or (tl_active and tl_prog < 1.0) else 44
-    bar_x = (app.fb_width - bar_w) / 2
-    bar_y = app.fb_height - bar_h - 10
+    layout = workspace(app)
+    bar_w = layout.width - layout.gap * 2
+    bar_h = layout.transport_height
+    bar_x = layout.gap
+    bar_y = layout.height - bar_h - layout.gap
 
     imgui.set_next_window_position(bar_x, bar_y, imgui.ALWAYS)
     imgui.set_next_window_size(bar_w, bar_h, imgui.ALWAYS)
@@ -87,7 +89,7 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
         imgui.pop_item_width()
 
         imgui.same_line(spacing=10)
-        imgui.push_item_width(320)
+        imgui.push_item_width(max(100, min(320, bar_w - 590 * layout.scale)))
         changed_scrub, scrub_index[0] = imgui.slider_int("##Scrub", scrub_index[0], 0, max_idx, "")
         imgui.pop_item_width()
 
@@ -106,7 +108,8 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
                 app.shared_state["timeline_active"] = False
             app.time_ctrl["timeline_playing"] = False
 
-        imgui.same_line(spacing=10)
+        if bar_w > 900 * layout.scale:
+            imgui.same_line(spacing=10)
         if getattr(app, "_spk_exporting", False):
             imgui.text_colored("Exporting SPK...", 0.55, 0.85, 1.0)
         else:
@@ -122,14 +125,14 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     # 1. Play / Pause
     is_paused = app.time_ctrl["paused"]
     btn_play_pause = " Play " if is_paused else " Pause "
-    if imgui.button(btn_play_pause, width=54):
+    if imgui.button(btn_play_pause, width=65 * layout.scale):
         app.time_ctrl["paused"] = not is_paused
 
     # 2. Direction (Forward / Backward)
     imgui.same_line(spacing=6)
     td = app.time_ctrl["time_direction"]
     dir_label = " Forward " if td >= 0 else " Reverse "
-    if imgui.button(dir_label, width=68):
+    if imgui.button(dir_label, width=80 * layout.scale):
         app.time_ctrl["time_direction"] = -td
 
     # 3. 1x Reset Speed
@@ -139,7 +142,7 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
 
     # 4. Speed Slider (Fixed position, placed BEFORE speed text so text length never moves the slider)
     imgui.same_line(spacing=8)
-    imgui.push_item_width(140)
+    imgui.push_item_width(max(80, min(210 * layout.scale, bar_w * 0.24)))
     val_log = math.log10(max(1.0, abs(app.time_ctrl["multiplier"])))
     changed_speed, new_log = imgui.slider_float("##speed_slider", val_log, 0.0, 12.0, "")
     if changed_speed:
@@ -150,34 +153,27 @@ def render_time_hud(app, cur_y, cur_m, cur_d, cur_h, cur_mn, cur_s, cur_tz, disp
     imgui.same_line(spacing=8)
     effective_mult = app.time_ctrl["multiplier"] * td
     imgui.text(format_time_speed(effective_mult))
-    imgui.same_line()
-    left_end_x = imgui.get_cursor_pos_x()
+    imgui.spacing()
+    left_end_x = imgui.get_style().window_padding.x
 
-    # 6. Date / Time Display + Jump Button (Aligned to right edge of the window)
+    # 6. Date and jump controls occupy their own row, so timezones cannot
+    # displace the speed slider or run into side panels.
     btn_label = "Jump to Date..." if (ephemeris_mode_active or keplerian_mode_active) else "Render Timeline..."
     date_str = f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {cur_tz}"
 
     style = imgui.get_style()
     btn_spacing = 8.0
-    text_w = imgui.calc_text_size(date_str)[0]
     btn_w = imgui.calc_text_size(btn_label)[0] + style.frame_padding.x * 2.0
-    total_right_w = text_w + btn_spacing + btn_w
-    target_x = bar_w - style.window_padding.x - total_right_w
+    date_width = max(0, bar_w - style.window_padding.x * 2 - btn_spacing - btn_w)
 
     # If space is too tight for the full timezone string, shorten long timezone name
-    if target_x <= left_end_x + 10 and len(cur_tz) > 6:
+    if imgui.calc_text_size(date_str)[0] > date_width and len(cur_tz) > 6:
         short_tz = "".join(c for c in cur_tz if c.isupper())
         if not short_tz:
             short_tz = cur_tz[:4]
         date_str = f"{cur_y:04d}-{cur_m:02d}-{cur_d:02d} {cur_h:02d}:{cur_mn:02d}:{cur_s:02d} {short_tz}"
-        text_w = imgui.calc_text_size(date_str)[0]
-        total_right_w = text_w + btn_spacing + btn_w
-        target_x = bar_w - style.window_padding.x - total_right_w
 
-    if target_x > left_end_x + 10:
-        imgui.set_cursor_pos_x(target_x)
-    else:
-        imgui.set_cursor_pos_x(left_end_x + 12)
+    imgui.set_cursor_pos_x(left_end_x)
 
     imgui.text_colored(date_str, 0.85, 0.9, 1.0)
 

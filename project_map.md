@@ -54,12 +54,15 @@
 | **FFT / Convolution Diffraction Spikes** | `engine/glsl/post/` | `conv_bloom_scene.comp`, `conv_bloom_kernel.comp`, `conv_bloom_convolve.comp`, `conv_bloom_common.glsl` |
 | **Texture Management & Hot-Reloading** | `engine/rendering/texture_manager.py`<br>`engine/rendering/texture_streamer.py` | `render_texture_management_ui`, `stage_imported_texture`, `hot_reload_body_texture`<br>`TextureStreamer` |
 | **Input Handling & Keybindings** | `engine/core/input_handler.py` | `InputHandlerMixin.key_callback`, `scroll_callback`, `mouse_button_callback`, `save_settings`, `load_settings` |
+| **Size Comparator Scene** | `engine/rendering/size_comparator.py`<br>`engine/rendering/comparator_atmosphere.py`<br>`engine/rendering/comparator_systems.py`<br>`engine/glsl/celestial/comparator*.{vert,frag}`<br>`engine/glsl/atmosphere/comparator_atmo.{vert,frag}` | `arrange_bodies`, `SizeComparatorRenderer`: View → Scene: Size Comparator; physical radii in AU mapped to km × 1e-5, planets in orbital order, satellite columns, independent orthographic pan/zoom; outliner checkboxes collect any number of saved/live systems, labels hide on overlap, premultiplied ring array mipmaps and pixel coverage filter thin rings. White directional light (75% phase), blackbody stars with limb darkening, no HDR/bloom/secondary light. `ComparatorAtmospheres`: parallel-ray Rayleigh/Mie scattering, absorption and multiple-scattering LUTs using each body's atmosphere properties; oblate shells, foreground depth clipping and ring layering; respects atmosphere toggle/quality. |
 | **Camera Math & Coordinate Frames** | `engine/core/input_handler.py`<br>`engine/core/math_utils.py` | `_camera_align_up`, `_camera_forward`, `_camera_yaw_pitch_from`, `_camera_rot_axis`, `_camera_get_up` |
 | **UI: Top Menu Bar** | `engine/ui/menu_bar.py` | `render_main_menu_bar` (Systems, Physics modes, View, Render, Tools, Quick Actions) |
 | **UI: System Outliner Panel** | `engine/ui/outliner.py` | `render_system_outliner` (Celestial body tree hierarchy, Add Body trigger) |
-| **UI: Body Inspector Panel** | `engine/ui/inspector.py` | `render_body_inspector` (Live astrophysics telemetry, orbit/atmosphere/ring/texture editor) |
+| **UI: Body Inspector Panel** | `engine/ui/inspector.py`<br>`engine/ui/inspector_widgets.py` | `render_body_inspector`: grouped live/proposed telemetry, expandable orbit details, atmosphere sections, selected ring-layer editor, Surface tools, fixed tabs and Apply/Cancel footer. `value_row`, `section`, `field`: responsive inspector presentation. |
 | **UI: Time Transport HUD** | `engine/ui/time_hud.py` | `render_time_hud` (Warp speed, pause, timeline render progress, scrubbing) |
 | **UI: Viewport HUD & Triangle Stats** | `engine/ui/viewport_hud.py` | `render_viewport_hud` (Camera mode pill, flight speed slider, triangle count overlay) |
+| **UI: Workspace Layout & Theme** | `engine/ui/workspace.py`<br>`docs/ui_workspace.md` | `apply_theme`, `workspace`, `panel`, `comparator_bounds`, `reset_workspace`: shared logical-pixel bounds, aligned/floating panels, interface scale, slate/cyan/amber theme. |
+| **UI: Categorized Settings** | `engine/ui/settings.py` | `render_settings`: Atmosphere, Optics, Visibility, Lighting, Terrain, Workspace; original setting callbacks and autosave retained. Render menu opens each category. |
 | **UI: Modals & Popups** | `engine/ui/modals.py` | `render_modals` (Graphics Settings, Add Body, Create System, Ephemeris Setup, Date Jump) |
 | **Shader Loading & Preprocessor** | `engine/rendering/shader_loader.py` | `load_shader` (handles `#include` directives via `_resolve_includes`), `clear_shader_cache` |
 | **ImGui Backend (ModernGL + GLFW)** | `engine/rendering/imgui_renderer.py` | `ModernGLImGuiRenderer`, `ModernGLGlfwRenderer` |
@@ -112,7 +115,10 @@ engine/
 │   └── texture_streamer.py     # Background mipmap generation and texture streaming
 │
 ├── ui/
+│   ├── workspace.py            # Shared theme, display-space panel bounds and layout reset
+│   ├── settings.py             # Categorized settings, responsive fields and autosave
 │   ├── inspector.py            # Body Inspector window (telemetry, physical parameters, orbital elements)
+│   ├── inspector_widgets.py    # Responsive metric rows, sections and full-width inspector fields
 │   ├── menu_bar.py             # Top menu bar (Systems, Physics, View, Render, Tools)
 │   ├── modals.py               # Popup dialogs (Graphics Settings, Add Body, Create System, Date Jump)
 │   ├── outliner.py             # Left-side celestial hierarchy outliner tree
@@ -164,6 +170,9 @@ stellar_forge.spec              # PyInstaller standalone build configuration
 ## 6. KEY GLOBALS & RUNTIME STATE KEYS
 
 ### `app.camera` (Dict)
+- `ui_aligned_panels`: Aligned workspace panels (default `True`); disable for movable/resizable windows.
+- `ui_outliner_width`, `ui_inspector_width`: Preferred logical widths before scaling (defaults `260`, `420`).
+- `ui_scale`: Interface scale (`0.9`–`1.5`, default `1.0`). These four keys are persisted by both settings writers.
 - `movement_mode`: `0` = Free Flight, `1` = Simple Orbit
 - `flight_speed`: Current flight speed in $\text{AU/s}$ (log-scaled with scroll wheel)
 - `fov`: Field of view in degrees (default `45.0`)

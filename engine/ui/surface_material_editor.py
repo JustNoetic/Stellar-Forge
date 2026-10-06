@@ -1,17 +1,17 @@
-"""Surface photometry controls in the body inspector's Cosmetics tab."""
+"""Surface photometry controls in the body inspector's Surface tab."""
 import copy
 import imgui
 
 from engine.rendering.surface_materials import MATERIAL_PRESETS, resolve_material
+from engine.ui.inspector_widgets import field, value_row
 
 
 def render_surface_material_editor(body):
-    imgui.text_colored('Surface Material', 1.0, 0.85, 0.4)
     raw = body.get('material')
     preset = raw if isinstance(raw,str) else raw.get('preset','auto') if isinstance(raw,dict) else 'auto'
     choices = ['auto','lambert','lunar','icy','custom']
     labels = ['Automatic','Lambert','Lunar regolith','Icy regolith','Custom Hapke']
-    changed, index = imgui.combo('Material preset', choices.index(preset) if preset in choices else 4, labels)
+    changed, index = field(imgui.combo, 'Material preset', choices.index(preset) if preset in choices else 4, labels)
     if changed:
         selected = choices[index]
         if selected == 'auto':
@@ -21,7 +21,7 @@ def render_surface_material_editor(body):
         else:
             body['material'] = dict(copy.deepcopy(MATERIAL_PRESETS[selected]),preset=selected)
     material = resolve_material(body)
-    imgui.text('Resolved: '+('Hapke granular surface' if material['model'] == 'hapke' else 'Lambert surface'))
+    value_row('Resolved model', 'Hapke granular surface' if material['model'] == 'hapke' else 'Lambert surface')
     if imgui.is_item_hovered():
         imgui.set_tooltip('Automatic uses lunar regolith for Moon/Luna and icy regolith for Europa. Other bodies use Lambert. Presets are editable starting points.')
     controls = [('Brightness','brightness',0.0,2.0,'%.2f')]
@@ -37,7 +37,7 @@ def render_surface_material_editor(body):
             ('Coherent opposition width','coherent_width',0.003,0.1,'%.3f'),
         ]
     for label, name, low, high, fmt in controls:
-        changed, value = imgui.slider_float(label,material[name],low,high,format=fmt)
+        changed, value = field(imgui.slider_float,label,material[name],low,high,format=fmt)
         if changed:
             material[name] = value
             body['material'] = dict(material,preset='custom' if material['model'] == 'hapke' else 'lambert')
