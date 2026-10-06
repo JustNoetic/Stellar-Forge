@@ -47,6 +47,7 @@ a = Analysis(
     ],
     hiddenimports=[
         # Core scientific stack
+        'stellar_terrain',
         'numpy',
         'numpy.core._multiarray_umath',
         'scipy',

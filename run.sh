@@ -34,6 +34,8 @@ source venv/bin/activate
 echo "[Stellar-Forge] Checking and installing dependencies..."
 pip install -r requirements.txt --quiet
 
+python3 scripts/build_terrain.py --if-needed
+
 # Configure PYTHONPATH and run
 export PYTHONPATH="$(pwd)/engine:${PYTHONPATH}"
 echo "[Stellar-Forge] Starting Stellar-Forge simulation..."

@@ -36,6 +36,9 @@ if !errorlevel! neq 0 (
     exit /b 1
 )
 
+python scripts\build_terrain.py --if-needed
+if !errorlevel! neq 0 exit /b 1
+
 :: ── 3. Clean previous build artefacts ───────────────────────────────────────
 echo [Build] Cleaning previous build...
 if exist build                   rmdir /s /q build

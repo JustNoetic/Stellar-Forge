@@ -55,6 +55,13 @@ if !errorlevel! neq 0 (
     echo [Stellar-Forge] All dependencies are satisfied.
 )
 
+:: Build/update the native terrain extension
+python scripts\build_terrain.py --if-needed
+if !errorlevel! neq 0 (
+    pause
+    exit /b 1
+)
+
 :: Run the simulation
 set PYTHONPATH=%~dp0engine;%PYTHONPATH%
 echo [Stellar-Forge] Starting Stellar-Forge simulation...

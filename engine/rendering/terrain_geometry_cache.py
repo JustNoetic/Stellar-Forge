@@ -18,7 +18,7 @@ class TerrainGeometryCache:
         self.max_bakes = max_bakes_per_frame
         self.height_program = ctx.compute_shader(load_shader('compute/terrain_cache_height.comp'))
         self.normal_program = ctx.compute_shader(load_shader('compute/terrain_cache_normal.comp'))
-        self.jobs = ctx.buffer(reserve=self.max_bakes * 96)
+        self.jobs = ctx.buffer(reserve=self.max_bakes * 112)
         self.mapping = ctx.buffer(reserve=max_patches * 4)
         self.geometry = self.heights = None
         self.resolution = None
@@ -65,10 +65,10 @@ class TerrainGeometryCache:
         # One compact geometry-only key per patch; diffuse tile uploads do not
         # invalidate height/normal work. Values are packed at draw precision.
         key_data = np.ascontiguousarray(np.column_stack((
-            patches[:, :4], patches[:, 8:10], patches[:, 12:18], shapes)))
+            patches[:, :4], patches[:, 8:10], patches[:, 12:18], patches[:, 20:23], shapes)))
         height_slots = patches[:, 12].astype('i4')
         versions = np.asarray(streamer.slot_upload_versions, dtype='u8')[np.maximum(0, height_slots)]
-        signature = (key_data.tobytes(), body_ids.tobytes(),
+        signature = (streamer.height_revision, key_data.tobytes(), body_ids.tobytes(),
                      versions.tobytes(), tuple(sorted(body_names.items())))
         if signature == self._ready_signature:
             self.last_hits = int(np.count_nonzero(height_slots >= 0))
@@ -83,7 +83,7 @@ class TerrainGeometryCache:
                 keys.append(None)
             else:
                 keys.append((body_names[int(body_ids[i])],
-                             streamer.slot_upload_versions[height_slot], row.tobytes()))
+                             streamer.height_revision, row.tobytes()))
         pinned = {key for key in keys if key in self.entries}
         pending = []
         self.last_hits = self.last_misses = 0
@@ -112,15 +112,17 @@ class TerrainGeometryCache:
             pending.append((i, slot))
         self.last_bakes = len(pending)
         if pending:
-            records = np.zeros((len(pending), 24), dtype='f4')
+            records = np.zeros((len(pending), 28), dtype='f4')
             indices = [item[0] for item in pending]
-            records[:, :20] = patches[indices]
-            records[:, 20:22] = shapes[indices]
-            records[:, 22] = [item[1] for item in pending]
+            records[:, :24] = patches[indices]
+            records[:, 24:26] = shapes[indices]
+            records[:, 26] = [item[1] for item in pending]
             self.jobs.write(records.tobytes())
             self.jobs.bind_to_storage_buffer(5)
             self.geometry.bind_to_storage_buffer(6)
             self.heights.bind_to_storage_buffer(7)
+            streamer.configure_height_program(self.height_program)
+            streamer.configure_height_program(self.normal_program)
             self.height_program['u_resolution'].value = self.resolution
             self.normal_program['u_resolution'].value = self.resolution
             self.normal_program['u_km_to_au'].value = 1.0 / 149597870.7

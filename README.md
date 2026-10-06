@@ -36,6 +36,8 @@
 - **Ring Shadows & Secondary Illumination**: Filtered penumbral ring shadows cast onto planetary atmospheres and surfaces, accompanied by dynamic planetshine, moonshine, and oblate ringshine.
 
 ### 🏔️ 3. Spherified Cube Quadtree Terrain & Planetary Surfaces
+
+The terrain CPU backend is written in Rust, with native streaming workers and a shared GPU/collision surface. See [terrain backend documentation](docs/terrain_backend.md) for build instructions, tile precision, seam handling and limits.
 - **Tangent-Corrected Spherified Cube Quadtree**: SpaceEngine-style multi-resolution quadtree mesh generation that eliminates polar pinches and ensures uniform tessellation.
 - **Multi-Level Chunk Streaming**: Dynamic Level-of-Detail (LOD) streaming driven by camera distance and screen-space error metrics.
 - **Multi-Map Surface Shader**: Support for high-resolution diffuse, height/normal, specular, city night lights (emission), and dynamic dual-layer cloud shadows.
@@ -116,7 +118,8 @@ flowchart TD
 ### Prerequisites
 - **Operating System**: Windows 10/11 or modern Linux (Ubuntu/Debian, Fedora, Arch, etc.)
 - **GPU**: OpenGL 4.3+ capable graphics card (NVIDIA GTX 900+ / AMD Radeon RX 400+ / Intel Iris Xe or newer)
-- **Python**: Python 3.10, 3.11, or 3.12 (64-bit recommended)
+- **Python**: Python 3.10+ (64-bit recommended)
+- **Rust**: Stable Rust 1.88+ for source builds of the terrain extension; prebuilt wheels and packaged releases do not require a compiler.
 
 #### Linux System Packages
 Ensure standard OpenGL, GLFW, and Python venv libraries are installed:
@@ -166,7 +169,10 @@ source venv/bin/activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Run the simulation
+# 4. Build the Rust terrain extension
+python scripts/build_terrain.py
+
+# 5. Run the simulation
 python engine/main.py
 ```
 
@@ -208,9 +214,9 @@ Stellar-Forge includes dedicated offline tools in [`scripts/`](scripts):
 ### 1. Planetary Map Tile Baker ([`bake_planet_tiles.py`](scripts/bake_planet_tiles.py))
 Converts high-resolution equirectangular planetary maps (diffuse, bump, night lights, specular) into tangent-corrected Spherified Cube Quadtree pyramids:
 ```bash
-python scripts/bake_planet_tiles.py --input textures/earth_8k.jpg --body Earth --type diffuse --max-lod 5
+python scripts/bake_planet_tiles.py --input textures/earth_8k.jpg --body Earth --map-type diffuse --max-lod 5
 ```
-*Output hierarchy:* `data/tiles/{body}/{map_type}/{face}/{lod}/{x}_{y}.jpg`
+*Output hierarchy:* `data/tiles/{body}/{map_type}/{face}/{lod}/{x}_{y}.png` (pixel-centred content plus two gutter texels; height is 16-bit)
 
 ### 2. Gaia DR3 Star Catalog Downloader ([`fetch_gaia.py`](scripts/fetch_gaia.py))
 Queries ESA Gaia Archive TAP (and VizieR TAP) in RA bands to compile magnitude-limited stars into a packed 32-byte binary format:

@@ -5,6 +5,7 @@ struct TerrainBakeJob {
     vec4 meta;
     vec4 height;
     vec4 hrange;
+    vec4 detail; // stitched edges, water enabled, water level, reserved
     vec4 shape; // radius in AU, oblateness, destination slot, unused
 };
 

@@ -1,54 +1,20 @@
 #version 460 core
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x=8,local_size_y=8) in;
 #include "common/terrain_geometry_cache.glsl"
-layout(std430, binding = 5) readonly buffer BakeJobs { TerrainBakeJob jobs[]; };
-layout(std430, binding = 7) readonly buffer BakeHeights { float heights[]; };
-layout(std430, binding = 6) writeonly buffer CachedGeometry { vec4 geometry[]; };
+#include "common/terrain_surface.glsl"
+layout(std430,binding=5) readonly buffer BakeJobs { TerrainBakeJob jobs[]; };
+layout(std430,binding=7) readonly buffer BakeHeights { float heights[]; };
+layout(std430,binding=6) writeonly buffer CachedGeometry { vec4 geometry[]; };
 uniform int u_resolution;
 uniform float u_km_to_au;
-
-vec3 surface(vec3 direction, float radius, float obl, float elevation) {
-    vec3 ellipsoid = direction * vec3(1.0, 1.0 - obl, 1.0);
-    return ellipsoid * radius + normalize(ellipsoid) * elevation;
-}
-
 void main() {
-    ivec2 ij = ivec2(gl_GlobalInvocationID.xy);
-    int width = u_resolution + 1;
-    if (any(greaterThanEqual(ij, ivec2(width)))) return;
-    int job_index = int(gl_GlobalInvocationID.z);
-    TerrainBakeJob job = jobs[job_index];
-    int stride = width * width;
-    int at = job_index * stride + ij.y * width + ij.x;
-    float elevation = heights[at];
-    vec2 uv = vec2(ij) / float(u_resolution);
-    vec2 sphere_uv = mix(job.range.xy, job.range.zw, uv);
-    vec3 direction = terrain_cache_direction(int(job.meta.x + 0.5), sphere_uv);
-    vec3 normal = direction;
-    if (job.hrange.y > 0.0) {
-        float radius = job.shape.x / max(1e-12, u_km_to_au);
-        float obl = clamp(job.shape.y, 0.0, 0.8);
-        vec3 center = surface(direction, radius, obl, elevation);
-        // The draw shader uses one-sided differences on patch boundaries.
-        // All samples therefore come from this grid, including skirts.
-        int left = max(0, ij.x - 1), right = min(u_resolution, ij.x + 1);
-        int down = max(0, ij.y - 1), up = min(u_resolution, ij.y + 1);
-        int base = job_index * stride;
-        int face = int(job.meta.x + 0.5);
-        vec3 p_left = surface(terrain_cache_direction(face, mix(job.range.xy, job.range.zw, vec2(left, ij.y) / float(u_resolution))), radius, obl, heights[base + ij.y * width + left]);
-        vec3 p_right = surface(terrain_cache_direction(face, mix(job.range.xy, job.range.zw, vec2(right, ij.y) / float(u_resolution))), radius, obl, heights[base + ij.y * width + right]);
-        vec3 p_down = surface(terrain_cache_direction(face, mix(job.range.xy, job.range.zw, vec2(ij.x, down) / float(u_resolution))), radius, obl, heights[base + down * width + ij.x]);
-        vec3 p_up = surface(terrain_cache_direction(face, mix(job.range.xy, job.range.zw, vec2(ij.x, up) / float(u_resolution))), radius, obl, heights[base + up * width + ij.x]);
-        vec3 tu = ij.x == 0 ? (p_right - center) * 2.0 :
-                  ij.x == u_resolution ? (center - p_left) * 2.0 : p_right - p_left;
-        vec3 tv = ij.y == 0 ? (p_up - center) * 2.0 :
-                  ij.y == u_resolution ? (center - p_down) * 2.0 : p_up - p_down;
-        vec3 candidate = cross(tv, tu);
-        if (dot(candidate, candidate) > 1e-12) {
-            candidate = normalize(candidate);
-            normal = dot(candidate, direction) < 0.0 ? -candidate : candidate;
-        }
-    }
-    int destination = int(job.shape.z + 0.5) * stride + ij.y * width + ij.x;
-    geometry[destination] = vec4(normal, elevation);
+    ivec2 ij=ivec2(gl_GlobalInvocationID.xy);int width=u_resolution+1;
+    if (any(greaterThanEqual(ij,ivec2(width)))) return;
+    int job_index=int(gl_GlobalInvocationID.z);TerrainBakeJob job=jobs[job_index];
+    int stride=width*width;float elevation=heights[job_index*stride+ij.y*width+ij.x];
+    dvec2 uv=mix(dvec2(job.range.xy),dvec2(job.range.zw),dvec2(ij)/double(u_resolution));
+    vec3 n=vec3(terrain_direction_precise(int(job.meta.x+0.5),uv));
+    vec3 normal=terrain_surface_normal(uint(job.meta.w+0.5),n,job.shape.x/max(1e-12,u_km_to_au),clamp(job.shape.y,0.0,0.8),job.hrange,job.detail,elevation);
+    int at=int(job.shape.z+0.5)*stride+ij.y*width+ij.x;
+    geometry[at]=vec4(normal,elevation);
 }

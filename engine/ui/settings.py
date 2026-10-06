@@ -445,15 +445,15 @@ def _terrain(app):
             app.camera["terrain_ground_lod_distance"] = ground_dist
             settings_changed = True
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Near-ground LOD transition distance.\nValues below 1.0x bring higher quality LOD patches closer to the camera\nwhen near the surface, concentrating dense geometry nearby while keeping distant terrain lightweight.")
+            imgui.set_tooltip("Near-ground detail multiplier, relative to overall LOD distance.\nValues below 1.0x add detail near the sampled surface.\nValues above 1.0x reduce near-ground detail. Camera rotation does not change refinement.")
 
         max_depth = int(app.camera.get("terrain_max_depth", 10))
-        changed_md, max_depth = _field(imgui.slider_int, "Max LOD Depth", max_depth, 0, 10)
+        changed_md, max_depth = _field(imgui.slider_int, "Max LOD Depth", max_depth, 0, 20)
         if changed_md:
             app.camera["terrain_max_depth"] = max_depth
             settings_changed = True
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Maximum quadtree subdivision depth level (0 to 10).\nGoverns the finest mesh resolution available near the camera.")
+            imgui.set_tooltip("Maximum quadtree subdivision depth level (0 to 20).\nGoverns the finest mesh resolution available near the camera.")
 
         res_options = [8, 16, 24, 32, 48, 64]
         res_labels = [
@@ -483,7 +483,7 @@ def _terrain(app):
             imgui.set_tooltip("Display live on-screen viewport HUD overlay with rendered triangle counts for terrain, celestial bodies, and current FPS.")
 
         if getattr(app, 'terrain_streamer', None) is not None:
-            res_cnt = len(app.terrain_streamer.resident_tiles)
+            res_cnt = app.terrain_streamer.resident_count
             cap = app.terrain_streamer.pool_capacity
             p_cnt = getattr(app, 'terrain_last_patch_count', 0)
             cp_cnt = getattr(app, 'terrain_last_cloud_patch_count', 0)

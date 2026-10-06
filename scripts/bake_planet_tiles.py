@@ -468,66 +468,12 @@ def slice_quadtree_pyramid_multi(face_imgs, body_out_dir, max_lod, tile_size=512
 # Planet Baking Pipeline
 # -----------------------------------------------------------------------------
 def bake_planet(body_name, src_path, map_type="diffuse", max_lod=3, tile_size=512, out_base="data/tiles", use_cuda=True, bilinear=True, stitch=True):
-    t_start = time.perf_counter()
-    print(f"[{body_name}] Loading source image: {src_path}...")
-    src_img = Image.open(src_path)
-    # Elevation uses 8-bit luminance and lossless PNG (no color-space conversion).
-    if map_type.lower() == "height":
-        src_img = src_img.convert("L")
-    src_w, src_h = src_img.size
-    print(f"[{body_name}] Source resolution: {src_w} x {src_h} ({src_img.mode})")
-
-    # Master face resolution matching max LOD: (2^max_lod) * tile_size
-    master_face_size = (1 << max_lod) * tile_size
-    print(f"[{body_name}] Max LOD {max_lod} -> Master cube face size: {master_face_size}x{master_face_size}")
-
+    # Direct source sampling preserves elevation precision and provides real
+    # neighbours across every tile/cube edge; legacy whole-face helpers remain
+    # available to old tools, but new bakes use the v2 layout.
+    from scripts.terrain_tile_baker import bake_tiles
     body_out_dir = os.path.join(ROOT_DIR, out_base, body_name, map_type)
-    os.makedirs(body_out_dir, exist_ok=True)
-
-    face_names = ["+X (Right)", "-X (Left)", "+Y (North)", "-Y (South)", "+Z (Front)", "-Z (Back)"]
-    fmt = "png" if (src_img.mode == "RGBA" or "normal" in map_type.lower() or "height" in map_type.lower()) else "jpg"
-
-    # Pre-upload texture to GPU if CUDA is active
-    src_gpu = None
-    dst_gpu = None
-    cuda_active = use_cuda and _CUDA_AVAILABLE
-
-    if cuda_active:
-        print(f"[{body_name}] CUDA backend active: using GPU [{_CUDA_DEVICE_NAME}]")
-        t_upload = time.perf_counter()
-        src_arr = np.array(src_img)
-        src_gpu = _cp.asarray(src_arr)
-        channels = src_gpu.shape[2] if src_gpu.ndim == 3 else 1
-        dst_shape = (master_face_size, master_face_size, channels) if channels > 1 else (master_face_size, master_face_size)
-        dst_gpu = _cp.empty(dst_shape, dtype=_cp.uint8)
-        _cp.cuda.Stream.null.synchronize()
-        print(f"[{body_name}] Transferred source to GPU VRAM in {(time.perf_counter() - t_upload)*1000:.1f} ms")
-    else:
-        print(f"[{body_name}] Running on CPU (NumPy)")
-
-    master_faces = []
-    for face_idx in range(6):
-        t0 = time.perf_counter()
-        print(f"[{body_name}] Reprojecting face {face_idx} ({face_names[face_idx]})...")
-        face_img = reproject_face(
-            src_img, face_idx, master_face_size,
-            src_gpu=src_gpu, dst_gpu=dst_gpu,
-            use_cuda=cuda_active, bilinear=bilinear
-        )
-        master_faces.append(face_img)
-        dt = time.perf_counter() - t0
-        print(f"[{body_name}] Face {face_idx} reprojected in {dt:.2f} s")
-
-    print(f"[{body_name}] Slicing and stitching quadtree pyramid across all 6 faces (stitch={stitch})...")
-    resample = Image.Resampling.BILINEAR if "height" in map_type.lower() else Image.Resampling.LANCZOS
-    slice_quadtree_pyramid_multi(
-        master_faces, body_out_dir, max_lod, tile_size, fmt=fmt,
-        resample=resample, stitch=stitch
-    )
-
-    total_time = time.perf_counter() - t_start
-    backend_str = f"GPU ({_CUDA_DEVICE_NAME})" if cuda_active else "CPU"
-    print(f"[{body_name}] All 6 faces baked and seamlessly stitched using {backend_str} to {body_out_dir} in {total_time:.2f} s!")
+    bake_tiles(body_name, src_path, map_type, max_lod, tile_size, body_out_dir)
 
 
 def bake_all(max_lod=3, tile_size=512, out_base="data/tiles", solar_system_dir="textures/Solar System", include_clouds=True, include_heights=True, use_cuda=True, bilinear=True, stitch=True):

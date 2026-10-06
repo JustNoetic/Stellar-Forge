@@ -88,7 +88,7 @@ def triangle_radius(direction, triangle):
 class CameraSurface:
     def __init__(self, radius, oblateness, pole, angle=0., streamer=None,
                  body_name='', elevation_range=(0., 8.848), max_lod=6,
-                 patch_res=32, patches=None, cache_queries=False):
+                 patch_res=32, patches=None, cache_queries=False, water_level=None):
         self.radius = float(radius)
         self.oblateness = np.clip(oblateness, 0., .8)
         self.frame = terrain_frame(pole, angle)
@@ -97,32 +97,27 @@ class CameraSurface:
         if not (math.isfinite(lo) and math.isfinite(hi) and hi >= lo):
             lo, hi = 0., 8.848
         self.elevation_range = lo, hi
+        self.water_level = water_level
         self.max_lod, self.patch_res = max(0, int(max_lod)), max(1, int(patch_res))
         self.patches = patches
         # App creates a surface after uploads on each frame. Reuse only exact
         # repeated queries within that frame; sweeps still inspect every point.
         self.cache_queries = cache_queries
         self._query_key = self._query_result = None
-        self.outer_radius = self.radius + max(0., hi if streamer is not None else 0.) + .01
+        self.outer_radius = self.radius + max(0., hi if streamer is not None else 0.) + .36
         self.cell_size = self.radius / (2**self.max_lod * self.patch_res)
 
-    def _patch_surface(self, direction, face, uv, lod, x, y):
+    def _patch_surface(self, direction, face, uv, lod, x, y, edges=0):
         scale = 2**lod
         local = np.clip(uv * scale - [x, y], 0., 1.)
         ij = np.minimum(np.floor(local * self.patch_res), self.patch_res - 1)
         grid = (ij + np.array([[0., 0.], [1., 0.], [0., 1.], [1., 1.]])) / self.patch_res
         slot, factor, ox, oy = self.streamer.get_tile_slot_or_fallback(
             self.body_name, 'height', face, lod, x, y)
-        samples = self.streamer.sample_height(slot, grid * factor + [ox, oy])
-        if samples is None:
-            elevation = np.zeros(4)
-        else:
-            lo, hi = self.elevation_range
-            elevation = lo + samples * (hi - lo)
-            if lo < -0.1:
-                elevation = np.maximum(0.0, elevation)
-        vertices = terrain_vertices(face, (grid + [x, y]) / scale,
-                                    self.radius, self.oblateness, elevation)
+        lo, hi = self.elevation_range
+        vertices = self.streamer.surface_vertices(
+            self.body_name, face, lod, x, y, grid, self.radius,
+            self.oblateness, lo, hi-lo, self.water_level, edges, self.patch_res)
         # Match create_terrain_grid_patch: (p0,p2,p1), (p1,p2,p3).
         for indices in ([0, 2, 1], [1, 2, 3]):
             hit = triangle_radius(direction, vertices[indices])
@@ -161,7 +156,7 @@ class CameraSurface:
                         & (p[:, 2] >= global_uv[0] - 1e-8) & (p[:, 1] <= global_uv[1] + 1e-8)
                         & (p[:, 3] >= global_uv[1] - 1e-8)]
             for patch in matches:
-                hit = self._patch_surface(direction, face, uv, *(int(v) for v in patch[5:8]))
+                hit = self._patch_surface(direction, face, uv, *(int(v) for v in patch[5:8]), edges=int(patch[9]))
                 if hit is not None and (result is None or hit[0] > result[0]):
                     result = hit
         return result if result is not None else (smooth_radius, cosine)

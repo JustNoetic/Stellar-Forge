@@ -340,8 +340,9 @@ from engine.rendering.surface_materials import SurfaceMaterialCache
 from engine.rendering.aerial_perspective import AerialPerspectiveVolume
 from engine.rendering.star_catalog import StarCatalog
 from engine.rendering.post_shaders import *
-from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches_jit, pack_cloud_patches_jit
+from engine.rendering.terrain_quadtree import PlanetQuadtree, pack_terrain_patches, pack_cloud_patches, terrain_refraction_cull_bend
 from engine.rendering.terrain_streamer import TerrainTileStreamer
+from engine.rendering.terrain_native import terrain_water_level
 from engine.rendering.terrain_geometry_cache import TerrainGeometryCache
 from engine.rendering.terrain_collision import CameraSurface, GROUND_CLEARANCE_KM, camera_near_plane, terrain_camera_split
 from engine.physics.atmosphere_physics import compute_atmosphere_properties, GAS_PROPERTIES, compute_mie_coefficients, compute_mie_absorption
@@ -2302,11 +2303,11 @@ class App(InputHandlerMixin):
             index_buffer=self.ibo_terrain_grid
         )
         MAX_TERRAIN_PATCHES = 4096
-        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
+        self.terrain_patch_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 96)
         terrain_patch_ssbo = self.terrain_patch_ssbo
-        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
-        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 80)
-        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 20), dtype=np.float32)
+        self.terrain_patch_staging = np.zeros((MAX_TERRAIN_PATCHES, 24), dtype=np.float32)
+        self.terrain_cloud_ssbo = ctx.buffer(reserve=MAX_TERRAIN_PATCHES * 96)
+        self.terrain_cloud_staging = np.zeros((MAX_TERRAIN_PATCHES, 24), dtype=np.float32)
         self.terrain_draw_cmds_buf = ctx.buffer(reserve=20)
         self.terrain_cloud_draw_cmds_buf = ctx.buffer(reserve=20)
         self.terrain_current_raw_patches = None
@@ -3736,7 +3737,7 @@ class App(InputHandlerMixin):
                         (self.pole_n_arr_cmp if is_cmp else self.pole_n_arr)[index],
                         float(np.float32(angles[index])), tiles, name,
                         info.get('height_range_km', [0., 8.848]),
-                        cam.get('terrain_max_depth', 10), cam.get('terrain_patch_res', 32), patches, cache_queries=True)
+                        cam.get('terrain_max_depth', 10), cam.get('terrain_patch_res', 32), patches, cache_queries=True, water_level=terrain_water_level(info))
                 return camera_surfaces[key]
 
             # Tracked body surface radius (used for approach gesture & landing).
@@ -4203,7 +4204,7 @@ class App(InputHandlerMixin):
             )
             
             vp_matrix_f8 = view_f8 @ projection_f8
-            frustum_planes = extract_frustum_planes(vp_matrix_f8).astype(np.float32)
+            frustum_planes = extract_frustum_planes(vp_matrix_f8)
             vp_matrix = view @ projection
             
             if self.pick_request is not None and not comparator_active:
@@ -5455,7 +5456,7 @@ class App(InputHandlerMixin):
                         # Compute relative camera vector in double precision (float64) to eliminate
                         # float32 truncation error regardless of what body is tracked or where cam_origin is!
                         cam_rel_world_au = cam_world_pos_f8 - b_pos_world
-                        cam_rel_km = (cam_rel_world_au * AU_TO_KM).astype(np.float32)
+                        cam_rel_km = (cam_rel_world_au * AU_TO_KM).astype(np.float64)
                         b_pos_rel_f8 = b_pos_world - cam_origin
 
                         pole = all_instances[b_i, 9:12]
@@ -5482,7 +5483,7 @@ class App(InputHandlerMixin):
                             p_local_x * c_r - p_local_z * s_r,
                             p_local_y,
                             p_local_x * s_r + p_local_z * c_r
-                        ], dtype=np.float32)
+                        ], dtype=np.float64)
 
                         # Transform world frustum planes into planet local space (km)
                         R_rot = np.array([
@@ -5532,7 +5533,7 @@ class App(InputHandlerMixin):
                                 if d_perp_gl_km < max(grav_lens_radius * 20.0, grav_lens_rs * 100.0):
                                     D_local[:4] += (d_cam_body_km * 0.15)
 
-                        local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float32)
+                        local_frustum_planes = np.hstack([N_local, D_local[:, None]]).astype(np.float64)
 
                         obl = float(all_instances[b_i, 12])
                         terrain_body_data = bodies_data[b_i] if b_i < num_bodies else self.bodies_data_cmp[b_i - num_bodies]
@@ -5542,16 +5543,22 @@ class App(InputHandlerMixin):
                             elev_min_km, elev_max_km = 0.0, 8.848
                         elev_span_km = elev_max_km - elev_min_km
                         has_height = self.terrain_streamer.get_max_lod(b_name, "height") >= 0
-                        height_max_km = max(abs(elev_min_km), abs(elev_max_km)) if has_height else 0.0
-                        alt_km = max(0.0, d_cam_body_km - b_r_km)
+                        height_max_km = max(abs(elev_min_km), abs(elev_max_km)) + .35 if has_height else 0.0
+                        water_level = terrain_water_level(terrain_body_data)
+                        height_cull_range = (elev_min_km - .35,
+                                             max(elev_max_km + .35, water_level if water_level is not None else elev_max_km)) if has_height else (0., 0.)
+                        surface_altitude_km = self.terrain_streamer.surface_altitude(
+                            b_name, cam_pos_local, b_r_km, obl, elev_min_km, elev_span_km,
+                            terrain_water_level(terrain_body_data))
+                        alt_km = max(0.0, surface_altitude_km)
                         # Ground LOD closeness: smoothly adapts the LOD transition distance near the surface.
                         # alt_factor = 0.0 at ground level, 1.0 at 50 km altitude and above.
                         alt_factor = min(1.0, alt_km / 50.0)
                         default_global_dist = 1.0 / max(0.1, float(self.camera.get("terrain_lod_split_factor", 1.0))) if "terrain_lod_distance" not in self.camera else 1.0
                         global_dist = float(self.camera.get("terrain_lod_distance", default_global_dist))
                         ground_dist = float(self.camera.get("terrain_ground_lod_distance", 1.0))
-                        # Effective distance multiplier: near the ground, lower ground_dist brings high-quality LOD patches closer to the camera
-                        effective_dist = global_dist * (ground_dist + (1.0 - ground_dist) * alt_factor)
+                        # Lower ground_dist reduces the pixel threshold near the surface, adding local detail.
+                        effective_dist = global_dist / max(0.1, ground_dist + (1.0 - ground_dist) * alt_factor)
                         effective_dist = max(0.15, min(5.0, effective_dist))
                         split_fac = (1.0 / effective_dist) * res_scale
 
@@ -5563,6 +5570,8 @@ class App(InputHandlerMixin):
                             b_cloud_alt_km = float(_c_varr[b_i, 12] * 0.35) if _c_varr.shape[1] > 12 and _c_varr[b_i, 12] > 0 else 3.5
 
                         body_refract_bend = refract_max_bend if is_refract_host else 0.0
+                        body_frustum_bend = terrain_refraction_cull_bend(
+                            cam_pos_local, refract_radius_km, obl, body_refract_bend, refract_scale_height)
 
                         raw_patches = p_quadtree.traverse_raw(
                             cam_pos_local,
@@ -5574,26 +5583,11 @@ class App(InputHandlerMixin):
                             max_patches=rem_budget,
                             frustum_planes=local_frustum_planes,
                             cloud_alt_km=0.0,
-                            refract_bend=body_refract_bend, height_max_km=height_max_km
+                            refract_bend=body_refract_bend, height_max_km=height_max_km,
+                            surface_altitude_km=surface_altitude_km, frustum_bend=body_frustum_bend,
+                            height_cull_range=height_cull_range
                         )
                         num_p = len(raw_patches)
-
-                        if num_p == 0 and rem_budget > 0:
-                            # Fallback: if frustum culling rejected all patches but the sphere is on-screen,
-                            # traverse without frustum planes at LOD 0 to ensure the body never disappears.
-                            raw_patches = p_quadtree.traverse_raw(
-                                cam_pos_local,
-                                fov_deg=float(self.camera["fov"]),
-                                screen_height=float(self.fb_height),
-                                max_lod=0,
-                                split_factor=split_fac,
-                                obl=obl,
-                                max_patches=min(rem_budget, 6),
-                                frustum_planes=None,
-                                cloud_alt_km=0.0,
-                                refract_bend=body_refract_bend, height_max_km=height_max_km
-                            )
-                            num_p = len(raw_patches)
 
                         if num_p > 0:
                             st = total_patches_rendered
@@ -5607,11 +5601,11 @@ class App(InputHandlerMixin):
                                 raw_patches[:, 6], raw_patches[:, 7]
                             )
 
-                            pack_terrain_patches_jit(
+                            pack_terrain_patches(
                                 self.terrain_patch_staging, st, raw_patches,
                                 uvs[0], ox_arr[0], oy_arr[0], slots[0], float(b_i),
                                 uvs[1], ox_arr[1], oy_arr[1], slots[1], elev_min_km, elev_span_km,
-                                b_caster_idx, float(slot_idx)
+                                b_caster_idx, float(slot_idx), water_level=terrain_water_level(terrain_body_data)
                             )
 
                             self.terrain_active_body_patches[b_i] = (raw_patches, b_name, b_pos, b_r_km, obl, pole_n, rot_angle, st, num_p)
@@ -5642,25 +5636,9 @@ class App(InputHandlerMixin):
                                     frustum_planes=local_frustum_planes,
                                     cloud_alt_km=0.0,
                                     refract_bend=body_refract_bend,
-                                    height_max_km=0.0
+                                    height_max_km=0.0, frustum_bend=body_frustum_bend
                                 )
                                 num_cloud_p = len(cloud_raw_patches)
-                                if num_cloud_p == 0:
-                                    cloud_raw_patches = p_cloud_quadtree.traverse_raw(
-                                        cam_pos_local,
-                                        fov_deg=float(self.camera["fov"]),
-                                        screen_height=float(self.fb_height),
-                                        max_lod=0,
-                                        split_factor=cloud_split_fac,
-                                        obl=obl,
-                                        max_patches=6,
-                                        frustum_planes=None,
-                                        cloud_alt_km=0.0,
-                                        refract_bend=body_refract_bend,
-                                        height_max_km=0.0
-                                    )
-                                    num_cloud_p = len(cloud_raw_patches)
-
                                 if num_cloud_p > 0:
                                     c_slots, c_uvs, c_ox, c_oy = self.terrain_streamer.resolve_tiles_batch(
                                         b_name, "clouds",
@@ -5683,6 +5661,8 @@ class App(InputHandlerMixin):
                         terrain_patch_ssbo.bind_to_storage_buffer(binding=4)
                         all_instances_buffer.bind_to_storage_buffer(binding=2)
 
+                        self.terrain_streamer.prepare_height_table(dict(active_terrain_bodies))
+                        self.terrain_streamer.configure_height_program(self.prog_terrain)
                         self.terrain_streamer.use(location=14)
                         self.terrain_geometry_cache.prepare(
                             self.terrain_patch_staging[:total_patches_rendered],
@@ -7110,7 +7090,7 @@ class App(InputHandlerMixin):
                             cloud_staged_count = int(np.count_nonzero(c_slots >= 0.0))
                             if cloud_staged_count > 0:
                                 bi_caster_idx = float(self.caster_idx_map.get(bi, -1.0)) if hasattr(self, 'caster_idx_map') else -1.0
-                                pack_cloud_patches_jit(
+                                pack_cloud_patches(
                                     self.terrain_cloud_staging, 0,
                                     cloud_raw_p, c_uvs, c_ox, c_oy, c_slots, float(bi),
                                     bi_caster_idx, 0.0
