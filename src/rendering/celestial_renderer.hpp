@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/camera.hpp"
+#include "rendering/render_settings.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
 #include <array>
@@ -37,7 +38,7 @@ public:
     void shutdown(rhi::VkContext& ctx);
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                const ephemeris::SystemState& sys, VkExtent2D extent);
+                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
 
 private:
     void build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors, uint32_t stacks);

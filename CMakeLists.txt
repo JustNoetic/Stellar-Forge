@@ -136,3 +136,23 @@ target_link_libraries(StellarForge PRIVATE
     glslang-default-resource-limits
     SPIRV
 )
+
+option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
+if(STELLAR_BUILD_TESTS)
+    enable_testing()
+    add_executable(StellarStateTests
+        tests/state_tests.cpp
+        src/ephemeris/simulation.cpp
+        src/ephemeris/system_manager.cpp
+        src/core/path_utils.cpp
+    )
+    target_include_directories(StellarStateTests PRIVATE src)
+    target_compile_definitions(StellarStateTests PRIVATE
+        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_link_libraries(StellarStateTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
+    if(MINGW)
+        target_link_options(StellarStateTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    endif()
+    add_test(NAME state_contracts COMMAND StellarStateTests "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
+endif()

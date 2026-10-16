@@ -192,7 +192,8 @@ glm::dvec3 Camera::right_dir() const noexcept {
     return nr > 1e-9 ? (r / nr) : glm::dvec3{1.0, 0.0, 0.0};
 }
 
-void Camera::update(double dt_sec, const ephemeris::SystemState& sys) {
+void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys) {
+    double dt_sec = elapsed.value;
     glm::dvec3 rel_prev = cam_pos_rel;
 
     double lerp_factor = 1.0 - std::exp(-15.0 * dt_sec);
@@ -203,12 +204,12 @@ void Camera::update(double dt_sec, const ephemeris::SystemState& sys) {
     double track_f = 0.0;
     glm::dvec3 track_pole{0.0, 1.0, 0.0};
 
-    if (tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.bodies.size())) {
-        const auto& b = sys.bodies[tracking_idx];
-        origin_render = b.pos_render;
-        track_r = b.radius_au;
-        track_f = b.oblateness;
-        track_pole = b.pole_render;
+    if (tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.size())) {
+        const auto& b = sys.body(tracking_idx);
+        origin_render = b.render.position.value;
+        track_r = b.definition.radius_au();
+        track_f = b.definition.oblateness;
+        track_pole = b.render.pole;
     } else {
         origin_render = target_au;
     }
@@ -232,7 +233,7 @@ void Camera::update(double dt_sec, const ephemeris::SystemState& sys) {
         reference_altitude_au = std::max(0.0, glm::length(cam_pos_rel) - ref_r);
     }
 
-    if (track_r > 0.0 && tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.bodies.size()) &&
+    if (track_r > 0.0 && tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.size()) &&
         reference_altitude_au < ROT_FOLLOW_ALT_AU) {
         double alt_km = reference_altitude_au * AU_TO_KM;
         double rot_weight = 1.0;
@@ -240,7 +241,7 @@ void Camera::update(double dt_sec, const ephemeris::SystemState& sys) {
             double t = (alt_km - 50.0) / 150.0;
             rot_weight = 1.0 - (3.0 * t * t - 2.0 * t * t * t);
         }
-        double spin_angle = sys.bodies[tracking_idx].spin_angle_rad;
+        double spin_angle = sys.body(tracking_idx).render.spin_angle_rad;
         if (has_prev_spin && prev_spin_track_idx == tracking_idx) {
             double d_spin = std::fmod(spin_angle - prev_spin_angle + PI, TWO_PI);
             if (d_spin < 0.0) d_spin += TWO_PI;
@@ -331,7 +332,7 @@ void Camera::on_mouse_button(int button, int action, double xpos, double ypos) {
     }
 }
 
-void Camera::on_cursor_pos(double xpos, double ypos, const ephemeris::SystemState& sys) {
+void Camera::on_cursor_pos(double xpos, double ypos, const ephemeris::SystemSnapshot& sys) {
     double dx = xpos - last_mouse_x;
     double dy = ypos - last_mouse_y;
     last_mouse_x = xpos;
@@ -346,9 +347,9 @@ void Camera::on_cursor_pos(double xpos, double ypos, const ephemeris::SystemStat
 
     double track_f = 0.0;
     glm::dvec3 track_pole{0.0, 1.0, 0.0};
-    if (tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.bodies.size())) {
-        track_f = sys.bodies[tracking_idx].oblateness;
-        track_pole = sys.bodies[tracking_idx].pole_render;
+    if (tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.size())) {
+        track_f = sys.body(tracking_idx).definition.oblateness;
+        track_pole = sys.body(tracking_idx).render.pole;
     }
 
     if (left_dragging && right_dragging) {
@@ -384,14 +385,14 @@ void Camera::on_scroll(double yoffset, bool shift_held) {
     }
 }
 
-void Camera::snap_to_tracked(const ephemeris::SystemState& sys) {
+void Camera::snap_to_tracked(const ephemeris::SystemSnapshot& sys) {
     double r = glm::length(cam_pos_rel);
     if (r < 1e-30) {
         return;
     }
-    if (is_near_surface && tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.bodies.size())) {
-        const auto& b = sys.bodies[tracking_idx];
-        glm::dvec3 local_up = oblate_surface_normal(cam_pos_rel, b.oblateness, b.pole_render);
+    if (is_near_surface && tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.size())) {
+        const auto& b = sys.body(tracking_idx);
+        glm::dvec3 local_up = oblate_surface_normal(cam_pos_rel, b.definition.oblateness, b.render.pole);
         glm::dvec3 fwd = forward_dir();
         glm::dvec3 horiz = fwd - glm::dot(fwd, local_up) * local_up;
         if (glm::length(horiz) > 1e-6) {
@@ -411,25 +412,24 @@ void Camera::snap_to_tracked(const ephemeris::SystemState& sys) {
     cam_look_aim = true;
 }
 
-void Camera::focus_body(int body_idx, const ephemeris::SystemState& sys, bool fly_close) {
-    if (body_idx < 0 || body_idx >= static_cast<int>(sys.bodies.size())) {
+void Camera::focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool fly_close) {
+    if (body_idx < 0 || body_idx >= static_cast<int>(sys.size())) {
         return;
     }
-    inspected_idx = body_idx;
     if (!fly_close && tracking_idx != body_idx) {
-        glm::dvec3 old_eye = eye_pos_render();
+        glm::dvec3 old_eye = eye_pos_render().value;
         tracking_idx = body_idx;
-        origin_render = sys.bodies[body_idx].pos_render;
+        origin_render = sys.body(body_idx).render.position.value;
         cam_pos_rel = old_eye - origin_render;
         snap_to_tracked(sys);
         return;
     }
 
     tracking_idx = body_idx;
-    const auto& b = sys.bodies[body_idx];
-    origin_render = b.pos_render;
+    const auto& b = sys.body(body_idx);
+    origin_render = b.render.position.value;
 
-    double dist = std::max(b.radius_au * 4.5, 1e-6);
+    double dist = std::max(b.definition.radius_au() * 4.5, 1e-6);
     glm::dvec3 dir = glm::normalize(glm::dvec3{0.0, 0.38, 0.925});
     cam_pos_rel = dir * dist;
     up = {0.0, 1.0, 0.0};
@@ -437,7 +437,7 @@ void Camera::focus_body(int body_idx, const ephemeris::SystemState& sys, bool fl
     auto [yn, pn] = forward_to_angles(-dir);
     yaw_deg = yaw_actual_deg = yn;
     pitch_deg = pitch_actual_deg = pn;
-    flight_speed_au_s = std::clamp(b.radius_au * 2.0, 1e-9, MAX_FLIGHT_SPEED_AU_S);
+    flight_speed_au_s = std::clamp(b.definition.radius_au() * 2.0, 1e-9, MAX_FLIGHT_SPEED_AU_S);
 }
 
 glm::mat4 Camera::view_matrix_origin_relative() const noexcept {

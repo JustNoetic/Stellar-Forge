@@ -170,8 +170,8 @@ void StarCatalog::shutdown(rhi::VkContext& ctx) {
 }
 
 void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                         double sim_time_yr, VkExtent2D extent) const {
-    if (!loaded_ || !cam.show_gaia_stars || count_ == 0) {
+                         units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) const {
+    if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
         return;
     }
 
@@ -181,22 +181,22 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     float fov_rad = static_cast<float>(cam.fov_deg * DEG_TO_RAD);
     float fov_factor = 1.0f / (2.0f * std::tan(0.5f * fov_rad));
 
-    float star_size_px = std::clamp(cam.star_point_size * (fb_h / 1080.0f), 2.0f, 10.0f);
+    float star_size_px = std::clamp(settings.star_point_size * (fb_h / 1080.0f), 2.0f, 10.0f);
     float flux_calib = static_cast<float>(3.879 * std::pow(static_cast<double>(fb_h * fov_factor), 2.0) *
                                           star_size_px * star_size_px / 1.0e13);
 
     StarfieldPushConstants pc{};
     pc.view_proj = cam.proj_matrix(aspect, 0.1f) * cam.view_matrix_eye_relative();
-    pc.eye_world_au = glm::dvec4(cam.eye_pos_render(), 0.0);
-    pc.sim_time_yr = sim_time_yr;
+    pc.eye_world_au = glm::dvec4(cam.eye_pos_render().value, 0.0);
+    pc.sim_time_yr = sim_time.value;
     pc.flux_calib = flux_calib;
     pc.screen_height = fb_h;
-    pc.point_base_px = cam.star_point_size;
+    pc.point_base_px = settings.star_point_size;
     pc.min_point_px = 2.0f;
     pc.max_point_px = 10.0f;
-    pc.intensity_scale = cam.star_intensity;
-    pc.exposure = cam.exposure;
-    pc.hdr_enabled = cam.hdr_enabled ? 1u : 0u;
+    pc.intensity_scale = settings.star_intensity;
+    pc.exposure = settings.exposure;
+    pc.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle);
     rhi::PushDescriptorWrite writes[] = {

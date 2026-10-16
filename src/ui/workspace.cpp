@@ -66,7 +66,7 @@ void UiSystem::render(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t swapcha
     ctx.end_rendering(cmd);
 }
 
-WorkspaceLayout UiSystem::compute_layout(const WorkspaceSettings& settings, float fb_width, float fb_height) const {
+WorkspaceLayout UiSystem::compute_layout(const WorkspaceSettings& settings, const WorkspaceState& state, float fb_width, float fb_height) const {
     ImGuiIO& io = ImGui::GetIO();
     float width = io.DisplaySize.x > 0.0f ? io.DisplaySize.x : fb_width;
     float height = io.DisplaySize.y > 0.0f ? io.DisplaySize.y : fb_height;
@@ -82,7 +82,7 @@ WorkspaceLayout UiSystem::compute_layout(const WorkspaceSettings& settings, floa
     float outliner_w = std::min(settings.outliner_width * scale, width * 0.25f);
     float inspector_w = std::min(settings.inspector_width * scale, width * 0.40f);
     float left = settings.show_outliner ? (outliner_w + gap * 2.0f) : gap;
-    bool show_insp = settings.show_inspector && settings.has_inspected_body;
+    bool show_insp = settings.show_inspector && state.has_selection();
     float right = width - (show_insp ? (inspector_w + gap * 2.0f) : gap);
 
     return WorkspaceLayout{
@@ -92,8 +92,8 @@ WorkspaceLayout UiSystem::compute_layout(const WorkspaceSettings& settings, floa
     };
 }
 
-ImGuiWindowFlags UiSystem::prepare_side_panel(const WorkspaceSettings& settings, PanelSide side, WorkspaceLayout& out_layout) {
-    out_layout = compute_layout(settings, 0.0f, 0.0f);
+ImGuiWindowFlags UiSystem::prepare_side_panel(const WorkspaceSettings& settings, const WorkspaceState& state, PanelSide side, WorkspaceLayout& out_layout) {
+    out_layout = compute_layout(settings, state, 0.0f, 0.0f);
     float width = (side == PanelSide::Left) ? out_layout.outliner_width : out_layout.inspector_width;
     float x = (side == PanelSide::Left) ? out_layout.gap : (out_layout.width - width - out_layout.gap);
 

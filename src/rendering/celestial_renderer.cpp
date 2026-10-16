@@ -125,8 +125,8 @@ void CelestialRenderer::build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors,
 }
 
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                               const ephemeris::SystemState& sys, VkExtent2D extent) {
-    uint32_t count = std::min(static_cast<uint32_t>(sys.bodies.size()), MAX_CELESTIAL_BODIES);
+                               const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
+    uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
     if (count == 0) {
         return;
     }
@@ -139,39 +139,39 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     float fov_factor = 1.0f / (2.0f * std::tan(0.5f * fov_rad));
     float z_near = cam.compute_near_plane_au();
 
-    glm::dvec3 eye_pos = cam.eye_pos_render();
+    glm::dvec3 eye_pos = cam.eye_pos_render().value;
     glm::mat4 view = cam.view_matrix_eye_relative();
     glm::mat4 proj = cam.proj_matrix(aspect, z_near);
 
     SceneCelestialUBO ubo{};
     ubo.view = view;
     ubo.view_proj = proj * view;
-    ubo.screen_params = {fb_w, fb_h, fov_factor, cam.exposure};
+    ubo.screen_params = {fb_w, fb_h, fov_factor, settings.exposure};
     ubo.num_bodies = count;
-    ubo.hdr_enabled = cam.hdr_enabled ? 1u : 0u;
+    ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
 
     auto* inst_ptr = static_cast<BodyInstanceGPU*>(instance_ssbos_[f_idx].mapped);
 
     for (uint32_t i = 0; i < count; ++i) {
-        const auto& b = sys.bodies[i];
-        glm::vec3 rel_eye = glm::vec3(b.pos_render - eye_pos);
-        float r_au = static_cast<float>(b.radius_au);
+        const auto& b = sys.body(i);
+        glm::vec3 rel_eye = glm::vec3(camera_relative(b.render.position, cam.eye_pos_render()));
+        float r_au = static_cast<float>(b.definition.radius_au());
 
         BodyInstanceGPU inst{};
         inst.pos_radius = glm::vec4(rel_eye, r_au);
-        inst.color_is_star = glm::vec4(b.color_rgb, b.is_star ? 1.0f : 0.0f);
-        inst.pole_oblateness = glm::vec4(glm::vec3(b.pole_render), static_cast<float>(b.oblateness));
-        inst.pole_color_lum = glm::vec4(b.color_pole_rgb, static_cast<float>(b.lum_eq));
-        inst.spin_flags = glm::vec4(static_cast<float>(b.spin_angle_rad),
-                                    static_cast<float>(b.lum_pole),
-                                    b.is_black_hole ? 1.0f : 0.0f,
+        inst.color_is_star = glm::vec4(b.definition.color_rgb, b.definition.is_star ? 1.0f : 0.0f);
+        inst.pole_oblateness = glm::vec4(glm::vec3(b.render.pole), static_cast<float>(b.definition.oblateness));
+        inst.pole_color_lum = glm::vec4(b.definition.color_pole_rgb, static_cast<float>(b.definition.lum_eq));
+        inst.spin_flags = glm::vec4(static_cast<float>(b.render.spin_angle_rad),
+                                    static_cast<float>(b.definition.lum_pole),
+                                    b.definition.is_black_hole ? 1.0f : 0.0f,
                                     static_cast<float>(i));
         inst_ptr[i] = inst;
 
-        if (b.is_star && ubo.num_stars < MAX_SCENE_STARS) {
+        if (b.definition.is_star && ubo.num_stars < MAX_SCENE_STARS) {
             uint32_t s = ubo.num_stars++;
             ubo.stars_pos_radius[s] = glm::vec4(rel_eye, r_au);
-            ubo.stars_color_lum[s] = glm::vec4(b.color_rgb, static_cast<float>(std::max(b.lum_eq, 1e-4)));
+            ubo.stars_color_lum[s] = glm::vec4(b.definition.color_rgb, static_cast<float>(std::max(b.definition.lum_eq, 1e-4)));
         }
     }
 

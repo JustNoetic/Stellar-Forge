@@ -14,6 +14,9 @@
 | **Mandatory Shared Boilerplate** | NEVER write raw Vulkan buffer/image/pipeline/barrier/renderpass boilerplate or raw ImGui layout math inside feature modules. Always call the shared helpers in `sf::rhi`, `sf::paths`, `sf::math`, and `sf::ui`. | Section 2 below |
 | **Graphics API** | Full **Vulkan 1.3** (`volk` + `VMA`). Dynamic Rendering (`vkCmdBeginRendering`), Synchronization2 (`vkCmdPipelineBarrier2`), Push Descriptors (`vkCmdPushDescriptorSetKHR`, `set = 0`), Buffer Device Address. No `VkRenderPass` or `VkFramebuffer`. | `src/rhi/vk_context.hpp`, `src/rhi/shader_cache.hpp` |
 | **Depth & Projection** | **Reverse-Z** (`[1.0 -> 0.0]`, clear to `0.0f`, `VK_COMPARE_OP_GREATER_OR_EQUAL`) with infinite far plane and `GLM_FORCE_DEPTH_ZERO_TO_ONE`. | `sf::math::reverse_z_perspective`, `RenderingAttachment::clear_depth_reverse_z` |
+| **State Ownership** | `Simulation` owns physical definitions, motion and prepared render state. Consumers read `SystemSnapshot`; mutate through validated commands. `RenderSettingsStore`, `Camera`, `WorkspaceSettings`, and `WorkspaceState` have separate responsibilities. | `docs/state_ownership.md`, `src/ephemeris/simulation.hpp` |
+| **Typed Boundaries** | Frame time: `units::Seconds`; simulation time: `units::Years`. Positions/velocities use distinct Ecliptic/Render types. Explicit `.value` only at numerical, UI and GPU boundaries. | `src/core/units.hpp`, `src/core/coordinates.hpp` |
+| **Definition Edits & Cache Keys** | Apply complete physical drafts atomically; reject stale generation/body revision. Domain cache keys include generation + body identity + dynamics/geometry/lighting revision. No change means no invalidation. | `src/ui/inspector_state.hpp`, `src/ephemeris/simulation.hpp` |
 | **Coordinate Transform** | Physics is Ecliptic `(x, y, z)` in `double`. Render is `(x, z, -y)` (`Y` up, `-Z` forward). Always convert via `sf::ecliptic_to_render` / `sf::render_to_ecliptic`. | `src/core/constants.hpp` |
 | **Units: Distance** | Interplanetary: `AU`. Radii / Altitudes: `km`. Conversion: `AU_TO_KM = 149597870.7`, `KM_TO_AU = 1.0 / AU_TO_KM`. | `src/core/constants.hpp` |
 | **Units: Time & Mass** | Orbital physics: `years` (`SECONDS_PER_YEAR = 365.25 * 86400.0`). Frame delta: `seconds`. Mass in Solar Masses ($M_\odot$), `G_CONST = 39.476926421373`. | `src/core/constants.hpp` |
@@ -26,6 +29,9 @@
 
 | Need | Shared Helper / Symbol | Header |
 | :--- | :--- | :--- |
+| **Simulation State / Commands** | `simulation.snapshot()` (live const reference), `simulation.advance(units::Seconds{...})`, `simulation.apply(SetPaused / SetTimeWarp / ApplyBodyPhysicalProperties)` | `src/ephemeris/simulation.hpp` |
+| **Rendering Settings** | `RenderSettingsStore::values`, `apply`, `revision`: validated whole-settings update; camera owns no rendering controls | `src/rendering/render_settings.hpp` |
+| **Inspector Drafts** | `BodyEditDraft::synchronize`, `reload`, `command`: draft edit -> Apply or Revert, with stale edit rejection | `src/ui/inspector_state.hpp` |
 | **Create GPU Buffer (Device-Local + Staging Upload)** | `vk.create_device_buffer(size, usage, initial_data)` | `src/rhi/vk_context.hpp` |
 | **Create Host-Mapped Buffer (UBO / Dynamic SSBO / Staging)** | `vk.create_host_buffer(size, usage, initial_data)` (`buf.mapped` is persistently mapped, `buf.address` has `VkDeviceAddress`) | `src/rhi/vk_context.hpp` |
 | **Create 2D / Array / 3D Texture or Render Target** | `vk.create_image_2d(w, h, format, usage, mips, layers)` / `vk.create_image_3d(...)` / `vk.upload_image_2d(img, pixels, bytes)` | `src/rhi/vk_context.hpp` |
@@ -40,7 +46,7 @@
 | **GPU Pass Timestamp Profiling** | `uint32_t id = vk.begin_gpu_timer(cmd, "gpu_pass"); ... vk.end_gpu_timer(cmd, id);` -> read via `vk.gpu_time_ms("gpu_pass")` | `src/rhi/vk_context.hpp` |
 | **File & JSON Load / Save** | `sf::paths::read_text_file`, `read_binary_file`, `write_binary_file`, `read_json`, `write_json` | `src/core/path_utils.hpp` |
 | **Logging & Fatal Assertions** | `sf::log::info(...)`, `sf::log::warn(...)`, `sf::log::error(...)`, `sf::log::fatal(...)`, `VK_CHECK(expr)` | `src/core/log.hpp`, `src/rhi/vk_types.hpp` |
-| **ImGui Side Panels & Theme** | `ui.prepare_side_panel(settings, PanelSide::Left/Right, layout)` / `ui.compute_layout(...)` | `src/ui/workspace.hpp` |
+| **ImGui Side Panels & Theme** | `ui.prepare_side_panel(settings, state, PanelSide::Left/Right, layout)` / `ui.compute_layout(...)` | `src/ui/workspace.hpp` |
 | **ImGui Inspector Widgets** | `sf::ui::heading(title, subtitle)`, `sf::ui::section(title, note)`, `sf::ui::value_row(label, val)`, `sf::ui::metric_text(str)`, `sf::ui::field(label, [&](const char* id){ ... })` | `src/ui/workspace.hpp` |
 
 ---
@@ -56,11 +62,15 @@
 | **Keplerian / Universal Conic Math & Reverse-Z** | `src/core/math_utils.hpp` | `stumpff_cs`, `propagate_conic_state`, `conic_time_at_angle`, `orbital_to_cartesian`, `vector_orbital_to_cartesian`, `pole_to_ecliptic`, `reverse_z_perspective` |
 | **Path Resolution & JSON/Binary I/O** | `src/core/path_utils.hpp`<br>`src/core/path_utils.cpp` | `project_root`, `bundled_path`, `external_path`, `read_json`, `write_json` |
 | **Dear ImGui Workspace & Shared Widgets** | `src/ui/workspace.hpp`<br>`src/ui/workspace.cpp` | `sf::ui::UiSystem`, `WorkspaceSettings`, `WorkspaceLayout`, `heading`, `section`, `value_row`, `field` |
-| **System Preset Loader & Analytical Propagator** | `src/ephemeris/system_manager.hpp`<br>`src/ephemeris/system_manager.cpp` | `sf::ephemeris::SystemManager`, `CelestialBody`, `BodyType`, `RingParams`, `AtmosphereParams` |
-| **64-Bit Camera Controller & Precision Modes** | `src/core/camera.hpp`<br>`src/core/camera.cpp` | `sf::Camera`, `CameraMode`, `update_free_flight`, `update_orbit`, `ray_sphere_intersect` |
-| **Gaia DR3 Starfield Renderer (~460k Stars)** | `src/rendering/star_catalog.hpp`<br>`src/rendering/star_catalog.cpp`<br>`shaders/celestial/starfield.vert`<br>`shaders/celestial/starfield.frag` | `sf::rendering::StarCatalog`, `StarRecord`, `StarPush` |
-| **3D Celestial Spheres & Subpixel Point Lights** | `src/rendering/celestial_renderer.hpp`<br>`src/rendering/celestial_renderer.cpp`<br>`shaders/celestial/sphere.vert`<br>`shaders/celestial/sphere.frag`<br>`shaders/celestial/point_celestial.vert`<br>`shaders/celestial/point_celestial.frag` | `sf::rendering::CelestialRenderer`, `SpherePush`, `PointCelestialInstance`, `PointCelestialPush` |
-| **HDR Post-Processing & Tone Mapping** | `shaders/common/tonemap.glsl`<br>`shaders/post/fullscreen.vert`<br>`shaders/post/composite.frag` | `aces_tonemap`, `linear_to_srgb`, `CompositePush` |
+| **System Preset Loader & Analytical Propagator** | `src/ephemeris/system_manager.hpp`<br>`src/ephemeris/system_manager.cpp` | `SystemManager::parse_system`, `serialize_definition`, `LoadedSystem`, `SystemDefinition`, `BodyDefinition`, `BodyMotion`, `SystemSnapshot`, `BodyView` |
+| **Simulation Ownership / Clock / Physical Edits** | `src/ephemeris/simulation.hpp/.cpp`<br>`docs/state_ownership.md` | `Simulation`, `SimulationClock`, `SetPaused`, `SetTimeWarp`, `ApplyBodyPhysicalProperties`, `BodyRevisions` |
+| **Typed Units & Coordinates** | `src/core/units.hpp`<br>`src/core/coordinates.hpp` | `Seconds`, `Years`, `Kilometres`, `AstronomicalUnits`, `SolarMasses`, `EclipticPosition`, `RenderPosition`, `EclipticVelocity`, `RenderVelocity`, `camera_relative` |
+| **Render Controls / UI Selection / Drafts** | `src/rendering/render_settings.hpp`<br>`src/ui/inspector_state.hpp` | `RenderSettingsStore`, `RenderSettings`, `WorkspaceState`, `BodyEditDraft` |
+| **CPU State Contract Tests** | `tests/state_tests.cpp`<br>`CMakeLists.txt` | `StellarStateTests`, `ctest --test-dir build --output-on-failure`, `STELLAR_BUILD_TESTS` |
+| **64-Bit Camera Controller & Precision Modes** | `src/core/camera.hpp`<br>`src/core/camera.cpp` | `Camera::update(Seconds, snapshot)`, `focus_body`, `eye_pos_render`, `compute_near_plane_au` |
+| **Gaia DR3 Starfield Renderer (~460k Stars)** | `src/rendering/star_catalog.hpp`<br>`src/rendering/star_catalog.cpp`<br>`shaders/celestial/starfield.vert`<br>`shaders/celestial/starfield.frag` | `StarCatalog`, `StarGpuRecord`, `StarfieldPushConstants` |
+| **3D Celestial Spheres & Subpixel Point Lights** | `src/rendering/celestial_renderer.hpp`<br>`src/rendering/celestial_renderer.cpp`<br>`shaders/celestial/sphere.vert`<br>`shaders/celestial/sphere.frag`<br>`shaders/celestial/point_celestial.vert`<br>`shaders/celestial/point_celestial.frag` | `CelestialRenderer`, `SceneCelestialUBO`, `BodyInstanceGPU` |
+| **HDR Post-Processing & Tone Mapping** | `shaders/common/tonemap.glsl`<br>`shaders/post/fullscreen.vert`<br>`shaders/post/composite.frag` | `aces_tonemap`, `linear_to_srgb` |
 
 ---
 
@@ -76,13 +86,17 @@ Stellar Forge Rewrite/
 │   ├── app.hpp / app.cpp           # Window, input, HDR/Reverse-Z frame loop, Outliner/Inspector/HUD workspace
 │   ├── core/
 │   │   ├── camera.hpp / .cpp       # FP64 camera (Free Flight, Simple Orbit, Near-Surface), log-depth zoom, ray picking
+│   │   ├── units.hpp / coordinates.hpp # Explicit units and framed positions/velocities
+│   │   ├── command_result.hpp    # Shared atomic command result
 │   │   ├── constants.hpp           # Astronomical constants & Ecliptic <-> Render transforms
 │   │   ├── log.hpp                 # Formatted stdout/stderr logging & fatal handler
 │   │   ├── math_utils.hpp          # FP64 Kepler/Stumpff conic propagators, frames, Reverse-Z perspective
 │   │   └── path_utils.hpp / .cpp   # Bundled/external path resolution, binary & JSON file I/O
 │   ├── ephemeris/
-│   │   └── system_manager.hpp/.cpp # JSON system loader, parent-child hierarchy, analytical Keplerian propagation
+│   │   ├── system_manager.hpp/.cpp # JSON definitions, motion seeds, immutable snapshot interfaces
+│   │   └── simulation.hpp/.cpp   # State owner, clock, validated commands, analytical propagation
 │   ├── rendering/
+│   │   ├── render_settings.hpp  # Validated render controls, separate from camera pose
 │   │   ├── star_catalog.hpp / .cpp # Gaia DR3 stars.bin loader & motion-blurred Airy point-sprite pipeline
 │   │   └── celestial_renderer.hpp/.cpp # Lat/lon UV sphere mesh, 3D star/planet shader, subpixel diffraction beacon pass
 │   ├── rhi/
@@ -90,6 +104,7 @@ Stellar Forge Rewrite/
 │   │   ├── vk_context.hpp / .cpp   # Vulkan 1.3 device, VMA, swapchain, Sync2 barriers, Dynamic Rendering, GPU timers
 │   │   └── shader_cache.hpp / .cpp # Recursive #include resolver, glslang SPIR-V compiler, disk cache, pipeline builders
 │   └── ui/
+│       ├── inspector_state.hpp  # Selection, transient state, atomic physical drafts
 │       └── workspace.hpp / .cpp    # ImGui Vulkan backend, Slate/Cyan/Amber theme, layout & inspector widget helpers
 ├── shaders/
 │   ├── celestial/
@@ -101,6 +116,8 @@ Stellar Forge Rewrite/
 │   └── post/
 │       ├── fullscreen.vert         # Shared vertex-pulling fullscreen triangle
 │       └── composite.frag          # HDR exposure & tone-mapping composite pass
+├── docs/state_ownership.md         # Ownership, mutation, units and invalidation contracts
+├── tests/state_tests.cpp           # CPU contract tests and preset checks
 ├── data/                           # Isolated runtime data (systems/, gaia/stars.bin, kernels/, tiles/)
 └── textures/                       # Isolated planetary surface & ring textures
 ```
@@ -112,6 +129,7 @@ Stellar Forge Rewrite/
 1. **[DONE] Phase 1 — Foundation, Shared RHI/Core/UI Boilerplate & SPIR-V Pipeline**
 2. **[DONE] Phase 2 — Data Model (`SystemManager`), FP64 Camera Controller, Gaia DR3 Starfield & Basic Celestial Spheres**
    - Ported `SystemManager` (`data/systems/*.json`), 64-bit `Camera` (Free Flight, Simple Orbit, Near-Surface, raycast picking), `StarCatalog` (`data/gaia/stars.bin`), and `CelestialRenderer` (`sphere.{vert,frag}` + `point_celestial.{vert,frag}`).
+   - **[DONE] Ownership foundation**: separated immutable definitions, live motion, prepared render state, render controls and transient UI state; typed time/coordinate boundaries; validated physical drafts; domain revisions and CPU contract tests. See `docs/state_ownership.md`.
 3. **[NEXT] Phase 3 — Physics & Ephemeris Engine (`src/physics/`, `src/ephemeris/`)**
    - Port `physics_core.py` (IAS15 adaptive integrator + 1PN relativity + $J_2/J_4$), `kepler_analytical.py`, `orbit_curve.glsl` + `orbit_layer.py`, and NASA SPICE (`CSPICE`) / Lagrange frames.
 4. **Phase 4 — Native C++ Terrain Quadtree, Async Tile Streamer & GPU Surface Caches (`src/terrain/`)**

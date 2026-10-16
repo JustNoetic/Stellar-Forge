@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <unordered_set>
+#include <stdexcept>
 
 namespace sf::ephemeris {
 
@@ -35,7 +36,7 @@ void topo_visit(int idx, const nlohmann::json& raw_arr,
 
 } // namespace
 
-int SystemState::find_body(std::string_view body_name) const {
+int SystemDefinition::find_body(std::string_view body_name) const {
     auto it = name_to_idx.find(std::string(body_name));
     return it != name_to_idx.end() ? it->second : -1;
 }
@@ -192,7 +193,7 @@ std::vector<std::string> SystemManager::list_systems() const {
     return names;
 }
 
-SystemState SystemManager::load_system(std::string_view name) const {
+LoadedSystem SystemManager::load_system(std::string_view name) const {
     std::filesystem::path path = sf::paths::external_path("data", "systems", name, "system.json");
     if (!std::filesystem::exists(path)) {
         path = sf::paths::external_path("data", "system.json");
@@ -202,12 +203,29 @@ SystemState SystemManager::load_system(std::string_view name) const {
     if (!raw_opt || !raw_opt->is_array()) {
         sf::log::fatal("Failed to load system JSON at {}", path.string());
     }
-    const auto& raw_arr = *raw_opt;
+    return parse_system(*raw_opt, name);
+}
+
+LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::string_view name) {
+    if (!raw_arr.is_array() || raw_arr.empty()) throw std::invalid_argument("System must contain at least one body.");
 
     std::unordered_map<std::string, int> raw_map;
     for (int i = 0; i < static_cast<int>(raw_arr.size()); ++i) {
         if (raw_arr[i].contains("name") && raw_arr[i]["name"].is_string()) {
-            raw_map[raw_arr[i]["name"].get<std::string>()] = i;
+            auto key = raw_arr[i]["name"].get<std::string>();
+            if (key.empty() || !raw_map.emplace(key, i).second) throw std::invalid_argument("Body names must be nonempty and unique.");
+        } else {
+            throw std::invalid_argument("Every body needs a name.");
+        }
+    }
+    for (const auto& item : raw_arr) {
+        std::unordered_set<std::string> chain;
+        std::string current = item.at("name").get<std::string>();
+        while (!current.empty()) {
+            if (!chain.insert(current).second) throw std::invalid_argument("Body hierarchy contains a cycle.");
+            auto it = raw_map.find(current);
+            if (it == raw_map.end()) throw std::invalid_argument("Body parent does not exist.");
+            current = raw_arr[it->second].value("parentId", "");
         }
     }
 
@@ -218,14 +236,16 @@ SystemState SystemManager::load_system(std::string_view name) const {
         topo_visit(i, raw_arr, raw_map, visited, sorted_order);
     }
 
-    SystemState state{};
+    LoadedSystem loaded{};
+    auto& state = loaded.definition;
     state.name = std::string(name);
     state.bodies.reserve(sorted_order.size());
 
     for (int old_idx : sorted_order) {
         const auto& j = raw_arr[old_idx];
-        CelestialBody b{};
-        b.raw_json = j;
+        BodyDefinition b{};
+        BodyMotion motion{};
+        b.source_json = j;
         b.name = j.value("name", "Body");
         b.type = j.value("type", "Terrestrial");
         b.parent_id = j.value("parentId", "");
@@ -274,14 +294,10 @@ SystemState SystemManager::load_system(std::string_view name) const {
             b.is_black_hole = true;
             double rs_km = 2.95325008 * b.mass_msun;
             b.radius_rsun = rs_km / SOLAR_RADIUS_KM;
-            b.radius_au = (2.5980762 * rs_km) / AU_TO_KM;
-        } else {
-            b.radius_au = b.radius_rsun * SOLAR_RADII_TO_AU;
         }
 
         if (j.contains("pole_ra") && j.contains("pole_dec")) {
             b.pole_ecl = sf::math::pole_to_ecliptic(b.pole_ra_deg, b.pole_dec_deg);
-            b.pole_render = glm::normalize(sf::ecliptic_to_render(b.pole_ecl));
         }
 
         int new_idx = static_cast<int>(state.bodies.size());
@@ -298,8 +314,8 @@ SystemState SystemManager::load_system(std::string_view name) const {
         double p_mass = 0.0;
         if (b.parent_idx >= 0) {
             const auto& parent = state.bodies[b.parent_idx];
-            p_pos = parent.pos_ecl;
-            p_vel = parent.vel_ecl;
+            p_pos = loaded.motions[b.parent_idx].position.value;
+            p_vel = loaded.motions[b.parent_idx].velocity.value;
             p_mass = parent.mass_msun;
         }
 
@@ -307,8 +323,8 @@ SystemState SystemManager::load_system(std::string_view name) const {
             const auto& sv = j["sv"];
             glm::dvec3 rel_p{sv.value("x", 0.0), sv.value("y", 0.0), sv.value("z", 0.0)};
             glm::dvec3 rel_v{sv.value("vx", 0.0), sv.value("vy", 0.0), sv.value("vz", 0.0)};
-            b.pos_ecl = p_pos + rel_p;
-            b.vel_ecl = p_vel + rel_v;
+            motion.position = EclipticPosition{p_pos + rel_p};
+            motion.velocity = EclipticVelocity{p_vel + rel_v};
         } else if (b.parent_idx >= 0) {
             auto [rel_p, rel_v] = sf::math::get_cartesian_from_keplerian(
                 p_mass, b.mass_msun, b.semi_major_au, b.eccentricity,
@@ -319,112 +335,53 @@ SystemState SystemManager::load_system(std::string_view name) const {
                 rel_p = R * rel_p;
                 rel_v = R * rel_v;
             }
-            b.pos_ecl = p_pos + rel_p;
-            b.vel_ecl = p_vel + rel_v;
+            motion.position = EclipticPosition{p_pos + rel_p};
+            motion.velocity = EclipticVelocity{p_vel + rel_v};
         }
 
         if (b.is_star && state.star_idx == 0 && new_idx > 0 && !state.bodies[0].is_star) {
             state.star_idx = new_idx;
         }
         state.bodies.push_back(std::move(b));
+        loaded.motions.push_back(motion);
     }
 
-    double total_mass = 0.0;
-    glm::dvec3 com_pos{0.0};
-    glm::dvec3 com_vel{0.0};
-    for (const auto& b : state.bodies) {
-        total_mass += b.mass_msun;
-        com_pos += b.mass_msun * b.pos_ecl;
-        com_vel += b.mass_msun * b.vel_ecl;
-    }
-    if (total_mass > 0.0) {
-        com_pos /= total_mass;
-        com_vel /= total_mass;
-        for (auto& b : state.bodies) {
-            b.pos_ecl -= com_pos;
-            b.vel_ecl -= com_vel;
-        }
-    }
-
-    sync_render_coords(state, 0.0);
     sf::log::info("Loaded system '{}' with {} bodies", state.name, state.bodies.size());
-    return state;
+    return loaded;
 }
 
-bool SystemManager::save_system(std::string_view name, const SystemState& state) const {
-    nlohmann::json arr = nlohmann::json::array();
-    for (const auto& b : state.bodies) {
-        arr.push_back(b.raw_json);
+nlohmann::json SystemManager::serialize_definition(const SystemDefinition& definition) {
+    auto arr = nlohmann::json::array();
+    for (const auto& b : definition.bodies) {
+        auto j = b.source_json;
+        j["name"] = b.name;
+        j["type"] = b.type;
+        j["parentId"] = b.parent_id;
+        j["m"] = b.mass_msun;
+        j["r"] = b.radius_rsun;
+        j["oblateness"] = b.oblateness;
+        j["J2"] = b.j2;
+        j["j4"] = b.j4;
+        j["a"] = b.semi_major_au;
+        j["e"] = b.eccentricity;
+        j["inc"] = b.inc_deg;
+        j["Omega"] = b.omega_node_deg;
+        j["omega"] = b.arg_peri_deg;
+        j["M"] = b.mean_anom_deg;
+        j["rotation_period"] = b.rotation_period_hr;
+        j["W0"] = b.w0_deg;
+        j["tidally_locked"] = b.tidally_locked;
+        j["lum_eq"] = b.lum_eq;
+        j["lum_pole"] = b.lum_pole;
+        j["color"] = rgb_to_hex(b.color_rgb);
+        j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+        arr.push_back(std::move(j));
     }
-    auto path = sf::paths::external_path("data", "systems", name, "system.json");
-    return sf::paths::write_json(path, arr, 2);
+    return arr;
 }
 
-void SystemManager::sync_render_coords(SystemState& state, double sim_time_yr) noexcept {
-    double t_sec = sim_time_yr * SECONDS_PER_YEAR;
-    for (auto& b : state.bodies) {
-        b.pos_render = sf::ecliptic_to_render(b.pos_ecl);
-        b.vel_render = sf::ecliptic_to_render(b.vel_ecl);
-
-        double w0_rad = b.w0_deg * DEG_TO_RAD;
-        if (b.tidally_locked && b.parent_idx >= 0) {
-            glm::dvec3 rel = b.pos_render - state.bodies[b.parent_idx].pos_render;
-            b.spin_angle_rad = std::atan2(rel.z, rel.x) + PI + w0_rad;
-        } else if (std::abs(b.rotation_period_hr) > 1e-9) {
-            double omega = TWO_PI / (b.rotation_period_hr * 3600.0);
-            b.spin_angle_rad = std::fmod(w0_rad + omega * t_sec, TWO_PI);
-        } else {
-            b.spin_angle_rad = w0_rad;
-        }
-    }
+bool SystemManager::save_system(std::string_view name, const SystemDefinition& definition) const {
+    return sf::paths::write_json(sf::paths::external_path("data", "systems", name, "system.json"), serialize_definition(definition), 2);
 }
 
-void SystemManager::step_keplerian(SystemState& state, double dt_yr, double sim_time_yr) noexcept {
-    if (std::abs(dt_yr) <= 0.0 || state.bodies.empty()) {
-        sync_render_coords(state, sim_time_yr);
-        return;
-    }
-
-    std::vector<glm::dvec3> old_pos(state.bodies.size());
-    std::vector<glm::dvec3> old_vel(state.bodies.size());
-    for (size_t i = 0; i < state.bodies.size(); ++i) {
-        old_pos[i] = state.bodies[i].pos_ecl;
-        old_vel[i] = state.bodies[i].vel_ecl;
-    }
-
-    for (size_t i = 0; i < state.bodies.size(); ++i) {
-        auto& b = state.bodies[i];
-        if (b.parent_idx >= 0) {
-            int p = b.parent_idx;
-            glm::dvec3 rel_p = old_pos[i] - old_pos[p];
-            glm::dvec3 rel_v = old_vel[i] - old_vel[p];
-            double mu = G_CONST * (state.bodies[p].mass_msun + b.mass_msun);
-            auto [new_rel_p, new_rel_v] = sf::math::propagate_conic_state(rel_p, rel_v, mu, dt_yr);
-            b.pos_ecl = state.bodies[p].pos_ecl + new_rel_p;
-            b.vel_ecl = state.bodies[p].vel_ecl + new_rel_v;
-        } else {
-            b.pos_ecl += b.vel_ecl * dt_yr;
-        }
-    }
-
-    double total_mass = 0.0;
-    glm::dvec3 com_pos{0.0};
-    glm::dvec3 com_vel{0.0};
-    for (const auto& b : state.bodies) {
-        total_mass += b.mass_msun;
-        com_pos += b.mass_msun * b.pos_ecl;
-        com_vel += b.mass_msun * b.vel_ecl;
-    }
-    if (total_mass > 0.0) {
-        com_pos /= total_mass;
-        com_vel /= total_mass;
-        for (auto& b : state.bodies) {
-            b.pos_ecl -= com_pos;
-            b.vel_ecl -= com_vel;
-        }
-    }
-
-    sync_render_coords(state, sim_time_yr);
 }
-
-} // namespace sf::ephemeris

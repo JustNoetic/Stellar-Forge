@@ -2,6 +2,8 @@
 
 #include "core/camera.hpp"
 #include "ephemeris/system_manager.hpp"
+#include "ephemeris/simulation.hpp"
+#include "rendering/render_settings.hpp"
 #include "rendering/celestial_renderer.hpp"
 #include "rendering/star_catalog.hpp"
 #include "rhi/shader_cache.hpp"
@@ -40,7 +42,11 @@ private:
     ui::WorkspaceSettings ui_settings_{};
 
     ephemeris::SystemManager sys_mgr_{};
-    ephemeris::SystemState system_{};
+    ephemeris::Simulation simulation_{};
+    rendering::RenderSettingsStore render_settings_{};
+    ui::WorkspaceState ui_state_{};
+
+    const ephemeris::SystemSnapshot& system() const noexcept { return simulation_.snapshot(); }
     std::vector<std::string> system_names_;
 
     Camera camera_{};
@@ -52,11 +58,7 @@ private:
     rhi::Pipeline composite_pipeline_{};
 
     bool self_test_ = false;
-    bool paused_ = false;
-    double sim_warp_ = 1.0;
-    double sim_time_yr_ = 0.0;
-    double frame_dt_ = 0.0;
-    double elapsed_sec_ = 0.0;
+    units::Seconds frame_dt_{};
 };
 
 } // namespace sf

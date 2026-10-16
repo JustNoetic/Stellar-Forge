@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/camera.hpp"
+#include "rendering/render_settings.hpp"
 #include "rhi/vk_context.hpp"
 #include <filesystem>
 #include <glm/glm.hpp>
@@ -20,7 +21,7 @@ public:
     void shutdown(rhi::VkContext& ctx);
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                double sim_time_yr, VkExtent2D extent) const;
+                units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) const;
 
     bool loaded() const noexcept { return loaded_; }
     uint32_t count() const noexcept { return count_; }

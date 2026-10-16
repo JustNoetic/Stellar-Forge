@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rhi/vk_context.hpp"
+#include "ui/inspector_state.hpp"
 #include <imgui.h>
 #include <string_view>
 
@@ -17,11 +18,9 @@ struct WorkspaceSettings {
     bool show_outliner = true;
     bool show_inspector = true;
     bool show_time_hud = true;
-    bool has_inspected_body = true;
     float outliner_width = 260.0f;
     float inspector_width = 420.0f;
     float scale = 1.0f;
-    uint32_t layout_revision = 0;
 };
 
 struct WorkspaceLayout {
@@ -52,8 +51,8 @@ public:
     void begin_frame(const WorkspaceSettings& settings);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t swapchain_idx);
 
-    WorkspaceLayout compute_layout(const WorkspaceSettings& settings, float fb_width, float fb_height) const;
-    ImGuiWindowFlags prepare_side_panel(const WorkspaceSettings& settings, PanelSide side, WorkspaceLayout& out_layout);
+    WorkspaceLayout compute_layout(const WorkspaceSettings& settings, const WorkspaceState& state, float fb_width, float fb_height) const;
+    ImGuiWindowFlags prepare_side_panel(const WorkspaceSettings& settings, const WorkspaceState& state, PanelSide side, WorkspaceLayout& out_layout);
 
 private:
     void apply_theme(float scale);

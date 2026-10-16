@@ -23,19 +23,12 @@ struct Camera {
     double flight_speed_au_s = 0.1;
     double approach_delta = 0.0;
 
-    float exposure = 1.0f;
-    bool hdr_enabled = true;
-    bool show_gaia_stars = true;
-    float star_point_size = 2.0f;
-    float star_intensity = 1.0f;
-
     int movement_mode = 0;
     bool cam_look_aim = true;
     bool horizon_align = true;
     bool is_near_surface = false;
 
     int tracking_idx = 0;
-    int inspected_idx = 0;
 
     bool left_dragging = false;
     bool right_dragging = false;
@@ -56,17 +49,17 @@ struct Camera {
     double prev_spin_angle = 0.0;
     bool has_prev_spin = false;
 
-    void update(double dt_sec, const ephemeris::SystemState& sys);
+    void update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys);
     void on_mouse_button(int button, int action, double xpos, double ypos);
-    void on_cursor_pos(double xpos, double ypos, const ephemeris::SystemState& sys);
+    void on_cursor_pos(double xpos, double ypos, const ephemeris::SystemSnapshot& sys);
     void on_scroll(double yoffset, bool shift_held);
-    void snap_to_tracked(const ephemeris::SystemState& sys);
-    void focus_body(int body_idx, const ephemeris::SystemState& sys, bool fly_close = false);
+    void snap_to_tracked(const ephemeris::SystemSnapshot& sys);
+    void focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool fly_close = false);
 
     glm::dvec3 forward_dir() const noexcept;
     glm::dvec3 up_dir() const noexcept;
     glm::dvec3 right_dir() const noexcept;
-    glm::dvec3 eye_pos_render() const noexcept { return origin_render + cam_pos_rel; }
+    RenderPosition eye_pos_render() const noexcept { return RenderPosition{origin_render + cam_pos_rel}; }
 
     glm::mat4 view_matrix_origin_relative() const noexcept;
     glm::mat4 view_matrix_eye_relative() const noexcept;

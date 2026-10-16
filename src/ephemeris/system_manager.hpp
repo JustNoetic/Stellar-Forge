@@ -1,5 +1,9 @@
 #pragma once
 
+#include "core/coordinates.hpp"
+#include "core/units.hpp"
+#include <memory>
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -20,7 +24,7 @@ struct DerivedStarProperties {
     double progress_pct = 46.0;
 };
 
-struct CelestialBody {
+struct BodyDefinition {
     std::string name;
     std::string type = "Terrestrial";
     std::string parent_id;
@@ -35,7 +39,6 @@ struct CelestialBody {
 
     double mass_msun = 0.0;
     double radius_rsun = 1.0;
-    double radius_au = 0.0;
     double oblateness = 0.0;
     double j2 = 0.0;
     double j4 = 0.0;
@@ -60,24 +63,82 @@ struct CelestialBody {
     glm::vec3 color_pole_rgb{1.0f, 1.0f, 1.0f};
 
     glm::dvec3 pole_ecl{0.0, 0.0, 1.0};
-    glm::dvec3 pole_render{0.0, 1.0, 0.0};
+    nlohmann::json source_json;
 
-    glm::dvec3 pos_ecl{0.0};
-    glm::dvec3 vel_ecl{0.0};
-    glm::dvec3 pos_render{0.0};
-    glm::dvec3 vel_render{0.0};
-
-    double spin_angle_rad = 0.0;
-    nlohmann::json raw_json;
+    double radius_au() const noexcept {
+        double physical = radius_rsun * SOLAR_RADII_TO_AU;
+        return is_black_hole ? 2.5980762 * physical : physical;
+    }
 };
 
-struct SystemState {
+struct SystemDefinition {
     std::string name = "Solar System";
-    std::vector<CelestialBody> bodies;
+    std::vector<BodyDefinition> bodies;
     std::unordered_map<std::string, int> name_to_idx;
     int star_idx = 0;
 
     int find_body(std::string_view body_name) const;
+};
+
+struct BodyMotion {
+    EclipticPosition position{};
+    EclipticVelocity velocity{};
+};
+
+struct BodyRenderState {
+    RenderPosition position{};
+    RenderVelocity velocity{};
+    glm::dvec3 pole{0.0, 1.0, 0.0};
+    double spin_angle_rad = 0.0;
+};
+
+struct BodyRevisions {
+    uint64_t definition = 1;
+    uint64_t dynamics = 1;
+    uint64_t geometry = 1;
+    uint64_t lighting = 1;
+};
+
+struct BodyView {
+    const BodyDefinition& definition;
+    const BodyMotion& motion;
+    const BodyRenderState& render;
+    const BodyRevisions& revisions;
+};
+
+struct LoadedSystem {
+    SystemDefinition definition;
+    std::vector<BodyMotion> motions;
+};
+
+class Simulation;
+
+class SystemSnapshot {
+public:
+    const SystemDefinition& definition() const noexcept { return *definition_; }
+    size_t size() const noexcept { return motions_.size(); }
+    bool empty() const noexcept { return motions_.empty(); }
+    const std::string& name() const noexcept { return definition_->name; }
+    int star_index() const noexcept { return definition_->star_idx; }
+    int find_body(std::string_view name) const { return definition_->find_body(name); }
+    units::Years time() const noexcept { return time_; }
+    uint64_t generation() const noexcept { return generation_; }
+    uint64_t state_revision() const noexcept { return state_revision_; }
+    uint64_t definition_revision() const noexcept { return definition_revision_; }
+    BodyView body(size_t index) const {
+        return {definition_->bodies.at(index), motions_.at(index), render_.at(index), revisions_.at(index)};
+    }
+
+private:
+    friend class Simulation;
+    std::shared_ptr<const SystemDefinition> definition_ = std::make_shared<const SystemDefinition>();
+    std::vector<BodyMotion> motions_;
+    std::vector<BodyRenderState> render_;
+    std::vector<BodyRevisions> revisions_;
+    units::Years time_{};
+    uint64_t generation_ = 0;
+    uint64_t state_revision_ = 0;
+    uint64_t definition_revision_ = 0;
 };
 
 glm::vec3 hex_to_rgb(std::string_view hex) noexcept;
@@ -91,11 +152,11 @@ public:
     static constexpr std::string_view SOLAR_SYSTEM_NAME = "Solar System";
 
     std::vector<std::string> list_systems() const;
-    SystemState load_system(std::string_view name) const;
-    bool save_system(std::string_view name, const SystemState& state) const;
+    LoadedSystem load_system(std::string_view name) const;
+    bool save_system(std::string_view name, const SystemDefinition& definition) const;
+    static LoadedSystem parse_system(const nlohmann::json& source, std::string_view name);
+    static nlohmann::json serialize_definition(const SystemDefinition& definition);
 
-    static void sync_render_coords(SystemState& state, double sim_time_yr = 0.0) noexcept;
-    static void step_keplerian(SystemState& state, double dt_yr, double sim_time_yr) noexcept;
 };
 
 } // namespace sf::ephemeris
