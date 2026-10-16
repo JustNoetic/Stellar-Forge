@@ -143,6 +143,7 @@ if(STELLAR_BUILD_TESTS)
     enable_testing()
     add_executable(StellarStateTests
         tests/state_tests.cpp
+        src/ephemeris/ias15.cpp
         src/ephemeris/jacobi.cpp
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
@@ -160,6 +161,7 @@ if(STELLAR_BUILD_TESTS)
     add_test(NAME state_contracts COMMAND StellarStateTests "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
     add_executable(StellarOrbitTests
         tests/orbit_tests.cpp
+        src/ephemeris/ias15.cpp
         src/ephemeris/jacobi.cpp
         src/ephemeris/orbit_curves.cpp
         src/ephemeris/simulation.cpp
@@ -188,6 +190,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
     enable_testing()
     add_executable(StellarRenderingTests
         tests/rendering_tests.cpp
+        src/ephemeris/ias15.cpp
         src/ephemeris/jacobi.cpp
         src/core/camera.cpp
         src/core/path_utils.cpp
@@ -206,6 +209,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
     add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
     add_executable(StellarOrbitRenderingTests
         tests/orbit_rendering_tests.cpp
+        src/ephemeris/ias15.cpp
         src/ephemeris/jacobi.cpp
         src/core/camera.cpp
         src/core/path_utils.cpp

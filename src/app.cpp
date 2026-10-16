@@ -432,6 +432,26 @@ void App::render_ui() {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Physics")) {
+            auto current_mode = system().definition().motion_model;
+            if (ImGui::MenuItem("N-Body (IAS15 Integrator)", nullptr, current_mode == ephemeris::MotionModel::NBody)) {
+                auto result = simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::NBody});
+                if (!result) simulation_error_ = result.error;
+                else simulation_error_.clear();
+            }
+            if (ImGui::MenuItem("Analytical Keplerian (Jacobi)", nullptr, current_mode == ephemeris::MotionModel::Keplerian)) {
+                auto result = simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Keplerian});
+                if (!result) simulation_error_ = result.error;
+                else simulation_error_.clear();
+            }
+            bool can_spice = (system().name() == ephemeris::SystemManager::SOLAR_SYSTEM_NAME || current_mode == ephemeris::MotionModel::Spice);
+            if (ImGui::MenuItem("NASA SPICE Ephemeris Playback", nullptr, current_mode == ephemeris::MotionModel::Spice, can_spice)) {
+                auto result = simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Spice});
+                if (!result) simulation_error_ = result.error;
+                else simulation_error_.clear();
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Navigation")) {
             if (ImGui::MenuItem("Free Flight Mode", nullptr, camera_.movement_mode == 0)) {
                 camera_.movement_mode = 0;
@@ -466,9 +486,13 @@ void App::render_ui() {
         ImGuiWindowFlags flags = ui_.prepare_side_panel(ui_settings_, ui_state_, ui::PanelSide::Left, layout);
         if (ImGui::Begin("System Outliner", &ui_settings_.show_outliner, flags)) {
             ui::heading(system().name(), "Click to inspect, double-click to fly to body.");
-            bool spice = system().definition().motion_model == ephemeris::MotionModel::Spice;
-            ImGui::TextDisabled("Motion: %s", spice ? "SPICE ephemeris" : "Keplerian");
-            if (spice) ImGui::TextDisabled("Epoch: %s UTC", system().definition().epoch_utc.c_str());
+            const char* mode_label = "Keplerian";
+            if (system().definition().motion_model == ephemeris::MotionModel::Spice) mode_label = "SPICE ephemeris";
+            else if (system().definition().motion_model == ephemeris::MotionModel::NBody) mode_label = "N-Body (IAS15)";
+            ImGui::TextDisabled("Motion: %s", mode_label);
+            if (system().definition().motion_model == ephemeris::MotionModel::Spice) {
+                ImGui::TextDisabled("Epoch: %s UTC", system().definition().epoch_utc.c_str());
+            }
             if (!simulation_error_.empty()) ImGui::TextWrapped("Last error: %s", simulation_error_.c_str());
             for (int i = 0; i < static_cast<int>(system().size()); ++i) {
                 if (system().body(i).definition.parent_idx < 0) {
@@ -629,9 +653,12 @@ void App::render_ui() {
             ImGui::SameLine();
             if (ImGui::Button("1 yr/s")) simulation_.apply(ephemeris::SetTimeWarp{SECONDS_PER_YEAR});
             ImGui::SameLine();
+            const char* hud_mode = "Keplerian";
+            if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
+            else if (system().definition().motion_model == ephemeris::MotionModel::NBody) hud_mode = "N-Body";
             ImGui::Text("| Warp: %.4gx | Sim Time: %.5f yr | %s | %s | Speed: %s",
                         simulation_.clock().warp, system().time().value,
-                        system().definition().motion_model == ephemeris::MotionModel::Spice ? "SPICE" : "Keplerian",
+                        hud_mode,
                         camera_.movement_mode == 0 ? "Free Flight" : "Simple Orbit",
                         format_speed_au_s(camera_.flight_speed_au_s).c_str());
         }

@@ -14,7 +14,7 @@
 
 namespace sf::ephemeris {
 
-enum class MotionModel { Keplerian, Spice };
+enum class MotionModel { Keplerian, Spice, NBody };
 
 struct DerivedStarProperties {
     double luminosity_lsun = 1.0;

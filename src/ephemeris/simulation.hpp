@@ -2,6 +2,7 @@
 
 #include "core/command_result.hpp"
 #include "ephemeris/system_manager.hpp"
+#include "ephemeris/ias15.hpp"
 #include "ephemeris/jacobi.hpp"
 
 namespace sf::ephemeris {
@@ -16,6 +17,7 @@ struct SimulationClock {
 
 struct SetPaused { bool value; };
 struct SetTimeWarp { double value; };
+struct SetMotionModel { MotionModel model; };
 
 struct BodyPhysicalProperties {
     units::SolarMasses mass{};
@@ -45,6 +47,7 @@ public:
     CommandResult replace_system(LoadedSystem loaded);
     CommandResult apply(SetPaused command);
     CommandResult apply(SetTimeWarp command);
+    CommandResult apply(SetMotionModel command);
     CommandResult apply(const ApplyBodyPhysicalProperties& command);
     CommandResult advance(units::Seconds elapsed);
 
@@ -59,6 +62,7 @@ private:
     std::shared_ptr<SpiceEphemeris> spice_;
     double epoch_et_ = 0.0;
     JacobiPropagator kepler_;
+    Ias15Integrator ias15_;
 };
 
 }

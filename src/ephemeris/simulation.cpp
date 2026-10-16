@@ -102,6 +102,9 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
     candidate.snapshot_.state_revision_ = snapshot_.state_revision_ + 1;
     candidate.recenter();
     candidate.reset_jacobi();
+    if (candidate.snapshot_.definition().motion_model == MotionModel::NBody) {
+        candidate.ias15_.reset(candidate.snapshot_.definition(), candidate.snapshot_.motions(), candidate.clock_.time);
+    }
     candidate.prepare_render_state(true);
     for (size_t i = 0; i < candidate.snapshot_.size(); ++i) {
         auto body = candidate.snapshot_.body(i);
@@ -112,6 +115,7 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
     spice_ = std::move(candidate.spice_);
     epoch_et_ = candidate.epoch_et_;
     kepler_ = std::move(candidate.kepler_);
+    ias15_ = std::move(candidate.ias15_);
     clock_.time = units::Years{};
     previous_motions_.resize(snapshot_.size());
     return {true, true, {}};
@@ -130,6 +134,46 @@ CommandResult Simulation::apply(SetTimeWarp command) {
     bool changed = command.value != clock_.warp;
     clock_.warp = command.value;
     return {true, changed, {}};
+}
+
+CommandResult Simulation::apply(SetMotionModel command) {
+    if (snapshot_.empty()) return {false, false, "No active system."};
+    if (command.model == snapshot_.definition().motion_model) return {true, false, {}};
+
+    if (command.model == MotionModel::Spice) {
+        if (!spice_) {
+            std::string error;
+            spice_ = SpiceEphemeris::open(error);
+            if (!spice_) return {false, false, "SPICE runtime unavailable: " + error};
+        }
+        double test_et = epoch_et_ + units::to_seconds(clock_.time).value;
+        for (const auto& b : snapshot_.definition().bodies) {
+            if (b.spice_id == 0) return {false, false, "Body '" + b.name + "' has no SPICE ID."};
+            BodyMotion test_motion;
+            auto status = spice_->state(b.spice_id, test_et, test_motion);
+            if (!status) return {false, false, b.name + ": " + status.error};
+        }
+    }
+
+    auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
+    updated->motion_model = command.model;
+    snapshot_.definition_ = std::move(updated);
+    ++snapshot_.definition_revision_;
+
+    if (command.model == MotionModel::Keplerian) {
+        reset_jacobi(true);
+    } else if (command.model == MotionModel::NBody) {
+        ias15_.reset(snapshot_.definition(), snapshot_.motions(), clock_.time);
+    } else if (command.model == MotionModel::Spice) {
+        double et = epoch_et_ + units::to_seconds(clock_.time).value;
+        for (size_t i = 0; i < snapshot_.size(); ++i) {
+            spice_->state(snapshot_.definition().bodies[i].spice_id, et, snapshot_.motions_[i]);
+        }
+        recenter();
+    }
+
+    prepare_render_state(true);
+    return {true, true, {}};
 }
 
 CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
@@ -169,15 +213,17 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
 
     auto& revisions = snapshot_.revisions_[index];
     ++revisions.definition;
-    if (before.mass != values.mass || before.oblateness != values.oblateness ||
-        before.j2 != values.j2 || before.j4 != values.j4 ||
-        (before.radius != values.radius && (before.j2 != 0.0 || before.j4 != 0.0))) ++revisions.dynamics;
+    bool dynamics_changed = (before.mass != values.mass || before.oblateness != values.oblateness ||
+                             before.j2 != values.j2 || before.j4 != values.j4 ||
+                             (before.radius != values.radius && (before.j2 != 0.0 || before.j4 != 0.0)));
+    if (dynamics_changed) ++revisions.dynamics;
     if (before.radius != values.radius || before.oblateness != values.oblateness) {
         ++revisions.geometry;
         ++revisions.lighting;
     }
     ++snapshot_.definition_revision_;
     if (before.mass != values.mass) reset_jacobi(true);
+    if (dynamics_changed) ias15_.update_parameters(snapshot_.definition());
     prepare_render_state(true);
     return {true, true, {}};
 }
@@ -194,12 +240,28 @@ CommandResult Simulation::advance(units::Seconds elapsed) {
     }
 
     previous_motions_ = snapshot_.motions_;
-    if (!spice_) kepler_.evaluate(snapshot_.definition(), snapshot_.jacobi_hierarchy(), units::Years{next_time}, snapshot_.motions_);
+    bool is_spice = (snapshot_.definition().motion_model == MotionModel::Spice);
+    bool is_nbody = (snapshot_.definition().motion_model == MotionModel::NBody);
+
+    if (is_nbody) {
+        auto status = ias15_.integrate(snapshot_.definition(), snapshot_.motions_, units::Years{next_time});
+        if (!status) {
+            snapshot_.motions_.swap(previous_motions_);
+            return status;
+        }
+    } else if (!is_spice) {
+        kepler_.evaluate(snapshot_.definition(), snapshot_.jacobi_hierarchy(), units::Years{next_time}, snapshot_.motions_);
+    }
+
     const auto& definitions = snapshot_.definition_->bodies;
     for (size_t i = 0; i < snapshot_.size(); ++i) {
         auto& motion = snapshot_.motions_[i];
         const auto& body = definitions[i];
-        if (spice_) {
+        if (is_spice) {
+            if (!spice_) {
+                snapshot_.motions_.swap(previous_motions_);
+                return {false, false, "SPICE runtime uninitialized."};
+            }
             auto status = spice_->state(body.spice_id, epoch_et_ + units::to_seconds(units::Years{next_time}).value, motion);
             if (!status) {
                 snapshot_.motions_.swap(previous_motions_);
@@ -228,7 +290,9 @@ CommandResult Simulation::advance(units::Seconds elapsed) {
 void Simulation::reset_jacobi(bool preserve_order) {
     auto hierarchy = build_jacobi_hierarchy(snapshot_.definition(), snapshot_.motions(), preserve_order ? snapshot_.jacobi_.get() : nullptr);
     snapshot_.jacobi_ = std::make_shared<const JacobiHierarchy>(std::move(hierarchy));
-    if (!spice_) kepler_.reset(snapshot_.definition(), snapshot_.motions(), snapshot_.jacobi_hierarchy(), clock_.time);
+    if (snapshot_.definition().motion_model == MotionModel::Keplerian) {
+        kepler_.reset(snapshot_.definition(), snapshot_.motions(), snapshot_.jacobi_hierarchy(), clock_.time);
+    }
 }
 
 void Simulation::recenter() {
@@ -246,6 +310,9 @@ void Simulation::recenter() {
     for (auto& motion : snapshot_.motions_) {
         motion.position.value -= position;
         motion.velocity.value -= velocity;
+    }
+    if (snapshot_.definition().motion_model == MotionModel::NBody) {
+        ias15_.shift_com(position, velocity);
     }
 }
 

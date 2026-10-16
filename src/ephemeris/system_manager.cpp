@@ -241,8 +241,15 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
     state.name = std::string(name);
     const auto& root = raw_arr[sorted_order.front()];
     auto model = root.value("motion_model", name == "Ephemeris Mode" ? "spice" : "keplerian");
-    if (model != "spice" && model != "keplerian") throw std::invalid_argument("Unknown motion model.");
-    state.motion_model = model == "spice" ? MotionModel::Spice : MotionModel::Keplerian;
+    if (model == "spice") {
+        state.motion_model = MotionModel::Spice;
+    } else if (model == "n_body" || model == "nbody") {
+        state.motion_model = MotionModel::NBody;
+    } else if (model == "keplerian") {
+        state.motion_model = MotionModel::Keplerian;
+    } else {
+        throw std::invalid_argument("Unknown motion model.");
+    }
     state.epoch_utc = root.value("epoch", "2000-01-01T12:00:00");
     state.bodies.reserve(sorted_order.size());
 
@@ -365,7 +372,10 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["name"] = b.name;
         if (definition.motion_model == MotionModel::Spice) j["spice_id"] = b.spice_id;
         if (b.parent_idx < 0) {
-            j["motion_model"] = definition.motion_model == MotionModel::Spice ? "spice" : "keplerian";
+            std::string model_str = "keplerian";
+            if (definition.motion_model == MotionModel::Spice) model_str = "spice";
+            else if (definition.motion_model == MotionModel::NBody) model_str = "n_body";
+            j["motion_model"] = model_str;
             j["epoch"] = definition.epoch_utc;
         }
         j["type"] = b.type;
