@@ -24,6 +24,7 @@ struct Options {
     uint32_t repeats = 3;
     double step_seconds = 1.0 / 60.0;
     double warp = 1.0;
+    std::string simulation_mode = "inline";
     std::vector<std::string> scenes{"overview", "approach", "analytical", "nbody"};
     std::filesystem::path output;
 };
@@ -31,6 +32,7 @@ struct Options {
 struct LaunchOptions {
     Options benchmark;
     bool self_test = false;
+    bool simulation_thread = true;
     bool help = false;
 };
 
@@ -42,6 +44,8 @@ struct FrameSample {
     double frame_ms = 0.0;
     double cpu_simulation_ms = 0.0;
     double cpu_camera_ms = 0.0;
+    double worker_advance_ms = 0.0;
+    double snapshot_copy_ms = 0.0;
     double cpu_record_ms = 0.0;
     double cpu_ui_ms = 0.0;
     double cpu_celestial_ms = 0.0;

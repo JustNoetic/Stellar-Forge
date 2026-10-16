@@ -1,6 +1,7 @@
 #include "ephemeris/jacobi.hpp"
 #include "core/math_utils.hpp"
 #include <algorithm>
+#include <numeric>
 
 namespace sf::ephemeris {
 namespace {
@@ -18,25 +19,39 @@ void merge(JacobiSubsystem& inner, const JacobiSubsystem& outer) {
 }
 
 JacobiHierarchy build_jacobi_hierarchy(const SystemDefinition& definition, std::span<const BodyMotion> motions,
-                                      const JacobiHierarchy* previous) {
+                                      const JacobiHierarchy* previous, std::span<const int> parents) {
     size_t count = definition.bodies.size();
     JacobiHierarchy hierarchy;
     hierarchy.children.resize(count);
     hierarchy.subsystem_mass.resize(count);
     hierarchy.inner_mass.resize(count);
-    if (previous) hierarchy.children = previous->children;
+    hierarchy.parents.resize(count);
+    for (size_t i = 0; i < count; ++i) hierarchy.parents[i] = parents.empty() ? definition.bodies[i].parent_idx : parents[i];
+    bool preserve = previous && previous->parents == hierarchy.parents;
+    if (preserve) hierarchy.children = previous->children;
     for (size_t i = 0; i < count; ++i) {
         hierarchy.subsystem_mass[i] = definition.bodies[i].mass_msun;
-        int parent = definition.bodies[i].parent_idx;
-        if (!previous && parent >= 0) hierarchy.children[parent].push_back(static_cast<int>(i));
+        int parent = hierarchy.parents[i];
+        if (!preserve && parent >= 0) hierarchy.children[parent].push_back(static_cast<int>(i));
     }
-    for (size_t i = count; i-- > 0;) {
-        int parent = definition.bodies[i].parent_idx;
+    if (parents.empty()) {
+        hierarchy.traversal.resize(count);
+        std::iota(hierarchy.traversal.begin(), hierarchy.traversal.end(), 0);
+    } else {
+        for (size_t i = 0; i < count; ++i) if (hierarchy.parents[i] < 0) hierarchy.traversal.push_back(static_cast<int>(i));
+        for (size_t i = 0; i < hierarchy.traversal.size(); ++i) {
+            const auto& children = hierarchy.children[hierarchy.traversal[i]];
+            hierarchy.traversal.insert(hierarchy.traversal.end(), children.begin(), children.end());
+        }
+    }
+    for (auto it = hierarchy.traversal.rbegin(); it != hierarchy.traversal.rend(); ++it) {
+        int i = *it;
+        int parent = hierarchy.parents[i];
         if (parent >= 0) hierarchy.subsystem_mass[parent] += hierarchy.subsystem_mass[i];
     }
     for (size_t parent = 0; parent < count; ++parent) {
         auto& children = hierarchy.children[parent];
-        if (!previous) std::stable_sort(children.begin(), children.end(), [&](int a, int b) {
+        if (!preserve) std::stable_sort(children.begin(), children.end(), [&](int a, int b) {
             auto ra = motions[a].position.value - motions[parent].position.value;
             auto rb = motions[b].position.value - motions[parent].position.value;
             return glm::dot(ra, ra) < glm::dot(rb, rb);
@@ -58,8 +73,9 @@ JacobiCoordinates extract_jacobi(const SystemDefinition& definition, std::span<c
     for (size_t i = 0; i < motions.size(); ++i) {
         coordinates.subsystems[i] = {definition.bodies[i].mass_msun, motions[i].position.value, motions[i].velocity.value};
     }
-    for (size_t i = motions.size(); i-- > 0;) {
-        int parent = definition.bodies[i].parent_idx;
+    for (auto it = hierarchy.traversal.rbegin(); it != hierarchy.traversal.rend(); ++it) {
+        int i = *it;
+        int parent = hierarchy.parents[i];
         if (parent >= 0) merge(coordinates.subsystems[parent], coordinates.subsystems[i]);
     }
     for (size_t parent = 0; parent < motions.size(); ++parent) {

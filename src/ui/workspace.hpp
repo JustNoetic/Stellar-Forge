@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/constants.hpp"
 #include "rhi/vk_context.hpp"
 #include "ui/inspector_state.hpp"
 #include <imgui.h>
@@ -18,9 +19,23 @@ struct WorkspaceSettings {
     bool show_outliner = true;
     bool show_inspector = true;
     bool show_time_hud = true;
+    bool show_settings = false;
+    int settings_section = 0;
+    bool show_telemetry = false;
+    double ly_threshold_au = DEFAULT_LY_THRESHOLD_AU;
     float outliner_width = 260.0f;
     float inspector_width = 420.0f;
     float scale = 1.0f;
+
+    void reset_layout() {
+        aligned_panels = true;
+        show_outliner = true;
+        show_inspector = true;
+        show_time_hud = true;
+        outliner_width = 260.0f;
+        inspector_width = 420.0f;
+        scale = 1.0f;
+    }
 };
 
 struct WorkspaceLayout {

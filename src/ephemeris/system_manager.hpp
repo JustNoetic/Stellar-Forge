@@ -112,6 +112,12 @@ struct BodyView {
     const BodyRevisions& revisions;
 };
 
+struct ReferenceHierarchy {
+    std::vector<int> parents;
+    std::vector<std::vector<int>> children;
+    std::vector<int> roots;
+};
+
 struct LoadedSystem {
     SystemDefinition definition;
     std::vector<BodyMotion> motions;
@@ -134,6 +140,10 @@ public:
     uint64_t definition_revision() const noexcept { return definition_revision_; }
     std::span<const BodyMotion> motions() const noexcept { return motions_; }
     const JacobiHierarchy& jacobi_hierarchy() const noexcept { return *jacobi_; }
+    const JacobiHierarchy& orbit_hierarchy() const noexcept { return reference_jacobi_ ? *reference_jacobi_ : *jacobi_; }
+    const ReferenceHierarchy& reference_hierarchy() const noexcept { return *reference_; }
+    int reference_parent(size_t index) const { return reference_->parents.at(index); }
+    uint64_t hierarchy_revision() const noexcept { return hierarchy_revision_; }
     BodyView body(size_t index) const {
         return {definition_->bodies.at(index), motions_.at(index), render_.at(index), revisions_.at(index)};
     }
@@ -142,6 +152,8 @@ private:
     friend class Simulation;
     std::shared_ptr<const SystemDefinition> definition_ = std::make_shared<const SystemDefinition>();
     std::shared_ptr<const JacobiHierarchy> jacobi_;
+    std::shared_ptr<const JacobiHierarchy> reference_jacobi_;
+    std::shared_ptr<const ReferenceHierarchy> reference_ = std::make_shared<const ReferenceHierarchy>();
     std::vector<BodyMotion> motions_;
     std::vector<BodyRenderState> render_;
     std::vector<BodyRevisions> revisions_;
@@ -149,6 +161,7 @@ private:
     uint64_t generation_ = 0;
     uint64_t state_revision_ = 0;
     uint64_t definition_revision_ = 0;
+    uint64_t hierarchy_revision_ = 0;
 };
 
 glm::vec3 hex_to_rgb(std::string_view hex) noexcept;

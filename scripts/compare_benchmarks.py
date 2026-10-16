@@ -41,7 +41,9 @@ def scene_results(report):
 
 
 def compatible(before, after):
-    if before["configuration"] != after["configuration"]:
+    configuration = lambda report: {key: value for key, value in report["configuration"].items()
+                                    if key != "simulation_mode"}
+    if configuration(before) != configuration(after):
         raise ValueError("Benchmark configurations differ; use identical capture arguments.")
     for key in ("host", "gpu", "validation_enabled"):
         if before["metadata"][key] != after["metadata"][key]:

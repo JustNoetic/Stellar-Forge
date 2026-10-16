@@ -43,6 +43,7 @@ double positive(std::string_view value) {
 LaunchOptions parse_options(int argc, char** argv) {
     LaunchOptions launch;
     bool benchmark_option = false;
+    bool simulation_option = false;
     for (int i = 1; i < argc; ++i) {
         std::string_view arg = argv[i];
         auto value = [&]() -> std::string_view {
@@ -51,6 +52,11 @@ LaunchOptions parse_options(int argc, char** argv) {
         };
         if (arg == "--help" || arg == "-h") { launch.help = true; continue; }
         if (arg == "--self-test") { launch.self_test = true; continue; }
+        if (arg == "--simulation-thread" || arg == "--no-simulation-thread") {
+            launch.simulation_thread = arg == "--simulation-thread";
+            simulation_option = true;
+            continue;
+        }
         if (arg == "--benchmark") { launch.benchmark.enabled = true; continue; }
         benchmark_option = true;
         auto& o = launch.benchmark;
@@ -64,6 +70,11 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-repeats") o.repeats = integer(value());
         else if (arg == "--benchmark-step") o.step_seconds = positive(value());
         else if (arg == "--benchmark-warp") o.warp = positive(value());
+        else if (arg == "--benchmark-simulation") {
+            o.simulation_mode = value();
+            if (o.simulation_mode != "inline" && o.simulation_mode != "worker" && o.simulation_mode != "pipeline")
+                throw std::runtime_error("Unknown simulation mode: " + o.simulation_mode);
+        }
         else if (arg == "--benchmark-output") { o.output = value(); if (o.output.empty()) throw std::runtime_error("Empty output directory."); }
         else if (arg == "--benchmark-scene") {
             auto scene = value();
@@ -76,6 +87,7 @@ LaunchOptions parse_options(int argc, char** argv) {
     const auto& o = launch.benchmark;
     if (benchmark_option && !o.enabled) throw std::runtime_error("Benchmark options require --benchmark.");
     if (o.enabled && launch.self_test) throw std::runtime_error("--benchmark and --self-test are mutually exclusive.");
+    if (o.enabled && simulation_option) throw std::runtime_error("Use --benchmark-simulation inline|worker|pipeline for benchmarks.");
     if (o.width > 16384 || o.height > 16384 || o.frames > 1000000 || o.warmup > 1000000 || o.repeats > 100)
         throw std::runtime_error("Benchmark dimensions/counts exceed supported limits.");
     if (!std::isfinite(o.step_seconds * o.warp)) throw std::runtime_error("Simulation step overflows.");
@@ -84,6 +96,9 @@ LaunchOptions parse_options(int argc, char** argv) {
 
 std::string_view help() {
     return R"(StellarForge [--self-test | --benchmark] [options]
+  --simulation-thread      Asynchronous simulation worker (interactive default)
+  --no-simulation-thread   Run simulation on the main thread for comparison/debugging
+  --benchmark-simulation inline|worker|pipeline  Inline, wait per step, or overlap rendering (inline)
   --benchmark-scene all|overview|approach|analytical|nbody|spice
   --benchmark-width N       Framebuffer width (1920)
   --benchmark-height N      Framebuffer height (1080)
@@ -117,6 +132,7 @@ nlohmann::json statistics(std::vector<double> values) {
 std::map<std::string, double> metrics(const FrameSample& s) {
     std::map<std::string, double> result{
         {"frame_ms", s.frame_ms}, {"cpu_simulation_ms", s.cpu_simulation_ms}, {"cpu_camera_ms", s.cpu_camera_ms},
+        {"worker_advance_ms", s.worker_advance_ms}, {"snapshot_copy_ms", s.snapshot_copy_ms},
         {"cpu_work_ms", s.cpu_simulation_ms + s.cpu_camera_ms + s.cpu_record_ms},
         {"wait_ms", s.host.fence_wait_ms + s.host.acquire_wait_ms + s.host.present_ms},
         {"cpu_record_ms", s.cpu_record_ms}, {"cpu_ui_ms", s.cpu_ui_ms}, {"cpu_celestial_ms", s.cpu_celestial_ms},
@@ -217,7 +233,7 @@ void write_report(const Options& o, const nlohmann::json& metadata, const std::v
     nlohmann::json report{{"schema_version", 2}, {"metadata", metadata},
         {"configuration", {{"fixture_version", 1}, {"width", o.width}, {"height", o.height}, {"warmup", o.warmup},
             {"frames", o.frames}, {"repeats", o.repeats}, {"step_seconds", o.step_seconds}, {"warp", o.warp},
-            {"ui", o.ui}, {"hidden", o.hidden}, {"scenes", o.scenes}}}, {"scenes", nlohmann::json::array()}};
+            {"ui", o.ui}, {"hidden", o.hidden}, {"scenes", o.scenes}, {"simulation_mode", o.simulation_mode}}}, {"scenes", nlohmann::json::array()}};
     for (const auto& name : o.scenes) {
         std::map<std::string, double> totals;
         std::map<std::string, uint64_t> counts;

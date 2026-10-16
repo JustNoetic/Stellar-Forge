@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         sf::App app;
-        app.init(options.self_test, std::move(options.benchmark));
+        app.init(options.self_test, std::move(options.benchmark), options.simulation_thread);
         try {
             app.run();
         } catch (...) {

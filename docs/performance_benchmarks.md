@@ -112,6 +112,52 @@ Reconfigure after switching commits; dirty builds require retaining their diff.
 
 ## Comparing captures
 
+### Simulation worker prototype
+
+Normal launches use the asynchronous simulation worker. Use
+`run.bat --no-simulation-thread` for the inline fallback; `--simulation-thread`
+remains an explicit enable flag. Deterministic benchmarks retain their inline
+baseline default and select worker execution with `--benchmark-simulation`. The worker owns the simulation and publishes
+independent snapshots with reused buffers; UI commands are synchronization barriers.
+Normal playback accumulates pending elapsed time and renders the latest completed
+state, without blocking on physics or interpolating between states.
+
+`--benchmark-simulation inline|worker|pipeline` selects execution for deterministic
+captures. `worker` waits for each step, isolating scheduling/publication overhead.
+`pipeline` prefetches the next physics step while rendering the current complete
+snapshot, then waits at the next frame boundary if necessary. All three complete
+the same number of physics steps and render the same camera/time sequence. The
+first pipeline step is primed in the first warmup frame. Pipeline benchmarks use
+backpressure for matched work; they do not measure unconstrained interactive FPS
+or prove input latency. They have no intentional interpolation or physics-rate cap.
+
+`cpu_simulation_ms` measures the main thread's advance/wait/submit scope;
+`worker_advance_ms` and `snapshot_copy_ms` separately measure worker integration
+and snapshot preparation. Worker scopes overlap rendering and must not be added
+to main-thread CPU work. A full-state copy remains O(body count), sharing immutable
+definitions/hierarchies. Paused scenes skip worker advances and record zero worker
+timings. The comparison script permits execution mode differences while still
+rejecting mismatched physics and camera traces in detailed captures.
+
+Run repeated comparisons in forward/reverse mode order, retaining raw frames:
+
+```powershell
+python scripts/benchmark_simulation_threads.py --output exports/benchmarks/thread-comparison
+python scripts/benchmark_simulation_threads.py --visible --workload normal --step 0.000588235294117647 --output exports/benchmarks/thread-high-fps
+```
+
+The script runs 56-body Solar System IAS15 at 1600x900, with Gaia, orbit lines
+and UI. It compares normal warp and 86400x warp by default, 3000 measured frames,
+600 warmup frames, three repetitions and two blocks with alternate mode order.
+Use `--no-ui`, `--frames`, `--repeats`, `--blocks` and `--heavy-warp` to vary the
+experiment. Each capture is checked for matching fixtures and full camera/time
+traces before `summary.md` and `summary.json` are written. Hidden windows can
+introduce driver presentation throttling; visible captures are necessary for
+assessing overhead near the application's uncapped high frame rates.
+
+Recorded results and prototype limitations are in
+[`simulation_thread_prototype.md`](simulation_thread_prototype.md).
+
 ```powershell
 python scripts/compare_benchmarks.py exports/benchmarks/baseline exports/benchmarks/candidate
 python scripts/compare_benchmarks.py exports/benchmarks/baseline exports/benchmarks/candidate --metric frame_ms --metric gpu_frame_ms

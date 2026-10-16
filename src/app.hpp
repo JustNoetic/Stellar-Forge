@@ -3,7 +3,7 @@
 #include "benchmark/benchmark.hpp"
 #include "core/camera.hpp"
 #include "ephemeris/system_manager.hpp"
-#include "ephemeris/simulation.hpp"
+#include "ephemeris/simulation_runner.hpp"
 #include "rendering/render_settings.hpp"
 #include "rendering/celestial_renderer.hpp"
 #include "rendering/star_catalog.hpp"
@@ -20,7 +20,7 @@ namespace sf {
 
 class App {
 public:
-    void init(bool self_test = false, benchmark::Options benchmark = {});
+    void init(bool self_test = false, benchmark::Options benchmark = {}, bool simulation_thread = true);
     void run();
     void shutdown();
 
@@ -37,7 +37,15 @@ private:
     bool render_frame(benchmark::FrameSample* sample = nullptr);
     void run_benchmark();
     void render_ui();
+    void render_main_menu_bar(rendering::RenderSettings& render_draft);
+    void render_settings_window(rendering::RenderSettings& render_draft);
+    void render_viewport_overlays();
+    void render_outliner();
     void render_outliner_node(int body_idx);
+    void render_body_inspector();
+    void render_time_hud(rendering::RenderSettings& render_draft);
+    void render_add_body_modal();
+    void render_delete_body_modal();
 
     GLFWwindow* window_ = nullptr;
     rhi::VkContext vk_;
@@ -45,7 +53,7 @@ private:
     ui::WorkspaceSettings ui_settings_{};
 
     ephemeris::SystemManager sys_mgr_{};
-    ephemeris::Simulation simulation_{};
+    ephemeris::SimulationRunner simulation_{};
     rendering::RenderSettingsStore render_settings_{};
     ui::WorkspaceState ui_state_{};
 

@@ -30,6 +30,11 @@ class ComparisonTests(unittest.TestCase):
             comparison.compare(self.report, self.candidate)
         self.assertIn("+66.7%", output.getvalue())
 
+    def test_execution_mode_can_change_with_identical_state_traces(self):
+        self.report["configuration"]["simulation_mode"] = "inline"
+        self.candidate["configuration"]["simulation_mode"] = "pipeline"
+        comparison.compatible(self.report, self.candidate)
+
     def test_rejects_workload_machine_and_data_changes(self):
         for section, key, value in (("configuration", "frames", 3), ("metadata", "host", {"cpu": "different"}),
                                      ("metadata", "gpu", {"driver": "different"}),

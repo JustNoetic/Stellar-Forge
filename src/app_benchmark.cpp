@@ -95,6 +95,8 @@ void App::run_benchmark() {
             "Warmup, initialization, asset fingerprinting, final GPU drain and report writing are excluded from frame_ms."
         }}
     };
+    metadata["simulation_execution"] = options.simulation_mode;
+    metadata["timing_notes"].push_back("worker_advance_ms and snapshot_copy_ms run on the simulation worker and overlap main-thread scopes; do not add them to CPU work. Pipeline prefetches the next step while rendering the same state sequence as inline.");
     log::info("Benchmark: {} scenes, {} warmup + {} measured frames, {} repetitions.",
               options.scenes.size(), options.warmup, options.frames, options.repeats);
     if (std::string_view(SF_BUILD_TYPE) != "Release" && std::string_view(SF_BUILD_TYPE) != "RelWithDebInfo")
@@ -154,7 +156,14 @@ void App::run_benchmark() {
                 check_window();
                 {
                     ScopedTimer timer(&sample.cpu_simulation_ms);
-                    require(simulation_.advance(frame_dt_));
+                    if (options.simulation_mode == "pipeline" && index > 0) require(simulation_.wait());
+                    else require(simulation_.advance(frame_dt_));
+                    if (simulation_.threaded() && !paused) {
+                        sample.worker_advance_ms = simulation_.publication().advance_ms;
+                        sample.snapshot_copy_ms = simulation_.publication().copy_ms;
+                    }
+                    if (options.simulation_mode == "pipeline" && index + 1 < options.warmup + options.frames)
+                        require(simulation_.advance_async(frame_dt_));
                 }
                 {
                     ScopedTimer timer(&sample.cpu_camera_ms);

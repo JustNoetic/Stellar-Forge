@@ -6,6 +6,8 @@
 namespace sf::ephemeris {
 
 struct JacobiHierarchy {
+    std::vector<int> parents;
+    std::vector<int> traversal;
     std::vector<std::vector<int>> children;
     std::vector<double> subsystem_mass;
     std::vector<double> inner_mass;
@@ -39,7 +41,7 @@ struct KeplerOrbit {
 };
 
 JacobiHierarchy build_jacobi_hierarchy(const SystemDefinition& definition, std::span<const BodyMotion> motions,
-                                      const JacobiHierarchy* previous = nullptr);
+                                      const JacobiHierarchy* previous = nullptr, std::span<const int> parents = {});
 JacobiCoordinates extract_jacobi(const SystemDefinition& definition, std::span<const BodyMotion> motions,
                                  const JacobiHierarchy& hierarchy);
 

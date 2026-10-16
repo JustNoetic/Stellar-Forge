@@ -29,6 +29,9 @@ struct Camera {
     bool is_near_surface = false;
 
     int tracking_idx = 0;
+    bool tracking_barycenter = false;
+    int centered_idx = -1;
+    bool centered_barycenter = false;
 
     bool left_dragging = false;
     bool right_dragging = false;
@@ -54,7 +57,8 @@ struct Camera {
     void on_cursor_pos(double xpos, double ypos, const ephemeris::SystemSnapshot& sys);
     void on_scroll(double yoffset, bool shift_held);
     void snap_to_tracked(const ephemeris::SystemSnapshot& sys);
-    void focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool fly_close = false);
+    void focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool fly_close = false, bool is_barycenter = false);
+    void center_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool is_barycenter = false);
 
     glm::dvec3 forward_dir() const noexcept;
     glm::dvec3 up_dir() const noexcept;

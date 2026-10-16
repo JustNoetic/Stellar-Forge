@@ -32,7 +32,7 @@ Curves use eccentric anomaly below `e = 0.999` and true anomaly above it. Circul
 states have a stable basis without dividing by eccentricity. Complete ellipses
 close exactly. Unbound root pairs share a finite draw domain, including their
 reflex curve. A companion outside its parent's Hill sphere has no local or reflex
-arc. Degenerate radial states do not produce an orbital curve.
+arc; its outer orbit around the grandparent is drawn as an active solid line in full color rather than a dashed continuation. Degenerate radial states do not produce an orbital curve.
 
 `OrbitRenderer` sends compact double-precision conic parameters to a Vulkan
 line-strip pipeline. `common/orbit_curve.glsl` evaluates each vertex and subtracts

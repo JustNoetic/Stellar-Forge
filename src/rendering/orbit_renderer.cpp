@@ -43,11 +43,13 @@ void OrbitRenderer::shutdown(rhi::VkContext& ctx) {
 void OrbitRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                             const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
     if (!settings.show_orbits || sys.empty()) return;
-    if (generation_ != sys.generation() || state_revision_ != sys.state_revision() || definition_revision_ != sys.definition_revision()) {
+    if (generation_ != sys.generation() || state_revision_ != sys.state_revision() || definition_revision_ != sys.definition_revision() ||
+        hierarchy_revision_ != sys.hierarchy_revision()) {
         curves_ = ephemeris::compute_orbit_curves(sys);
         generation_ = sys.generation();
         state_revision_ = sys.state_revision();
         definition_revision_ = sys.definition_revision();
+        hierarchy_revision_ = sys.hierarchy_revision();
     }
     if (curves_.empty()) return;
     auto& buffer = buffers_[ctx.frame_index()];

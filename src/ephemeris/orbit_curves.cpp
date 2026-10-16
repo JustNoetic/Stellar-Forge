@@ -88,9 +88,10 @@ EclipticPosition OrbitCurve::point(double fraction) const {
 
 std::vector<OrbitCurve> compute_orbit_curves(const SystemSnapshot& sys) {
     if (sys.empty()) return {};
-    auto coordinates = extract_jacobi(sys.definition(), sys.motions(), sys.jacobi_hierarchy());
+    const auto& hierarchy = sys.orbit_hierarchy();
+    auto coordinates = extract_jacobi(sys.definition(), sys.motions(), hierarchy);
     const auto& subsystems = coordinates.subsystems;
-    const auto& children = sys.jacobi_hierarchy().children;
+    const auto& children = hierarchy.children;
     std::vector<int> dominant(sys.size(), -1);
     std::vector<OrbitCurve> curves;
     curves.reserve(sys.size() * 3);
@@ -101,16 +102,15 @@ std::vector<OrbitCurve> compute_orbit_curves(const SystemSnapshot& sys) {
     }
     auto hill_radius = [&](int parent) {
         auto b = sys.body(parent);
-        int gp = b.definition.parent_idx;
+        int gp = hierarchy.parents[parent];
         if (gp < 0 || sys.body(gp).definition.mass_msun <= 0.0) return std::numeric_limits<double>::infinity();
         return glm::length(b.motion.position.value - sys.body(gp).motion.position.value) *
                std::cbrt(b.definition.mass_msun / (3.0 * sys.body(gp).definition.mass_msun));
     };
     for (size_t i = 0; i < sys.size(); ++i) {
         auto body = sys.body(i);
-        int parent = body.definition.parent_idx;
+        int parent = hierarchy.parents[i];
         if (parent < 0) continue;
-        auto primary = sys.body(parent);
         const auto& frame = coordinates.frames[i];
         auto effective = frame.inner;
         if (effective.mass <= 0.0) continue;
@@ -125,7 +125,7 @@ std::vector<OrbitCurve> compute_orbit_curves(const SystemSnapshot& sys) {
         double theta = angle_at(curve, r), p = curve.semilatus_au / scale, e = curve.eccentricity;
         curve.arc = compute_orbit_arc(e, theta, p, glm::length(r), hill_radius(parent), scale);
         if (curve.arc.span > 0.0) curves.push_back(curve);
-        int gp = primary.definition.parent_idx;
+        int gp = hierarchy.parents[parent];
         if (!curve.arc.escape || gp < 0 || sys.body(gp).definition.mass_msun <= 0.0) continue;
         glm::dvec3 exit_r = r, exit_v = v;
         double dt = 0.0;
@@ -147,7 +147,7 @@ std::vector<OrbitCurve> compute_orbit_curves(const SystemSnapshot& sys) {
         auto gr = propagated.pos + exit_r, gv = propagated.vel + exit_v;
         auto focus = grandparent.motion.position.value + mass / (gm + mass) * gr;
         auto outer = extract(gr, gv, G_CONST * (gm + mass), gm / (gm + mass), focus,
-                             body.definition.color_rgb * 0.5f, static_cast<int>(i));
+                             body.definition.color_rgb * (curve.arc.outside ? 1.0f : 0.5f), static_cast<int>(i));
         if (!outer) continue;
         double gt = angle_at(*outer, gr), ge = outer->eccentricity;
         outer->arc.start = parameter_angle(ge, gt);
@@ -157,7 +157,7 @@ std::vector<OrbitCurve> compute_orbit_curves(const SystemSnapshot& sys) {
                                  std::acos(std::clamp((outer->semilatus_au / extent - 1.0) / ge, -1.0, 1.0)));
             outer->arc.span = std::max(0.0, end - gt);
         }
-        outer->patched = true;
+        outer->patched = !curve.arc.outside;
         if (outer->arc.span > 0.0) curves.push_back(*outer);
     }
     for (size_t parent = 0; parent < sys.size(); ++parent) {

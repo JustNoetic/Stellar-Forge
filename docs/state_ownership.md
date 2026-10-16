@@ -2,7 +2,8 @@
 
 | Data | Owner | Readers | Mutation path |
 | --- | --- | --- | --- |
-| Physical properties, initial orbit elements, identity, hierarchy | `Simulation` owns a shared immutable `SystemDefinition` | Snapshot consumers | Validated `replace_system` or `ApplyBodyPhysicalProperties` |
+| Physical properties, initial orbit elements, identity, propagation hierarchy | `Simulation` owns a shared immutable `SystemDefinition` | Snapshot consumers | Validated `replace_system`, `ApplyBodyPhysicalProperties`, `AddBody`, or `DeleteBody` |
+| Current reference parents, distance-sorted children, orbit reference topology | `Simulation` owns shared immutable snapshot hierarchy data | Outliner, inspector, camera, orbit curves | 15 Hz refresh after successful steps; immediate load/edit/model changes and pause flush |
 | Ecliptic positions and velocities | `Simulation` inside `SystemSnapshot` | Camera, inspector, renderer | `advance(Seconds)` |
 | Simulation time, pause, warp, direction | `SimulationClock`, private to `Simulation` | App and HUD through `clock()` | `advance`, `SetPaused`, `SetTimeWarp`, `SetTimeDirection`, `ReverseTimeDirection` |
 | Render positions, velocities, pole directions, spin | Prepared snapshot data owned by `Simulation` | Camera and renderers | Prepared after a successful load, edit, or simulation step |
@@ -18,7 +19,9 @@
 
 `SystemSnapshot::body(index)` returns a `BodyView` containing four const references: `definition`, `motion`, `render`, and `revisions`. Renderers, cameras and UI cannot mutate those values. Initial orbital elements belong to the definition; current positions and velocities belong to motion. Editing mass does not reset the trajectory to its initial orbital elements.
 
-The present loop is single-threaded. `simulation.snapshot()` returns a live const reference without copying arrays or metadata. Its views must not be retained across a load, edit, or step. Explicitly copying a snapshot owns independent motion/render/revision arrays and shares the immutable definitions. Such a captured snapshot remains unchanged by later edits or steps. Copying costs O(body count); take the copy on the simulation thread before handing it to a worker. This API does not make concurrent reads of the live snapshot safe.
+Normal interactive playback runs simulation on a worker thread; `--no-simulation-thread` selects the inline fallback. `Simulation::snapshot()` returns a live const reference without copying arrays or metadata. Its views must not be retained across a load, edit, or step. Explicitly copying a snapshot owns independent motion/render/revision arrays and shares the immutable definitions. Such a captured snapshot remains unchanged by later edits or steps. Copying costs O(body count); take the copy on the simulation thread before handing it to another thread. This API does not make concurrent reads of the live snapshot safe.
+
+`SimulationRunner` runs a worker by default (`--simulation-thread` remains an explicit enable flag). Its public API has one caller, the main thread. Once started, only the worker accesses `Simulation`. Three reusable publication buffers hold snapshot arrays, clock, status and timing data; immutable definitions and hierarchy data remain shared. Copying happens outside the mailbox mutex on the worker. Publication and consumption swap buffers under the mutex; the main thread polls with `try_lock` at frame boundaries, keeping its front snapshot stable throughout rendering. Normal playback never waits for a physics step. Pending elapsed seconds are coalesced into a single backlog entry, without dropping elapsed time; this can change adaptive step boundaries compared with per-frame integration. Control commands wait for earlier steps, execute on the worker and publish their result before returning. These barriers preserve existing edit validation and UI behavior, but a command can still wait for an expensive in-flight step. Shutdown drains pending steps and joins the worker. Numerical integration and its existing substep limit are unchanged.
 
 The analytical propagator reuses its previous-motion scratch vector. It does not copy body definitions, strings or JSON on each tick. JSON and definition copying occurs on loading, saving, or explicit physical edits.
 
@@ -30,6 +33,16 @@ hierarchy and complete descendant centers. A mass edit publishes updated hierarc
 masses and reseeds the propagator at the current epoch without moving any body;
 captured snapshots retain their previous hierarchy. `motions()` exposes only a
 const span with the same lifetime rules as `body()` views.
+
+`reference_hierarchy()` separately publishes cached distance-sorted children and
+current reference parents. IAS15 mode classifies parents using Hill regions and
+hysteresis; other models retain declared parents. `orbit_hierarchy()` supplies
+coordinates for these references without reseeding analytical propagation.
+Reference parents can follow their children in array order. Body indices remain
+stable, and captured snapshots retain old reference data. Include
+`hierarchy_revision()` in hierarchy-dependent cache keys, since pausing can flush
+a pending reference update without advancing `state_revision()`. See
+`docs/dynamic_hierarchy.md` for scheduling and classification rules.
 
 Motion selection is explicit in `SystemDefinition::motion_model`. SPICE playback queries geometric kernel states at the stored UTC epoch plus elapsed simulation seconds; the Keplerian propagator remains the model for ordinary presets. `Simulation` owns the shared CSPICE source, validates initial availability and commits all queried states atomically. A coverage failure preserves motion, prepared render state, clock and revisions. The app pauses on a rejected tick. See `docs/orbit_lines.md` for runtime setup and orbit-line approximation boundaries.
 

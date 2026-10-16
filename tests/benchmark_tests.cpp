@@ -37,6 +37,14 @@ int main(int argc, char** argv) {
         reject({"app", "--benchmark", "--benchmark-output"});
         reject({"app", "--benchmark-scene", "overview"});
         reject({"app", "--benchmark", "--benchmark-scene", "missing"});
+        check(parse({"app", "--simulation-thread"}).simulation_thread, "Interactive simulation worker flag");
+        check(parse({"app"}).simulation_thread, "Interactive simulation worker is not the default");
+        check(!parse({"app", "--no-simulation-thread"}).simulation_thread, "Inline simulation fallback flag");
+        check(parse({"app", "--benchmark"}).benchmark.simulation_mode == "inline", "Benchmark baseline default changed");
+        check(parse({"app", "--benchmark", "--benchmark-simulation", "pipeline"}).benchmark.simulation_mode == "pipeline", "Pipeline mode");
+        reject({"app", "--benchmark", "--benchmark-simulation", "missing"});
+        reject({"app", "--benchmark", "--simulation-thread"});
+        reject({"app", "--benchmark", "--no-simulation-thread"});
         auto stats = sf::benchmark::statistics({9, 1, 5, 3});
         check(stats["count"] == 4 && stats["median"] == 4 && stats["mean"] == 4.5, "Statistics center");
         check(std::abs(stats["p95"].get<double>() - 8.4) < 1e-12, "Statistics percentile interpolation");

@@ -322,4 +322,170 @@ inline glm::mat4 reverse_z_perspective(float fov_rad, float aspect, float z_near
     return m;
 }
 
+struct KeplerianElements {
+    double a = 0.0;
+    double e = 0.0;
+    double inc_deg = 0.0;
+    double omega_node_deg = 0.0;
+    double arg_peri_deg = 0.0;
+    double true_anomaly_deg = 0.0;
+    double mean_anomaly_deg = 0.0;
+    double period_days = 0.0;
+};
+
+inline KeplerianElements compute_keplerian_elements(const glm::dvec3& rel_pos, const glm::dvec3& rel_vel, double mu) noexcept {
+    double rx = rel_pos.x, ry = rel_pos.y, rz = rel_pos.z;
+    double vx = rel_vel.x, vy = rel_vel.y, vz = rel_vel.z;
+    double r = std::sqrt(rx * rx + ry * ry + rz * rz);
+    double v2 = vx * vx + vy * vy + vz * vz;
+    if (r < 1e-30 || mu < 1e-30) {
+        return {};
+    }
+    double hx = ry * vz - rz * vy;
+    double hy = rz * vx - rx * vz;
+    double hz = rx * vy - ry * vx;
+    double h = std::sqrt(hx * hx + hy * hy + hz * hz);
+    if (h < 1e-30) {
+        return {};
+    }
+    double vhx = vy * hz - vz * hy;
+    double vhy = vz * hx - vx * hz;
+    double vhz = vx * hy - vy * hx;
+    double ex = vhx / mu - rx / r;
+    double ey = vhy / mu - ry / r;
+    double ez = vhz / mu - rz / r;
+    double e = std::sqrt(ex * ex + ey * ey + ez * ez);
+
+    double energy = v2 / 2.0 - mu / r;
+    double a = std::abs(energy) < 1e-30 ? 1e30 : (-mu / (2.0 * energy));
+    double inc = std::acos(std::clamp(hz / h, -1.0, 1.0));
+
+    double nx = -hy;
+    double ny = hx;
+    double n_mag = std::sqrt(nx * nx + ny * ny);
+
+    double Omega = 0.0;
+    if (n_mag > 1e-15) {
+        Omega = std::atan2(ny, nx);
+        if (Omega < 0.0) Omega += TWO_PI;
+    }
+
+    double omega = 0.0;
+    if (n_mag > 1e-15 && e > 1e-10) {
+        double n_dot_e = (nx * ex + ny * ey) / (n_mag * e);
+        omega = std::acos(std::clamp(n_dot_e, -1.0, 1.0));
+        if (ez < 0.0) omega = TWO_PI - omega;
+    } else if (e > 1e-10) {
+        omega = std::atan2(ey, ex);
+        if (omega < 0.0) omega += TWO_PI;
+    }
+
+    double nu = 0.0;
+    if (e > 1e-10) {
+        double r_dot_e = (rx * ex + ry * ey + rz * ez) / (r * e);
+        nu = std::acos(std::clamp(r_dot_e, -1.0, 1.0));
+        double rdotv = rx * vx + ry * vy + rz * vz;
+        if (rdotv < 0.0) nu = TWO_PI - nu;
+    } else {
+        if (n_mag > 1e-15) {
+            double r_dot_n = (rx * nx + ry * ny) / (r * n_mag);
+            nu = std::acos(std::clamp(r_dot_n, -1.0, 1.0));
+            if (rz < 0.0) nu = TWO_PI - nu;
+        } else {
+            nu = std::atan2(ry, rx);
+            if (nu < 0.0) nu += TWO_PI;
+        }
+    }
+
+    double M = 0.0;
+    if (e < 1.0) {
+        double cos_nu = std::cos(nu);
+        double sin_nu = std::sin(nu);
+        double denom = 1.0 + e * cos_nu;
+        double sin_E = sin_nu * std::sqrt(std::max(0.0, 1.0 - e * e)) / (denom > 1e-12 ? denom : 1e-12);
+        double cos_E = (e + cos_nu) / (denom > 1e-12 ? denom : 1e-12);
+        double E = std::atan2(sin_E, cos_E);
+        M = E - e * sin_E;
+        if (M < 0.0) M += TWO_PI;
+    }
+
+    double period_days = 0.0;
+    if (a > 0.0 && e < 1.0) {
+        double period_yr = TWO_PI * std::sqrt((a * a * a) / mu);
+        period_days = period_yr * 365.25;
+    }
+
+    return {a, e, inc * RAD_TO_DEG, Omega * RAD_TO_DEG, omega * RAD_TO_DEG, nu * RAD_TO_DEG, M * RAD_TO_DEG, period_days};
+}
+
+inline std::pair<glm::dvec3, glm::dvec3> rotate_equatorial_to_ecliptic(const glm::dvec3& pos, const glm::dvec3& vel, const glm::dvec3& pole_ecl) noexcept {
+    double px = pole_ecl.x, py = pole_ecl.y, pz = pole_ecl.z;
+    if (std::abs(px) < 1e-8 && std::abs(py) < 1e-8 && pz > 0.0) {
+        return {pos, vel};
+    }
+    glm::dvec3 N{-py, px, 0.0};
+    double n_mag = glm::length(N);
+    glm::dvec3 X, Y, Z;
+    if (n_mag < 1e-8) {
+        X = {1.0, 0.0, 0.0};
+        Y = {0.0, -1.0, 0.0};
+        Z = {0.0, 0.0, -1.0};
+    } else {
+        X = N / n_mag;
+        Z = glm::normalize(pole_ecl);
+        Y = glm::cross(Z, X);
+    }
+    glm::dmat3 R(X, Y, Z); // Column-major: X is col 0, Y is col 1, Z is col 2
+    return {R * pos, R * vel};
+}
+
+inline std::pair<glm::dvec3, glm::dvec3> rotate_ecliptic_to_equatorial(const glm::dvec3& pos, const glm::dvec3& vel, const glm::dvec3& pole_ecl) noexcept {
+    double px = pole_ecl.x, py = pole_ecl.y, pz = pole_ecl.z;
+    if (std::abs(px) < 1e-8 && std::abs(py) < 1e-8 && pz > 0.0) {
+        return {pos, vel};
+    }
+    glm::dvec3 N{-py, px, 0.0};
+    double n_mag = glm::length(N);
+    glm::dvec3 X, Y, Z;
+    if (n_mag < 1e-8) {
+        X = {1.0, 0.0, 0.0};
+        Y = {0.0, -1.0, 0.0};
+        Z = {0.0, 0.0, -1.0};
+    } else {
+        X = N / n_mag;
+        Z = glm::normalize(pole_ecl);
+        Y = glm::cross(Z, X);
+    }
+    glm::dmat3 R(X, Y, Z);
+    glm::dmat3 R_inv = glm::transpose(R);
+    return {R_inv * pos, R_inv * vel};
+}
+
+struct HydrostaticShape {
+    double oblateness = 0.0;
+    double j2 = 0.0;
+    double j4 = 0.0;
+};
+
+inline HydrostaticShape compute_hydrostatic_shape(double mass_msun, double radius_km, double rotation_period_hr, std::string_view body_type) noexcept {
+    if (mass_msun <= 0.0 || radius_km <= 0.0 || rotation_period_hr <= 0.0) {
+        return {};
+    }
+    double omega = TWO_PI / (rotation_period_hr * 3600.0);
+    double r_eq_m = radius_km * 1000.0;
+    double mass_kg = mass_msun * 1.98847e30;
+    constexpr double G_SI = 6.6743e-11;
+    double m_param = (omega * omega * r_eq_m * r_eq_m * r_eq_m) / (G_SI * mass_kg);
+    double chi = 0.65;
+    if (body_type == "Moon" || body_type == "Dwarf Planet") {
+        chi = 1.25;
+    } else if (body_type == "Terrestrial") {
+        chi = 0.95;
+    }
+    double f = std::clamp(chi * m_param, 0.0, 0.5);
+    double j2 = m_param * (chi - 0.5);
+    double j4 = -0.15 * (f * f);
+    return {f, j2, j4};
+}
+
 } // namespace sf::math

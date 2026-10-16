@@ -1,5 +1,6 @@
 #include "core/camera.hpp"
 #include "core/math_utils.hpp"
+#include "ephemeris/jacobi.hpp"
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
@@ -205,13 +206,41 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
     glm::dvec3 track_pole{0.0, 1.0, 0.0};
 
     if (tracking_idx >= 0 && tracking_idx < static_cast<int>(sys.size())) {
-        const auto& b = sys.body(tracking_idx);
-        origin_render = b.render.position.value;
-        track_r = b.definition.radius_au();
-        track_f = b.definition.oblateness;
-        track_pole = b.render.pole;
+        if (tracking_barycenter) {
+            auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
+            origin_render = ecliptic_to_render(EclipticPosition{coords.subsystems[tracking_idx].position}).value;
+            track_r = 0.0;
+            track_f = 0.0;
+        } else {
+            const auto& b = sys.body(tracking_idx);
+            origin_render = b.render.position.value;
+            track_r = b.definition.radius_au();
+            track_f = b.definition.oblateness;
+            track_pole = b.render.pole;
+        }
     } else {
         origin_render = target_au;
+    }
+
+    if (centered_idx >= 0 && centered_idx < static_cast<int>(sys.size())) {
+        glm::dvec3 target_pos{0.0};
+        if (centered_barycenter) {
+            auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
+            target_pos = ecliptic_to_render(EclipticPosition{coords.subsystems[centered_idx].position}).value;
+        } else {
+            target_pos = sys.body(centered_idx).render.position.value;
+        }
+        glm::dvec3 eye = origin_render + cam_pos_rel;
+        glm::dvec3 to_target = target_pos - eye;
+        double dist = glm::length(to_target);
+        if (dist > 1e-12) {
+            glm::dvec3 fwd = to_target / dist;
+            auto [yn, pn] = forward_to_angles(fwd);
+            yaw_deg = yaw_actual_deg = yn;
+            pitch_deg = pitch_actual_deg = pn;
+            up = orthogonalize_up(up, fwd);
+            cam_look_aim = true;
+        }
     }
 
     double ref_r = track_r > 0.0 ? ellipsoid_surface_radius(track_r, track_f, track_pole, cam_pos_rel) : 0.0;
@@ -342,6 +371,10 @@ void Camera::on_cursor_pos(double xpos, double ypos, const ephemeris::SystemSnap
         return;
     }
 
+    if (std::abs(dx) > 0.0 || std::abs(dy) > 0.0) {
+        centered_idx = -1;
+    }
+
     double fov_ratio = std::clamp(fov_deg / 45.0, 0.0001, 1.0);
     double sensitivity = 0.25 * fov_ratio;
 
@@ -380,6 +413,7 @@ void Camera::on_scroll(double yoffset, bool shift_held) {
         fov_deg = std::clamp(fov_deg, 0.001, 120.0);
     } else if (movement_mode == 1) {
         approach_delta += yoffset * 0.15;
+        centered_idx = -1;
     } else {
         flight_speed_au_s = std::clamp(flight_speed_au_s * std::pow(2.0, yoffset), 1e-12, MAX_FLIGHT_SPEED_AU_S);
     }
@@ -412,24 +446,39 @@ void Camera::snap_to_tracked(const ephemeris::SystemSnapshot& sys) {
     cam_look_aim = true;
 }
 
-void Camera::focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool fly_close) {
+void Camera::focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool fly_close, bool is_barycenter) {
     if (body_idx < 0 || body_idx >= static_cast<int>(sys.size())) {
         return;
     }
-    if (!fly_close && tracking_idx != body_idx) {
+    centered_idx = -1;
+    tracking_barycenter = is_barycenter;
+
+    if (!fly_close && (tracking_idx != body_idx || tracking_barycenter != is_barycenter)) {
         glm::dvec3 old_eye = eye_pos_render().value;
         tracking_idx = body_idx;
-        origin_render = sys.body(body_idx).render.position.value;
+        if (is_barycenter) {
+            auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
+            origin_render = ecliptic_to_render(EclipticPosition{coords.subsystems[body_idx].position}).value;
+        } else {
+            origin_render = sys.body(body_idx).render.position.value;
+        }
         cam_pos_rel = old_eye - origin_render;
         snap_to_tracked(sys);
         return;
     }
 
     tracking_idx = body_idx;
-    const auto& b = sys.body(body_idx);
-    origin_render = b.render.position.value;
+    double dist = 0.01;
+    if (is_barycenter) {
+        auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
+        origin_render = ecliptic_to_render(EclipticPosition{coords.subsystems[body_idx].position}).value;
+        dist = std::max(sys.body(body_idx).definition.semi_major_au * 2.5, 0.01);
+    } else {
+        const auto& b = sys.body(body_idx);
+        origin_render = b.render.position.value;
+        dist = std::max(b.definition.radius_au() * 4.5, 1e-6);
+    }
 
-    double dist = std::max(b.definition.radius_au() * 4.5, 1e-6);
     glm::dvec3 dir = glm::normalize(glm::dvec3{0.0, 0.38, 0.925});
     cam_pos_rel = dir * dist;
     up = {0.0, 1.0, 0.0};
@@ -437,7 +486,36 @@ void Camera::focus_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool
     auto [yn, pn] = forward_to_angles(-dir);
     yaw_deg = yaw_actual_deg = yn;
     pitch_deg = pitch_actual_deg = pn;
-    flight_speed_au_s = std::clamp(b.definition.radius_au() * 2.0, 1e-9, MAX_FLIGHT_SPEED_AU_S);
+    flight_speed_au_s = std::clamp(dist * 0.5, 1e-9, MAX_FLIGHT_SPEED_AU_S);
+}
+
+void Camera::center_body(int body_idx, const ephemeris::SystemSnapshot& sys, bool is_barycenter) {
+    if (body_idx < 0 || body_idx >= static_cast<int>(sys.size())) {
+        centered_idx = -1;
+        return;
+    }
+    centered_idx = body_idx;
+    centered_barycenter = is_barycenter;
+
+    glm::dvec3 target_pos{0.0};
+    if (is_barycenter) {
+        auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
+        target_pos = ecliptic_to_render(EclipticPosition{coords.subsystems[body_idx].position}).value;
+    } else {
+        target_pos = sys.body(body_idx).render.position.value;
+    }
+    glm::dvec3 eye = eye_pos_render().value;
+    glm::dvec3 to_target = target_pos - eye;
+    double dist = glm::length(to_target);
+    if (dist > 1e-12) {
+        glm::dvec3 fwd = to_target / dist;
+        auto [yn, pn] = forward_to_angles(fwd);
+        yaw_deg = yaw_actual_deg = yn;
+        pitch_deg = pitch_actual_deg = pn;
+        up = orthogonalize_up(up, fwd);
+        cam_look_aim = true;
+        approach_delta = 0.0;
+    }
 }
 
 glm::mat4 Camera::view_matrix_origin_relative() const noexcept {
