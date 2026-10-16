@@ -54,16 +54,29 @@ public:
     WorkspaceLayout compute_layout(const WorkspaceSettings& settings, const WorkspaceState& state, float fb_width, float fb_height) const;
     ImGuiWindowFlags prepare_side_panel(const WorkspaceSettings& settings, const WorkspaceState& state, PanelSide side, WorkspaceLayout& out_layout);
 
+    void notify_drag_active(ImGuiID id);
+    void update_drag_interaction();
+    bool is_dragging() const noexcept { return is_dragging_; }
+
 private:
     void apply_theme(float scale);
 
+    GLFWwindow* window_ = nullptr;
     float applied_scale_ = -1.0f;
+    bool is_dragging_ = false;
+    ImVec2 drag_origin_{0.0f, 0.0f};
+    ImGuiID active_drag_id_ = 0;
 };
 
 void heading(std::string_view title, std::string_view subtitle = {});
 void section(std::string_view title, std::string_view note = {});
 void value_row(std::string_view label, std::string_view value);
 void metric_text(std::string_view text);
+
+bool drag_float(const char* label, float* v, float v_speed = 1.0f, float v_min = 0.0f, float v_max = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);
+bool drag_float2(const char* label, float v[2], float v_speed = 1.0f, float v_min = 0.0f, float v_max = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);
+bool drag_float3(const char* label, float v[3], float v_speed = 1.0f, float v_min = 0.0f, float v_max = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);
+bool drag_float4(const char* label, float v[4], float v_speed = 1.0f, float v_min = 0.0f, float v_max = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);
 
 template <typename Fn>
 auto field(std::string_view label, Fn&& widget_fn) {

@@ -28,8 +28,8 @@
 ## 2. SHARED BOILERPLATE REGISTRY (USE THESE INSTEAD OF RAW CALLS)
 
 | Need | Shared Helper / Symbol | Header |
-| :--- | :--- | :--- |
-| **Simulation State / Commands** | `simulation.snapshot()` (live const reference), `simulation.advance(units::Seconds{...})`, `simulation.apply(SetPaused / SetTimeWarp / ApplyBodyPhysicalProperties)` | `src/ephemeris/simulation.hpp` |
+| **Simulation State / Commands** | `simulation.snapshot()` (live const reference), `simulation.advance(units::Seconds{...})`, `simulation.apply(SetPaused / SetTimeWarp / SetTimeDirection / ReverseTimeDirection / ApplyBodyPhysicalProperties)` | `src/ephemeris/simulation.hpp` |
+| **Time & Date Formatting** | `sf::time::calculate_sim_date`, `sf::time::format_sim_date`, `sf::time::format_time_speed` (Gregorian/UTC date math & original speed string thresholds) | `src/core/time_utils.hpp` |
 | **Rendering Settings** | `RenderSettingsStore::values`, `apply`, `revision`: validated whole-settings update; camera owns no rendering controls | `src/rendering/render_settings.hpp` |
 | **Inspector Drafts** | `BodyEditDraft::synchronize`, `reload`, `command`: draft edit -> Apply or Revert, with stale edit rejection | `src/ui/inspector_state.hpp` |
 | **Create GPU Buffer (Device-Local + Staging Upload)** | `vk.create_device_buffer(size, usage, initial_data)` | `src/rhi/vk_context.hpp` |
@@ -64,7 +64,7 @@
 | **Path Resolution & JSON/Binary I/O** | `src/core/path_utils.hpp`<br>`src/core/path_utils.cpp` | `project_root`, `bundled_path`, `external_path`, `read_json`, `write_json` |
 | **Dear ImGui Workspace & Shared Widgets** | `src/ui/workspace.hpp`<br>`src/ui/workspace.cpp` | `sf::ui::UiSystem`, `WorkspaceSettings`, `WorkspaceLayout`, `heading`, `section`, `value_row`, `field` |
 | **System Preset Loader & Analytical Propagator** | `src/ephemeris/system_manager.hpp`<br>`src/ephemeris/system_manager.cpp` | `SystemManager::parse_system`, `serialize_definition`, `LoadedSystem`, `SystemDefinition`, `BodyDefinition`, `BodyMotion`, `SystemSnapshot`, `BodyView` |
-| **Simulation Ownership / Clock / Physical Edits** | `src/ephemeris/simulation.hpp/.cpp`<br>`docs/state_ownership.md` | `Simulation`, `SimulationClock`, `SetPaused`, `SetTimeWarp`, `SetMotionModel`, `ApplyBodyPhysicalProperties`, `BodyRevisions` |
+| **Simulation Ownership / Clock / Physical Edits** | `src/ephemeris/simulation.hpp/.cpp`<br>`src/core/time_utils.hpp/.cpp`<br>`docs/state_ownership.md` | `Simulation`, `SimulationClock`, `SetPaused`, `SetTimeWarp`, `SetTimeDirection`, `ReverseTimeDirection`, `SetMotionModel`, `calculate_sim_date`, `format_sim_date`, `format_time_speed` |
 | **IAS15 15th-Order Adaptive Integrator & GR/Oblateness** | `src/ephemeris/ias15.hpp/.cpp`<br>`src/ephemeris/simulation.hpp` | `Ias15Integrator`, `MotionModel::NBody`, 1PN General Relativity, $J_2 / J_4$ oblateness, Gauss-Radau spacing, compensated summation |
 | **Shared Jacobi Coordinates & Analytical Propagation** | `src/ephemeris/jacobi.hpp/.cpp` | `JacobiHierarchy`, `build_jacobi_hierarchy`, `extract_jacobi`, `JacobiPropagator::reset/evaluate`; fixed sibling order, complete descendant masses, cached epoch states, top-down reflex reconstruction, analytical $J_2$ secular precession, third-body (grandparent) secular perturbation, GR apsidal advance; shared by simulation and orbit lines |
 | **SPICE Ephemeris Playback** | `src/ephemeris/spice_ephemeris.hpp/.cpp`<br>`data/ephemeris.json`<br>`docs/orbit_lines.md` | `MotionModel::Spice`, `SpiceEphemeris::open/epoch/state`; geometric ECLIPJ2000 states; explicit NAIF IDs; local CSPICE runtime/kernel manifest; atomic coverage failures |

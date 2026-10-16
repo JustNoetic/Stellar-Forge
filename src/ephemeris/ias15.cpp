@@ -535,7 +535,7 @@ Ias15Integrator::StepResult Ias15Integrator::step(double dt) {
             bodies_[i].vel = {v0_[3 * i + 0], v0_[3 * i + 1], v0_[3 * i + 2]};
             bodies_[i].acc = {a0_[3 * i + 0], a0_[3 * i + 1], a0_[3 * i + 2]};
         }
-        if (dt_last_done_ != 0.0) {
+        if (dt_last_done_ != 0.0 && dt_new * dt_last_done_ > 0.0) {
             double ratio = dt_new / dt_last_done_;
             predict_next_step(ratio, n3, er_.data(), br_.data(), e_.data(), b_.data());
         }
@@ -602,6 +602,9 @@ CommandResult Ias15Integrator::integrate(const SystemDefinition& def, std::vecto
         double dt_step = dt_;
         if ((t_diff > 0.0 && dt_step < 0.0) || (t_diff < 0.0 && dt_step > 0.0)) {
             dt_step = -dt_step;
+            dt_last_done_ = 0.0;
+            b_.assign(7 * num_bodies_ * 3, 0.0);
+            e_.assign(7 * num_bodies_ * 3, 0.0);
         }
         if (t_diff > 0.0 && dt_step > t_diff) {
             dt_step = t_diff;

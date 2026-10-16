@@ -12,11 +12,16 @@ class SpiceEphemeris;
 struct SimulationClock {
     units::Years time{};
     double warp = 1.0;
+    double direction = 1.0;
     bool paused = false;
+
+    double effective_warp() const noexcept { return warp * direction; }
 };
 
 struct SetPaused { bool value; };
 struct SetTimeWarp { double value; };
+struct SetTimeDirection { double value; };
+struct ReverseTimeDirection {};
 struct SetMotionModel { MotionModel model; };
 
 struct BodyPhysicalProperties {
@@ -49,6 +54,8 @@ public:
     CommandResult replace_system(LoadedSystem loaded);
     CommandResult apply(SetPaused command);
     CommandResult apply(SetTimeWarp command);
+    CommandResult apply(SetTimeDirection command);
+    CommandResult apply(ReverseTimeDirection command);
     CommandResult apply(SetMotionModel command);
     CommandResult apply(const ApplyBodyPhysicalProperties& command);
     CommandResult advance(units::Seconds elapsed);

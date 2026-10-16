@@ -2,6 +2,7 @@
 #include "core/constants.hpp"
 #include "core/log.hpp"
 #include "core/path_utils.hpp"
+#include "core/time_utils.hpp"
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
@@ -247,10 +248,12 @@ void App::on_key(int key, int, int action, int mods) {
         camera_.snap_to_tracked(system());
     } else if (key == GLFW_KEY_R) {
         simulation_.apply(ephemeris::SetTimeWarp{1.0});
+    } else if (key == GLFW_KEY_BACKSPACE && action == GLFW_PRESS) {
+        simulation_.apply(ephemeris::ReverseTimeDirection{});
     } else if (key == GLFW_KEY_UP || key == GLFW_KEY_RIGHT) {
-        simulation_.apply(ephemeris::SetTimeWarp{std::min(simulation_.clock().warp * 2.0, 1e12)});
+        simulation_.apply(ephemeris::SetTimeWarp{std::min(simulation_.clock().warp * 2.0, 1e16)});
     } else if (key == GLFW_KEY_DOWN || key == GLFW_KEY_LEFT) {
-        simulation_.apply(ephemeris::SetTimeWarp{std::max(simulation_.clock().warp * 0.5, 1.0)});
+        simulation_.apply(ephemeris::SetTimeWarp{std::max(simulation_.clock().warp * 0.5, 1e-4)});
     } else if (key == GLFW_KEY_EQUAL) {
         float step = (mods & GLFW_MOD_SHIFT) ? 2.0f : 1.15f;
         auto settings = render_settings_.values();
@@ -281,7 +284,7 @@ void App::on_mouse_button(int button, int action, int) {
 }
 
 void App::on_cursor_pos(double xpos, double ypos) {
-    if (benchmark_.enabled) return;
+    if (benchmark_.enabled || ui_.is_dragging()) return;
     camera_.on_cursor_pos(xpos, ypos, system());
 }
 
@@ -643,7 +646,7 @@ void App::render_ui() {
             ui::field("Exposure##exp", [&](const char* id) {
                 float speed = std::max(0.005f, render_draft.exposure * 0.02f);
                 const char* fmt = (render_draft.exposure >= 10000.0f || (render_draft.exposure > 0.0f && render_draft.exposure < 0.005f)) ? "%.4g" : "%.3f";
-                if (ImGui::DragFloat(id, &render_draft.exposure, speed, 0.0f, 0.0f, fmt)) {
+                if (ui::drag_float(id, &render_draft.exposure, speed, 0.0f, 0.0f, fmt)) {
                     render_draft.exposure = std::max(0.0f, render_draft.exposure);
                 }
             });
@@ -652,7 +655,7 @@ void App::render_ui() {
             });
             ui::field("Star Brightness##sbi", [&](const char* id) {
                 float star_speed = std::max(0.01f, render_draft.star_intensity * 0.02f);
-                if (ImGui::DragFloat(id, &render_draft.star_intensity, star_speed, 0.0f, 0.0f, "%.2f")) {
+                if (ui::drag_float(id, &render_draft.star_intensity, star_speed, 0.0f, 0.0f, "%.2f")) {
                     render_draft.star_intensity = std::max(0.0f, render_draft.star_intensity);
                 }
             });
@@ -685,28 +688,62 @@ void App::render_ui() {
         ImGuiWindowFlags hud_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse;
         if (ImGui::Begin("TimeTransportHUD", nullptr, hud_flags)) {
-            if (ImGui::Button(simulation_.clock().paused ? "Resume (Space)" : "Pause (Space)")) {
-                simulation_.apply(ephemeris::SetPaused{!simulation_.clock().paused});
+            bool is_paused = simulation_.clock().paused;
+            const char* play_pause_label = is_paused ? " Play " : " Pause ";
+            if (ImGui::Button(play_pause_label, ImVec2(65.0f * layout.scale, 0.0f))) {
+                simulation_.apply(ephemeris::SetPaused{!is_paused});
             }
-            ImGui::SameLine();
-            if (ImGui::Button("1x")) simulation_.apply(ephemeris::SetTimeWarp{1.0});
-            ImGui::SameLine();
-            if (ImGui::Button("100x")) simulation_.apply(ephemeris::SetTimeWarp{100.0});
-            ImGui::SameLine();
-            if (ImGui::Button("10,000x")) simulation_.apply(ephemeris::SetTimeWarp{10000.0});
-            ImGui::SameLine();
-            if (ImGui::Button("1e6x")) simulation_.apply(ephemeris::SetTimeWarp{1.0e6});
-            ImGui::SameLine();
-            if (ImGui::Button("1 yr/s")) simulation_.apply(ephemeris::SetTimeWarp{SECONDS_PER_YEAR});
-            ImGui::SameLine();
+
+            ImGui::SameLine(0.0f, 6.0f * layout.scale);
+            bool is_forward = simulation_.clock().direction >= 0.0;
+            const char* dir_label = is_forward ? " Forward " : " Reverse ";
+            if (ImGui::Button(dir_label, ImVec2(75.0f * layout.scale, 0.0f))) {
+                simulation_.apply(ephemeris::ReverseTimeDirection{});
+            }
+
+            ImGui::SameLine(0.0f, 6.0f * layout.scale);
+            if (ImGui::Button("1x", ImVec2(32.0f * layout.scale, 0.0f))) {
+                simulation_.apply(ephemeris::SetTimeWarp{1.0});
+            }
+
+            ImGui::SameLine(0.0f, 8.0f * layout.scale);
+            float bar_w = layout.width - layout.gap * 2.0f;
+            ImGui::PushItemWidth(std::max(110.0f, std::min(220.0f * layout.scale, bar_w * 0.26f)));
+            float val_log = static_cast<float>(std::log10(std::max(1e-4, simulation_.clock().warp)));
+            double effective_mult = simulation_.clock().effective_warp();
+            std::string speed_str = time::format_time_speed(effective_mult);
+            if (is_paused) {
+                speed_str = "Paused (" + speed_str + ")";
+            }
+            std::string fmt_str;
+            for (char c : speed_str) {
+                if (c == '%') fmt_str += "%%";
+                else fmt_str += c;
+            }
+            if (ui::drag_float("##speed_drag", &val_log, 0.003f, -4.0f, 16.0f, fmt_str.c_str())) {
+                simulation_.apply(ephemeris::SetTimeWarp{std::pow(10.0, static_cast<double>(val_log))});
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Drag or Ctrl+Click to edit warp (10^x). Range: 10^-4 (slow-mo) to 10^16.");
+            }
+            ImGui::PopItemWidth();
+
+            std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time());
+            ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", date_str.c_str());
+
+            ImGui::SameLine(0.0f, 10.0f * layout.scale);
+            ImGui::TextDisabled("| Sim Time: %.5f yr", system().time().value);
+
+            ImGui::SameLine(0.0f, 10.0f * layout.scale);
             const char* hud_mode = "Keplerian";
             if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
             else if (system().definition().motion_model == ephemeris::MotionModel::NBody) hud_mode = "N-Body";
-            ImGui::Text("| Warp: %.4gx | Sim Time: %.5f yr | %s | %s | Speed: %s",
-                        simulation_.clock().warp, system().time().value,
-                        hud_mode,
-                        camera_.movement_mode == 0 ? "Free Flight" : "Simple Orbit",
-                        format_speed_au_s(camera_.flight_speed_au_s).c_str());
+            ImGui::TextDisabled("| %s", hud_mode);
+
+            ImGui::SameLine(0.0f, 10.0f * layout.scale);
+            ImGui::TextDisabled("| %s | %s",
+                                camera_.movement_mode == 0 ? "Free Flight" : "Simple Orbit",
+                                format_speed_au_s(camera_.flight_speed_au_s).c_str());
         }
         ImGui::End();
     }

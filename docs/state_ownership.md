@@ -4,7 +4,7 @@
 | --- | --- | --- | --- |
 | Physical properties, initial orbit elements, identity, hierarchy | `Simulation` owns a shared immutable `SystemDefinition` | Snapshot consumers | Validated `replace_system` or `ApplyBodyPhysicalProperties` |
 | Ecliptic positions and velocities | `Simulation` inside `SystemSnapshot` | Camera, inspector, renderer | `advance(Seconds)` |
-| Simulation time, pause, warp | `SimulationClock`, private to `Simulation` | App and HUD through `clock()` | `advance`, `SetPaused`, `SetTimeWarp` |
+| Simulation time, pause, warp, direction | `SimulationClock`, private to `Simulation` | App and HUD through `clock()` | `advance`, `SetPaused`, `SetTimeWarp`, `SetTimeDirection`, `ReverseTimeDirection` |
 | Render positions, velocities, pole directions, spin | Prepared snapshot data owned by `Simulation` | Camera and renderers | Prepared after a successful load, edit, or simulation step |
 | Exposure, HDR, Gaia visibility, star size and brightness | App-owned `RenderSettingsStore` | Renderers receive `const RenderSettings&` | Validated atomic `apply(RenderSettings)` |
 | Navigation pose, tracking, input and motion history | `Camera` | App and renderers | Camera methods and navigation input |

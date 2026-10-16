@@ -117,6 +117,7 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
     kepler_ = std::move(candidate.kepler_);
     ias15_ = std::move(candidate.ias15_);
     clock_.time = units::Years{};
+    clock_.direction = 1.0;
     previous_motions_.resize(snapshot_.size());
     return {true, true, {}};
 }
@@ -128,12 +129,26 @@ CommandResult Simulation::apply(SetPaused command) {
 }
 
 CommandResult Simulation::apply(SetTimeWarp command) {
-    if (!std::isfinite(command.value) || command.value < 1.0 || command.value > 1e12) {
-        return {false, false, "Time warp must be finite and between 1 and 1e12."};
+    if (!std::isfinite(command.value) || command.value < 1e-6 || command.value > 1e16) {
+        return {false, false, "Time warp must be finite and between 1e-6 and 1e16."};
     }
     bool changed = command.value != clock_.warp;
     clock_.warp = command.value;
     return {true, changed, {}};
+}
+
+CommandResult Simulation::apply(SetTimeDirection command) {
+    if (command.value != 1.0 && command.value != -1.0) {
+        return {false, false, "Time direction must be +1.0 or -1.0."};
+    }
+    bool changed = command.value != clock_.direction;
+    clock_.direction = command.value;
+    return {true, changed, {}};
+}
+
+CommandResult Simulation::apply(ReverseTimeDirection) {
+    clock_.direction = -clock_.direction;
+    return {true, true, {}};
 }
 
 CommandResult Simulation::apply(SetMotionModel command) {
@@ -233,7 +248,7 @@ CommandResult Simulation::advance(units::Seconds elapsed) {
         return {false, false, "Frame time must be finite and nonnegative."};
     }
     if (clock_.paused || elapsed.value == 0.0 || snapshot_.empty()) return {};
-    auto dt = units::to_years(units::Seconds{elapsed.value * clock_.warp});
+    auto dt = units::to_years(units::Seconds{elapsed.value * clock_.warp * clock_.direction});
     double next_time = clock_.time.value + dt.value;
     if (!std::isfinite(dt.value) || !std::isfinite(next_time) || !std::isfinite(units::to_seconds(units::Years{next_time}).value)) {
         return {false, false, "Simulation time overflow."};
@@ -331,6 +346,7 @@ void Simulation::prepare_render_state(bool definitions_changed) {
         } else if (std::abs(body.rotation_period_hr) > 1e-9) {
             double omega = TWO_PI / (body.rotation_period_hr * 3600.0);
             render.spin_angle_rad = std::fmod(w0 + omega * seconds, TWO_PI);
+            if (render.spin_angle_rad < 0.0) render.spin_angle_rad += TWO_PI;
         } else {
             render.spin_angle_rad = w0;
         }

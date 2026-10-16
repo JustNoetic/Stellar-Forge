@@ -176,6 +176,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
         src/core/path_utils.cpp
+        src/core/time_utils.cpp
     )
     target_include_directories(StellarStateTests PRIVATE src)
     target_compile_definitions(StellarStateTests PRIVATE

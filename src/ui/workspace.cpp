@@ -1,13 +1,19 @@
 #include "ui/workspace.hpp"
 
+#include <GLFW/glfw3.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
+#include <imgui_internal.h>
 #include <algorithm>
 #include <string>
 
 namespace sf::ui {
 
+static UiSystem* s_active_ui_system = nullptr;
+
 void UiSystem::init(GLFWwindow* window, rhi::VkContext& ctx) {
+    window_ = window;
+    s_active_ui_system = this;
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -39,6 +45,12 @@ void UiSystem::init(GLFWwindow* window, rhi::VkContext& ctx) {
 }
 
 void UiSystem::shutdown(rhi::VkContext& ctx) {
+    if (is_dragging_ && window_) {
+        glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        is_dragging_ = false;
+    }
+    s_active_ui_system = nullptr;
+    window_ = nullptr;
     ctx.wait_idle();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
@@ -50,9 +62,11 @@ void UiSystem::begin_frame(const WorkspaceSettings& settings) {
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+    update_drag_interaction();
 }
 
 void UiSystem::render(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t swapchain_idx) {
+    update_drag_interaction();
     ImGui::Render();
 
     rhi::RenderingAttachment att{};
@@ -64,6 +78,61 @@ void UiSystem::render(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t swapcha
     ctx.begin_rendering(cmd, ctx.swapchain_extent(), std::span{&att, 1}, nullptr);
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
     ctx.end_rendering(cmd);
+}
+
+void UiSystem::notify_drag_active(ImGuiID id) {
+    active_drag_id_ = id;
+}
+
+void UiSystem::update_drag_interaction() {
+    if (!window_) {
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiContext* g = ImGui::GetCurrentContext();
+    if (!g) {
+        return;
+    }
+
+    bool mouse_down = io.MouseDown[0];
+    bool is_focused = glfwGetWindowAttrib(window_, GLFW_FOCUSED) != 0;
+
+    if (is_dragging_) {
+        bool should_end = !mouse_down || !is_focused || (g->ActiveId == 0) || (active_drag_id_ != 0 && g->ActiveId != active_drag_id_);
+        if (should_end) {
+            glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            glfwSetCursorPos(window_, static_cast<double>(drag_origin_.x), static_cast<double>(drag_origin_.y));
+            io.MousePos = drag_origin_;
+            io.MousePosPrev = drag_origin_;
+            io.MouseDelta = ImVec2(0.0f, 0.0f);
+            io.WantSetMousePos = false;
+            is_dragging_ = false;
+            active_drag_id_ = 0;
+        } else {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+        }
+    } else {
+        if (mouse_down && is_focused && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) {
+            bool is_drag_widget = false;
+            if (active_drag_id_ != 0 && g->ActiveId == active_drag_id_) {
+                is_drag_widget = true;
+            } else if (g->ActiveId != 0 && g->ActiveIdSource == ImGuiInputSource_Mouse &&
+                       g->MovingWindow == nullptr && !ImGui::TempInputIsActive(g->ActiveId) &&
+                       g->InputTextState.ID != g->ActiveId &&
+                       (g->ActiveIdUsingNavDirMask & ((1 << ImGuiDir_Left) | (1 << ImGuiDir_Right))) != 0) {
+                is_drag_widget = true;
+                active_drag_id_ = g->ActiveId;
+            }
+
+            if (is_drag_widget) {
+                is_dragging_ = true;
+                drag_origin_ = io.MouseClickedPos[0];
+                glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+            }
+        }
+    }
 }
 
 WorkspaceLayout UiSystem::compute_layout(const WorkspaceSettings& settings, const WorkspaceState& state, float fb_width, float fb_height) const {
@@ -213,6 +282,38 @@ void metric_text(std::string_view text) {
     } else {
         ImGui::TextWrapped("%.*s", static_cast<int>(text.size()), text.data());
     }
+}
+
+bool drag_float(const char* label, float* v, float v_speed, float v_min, float v_max, const char* format, ImGuiSliderFlags flags) {
+    bool changed = ImGui::DragFloat(label, v, v_speed, v_min, v_max, format, flags);
+    if (ImGui::IsItemActive() && s_active_ui_system) {
+        s_active_ui_system->notify_drag_active(ImGui::GetItemID());
+    }
+    return changed;
+}
+
+bool drag_float2(const char* label, float v[2], float v_speed, float v_min, float v_max, const char* format, ImGuiSliderFlags flags) {
+    bool changed = ImGui::DragFloat2(label, v, v_speed, v_min, v_max, format, flags);
+    if (ImGui::IsItemActive() && s_active_ui_system) {
+        s_active_ui_system->notify_drag_active(ImGui::GetItemID());
+    }
+    return changed;
+}
+
+bool drag_float3(const char* label, float v[3], float v_speed, float v_min, float v_max, const char* format, ImGuiSliderFlags flags) {
+    bool changed = ImGui::DragFloat3(label, v, v_speed, v_min, v_max, format, flags);
+    if (ImGui::IsItemActive() && s_active_ui_system) {
+        s_active_ui_system->notify_drag_active(ImGui::GetItemID());
+    }
+    return changed;
+}
+
+bool drag_float4(const char* label, float v[4], float v_speed, float v_min, float v_max, const char* format, ImGuiSliderFlags flags) {
+    bool changed = ImGui::DragFloat4(label, v, v_speed, v_min, v_max, format, flags);
+    if (ImGui::IsItemActive() && s_active_ui_system) {
+        s_active_ui_system->notify_drag_active(ImGui::GetItemID());
+    }
+    return changed;
 }
 
 } // namespace sf::ui
