@@ -1,17 +1,27 @@
 #include "app.hpp"
-#include <cstring>
+#include "core/log.hpp"
+#include <exception>
+#include <iostream>
 
 int main(int argc, char** argv) {
-    bool self_test = false;
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--self-test") == 0) {
-            self_test = true;
+    try {
+        auto options = sf::benchmark::parse_options(argc, argv);
+        if (options.help) {
+            std::cout << sf::benchmark::help();
+            return 0;
         }
+        sf::App app;
+        app.init(options.self_test, std::move(options.benchmark));
+        try {
+            app.run();
+        } catch (...) {
+            app.shutdown();
+            throw;
+        }
+        app.shutdown();
+        return 0;
+    } catch (const std::exception& error) {
+        sf::log::error("{}", error.what());
+        return 1;
     }
-
-    sf::App app;
-    app.init(self_test);
-    app.run();
-    app.shutdown();
-    return 0;
 }

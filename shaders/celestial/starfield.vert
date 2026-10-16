@@ -13,6 +13,10 @@ layout(std430, set = 0, binding = 0) readonly buffer StarCatalogBuffer {
     StarGpuRecord stars[];
 };
 
+layout(std430, set = 0, binding = 1) readonly buffer VisibleIndexBuffer {
+    uint visible_indices[];
+};
+
 layout(push_constant) uniform StarfieldPush {
     mat4 view_proj;
     dvec4 eye_world_au;
@@ -26,6 +30,7 @@ layout(push_constant) uniform StarfieldPush {
     float exposure;
     uint hdr_enabled;
     float screen_width;
+    uint star_count;
 } pc;
 
 layout(location = 0) flat out vec3 f_color;
@@ -34,7 +39,8 @@ layout(location = 2) flat out float f_point_radius;
 layout(location = 3) out vec2 f_pixel_offset;
 
 void main() {
-    StarGpuRecord s = stars[gl_InstanceIndex];
+    uint star_idx = visible_indices[gl_InstanceIndex];
+    StarGpuRecord s = stars[star_idx];
 
     vec3 rel_eye = vec3(s.pos0.xyz + dvec3(s.pm_flux.xyz) * pc.sim_time_yr - pc.eye_world_au.xyz);
     float dist_eye = length(rel_eye);

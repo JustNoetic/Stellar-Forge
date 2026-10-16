@@ -103,8 +103,23 @@ file(GLOB_RECURSE STELLAR_SOURCES CONFIGURE_DEPENDS
 
 add_executable(StellarForge ${STELLAR_SOURCES})
 
+execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE STELLAR_GIT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git diff --quiet HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RESULT_VARIABLE STELLAR_GIT_DIFF ERROR_QUIET)
+if(NOT STELLAR_GIT_COMMIT)
+    set(STELLAR_GIT_COMMIT "unavailable")
+endif()
+if(STELLAR_GIT_DIFF STREQUAL "0")
+    set(STELLAR_GIT_DIRTY false)
+else()
+    set(STELLAR_GIT_DIRTY true)
+endif()
+configure_file(src/benchmark/build_info.hpp.in generated/benchmark/build_info.hpp @ONLY)
+
 target_include_directories(StellarForge PRIVATE
     src
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
     ${vma_SOURCE_DIR}/include
 )
 
@@ -141,6 +156,18 @@ target_link_libraries(StellarForge PRIVATE
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
 if(STELLAR_BUILD_TESTS)
     enable_testing()
+    add_executable(StellarBenchmarkTests tests/benchmark_tests.cpp src/benchmark/benchmark.cpp src/core/path_utils.cpp)
+    target_include_directories(StellarBenchmarkTests PRIVATE src)
+    target_compile_definitions(StellarBenchmarkTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(StellarBenchmarkTests PRIVATE nlohmann_json::nlohmann_json)
+    if(MINGW)
+        target_link_options(StellarBenchmarkTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    endif()
+    add_test(NAME benchmark_contracts COMMAND StellarBenchmarkTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/benchmark-contracts")
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME benchmark_comparison COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_comparison_tests.py")
+    endif()
     add_executable(StellarStateTests
         tests/state_tests.cpp
         src/ephemeris/ias15.cpp

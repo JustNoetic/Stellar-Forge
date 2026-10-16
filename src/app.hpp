@@ -1,5 +1,6 @@
 #pragma once
 
+#include "benchmark/benchmark.hpp"
 #include "core/camera.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "ephemeris/simulation.hpp"
@@ -19,7 +20,7 @@ namespace sf {
 
 class App {
 public:
-    void init(bool self_test = false);
+    void init(bool self_test = false, benchmark::Options benchmark = {});
     void run();
     void shutdown();
 
@@ -33,7 +34,8 @@ private:
     void switch_system(std::string_view system_name);
     void recreate_render_targets();
     void destroy_render_targets();
-    void render_frame();
+    bool render_frame(benchmark::FrameSample* sample = nullptr);
+    void run_benchmark();
     void render_ui();
     void render_outliner_node(int body_idx);
 
@@ -60,6 +62,7 @@ private:
     rhi::Pipeline composite_pipeline_{};
 
     bool self_test_ = false;
+    benchmark::Options benchmark_;
     std::string simulation_error_;
     units::Seconds frame_dt_{};
 };

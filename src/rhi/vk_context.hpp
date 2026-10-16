@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rhi/vk_types.hpp"
+#include "core/timing.hpp"
 #include <array>
 #include <functional>
 #include <optional>
@@ -25,6 +26,12 @@ struct FrameContext {
     VkQueryPool timestamp_pool = VK_NULL_HANDLE;
     uint32_t timer_count = 0;
     std::vector<std::string> timer_names;
+    uint64_t serial = 0;
+};
+
+struct GpuTimingSample {
+    uint64_t frame_id = 0;
+    std::unordered_map<std::string, double> timings;
 };
 
 class VkContext {
@@ -34,8 +41,8 @@ public:
 
     void wait_idle() const;
 
-    bool begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_idx);
-    void end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx);
+    bool begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_idx, FrameHostTimings* timings = nullptr);
+    void end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx, FrameHostTimings* timings = nullptr);
     void request_swapchain_resize() noexcept { swapchain_dirty_ = true; }
 
     Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage,
@@ -92,6 +99,15 @@ public:
     void end_gpu_timer(VkCommandBuffer cmd, uint32_t timer_id);
     double gpu_time_ms(std::string_view name) const;
     const std::unordered_map<std::string, double>& gpu_timings() const noexcept { return gpu_timings_ms_; }
+    void capture_gpu_timings(bool enabled, size_t capacity = 0) {
+        capture_gpu_timings_ = enabled;
+        if (enabled) captured_gpu_timings_.reserve(capacity);
+    }
+    std::vector<GpuTimingSample> drain_gpu_timings();
+    uint64_t submitted_frames() const noexcept { return submitted_frames_; }
+    bool timestamps_supported() const noexcept { return timestamp_valid_bits_ > 0; }
+    const VkPhysicalDeviceProperties& device_properties() const noexcept { return device_props_; }
+    const VkPhysicalDeviceDriverProperties& driver_properties() const noexcept { return driver_props_; }
 
     VkInstance instance() const noexcept { return instance_; }
     VkPhysicalDevice physical_device() const noexcept { return physical_device_; }
@@ -129,6 +145,8 @@ private:
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties device_props_{};
+    VkPhysicalDeviceDriverProperties driver_props_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    uint32_t timestamp_valid_bits_ = 0;
     bool bresenham_lines_enabled_ = false;
     VkDevice device_ = VK_NULL_HANDLE;
     uint32_t graphics_queue_family_ = 0;
@@ -159,6 +177,9 @@ private:
     VkSampler sampler_nearest_clamp_ = VK_NULL_HANDLE;
 
     std::unordered_map<std::string, double> gpu_timings_ms_;
+    bool capture_gpu_timings_ = false;
+    uint64_t submitted_frames_ = 0;
+    std::vector<GpuTimingSample> captured_gpu_timings_;
 };
 
 } // namespace sf::rhi

@@ -56,6 +56,7 @@
 | Task / Feature | Primary Files | Key Symbols |
 | :--- | :--- | :--- |
 | **Application Lifecycle & Main Loop** | `src/main.cpp`<br>`src/app.hpp`<br>`src/app.cpp`<br>`run.bat` | `sf::App::init`, `sf::App::run`, `sf::App::render_frame`, `--self-test` CLI flag |
+| **Repeatable CPU/GPU Benchmarks** | `src/app_benchmark.cpp`<br>`src/benchmark/benchmark.hpp/.cpp`<br>`src/core/timing.hpp`<br>`scripts/compare_benchmarks.py`<br>`docs/performance_benchmarks.md` | `--benchmark`, fixed-step overview/approach/analytical/IAS15 + opt-in SPICE; warmup/repeats, frame-ID GPU pairing/final drain, CPU work/waits; compact averaged `report.txt` + JSON by default, raw JSON/CSV only with `--benchmark-detailed`; fixture-checked comparisons; `StellarBenchmarkTests` |
 | **Vulkan 1.3 Context, VMA, Swapchain & Timers** | `src/rhi/vk_types.hpp`<br>`src/rhi/vk_context.hpp`<br>`src/rhi/vk_context.cpp` | `sf::rhi::VkContext`, `Buffer`, `Image`, `Pipeline`, `PushDescriptorWrite`, `RenderingAttachment`, `set_vsync`, `present_mode` |
 | **GLSL `#include` Preprocessor & SPIR-V Disk Cache** | `src/rhi/shader_cache.hpp`<br>`src/rhi/shader_cache.cpp` | `sf::rhi::ShaderCache::load_and_preprocess`, `compile_to_spirv`, `create_compute_pipeline`, `create_graphics_pipeline` |
 | **Physical Constants & Coordinate Transforms** | `src/core/constants.hpp` | `G_CONST`, `AU_TO_KM`, `SECONDS_PER_YEAR`, `OBLIQUITY`, `ecliptic_to_render`, `render_to_ecliptic` |
@@ -75,7 +76,7 @@
 | **CPU State Contract Tests** | `tests/state_tests.cpp`<br>`CMakeLists.txt` | `StellarStateTests`, `ctest --test-dir build --output-on-failure`, `STELLAR_BUILD_TESTS` |
 | **GPU Point-Source Contract Tests** | `tests/rendering_tests.cpp`<br>`docs/point_sources.md`<br>`CMakeLists.txt` | `StellarRenderingTests`, `STELLAR_BUILD_RENDER_TESTS` (opt-in; requires Vulkan + window system), HDR readback: transitions, inverse-square flux, occlusion, Gaia calibration |
 | **64-Bit Camera Controller & Precision Modes** | `src/core/camera.hpp`<br>`src/core/camera.cpp` | `Camera::update(Seconds, snapshot)`, `focus_body`, `eye_pos_render`, `compute_near_plane_au` |
-| **Gaia DR3 Starfield Renderer (~460k Stars)** | `src/rendering/star_catalog.hpp`<br>`src/rendering/star_catalog.cpp`<br>`shaders/celestial/starfield.vert`<br>`shaders/celestial/starfield.frag` | `StarCatalog`, `StarGpuRecord`, `StarfieldPushConstants` |
+| **Gaia DR3 Starfield Renderer (~460k Stars)** | `src/rendering/star_catalog.hpp`<br>`src/rendering/star_catalog.cpp`<br>`shaders/celestial/starfield_cull.comp`<br>`shaders/celestial/starfield.vert`<br>`shaders/celestial/starfield.frag` | `StarCatalog`, `StarGpuRecord`, `StarfieldPushConstants`, compute culling pre-pass, indirect draw (`vkCmdDrawIndirect`) |
 | **3D Celestial Spheres & Subpixel Point Lights** | `src/rendering/celestial_renderer.hpp`<br>`src/rendering/celestial_renderer.cpp`<br>`shaders/celestial/sphere.vert`<br>`shaders/celestial/sphere.frag`<br>`shaders/celestial/point_celestial.vert`<br>`shaders/celestial/point_celestial.frag` | `CelestialRenderer`, `SceneCelestialUBO`, `BodyInstanceGPU` |
 | **Shared Mesh/Point Transition & Photometry** | `shaders/common/point_source.glsl`<br>`shaders/common/celestial_scene.glsl`<br>`docs/point_sources.md` | `mesh_weight` (1.5–2.5 px radius / 3–5 px diameter); local sprite follows mesh size down to 3 px default minimum; `point_profile` (compact radial), `point_profile_sum` (pixel-grid flux normalization), `point_signal_fade`, `stellar_radiance`, `surface_reflectance`; fully unresolved bodies do not occlude points |
 | **HDR Post-Processing & Tone Mapping** | `shaders/common/tonemap.glsl`<br>`shaders/post/fullscreen.vert`<br>`shaders/post/composite.frag` | `aces_tonemap`, `linear_to_srgb` |
@@ -120,6 +121,7 @@ Stellar Forge Rewrite/
 │       └── workspace.hpp / .cpp    # ImGui Vulkan backend, Slate/Cyan/Amber theme, layout & inspector widget helpers
 ├── shaders/
 │   ├── celestial/
+│   │   ├── starfield_cull.comp     # Gaia DR3 compute culling pre-pass & dynamic indirect draw generation
 │   │   ├── starfield.vert / .frag  # Gaia DR3 starfield with proper motion & shared compact 3 px PSF
 │   │   ├── sphere.vert / .frag     # Camera-relative 3D star/planet renderer (limb darkening, Oren-Nayar, rings)
 │   │   ├── point_celestial.vert/.frag # Subpixel billboard with disc-integrated flux & resolved-body visibility

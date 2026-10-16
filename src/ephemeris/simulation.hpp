@@ -45,6 +45,7 @@ public:
     const SystemSnapshot& snapshot() const noexcept { return snapshot_; }
     const SimulationClock& clock() const noexcept { return clock_; }
     const JacobiPropagator& kepler() const noexcept { return kepler_; }
+    double nbody_epsilon() const noexcept { return ias15_.epsilon(); }
     CommandResult replace_system(LoadedSystem loaded);
     CommandResult apply(SetPaused command);
     CommandResult apply(SetTimeWarp command);

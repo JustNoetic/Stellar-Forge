@@ -60,19 +60,22 @@ std::string format_speed_au_s(double speed_au_s) {
 
 } // namespace
 
-void App::init(bool self_test) {
+void App::init(bool self_test, benchmark::Options benchmark) {
     self_test_ = self_test;
+    benchmark_ = std::move(benchmark);
 
     if (!glfwInit()) {
         sf::log::fatal("Failed to initialize GLFW.");
     }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    if (self_test_) {
+    if (self_test_ || (benchmark_.enabled && benchmark_.hidden)) {
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     }
+    if (benchmark_.enabled) glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-    window_ = glfwCreateWindow(1600, 900, "Stellar Forge", nullptr, nullptr);
+    window_ = glfwCreateWindow(benchmark_.enabled ? benchmark_.width : 1600,
+                               benchmark_.enabled ? benchmark_.height : 900, "Stellar Forge", nullptr, nullptr);
     if (!window_) {
         sf::log::fatal("Failed to create GLFW window.");
     }
@@ -97,6 +100,11 @@ void App::init(bool self_test) {
     rhi::ShaderCache::init();
     vk_.init(window_, false);
     ui_.init(window_, vk_);
+    if (benchmark_.enabled) {
+        ImGui::GetIO().IniFilename = nullptr;
+        ImGui::GetIO().LogFilename = nullptr;
+        ui_settings_.ui_visible = benchmark_.ui;
+    }
 
     recreate_render_targets();
 
@@ -151,6 +159,10 @@ void App::switch_system(std::string_view system_name) {
 }
 
 void App::run() {
+    if (benchmark_.enabled) {
+        run_benchmark();
+        return;
+    }
     double last_time = glfwGetTime();
     uint32_t frames_rendered = 0;
 
@@ -201,6 +213,10 @@ void App::on_framebuffer_resize(int, int) {
 }
 
 void App::on_key(int key, int, int action, int mods) {
+    if (benchmark_.enabled) {
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) glfwSetWindowShouldClose(window_, GLFW_TRUE);
+        return;
+    }
     if (key == GLFW_KEY_H && action == GLFW_PRESS &&
         (!ImGui::GetCurrentContext() || !ImGui::GetIO().WantTextInput)) {
         ui_settings_.ui_visible = !ui_settings_.ui_visible;
@@ -251,6 +267,7 @@ void App::on_key(int key, int, int action, int mods) {
 }
 
 void App::on_mouse_button(int button, int action, int) {
+    if (benchmark_.enabled) return;
     double x = 0.0, y = 0.0;
     glfwGetCursorPos(window_, &x, &y);
     if (action == GLFW_RELEASE) {
@@ -264,10 +281,12 @@ void App::on_mouse_button(int button, int action, int) {
 }
 
 void App::on_cursor_pos(double xpos, double ypos) {
+    if (benchmark_.enabled) return;
     camera_.on_cursor_pos(xpos, ypos, system());
 }
 
 void App::on_scroll(double, double yoffset) {
+    if (benchmark_.enabled) return;
     if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
         return;
     }
@@ -297,22 +316,29 @@ void App::destroy_render_targets() {
     vk_.destroy_image(scene_depth_);
 }
 
-void App::render_frame() {
+bool App::render_frame(benchmark::FrameSample* sample) {
     if (vk_.vsync_enabled() != render_settings_.values().vsync) {
         vk_.set_vsync(render_settings_.values().vsync);
     }
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     uint32_t swapchain_idx = 0;
-    if (!vk_.begin_frame(cmd, swapchain_idx)) {
-        return;
+    if (!vk_.begin_frame(cmd, swapchain_idx, sample ? &sample->host : nullptr)) {
+        return false;
     }
 
+    auto record_start = sample ? SteadyClock::now() : SteadyClock::time_point{};
+    uint32_t t_frame = sample ? vk_.begin_gpu_timer(cmd, "gpu_frame") : UINT32_MAX;
     recreate_render_targets();
 
-    ui_.begin_frame(ui_settings_);
-    if (ui_settings_.ui_visible) {
-        render_ui();
+    {
+        ScopedTimer timer(sample ? &sample->cpu_ui_ms : nullptr);
+        ui_.begin_frame(ui_settings_);
+        if (ui_settings_.ui_visible) {
+            if (benchmark_.enabled) ImGui::BeginDisabled();
+            render_ui();
+            if (benchmark_.enabled) ImGui::EndDisabled();
+        }
     }
 
     VkExtent2D ext = vk_.swapchain_extent();
@@ -325,13 +351,30 @@ void App::render_frame() {
                          VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
+    star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
+
     auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, 0.0f, 0.0f, 0.0f, 1.0f);
     auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0.0f);
     vk_.begin_rendering(cmd, ext, std::span{&color_att, 1}, &depth_att);
 
-    celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
-    star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
-    orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+    {
+        ScopedTimer timer(sample ? &sample->cpu_celestial_ms : nullptr);
+        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_celestial") : UINT32_MAX;
+        celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+        vk_.end_gpu_timer(cmd, id);
+    }
+    {
+        ScopedTimer timer(sample ? &sample->cpu_gaia_ms : nullptr);
+        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_gaia") : UINT32_MAX;
+        star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
+        vk_.end_gpu_timer(cmd, id);
+    }
+    {
+        ScopedTimer timer(sample ? &sample->cpu_orbits_ms : nullptr);
+        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_orbits") : UINT32_MAX;
+        orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+        vk_.end_gpu_timer(cmd, id);
+    }
 
     vk_.end_rendering(cmd);
     vk_.end_gpu_timer(cmd, t_scene);
@@ -372,7 +415,10 @@ void App::render_frame() {
                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                              VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
 
-    vk_.end_frame(cmd, swapchain_idx);
+    vk_.end_gpu_timer(cmd, t_frame);
+    if (sample) sample->cpu_record_ms = elapsed_ms(record_start);
+    vk_.end_frame(cmd, swapchain_idx, sample ? &sample->host : nullptr);
+    return true;
 }
 
 void App::render_outliner_node(int body_idx) {

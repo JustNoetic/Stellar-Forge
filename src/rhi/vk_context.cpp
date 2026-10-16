@@ -85,7 +85,10 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
             break;
         }
     }
-    vkGetPhysicalDeviceProperties(physical_device_, &device_props_);
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    properties.pNext = &driver_props_;
+    vkGetPhysicalDeviceProperties2(physical_device_, &properties);
+    device_props_ = properties.properties;
     sf::log::info("Selected GPU: {} (Vulkan {}.{}.{})", device_props_.deviceName,
                   VK_API_VERSION_MAJOR(device_props_.apiVersion),
                   VK_API_VERSION_MINOR(device_props_.apiVersion),
@@ -109,6 +112,8 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
     if (!found_queue) {
         sf::log::fatal("No queue family supporting graphics, compute, and presentation found.");
     }
+    timestamp_valid_bits_ = qf_props[graphics_queue_family_].timestampValidBits;
+    if (device_props_.limits.timestampPeriod <= 0.0f) timestamp_valid_bits_ = 0;
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo q_ci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -214,8 +219,10 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
         VK_CHECK(vkAllocateCommandBuffers(device_, &cmd_ai, &f.cmd));
         VK_CHECK(vkCreateSemaphore(device_, &sem_ci, nullptr, &f.image_acquired_sem));
         VK_CHECK(vkCreateFence(device_, &fence_ci, nullptr, &f.in_flight_fence));
-        VK_CHECK(vkCreateQueryPool(device_, &qp_ci, nullptr, &f.timestamp_pool));
-        vkResetQueryPool(device_, f.timestamp_pool, 0, MAX_GPU_TIMERS * 2);
+        if (timestamps_supported()) {
+            VK_CHECK(vkCreateQueryPool(device_, &qp_ci, nullptr, &f.timestamp_pool));
+            vkResetQueryPool(device_, f.timestamp_pool, 0, MAX_GPU_TIMERS * 2);
+        }
     }
 
     VK_CHECK(vkCreateCommandPool(device_, &pool_ci, nullptr, &imm_pool_));
@@ -433,30 +440,41 @@ void VkContext::resolve_gpu_timers(FrameContext& frame) {
         timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT);
     if (res == VK_SUCCESS) {
+        GpuTimingSample sample;
+        sample.frame_id = frame.serial;
         double ns_per_tick = static_cast<double>(device_props_.limits.timestampPeriod);
+        uint64_t mask = timestamp_valid_bits_ >= 64 ? UINT64_MAX : (uint64_t{1} << timestamp_valid_bits_) - 1;
         for (uint32_t i = 0; i < frame.timer_count; ++i) {
             uint64_t t0 = timestamps[i * 2];
             uint64_t t1 = timestamps[i * 2 + 1];
-            if (t1 >= t0) {
-                gpu_timings_ms_[frame.timer_names[i]] = static_cast<double>(t1 - t0) * ns_per_tick * 1e-6;
-            }
+            double ms = static_cast<double>((t1 - t0) & mask) * ns_per_tick * 1e-6;
+            gpu_timings_ms_[frame.timer_names[i]] = ms;
+            if (capture_gpu_timings_) sample.timings[frame.timer_names[i]] = ms;
         }
+        if (capture_gpu_timings_) captured_gpu_timings_.push_back(std::move(sample));
     }
     vkResetQueryPool(device_, frame.timestamp_pool, 0, MAX_GPU_TIMERS * 2);
     frame.timer_count = 0;
     frame.timer_names.clear();
 }
 
-bool VkContext::begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_idx) {
+bool VkContext::begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_idx, FrameHostTimings* timings) {
     if (swapchain_dirty_) {
         recreate_swapchain();
     }
 
     FrameContext& frame = frames_[frame_index_];
-    VK_CHECK(vkWaitForFences(device_, 1, &frame.in_flight_fence, VK_TRUE, UINT64_MAX));
+    {
+        ScopedTimer timer(timings ? &timings->fence_wait_ms : nullptr);
+        VK_CHECK(vkWaitForFences(device_, 1, &frame.in_flight_fence, VK_TRUE, UINT64_MAX));
+    }
 
-    VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, frame.image_acquired_sem,
-                                         VK_NULL_HANDLE, &out_swapchain_idx);
+    VkResult acq;
+    {
+        ScopedTimer timer(timings ? &timings->acquire_wait_ms : nullptr);
+        acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, frame.image_acquired_sem,
+                                   VK_NULL_HANDLE, &out_swapchain_idx);
+    }
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         return false;
@@ -466,6 +484,7 @@ bool VkContext::begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_id
     }
 
     resolve_gpu_timers(frame);
+    frame.serial = submitted_frames_;
 
     VK_CHECK(vkResetFences(device_, 1, &frame.in_flight_fence));
     VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
@@ -478,7 +497,7 @@ bool VkContext::begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_id
     return true;
 }
 
-void VkContext::end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx) {
+void VkContext::end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx, FrameHostTimings* timings) {
     FrameContext& frame = frames_[frame_index_];
     VK_CHECK(vkEndCommandBuffer(cmd));
 
@@ -501,7 +520,10 @@ void VkContext::end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx) {
     sub_info.signalSemaphoreInfoCount = 1;
     sub_info.pSignalSemaphoreInfos = &sig_sem;
 
-    VK_CHECK(vkQueueSubmit2(graphics_queue_, 1, &sub_info, frame.in_flight_fence));
+    {
+        ScopedTimer timer(timings ? &timings->submit_ms : nullptr);
+        VK_CHECK(vkQueueSubmit2(graphics_queue_, 1, &sub_info, frame.in_flight_fence));
+    }
 
     VkPresentInfoKHR pres_info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pres_info.waitSemaphoreCount = 1;
@@ -510,7 +532,11 @@ void VkContext::end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx) {
     pres_info.pSwapchains = &swapchain_;
     pres_info.pImageIndices = &swapchain_idx;
 
-    VkResult pres = vkQueuePresentKHR(graphics_queue_, &pres_info);
+    VkResult pres;
+    {
+        ScopedTimer timer(timings ? &timings->present_ms : nullptr);
+        pres = vkQueuePresentKHR(graphics_queue_, &pres_info);
+    }
     if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
         swapchain_dirty_ = true;
     } else if (pres != VK_SUCCESS) {
@@ -518,6 +544,7 @@ void VkContext::end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx) {
     }
 
     frame_index_ = (frame_index_ + 1) % FRAMES_IN_FLIGHT;
+    ++submitted_frames_;
 }
 
 Buffer VkContext::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage,
@@ -833,7 +860,7 @@ void VkContext::push_descriptors(VkCommandBuffer cmd, const Pipeline& pipeline,
 
 uint32_t VkContext::begin_gpu_timer(VkCommandBuffer cmd, std::string_view name) {
     FrameContext& frame = frames_[frame_index_];
-    if (frame.timer_count >= MAX_GPU_TIMERS) {
+    if (!timestamps_supported() || frame.timer_count >= MAX_GPU_TIMERS) {
         return UINT32_MAX;
     }
     uint32_t id = frame.timer_count++;
@@ -853,6 +880,14 @@ void VkContext::end_gpu_timer(VkCommandBuffer cmd, uint32_t timer_id) {
 double VkContext::gpu_time_ms(std::string_view name) const {
     auto it = gpu_timings_ms_.find(std::string(name));
     return it != gpu_timings_ms_.end() ? it->second : 0.0;
+}
+
+std::vector<GpuTimingSample> VkContext::drain_gpu_timings() {
+    wait_idle();
+    for (auto& frame : frames_) resolve_gpu_timers(frame);
+    std::vector<GpuTimingSample> result;
+    result.swap(captured_gpu_timings_);
+    return result;
 }
 
 } // namespace sf::rhi

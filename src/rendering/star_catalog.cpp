@@ -57,7 +57,9 @@ struct alignas(16) StarfieldPushConstants {
     float exposure = 1.0f;
     uint32_t hdr_enabled = 1u;
     float screen_width = 1920.0f;
+    uint32_t star_count = 0;
 };
+static_assert(sizeof(StarfieldPushConstants) == 144);
 
 } // namespace
 
@@ -140,11 +142,29 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         gpu_records.data());
 
+    for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
+        indirect_buffers_[i] = ctx.create_device_buffer(
+            sizeof(VkDrawIndirectCommand),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+        visible_index_buffers_[i] = ctx.create_device_buffer(
+            count_ * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+
+    rhi::DescriptorLayoutBinding cull_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+    };
+    cull_pipeline_ = rhi::ShaderCache::create_compute_pipeline(
+        ctx, "celestial/starfield_cull.comp", cull_bindings, sizeof(StarfieldPushConstants));
+
     rhi::GraphicsPipelineDesc desc{};
     desc.vert_path = "celestial/starfield.vert";
     desc.frag_path = "celestial/starfield.frag";
     desc.bindings = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
     };
     desc.push_constant_size = sizeof(StarfieldPushConstants);
     desc.color_formats = {VK_FORMAT_R16G16B16A16_SFLOAT};
@@ -165,18 +185,22 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
 
 void StarCatalog::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, cull_pipeline_);
+    for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
+        ctx.destroy_buffer(visible_index_buffers_[i]);
+        ctx.destroy_buffer(indirect_buffers_[i]);
+    }
     ctx.destroy_buffer(star_ssbo_);
     loaded_ = false;
     count_ = 0;
 }
 
-void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                         units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) const {
-    if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
-        return;
-    }
+namespace {
 
-    float fb_w = static_cast<float>( std::max(1u, extent.width));
+StarfieldPushConstants make_push_constants(const Camera& cam, units::Years sim_time,
+                                           const RenderSettings& settings, VkExtent2D extent,
+                                           uint32_t star_count) {
+    float fb_w = static_cast<float>(std::max(1u, extent.width));
     float fb_h = static_cast<float>(std::max(1u, extent.height));
     float aspect = fb_w / fb_h;
     float fov_rad = static_cast<float>(cam.fov_deg * DEG_TO_RAD);
@@ -198,14 +222,73 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     pc.intensity_scale = settings.star_intensity;
     pc.exposure = settings.exposure;
     pc.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
+    pc.star_count = star_count;
+    return pc;
+}
+
+} // namespace
+
+void StarCatalog::cull(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                       units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) {
+    if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
+        return;
+    }
+
+    uint32_t f_idx = ctx.frame_index();
+    auto& indirect_buf = indirect_buffers_[f_idx];
+    auto& visible_buf = visible_index_buffers_[f_idx];
+
+    VkDrawIndirectCommand init_cmd{6, 0, 0, 0};
+    vkCmdUpdateBuffer(cmd, indirect_buf.handle, 0, sizeof(init_cmd), &init_cmd);
+
+    ctx.memory_barrier(cmd,
+                       VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    StarfieldPushConstants pc = make_push_constants(cam, sim_time, settings, extent, count_);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cull_pipeline_.handle);
+    rhi::PushDescriptorWrite writes[] = {
+        rhi::PushDescriptorWrite::storage_buffer(0, star_ssbo_),
+        rhi::PushDescriptorWrite::storage_buffer(1, indirect_buf),
+        rhi::PushDescriptorWrite::storage_buffer(2, visible_buf),
+    };
+    ctx.push_descriptors(cmd, cull_pipeline_, writes);
+    ctx.push_constants(cmd, cull_pipeline_, pc);
+
+    uint32_t group_size = 256;
+    uint32_t group_count = (count_ + group_size - 1) / group_size;
+    vkCmdDispatch(cmd, group_count, 1, 1);
+
+    ctx.memory_barrier(cmd,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+                       VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+}
+
+void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                         units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) const {
+    if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
+        return;
+    }
+
+    uint32_t f_idx = ctx.frame_index();
+    const auto& indirect_buf = indirect_buffers_[f_idx];
+    const auto& visible_buf = visible_index_buffers_[f_idx];
+
+    StarfieldPushConstants pc = make_push_constants(cam, sim_time, settings, extent, count_);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle);
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::storage_buffer(0, star_ssbo_),
+        rhi::PushDescriptorWrite::storage_buffer(1, visible_buf),
     };
     ctx.push_descriptors(cmd, pipeline_, writes);
     ctx.push_constants(cmd, pipeline_, pc);
-    vkCmdDraw(cmd, 6, count_, 0, 0);
+    vkCmdDrawIndirect(cmd, indirect_buf.handle, 0, 1, sizeof(VkDrawIndirectCommand));
 }
 
 } // namespace sf::rendering

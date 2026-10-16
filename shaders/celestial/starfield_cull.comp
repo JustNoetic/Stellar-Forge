@@ -1,0 +1,83 @@
+#version 460
+
+#include "common/point_source.glsl"
+
+struct StarGpuRecord {
+    dvec4 pos0;
+    vec4 pm_flux;
+    vec4 color;
+    vec4 reserved;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer StarCatalogBuffer {
+    StarGpuRecord stars[];
+};
+
+layout(std430, set = 0, binding = 1) buffer IndirectDrawBuffer {
+    uint vertex_count;
+    uint instance_count;
+    uint first_vertex;
+    uint first_instance;
+} draw_cmd;
+
+layout(std430, set = 0, binding = 2) writeonly buffer VisibleIndexBuffer {
+    uint visible_indices[];
+};
+
+layout(push_constant) uniform StarfieldPush {
+    mat4 view_proj;
+    dvec4 eye_world_au;
+    double sim_time_yr;
+    float flux_calib;
+    float screen_height;
+    float point_base_px;
+    float min_point_px;
+    float max_point_px;
+    float intensity_scale;
+    float exposure;
+    uint hdr_enabled;
+    float screen_width;
+    uint star_count;
+} pc;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint star_idx = gl_GlobalInvocationID.x;
+    if (star_idx >= pc.star_count) {
+        return;
+    }
+
+    StarGpuRecord s = stars[star_idx];
+
+    vec3 rel_eye = vec3(s.pos0.xyz + dvec3(s.pm_flux.xyz) * pc.sim_time_yr - pc.eye_world_au.xyz);
+    float dist_eye = length(rel_eye);
+    float d2 = max(dist_eye * dist_eye, 1.0);
+    float intensity = s.pm_flux.w * pc.flux_calib / d2;
+
+    float size = clamp(pc.point_base_px, pc.min_point_px, pc.max_point_px);
+    float radius = 0.5 * size;
+    float eff_exposure = (pc.hdr_enabled != 0u) ? pc.exposure : 1.0;
+    vec3 flux = s.color.rgb * (intensity * pc.intensity_scale * eff_exposure);
+    float fade = point_signal_fade(flux, radius);
+
+    if (fade <= 0.0) {
+        return;
+    }
+
+    vec3 dir_eye = dist_eye > 1e-9 ? (rel_eye / dist_eye) : vec3(0.0, 0.0, -1.0);
+    vec4 clip = pc.view_proj * vec4(dir_eye, 1.0);
+
+    if (clip.w <= 0.0) {
+        return;
+    }
+
+    vec2 pad_ndc = size / vec2(pc.screen_width, pc.screen_height);
+    vec2 ndc = clip.xy / clip.w;
+    if (!all(lessThanEqual(abs(ndc), vec2(1.0) + pad_ndc))) {
+        return;
+    }
+
+    uint out_idx = atomicAdd(draw_cmd.instance_count, 1);
+    visible_indices[out_idx] = star_idx;
+}
