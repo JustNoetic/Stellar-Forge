@@ -44,6 +44,7 @@ class Simulation {
 public:
     const SystemSnapshot& snapshot() const noexcept { return snapshot_; }
     const SimulationClock& clock() const noexcept { return clock_; }
+    const JacobiPropagator& kepler() const noexcept { return kepler_; }
     CommandResult replace_system(LoadedSystem loaded);
     CommandResult apply(SetPaused command);
     CommandResult apply(SetTimeWarp command);

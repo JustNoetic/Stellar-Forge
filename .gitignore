@@ -22,3 +22,4 @@ data/kernels/
 data/tiles/
 textures/*
 !textures/.gitkeep
+tests/

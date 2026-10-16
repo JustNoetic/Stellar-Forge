@@ -239,6 +239,72 @@ inline StateVector vector_orbital_to_cartesian(double a, double e, const glm::dv
     return {x_orb * e_vec + y_orb * q_vec, vx_orb * e_vec + vy_orb * q_vec};
 }
 
+struct KeplerVectors {
+    double a = 0.0;
+    double e = 0.0;
+    double M0 = 0.0;
+    glm::dvec3 n{0.0, 0.0, 1.0};
+    glm::dvec3 u_e{1.0, 0.0, 0.0};
+};
+
+inline KeplerVectors cartesian_to_orbital_vectors(const glm::dvec3& r, const glm::dvec3& v, double mu) noexcept {
+    double r_len = glm::length(r);
+    double v2 = glm::dot(v, v);
+    if (r_len < 1e-30 || mu < 1e-30) {
+        return {0.0, 0.0, 0.0, glm::dvec3{0.0, 0.0, 1.0}, glm::dvec3{1.0, 0.0, 0.0}};
+    }
+    glm::dvec3 h = glm::cross(r, v);
+    double h_len = glm::length(h);
+    if (h_len < 1e-30) {
+        return {r_len, 0.0, 0.0, glm::dvec3{0.0, 0.0, 1.0}, glm::dvec3{1.0, 0.0, 0.0}};
+    }
+    glm::dvec3 n = h / h_len;
+    glm::dvec3 e_vec = glm::cross(v, h) / mu - r / r_len;
+    double e = glm::length(e_vec);
+    glm::dvec3 u_e{1.0, 0.0, 0.0};
+    if (e > 1e-10) {
+        u_e = e_vec / e;
+    } else {
+        if (std::abs(n.z) < 0.999999) {
+            glm::dvec3 node{-n.y, n.x, 0.0};
+            double node_len = glm::length(node);
+            u_e = node_len > 1e-15 ? (node / node_len) : glm::dvec3{1.0, 0.0, 0.0};
+        } else {
+            u_e = glm::dvec3{1.0, 0.0, 0.0};
+        }
+    }
+    u_e = glm::normalize(u_e - n * glm::dot(u_e, n));
+
+    double energy = 0.5 * v2 - mu / r_len;
+    double a = std::abs(energy) < 1e-30 ? 1e30 : (-mu / (2.0 * energy));
+
+    double nu = 0.0;
+    if (e > 1e-10) {
+        double r_dot_e = glm::dot(r, e_vec) / (r_len * e);
+        nu = std::acos(std::clamp(r_dot_e, -1.0, 1.0));
+        if (glm::dot(r, v) < 0.0) nu = TWO_PI - nu;
+    } else {
+        double r_dot_ue = glm::dot(r, u_e) / r_len;
+        nu = std::acos(std::clamp(r_dot_ue, -1.0, 1.0));
+        if (glm::dot(glm::cross(u_e, r), n) < 0.0) nu = TWO_PI - nu;
+    }
+
+    double M = 0.0;
+    if (e < 1.0) {
+        double cos_nu = std::cos(nu);
+        double sin_nu = std::sin(nu);
+        double denom = 1.0 + e * cos_nu;
+        if (std::abs(denom) < 1e-12) denom = 1e-12;
+        double sin_E = sin_nu * std::sqrt(std::max(0.0, 1.0 - e * e)) / denom;
+        double cos_E = (e + cos_nu) / denom;
+        double E = std::atan2(sin_E, cos_E);
+        M = E - e * std::sin(E);
+        M = std::fmod(M, TWO_PI);
+        if (M < 0.0) M += TWO_PI;
+    }
+    return {a, e, M, n, u_e};
+}
+
 inline glm::dvec3 axis_angle_rotation(const glm::dvec3& v, const glm::dvec3& axis, double theta) noexcept {
     double cos_t = std::cos(theta);
     double sin_t = std::sin(theta);

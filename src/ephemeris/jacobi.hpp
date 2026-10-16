@@ -26,6 +26,18 @@ struct JacobiCoordinates {
     std::vector<JacobiFrame> frames;
 };
 
+struct KeplerOrbit {
+    double a = 0.0;
+    double e = 0.0;
+    double M0 = 0.0;
+    double mu = 0.0;
+    glm::dvec3 n{0.0, 0.0, 1.0};
+    glm::dvec3 u_e{1.0, 0.0, 0.0};
+    glm::dvec3 prec_vec{0.0};
+    double domega_peri = 0.0;
+    bool is_elliptic = false;
+};
+
 JacobiHierarchy build_jacobi_hierarchy(const SystemDefinition& definition, std::span<const BodyMotion> motions,
                                       const JacobiHierarchy* previous = nullptr);
 JacobiCoordinates extract_jacobi(const SystemDefinition& definition, std::span<const BodyMotion> motions,
@@ -38,9 +50,12 @@ public:
     void evaluate(const SystemDefinition& definition, const JacobiHierarchy& hierarchy,
                   units::Years time, std::vector<BodyMotion>& output);
 
+    const std::vector<KeplerOrbit>& orbits() const noexcept { return orbits_; }
+
 private:
     units::Years epoch_{};
     std::vector<BodyMotion> seeds_, initial_centers_, relative_, centers_;
+    std::vector<KeplerOrbit> orbits_;
 };
 
 }

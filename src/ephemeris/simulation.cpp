@@ -222,7 +222,7 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
         ++revisions.lighting;
     }
     ++snapshot_.definition_revision_;
-    if (before.mass != values.mass) reset_jacobi(true);
+    if (dynamics_changed) reset_jacobi(true);
     if (dynamics_changed) ias15_.update_parameters(snapshot_.definition());
     prepare_render_state(true);
     return {true, true, {}};
