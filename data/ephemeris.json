@@ -1,0 +1,15 @@
+{
+  "runtime": "cspice.dll",
+  "kernels": [
+    "default/naif0012.tls",
+    "default/pck00010.tpc",
+    "default/de440s.bsp",
+    "default/mar099s.bsp",
+    "default/jup365.bsp",
+    "default/sat441.bsp",
+    "default/nep095.bsp",
+    "default/nep105.bsp",
+    "default/plu060.bsp",
+    "additional/artemis2.bsp"
+  ]
+}

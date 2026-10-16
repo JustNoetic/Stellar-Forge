@@ -2,8 +2,11 @@
 
 #include "core/command_result.hpp"
 #include "ephemeris/system_manager.hpp"
+#include "ephemeris/jacobi.hpp"
 
 namespace sf::ephemeris {
+
+class SpiceEphemeris;
 
 struct SimulationClock {
     units::Years time{};
@@ -48,10 +51,14 @@ public:
 private:
     void recenter();
     void prepare_render_state(bool definitions_changed = false);
+    void reset_jacobi(bool preserve_order = false);
 
     SystemSnapshot snapshot_{};
     SimulationClock clock_{};
     std::vector<BodyMotion> previous_motions_;
+    std::shared_ptr<SpiceEphemeris> spice_;
+    double epoch_et_ = 0.0;
+    JacobiPropagator kepler_;
 };
 
 }

@@ -294,6 +294,11 @@ Pipeline ShaderCache::create_graphics_pipeline(VkContext& ctx, const GraphicsPip
     rs_ci.cullMode = desc.cull_mode;
     rs_ci.frontFace = desc.front_face;
     rs_ci.lineWidth = 1.0f;
+    VkPipelineRasterizationLineStateCreateInfoKHR line_state{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_KHR};
+    if (desc.bresenham_lines && ctx.bresenham_lines_enabled()) {
+        line_state.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR;
+        rs_ci.pNext = &line_state;
+    }
 
     VkPipelineMultisampleStateCreateInfo ms_ci{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms_ci.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;

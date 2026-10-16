@@ -101,6 +101,10 @@ public:
     VmaAllocator allocator() const noexcept { return allocator_; }
     VkDescriptorPool imgui_descriptor_pool() const noexcept { return imgui_pool_; }
 
+    void set_vsync(bool enabled) noexcept;
+    bool vsync_enabled() const noexcept { return vsync_enabled_; }
+    VkPresentModeKHR present_mode() const noexcept { return present_mode_; }
+
     VkFormat swapchain_format() const noexcept { return swapchain_format_; }
     VkExtent2D swapchain_extent() const noexcept { return swapchain_extent_; }
     VkImage swapchain_image(uint32_t idx) const noexcept { return swapchain_images_[idx]; }
@@ -108,6 +112,7 @@ public:
     uint32_t swapchain_image_count() const noexcept { return static_cast<uint32_t>(swapchain_images_.size()); }
     uint32_t frame_index() const noexcept { return frame_index_; }
     const char* device_name() const noexcept { return device_props_.deviceName; }
+    bool bresenham_lines_enabled() const noexcept { return bresenham_lines_enabled_; }
 
     VkSampler sampler_linear_clamp() const noexcept { return sampler_linear_clamp_; }
     VkSampler sampler_linear_repeat() const noexcept { return sampler_linear_repeat_; }
@@ -124,6 +129,7 @@ private:
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties device_props_{};
+    bool bresenham_lines_enabled_ = false;
     VkDevice device_ = VK_NULL_HANDLE;
     uint32_t graphics_queue_family_ = 0;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
@@ -136,6 +142,8 @@ private:
     std::vector<VkImageView> swapchain_views_;
     std::vector<VkSemaphore> render_finished_sems_;
     bool swapchain_dirty_ = false;
+    bool vsync_enabled_ = false;
+    VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
 
     std::array<FrameContext, FRAMES_IN_FLIGHT> frames_{};
     uint32_t frame_index_ = 0;

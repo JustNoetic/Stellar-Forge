@@ -56,7 +56,7 @@
 | Task / Feature | Primary Files | Key Symbols |
 | :--- | :--- | :--- |
 | **Application Lifecycle & Main Loop** | `src/main.cpp`<br>`src/app.hpp`<br>`src/app.cpp`<br>`run.bat` | `sf::App::init`, `sf::App::run`, `sf::App::render_frame`, `--self-test` CLI flag |
-| **Vulkan 1.3 Context, VMA, Swapchain & Timers** | `src/rhi/vk_types.hpp`<br>`src/rhi/vk_context.hpp`<br>`src/rhi/vk_context.cpp` | `sf::rhi::VkContext`, `Buffer`, `Image`, `Pipeline`, `PushDescriptorWrite`, `RenderingAttachment` |
+| **Vulkan 1.3 Context, VMA, Swapchain & Timers** | `src/rhi/vk_types.hpp`<br>`src/rhi/vk_context.hpp`<br>`src/rhi/vk_context.cpp` | `sf::rhi::VkContext`, `Buffer`, `Image`, `Pipeline`, `PushDescriptorWrite`, `RenderingAttachment`, `set_vsync`, `present_mode` |
 | **GLSL `#include` Preprocessor & SPIR-V Disk Cache** | `src/rhi/shader_cache.hpp`<br>`src/rhi/shader_cache.cpp` | `sf::rhi::ShaderCache::load_and_preprocess`, `compile_to_spirv`, `create_compute_pipeline`, `create_graphics_pipeline` |
 | **Physical Constants & Coordinate Transforms** | `src/core/constants.hpp` | `G_CONST`, `AU_TO_KM`, `SECONDS_PER_YEAR`, `OBLIQUITY`, `ecliptic_to_render`, `render_to_ecliptic` |
 | **Keplerian / Universal Conic Math & Reverse-Z** | `src/core/math_utils.hpp` | `stumpff_cs`, `propagate_conic_state`, `conic_time_at_angle`, `orbital_to_cartesian`, `vector_orbital_to_cartesian`, `pole_to_ecliptic`, `reverse_z_perspective` |
@@ -64,6 +64,11 @@
 | **Dear ImGui Workspace & Shared Widgets** | `src/ui/workspace.hpp`<br>`src/ui/workspace.cpp` | `sf::ui::UiSystem`, `WorkspaceSettings`, `WorkspaceLayout`, `heading`, `section`, `value_row`, `field` |
 | **System Preset Loader & Analytical Propagator** | `src/ephemeris/system_manager.hpp`<br>`src/ephemeris/system_manager.cpp` | `SystemManager::parse_system`, `serialize_definition`, `LoadedSystem`, `SystemDefinition`, `BodyDefinition`, `BodyMotion`, `SystemSnapshot`, `BodyView` |
 | **Simulation Ownership / Clock / Physical Edits** | `src/ephemeris/simulation.hpp/.cpp`<br>`docs/state_ownership.md` | `Simulation`, `SimulationClock`, `SetPaused`, `SetTimeWarp`, `ApplyBodyPhysicalProperties`, `BodyRevisions` |
+| **Shared Jacobi Coordinates & Analytical Propagation** | `src/ephemeris/jacobi.hpp/.cpp` | `JacobiHierarchy`, `build_jacobi_hierarchy`, `extract_jacobi`, `JacobiPropagator::reset/evaluate`; fixed sibling order, complete descendant masses, cached epoch states, top-down reflex reconstruction; shared by simulation and orbit lines |
+| **SPICE Ephemeris Playback** | `src/ephemeris/spice_ephemeris.hpp/.cpp`<br>`data/ephemeris.json`<br>`docs/orbit_lines.md` | `MotionModel::Spice`, `SpiceEphemeris::open/epoch/state`; geometric ECLIPJ2000 states; explicit NAIF IDs; local CSPICE runtime/kernel manifest; atomic coverage failures |
+| **Orbit Extraction & Hill Continuations** | `src/ephemeris/orbit_curves.hpp/.cpp`<br>`docs/orbit_lines.md` | `compute_orbit_curves`, `compute_orbit_arc`, `OrbitCurve::point`; complete subsystem barycenters, Jacobi masses, dominant-child reflex, physical Hill exits, dashed outer estimates |
+| **Vulkan Orbit Lines** | `src/rendering/orbit_renderer.hpp/.cpp`<br>`shaders/common/orbit_curve.glsl`<br>`shaders/celestial/orbit.vert/.frag` | `OrbitRenderer`; FP64 conic evaluation/camera subtraction; one-pixel Bresenham (`GraphicsPipelineDesc::bresenham_lines`, RHI KHR/EXT feature negotiation); original RGB conditioning/Bright Behind fade; reverse-Z opaque occlusion; `show_orbits`, `orbit_opacity`, `orbit_segments`; paused camera culling |
+| **Orbit & Ephemeris Contract Tests** | `tests/orbit_tests.cpp`<br>`tests/fixtures/`<br>`tests/orbit_rendering_tests.cpp` | `StellarOrbitTests`, `StellarOrbitRenderingTests`; original Python conic fixtures; independent SpiceyPy oracles (`STELLAR_TEST_EPHEMERIS` opt-in); GPU readback/occlusion/large-world precision |
 | **Typed Units & Coordinates** | `src/core/units.hpp`<br>`src/core/coordinates.hpp` | `Seconds`, `Years`, `Kilometres`, `AstronomicalUnits`, `SolarMasses`, `EclipticPosition`, `RenderPosition`, `EclipticVelocity`, `RenderVelocity`, `camera_relative` |
 | **Render Controls / UI Selection / Drafts** | `src/rendering/render_settings.hpp`<br>`src/ui/inspector_state.hpp` | `RenderSettingsStore`, `RenderSettings`, `WorkspaceState`, `BodyEditDraft` |
 | **CPU State Contract Tests** | `tests/state_tests.cpp`<br>`CMakeLists.txt` | `StellarStateTests`, `ctest --test-dir build --output-on-failure`, `STELLAR_BUILD_TESTS` |
@@ -96,11 +101,15 @@ Stellar Forge Rewrite/
 │   │   └── path_utils.hpp / .cpp   # Bundled/external path resolution, binary & JSON file I/O
 │   ├── ephemeris/
 │   │   ├── system_manager.hpp/.cpp # JSON definitions, motion seeds, immutable snapshot interfaces
-│   │   └── simulation.hpp/.cpp   # State owner, clock, validated commands, analytical propagation
+│   │   ├── simulation.hpp/.cpp   # State owner, clock, validated commands, Keplerian/SPICE propagation
+│   │   ├── spice_ephemeris.hpp/.cpp # Dynamic CSPICE runtime, local kernels, epoch/state queries
+│   │   ├── jacobi.hpp/.cpp        # Shared subsystem/inner coordinates and cached analytical propagation
+│   │   └── orbit_curves.hpp/.cpp # Osculating/Jacobi conics, Hill exit patches and primary reflex
 │   ├── rendering/
 │   │   ├── render_settings.hpp  # Validated render controls, separate from camera pose
 │   │   ├── star_catalog.hpp / .cpp # Gaia DR3 stars.bin loader & flux-normalized point-sprite pipeline
-│   │   └── celestial_renderer.hpp/.cpp # Lat/lon UV sphere mesh, 3D star/planet shader, additive subpixel point pass
+│   │   ├── celestial_renderer.hpp/.cpp # Lat/lon UV sphere mesh, 3D star/planet shader, additive subpixel point pass
+│   │   └── orbit_renderer.hpp/.cpp # FP64 parameter-driven Vulkan orbit line strips
 │   ├── rhi/
 │   │   ├── vk_types.hpp            # Buffer, Image, Pipeline, PushDescriptorWrite, RenderingAttachment, GraphicsPipelineDesc
 │   │   ├── vk_context.hpp / .cpp   # Vulkan 1.3 device, VMA, swapchain, Sync2 barriers, Dynamic Rendering, GPU timers
@@ -112,15 +121,18 @@ Stellar Forge Rewrite/
 │   ├── celestial/
 │   │   ├── starfield.vert / .frag  # Gaia DR3 starfield with proper motion & shared compact 3 px PSF
 │   │   ├── sphere.vert / .frag     # Camera-relative 3D star/planet renderer (limb darkening, Oren-Nayar, rings)
-│   │   └── point_celestial.vert/.frag # Subpixel billboard with disc-integrated flux & resolved-body visibility
+│   │   ├── point_celestial.vert/.frag # Subpixel billboard with disc-integrated flux & resolved-body visibility
+│   │   └── orbit.vert/.frag       # Faded/dashed orbital lines with opaque reverse-Z depth testing
 │   ├── common/
 │   │   ├── point_source.glsl      # Shared complementary transition, normalized PSF & faint-signal fade
 │   │   ├── celestial_scene.glsl   # Celestial GPU layout, projected radius & shared surface lighting
-│   │   └── tonemap.glsl            # Shared ACES tone mapping & sRGB conversion
+│   │   ├── tonemap.glsl            # Shared ACES tone mapping & sRGB conversion
+│   │   └── orbit_curve.glsl        # FP64 eccentric/true anomaly curve evaluation
 │   └── post/
 │       ├── fullscreen.vert         # Shared vertex-pulling fullscreen triangle
 │       └── composite.frag          # HDR exposure & tone-mapping composite pass
 ├── docs/state_ownership.md         # Ownership, mutation, units and invalidation contracts
+├── docs/orbit_lines.md             # Conic migration, SPICE runtime setup, model semantics and tests
 ├── tests/state_tests.cpp           # CPU contract tests and preset checks
 ├── data/                           # Isolated runtime data (systems/, gaia/stars.bin, kernels/, tiles/)
 └── textures/                       # Isolated planetary surface & ring textures
@@ -134,8 +146,11 @@ Stellar Forge Rewrite/
 2. **[DONE] Phase 2 — Data Model (`SystemManager`), FP64 Camera Controller, Gaia DR3 Starfield & Basic Celestial Spheres**
    - Ported `SystemManager` (`data/systems/*.json`), 64-bit `Camera` (Free Flight, Simple Orbit, Near-Surface, raycast picking), `StarCatalog` (`data/gaia/stars.bin`), and `CelestialRenderer` (`sphere.{vert,frag}` + `point_celestial.{vert,frag}`).
    - **[DONE] Ownership foundation**: separated immutable definitions, live motion, prepared render state, render controls and transient UI state; typed time/coordinate boundaries; validated physical drafts; domain revisions and CPU contract tests. See `docs/state_ownership.md`.
-3. **[NEXT] Phase 3 — Physics & Ephemeris Engine (`src/physics/`, `src/ephemeris/`)**
-   - Port `physics_core.py` (IAS15 adaptive integrator + 1PN relativity + $J_2/J_4$), `kepler_analytical.py`, `orbit_curve.glsl` + `orbit_layer.py`, and NASA SPICE (`CSPICE`) / Lagrange frames.
+3. **[IN PROGRESS] Phase 3 — Physics & Ephemeris Engine (`src/physics/`, `src/ephemeris/`)**
+   - **[DONE]** Osculating orbit calculations, subsystem/Jacobi barycenters, dominant-child reflex curves, Hill clipping and dashed outer conic estimates; FP64 Vulkan line renderer and opaque-scene occlusion. See `docs/orbit_lines.md`.
+   - **[DONE]** Explicit Keplerian/SPICE motion models; CSPICE kernel playback for Ephemeris Mode via local `data/ephemeris.json`, NAIF IDs and stored UTC epoch; coverage failures roll back and pause.
+   - **[DONE]** Shared fixed-order Jacobi propagation/extraction, complete subsystem masses and top-down primary/moon reconstruction; mass-edit reseeding; Pluto/Charon and crossing-sibling time-series regressions. SPICE planets use physical centers (`599/699/899/999`) before accumulating moon barycenters.
+   - **[NEXT]** IAS15 adaptive integrator + 1PN relativity + $J_2/J_4$, analytical secular precession, sampled spacecraft ephemeris polylines/Lagrange frames, adaptive optical subdivision and `orbit_layer.py` atmosphere transport/MSAA.
 4. **Phase 4 — Native C++ Terrain Quadtree, Async Tile Streamer & GPU Surface Caches (`src/terrain/`)**
    - Port `native/terrain/src/{quadtree,stream,surface,erosion}.rs` + GPU height/normal/horizon/local-shadow caches (`terrain_*.comp`, `terrain.{vert,frag}`).
 5. **Phase 5 — Volumetric & Analytical Atmospheres, Rings & Eclipse Optics (`src/rendering/`)**

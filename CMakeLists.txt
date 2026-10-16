@@ -135,6 +135,7 @@ target_link_libraries(StellarForge PRIVATE
     glslang
     glslang-default-resource-limits
     SPIRV
+    ${CMAKE_DL_LIBS}
 )
 
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
@@ -142,7 +143,9 @@ if(STELLAR_BUILD_TESTS)
     enable_testing()
     add_executable(StellarStateTests
         tests/state_tests.cpp
+        src/ephemeris/jacobi.cpp
         src/ephemeris/simulation.cpp
+        src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
         src/core/path_utils.cpp
     )
@@ -150,11 +153,34 @@ if(STELLAR_BUILD_TESTS)
     target_compile_definitions(StellarStateTests PRIVATE
         GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(StellarStateTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
+    target_link_libraries(StellarStateTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
     if(MINGW)
         target_link_options(StellarStateTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
     add_test(NAME state_contracts COMMAND StellarStateTests "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
+    add_executable(StellarOrbitTests
+        tests/orbit_tests.cpp
+        src/ephemeris/jacobi.cpp
+        src/ephemeris/orbit_curves.cpp
+        src/ephemeris/simulation.cpp
+        src/ephemeris/spice_ephemeris.cpp
+        src/ephemeris/system_manager.cpp
+        src/core/path_utils.cpp
+    )
+    target_include_directories(StellarOrbitTests PRIVATE src)
+    target_compile_definitions(StellarOrbitTests PRIVATE
+        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_link_libraries(StellarOrbitTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+    if(MINGW)
+        target_link_options(StellarOrbitTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    endif()
+    add_test(NAME orbit_contracts COMMAND StellarOrbitTests "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
+    option(STELLAR_TEST_EPHEMERIS "Test against locally installed CSPICE kernels" OFF)
+    if(STELLAR_TEST_EPHEMERIS)
+        target_compile_definitions(StellarStateTests PRIVATE STELLAR_TEST_EPHEMERIS)
+        add_test(NAME ephemeris_contracts COMMAND StellarOrbitTests "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${CMAKE_CURRENT_SOURCE_DIR}/data/systems" --spice)
+    endif()
 endif()
 
 option(STELLAR_BUILD_RENDER_TESTS "Build GPU rendering contract tests (requires Vulkan and a window system)" OFF)
@@ -162,9 +188,11 @@ if(STELLAR_BUILD_RENDER_TESTS)
     enable_testing()
     add_executable(StellarRenderingTests
         tests/rendering_tests.cpp
+        src/ephemeris/jacobi.cpp
         src/core/camera.cpp
         src/core/path_utils.cpp
         src/ephemeris/simulation.cpp
+        src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
         src/rendering/celestial_renderer.cpp
         src/rendering/star_catalog.cpp
@@ -176,4 +204,22 @@ if(STELLAR_BUILD_RENDER_TESTS)
     target_link_libraries(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
     target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
     add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
+    add_executable(StellarOrbitRenderingTests
+        tests/orbit_rendering_tests.cpp
+        src/ephemeris/jacobi.cpp
+        src/core/camera.cpp
+        src/core/path_utils.cpp
+        src/ephemeris/orbit_curves.cpp
+        src/ephemeris/simulation.cpp
+        src/ephemeris/spice_ephemeris.cpp
+        src/ephemeris/system_manager.cpp
+        src/rendering/orbit_renderer.cpp
+        src/rhi/shader_cache.cpp
+        src/rhi/vk_context.cpp
+    )
+    target_include_directories(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,COMPILE_DEFINITIONS>)
+    target_link_libraries(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
+    target_link_options(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
+    add_test(NAME orbit_rendering_contracts COMMAND StellarOrbitRenderingTests)
 endif()

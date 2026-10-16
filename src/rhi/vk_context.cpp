@@ -142,6 +142,32 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
     };
 
+    uint32_t extension_count = 0;
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &extension_count, nullptr));
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &extension_count, extensions.data()));
+    auto has_extension = [&](const char* name) {
+        return std::any_of(extensions.begin(), extensions.end(), [&](const auto& extension) {
+            return std::strcmp(extension.extensionName, name) == 0;
+        });
+    };
+    const char* line_extension = has_extension(VK_KHR_LINE_RASTERIZATION_EXTENSION_NAME)
+        ? VK_KHR_LINE_RASTERIZATION_EXTENSION_NAME
+        : has_extension(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME) ? VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME : nullptr;
+    VkPhysicalDeviceLineRasterizationFeaturesKHR line_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_KHR};
+    if (line_extension) {
+        VkPhysicalDeviceLineRasterizationFeaturesKHR supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &supported;
+        vkGetPhysicalDeviceFeatures2(physical_device_, &query);
+        bresenham_lines_enabled_ = supported.bresenhamLines == VK_TRUE;
+        if (bresenham_lines_enabled_) {
+            dev_exts.push_back(line_extension);
+            line_features.bresenhamLines = VK_TRUE;
+            feat13.pNext = &line_features;
+        }
+    }
+
     VkDeviceCreateInfo dev_ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dev_ci.pNext = &feat2;
     dev_ci.queueCreateInfoCount = 1;
@@ -302,6 +328,27 @@ void VkContext::create_swapchain() {
         img_count = caps.maxImageCount;
     }
 
+    uint32_t mode_count = 0;
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &mode_count, nullptr));
+    std::vector<VkPresentModeKHR> modes(mode_count);
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &mode_count, modes.data()));
+
+    VkPresentModeKHR chosen_mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!vsync_enabled_) {
+        bool has_immediate = false;
+        bool has_mailbox = false;
+        for (VkPresentModeKHR m : modes) {
+            if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) has_immediate = true;
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) has_mailbox = true;
+        }
+        if (has_immediate) {
+            chosen_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        } else if (has_mailbox) {
+            chosen_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+    }
+    present_mode_ = chosen_mode;
+
     VkSwapchainCreateInfoKHR sc_ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     sc_ci.surface = surface_;
     sc_ci.minImageCount = img_count;
@@ -313,7 +360,7 @@ void VkContext::create_swapchain() {
     sc_ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sc_ci.preTransform = caps.currentTransform;
     sc_ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sc_ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    sc_ci.presentMode = chosen_mode;
     sc_ci.clipped = VK_TRUE;
 
     VK_CHECK(vkCreateSwapchainKHR(device_, &sc_ci, nullptr, &swapchain_));
@@ -367,6 +414,13 @@ void VkContext::recreate_swapchain() {
     destroy_swapchain();
     create_swapchain();
     swapchain_dirty_ = false;
+}
+
+void VkContext::set_vsync(bool enabled) noexcept {
+    if (vsync_enabled_ != enabled) {
+        vsync_enabled_ = enabled;
+        swapchain_dirty_ = true;
+    }
 }
 
 void VkContext::resolve_gpu_timers(FrameContext& frame) {

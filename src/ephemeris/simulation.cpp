@@ -1,5 +1,7 @@
 #include "ephemeris/simulation.hpp"
 #include "core/math_utils.hpp"
+#include "core/log.hpp"
+#include "ephemeris/spice_ephemeris.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -49,8 +51,48 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
         return {false, false, "System reference body is out of range."};
     }
 
-    auto owned_definition = std::make_shared<const SystemDefinition>(std::move(definition));
     Simulation candidate;
+    if (definition.motion_model == MotionModel::Spice) {
+        std::string error;
+        candidate.spice_ = SpiceEphemeris::open(error);
+        if (!candidate.spice_) return {false, false, error};
+        auto status = candidate.spice_->epoch(definition.epoch_utc, candidate.epoch_et_);
+        if (!status) return status;
+        std::vector<BodyDefinition> available;
+        std::vector<BodyMotion> states;
+        for (const auto& body : definition.bodies) {
+            if (body.spice_id == 0) return {false, false, "Missing SPICE ID for " + body.name};
+            BodyMotion state;
+            status = candidate.spice_->state(body.spice_id, candidate.epoch_et_, state);
+            if (!status) {
+                if (!body.is_spacecraft) return {false, false, body.name + ": " + status.error};
+                log::warn("Omitting spacecraft '{}' without SPICE coverage at {}", body.name, definition.epoch_utc);
+                continue;
+            }
+            available.push_back(body);
+            states.push_back(state);
+        }
+        if (available.empty()) return {false, false, "No ephemeris bodies are available at this epoch."};
+        definition.bodies = std::move(available);
+        loaded.motions = std::move(states);
+        definition.name_to_idx.clear();
+        for (size_t i = 0; i < definition.bodies.size(); ++i) {
+            auto& body = definition.bodies[i];
+            body.parent_idx = -1;
+            if (!body.parent_id.empty()) {
+                auto parent = definition.name_to_idx.find(body.parent_id);
+                if (parent == definition.name_to_idx.end()) return {false, false, "Ephemeris body has an unavailable parent: " + body.name};
+                body.parent_idx = parent->second;
+            }
+            definition.name_to_idx[body.name] = static_cast<int>(i);
+        }
+        definition.star_idx = 0;
+        for (size_t i = 0; i < definition.bodies.size(); ++i) if (definition.bodies[i].is_star) {
+            definition.star_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    auto owned_definition = std::make_shared<const SystemDefinition>(std::move(definition));
     candidate.snapshot_.definition_ = std::move(owned_definition);
     candidate.snapshot_.motions_ = std::move(loaded.motions);
     candidate.snapshot_.render_.resize(candidate.snapshot_.size());
@@ -59,6 +101,7 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
     candidate.snapshot_.definition_revision_ = snapshot_.definition_revision_ + 1;
     candidate.snapshot_.state_revision_ = snapshot_.state_revision_ + 1;
     candidate.recenter();
+    candidate.reset_jacobi();
     candidate.prepare_render_state(true);
     for (size_t i = 0; i < candidate.snapshot_.size(); ++i) {
         auto body = candidate.snapshot_.body(i);
@@ -66,6 +109,9 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
             !std::isfinite(body.render.spin_angle_rad)) return {false, false, "System preparation produced a nonfinite state."};
     }
     snapshot_ = std::move(candidate.snapshot_);
+    spice_ = std::move(candidate.spice_);
+    epoch_et_ = candidate.epoch_et_;
+    kepler_ = std::move(candidate.kepler_);
     clock_.time = units::Years{};
     previous_motions_.resize(snapshot_.size());
     return {true, true, {}};
@@ -131,6 +177,7 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
         ++revisions.lighting;
     }
     ++snapshot_.definition_revision_;
+    if (before.mass != values.mass) reset_jacobi(true);
     prepare_render_state(true);
     return {true, true, {}};
 }
@@ -147,20 +194,17 @@ CommandResult Simulation::advance(units::Seconds elapsed) {
     }
 
     previous_motions_ = snapshot_.motions_;
+    if (!spice_) kepler_.evaluate(snapshot_.definition(), snapshot_.jacobi_hierarchy(), units::Years{next_time}, snapshot_.motions_);
     const auto& definitions = snapshot_.definition_->bodies;
     for (size_t i = 0; i < snapshot_.size(); ++i) {
         auto& motion = snapshot_.motions_[i];
         const auto& body = definitions[i];
-        if (body.parent_idx >= 0) {
-            auto p = static_cast<size_t>(body.parent_idx);
-            glm::dvec3 rel_p = previous_motions_[i].position.value - previous_motions_[p].position.value;
-            glm::dvec3 rel_v = previous_motions_[i].velocity.value - previous_motions_[p].velocity.value;
-            double mu = G_CONST * (definitions[p].mass_msun + body.mass_msun);
-            auto [position, velocity] = math::propagate_conic_state(rel_p, rel_v, mu, dt.value);
-            motion.position = EclipticPosition{snapshot_.motions_[p].position.value + position};
-            motion.velocity = EclipticVelocity{snapshot_.motions_[p].velocity.value + velocity};
-        } else {
-            motion.position.value += motion.velocity.value * dt.value;
+        if (spice_) {
+            auto status = spice_->state(body.spice_id, epoch_et_ + units::to_seconds(units::Years{next_time}).value, motion);
+            if (!status) {
+                snapshot_.motions_.swap(previous_motions_);
+                return {false, false, body.name + ": " + status.error};
+            }
         }
         if (!finite_vector(motion.position.value) || !finite_vector(motion.velocity.value)) {
             snapshot_.motions_.swap(previous_motions_);
@@ -179,6 +223,12 @@ CommandResult Simulation::advance(units::Seconds elapsed) {
     ++snapshot_.state_revision_;
     prepare_render_state();
     return {true, true, {}};
+}
+
+void Simulation::reset_jacobi(bool preserve_order) {
+    auto hierarchy = build_jacobi_hierarchy(snapshot_.definition(), snapshot_.motions(), preserve_order ? snapshot_.jacobi_.get() : nullptr);
+    snapshot_.jacobi_ = std::make_shared<const JacobiHierarchy>(std::move(hierarchy));
+    if (!spice_) kepler_.reset(snapshot_.definition(), snapshot_.motions(), snapshot_.jacobi_hierarchy(), clock_.time);
 }
 
 void Simulation::recenter() {

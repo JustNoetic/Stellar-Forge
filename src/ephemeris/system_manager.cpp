@@ -239,6 +239,11 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
     LoadedSystem loaded{};
     auto& state = loaded.definition;
     state.name = std::string(name);
+    const auto& root = raw_arr[sorted_order.front()];
+    auto model = root.value("motion_model", name == "Ephemeris Mode" ? "spice" : "keplerian");
+    if (model != "spice" && model != "keplerian") throw std::invalid_argument("Unknown motion model.");
+    state.motion_model = model == "spice" ? MotionModel::Spice : MotionModel::Keplerian;
+    state.epoch_utc = root.value("epoch", "2000-01-01T12:00:00");
     state.bodies.reserve(sorted_order.size());
 
     for (int old_idx : sorted_order) {
@@ -247,6 +252,7 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
         BodyMotion motion{};
         b.source_json = j;
         b.name = j.value("name", "Body");
+        b.spice_id = j.value("spice_id", 0);
         b.type = j.value("type", "Terrestrial");
         b.parent_id = j.value("parentId", "");
         b.is_star = (b.type == "Star");
@@ -319,7 +325,9 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
             p_mass = parent.mass_msun;
         }
 
-        if (j.contains("sv") && j["sv"].is_object()) {
+        if (state.motion_model == MotionModel::Spice) {
+            motion = {};
+        } else if (j.contains("sv") && j["sv"].is_object()) {
             const auto& sv = j["sv"];
             glm::dvec3 rel_p{sv.value("x", 0.0), sv.value("y", 0.0), sv.value("z", 0.0)};
             glm::dvec3 rel_v{sv.value("vx", 0.0), sv.value("vy", 0.0), sv.value("vz", 0.0)};
@@ -355,6 +363,11 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
     for (const auto& b : definition.bodies) {
         auto j = b.source_json;
         j["name"] = b.name;
+        if (definition.motion_model == MotionModel::Spice) j["spice_id"] = b.spice_id;
+        if (b.parent_idx < 0) {
+            j["motion_model"] = definition.motion_model == MotionModel::Spice ? "spice" : "keplerian";
+            j["epoch"] = definition.epoch_utc;
+        }
         j["type"] = b.type;
         j["parentId"] = b.parent_id;
         j["m"] = b.mass_msun;

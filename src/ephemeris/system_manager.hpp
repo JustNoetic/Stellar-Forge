@@ -3,6 +3,7 @@
 #include "core/coordinates.hpp"
 #include "core/units.hpp"
 #include <memory>
+#include <span>
 #include <cstdint>
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
@@ -12,6 +13,8 @@
 #include <vector>
 
 namespace sf::ephemeris {
+
+enum class MotionModel { Keplerian, Spice };
 
 struct DerivedStarProperties {
     double luminosity_lsun = 1.0;
@@ -32,6 +35,7 @@ struct BodyDefinition {
     std::string stage;
 
     int parent_idx = -1;
+    int spice_id = 0;
     bool is_star = false;
     bool is_black_hole = false;
     bool is_spacecraft = false;
@@ -73,6 +77,8 @@ struct BodyDefinition {
 
 struct SystemDefinition {
     std::string name = "Solar System";
+    MotionModel motion_model = MotionModel::Keplerian;
+    std::string epoch_utc;
     std::vector<BodyDefinition> bodies;
     std::unordered_map<std::string, int> name_to_idx;
     int star_idx = 0;
@@ -112,6 +118,7 @@ struct LoadedSystem {
 };
 
 class Simulation;
+struct JacobiHierarchy;
 
 class SystemSnapshot {
 public:
@@ -125,6 +132,8 @@ public:
     uint64_t generation() const noexcept { return generation_; }
     uint64_t state_revision() const noexcept { return state_revision_; }
     uint64_t definition_revision() const noexcept { return definition_revision_; }
+    std::span<const BodyMotion> motions() const noexcept { return motions_; }
+    const JacobiHierarchy& jacobi_hierarchy() const noexcept { return *jacobi_; }
     BodyView body(size_t index) const {
         return {definition_->bodies.at(index), motions_.at(index), render_.at(index), revisions_.at(index)};
     }
@@ -132,6 +141,7 @@ public:
 private:
     friend class Simulation;
     std::shared_ptr<const SystemDefinition> definition_ = std::make_shared<const SystemDefinition>();
+    std::shared_ptr<const JacobiHierarchy> jacobi_;
     std::vector<BodyMotion> motions_;
     std::vector<BodyRenderState> render_;
     std::vector<BodyRevisions> revisions_;

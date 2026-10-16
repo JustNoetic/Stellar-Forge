@@ -22,6 +22,17 @@ The present loop is single-threaded. `simulation.snapshot()` returns a live cons
 
 The analytical propagator reuses its previous-motion scratch vector. It does not copy body definitions, strings or JSON on each tick. JSON and definition copying occurs on loading, saving, or explicit physical edits.
 
+`Simulation` also owns the cached `JacobiPropagator`. Snapshots share an immutable
+`JacobiHierarchy` containing sibling order and subsystem/inner masses. Sibling
+order is established from the loaded state and remains fixed while moving bodies
+cross in radius. Both analytical propagation and orbit extraction use that same
+hierarchy and complete descendant centers. A mass edit publishes updated hierarchy
+masses and reseeds the propagator at the current epoch without moving any body;
+captured snapshots retain their previous hierarchy. `motions()` exposes only a
+const span with the same lifetime rules as `body()` views.
+
+Motion selection is explicit in `SystemDefinition::motion_model`. SPICE playback queries geometric kernel states at the stored UTC epoch plus elapsed simulation seconds; the Keplerian propagator remains the model for ordinary presets. `Simulation` owns the shared CSPICE source, validates initial availability and commits all queried states atomically. A coverage failure preserves motion, prepared render state, clock and revisions. The app pauses on a rejected tick. See `docs/orbit_lines.md` for runtime setup and orbit-line approximation boundaries.
+
 ## Typed boundaries
 
 `units::Seconds`, `Years`, `Kilometres`, `AstronomicalUnits`, and `SolarMasses` are explicit wrappers around a double. Convert with `to_years`, `to_seconds`, `to_au`, and `to_km`. `Simulation::advance` and `Camera::update` accept seconds; snapshots expose years; physical edit commands accept kilometres and solar masses.

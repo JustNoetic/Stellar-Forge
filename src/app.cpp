@@ -6,6 +6,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <format>
 
 namespace sf {
@@ -104,6 +105,7 @@ void App::init(bool self_test) {
 
     star_catalog_.init(vk_, sf::paths::external_path("data", "gaia", "stars.bin"));
     celestial_renderer_.init(vk_);
+    orbit_renderer_.init(vk_);
 
     rhi::GraphicsPipelineDesc comp_desc{};
     comp_desc.vert_path = "post/fullscreen.vert";
@@ -122,11 +124,18 @@ void App::init(bool self_test) {
 }
 
 void App::switch_system(std::string_view system_name) {
-    auto result = simulation_.replace_system(sys_mgr_.load_system(system_name));
+    CommandResult result;
+    try {
+        result = simulation_.replace_system(sys_mgr_.load_system(system_name));
+    } catch (const std::exception& error) {
+        result = {false, false, error.what()};
+    }
     if (!result) {
         sf::log::error("Cannot switch system: {}", result.error);
+        simulation_error_ = result.error;
         return;
     }
+    simulation_error_.clear();
     ui_state_ = {};
     camera_.tracking_idx = system().star_index();
     ui_state_.inspected_body = system().find_body("Earth");
@@ -152,7 +161,11 @@ void App::run() {
         frame_dt_ = units::Seconds{std::clamp(now - last_time, 1e-5, 0.25)};
         last_time = now;
         auto step = simulation_.advance(frame_dt_);
-        if (!step) sf::log::error("Simulation step rejected: {}", step.error);
+        if (!step) {
+            simulation_error_ = step.error;
+            simulation_.apply(ephemeris::SetPaused{true});
+            sf::log::error("Simulation paused: {}", step.error);
+        }
 
         camera_.update(frame_dt_, system());
         render_frame();
@@ -169,6 +182,7 @@ void App::shutdown() {
     vk_.wait_idle();
     rhi::ShaderCache::destroy_pipeline(vk_, composite_pipeline_);
     celestial_renderer_.shutdown(vk_);
+    orbit_renderer_.shutdown(vk_);
     star_catalog_.shutdown(vk_);
     destroy_render_targets();
     ui_.shutdown(vk_);
@@ -284,6 +298,10 @@ void App::destroy_render_targets() {
 }
 
 void App::render_frame() {
+    if (vk_.vsync_enabled() != render_settings_.values().vsync) {
+        vk_.set_vsync(render_settings_.values().vsync);
+    }
+
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     uint32_t swapchain_idx = 0;
     if (!vk_.begin_frame(cmd, swapchain_idx)) {
@@ -313,6 +331,7 @@ void App::render_frame() {
 
     celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
     star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
+    orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
 
     vk_.end_rendering(cmd);
     vk_.end_gpu_timer(cmd, t_scene);
@@ -433,6 +452,8 @@ void App::render_ui() {
             ImGui::MenuItem("Time Transport HUD", nullptr, &ui_settings_.show_time_hud);
             ImGui::Separator();
             ImGui::MenuItem("Gaia DR3 Starfield", nullptr, &render_draft.show_gaia_stars);
+            ImGui::MenuItem("Orbit Lines", nullptr, &render_draft.show_orbits);
+            ImGui::SliderFloat("Orbit Opacity", &render_draft.orbit_opacity, 0.0f, 1.0f);
             ImGui::MenuItem("HDR Rendering", nullptr, &render_draft.hdr_enabled);
             ImGui::MenuItem("Aligned Panels", nullptr, &ui_settings_.aligned_panels);
             ImGui::EndMenu();
@@ -445,6 +466,10 @@ void App::render_ui() {
         ImGuiWindowFlags flags = ui_.prepare_side_panel(ui_settings_, ui_state_, ui::PanelSide::Left, layout);
         if (ImGui::Begin("System Outliner", &ui_settings_.show_outliner, flags)) {
             ui::heading(system().name(), "Click to inspect, double-click to fly to body.");
+            bool spice = system().definition().motion_model == ephemeris::MotionModel::Spice;
+            ImGui::TextDisabled("Motion: %s", spice ? "SPICE ephemeris" : "Keplerian");
+            if (spice) ImGui::TextDisabled("Epoch: %s UTC", system().definition().epoch_utc.c_str());
+            if (!simulation_error_.empty()) ImGui::TextWrapped("Last error: %s", simulation_error_.c_str());
             for (int i = 0; i < static_cast<int>(system().size()); ++i) {
                 if (system().body(i).definition.parent_idx < 0) {
                     render_outliner_node(i);
@@ -561,9 +586,19 @@ void App::render_ui() {
                     render_draft.star_intensity = std::max(0.0f, render_draft.star_intensity);
                 }
             });
+            ui::field("VSync##vsync_field", [&](const char* id) {
+                ImGui::Checkbox(id, &render_draft.vsync);
+            });
 
             ui::section("Engine Telemetry", vk_.device_name());
             ui::value_row("Frame Rate", std::format("{:.1f} FPS", ImGui::GetIO().Framerate));
+            const char* pm_str = "FIFO (VSync)";
+            if (vk_.present_mode() == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                pm_str = "Immediate (Uncapped)";
+            } else if (vk_.present_mode() == VK_PRESENT_MODE_MAILBOX_KHR) {
+                pm_str = "Mailbox (Uncapped)";
+            }
+            ui::value_row("Present Mode", pm_str);
             ui::value_row("Gaia Stars Loaded", std::format("{}", star_catalog_.count()));
             ui::value_row("GPU Scene HDR", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_scene_hdr")));
             ui::value_row("GPU Composite", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_post_composite")));
@@ -594,8 +629,9 @@ void App::render_ui() {
             ImGui::SameLine();
             if (ImGui::Button("1 yr/s")) simulation_.apply(ephemeris::SetTimeWarp{SECONDS_PER_YEAR});
             ImGui::SameLine();
-            ImGui::Text("| Warp: %.4gx | Sim Time: %.5f yr | Mode: %s | Speed: %s",
+            ImGui::Text("| Warp: %.4gx | Sim Time: %.5f yr | %s | %s | Speed: %s",
                         simulation_.clock().warp, system().time().value,
+                        system().definition().motion_model == ephemeris::MotionModel::Spice ? "SPICE" : "Keplerian",
                         camera_.movement_mode == 0 ? "Free Flight" : "Simple Orbit",
                         format_speed_au_s(camera_.flight_speed_au_s).c_str());
         }

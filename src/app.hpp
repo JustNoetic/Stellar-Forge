@@ -6,6 +6,7 @@
 #include "rendering/render_settings.hpp"
 #include "rendering/celestial_renderer.hpp"
 #include "rendering/star_catalog.hpp"
+#include "rendering/orbit_renderer.hpp"
 #include "rhi/shader_cache.hpp"
 #include "rhi/vk_context.hpp"
 #include "ui/workspace.hpp"
@@ -52,12 +53,14 @@ private:
     Camera camera_{};
     rendering::StarCatalog star_catalog_{};
     rendering::CelestialRenderer celestial_renderer_{};
+    rendering::OrbitRenderer orbit_renderer_{};
 
     rhi::Image hdr_color_{};
     rhi::Image scene_depth_{};
     rhi::Pipeline composite_pipeline_{};
 
     bool self_test_ = false;
+    std::string simulation_error_;
     units::Seconds frame_dt_{};
 };
 
