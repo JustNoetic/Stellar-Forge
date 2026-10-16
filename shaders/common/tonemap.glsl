@@ -1,4 +1,5 @@
 vec3 aces_tonemap(vec3 x) {
+    x = min(x, vec3(65504.0));
     const float a = 2.51;
     const float b = 0.03;
     const float c = 2.43;

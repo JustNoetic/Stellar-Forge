@@ -6,29 +6,7 @@ layout(location = 2) in vec3 f_normal;
 layout(location = 3) in float f_subpixel_factor;
 layout(location = 4) flat in uint f_body_idx;
 
-struct BodyInstanceGPU {
-    vec4 pos_radius;
-    vec4 color_is_star;
-    vec4 pole_oblateness;
-    vec4 pole_color_lum;
-    vec4 spin_flags;
-};
-
-layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
-    mat4 view_proj;
-    mat4 view;
-    vec4 stars_pos_radius[16];
-    vec4 stars_color_lum[16];
-    vec4 screen_params;
-    uint num_stars;
-    uint num_bodies;
-    uint hdr_enabled;
-    uint pad0;
-} u_scene;
-
-layout(std430, set = 0, binding = 1) readonly buffer BodyInstanceBuffer {
-    BodyInstanceGPU bodies[];
-};
+#include "common/celestial_scene.glsl"
 
 layout(location = 0) out vec4 out_color;
 
@@ -64,7 +42,7 @@ float compute_eclipse_shadow(vec3 frag_pos, vec3 star_pos, float star_radius, ui
 }
 
 void main() {
-    if (f_subpixel_factor > 0.999) {
+    if (f_subpixel_factor >= 1.0) {
         discard;
     }
 
@@ -81,18 +59,7 @@ void main() {
     float mesh_weight = 1.0 - f_subpixel_factor;
 
     if (b.color_is_star.w > 0.5) {
-        vec3 pole = length(b.pole_oblateness.xyz) > 1e-4 ? normalize(b.pole_oblateness.xyz) : vec3(0.0, 1.0, 0.0);
-        float lat = abs(dot(N, pole));
-        vec3 star_col = mix(b.color_is_star.rgb, b.pole_color_lum.rgb, lat * lat);
-        float star_lum = max(mix(b.pole_color_lum.w, b.spin_flags.y, lat * lat), 1e-4);
-        float star_r = max(b.pos_radius.w, 1e-6);
-
-        float mu = clamp(dot(N, V), 0.0, 1.0);
-        float one_m_mu = 1.0 - mu;
-        float limb = 1.0 - 0.4 * one_m_mu - 0.2 * one_m_mu * one_m_mu;
-
-        float surf_lum = (u_scene.hdr_enabled != 0u) ? (star_lum / (star_r * star_r)) : 1.0;
-        vec3 rgb = star_col * surf_lum * limb * exposure * mesh_weight;
+        vec3 rgb = stellar_radiance(b, N, V) * exposure * mesh_weight;
         out_color = vec4(rgb, 1.0);
         return;
     }
@@ -116,9 +83,7 @@ void main() {
         if (ndotl > 0.0) {
             float shadow = compute_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx);
             float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
-            float ndotv = max(dot(N, V), 0.05);
-            float lommel = 2.0 * ndotl / (ndotl + ndotv);
-            float brdf = mix(ndotl, lommel * 0.5, 0.35);
+            float brdf = surface_reflectance(N, L, V);
             total_light += albedo * star_col * irradiance * brdf * shadow;
         }
     }

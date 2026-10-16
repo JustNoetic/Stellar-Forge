@@ -552,8 +552,8 @@ void App::render_ui() {
                     render_draft.exposure = std::max(0.0f, render_draft.exposure);
                 }
             });
-            ui::field("Star Point Size##sps", [&](const char* id) {
-                ImGui::SliderFloat(id, &render_draft.star_point_size, 1.5f, 6.0f, "%.1f");
+            ui::field("Point Diameter##sps", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.star_point_size, 1.5f, 6.0f, "%.1f px");
             });
             ui::field("Star Brightness##sbi", [&](const char* id) {
                 float star_speed = std::max(0.01f, render_draft.star_intensity * 0.02f);

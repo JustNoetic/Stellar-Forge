@@ -6,11 +6,13 @@
 
 namespace sf::rendering {
 
+inline constexpr float DEFAULT_POINT_DIAMETER_PX = 3.0f;
+
 struct RenderSettings {
     float exposure = 1.0f;
     bool hdr_enabled = true;
     bool show_gaia_stars = true;
-    float star_point_size = 2.0f;
+    float star_point_size = DEFAULT_POINT_DIAMETER_PX;
     float star_intensity = 1.0f;
     bool operator==(const RenderSettings&) const = default;
 };

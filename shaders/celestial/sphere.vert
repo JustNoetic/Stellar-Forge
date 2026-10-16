@@ -3,29 +3,7 @@
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
 
-struct BodyInstanceGPU {
-    vec4 pos_radius;
-    vec4 color_is_star;
-    vec4 pole_oblateness;
-    vec4 pole_color_lum;
-    vec4 spin_flags;
-};
-
-layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
-    mat4 view_proj;
-    mat4 view;
-    vec4 stars_pos_radius[16];
-    vec4 stars_color_lum[16];
-    vec4 screen_params;
-    uint num_stars;
-    uint num_bodies;
-    uint hdr_enabled;
-    uint pad0;
-} u_scene;
-
-layout(std430, set = 0, binding = 1) readonly buffer BodyInstanceBuffer {
-    BodyInstanceGPU bodies[];
-};
+#include "common/celestial_scene.glsl"
 
 layout(location = 0) out vec3 f_world_pos;
 layout(location = 1) out vec3 f_local_pos;
@@ -52,15 +30,9 @@ void main() {
     float spin = b.spin_flags.x;
     bool is_bh = b.spin_flags.z > 0.5;
 
-    float dist = length(center);
-    float apparent_px = (radius / max(dist, 1e-12)) * u_scene.screen_params.y * u_scene.screen_params.z;
-    float final_radius = radius;
-    if (apparent_px > 1e-6 && apparent_px < 2.0) {
-        final_radius = radius * (2.0 / apparent_px);
-    }
-
-    f_subpixel_factor = is_bh ? 0.0 : (1.0 - smoothstep(2.0, 3.0, apparent_px));
-    if (f_subpixel_factor > 0.999) {
+    float weight = is_bh ? 1.0 : mesh_weight(apparent_radius_px(b.pos_radius));
+    f_subpixel_factor = 1.0 - weight;
+    if (weight <= 0.0) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
         f_world_pos = vec3(0.0);
         f_local_pos = vec3(0.0);
@@ -81,7 +53,7 @@ void main() {
         adj_norm = normalize(mesh_norm + pole * (dot(mesh_norm, pole) * f_inv));
     }
 
-    vec3 world_pos = center + scaled_pos * final_radius;
+    vec3 world_pos = center + scaled_pos * radius;
     f_world_pos = world_pos;
     f_normal = adj_norm;
     gl_Position = u_scene.view_proj * vec4(world_pos, 1.0);

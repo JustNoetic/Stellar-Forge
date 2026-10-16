@@ -156,3 +156,24 @@ if(STELLAR_BUILD_TESTS)
     endif()
     add_test(NAME state_contracts COMMAND StellarStateTests "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
 endif()
+
+option(STELLAR_BUILD_RENDER_TESTS "Build GPU rendering contract tests (requires Vulkan and a window system)" OFF)
+if(STELLAR_BUILD_RENDER_TESTS)
+    enable_testing()
+    add_executable(StellarRenderingTests
+        tests/rendering_tests.cpp
+        src/core/camera.cpp
+        src/core/path_utils.cpp
+        src/ephemeris/simulation.cpp
+        src/ephemeris/system_manager.cpp
+        src/rendering/celestial_renderer.cpp
+        src/rendering/star_catalog.cpp
+        src/rhi/shader_cache.cpp
+        src/rhi/vk_context.cpp
+    )
+    target_include_directories(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,COMPILE_DEFINITIONS>)
+    target_link_libraries(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
+    target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
+    add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
+endif()

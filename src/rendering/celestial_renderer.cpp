@@ -60,7 +60,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx) {
     point_desc.bindings.assign(std::begin(bindings), std::end(bindings));
     point_desc.color_formats = {VK_FORMAT_R16G16B16A16_SFLOAT};
     point_desc.depth_format = VK_FORMAT_D32_SFLOAT;
-    point_desc.depth_test = true;
+    point_desc.depth_test = false;
     point_desc.depth_write = false;
     point_desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
     point_desc.additive_blend = true;
@@ -147,6 +147,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ubo.view = view;
     ubo.view_proj = proj * view;
     ubo.screen_params = {fb_w, fb_h, fov_factor, settings.exposure};
+    ubo.point_params.x = std::clamp(settings.star_point_size, 1.5f, 6.0f);
     ubo.num_bodies = count;
     ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
 

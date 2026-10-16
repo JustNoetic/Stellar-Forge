@@ -8,7 +8,7 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2D u_hdr_scene;
 
 void main() {
-    vec3 final_color = texture(u_hdr_scene, v_uv).rgb;
+    vec3 final_color = texelFetch(u_hdr_scene, ivec2(gl_FragCoord.xy), 0).rgb;
     float pre_luma = dot(final_color, vec3(0.2126, 0.7152, 0.0722));
     final_color = aces_tonemap(final_color);
     float eye_hurt_blend = smoothstep(10.0, 150.0, pre_luma);

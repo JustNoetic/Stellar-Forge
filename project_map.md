@@ -67,9 +67,11 @@
 | **Typed Units & Coordinates** | `src/core/units.hpp`<br>`src/core/coordinates.hpp` | `Seconds`, `Years`, `Kilometres`, `AstronomicalUnits`, `SolarMasses`, `EclipticPosition`, `RenderPosition`, `EclipticVelocity`, `RenderVelocity`, `camera_relative` |
 | **Render Controls / UI Selection / Drafts** | `src/rendering/render_settings.hpp`<br>`src/ui/inspector_state.hpp` | `RenderSettingsStore`, `RenderSettings`, `WorkspaceState`, `BodyEditDraft` |
 | **CPU State Contract Tests** | `tests/state_tests.cpp`<br>`CMakeLists.txt` | `StellarStateTests`, `ctest --test-dir build --output-on-failure`, `STELLAR_BUILD_TESTS` |
+| **GPU Point-Source Contract Tests** | `tests/rendering_tests.cpp`<br>`docs/point_sources.md`<br>`CMakeLists.txt` | `StellarRenderingTests`, `STELLAR_BUILD_RENDER_TESTS` (opt-in; requires Vulkan + window system), HDR readback: transitions, inverse-square flux, occlusion, Gaia calibration |
 | **64-Bit Camera Controller & Precision Modes** | `src/core/camera.hpp`<br>`src/core/camera.cpp` | `Camera::update(Seconds, snapshot)`, `focus_body`, `eye_pos_render`, `compute_near_plane_au` |
 | **Gaia DR3 Starfield Renderer (~460k Stars)** | `src/rendering/star_catalog.hpp`<br>`src/rendering/star_catalog.cpp`<br>`shaders/celestial/starfield.vert`<br>`shaders/celestial/starfield.frag` | `StarCatalog`, `StarGpuRecord`, `StarfieldPushConstants` |
 | **3D Celestial Spheres & Subpixel Point Lights** | `src/rendering/celestial_renderer.hpp`<br>`src/rendering/celestial_renderer.cpp`<br>`shaders/celestial/sphere.vert`<br>`shaders/celestial/sphere.frag`<br>`shaders/celestial/point_celestial.vert`<br>`shaders/celestial/point_celestial.frag` | `CelestialRenderer`, `SceneCelestialUBO`, `BodyInstanceGPU` |
+| **Shared Mesh/Point Transition & Photometry** | `shaders/common/point_source.glsl`<br>`shaders/common/celestial_scene.glsl`<br>`docs/point_sources.md` | `mesh_weight` (1.5–2.5 px radius / 3–5 px diameter); local sprite follows mesh size down to 3 px default minimum; `point_profile` (compact radial), `point_profile_sum` (pixel-grid flux normalization), `point_signal_fade`, `stellar_radiance`, `surface_reflectance`; fully unresolved bodies do not occlude points |
 | **HDR Post-Processing & Tone Mapping** | `shaders/common/tonemap.glsl`<br>`shaders/post/fullscreen.vert`<br>`shaders/post/composite.frag` | `aces_tonemap`, `linear_to_srgb` |
 
 ---
@@ -97,8 +99,8 @@ Stellar Forge Rewrite/
 │   │   └── simulation.hpp/.cpp   # State owner, clock, validated commands, analytical propagation
 │   ├── rendering/
 │   │   ├── render_settings.hpp  # Validated render controls, separate from camera pose
-│   │   ├── star_catalog.hpp / .cpp # Gaia DR3 stars.bin loader & motion-blurred Airy point-sprite pipeline
-│   │   └── celestial_renderer.hpp/.cpp # Lat/lon UV sphere mesh, 3D star/planet shader, subpixel diffraction beacon pass
+│   │   ├── star_catalog.hpp / .cpp # Gaia DR3 stars.bin loader & flux-normalized point-sprite pipeline
+│   │   └── celestial_renderer.hpp/.cpp # Lat/lon UV sphere mesh, 3D star/planet shader, additive subpixel point pass
 │   ├── rhi/
 │   │   ├── vk_types.hpp            # Buffer, Image, Pipeline, PushDescriptorWrite, RenderingAttachment, GraphicsPipelineDesc
 │   │   ├── vk_context.hpp / .cpp   # Vulkan 1.3 device, VMA, swapchain, Sync2 barriers, Dynamic Rendering, GPU timers
@@ -108,10 +110,12 @@ Stellar Forge Rewrite/
 │       └── workspace.hpp / .cpp    # ImGui Vulkan backend, Slate/Cyan/Amber theme, layout & inspector widget helpers
 ├── shaders/
 │   ├── celestial/
-│   │   ├── starfield.vert / .frag  # Gaia DR3 starfield with proper motion, velocity streak & Airy PSF
+│   │   ├── starfield.vert / .frag  # Gaia DR3 starfield with proper motion & shared compact 3 px PSF
 │   │   ├── sphere.vert / .frag     # Camera-relative 3D star/planet renderer (limb darkening, Oren-Nayar, rings)
-│   │   └── point_celestial.vert/.frag # Subpixel billboard with inverse-square flux & 6-point diffraction spikes
+│   │   └── point_celestial.vert/.frag # Subpixel billboard with disc-integrated flux & resolved-body visibility
 │   ├── common/
+│   │   ├── point_source.glsl      # Shared complementary transition, normalized PSF & faint-signal fade
+│   │   ├── celestial_scene.glsl   # Celestial GPU layout, projected radius & shared surface lighting
 │   │   └── tonemap.glsl            # Shared ACES tone mapping & sRGB conversion
 │   └── post/
 │       ├── fullscreen.vert         # Shared vertex-pulling fullscreen triangle

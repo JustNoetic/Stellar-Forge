@@ -26,6 +26,7 @@ struct alignas(16) SceneCelestialUBO {
     glm::vec4 stars_pos_radius[MAX_SCENE_STARS]{};
     glm::vec4 stars_color_lum[MAX_SCENE_STARS]{};
     glm::vec4 screen_params{1600.0f, 900.0f, 1.2f, 1.0f};
+    glm::vec4 point_params{DEFAULT_POINT_DIAMETER_PX, 0.0f, 0.0f, 0.0f};
     uint32_t num_stars = 0;
     uint32_t num_bodies = 0;
     uint32_t hdr_enabled = 1;

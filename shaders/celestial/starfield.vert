@@ -1,5 +1,7 @@
 #version 460
 
+#include "common/point_source.glsl"
+
 struct StarGpuRecord {
     dvec4 pos0;
     vec4 pm_flux;
@@ -23,14 +25,16 @@ layout(push_constant) uniform StarfieldPush {
     float intensity_scale;
     float exposure;
     uint hdr_enabled;
+    float screen_width;
 } pc;
 
-layout(location = 0) out vec3 f_color;
-layout(location = 1) out float f_intensity;
-layout(location = 2) out float f_point_size;
+layout(location = 0) flat out vec3 f_color;
+layout(location = 1) flat out float f_intensity;
+layout(location = 2) flat out float f_point_radius;
+layout(location = 3) out vec2 f_pixel_offset;
 
 void main() {
-    StarGpuRecord s = stars[gl_VertexIndex];
+    StarGpuRecord s = stars[gl_InstanceIndex];
 
     vec3 rel_eye = vec3(s.pos0.xyz + dvec3(s.pm_flux.xyz) * pc.sim_time_yr - pc.eye_world_au.xyz);
     float dist_eye = length(rel_eye);
@@ -42,37 +46,40 @@ void main() {
 
     if (clip.w <= 0.0) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
-        gl_PointSize = 0.0;
         f_color = vec3(0.0);
         f_intensity = 0.0;
-        f_point_size = 0.0;
+        f_point_radius = 1.0;
+        f_pixel_offset = vec2(0.0);
         return;
     }
 
-    float size = clamp(pc.point_base_px * (pc.screen_height / 1080.0), pc.min_point_px, pc.max_point_px);
-    gl_PointSize = size;
-
-    float pad_ndc = pc.max_point_px / max(pc.screen_height, 1.0) * 2.0;
+    float size = clamp(pc.point_base_px, pc.min_point_px, pc.max_point_px);
+    float radius = 0.5 * size;
+    vec2 pad_ndc = size / vec2(pc.screen_width, pc.screen_height);
     vec2 ndc = clip.xy / clip.w;
-    bool on_screen = all(lessThanEqual(abs(ndc), vec2(1.0 + pad_ndc)));
+    bool on_screen = all(lessThanEqual(abs(ndc), vec2(1.0) + pad_ndc));
 
-    float flux_norm = 1.0 / (size * size * 0.2524);
     float eff_exposure = (pc.hdr_enabled != 0u) ? pc.exposure : 1.0;
-    float star_peak = max(s.color.r, max(s.color.g, s.color.b));
-    float peak_signal = intensity * pc.intensity_scale * star_peak * flux_norm * eff_exposure;
+    vec3 flux = s.color.rgb * (intensity * pc.intensity_scale * eff_exposure);
+    float fade = point_signal_fade(flux, radius);
 
-    if (!on_screen || peak_signal < 1.0e-6) {
+    if (!on_screen || fade <= 0.0) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
-        gl_PointSize = 0.0;
         f_color = vec3(0.0);
         f_intensity = 0.0;
-        f_point_size = 0.0;
+        f_point_radius = 1.0;
+        f_pixel_offset = vec2(0.0);
         return;
     }
 
+    vec2 center_px = (clip.xy / clip.w * 0.5 + 0.5) * vec2(pc.screen_width, pc.screen_height);
+    float normalization = point_profile_sum(center_px, radius);
     clip.z = 1e-6 * clip.w;
+    vec2 q = POINT_QUAD_VERTS[gl_VertexIndex];
+    clip.xy += q * pad_ndc * clip.w;
     gl_Position = clip;
     f_color = s.color.rgb;
-    f_intensity = intensity;
-    f_point_size = size;
+    f_intensity = intensity * pc.intensity_scale * eff_exposure * fade / normalization;
+    f_point_radius = radius;
+    f_pixel_offset = q * radius;
 }

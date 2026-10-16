@@ -1,113 +1,105 @@
 #version 460
 
-struct BodyInstanceGPU {
-    vec4 pos_radius;
-    vec4 color_is_star;
-    vec4 pole_oblateness;
-    vec4 pole_color_lum;
-    vec4 spin_flags;
-};
+#include "common/celestial_scene.glsl"
 
-layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
-    mat4 view_proj;
-    mat4 view;
-    vec4 stars_pos_radius[16];
-    vec4 stars_color_lum[16];
-    vec4 screen_params;
-    uint num_stars;
-    uint num_bodies;
-    uint hdr_enabled;
-    uint pad0;
-} u_scene;
+layout(location = 0) out vec2 f_pixel_offset;
+layout(location = 1) flat out float f_point_radius;
+layout(location = 2) flat out vec3 f_flux;
 
-layout(std430, set = 0, binding = 1) readonly buffer BodyInstanceBuffer {
-    BodyInstanceGPU bodies[];
-};
+float point_visibility(vec3 center, uint self_idx) {
+    float distance = length(center);
+    vec3 ray = center / max(distance, 1e-12);
+    float visibility = 1.0;
+    for (uint i = 0; i < u_scene.num_bodies; ++i) {
+        if (i == self_idx) continue;
+        BodyInstanceGPU caster = bodies[i];
+        float weight = caster.spin_flags.z > 0.5 ? 1.0
+                       : mesh_weight(apparent_radius_px(caster.pos_radius));
+        if (weight <= 0.0) continue;
 
-layout(location = 0) out vec2 f_quad_uv;
-layout(location = 1) flat out float f_apparent_px;
-layout(location = 2) flat out float f_half_size_px;
-layout(location = 3) flat out float f_is_star;
-layout(location = 4) flat out vec3 f_surface_color;
-
-const vec2 QUAD_VERTS[6] = vec2[](
-    vec2(-1.0, -1.0),
-    vec2( 1.0, -1.0),
-    vec2( 1.0,  1.0),
-    vec2(-1.0, -1.0),
-    vec2( 1.0,  1.0),
-    vec2(-1.0,  1.0)
-);
-
-void main() {
-    uint inst_idx = gl_InstanceIndex;
-    BodyInstanceGPU b = bodies[inst_idx];
-
-    vec3 center = b.pos_radius.xyz;
-    float radius = b.pos_radius.w;
-    float is_star = b.color_is_star.w;
-    bool is_bh = b.spin_flags.z > 0.5;
-
-    if (is_bh) {
-        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
-        return;
+        vec3 pole = body_pole(caster);
+        float stretch = 1.0 / max(1.0 - caster.pole_oblateness.w, 1e-4) - 1.0;
+        vec3 oc = caster.pos_radius.xyz;
+        vec3 scaled_ray = ray + pole * (dot(ray, pole) * stretch);
+        vec3 scaled_oc = oc + pole * (dot(oc, pole) * stretch);
+        float ray_scale = length(scaled_ray);
+        vec3 direction = scaled_ray / ray_scale;
+        float along = dot(scaled_oc, direction);
+        float perpendicular = length(cross(scaled_oc, direction));
+        float radius = caster.pos_radius.w;
+        if (along <= 0.0 || perpendicular >= radius) continue;
+        float hit = (along - sqrt(max(radius * radius - perpendicular * perpendicular, 0.0))) / ray_scale;
+        if (hit > 0.0 && hit < distance) visibility *= 1.0 - weight;
     }
+    return visibility;
+}
 
-    float dist = length(center);
-    float screen_w = u_scene.screen_params.x;
-    float screen_h = u_scene.screen_params.y;
-    float fov_factor = u_scene.screen_params.z;
-    float apparent_px = (radius / max(dist, 1e-12)) * screen_h * fov_factor;
-
-    if (apparent_px >= 3.0) {
-        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
-        return;
-    }
-
-    vec4 center_clip = u_scene.view_proj * vec4(center, 1.0);
-    if (center_clip.w <= 1e-6) {
-        gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
-        return;
-    }
-
-    float r_min = (is_star > 0.5) ? 1.0 : 0.5;
-    float r_mesh_px = apparent_px * 0.5;
-    float r_eff = max(r_mesh_px, r_min);
-    float half_size_px = r_eff + 1.0;
-
-    vec2 q_pos = QUAD_VERTS[gl_VertexIndex];
-    vec2 ndc_offset = q_pos * ((half_size_px * 2.0) / vec2(screen_w, screen_h));
-
-    vec4 clip = center_clip;
-    clip.xy += ndc_offset * center_clip.w;
-    gl_Position = clip;
-
-    f_quad_uv = q_pos * half_size_px;
-    f_apparent_px = apparent_px;
-    f_half_size_px = half_size_px;
-    f_is_star = is_star;
-
-    vec3 surf_col = vec3(0.0);
-    if (is_star > 0.5) {
-        float lum_eq = max(b.pole_color_lum.w, 1e-4);
-        float sr = max(radius, 1e-6);
-        float surf_lum = (u_scene.hdr_enabled != 0u) ? (0.8333 * lum_eq / (sr * sr)) : 1.0;
-        surf_col = b.color_is_star.rgb * surf_lum;
-    } else {
-        vec3 V_dir = (dist > 1e-6) ? normalize(-center) : vec3(0.0, 0.0, 1.0);
-        for (uint s = 0; s < u_scene.num_stars; ++s) {
-            vec3 star_pos = u_scene.stars_pos_radius[s].xyz;
-            vec3 star_col = u_scene.stars_color_lum[s].rgb;
-            float star_lum = u_scene.stars_color_lum[s].w;
-            vec3 to_star = star_pos - center;
-            float d_au = max(length(to_star), 1e-5);
-            vec3 L_dir = to_star / d_au;
-            float cos_alpha = clamp(dot(L_dir, V_dir), -1.0, 1.0);
-            float alpha = acos(cos_alpha);
-            float phase = ((sin(alpha) + (3.14159265 - alpha) * cos_alpha) / 3.14159265);
-            float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
-            surf_col += b.color_is_star.rgb * star_col * irradiance * max(phase, 0.08);
+vec3 disc_radiance(BodyInstanceGPU b, vec3 V) {
+    vec3 tangent = normalize(cross(V, abs(V.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 bitangent = cross(V, tangent);
+    vec3 total = vec3(0.0);
+    const int SAMPLES = 64;
+    for (int i = 0; i < SAMPLES; ++i) {
+        float r2 = (float(i) + 0.5) / float(SAMPLES);
+        float angle = float(i) * 2.39996323;
+        vec3 N = sqrt(1.0 - r2) * V
+                 + sqrt(r2) * (cos(angle) * tangent + sin(angle) * bitangent);
+        if (b.color_is_star.w > 0.5) {
+            total += stellar_radiance(b, N, V);
+        } else {
+            for (uint s = 0; s < u_scene.num_stars; ++s) {
+                vec3 to_star = u_scene.stars_pos_radius[s].xyz - b.pos_radius.xyz;
+                float distance = max(length(to_star), 1e-12);
+                float irradiance = u_scene.hdr_enabled != 0u
+                                   ? u_scene.stars_color_lum[s].w / (distance * distance) : 1.0;
+                total += b.color_is_star.rgb * u_scene.stars_color_lum[s].rgb
+                         * irradiance * surface_reflectance(N, to_star / distance, V);
+            }
         }
     }
-    f_surface_color = surf_col;
+    return total / float(SAMPLES);
+}
+
+void main() {
+    gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
+    f_pixel_offset = vec2(0.0);
+    f_point_radius = 1.0;
+    f_flux = vec3(0.0);
+
+    uint idx = gl_InstanceIndex;
+    BodyInstanceGPU b = bodies[idx];
+    float radius_px = apparent_radius_px(b.pos_radius);
+    float weight = 1.0 - mesh_weight(radius_px);
+    if (b.spin_flags.z > 0.5 || weight <= 0.0) return;
+
+    vec3 center = b.pos_radius.xyz;
+    vec4 clip = u_scene.view_proj * vec4(center, 1.0);
+    if (clip.w <= 0.0) return;
+
+    float half_size = max(radius_px, 0.5 * u_scene.point_params.x);
+    vec2 padding = 2.0 * half_size / u_scene.screen_params.xy;
+    if (any(greaterThan(abs(clip.xy / clip.w), vec2(1.0) + padding))) return;
+
+    float visibility = point_visibility(center, idx);
+    if (visibility <= 0.0) return;
+
+    vec3 V = normalize(-center);
+    float polar_radius = max(1.0 - b.pole_oblateness.w, 1e-4);
+    float pole_view = dot(body_pole(b), V);
+    float area_scale = sqrt(polar_radius * polar_radius
+                            + (1.0 - polar_radius * polar_radius) * pole_view * pole_view);
+    vec3 flux = disc_radiance(b, V) * (POINT_PI * radius_px * radius_px * area_scale);
+    if (u_scene.hdr_enabled != 0u) flux *= u_scene.screen_params.w;
+    flux *= point_signal_fade(flux, half_size) * weight * visibility;
+    if (max(flux.r, max(flux.g, flux.b)) <= 0.0) return;
+
+    vec2 center_px = (clip.xy / clip.w * 0.5 + 0.5) * u_scene.screen_params.xy;
+    flux /= point_profile_sum(center_px, half_size);
+
+    vec2 q = POINT_QUAD_VERTS[gl_VertexIndex];
+    clip.xy += q * padding * clip.w;
+    gl_Position = clip;
+    f_pixel_offset = q * half_size;
+    f_point_radius = half_size;
+    f_flux = flux;
 }

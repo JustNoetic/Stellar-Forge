@@ -37,6 +37,7 @@ inline constexpr double PC_TO_AU = 206264.80624709636;
 inline constexpr double MAS_TO_RAD = PI / (180.0 * 3600.0 * 1000.0);
 inline constexpr double EPOCH_OFFSET_YEARS = 16.0;
 inline constexpr double FLUX_SCALE = 1.0e13;
+inline constexpr double SOLAR_ABSOLUTE_G_MAG = 4.67;
 
 inline constexpr double TEFF_A = 8842.0;
 inline constexpr double TEFF_B = -4578.875;
@@ -49,12 +50,13 @@ struct alignas(16) StarfieldPushConstants {
     double sim_time_yr = 0.0;
     float flux_calib = 1.0f;
     float screen_height = 1080.0f;
-    float point_base_px = 2.0f;
-    float min_point_px = 2.0f;
-    float max_point_px = 10.0f;
+    float point_base_px = DEFAULT_POINT_DIAMETER_PX;
+    float min_point_px = 1.5f;
+    float max_point_px = 6.0f;
     float intensity_scale = 1.0f;
     float exposure = 1.0f;
     uint32_t hdr_enabled = 1u;
+    float screen_width = 1920.0f;
 };
 
 } // namespace
@@ -151,7 +153,6 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
     desc.depth_write = false;
     desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
     desc.additive_blend = true;
-    desc.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
     desc.cull_mode = VK_CULL_MODE_NONE;
 
     pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
@@ -181,9 +182,8 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     float fov_rad = static_cast<float>(cam.fov_deg * DEG_TO_RAD);
     float fov_factor = 1.0f / (2.0f * std::tan(0.5f * fov_rad));
 
-    float star_size_px = std::clamp(settings.star_point_size * (fb_h / 1080.0f), 2.0f, 10.0f);
-    float flux_calib = static_cast<float>(3.879 * std::pow(static_cast<double>(fb_h * fov_factor), 2.0) *
-                                          star_size_px * star_size_px / 1.0e13);
+    float flux_calib = static_cast<float>(PI * (5.0 / 6.0) * std::pow(10.0, 0.4 * SOLAR_ABSOLUTE_G_MAG) *
+                                          std::pow(static_cast<double>(fb_h * fov_factor), 2.0) / FLUX_SCALE);
 
     StarfieldPushConstants pc{};
     pc.view_proj = cam.proj_matrix(aspect, 0.1f) * cam.view_matrix_eye_relative();
@@ -191,9 +191,10 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     pc.sim_time_yr = sim_time.value;
     pc.flux_calib = flux_calib;
     pc.screen_height = fb_h;
+    pc.screen_width = fb_w;
     pc.point_base_px = settings.star_point_size;
-    pc.min_point_px = 2.0f;
-    pc.max_point_px = 10.0f;
+    pc.min_point_px = 1.5f;
+    pc.max_point_px = 6.0f;
     pc.intensity_scale = settings.star_intensity;
     pc.exposure = settings.exposure;
     pc.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
@@ -204,7 +205,7 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     };
     ctx.push_descriptors(cmd, pipeline_, writes);
     ctx.push_constants(cmd, pipeline_, pc);
-    vkCmdDraw(cmd, count_, 1, 0, 0);
+    vkCmdDraw(cmd, 6, count_, 0, 0);
 }
 
 } // namespace sf::rendering
