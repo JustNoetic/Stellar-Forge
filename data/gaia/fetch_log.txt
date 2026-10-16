@@ -1,0 +1,44 @@
+Fetching Gaia DR3 (source=esa, G < 10, plx/error > 5)
+Output: D:\Files\Coding\OpenGL\Stellar-Forge\data\gaia\stars.bin
+  band [  0.0°,  15.0°):  14,195 stars  (total 14,195)
+  band [ 15.0°,  30.0°):  14,166 stars  (total 28,361)
+  band [ 30.0°,  45.0°):  14,301 stars  (total 42,662)
+  band [ 45.0°,  60.0°):  14,155 stars  (total 56,817)
+  band [ 60.0°,  75.0°):  15,550 stars  (total 72,367)
+  band [ 75.0°,  90.0°):  21,679 stars  (total 94,046)
+  band [ 90.0°, 105.0°):  28,266 stars  (total 122,312)
+  band [105.0°, 120.0°):  29,627 stars  (total 151,939)
+  band [120.0°, 135.0°):  24,480 stars  (total 176,419)
+  band [135.0°, 150.0°):  19,182 stars  (total 195,601)
+  band [150.0°, 165.0°):  17,559 stars  (total 213,160)
+  band [165.0°, 180.0°):  15,791 stars  (total 228,951)
+  band [180.0°, 195.0°):  14,403 stars  (total 243,354)
+  band [195.0°, 210.0°):  15,101 stars  (total 258,455)
+  band [210.0°, 225.0°):  15,964 stars  (total 274,419)
+  band [225.0°, 240.0°) attempt 1/3 failed: HTTP Error 500: 500
+  band [225.0°, 240.0°):  17,784 stars  (total 292,203)
+  band [240.0°, 255.0°):  19,969 stars  (total 312,172)
+  band [255.0°, 270.0°) attempt 1/3 failed: HTTP Error 500: 500
+  band [255.0°, 270.0°) attempt 2/3 failed: HTTP Error 500: 500
+  band [255.0°, 270.0°):  24,319 stars  (total 336,491)
+  band [270.0°, 285.0°):  29,404 stars  (total 365,895)
+  band [285.0°, 300.0°):  29,350 stars  (total 395,245)
+  band [300.0°, 315.0°):  26,893 stars  (total 422,138)
+  band [315.0°, 330.0°):  20,630 stars  (total 442,768)
+  band [330.0°, 345.0°):  17,659 stars  (total 460,427)
+  band [345.0°, 360.0°):  15,214 stars  (total 475,641)
+Fetching Hipparcos supplement (V < 2.5) ...
+  Hipparcos supplement: 93 stars (propagated to J2016.0)
+  dedupe: 10 Gaia entries replaced by 93 Hipparcos stars
+
+Wrote 475,724 stars (14.5 MB) in 205s
+
+=== GAIA catalog summary ===
+Stars:           475,724
+G mag range:     -1.44 .. 10.00
+BP-RP range:     -9.28 .. 11.99
+Nearest star:    1.302 pc (4.246 ly) at RA=217.3923° Dec=-62.6761°
+                 (expect ~1.34 pc / 4.37 ly = Alpha Centauri A)
+Within 50 pc:    6,739
+Within 500 pc:   258,037
+pm > 100 mas/yr: 19,608
