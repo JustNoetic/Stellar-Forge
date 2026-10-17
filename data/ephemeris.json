@@ -1,5 +1,4 @@
 {
-  "runtime": "cspice.dll",
   "kernels": [
     "default/naif0012.tls",
     "default/pck00010.tpc",
@@ -11,5 +10,6 @@
     "default/nep105.bsp",
     "default/plu060.bsp",
     "additional/artemis2.bsp"
-  ]
+  ],
+  "runtime": "cspice.dll"
 }

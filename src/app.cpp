@@ -2198,26 +2198,78 @@ void App::render_ephem_setup_modal() {
         if (ImGui::BeginChild("ephem_kernels_scroll", ImVec2(0.0f, -195.0f), true)) {
             struct GroupSpec {
                 const char* key;
+                const char* alt_key;
                 const char* title;
             };
             static constexpr GroupSpec kGroups[] = {
-                {"Core", "Core Ephemeris (Essential)"},
-                {"Planetary", "Planetary Moons (Essential)"},
-                {"Inner Moons", "Inner Planet Moons (Optional)"},
-                {"Jupiter Moons", "Jupiter Moons (Optional)"},
-                {"Saturn Moons", "Saturn Moons (Optional)"},
-                {"Uranus Moons", "Uranus Moons (Optional)"},
-                {"Neptune Moons", "Neptune Moons (Optional)"},
+                {"Required Core", "Core", "Core Ephemeris (Essential)"},
+                {"Mars Moons", "Inner Moons", "Inner Planet Moons (Mars / Phobos / Deimos)"},
+                {"Jupiter Moons", "Jupiter", "Jupiter Moons (Optional)"},
+                {"Saturn Moons", "Saturn", "Saturn Moons (Optional)"},
+                {"Uranus Moons", "Uranus", "Uranus Moons (Optional)"},
+                {"Neptune Moons", "Neptune", "Neptune Moons (Optional)"},
+                {"Pluto System", "Pluto", "Pluto System (Optional)"},
             };
 
+            std::vector<bool> rendered(defaults.size(), false);
+
             for (const auto& grp : kGroups) {
+                bool has_any = false;
+                for (size_t i = 0; i < defaults.size(); ++i) {
+                    const auto& k = defaults[i];
+                    if (k.group == grp.key || (grp.alt_key && k.group == grp.alt_key)) {
+                        has_any = true;
+                        break;
+                    }
+                }
+                if (!has_any) continue;
+
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
                 ImGui::TextUnformatted(grp.title);
                 ImGui::PopStyleColor();
                 ImGui::Separator();
 
-                for (const auto& k : defaults) {
-                    if (k.group != grp.key) continue;
+                for (size_t i = 0; i < defaults.size(); ++i) {
+                    const auto& k = defaults[i];
+                    if (k.group != grp.key && (!grp.alt_key || k.group != grp.alt_key)) continue;
+                    rendered[i] = true;
+                    bool enabled = spice_mgr_.is_kernel_enabled(k.filename);
+                    bool downloaded = !spice_mgr_.find_kernel_path(k.filename).empty();
+                    std::string chk_id = "##def_chk_" + k.filename;
+                    if (ImGui::Checkbox(chk_id.c_str(), &enabled)) {
+                        spice_mgr_.set_kernel_enabled(k.filename, enabled);
+                        if (in_spice_mode && (downloaded || !enabled)) {
+                            apply_ephemeris_system();
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::Text("%s - %s", k.filename.c_str(), k.description.c_str());
+                    ImGui::SameLine();
+                    if (downloaded) {
+                        ImGui::TextColored(ImVec4(0.4f, 0.88f, 0.45f, 1.0f), "[Downloaded]");
+                    } else {
+                        ImGui::TextDisabled("[Not Downloaded]");
+                    }
+                }
+                ImGui::Spacing();
+            }
+
+            bool has_unrendered = false;
+            for (size_t i = 0; i < defaults.size(); ++i) {
+                if (!rendered[i]) {
+                    has_unrendered = true;
+                    break;
+                }
+            }
+            if (has_unrendered) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
+                ImGui::TextUnformatted("Other Ephemeris Kernels");
+                ImGui::PopStyleColor();
+                ImGui::Separator();
+
+                for (size_t i = 0; i < defaults.size(); ++i) {
+                    if (rendered[i]) continue;
+                    const auto& k = defaults[i];
                     bool enabled = spice_mgr_.is_kernel_enabled(k.filename);
                     bool downloaded = !spice_mgr_.find_kernel_path(k.filename).empty();
                     std::string chk_id = "##def_chk_" + k.filename;

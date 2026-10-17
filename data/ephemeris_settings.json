@@ -1,0 +1,21 @@
+{
+    "artemis2.bsp": true,
+    "de440s.bsp": true,
+    "jup347.bsp": false,
+    "jup348.bsp": false,
+    "jup349.bsp": false,
+    "jup365.bsp": true,
+    "mar099s.bsp": true,
+    "naif0012.tls": true,
+    "nep095.bsp": true,
+    "nep104.bsp": false,
+    "nep105.bsp": true,
+    "pck00010.tpc": true,
+    "plu060.bsp": true,
+    "sat441.bsp": true,
+    "sat455.bsp": false,
+    "sat456.bsp": false,
+    "sat457.bsp": false,
+    "sat459.bsp": false,
+    "ura111.bsp": false
+}
