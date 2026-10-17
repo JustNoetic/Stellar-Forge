@@ -4,7 +4,10 @@
 
 namespace sf::ephemeris {
 
-SimulationRunner::~SimulationRunner() { stop(); }
+SimulationRunner::~SimulationRunner() {
+    cancel_timeline_render();
+    stop();
+}
 
 void SimulationRunner::set_threaded(bool enabled) {
     if (enabled == threaded()) return;
@@ -144,6 +147,172 @@ void SimulationRunner::work() {
         }
         completed_.notify_one();
     }
+}
+
+TimelineRenderProgress SimulationRunner::timeline_progress() const {
+    TimelineRenderProgress p;
+    p.active = timeline_active_.load(std::memory_order_relaxed);
+    p.progress = timeline_progress_.load(std::memory_order_relaxed);
+    p.steps_done = timeline_steps_done_.load(std::memory_order_relaxed);
+    p.steps_total = timeline_steps_total_.load(std::memory_order_relaxed);
+    p.sim_rate_yr_s = timeline_sim_rate_.load(std::memory_order_relaxed);
+    p.completed = timeline_completed_.load(std::memory_order_relaxed);
+    p.cancelled = timeline_cancel_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lk(timeline_mutex_);
+        p.error = timeline_error_;
+    }
+    return p;
+}
+
+void SimulationRunner::cancel_timeline_render() {
+    timeline_cancel_ = true;
+    if (timeline_worker_.joinable()) {
+        timeline_worker_.join();
+    }
+    timeline_active_ = false;
+}
+
+std::shared_ptr<TimelineRecording> SimulationRunner::take_completed_timeline() {
+    std::lock_guard lk(timeline_mutex_);
+    timeline_completed_ = false;
+    return std::move(completed_timeline_);
+}
+
+void SimulationRunner::apply_timeline_frame(const TimelineRecording& rec, size_t frame_index) {
+    execute([&](Simulation& sim) {
+        sim.apply_timeline_frame(rec, frame_index);
+        return CommandResult{true, true, {}};
+    });
+}
+
+void SimulationRunner::start_timeline_render(units::Years target_time, size_t requested_steps) {
+    cancel_timeline_render();
+    apply(SetPaused{true});
+
+    SystemDefinition def;
+    std::vector<BodyMotion> motions;
+    JacobiHierarchy jacobi;
+    units::Years clock_time;
+    Ias15Integrator ias15;
+    JacobiPropagator kepler;
+    std::shared_ptr<SpiceEphemeris> spice;
+    double epoch_et = 0.0;
+    double p_min = 1.0;
+
+    execute([&](Simulation& sim) {
+        def = sim.snapshot().definition();
+        motions.assign(sim.snapshot().motions().begin(), sim.snapshot().motions().end());
+        jacobi = sim.snapshot().jacobi_hierarchy();
+        clock_time = sim.clock().time;
+        ias15 = sim.ias15();
+        kepler = sim.kepler();
+        spice = sim.spice();
+        epoch_et = sim.epoch_et();
+        p_min = sim.estimate_min_orbital_period();
+        return CommandResult{true, false, {}};
+    });
+
+    timeline_active_ = true;
+    timeline_cancel_ = false;
+    timeline_completed_ = false;
+    timeline_progress_ = 0.0f;
+    timeline_steps_done_ = 0;
+    timeline_steps_total_ = 0;
+    timeline_sim_rate_ = 0.0;
+    {
+        std::lock_guard lk(timeline_mutex_);
+        timeline_error_.clear();
+        completed_timeline_.reset();
+    }
+
+    timeline_worker_ = std::thread([this, def = std::move(def), motions = std::move(motions),
+                                    jacobi = std::move(jacobi), clock_time, ias15, kepler,
+                                    spice, epoch_et, p_min, target_time, requested_steps]() mutable {
+        double diff_t = target_time.value - clock_time.value;
+        if (std::abs(diff_t) < 1e-9) {
+            std::lock_guard lk(timeline_mutex_);
+            timeline_error_ = "Target time is identical to current time.";
+            timeline_active_ = false;
+            return;
+        }
+
+        size_t num_steps = requested_steps;
+        if (num_steps == 0) {
+            num_steps = static_cast<size_t>(std::ceil(std::abs(diff_t) / p_min * 64.0));
+            num_steps = std::clamp(num_steps, size_t(1000), size_t(200000));
+        }
+        timeline_steps_total_ = num_steps;
+        double step_dt = diff_t / static_cast<double>(num_steps);
+
+        auto recording = std::make_shared<TimelineRecording>();
+        recording->start_time = clock_time;
+        recording->end_time = target_time;
+        recording->source_model = def.motion_model;
+        recording->times.resize(num_steps);
+        const size_t num_bodies = def.bodies.size();
+        recording->motions.resize(num_steps * num_bodies);
+
+        auto current_motions = motions;
+        auto start_wall = SteadyClock::now();
+
+        for (size_t step = 0; step < num_steps; ++step) {
+            if (timeline_cancel_.load(std::memory_order_relaxed)) {
+                timeline_active_ = false;
+                return;
+            }
+
+            units::Years t_k{clock_time.value + (step + 1) * step_dt};
+
+            if (def.motion_model == MotionModel::NBody) {
+                auto res = ias15.integrate(def, current_motions, t_k, 0, &timeline_cancel_);
+                if (!res && !res.changed) {
+                    std::lock_guard lk(timeline_mutex_);
+                    timeline_error_ = res.error;
+                    timeline_active_ = false;
+                    return;
+                }
+            } else if (def.motion_model == MotionModel::Keplerian) {
+                kepler.evaluate(def, jacobi, t_k, current_motions);
+            } else if (def.motion_model == MotionModel::Spice) {
+                if (!spice) {
+                    std::lock_guard lk(timeline_mutex_);
+                    timeline_error_ = "SPICE runtime is not loaded.";
+                    timeline_active_ = false;
+                    return;
+                }
+                double et_k = epoch_et + units::to_seconds(t_k).value;
+                for (size_t b = 0; b < num_bodies; ++b) {
+                    auto st = spice->state(def.bodies[b].spice_id, et_k, current_motions[b]);
+                    if (!st && !def.bodies[b].is_spacecraft) {
+                        std::lock_guard lk(timeline_mutex_);
+                        timeline_error_ = def.bodies[b].name + ": " + st.error;
+                        timeline_active_ = false;
+                        return;
+                    }
+                }
+            }
+
+            recording->times[step] = t_k;
+            std::copy(current_motions.begin(), current_motions.end(), recording->motions.begin() + step * num_bodies);
+
+            if ((step & 63) == 0 || step + 1 == num_steps) {
+                timeline_steps_done_ = step + 1;
+                timeline_progress_ = static_cast<float>(step + 1) / static_cast<float>(num_steps);
+                double elapsed_sec = elapsed_ms(start_wall) / 1000.0;
+                if (elapsed_sec > 0.01) {
+                    timeline_sim_rate_ = std::abs((step + 1) * step_dt) / elapsed_sec;
+                }
+            }
+        }
+
+        {
+            std::lock_guard lk(timeline_mutex_);
+            completed_timeline_ = std::move(recording);
+        }
+        timeline_completed_ = true;
+        timeline_active_ = false;
+    });
 }
 
 }

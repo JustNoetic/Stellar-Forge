@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ephemeris/simulation.hpp"
+#include "ephemeris/spk_exporter.hpp"
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -17,6 +18,17 @@ struct SimulationPublication {
     double advance_ms = 0.0;
     double copy_ms = 0.0;
     double nbody_epsilon = 0.0;
+};
+
+struct TimelineRenderProgress {
+    bool active = false;
+    float progress = 0.0f;
+    size_t steps_done = 0;
+    size_t steps_total = 0;
+    double sim_rate_yr_s = 0.0;
+    bool completed = false;
+    bool cancelled = false;
+    std::string error;
 };
 
 class SimulationRunner {
@@ -38,6 +50,13 @@ public:
     CommandResult poll();
     CommandResult wait();
 
+    bool is_rendering_timeline() const noexcept { return timeline_active_.load(std::memory_order_relaxed); }
+    TimelineRenderProgress timeline_progress() const;
+    void start_timeline_render(units::Years target_time, size_t requested_steps = 0);
+    void cancel_timeline_render();
+    std::shared_ptr<TimelineRecording> take_completed_timeline();
+    void apply_timeline_frame(const TimelineRecording& rec, size_t frame_index);
+
 private:
     CommandResult execute(std::function<CommandResult(Simulation&)> command);
     CommandResult submit(units::Seconds elapsed);
@@ -56,6 +75,18 @@ private:
     double pending_seconds_ = 0.0;
     uint64_t submitted_id_ = 0, completed_id_ = 0;
     bool pending_ = false, ready_available_ = false, stopping_ = false;
+
+    std::thread timeline_worker_;
+    mutable std::mutex timeline_mutex_;
+    std::atomic<bool> timeline_active_{false};
+    std::atomic<bool> timeline_cancel_{false};
+    std::atomic<bool> timeline_completed_{false};
+    std::atomic<float> timeline_progress_{0.0f};
+    std::atomic<size_t> timeline_steps_done_{0};
+    std::atomic<size_t> timeline_steps_total_{0};
+    std::atomic<double> timeline_sim_rate_{0.0};
+    std::string timeline_error_;
+    std::shared_ptr<TimelineRecording> completed_timeline_;
 };
 
 }

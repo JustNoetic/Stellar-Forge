@@ -584,18 +584,26 @@ Ias15Integrator::StepResult Ias15Integrator::step(double dt) {
     return {dt_new, dt, true};
 }
 
-CommandResult Ias15Integrator::integrate(const SystemDefinition& def, std::vector<BodyMotion>& motions, units::Years target_time) {
+CommandResult Ias15Integrator::integrate(const SystemDefinition& def, std::vector<BodyMotion>& motions, units::Years target_time, int max_substeps, const std::atomic<bool>* cancel) {
     if (bodies_.size() != motions.size()) {
         reset(def, motions, units::Years{t_});
     }
 
     double t_target = target_time.value;
     int substeps = 0;
-    constexpr int MAX_SUBSTEPS = 2000;
 
-    while (substeps < MAX_SUBSTEPS) {
+    while (max_substeps <= 0 || substeps < max_substeps) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) {
+            for (size_t i = 0; i < bodies_.size(); ++i) {
+                motions[i].position = EclipticPosition{bodies_[i].pos};
+                motions[i].velocity = EclipticVelocity{bodies_[i].vel};
+            }
+            return {false, false, "Integration cancelled"};
+        }
+
         double t_diff = t_target - t_;
         if (std::abs(t_diff) < 1e-12) {
+            t_ = t_target;
             break;
         }
 
@@ -626,8 +634,12 @@ CommandResult Ias15Integrator::integrate(const SystemDefinition& def, std::vecto
         motions[i].velocity = EclipticVelocity{bodies_[i].vel};
     }
 
-    t_ = t_target;
-    return {true, true, {}};
+    if (std::abs(t_target - t_) < 1e-12) {
+        t_ = t_target;
+        return {true, true, {}};
+    }
+
+    return {false, true, "Substep limit reached before target time"};
 }
 
 } // namespace sf::ephemeris

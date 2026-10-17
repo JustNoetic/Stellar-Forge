@@ -9,6 +9,7 @@
 namespace sf::ephemeris {
 
 class SpiceEphemeris;
+struct TimelineRecording;
 
 struct SimulationClock {
     units::Years time{};
@@ -87,12 +88,25 @@ struct DeleteBody {
     int body_index = -1;
 };
 
+struct JumpToTime {
+    units::Years target_time;
+};
+
+struct SyncTimelineState {
+    units::Years time;
+    std::vector<BodyMotion> motions;
+};
+
 class Simulation {
 public:
     const SystemSnapshot& snapshot() const noexcept { return snapshot_; }
     const SimulationClock& clock() const noexcept { return clock_; }
     const JacobiPropagator& kepler() const noexcept { return kepler_; }
     double nbody_epsilon() const noexcept { return ias15_.epsilon(); }
+    std::shared_ptr<SpiceEphemeris> spice() const noexcept { return spice_; }
+    double epoch_et() const noexcept { return epoch_et_; }
+    const Ias15Integrator& ias15() const noexcept { return ias15_; }
+
     CommandResult replace_system(LoadedSystem loaded);
     CommandResult apply(SetPaused command);
     CommandResult apply(SetTimeWarp command);
@@ -102,6 +116,10 @@ public:
     CommandResult apply(const ApplyBodyPhysicalProperties& command);
     CommandResult apply(const AddBody& command);
     CommandResult apply(const DeleteBody& command);
+    CommandResult apply(JumpToTime command);
+    CommandResult apply(const SyncTimelineState& command);
+    void apply_timeline_frame(const TimelineRecording& rec, size_t frame_index);
+    double estimate_min_orbital_period() const;
     CommandResult advance(units::Seconds elapsed);
 
 private:

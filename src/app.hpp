@@ -52,7 +52,10 @@ private:
     void render_ephem_setup_modal();
     void render_ephem_download_modal();
     void render_bsp_import_modal();
+    void render_jump_timeline_modal();
     void open_export_nbody_modal();
+    void open_jump_timeline_modal();
+    void trigger_timeline_bsp_export();
     void trigger_ephemeris_mode();
     void apply_ephemeris_system();
     void open_generic_bsp_playback(const std::filesystem::path& bsp_path);

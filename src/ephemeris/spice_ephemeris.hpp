@@ -104,6 +104,18 @@ public:
     CommandResult furnish_file(const std::filesystem::path& path);
     BspInspectResult inspect_bsp(const std::filesystem::path& bsp_path);
 
+    bool can_write_spk() const noexcept { return spkopn_ && (spkw02_ || spkw13_) && spkcls_; }
+    CommandResult spk_open(const std::filesystem::path& path, std::string_view internal_name, int& handle);
+    CommandResult spk_write_type2(int handle, int body, int center, std::string_view frame,
+                                  double first_et, double last_et, std::string_view segid,
+                                  double intlen_sec, int n_intervals, int degree,
+                                  const double* cdata, double btime_et);
+    CommandResult spk_write_type13(int handle, int body, int center, std::string_view frame,
+                                   double first_et, double last_et, std::string_view segid,
+                                   int degree, int num_states, const double* states_6d,
+                                   const double* epochs_et);
+    CommandResult spk_close(int handle);
+
     std::string body_name(int spice_id) const;
     std::string et_to_utc(double et, const char* format = "C") const;
     bool body_gm_and_radius(int spice_id, double fallback_mass_kg, double fallback_radius_km,
@@ -147,6 +159,11 @@ private:
     void (*reset_)() = nullptr;
     void (*to_et_)(const char*, double*) = nullptr;
     void (*state_)(int, double, const char*, int, double*, double*) = nullptr;
+    void (*spkopn_)(const char*, const char*, int, int*) = nullptr;
+    void (*spkw02_)(int, int, int, const char*, double, double, const char*, double, int, int, const double*, double) = nullptr;
+    void (*spkw03_)(int, int, int, const char*, double, double, const char*, double, int, int, const double*, double) = nullptr;
+    void (*spkw13_)(int, int, int, const char*, double, double, const char*, int, int, const void*, const double*) = nullptr;
+    void (*spkcls_)(int) = nullptr;
 };
 
 class SpiceKernelManager {

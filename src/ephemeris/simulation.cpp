@@ -2,6 +2,7 @@
 #include "core/math_utils.hpp"
 #include "core/log.hpp"
 #include "ephemeris/spice_ephemeris.hpp"
+#include "ephemeris/spk_exporter.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -536,6 +537,118 @@ CommandResult Simulation::apply(const DeleteBody& command) {
     prepare_render_state(true);
     previous_motions_.resize(snapshot_.size());
     return {true, true, {}};
+}
+
+CommandResult Simulation::apply(JumpToTime command) {
+    if (snapshot_.definition().motion_model == MotionModel::NBody) {
+        return {false, false, "Instant jump is not supported in N-Body mode; use Render Timeline instead."};
+    }
+
+    if (snapshot_.definition().motion_model == MotionModel::Keplerian) {
+        clock_.time = command.target_time;
+        snapshot_.time_ = command.target_time;
+        kepler_.evaluate(snapshot_.definition(), snapshot_.jacobi_hierarchy(), clock_.time, snapshot_.motions_);
+        recenter();
+        refresh_reference_hierarchy(true);
+        prepare_render_state();
+        ++snapshot_.state_revision_;
+        return {true, true, {}};
+    }
+
+    if (snapshot_.definition().motion_model == MotionModel::Spice) {
+        if (!spice_) return {false, false, "SPICE runtime is not initialized."};
+        double et = epoch_et_ + units::to_seconds(command.target_time).value;
+        std::vector<BodyMotion> new_motions(snapshot_.size());
+        for (size_t i = 0; i < snapshot_.size(); ++i) {
+            const auto& body = snapshot_.definition().bodies[i];
+            auto status = spice_->state(body.spice_id, et, new_motions[i]);
+            if (!status) {
+                if (!body.is_spacecraft) {
+                    return {false, false, std::format("{}: {}", body.name, status.error)};
+                }
+                new_motions[i] = snapshot_.motions_[i];
+            }
+        }
+        clock_.time = command.target_time;
+        snapshot_.time_ = command.target_time;
+        snapshot_.motions_ = std::move(new_motions);
+        recenter();
+        refresh_reference_hierarchy(true);
+        prepare_render_state();
+        ++snapshot_.state_revision_;
+        return {true, true, {}};
+    }
+
+    return {false, false, "Unsupported motion model for jump."};
+}
+
+CommandResult Simulation::apply(const SyncTimelineState& command) {
+    if (command.motions.size() != snapshot_.size()) {
+        return {false, false, "Timeline state body count mismatch."};
+    }
+    clock_.time = command.time;
+    snapshot_.time_ = command.time;
+    snapshot_.motions_ = command.motions;
+
+    recenter();
+    if (snapshot_.definition().motion_model == MotionModel::NBody) {
+        ias15_.reset(snapshot_.definition(), snapshot_.motions(), clock_.time);
+    } else if (snapshot_.definition().motion_model == MotionModel::Keplerian) {
+        reset_jacobi(true);
+    }
+    refresh_reference_hierarchy(true);
+    prepare_render_state();
+    ++snapshot_.state_revision_;
+    return {true, true, {}};
+}
+
+void Simulation::apply_timeline_frame(const TimelineRecording& rec, size_t frame_index) {
+    if (rec.empty() || frame_index >= rec.num_steps()) return;
+    const size_t num_bodies = snapshot_.size();
+    if (rec.num_bodies() != num_bodies) return;
+
+    clock_.time = rec.times[frame_index];
+    snapshot_.time_ = rec.times[frame_index];
+    const auto* src = &rec.motions[frame_index * num_bodies];
+    std::copy(src, src + num_bodies, snapshot_.motions_.begin());
+
+    recenter();
+    refresh_reference_hierarchy(true);
+    prepare_render_state();
+    ++snapshot_.state_revision_;
+}
+
+double Simulation::estimate_min_orbital_period() const {
+    double p_min = 1.0;
+    bool found = false;
+    const size_t num_bodies = snapshot_.size();
+    for (size_t i = 0; i < num_bodies; ++i) {
+        int p = snapshot_.reference_hierarchy().parent_index(static_cast<int>(i));
+        if (p < 0 || static_cast<size_t>(p) >= num_bodies || p == static_cast<int>(i)) continue;
+
+        double M = snapshot_.definition().bodies[p].mass_msun;
+        double m = snapshot_.definition().bodies[i].mass_msun;
+        double mu = G_CONST * (M + m);
+        if (mu <= 0.0) continue;
+
+        double r = glm::length(snapshot_.motions_[i].position.value - snapshot_.motions_[p].position.value);
+        double v = glm::length(snapshot_.motions_[i].velocity.value - snapshot_.motions_[p].velocity.value);
+        if (r <= 0.0) continue;
+
+        double inv_a = (2.0 / r) - (v * v / mu);
+        double period = 0.0;
+        if (inv_a > 1e-9) {
+            double a = 1.0 / inv_a;
+            period = TWO_PI * std::sqrt((a * a * a) / mu);
+        } else {
+            period = TWO_PI * std::sqrt((r * r * r) / mu);
+        }
+        if (period > 0.0 && std::isfinite(period)) {
+            p_min = found ? std::min(p_min, period) : period;
+            found = true;
+        }
+    }
+    return std::max(p_min, 1e-4);
 }
 
 CommandResult Simulation::advance(units::Seconds elapsed) {

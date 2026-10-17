@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <exception>
 #include <format>
 #include <stdexcept>
@@ -706,6 +707,7 @@ void App::render_ui() {
     render_create_system_modal();
     render_delete_system_modal();
     render_export_nbody_modal();
+    render_jump_timeline_modal();
     render_ephem_setup_modal();
     render_ephem_download_modal();
     render_bsp_import_modal();
@@ -802,6 +804,9 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         if (ImGui::MenuItem("SPICE Ephemeris Kernel Settings...")) {
             ui_state_.ephem_setup.reset();
         }
+        if (ImGui::MenuItem("Jump to Date / Render Timeline...")) {
+            open_jump_timeline_modal();
+        }
         ImGui::Separator();
         const char* export_physics_label = (current_mode == ephemeris::MotionModel::Spice)
             ? "Export Ephemeris to N-Body System..."
@@ -812,6 +817,13 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Tools")) {
+        if (ImGui::MenuItem("Jump to Date / Render Timeline...")) {
+            open_jump_timeline_modal();
+        }
+        if (ImGui::MenuItem("Export Timeline to SPK (.bsp)...")) {
+            trigger_timeline_bsp_export();
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Import Ephemeris Kernel (.bsp)...")) {
             ui_state_.bsp_import.reset();
         }
@@ -1607,6 +1619,18 @@ void App::render_body_inspector() {
 void App::render_time_hud(rendering::RenderSettings& render_draft) {
     if (!ui_settings_.show_time_hud) return;
 
+    if (auto rec = simulation_.take_completed_timeline()) {
+        ui_state_.timeline_scrub.active = true;
+        ui_state_.timeline_scrub.recording = rec;
+        ui_state_.timeline_scrub.scrub_index = static_cast<int>(rec->num_steps() - 1);
+        ui_state_.timeline_scrub.is_playing = false;
+        ui_state_.timeline_scrub.playback_speed = 1.0;
+        ui_state_.timeline_scrub.accumulated_steps = 0.0;
+        ui_state_.timeline_scrub.pre_timeline_snapshot = system();
+        ui_state_.timeline_scrub.pre_timeline_clock = simulation_.clock();
+        simulation_.apply_timeline_frame(*rec, ui_state_.timeline_scrub.scrub_index);
+    }
+
     ui::WorkspaceLayout layout = ui_.compute_layout(ui_settings_, ui_state_,
                                                    static_cast<float>(vk_.swapchain_extent().width),
                                                    static_cast<float>(vk_.swapchain_extent().height));
@@ -1619,70 +1643,167 @@ void App::render_time_hud(rendering::RenderSettings& render_draft) {
         return;
     }
 
-    bool is_paused = simulation_.clock().paused;
-    const char* play_pause_label = is_paused ? " Play " : " Pause ";
-    if (ImGui::Button(play_pause_label, ImVec2(65.0f * layout.scale, 0.0f))) {
-        simulation_.apply(ephemeris::SetPaused{!is_paused});
-    }
+    if (ui_state_.timeline_scrub.active && ui_state_.timeline_scrub.recording) {
+        auto& ts = ui_state_.timeline_scrub;
+        int max_step = static_cast<int>(ts.recording->num_steps() - 1);
 
-    ImGui::SameLine(0.0f, 6.0f * layout.scale);
-    bool is_forward = simulation_.clock().direction >= 0.0;
-    const char* dir_label = is_forward ? " Forward " : " Reverse ";
-    if (ImGui::Button(dir_label, ImVec2(75.0f * layout.scale, 0.0f))) {
-        simulation_.apply(ephemeris::ReverseTimeDirection{});
-    }
+        const char* play_label = ts.is_playing ? " Pause " : " Play ";
+        if (ImGui::Button(play_label, ImVec2(65.0f * layout.scale, 0.0f))) {
+            ts.is_playing = !ts.is_playing;
+        }
 
-    ImGui::SameLine(0.0f, 6.0f * layout.scale);
-    if (ImGui::Button("1x", ImVec2(32.0f * layout.scale, 0.0f))) {
-        simulation_.apply(ephemeris::SetTimeWarp{1.0});
-    }
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        ImGui::PushItemWidth(80.0f * layout.scale);
+        float spd = static_cast<float>(ts.playback_speed);
+        if (ImGui::SliderFloat("##scrub_speed", &spd, 0.1f, 100.0f, "%.1fx")) {
+            ts.playback_speed = std::max(0.1, static_cast<double>(spd));
+        }
+        ImGui::PopItemWidth();
 
-    ImGui::SameLine(0.0f, 8.0f * layout.scale);
-    float bar_w = layout.width - layout.gap * 2.0f;
-    ImGui::PushItemWidth(std::max(110.0f, std::min(220.0f * layout.scale, bar_w * 0.26f)));
-    float val_log = static_cast<float>(std::log10(std::max(1e-4, simulation_.clock().warp)));
-    double effective_mult = simulation_.clock().effective_warp();
-    std::string speed_str = time::format_time_speed(effective_mult);
-    if (is_paused) {
-        speed_str = "Paused (" + speed_str + ")";
-    }
-    std::string fmt_str;
-    for (char c : speed_str) {
-        if (c == '%') fmt_str += "%%";
-        else fmt_str += c;
-    }
-    if (ui::drag_float("##speed_drag", &val_log, 0.003f, -4.0f, 16.0f, fmt_str.c_str())) {
-        simulation_.apply(ephemeris::SetTimeWarp{std::pow(10.0, static_cast<double>(val_log))});
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Drag or Ctrl+Click to edit warp (10^x). Range: 10^-4 (slow-mo) to 10^16.");
-    }
-    ImGui::PopItemWidth();
+        if (ts.is_playing) {
+            ts.accumulated_steps += frame_dt_.value * ts.playback_speed * 60.0;
+            int adv = static_cast<int>(ts.accumulated_steps);
+            if (adv > 0) {
+                ts.accumulated_steps -= adv;
+                ts.scrub_index = (ts.scrub_index + adv) % (max_step + 1);
+                simulation_.apply_timeline_frame(*ts.recording, ts.scrub_index);
+            }
+        }
 
-    std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time());
-    ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", date_str.c_str());
+        ImGui::SameLine(0.0f, 8.0f * layout.scale);
+        ImGui::PushItemWidth(std::max(120.0f, (layout.width - layout.gap * 2.0f) * 0.20f));
+        if (ImGui::SliderInt("##timeline_scrubber", &ts.scrub_index, 0, max_step, "Step %d")) {
+            simulation_.apply_timeline_frame(*ts.recording, ts.scrub_index);
+        }
+        ImGui::PopItemWidth();
 
-    ImGui::SameLine(0.0f, 10.0f * layout.scale);
-    ImGui::TextDisabled("| Sim Time: %.5f yr", system().time().value);
+        ImGui::SameLine(0.0f, 8.0f * layout.scale);
+        std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time(), ui_state_.use_local_timezone);
+        ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", date_str.c_str());
 
-    ImGui::SameLine(0.0f, 10.0f * layout.scale);
-    const char* hud_mode = "Keplerian";
-    if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
-    ImGui::TextDisabled("| %s", hud_mode);
+        ImGui::SameLine(0.0f, 4.0f * layout.scale);
+        if (ImGui::SmallButton(ui_state_.use_local_timezone ? "Local" : "UTC")) {
+            ui_state_.use_local_timezone = !ui_state_.use_local_timezone;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Local vs UTC display");
 
-    ImGui::SameLine(0.0f, 6.0f * layout.scale);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.35f, 0.50f, 0.8f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.45f, 0.65f, 1.0f));
-    if (ImGui::SmallButton("Export to N-Body")) {
-        open_export_nbody_modal();
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.25f, 0.9f));
+        if (ImGui::Button("Resume Here")) {
+            size_t nb = ts.recording->num_bodies();
+            std::vector<ephemeris::BodyMotion> frame_m(ts.recording->motions.begin() + ts.scrub_index * nb,
+                                                       ts.recording->motions.begin() + (ts.scrub_index + 1) * nb);
+            simulation_.apply(ephemeris::SyncTimelineState{ts.recording->times[ts.scrub_index], std::move(frame_m)});
+            ts.clear();
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 4.0f * layout.scale);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.2f, 0.2f, 0.9f));
+        if (ImGui::Button("Cancel##scrub_cancel")) {
+            auto m_span = ts.pre_timeline_snapshot.motions();
+            simulation_.apply(ephemeris::SyncTimelineState{ts.pre_timeline_clock.time,
+                std::vector<ephemeris::BodyMotion>(m_span.begin(), m_span.end())});
+            ts.clear();
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 4.0f * layout.scale);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.35f, 0.50f, 0.8f));
+        if (ImGui::Button("Export .bsp")) {
+            trigger_timeline_bsp_export();
+        }
+        ImGui::PopStyleColor();
+
+        if (!ts.export_status.empty()) {
+            ImGui::SameLine(0.0f, 6.0f * layout.scale);
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", ts.export_status.c_str());
+        }
+    } else {
+        bool is_paused = simulation_.clock().paused;
+        const char* play_pause_label = is_paused ? " Play " : " Pause ";
+        if (ImGui::Button(play_pause_label, ImVec2(65.0f * layout.scale, 0.0f))) {
+            simulation_.apply(ephemeris::SetPaused{!is_paused});
+        }
+
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        bool is_forward = simulation_.clock().direction >= 0.0;
+        const char* dir_label = is_forward ? " Forward " : " Reverse ";
+        if (ImGui::Button(dir_label, ImVec2(75.0f * layout.scale, 0.0f))) {
+            simulation_.apply(ephemeris::ReverseTimeDirection{});
+        }
+
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        if (ImGui::Button("1x", ImVec2(32.0f * layout.scale, 0.0f))) {
+            simulation_.apply(ephemeris::SetTimeWarp{1.0});
+        }
+
+        ImGui::SameLine(0.0f, 8.0f * layout.scale);
+        float bar_w = layout.width - layout.gap * 2.0f;
+        ImGui::PushItemWidth(std::max(110.0f, std::min(200.0f * layout.scale, bar_w * 0.22f)));
+        float val_log = static_cast<float>(std::log10(std::max(1e-4, simulation_.clock().warp)));
+        double effective_mult = simulation_.clock().effective_warp();
+        std::string speed_str = time::format_time_speed(effective_mult);
+        if (is_paused) {
+            speed_str = "Paused (" + speed_str + ")";
+        }
+        std::string fmt_str;
+        for (char c : speed_str) {
+            if (c == '%') fmt_str += "%%";
+            else fmt_str += c;
+        }
+        if (ui::drag_float("##speed_drag", &val_log, 0.003f, -4.0f, 16.0f, fmt_str.c_str())) {
+            simulation_.apply(ephemeris::SetTimeWarp{std::pow(10.0, static_cast<double>(val_log))});
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Drag or Ctrl+Click to edit warp (10^x). Range: 10^-4 (slow-mo) to 10^16.");
+        }
+        ImGui::PopItemWidth();
+
+        std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time(), ui_state_.use_local_timezone);
+        ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", date_str.c_str());
+
+        ImGui::SameLine(0.0f, 4.0f * layout.scale);
+        if (ImGui::SmallButton(ui_state_.use_local_timezone ? "Local" : "UTC")) {
+            ui_state_.use_local_timezone = !ui_state_.use_local_timezone;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Local vs UTC display");
+
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        if (ImGui::Button("Jump / Timeline...", ImVec2(125.0f * layout.scale, 0.0f))) {
+            open_jump_timeline_modal();
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to specific date/time or render timeline to date.");
+
+        if (simulation_.is_rendering_timeline()) {
+            auto prog = simulation_.timeline_progress();
+            ImGui::SameLine(0.0f, 6.0f * layout.scale);
+            std::string prog_text = std::format("{:.1f}% ({}/{}) | {:.1f} yr/s",
+                                                prog.progress * 100.0f, prog.steps_done, prog.steps_total, prog.sim_rate_yr_s);
+            ImGui::ProgressBar(prog.progress, ImVec2(160.0f * layout.scale, 0.0f), prog_text.c_str());
+            ImGui::SameLine(0.0f, 4.0f * layout.scale);
+            if (ImGui::Button("Cancel##cancel_render")) {
+                simulation_.cancel_timeline_render();
+            }
+        }
+
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        const char* hud_mode = "Keplerian";
+        if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
+        else if (system().definition().motion_model == ephemeris::MotionModel::NBody) hud_mode = "N-Body";
+        ImGui::TextDisabled("| %s", hud_mode);
+
+        ImGui::SameLine(0.0f, 6.0f * layout.scale);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.35f, 0.50f, 0.8f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.45f, 0.65f, 1.0f));
+        if (ImGui::SmallButton("Export to N-Body")) {
+            open_export_nbody_modal();
+        }
+        ImGui::PopStyleColor(2);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Export current positions & velocities as a new N-Body system");
+        }
     }
-    ImGui::PopStyleColor(2);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Export current positions & velocities as a new N-Body system");
-    }
-
-    ImGui::SameLine(0.0f, 10.0f * layout.scale);
-    ImGui::TextDisabled("| %s", camera_.movement_mode == 0 ? "Free Flight" : "Simple Orbit");
 
     float exp_val = render_draft.exposure;
     float ev = (exp_val > 0.0f) ? std::log2(exp_val) : -10.0f;
@@ -2145,6 +2266,242 @@ void App::render_export_nbody_modal() {
 
         ImGui::EndPopup();
     }
+}
+
+void App::open_jump_timeline_modal() {
+    ui_state_.jump_timeline.reset_to_now(system().definition().epoch_utc, system().time(), !ui_state_.use_local_timezone);
+}
+
+void App::render_jump_timeline_modal() {
+    if (!ui_state_.jump_timeline.active) return;
+
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 500.0f), ImGuiCond_Always);
+    ImGui::OpenPopup("Jump to Date / Render Timeline###jump_timeline_modal");
+    if (ImGui::BeginPopupModal("Jump to Date / Render Timeline###jump_timeline_modal", &ui_state_.jump_timeline.active, ImGuiWindowFlags_NoResize)) {
+        auto& jd = ui_state_.jump_timeline;
+
+        ui::heading("Jump to Date / Render Timeline", "Jump instantly or render a scrubbable timeline to a target epoch.");
+
+        auto cur_utc = time::calculate_sim_date(system().definition().epoch_utc, system().time(), false);
+        auto cur_local = time::calculate_sim_date(system().definition().epoch_utc, system().time(), true);
+
+        ImGui::TextDisabled("Current Sim Time (UTC):   %04lld-%02d-%02d %02d:%02d:%02d UTC",
+                            static_cast<long long>(cur_utc.year), cur_utc.month, cur_utc.day,
+                            cur_utc.hour, cur_utc.minute, cur_utc.second);
+        ImGui::TextDisabled("Current Sim Time (Local): %04lld-%02d-%02d %02d:%02d:%02d %s",
+                            static_cast<long long>(cur_local.year), cur_local.month, cur_local.day,
+                            cur_local.hour, cur_local.minute, cur_local.second, cur_local.tz.c_str());
+        ImGui::Separator();
+
+        ImGui::Text("Input Time Standard:");
+        ImGui::SameLine();
+        bool prev_utc = jd.is_utc;
+        if (ImGui::RadioButton("Local Time", !jd.is_utc)) {
+            jd.is_utc = false;
+        }
+        ImGui::SameLine();
+        if (ImGui::RadioButton("UTC", jd.is_utc)) {
+            jd.is_utc = true;
+        }
+        if (prev_utc != jd.is_utc) {
+            time::DateTimeUTC current_draft{jd.target_year, jd.target_month, jd.target_day, jd.target_hour, jd.target_minute, jd.target_second, ""};
+            auto sim_t = time::sim_time_from_date(system().definition().epoch_utc, current_draft, prev_utc);
+            auto converted = time::calculate_sim_date(system().definition().epoch_utc, sim_t, !jd.is_utc);
+            jd.target_year = converted.year;
+            jd.target_month = converted.month;
+            jd.target_day = converted.day;
+            jd.target_hour = converted.hour;
+            jd.target_minute = converted.minute;
+            jd.target_second = converted.second;
+        }
+
+        ImGui::PushItemWidth(100.0f);
+        ImGui::InputScalar("Year", ImGuiDataType_S64, &jd.target_year);
+        ImGui::SameLine();
+        ImGui::InputInt("Month", &jd.target_month);
+        ImGui::SameLine();
+        ImGui::InputInt("Day", &jd.target_day);
+        ImGui::PopItemWidth();
+
+        ImGui::PushItemWidth(100.0f);
+        ImGui::InputInt("Hour", &jd.target_hour);
+        ImGui::SameLine();
+        ImGui::InputInt("Min", &jd.target_minute);
+        ImGui::SameLine();
+        ImGui::InputInt("Sec", &jd.target_second);
+        ImGui::PopItemWidth();
+
+        jd.target_month = std::clamp(jd.target_month, 1, 12);
+        jd.target_day = std::clamp(jd.target_day, 1, 31);
+        jd.target_hour = std::clamp(jd.target_hour, 0, 23);
+        jd.target_minute = std::clamp(jd.target_minute, 0, 59);
+        jd.target_second = std::clamp(jd.target_second, 0, 59);
+
+        ImGui::Text("Presets:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Today/Now")) {
+            auto now = time::calculate_sim_date(system().definition().epoch_utc, units::Years{0.0}, !jd.is_utc);
+            jd.target_year = now.year; jd.target_month = now.month; jd.target_day = now.day;
+            jd.target_hour = now.hour; jd.target_minute = now.minute; jd.target_second = now.second;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("J2000")) {
+            time::DateTimeUTC j2000{2000, 1, 1, 12, 0, 0, "UTC"};
+            if (!jd.is_utc) {
+                auto st = time::sim_time_from_date(system().definition().epoch_utc, j2000, true);
+                j2000 = time::calculate_sim_date(system().definition().epoch_utc, st, true);
+            }
+            jd.target_year = j2000.year; jd.target_month = j2000.month; jd.target_day = j2000.day;
+            jd.target_hour = j2000.hour; jd.target_minute = j2000.minute; jd.target_second = j2000.second;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+1 Year")) { jd.target_year += 1; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("-1 Year")) { jd.target_year -= 1; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+10 Years")) { jd.target_year += 10; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("+100 Years")) { jd.target_year += 100; }
+
+        time::DateTimeUTC target_dt{jd.target_year, jd.target_month, jd.target_day, jd.target_hour, jd.target_minute, jd.target_second, ""};
+        units::Years target_sim_time = time::sim_time_from_date(system().definition().epoch_utc, target_dt, jd.is_utc);
+        double diff_years = target_sim_time.value - system().time().value;
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("Target Sim Time: %.5f yr (%+.5f yr from current)", target_sim_time.value, diff_years);
+        ImGui::Separator();
+
+        auto motion_model = system().definition().motion_model;
+        bool can_jump = (motion_model == ephemeris::MotionModel::Keplerian || motion_model == ephemeris::MotionModel::Spice);
+
+        if (can_jump) {
+            if (ImGui::Button("Jump to Date (Instant)", ImVec2(240.0f, 32.0f))) {
+                auto res = simulation_.apply(ephemeris::JumpToTime{target_sim_time});
+                if (!res) {
+                    jd.error = res.error;
+                } else {
+                    jd.active = false;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(No timeline recording)");
+            ImGui::Spacing();
+        }
+
+        const char* res_names[] = {
+            "Auto (Adaptive - Min Orbital Period)",
+            "1,000 Steps",
+            "10,000 Steps",
+            "50,000 Steps",
+            "200,000 Steps"
+        };
+        ImGui::PushItemWidth(280.0f);
+        ImGui::Combo("Timeline Resolution", &jd.resolution_choice, res_names, IM_ARRAYSIZE(res_names));
+        ImGui::PopItemWidth();
+
+        size_t requested_steps = 0;
+        if (jd.resolution_choice == 1) requested_steps = 1000;
+        else if (jd.resolution_choice == 2) requested_steps = 10000;
+        else if (jd.resolution_choice == 3) requested_steps = 50000;
+        else if (jd.resolution_choice == 4) requested_steps = 200000;
+
+        if (ImGui::Button("Render Timeline to Date", ImVec2(240.0f, 32.0f))) {
+            if (std::abs(diff_years) < 1e-9) {
+                jd.error = "Target time is identical to current time.";
+            } else {
+                simulation_.start_timeline_render(target_sim_time, requested_steps);
+                jd.active = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Background worker integration)");
+
+        if (motion_model == ephemeris::MotionModel::NBody) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f),
+                               "Note: Instant jump without integration is only physical in Keplerian/SPICE modes.\n"
+                               "N-Body uses Render Timeline to integrate equations of motion physically.");
+        }
+
+        if (!jd.error.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", jd.error.c_str());
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (ImGui::Button("Cancel", ImVec2(120.0f, 28.0f))) {
+            jd.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::trigger_timeline_bsp_export() {
+    if (!ui_state_.timeline_scrub.recording || ui_state_.timeline_scrub.recording->empty()) {
+        open_jump_timeline_modal();
+        return;
+    }
+    if (ui_state_.timeline_scrub.export_in_progress) return;
+
+    auto slugify = [](std::string_view s) {
+        std::string out;
+        for (char c : s) {
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') {
+                out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            } else if (c == ' ') {
+                out += '_';
+            }
+        }
+        return out.empty() ? "system" : out;
+    };
+
+    std::string sys_slug = slugify(system().name());
+    auto export_dir = paths::external_path("exports", "ephemeris", sys_slug);
+    std::error_code ec;
+    std::filesystem::create_directories(export_dir, ec);
+
+    auto now_t = std::time(nullptr);
+    std::tm tm_now{};
+#if defined(_WIN32)
+    _gmtime64_s(&tm_now, &now_t);
+#else
+    gmtime_r(&now_t, &tm_now);
+#endif
+    std::string filename = std::format("{}_timeline_{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}.bsp",
+        sys_slug, tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+        tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    auto bsp_path = export_dir / filename;
+
+    ui_state_.timeline_scrub.export_in_progress = true;
+    ui_state_.timeline_scrub.export_progress = 0.0f;
+    ui_state_.timeline_scrub.export_status = "Exporting SPK...";
+
+    std::thread([this, bsp_path, recording = ui_state_.timeline_scrub.recording,
+                 def = system().definition(), hier = system().reference_hierarchy()]() {
+        ephemeris::SpkExportOptions opts;
+        opts.spk_type = 2;
+        opts.cheb_degree = 13;
+        opts.cheb_tol_km = 1.0;
+        opts.use_hierarchical_center = true;
+        opts.progress_callback = [this](float p, std::string_view s) {
+            ui_state_.timeline_scrub.export_progress = p;
+            ui_state_.timeline_scrub.export_status = std::string(s);
+        };
+        std::string spice_err;
+        auto spice = ephemeris::SpiceEphemeris::open(spice_err);
+        auto res = ephemeris::SpkExporter::export_timeline(bsp_path, *recording, def, hier, spice, opts);
+        if (res.success) {
+            ui_state_.timeline_scrub.export_status = "Exported: " + res.bsp_path.filename().string();
+        } else {
+            ui_state_.timeline_scrub.export_status = "Error: " + res.error;
+        }
+        ui_state_.timeline_scrub.export_in_progress = false;
+    }).detach();
 }
 
 namespace {

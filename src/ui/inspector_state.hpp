@@ -1,8 +1,10 @@
 #pragma once
 
 #include "core/math_utils.hpp"
+#include "core/time_utils.hpp"
 #include "ephemeris/simulation.hpp"
 #include "ephemeris/spice_ephemeris.hpp"
+#include "ephemeris/spk_exporter.hpp"
 #include "physics/star_calc.hpp"
 #include <algorithm>
 #include <format>
@@ -294,6 +296,59 @@ struct BspImportDraft {
     }
 };
 
+struct JumpTimelineDraft {
+    bool active = false;
+    bool is_utc = false;
+    int64_t target_year = 2026;
+    int target_month = 1;
+    int target_day = 1;
+    int target_hour = 0;
+    int target_minute = 0;
+    int target_second = 0;
+    int resolution_choice = 0;
+    std::string error;
+
+    void reset_to_now(std::string_view epoch_utc, units::Years current_sim_time, bool default_utc = false) {
+        active = true;
+        is_utc = default_utc;
+        auto dt = time::calculate_sim_date(epoch_utc, current_sim_time, !is_utc);
+        target_year = dt.year;
+        target_month = dt.month;
+        target_day = dt.day;
+        target_hour = dt.hour;
+        target_minute = dt.minute;
+        target_second = dt.second;
+        resolution_choice = 0;
+        error.clear();
+    }
+};
+
+struct TimelineScrubState {
+    bool active = false;
+    std::shared_ptr<ephemeris::TimelineRecording> recording;
+    int scrub_index = 0;
+    bool is_playing = false;
+    double playback_speed = 1.0;
+    double accumulated_steps = 0.0;
+    ephemeris::SystemSnapshot pre_timeline_snapshot;
+    ephemeris::SimulationClock pre_timeline_clock;
+    std::string export_status;
+    float export_progress = 0.0f;
+    bool export_in_progress = false;
+
+    void clear() {
+        active = false;
+        recording.reset();
+        scrub_index = 0;
+        is_playing = false;
+        playback_speed = 1.0;
+        accumulated_steps = 0.0;
+        export_status.clear();
+        export_progress = 0.0f;
+        export_in_progress = false;
+    }
+};
+
 struct WorkspaceState {
     int inspected_body = -1;
     bool edit_mode = false;
@@ -310,6 +365,10 @@ struct WorkspaceState {
     BspImportDraft bsp_import{};
     bool show_ephem_download_modal = false;
     std::string settings_error;
+
+    bool use_local_timezone = true;
+    JumpTimelineDraft jump_timeline{};
+    TimelineScrubState timeline_scrub{};
 
     bool has_selection() const noexcept { return inspected_body >= 0; }
     bool has_selection(const ephemeris::SystemSnapshot& snapshot) const noexcept {

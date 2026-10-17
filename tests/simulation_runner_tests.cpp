@@ -1,8 +1,10 @@
 #include "ephemeris/simulation_runner.hpp"
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 using namespace sf;
 using namespace sf::ephemeris;
@@ -127,6 +129,33 @@ void rejected_step() {
     check(runner.clock().time.value > 0.0, "Worker did not recover after a rejected step");
 }
 
+void timeline_render_contracts() {
+    SimulationRunner runner;
+    require(runner.replace_system(fixture(MotionModel::Keplerian)));
+    runner.start_timeline_render(units::Years{2.0}, 100);
+    while (runner.is_rendering_timeline()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    auto prog = runner.timeline_progress();
+    check(!prog.active, "Timeline render completed");
+    check(prog.completed, "Timeline marked completed");
+    check(prog.steps_done == 100, "100 steps completed");
+    auto rec = runner.take_completed_timeline();
+    check(rec != nullptr, "Timeline recording retrieved");
+    check(rec->num_steps() == 100, "Recording steps match");
+    check(rec->times.size() == 100, "Times count match");
+
+    // Test scrubbing frame application
+    runner.apply_timeline_frame(*rec, 25);
+    check(std::abs(runner.snapshot().time().value - rec->times[25].value) < 1e-9, "Frame applied");
+
+    // Test cancellation
+    runner.start_timeline_render(units::Years{100.0}, 200000);
+    check(runner.is_rendering_timeline(), "Long render active");
+    runner.cancel_timeline_render();
+    check(!runner.is_rendering_timeline(), "Render cancelled immediately");
+}
+
 }
 
 int main() {
@@ -136,6 +165,7 @@ int main() {
         deterministic_pipeline(MotionModel::NBody, true);
         backlog_and_commands();
         rejected_step();
+        timeline_render_contracts();
         std::cout << "Simulation worker contracts passed.\n";
         return 0;
     } catch (const std::exception& error) {

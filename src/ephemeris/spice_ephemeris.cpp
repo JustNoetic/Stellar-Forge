@@ -35,6 +35,16 @@ Function symbol(void* library, const char* name) {
     return reinterpret_cast<Function>(address);
 }
 
+template <typename Function>
+Function optional_symbol(void* library, const char* name) {
+#ifdef _WIN32
+    auto address = GetProcAddress(static_cast<HMODULE>(library), name);
+#else
+    auto address = dlsym(library, name);
+#endif
+    return reinterpret_cast<Function>(address);
+}
+
 std::string to_upper(std::string_view sv) {
     std::string out(sv);
     std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -261,6 +271,11 @@ CommandResult SpiceEphemeris::initialize() {
             reset_ = symbol<decltype(reset_)>(library_, "reset_c");
             to_et_ = symbol<decltype(to_et_)>(library_, "str2et_c");
             state_ = symbol<decltype(state_)>(library_, "spkgeo_c");
+            spkopn_ = optional_symbol<decltype(spkopn_)>(library_, "spkopn_c");
+            spkw02_ = optional_symbol<decltype(spkw02_)>(library_, "spkw02_c");
+            spkw03_ = optional_symbol<decltype(spkw03_)>(library_, "spkw03_c");
+            spkw13_ = optional_symbol<decltype(spkw13_)>(library_, "spkw13_c");
+            spkcls_ = optional_symbol<decltype(spkcls_)>(library_, "spkcls_c");
         }
         reset_();
         clear_();
@@ -365,6 +380,74 @@ CommandResult SpiceEphemeris::state_relative(int target, int observer, double et
     }
     motion.position = EclipticPosition{glm::dvec3(state[0], state[1], state[2]) * KM_TO_AU};
     motion.velocity = EclipticVelocity{glm::dvec3(state[3], state[4], state[5]) * (KM_TO_AU * SECONDS_PER_YEAR)};
+    return {};
+}
+
+CommandResult SpiceEphemeris::spk_open(const std::filesystem::path& path, std::string_view internal_name, int& handle) {
+    std::lock_guard lock(mutex_);
+    if (!spkopn_) return {false, false, "SPICE runtime does not support SPK writing (spkopn_c missing)"};
+    std::string path_str = path.string();
+    std::string iname(internal_name.substr(0, 60));
+    int h = 0;
+    spkopn_(path_str.c_str(), iname.c_str(), 1024, &h);
+    if (failed_()) {
+        char msg[2048]{};
+        message_("LONG", sizeof(msg), msg);
+        reset_();
+        return {false, false, msg};
+    }
+    handle = h;
+    return {};
+}
+
+CommandResult SpiceEphemeris::spk_write_type2(int handle, int body, int center, std::string_view frame,
+                                              double first_et, double last_et, std::string_view segid,
+                                              double intlen_sec, int n_intervals, int degree,
+                                              const double* cdata, double btime_et) {
+    std::lock_guard lock(mutex_);
+    if (!spkw02_) return {false, false, "SPICE runtime missing spkw02_c"};
+    std::string frame_str(frame);
+    std::string seg_str(segid.substr(0, 40));
+    spkw02_(handle, body, center, frame_str.c_str(), first_et, last_et, seg_str.c_str(),
+            intlen_sec, n_intervals, degree, cdata, btime_et);
+    if (failed_()) {
+        char msg[2048]{};
+        message_("LONG", sizeof(msg), msg);
+        reset_();
+        return {false, false, msg};
+    }
+    return {};
+}
+
+CommandResult SpiceEphemeris::spk_write_type13(int handle, int body, int center, std::string_view frame,
+                                               double first_et, double last_et, std::string_view segid,
+                                               int degree, int num_states, const double* states_6d,
+                                               const double* epochs_et) {
+    std::lock_guard lock(mutex_);
+    if (!spkw13_) return {false, false, "SPICE runtime missing spkw13_c"};
+    std::string frame_str(frame);
+    std::string seg_str(segid.substr(0, 40));
+    spkw13_(handle, body, center, frame_str.c_str(), first_et, last_et, seg_str.c_str(),
+            degree, num_states, states_6d, epochs_et);
+    if (failed_()) {
+        char msg[2048]{};
+        message_("LONG", sizeof(msg), msg);
+        reset_();
+        return {false, false, msg};
+    }
+    return {};
+}
+
+CommandResult SpiceEphemeris::spk_close(int handle) {
+    std::lock_guard lock(mutex_);
+    if (!spkcls_) return {false, false, "SPICE runtime missing spkcls_c"};
+    spkcls_(handle);
+    if (failed_()) {
+        char msg[2048]{};
+        message_("LONG", sizeof(msg), msg);
+        reset_();
+        return {false, false, msg};
+    }
     return {};
 }
 

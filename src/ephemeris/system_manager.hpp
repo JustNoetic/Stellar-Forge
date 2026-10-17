@@ -118,6 +118,10 @@ struct ReferenceHierarchy {
     std::vector<int> parents;
     std::vector<std::vector<int>> children;
     std::vector<int> roots;
+
+    int parent_index(int index) const noexcept {
+        return (index >= 0 && static_cast<size_t>(index) < parents.size()) ? parents[index] : -1;
+    }
 };
 
 struct LoadedSystem {

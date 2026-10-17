@@ -184,6 +184,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/jacobi.cpp
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
+        src/ephemeris/spk_exporter.cpp
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/core/path_utils.cpp
@@ -217,6 +218,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/orbit_curves.cpp
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
+        src/ephemeris/spk_exporter.cpp
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/core/path_utils.cpp
@@ -239,6 +241,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/orbit_curves.cpp
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
+        src/ephemeris/spk_exporter.cpp
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/core/path_utils.cpp

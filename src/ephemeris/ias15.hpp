@@ -7,6 +7,7 @@
 #include "ephemeris/system_manager.hpp"
 
 #include <array>
+#include <atomic>
 #include <span>
 #include <vector>
 #include <glm/glm.hpp>
@@ -17,9 +18,10 @@ class Ias15Integrator {
 public:
     void reset(const SystemDefinition& def, std::span<const BodyMotion> motions, units::Years t);
     void update_parameters(const SystemDefinition& def);
-    CommandResult integrate(const SystemDefinition& def, std::vector<BodyMotion>& motions, units::Years target_time);
+    CommandResult integrate(const SystemDefinition& def, std::vector<BodyMotion>& motions, units::Years target_time, int max_substeps = 2000, const std::atomic<bool>* cancel = nullptr);
     void shift_com(glm::dvec3 pos_shift, glm::dvec3 vel_shift);
 
+    units::Years time() const noexcept { return units::Years{t_}; }
     double dt() const noexcept { return dt_; }
     void set_dt(double dt) noexcept { dt_ = dt; }
     double epsilon() const noexcept { return epsilon_; }

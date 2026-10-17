@@ -29,4 +29,9 @@ tests/*
 !tests/benchmark_comparison_tests.py
 !tests/hierarchy_tests.cpp
 !tests/simulation_runner_tests.cpp
+!tests/orbit_rendering_tests.cpp
+!tests/orbit_tests.cpp
+!tests/star_calc_tests.cpp
+!tests/state_tests.cpp
+!tests/fixtures/**
 __pycache__/
