@@ -1,0 +1,46 @@
+#version 460
+
+#include "common/terrain_geometry.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+struct GeometryBakeGPU {
+    dvec4 anchor_polar_ratio;
+    dvec4 shape;
+    uvec4 address;
+    uvec4 destination;
+};
+
+struct GeometryVertex {
+    vec4 position;
+    vec4 normal;
+    vec4 direction;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer BakeJobs {
+    GeometryBakeGPU jobs[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer GeometryCache {
+    GeometryVertex vertices[];
+};
+
+void main() {
+    uvec2 grid = gl_GlobalInvocationID.xy;
+    if (any(greaterThan(grid, uvec2(16)))) return;
+    GeometryBakeGPU job = jobs[gl_GlobalInvocationID.z];
+    double width = 2.0 / double(1u << job.address.y);
+    dvec2 uv = -1.0 + (dvec2(job.address.zw) + dvec2(grid) / 16.0) * width;
+    double b = job.anchor_polar_ratio.w;
+    double amplitude = job.shape.x;
+    dvec3 point = terrain_surface(job.address.x, uv, b, amplitude);
+    double e = 0.0001;
+    dvec3 du = terrain_surface(job.address.x, uv + dvec2(e, 0.0), b, amplitude)
+             - terrain_surface(job.address.x, uv - dvec2(e, 0.0), b, amplitude);
+    dvec3 dv = terrain_surface(job.address.x, uv + dvec2(0.0, e), b, amplitude)
+             - terrain_surface(job.address.x, uv - dvec2(0.0, e), b, amplitude);
+    GeometryVertex vertex;
+    vertex.position = vec4(vec3(point - job.anchor_polar_ratio.xyz), 0.0);
+    vertex.normal = vec4(vec3(normalize(cross(du, dv))), 0.0);
+    vertex.direction = vec4(vec3(normalize(terrain_cube_vector(job.address.x, uv))), 0.0);
+    vertices[job.destination.x * 289u + grid.y * 17u + grid.x] = vertex;
+}

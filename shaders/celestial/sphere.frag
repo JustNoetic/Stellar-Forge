@@ -6,6 +6,11 @@ layout(location = 2) in vec3 f_normal;
 layout(location = 3) in float f_subpixel_factor;
 layout(location = 4) flat in uint f_body_idx;
 
+#ifdef TERRAIN_SURFACE
+layout(location = 5) flat in vec4 f_tile_color;
+layout(location = 6) in vec2 f_tile_uv;
+#endif
+
 #include "common/celestial_scene.glsl"
 
 layout(location = 0) out vec4 out_color;
@@ -49,6 +54,14 @@ float compute_eclipse_shadow(vec3 frag_pos, vec3 star_pos, float star_radius, ui
 }
 
 void main() {
+#ifdef TERRAIN_SURFACE
+    if (f_tile_color.w > 0.5) {
+        vec2 edge = min(f_tile_uv, 1.0 - f_tile_uv);
+        vec2 line = smoothstep(vec2(0.0), max(fwidth(f_tile_uv) * 1.5, vec2(1e-5)), edge);
+        out_color = vec4(f_tile_color.rgb * mix(0.2, 1.0, min(line.x, line.y)), 1.0);
+        return;
+    }
+#endif
     if (f_subpixel_factor >= 1.0) {
         discard;
     }

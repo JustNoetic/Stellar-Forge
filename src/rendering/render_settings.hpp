@@ -18,6 +18,13 @@ struct RenderSettings {
     float star_point_size = DEFAULT_POINT_DIAMETER_PX;
     float star_intensity = 1.0f;
     bool vsync = false;
+    bool terrain_enabled = false;
+    bool terrain_debug_tiles = false;
+    bool terrain_reference_fp64 = false;
+    bool terrain_cached_fp64 = false;
+    float terrain_error_pixels = 2.0f;
+    float terrain_height_km = 2.0f;
+    uint32_t terrain_patch_limit = 1024;
     bool operator==(const RenderSettings&) const = default;
 };
 
@@ -27,6 +34,11 @@ public:
     uint64_t revision() const noexcept { return revision_; }
 
     CommandResult apply(const RenderSettings& candidate) {
+        if (!std::isfinite(candidate.terrain_error_pixels) || candidate.terrain_error_pixels < 0.5f || candidate.terrain_error_pixels > 16.0f ||
+            !std::isfinite(candidate.terrain_height_km) || candidate.terrain_height_km < 0.0f || candidate.terrain_height_km > 20.0f ||
+            candidate.terrain_patch_limit < 64 || candidate.terrain_patch_limit > 4096) {
+            return {false, false, "Terrain error must be 0.5 to 16 pixels, relief 0 to 20 km and patch limit 64 to 4096."};
+        }
         if (!std::isfinite(candidate.orbit_opacity) || candidate.orbit_opacity < 0.0f || candidate.orbit_opacity > 1.0f ||
             candidate.orbit_segments < 128 || candidate.orbit_segments > 8192) {
             return {false, false, "Orbit opacity must be 0 to 1 and segment count 128 to 8192."};

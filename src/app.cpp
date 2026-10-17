@@ -504,6 +504,13 @@ bool App::render_frame(benchmark::FrameSample* sample) {
                          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
     star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
+    double celestial_prepare_ms = 0.0;
+    {
+        ScopedTimer timer(sample ? &celestial_prepare_ms : nullptr);
+        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_terrain_prepare") : UINT32_MAX;
+        celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+        vk_.end_gpu_timer(cmd, id);
+    }
 
     auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, 0.0f, 0.0f, 0.0f, 1.0f);
     auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0.0f);
@@ -515,6 +522,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
         vk_.end_gpu_timer(cmd, id);
     }
+    if (sample) sample->cpu_celestial_ms += celestial_prepare_ms;
     {
         ScopedTimer timer(sample ? &sample->cpu_gaia_ms : nullptr);
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_gaia") : UINT32_MAX;
@@ -735,8 +743,10 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         if (ImGui::MenuItem("+ Create New System...")) {
             ui_state_.create_system.reset();
         }
-        if (ImGui::MenuItem("Export to N-Body System...")) {
-            open_export_nbody_modal();
+        if (system().definition().motion_model != ephemeris::MotionModel::NBody) {
+            if (ImGui::MenuItem("Export to N-Body System...")) {
+                open_export_nbody_modal();
+            }
         }
         if (ImGui::MenuItem("Import Ephemeris Kernel (.bsp)...")) {
             ui_state_.bsp_import.reset();
@@ -807,12 +817,14 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         if (ImGui::MenuItem("Jump to Date / Render Timeline...")) {
             open_jump_timeline_modal();
         }
-        ImGui::Separator();
-        const char* export_physics_label = (current_mode == ephemeris::MotionModel::Spice)
-            ? "Export Ephemeris to N-Body System..."
-            : "Export Current State to N-Body System...";
-        if (ImGui::MenuItem(export_physics_label)) {
-            open_export_nbody_modal();
+        if (current_mode != ephemeris::MotionModel::NBody) {
+            ImGui::Separator();
+            const char* export_physics_label = (current_mode == ephemeris::MotionModel::Spice)
+                ? "Export Ephemeris to N-Body System..."
+                : "Export Current State to N-Body System...";
+            if (ImGui::MenuItem(export_physics_label)) {
+                open_export_nbody_modal();
+            }
         }
         ImGui::EndMenu();
     }
@@ -822,6 +834,11 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         }
         if (ImGui::MenuItem("Export Timeline to SPK (.bsp)...")) {
             trigger_timeline_bsp_export();
+        }
+        if (system().definition().motion_model != ephemeris::MotionModel::NBody) {
+            if (ImGui::MenuItem("Export to N-Body System...")) {
+                open_export_nbody_modal();
+            }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Import Ephemeris Kernel (.bsp)...")) {
@@ -942,6 +959,28 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ui::field("Orbit Opacity##orb_op", [&](const char* id) {
                 ImGui::SliderFloat(id, &render_draft.orbit_opacity, 0.0f, 1.0f, "%.2f");
             });
+            ui::section("Terrain preview", "Synthetic relief on solid bodies");
+            ImGui::Checkbox("Terrain LOD", &render_draft.terrain_enabled);
+            ImGui::BeginDisabled(!render_draft.terrain_enabled);
+            ImGui::Checkbox("Terrain Tile Colors", &render_draft.terrain_debug_tiles);
+            ImGui::Checkbox("FP64 Terrain Reference", &render_draft.terrain_reference_fp64);
+            ui::field("Terrain Error##terrain_error", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.terrain_error_pixels, 0.5f, 16.0f, "%.1f px");
+            });
+            ui::field("Synthetic Relief##terrain_height", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.terrain_height_km, 0.0f, 20.0f, "%.2f km");
+            });
+            ui::field("Patches per Body##terrain_patches", [&](const char* id) {
+                int limit = static_cast<int>(render_draft.terrain_patch_limit);
+                if (ImGui::SliderInt(id, &limit, 64, 4096)) render_draft.terrain_patch_limit = static_cast<uint32_t>(limit);
+            });
+            ImGui::EndDisabled();
+            const auto& terrain = celestial_renderer_.terrain_stats();
+            ui::value_row("Terrain Patches", std::format("{} / 4096", terrain.patches));
+            ui::value_row("Deepest Terrain Level", std::to_string(terrain.deepest_level));
+            ui::value_row("Geometry Cache", std::format("{} cached / {} reference", terrain.cached_patches, terrain.reference_patches));
+            ui::value_row("Geometry Bakes", std::format("{} / {} per frame", terrain.cache_bakes, terrain::MAX_GEOMETRY_BAKES));
+            if (terrain.budget_limited) ImGui::TextDisabled("Patch budget reached; using coarser terrain.");
         } else if (section_idx == 2) {
             const char* modes[] = {"Free Flight", "Simple Orbit"};
             int cur_mode = camera_.movement_mode;
@@ -1760,15 +1799,6 @@ void App::render_time_hud(rendering::RenderSettings& render_draft) {
         }
         ImGui::PopItemWidth();
 
-        std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time(), ui_state_.use_local_timezone);
-        ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", date_str.c_str());
-
-        ImGui::SameLine(0.0f, 4.0f * layout.scale);
-        if (ImGui::SmallButton(ui_state_.use_local_timezone ? "Local" : "UTC")) {
-            ui_state_.use_local_timezone = !ui_state_.use_local_timezone;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Local vs UTC display");
-
         ImGui::SameLine(0.0f, 6.0f * layout.scale);
         if (ImGui::Button("Jump / Timeline...", ImVec2(125.0f * layout.scale, 0.0f))) {
             open_jump_timeline_modal();
@@ -1787,22 +1817,20 @@ void App::render_time_hud(rendering::RenderSettings& render_draft) {
             }
         }
 
+        std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time(), ui_state_.use_local_timezone);
+        ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", date_str.c_str());
+
+        ImGui::SameLine(0.0f, 4.0f * layout.scale);
+        if (ImGui::SmallButton(ui_state_.use_local_timezone ? "Local" : "UTC")) {
+            ui_state_.use_local_timezone = !ui_state_.use_local_timezone;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle Local vs UTC display");
+
         ImGui::SameLine(0.0f, 6.0f * layout.scale);
         const char* hud_mode = "Keplerian";
         if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
         else if (system().definition().motion_model == ephemeris::MotionModel::NBody) hud_mode = "N-Body";
         ImGui::TextDisabled("| %s", hud_mode);
-
-        ImGui::SameLine(0.0f, 6.0f * layout.scale);
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.35f, 0.50f, 0.8f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.45f, 0.65f, 1.0f));
-        if (ImGui::SmallButton("Export to N-Body")) {
-            open_export_nbody_modal();
-        }
-        ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Export current positions & velocities as a new N-Body system");
-        }
     }
 
     float exp_val = render_draft.exposure;
@@ -2183,6 +2211,7 @@ void App::render_delete_system_modal() {
 }
 
 void App::open_export_nbody_modal() {
+    if (system().definition().motion_model == ephemeris::MotionModel::NBody) return;
     auto dt = time::calculate_sim_date(system().definition().epoch_utc, system().time());
     std::string default_name = std::format("{} ({:04d}-{:02d}-{:02d})", system().name(), dt.year, dt.month, dt.day);
     ui_state_.export_nbody.reset(default_name);

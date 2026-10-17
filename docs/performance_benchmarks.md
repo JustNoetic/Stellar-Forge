@@ -82,6 +82,7 @@ This is application frame throughput, not a display scanout or input-latency met
 | `gpu_frame_ms` | Timestamp interval across the frame commands, including barriers |
 | `gpu_scene_hdr_ms` | HDR scene interval, including its three renderer children |
 | `gpu_celestial_ms`, `gpu_gaia_ms`, `gpu_orbits_ms` | Renderer GPU intervals |
+| `gpu_terrain_prepare_ms` | Terrain cache compute prepass before dynamic rendering; included in HDR scene time; CPU preparation is included in `cpu_celestial_ms` |
 | `gpu_post_composite_ms`, `gpu_ui_ms` | Composite and ImGui GPU intervals |
 
 CPU scopes measure elapsed wall time, not scheduled thread/process CPU execution.
@@ -103,6 +104,16 @@ The default report pools repetitions into one arithmetic mean per timing per
 scene. FPS is `1000 / average frame time`. CPU work is simulation + camera + render
 recording; wait time is fence + acquire + present. These scopes remain separate
 from GPU time because CPU/GPU work overlaps.
+
+The terrain-specific offscreen benchmark is available with render tests enabled:
+
+```powershell
+.\build\StellarRenderingTests.exe --terrain-benchmark scratch/terrain-benchmark/capture.json
+```
+
+It compares sphere, full procedural FP64, cached FP32 and cached FP64 vertex arithmetic,
+including stationary, moving, cold-cache and distant telescope cases. It excludes
+the rest of the application frame. See [terrain performance](terrain_performance.md).
 
 With `--benchmark-detailed`, the report additionally includes per-run count, mean,
 median, p95, p99, minimum and maximum, raw JSON frames, and `frames.csv`.

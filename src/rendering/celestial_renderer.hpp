@@ -4,6 +4,7 @@
 #include "rendering/render_settings.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
+#include "terrain/terrain_renderer.hpp"
 #include <array>
 #include <vector>
 #include <glm/glm.hpp>
@@ -19,6 +20,7 @@ struct alignas(16) BodyInstanceGPU {
     glm::vec4 pole_oblateness{0.0f, 1.0f, 0.0f, 0.0f};
     glm::vec4 pole_color_lum{1.0f};
     glm::vec4 spin_flags{0.0f};
+    glm::uvec4 surface_flags{0};
 };
 
 struct alignas(16) SceneCelestialUBO {
@@ -32,15 +34,19 @@ struct alignas(16) SceneCelestialUBO {
     uint32_t num_bodies = 0;
     uint32_t hdr_enabled = 1;
     uint32_t pad0 = 0;
+    glm::mat4 projection{1.0f};
 };
 
 class CelestialRenderer {
 public:
     void init(rhi::VkContext& ctx);
     void shutdown(rhi::VkContext& ctx);
+    void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
+    const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
 
 private:
     void build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors, uint32_t stacks);
@@ -57,6 +63,7 @@ private:
 
     rhi::Pipeline sphere_pipeline_{};
     rhi::Pipeline point_pipeline_{};
+    terrain::TerrainRenderer terrain_;
 };
 
 } // namespace sf::rendering

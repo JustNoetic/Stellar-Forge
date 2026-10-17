@@ -158,6 +158,13 @@ target_link_libraries(StellarForge PRIVATE
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
 if(STELLAR_BUILD_TESTS)
     enable_testing()
+    add_executable(StellarTerrainTests tests/terrain_tests.cpp src/terrain/quadtree.cpp src/terrain/tile_metadata.cpp src/terrain/geometry_residency.cpp)
+    target_include_directories(StellarTerrainTests PRIVATE src)
+    target_link_libraries(StellarTerrainTests PRIVATE glm::glm)
+    if(MINGW)
+        target_link_options(StellarTerrainTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    endif()
+    add_test(NAME terrain_contracts COMMAND StellarTerrainTests)
     add_executable(StellarEclipseTests tests/eclipse_tests.cpp)
     target_include_directories(StellarEclipseTests PRIVATE src)
     target_link_libraries(StellarEclipseTests PRIVATE glm::glm)
@@ -294,6 +301,11 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/rendering/celestial_renderer.cpp
+        src/terrain/quadtree.cpp
+        src/terrain/tile_metadata.cpp
+        src/terrain/terrain_renderer.cpp
+        src/terrain/geometry_cache.cpp
+        src/terrain/geometry_residency.cpp
         src/rendering/star_catalog.cpp
         src/rhi/shader_cache.cpp
         src/rhi/vk_context.cpp

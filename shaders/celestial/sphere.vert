@@ -32,7 +32,7 @@ void main() {
 
     float weight = is_bh ? 1.0 : mesh_weight(apparent_radius_px(b.pos_radius));
     f_subpixel_factor = 1.0 - weight;
-    if (weight <= 0.0) {
+    if (weight <= 0.0 || b.surface_flags.x != 0u) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
         f_world_pos = vec3(0.0);
         f_local_pos = vec3(0.0);

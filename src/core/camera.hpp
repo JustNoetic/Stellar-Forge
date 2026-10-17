@@ -67,6 +67,7 @@ struct Camera {
 
     glm::mat4 view_matrix_origin_relative() const noexcept;
     glm::mat4 view_matrix_eye_relative() const noexcept;
+    glm::dmat3 view_rotation_double() const noexcept;
     glm::mat4 proj_matrix(float aspect, float z_near_au) const noexcept;
     float compute_near_plane_au() const noexcept;
 };

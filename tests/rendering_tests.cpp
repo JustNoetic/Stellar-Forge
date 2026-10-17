@@ -116,6 +116,7 @@ struct RenderProbe {
                   const rendering::RenderSettings& settings, rendering::StarCatalog* catalog = nullptr,
                   bool tone_map = false) {
         vk.immediate_submit([&](VkCommandBuffer cmd) {
+            if (!catalog) renderer.prepare(cmd, vk, camera, system, settings, extent);
             if (catalog) catalog->cull(cmd, vk, camera, units::Years{0.0}, settings, extent);
             vk.transition_image(cmd, color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             vk.transition_image(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
@@ -179,12 +180,16 @@ struct RenderProbe {
               "Displayed point obeys its configured pixel diameter");
     }
 
-    void save_preview(const std::filesystem::path& path) const {
+    void save_preview(const std::filesystem::path& path, bool full = false) const {
         std::ofstream file(path, std::ios::binary);
-        file << "P6\n64 64\n255\n";
+        uint32_t width = full ? extent.width : 64;
+        uint32_t height = full ? extent.height : 64;
+        uint32_t x0 = (extent.width - width) / 2;
+        uint32_t y0 = (extent.height - height) / 2;
+        file << "P6\n" << width << ' ' << height << "\n255\n";
         auto* pixels = static_cast<const uint16_t*>(readback.mapped);
-        for (uint32_t y = extent.height / 2 - 32; y < extent.height / 2 + 32; ++y) {
-            for (uint32_t x = extent.width / 2 - 32; x < extent.width / 2 + 32; ++x) {
+        for (uint32_t y = y0; y < y0 + height; ++y) {
+            for (uint32_t x = x0; x < x0 + width; ++x) {
                 for (uint32_t c = 0; c < 3; ++c) {
                     float v = glm::unpackHalf2x16(pixels[4 * (static_cast<size_t>(y) * extent.width + x) + c]).x;
                     file.put(static_cast<char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f));
@@ -202,6 +207,83 @@ Camera camera_at(double distance, double pixel_offset = 0.0) {
     camera.yaw_actual_deg = -90.0;
     camera.pitch_actual_deg = 0.0;
     return camera;
+}
+
+void terrain_surfaces(RenderProbe& probe, const std::filesystem::path& output = {}) {
+    probe.resize({512, 512});
+    if (!output.empty()) std::filesystem::create_directories(output);
+    constexpr double radius = 6378.137 * KM_TO_AU;
+    auto make_system = [](glm::dvec3 origin, double flattening) {
+        auto loaded = fixture();
+        loaded.motions[0].position = render_to_ecliptic(RenderPosition{origin + glm::dvec3(0, 0, 10)});
+        loaded.definition.bodies[0].lum_eq = 100.0;
+        loaded.definition.bodies[0].lum_pole = 100.0;
+        ephemeris::BodyDefinition earth;
+        earth.name = "Terrain probe";
+        earth.type = "Terrestrial";
+        earth.radius_rsun = radius / SOLAR_RADII_TO_AU;
+        earth.oblateness = flattening;
+        earth.color_rgb = {0.45f, 0.65f, 0.3f};
+        loaded.definition.bodies.push_back(earth);
+        ephemeris::BodyMotion motion;
+        motion.position = render_to_ecliptic(RenderPosition{origin});
+        loaded.motions.push_back(motion);
+        loaded.definition.name_to_idx[earth.name] = 1;
+        return loaded;
+    };
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(make_system({}, 0.15)).accepted, "Terrain fixture");
+    rendering::RenderSettings settings;
+    settings.terrain_enabled = true;
+    settings.terrain_debug_tiles = true;
+    settings.terrain_patch_limit = 512;
+    settings.terrain_height_km = 2.0f;
+    Camera camera = camera_at(radius * 3.0);
+    camera.tracking_idx = 1;
+    check(probe.render(camera, simulation.snapshot(), settings) > 1000.0, "Oblate terrain produces visible GPU output");
+    check(probe.renderer.terrain_stats().patches > 6, "GPU terrain uses adaptive patches");
+    check(probe.renderer.terrain_stats().patches <= settings.terrain_patch_limit, "GPU patch count respects the budget");
+    for (int y = 160; y < 352; ++y)
+        for (int x = 160; x < 352; ++x)
+            check(probe.red_at(x, y) > 0.01f, "No holes inside the resolved terrain disc");
+    if (!output.empty()) probe.save_preview(output / "orbit-tiles.ppm", true);
+    settings.terrain_debug_tiles = false;
+    check(probe.render(camera, simulation.snapshot(), settings) > 1000.0, "Terrain retains celestial surface lighting");
+    if (!output.empty()) probe.save_preview(output / "orbit-relief.ppm", true);
+    settings.terrain_debug_tiles = true;
+    for (const auto& [name, direction] : std::vector<std::pair<std::string, glm::dvec3>>{
+             {"pole", {0, 1, 0}}, {"face-edge", glm::normalize(glm::dvec3(1, 0, 1))},
+             {"face-corner", glm::normalize(glm::dvec3(1, 1, 1))}}) {
+        camera.cam_pos_rel = direction * radius * 2.0;
+        camera.up = std::abs(direction.y) > 0.9 ? glm::dvec3(0, 0, 1) : glm::dvec3(0, 1, 0);
+        camera.center_body(1, simulation.snapshot());
+        check(probe.render(camera, simulation.snapshot(), settings) > 1000.0, "Cube edges and poles remain visible");
+        check(probe.red_at(256, 256) > 0.01f, "Cube junction has no center hole");
+        if (!output.empty()) probe.save_preview(output / (name + ".ppm"), true);
+    }
+    settings.terrain_height_km = 0.0f;
+    for (glm::dvec3 origin : {glm::dvec3(0), glm::dvec3(1.0, -2.0, 3.0)}) {
+        check(simulation.replace_system(make_system(origin, 0.0)).accepted, "Translated terrain fixture");
+        for (double altitude_km : {1.0, 0.001}) {
+            camera = camera_at(radius + altitude_km * KM_TO_AU);
+            camera.origin_render = origin;
+            camera.tracking_idx = 1;
+            camera.is_near_surface = true;
+            probe.render(camera, simulation.snapshot(), settings);
+            check(probe.renderer.terrain_stats().deepest_level >= 10, "Near-surface GPU view selects fine patches");
+            check(probe.renderer.terrain_stats().patches <= settings.terrain_patch_limit, "Near-surface VRAM workload stays bounded");
+            for (uint32_t y = 4; y < 508; ++y)
+                for (uint32_t x = 4; x < 508; ++x)
+                    check(probe.red_at(x, y) > 0.01f, "Continuous meter-scale surface at local and astronomical origins");
+            if (!output.empty() && glm::length(origin) == 0.0)
+                probe.save_preview(output / (altitude_km == 1.0 ? "one-km.ppm" : "one-meter.ppm"), true);
+        }
+    }
+    settings.terrain_enabled = false;
+    probe.render(camera_at(radius * 3.0), simulation.snapshot(), settings);
+    check(probe.renderer.terrain_stats().patches == 0, "Disabling terrain clears the prepared draw list");
+    probe.resize(EXTENT);
+    std::cout << "Terrain GPU contracts passed: oblate disc, lighting, cube seams, poles, meter precision and bounded patches.\n";
 }
 
 void earth_closeups(RenderProbe& probe, const std::filesystem::path& output) {
@@ -560,10 +642,34 @@ void scaling_point_footprint(RenderProbe& probe) {
 
 }
 
+#include "terrain_gpu_tests.hpp"
+
 int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc >= 2 && std::string_view(argv[1]) == "--terrain-relief-benchmark") {
+            terrain_ground_benchmark(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{}, true);
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--terrain-ground-benchmark") {
+            terrain_ground_benchmark(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--terrain-benchmark") {
+            terrain_benchmark(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--terrain-precision") {
+            terrain_precision(probe);
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--terrain-preview") {
+            terrain_surfaces(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
+            return 0;
+        }
+        terrain_surfaces(probe);
+        terrain_precision(probe);
         if (argc == 3 && std::string_view(argv[1]) == "--earth-closeups") {
             earth_closeups(probe, argv[2]);
             return 0;

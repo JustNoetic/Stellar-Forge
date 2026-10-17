@@ -50,6 +50,7 @@ public:
     Buffer create_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage, const void* initial_data = nullptr);
     Buffer create_device_buffer(VkDeviceSize size, VkBufferUsageFlags usage, const void* initial_data = nullptr);
     void destroy_buffer(Buffer& buffer);
+    void flush_buffer(const Buffer& buffer, VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
 
     Image create_image_2d(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
                           uint32_t mip_levels = 1, uint32_t array_layers = 1);

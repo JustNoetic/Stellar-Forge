@@ -531,6 +531,10 @@ glm::mat4 Camera::view_matrix_eye_relative() const noexcept {
     return glm::mat4(glm::lookAt(glm::dvec3(0.0), f, u));
 }
 
+glm::dmat3 Camera::view_rotation_double() const noexcept {
+    return glm::dmat3(glm::lookAt(glm::dvec3(0.0), forward_dir(), up_dir()));
+}
+
 float Camera::compute_near_plane_au() const noexcept {
     if (is_near_surface) {
         return static_cast<float>(0.0001 / AU_TO_KM);

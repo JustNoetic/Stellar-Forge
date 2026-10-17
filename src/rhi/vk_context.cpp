@@ -604,6 +604,10 @@ void VkContext::destroy_buffer(Buffer& buffer) {
     }
 }
 
+void VkContext::flush_buffer(const Buffer& buffer, VkDeviceSize offset, VkDeviceSize size) {
+    if (buffer.mapped != nullptr) VK_CHECK(vmaFlushAllocation(allocator_, buffer.allocation, offset, size));
+}
+
 Image VkContext::create_image_2d(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
                                  uint32_t mip_levels, uint32_t array_layers) {
     Image img{};

@@ -10,6 +10,8 @@
 
 namespace sf::rendering {
 
+static_assert(sizeof(BodyInstanceGPU) == 96);
+
 namespace {
 
 struct SphereVertex {
@@ -70,9 +72,11 @@ void CelestialRenderer::init(rhi::VkContext& ctx) {
     point_desc.cull_mode = VK_CULL_MODE_NONE;
 
     point_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
+    terrain_.init(ctx);
 }
 
 void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
+    terrain_.shutdown(ctx);
     rhi::ShaderCache::destroy_pipeline(ctx, point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
@@ -128,6 +132,13 @@ void CelestialRenderer::build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors,
                                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data());
 }
 
+void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
+    uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
+    terrain_.prepare(ctx, cam, sys, settings, extent, count);
+    terrain_.bake(cmd, ctx);
+}
+
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
@@ -150,6 +161,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     SceneCelestialUBO ubo{};
     ubo.view = view;
     ubo.view_proj = proj * view;
+    ubo.projection = proj;
     ubo.screen_params = {fb_w, fb_h, fov_factor, settings.exposure};
     ubo.point_params.x = std::clamp(settings.star_point_size, 1.5f, 6.0f);
     ubo.num_bodies = count;
@@ -172,6 +184,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
                                     static_cast<float>(b.definition.lum_pole),
                                     b.definition.is_black_hole ? 1.0f : 0.0f,
                                     static_cast<float>(i));
+        inst.surface_flags.x = terrain_.covers(i) ? 1u : 0u;
         inst_ptr[i] = inst;
 
         if (b.definition.is_star && ubo.num_stars < MAX_SCENE_STARS) {
@@ -194,12 +207,15 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         float distance = std::max(glm::length(glm::vec3(receiver.pos_radius)), 1e-12f);
         float radius_px = receiver.pos_radius.w / distance * fb_h * fov_factor;
         if (radius_px <= 1.49f) continue;
+        auto receiver_bounds = receiver.pos_radius;
+        if (receiver.surface_flags.x != 0u)
+            receiver_bounds.w += std::min(settings.terrain_height_km * float(KM_TO_AU), receiver.pos_radius.w * 0.01f);
         for (uint32_t s = 0; s < ubo.num_stars; ++s) {
             uint32_t range = (i * ubo.num_stars + s) * 2;
             uint32_t start = static_cast<uint32_t>(eclipse_words_.size());
             for (uint32_t j = 0; j < count; ++j) {
                 if (i == j || inst_ptr[j].color_is_star.w > 0.5f) continue;
-                if (eclipse_could_shadow(receiver.pos_radius, ubo.stars_pos_radius[s], inst_ptr[j].pos_radius))
+                if (eclipse_could_shadow(receiver_bounds, ubo.stars_pos_radius[s], inst_ptr[j].pos_radius))
                     eclipse_words_.push_back(j);
             }
             eclipse_words_[range] = start;
@@ -216,6 +232,9 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     std::memcpy(eclipse_buffer.mapped, eclipse_words_.data(), eclipse_bytes);
     std::memcpy(instance_ssbos_[f_idx].mapped, body_instances_.data(), count * sizeof(BodyInstanceGPU));
     std::memcpy(scene_ubos_[f_idx].mapped, &ubo, sizeof(SceneCelestialUBO));
+    ctx.flush_buffer(eclipse_buffer, 0, eclipse_bytes);
+    ctx.flush_buffer(instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU));
+    ctx.flush_buffer(scene_ubos_[f_idx], 0, sizeof(SceneCelestialUBO));
 
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
@@ -229,6 +248,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     vkCmdBindVertexBuffers(cmd, 0, 1, &sphere_vbo_.handle, &offset);
     vkCmdBindIndexBuffer(cmd, sphere_ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, sphere_index_count_, count, 0, 0, 0);
+
+    terrain_.render(cmd, ctx, writes);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, point_pipeline_.handle);
     ctx.push_descriptors(cmd, point_pipeline_, writes);

@@ -6,6 +6,7 @@ struct BodyInstanceGPU {
     vec4 pole_oblateness;
     vec4 pole_color_lum;
     vec4 spin_flags;
+    uvec4 surface_flags;
 };
 
 layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
@@ -19,6 +20,7 @@ layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
     uint num_bodies;
     uint hdr_enabled;
     uint pad0;
+    mat4 projection;
 } u_scene;
 
 layout(std430, set = 0, binding = 1) readonly buffer BodyInstanceBuffer {
