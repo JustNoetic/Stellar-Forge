@@ -3,6 +3,7 @@
 #include "core/log.hpp"
 #include "core/math_utils.hpp"
 #include "core/path_utils.hpp"
+#include "core/time_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,20 @@ void topo_visit(int idx, const nlohmann::json& raw_arr,
         }
     }
     order.push_back(idx);
+}
+
+std::string current_utc_iso() {
+    auto now = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm gmt{};
+#ifdef _WIN32
+    gmtime_s(&gmt, &tt);
+#else
+    gmtime_r(&tt, &gmt);
+#endif
+    return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}Z",
+                       gmt.tm_year + 1900, gmt.tm_mon + 1, gmt.tm_mday,
+                       gmt.tm_hour, gmt.tm_min, gmt.tm_sec);
 }
 
 } // namespace
@@ -240,7 +255,8 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
     auto& state = loaded.definition;
     state.name = std::string(name);
     const auto& root = raw_arr[sorted_order.front()];
-    auto model = root.value("motion_model", name == "Ephemeris Mode" ? "spice" : "keplerian");
+    std::string default_model = (name == "Ephemeris Mode") ? "spice" : "keplerian";
+    auto model = root.value("motion_model", default_model);
     if (model == "spice") {
         state.motion_model = MotionModel::Spice;
     } else if (model == "n_body" || model == "nbody") {
@@ -250,7 +266,7 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
     } else {
         throw std::invalid_argument("Unknown motion model.");
     }
-    state.epoch_utc = root.value("epoch", "2000-01-01T12:00:00");
+    state.epoch_utc = root.value("epoch", "2026-10-17T12:00:00");
     state.bodies.reserve(sorted_order.size());
 
     for (int old_idx : sorted_order) {
@@ -375,9 +391,9 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["name"] = b.name;
         if (definition.motion_model == MotionModel::Spice) j["spice_id"] = b.spice_id;
         if (b.parent_idx < 0) {
-            std::string model_str = "keplerian";
+            std::string model_str = "n_body";
             if (definition.motion_model == MotionModel::Spice) model_str = "spice";
-            else if (definition.motion_model == MotionModel::NBody) model_str = "n_body";
+            else if (definition.motion_model == MotionModel::Keplerian) model_str = "keplerian";
             j["motion_model"] = model_str;
             j["epoch"] = definition.epoch_utc;
         }
@@ -468,8 +484,8 @@ bool SystemManager::create_new_system_from_props(
         {"x", 0.0}, {"y", 0.0}, {"z", 0.0},
         {"vx", 0.0}, {"vy", 0.0}, {"vz", 0.0}
     };
-    star_node["epoch"] = "2026-01-01T12:00:00";
-    star_node["motion_model"] = "keplerian";
+    star_node["epoch"] = "2026-10-17T12:00:00";
+    star_node["motion_model"] = "n_body";
 
     nlohmann::json arr = nlohmann::json::array();
     arr.push_back(std::move(star_node));
@@ -479,7 +495,132 @@ bool SystemManager::create_new_system_from_props(
     std::filesystem::create_directories(dir, ec);
 
     std::filesystem::path path = dir / "system.json";
-    return sf::paths::write_json(path, arr, 2);
+    bool ok_sys = sf::paths::write_json(path, arr, 2);
+    if (!ok_sys) return false;
+
+    nlohmann::json meta;
+    std::string now_iso = current_utc_iso();
+    meta["created"] = now_iso;
+    meta["modified"] = now_iso;
+    meta["body_count"] = 1;
+    meta["star"] = {
+        {"star_name", s_name},
+        {"mass", result.mass_msun},
+        {"spectral_class", result.spectral_class}
+    };
+    sf::paths::write_json(dir / "meta.json", meta, 2);
+    return true;
+}
+
+nlohmann::json SystemManager::serialize_snapshot_to_nbody(const SystemSnapshot& snapshot) {
+    auto arr = nlohmann::json::array();
+    const auto& def = snapshot.definition();
+    auto motions = snapshot.motions();
+    size_t count = snapshot.size();
+
+    auto dt = time::calculate_sim_date(def.epoch_utc, snapshot.time());
+    std::string epoch_iso = std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}",
+                                        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+
+    for (size_t i = 0; i < count; ++i) {
+        const auto& b = def.bodies[i];
+        auto j = b.source_json;
+        j["name"] = b.name;
+        j["type"] = b.type;
+        j["parentId"] = b.parent_id;
+        j["m"] = b.mass_msun;
+        j["r"] = b.radius_rsun;
+        j["oblateness"] = b.oblateness;
+        j["J2"] = b.j2;
+        j["j4"] = b.j4;
+        j["rotation_period"] = b.rotation_period_hr;
+        j["W0"] = b.w0_deg;
+        j["tidally_locked"] = b.tidally_locked;
+        j["lum_eq"] = b.lum_eq;
+        j["lum_pole"] = b.lum_pole;
+        j["color"] = rgb_to_hex(b.color_rgb);
+        j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+
+        if (b.parent_idx < 0) {
+            j["motion_model"] = "n_body";
+            j["epoch"] = epoch_iso;
+            j["sv"] = {
+                {"x", 0.0}, {"y", 0.0}, {"z", 0.0},
+                {"vx", 0.0}, {"vy", 0.0}, {"vz", 0.0}
+            };
+        } else {
+            int p_idx = b.parent_idx;
+            glm::dvec3 p_pos = motions[p_idx].position.value;
+            glm::dvec3 p_vel = motions[p_idx].velocity.value;
+            double p_mass = def.bodies[p_idx].mass_msun;
+
+            glm::dvec3 rel_p = motions[i].position.value - p_pos;
+            glm::dvec3 rel_v = motions[i].velocity.value - p_vel;
+
+            j["sv"] = {
+                {"x", rel_p.x}, {"y", rel_p.y}, {"z", rel_p.z},
+                {"vx", rel_v.x}, {"vy", rel_v.y}, {"vz", rel_v.z}
+            };
+
+            double mu = G_CONST * (p_mass + b.mass_msun);
+            auto el = sf::math::compute_keplerian_elements(rel_p, rel_v, mu);
+            if (el.a > 0.0) {
+                j["a"] = el.a;
+                j["e"] = el.e;
+                j["inc"] = el.inc_deg;
+                j["Omega"] = el.omega_node_deg;
+                j["omega"] = el.arg_peri_deg;
+                j["M"] = el.mean_anomaly_deg;
+            }
+        }
+
+        if (b.is_star) {
+            if (!j.contains("star_props") || !j["star_props"].is_object()) {
+                j["star_props"] = nlohmann::json::object();
+            }
+            j["star_props"]["class"] = b.spectral_class;
+            j["star_props"]["stage"] = b.stage;
+            j["star_props"]["temp"] = b.temp_k;
+            j["star_props"]["lum"] = b.lum_eq;
+            j["star_props"]["lum_eq"] = b.lum_eq;
+            j["star_props"]["lum_pole"] = b.lum_pole;
+            j["star_props"]["radius"] = b.radius_rsun;
+            j["star_props"]["mass"] = b.mass_msun;
+            j["star_props"]["oblateness"] = b.oblateness;
+        }
+
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+bool SystemManager::export_snapshot_to_nbody(std::string_view name, const SystemSnapshot& snapshot) const {
+    auto arr = serialize_snapshot_to_nbody(snapshot);
+    std::filesystem::path dir = sf::paths::external_path("data", "systems", name);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return false;
+
+    bool ok_sys = sf::paths::write_json(dir / "system.json", arr, 2);
+    if (!ok_sys) return false;
+
+    nlohmann::json meta;
+    std::string now_iso = current_utc_iso();
+    meta["created"] = now_iso;
+    meta["modified"] = now_iso;
+    meta["body_count"] = snapshot.size();
+
+    int star_idx = snapshot.star_index();
+    if (star_idx >= 0 && star_idx < static_cast<int>(snapshot.size())) {
+        const auto& star = snapshot.body(star_idx).definition;
+        meta["star"] = {
+            {"star_name", star.name},
+            {"mass", star.mass_msun},
+            {"spectral_class", star.spectral_class}
+        };
+    }
+    sf::paths::write_json(dir / "meta.json", meta, 2);
+    return true;
 }
 
 }

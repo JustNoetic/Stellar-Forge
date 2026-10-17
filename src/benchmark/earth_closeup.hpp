@@ -6,7 +6,7 @@
 
 namespace sf::benchmark {
 
-inline constexpr double ECLIPSE_FIXTURE_YEARS = 1.565;
+inline constexpr double ECLIPSE_FIXTURE_YEARS = 0.297293;
 
 inline Camera earth_closeup_camera(const ephemeris::SystemSnapshot& system, bool eclipse) {
     int earth = system.find_body("Earth");

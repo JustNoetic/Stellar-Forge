@@ -80,6 +80,7 @@ struct SystemDefinition {
     std::string name = "Solar System";
     MotionModel motion_model = MotionModel::Keplerian;
     std::string epoch_utc;
+    std::string custom_bsp_path;
     std::vector<BodyDefinition> bodies;
     std::unordered_map<std::string, int> name_to_idx;
     int star_idx = 0;
@@ -183,8 +184,10 @@ public:
     bool create_new_system_from_props(std::string_view system_name, std::string_view star_name,
                                       const physics::StarForgeResult& result,
                                       const physics::StarParameters& params) const;
+    bool export_snapshot_to_nbody(std::string_view name, const SystemSnapshot& snapshot) const;
     static LoadedSystem parse_system(const nlohmann::json& source, std::string_view name);
     static nlohmann::json serialize_definition(const SystemDefinition& definition);
+    static nlohmann::json serialize_snapshot_to_nbody(const SystemSnapshot& snapshot);
 };
 
 } // namespace sf::ephemeris

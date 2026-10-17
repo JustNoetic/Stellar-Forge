@@ -132,8 +132,10 @@ target_compile_definitions(StellarForge PRIVATE
     WIN32_LEAN_AND_MEAN
 )
 
+set(STELLAR_PLATFORM_LIBS ${CMAKE_DL_LIBS})
 if(WIN32)
     target_compile_definitions(StellarForge PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    list(APPEND STELLAR_PLATFORM_LIBS winhttp)
 endif()
 
 if(MINGW)
@@ -150,7 +152,7 @@ target_link_libraries(StellarForge PRIVATE
     glslang
     glslang-default-resource-limits
     SPIRV
-    ${CMAKE_DL_LIBS}
+    ${STELLAR_PLATFORM_LIBS}
 )
 
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
@@ -191,7 +193,7 @@ if(STELLAR_BUILD_TESTS)
     target_compile_definitions(StellarStateTests PRIVATE
         GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(StellarStateTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+    target_link_libraries(StellarStateTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${STELLAR_PLATFORM_LIBS})
     if(MINGW)
         target_link_options(StellarStateTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
@@ -218,12 +220,13 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/core/path_utils.cpp
+        src/core/time_utils.cpp
     )
     target_include_directories(StellarOrbitTests PRIVATE src)
     target_compile_definitions(StellarOrbitTests PRIVATE
         GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(StellarOrbitTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+    target_link_libraries(StellarOrbitTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${STELLAR_PLATFORM_LIBS})
     if(MINGW)
         target_link_options(StellarOrbitTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
@@ -239,12 +242,13 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/core/path_utils.cpp
+        src/core/time_utils.cpp
     )
     target_include_directories(StellarHierarchyTests PRIVATE src)
     target_compile_definitions(StellarHierarchyTests PRIVATE
         GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
     )
-    target_link_libraries(StellarHierarchyTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+    target_link_libraries(StellarHierarchyTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${STELLAR_PLATFORM_LIBS})
     if(MINGW)
         target_link_options(StellarHierarchyTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
@@ -281,6 +285,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/jacobi.cpp
         src/core/camera.cpp
         src/core/path_utils.cpp
+        src/core/time_utils.cpp
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
@@ -302,6 +307,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/jacobi.cpp
         src/core/camera.cpp
         src/core/path_utils.cpp
+        src/core/time_utils.cpp
         src/ephemeris/orbit_curves.cpp
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp

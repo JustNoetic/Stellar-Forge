@@ -64,6 +64,10 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
         std::string error;
         candidate.spice_ = SpiceEphemeris::open(error);
         if (!candidate.spice_) return {false, false, error};
+        if (!definition.custom_bsp_path.empty()) {
+            auto f_status = candidate.spice_->furnish_file(definition.custom_bsp_path);
+            if (!f_status) return f_status;
+        }
         auto status = candidate.spice_->epoch(definition.epoch_utc, candidate.epoch_et_);
         if (!status) return status;
         std::vector<BodyDefinition> available;

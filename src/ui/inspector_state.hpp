@@ -2,6 +2,7 @@
 
 #include "core/math_utils.hpp"
 #include "ephemeris/simulation.hpp"
+#include "ephemeris/spice_ephemeris.hpp"
 #include "physics/star_calc.hpp"
 #include <algorithm>
 #include <format>
@@ -240,6 +241,59 @@ struct DeleteBodyPrompt {
     std::string fallback_parent_name;
 };
 
+struct ExportNBodyDraft {
+    bool active = false;
+    std::string system_name;
+    bool switch_after_export = true;
+    std::string error;
+
+    void reset(std::string_view default_name) {
+        active = true;
+        system_name = std::string(default_name);
+        switch_after_export = true;
+        error.clear();
+    }
+};
+
+struct EphemerisSetupDraft {
+    bool active = false;
+    std::string external_bsp_path;
+    std::string inspected_external_path;
+    ephemeris::BspInspectResult external_preview{};
+    std::string error;
+
+    void reset() {
+        active = true;
+        external_bsp_path.clear();
+        inspected_external_path.clear();
+        external_preview = {};
+        error.clear();
+    }
+};
+
+struct BspImportDraft {
+    bool active = false;
+    bool refresh_needed = true;
+    std::vector<ephemeris::AvailableBspFile> available_files;
+    int selected_idx = 0;
+    std::string custom_path;
+    std::string inspected_path;
+    ephemeris::BspInspectResult preview{};
+    std::string status_msg;
+    std::string error;
+
+    void reset() {
+        active = true;
+        refresh_needed = true;
+        selected_idx = 0;
+        custom_path.clear();
+        inspected_path.clear();
+        preview = {};
+        status_msg.clear();
+        error.clear();
+    }
+};
+
 struct WorkspaceState {
     int inspected_body = -1;
     bool edit_mode = false;
@@ -251,6 +305,10 @@ struct WorkspaceState {
     CreateSystemDraft create_system{};
     bool confirm_delete_system = false;
     std::string delete_system_name;
+    ExportNBodyDraft export_nbody{};
+    EphemerisSetupDraft ephem_setup{};
+    BspImportDraft bsp_import{};
+    bool show_ephem_download_modal = false;
     std::string settings_error;
 
     bool has_selection() const noexcept { return inspected_body >= 0; }

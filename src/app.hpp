@@ -48,6 +48,14 @@ private:
     void render_delete_body_modal();
     void render_create_system_modal();
     void render_delete_system_modal();
+    void render_export_nbody_modal();
+    void render_ephem_setup_modal();
+    void render_ephem_download_modal();
+    void render_bsp_import_modal();
+    void open_export_nbody_modal();
+    void trigger_ephemeris_mode();
+    void apply_ephemeris_system();
+    void open_generic_bsp_playback(const std::filesystem::path& bsp_path);
     void delete_body_immediate(int body_idx);
 
     GLFWwindow* window_ = nullptr;
@@ -56,6 +64,7 @@ private:
     ui::WorkspaceSettings ui_settings_{};
 
     ephemeris::SystemManager sys_mgr_{};
+    ephemeris::SpiceKernelManager spice_mgr_{};
     ephemeris::SimulationRunner simulation_{};
     rendering::RenderSettingsStore render_settings_{};
     ui::WorkspaceState ui_state_{};

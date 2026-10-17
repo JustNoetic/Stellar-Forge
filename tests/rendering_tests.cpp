@@ -214,6 +214,7 @@ void earth_closeups(RenderProbe& probe, const std::filesystem::path& output) {
     for (bool eclipse : {false, true}) {
         ephemeris::Simulation simulation;
         check(simulation.replace_system(manager.load_system("Solar System")).accepted, "Earth fixture load");
+        check(simulation.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Keplerian}).accepted, "Earth Keplerian mode");
         if (eclipse) check(simulation.advance(units::Seconds{benchmark::ECLIPSE_FIXTURE_YEARS * SECONDS_PER_YEAR}).accepted, "Eclipse epoch");
         auto camera = benchmark::earth_closeup_camera(simulation.snapshot(), eclipse);
         camera.update(units::Seconds{1.0 / 60.0}, simulation.snapshot());

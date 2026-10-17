@@ -152,6 +152,10 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
 }
 
 void App::switch_system(std::string_view system_name) {
+    if (system_name == "Ephemeris Mode" && !self_test_ && !benchmark_.enabled) {
+        trigger_ephemeris_mode();
+        return;
+    }
     CommandResult result;
     try {
         result = simulation_.replace_system(sys_mgr_.load_system(system_name));
@@ -176,6 +180,113 @@ void App::switch_system(std::string_view system_name) {
     camera_.flight_speed_au_s = 0.2;
     camera_.has_prev_spin = false;
     camera_.origin_render = system().body(camera_.tracking_idx).render.position.value;
+}
+
+void App::trigger_ephemeris_mode() {
+    if (!spice_mgr_.settings_initialized()) {
+        ui_state_.ephem_setup.reset();
+        return;
+    }
+    if (!spice_mgr_.check_missing_kernels().empty()) {
+        ui_state_.show_ephem_download_modal = true;
+        spice_mgr_.start_download_missing();
+        return;
+    }
+    apply_ephemeris_system();
+}
+
+void App::apply_ephemeris_system() {
+    bool was_spice = (!system().empty() && system().definition().motion_model == ephemeris::MotionModel::Spice &&
+                      system().definition().custom_bsp_path.empty());
+    std::string prev_tracked_name;
+    std::string prev_inspected_name;
+    if (was_spice) {
+        if (camera_.tracking_idx >= 0 && static_cast<size_t>(camera_.tracking_idx) < system().size()) {
+            prev_tracked_name = system().body(camera_.tracking_idx).definition.name;
+        }
+        if (ui_state_.inspected_body >= 0 && static_cast<size_t>(ui_state_.inspected_body) < system().size()) {
+            prev_inspected_name = system().body(ui_state_.inspected_body).definition.name;
+        }
+    }
+
+    ephemeris::LoadedSystem tmpl{};
+    try {
+        if (sys_mgr_.system_exists("Ephemeris Mode")) {
+            tmpl = sys_mgr_.load_system("Ephemeris Mode");
+        } else {
+            tmpl = sys_mgr_.load_system(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
+        }
+    } catch (const std::exception& e) {
+        simulation_error_ = e.what();
+        return;
+    }
+
+    std::string err;
+    auto ephem_loaded = spice_mgr_.build_ephemeris_system(&tmpl.definition, tmpl.definition.epoch_utc, err);
+    if (ephem_loaded.definition.bodies.empty()) {
+        sf::log::error("Cannot build ephemeris system: {}", err);
+        simulation_error_ = err;
+        return;
+    }
+
+    auto result = simulation_.replace_system(std::move(ephem_loaded));
+    if (!result) {
+        sf::log::error("Cannot switch to ephemeris system: {}", result.error);
+        simulation_error_ = result.error;
+        return;
+    }
+    simulation_error_.clear();
+
+    if (was_spice) {
+        int trk = prev_tracked_name.empty() ? -1 : system().find_body(prev_tracked_name);
+        camera_.tracking_idx = (trk >= 0) ? trk : system().star_index();
+        int insp = prev_inspected_name.empty() ? -1 : system().find_body(prev_inspected_name);
+        ui_state_.inspected_body = (insp >= 0) ? insp : system().find_body("Earth");
+        if (ui_state_.inspected_body < 0) ui_state_.inspected_body = system().star_index();
+        camera_.origin_render = system().body(camera_.tracking_idx).render.position.value;
+    } else {
+        ui_state_ = {};
+        camera_.tracking_idx = system().star_index();
+        ui_state_.inspected_body = system().find_body("Earth");
+        if (ui_state_.inspected_body < 0) ui_state_.inspected_body = system().star_index();
+        camera_.cam_pos_rel = {0.0, 19.02, 40.78};
+        camera_.up = {0.0, 1.0, 0.0};
+        camera_.cam_look_aim = true;
+        camera_.flight_speed_au_s = 0.2;
+        camera_.has_prev_spin = false;
+        camera_.origin_render = system().body(camera_.tracking_idx).render.position.value;
+    }
+}
+
+void App::open_generic_bsp_playback(const std::filesystem::path& bsp_path) {
+    std::string err;
+    auto loaded = spice_mgr_.build_generic_bsp_system(bsp_path, err);
+    if (loaded.definition.bodies.empty()) {
+        simulation_error_ = err;
+        ui_state_.bsp_import.error = err;
+        return;
+    }
+    auto result = simulation_.replace_system(std::move(loaded));
+    if (!result) {
+        simulation_error_ = result.error;
+        ui_state_.bsp_import.error = result.error;
+        return;
+    }
+    simulation_error_.clear();
+    ui_state_ = {};
+
+    int focus_idx = 0;
+    for (size_t i = 0; i < system().size(); ++i) {
+        if (system().body(i).definition.is_spacecraft) {
+            focus_idx = static_cast<int>(i);
+            break;
+        }
+        if (!system().body(i).definition.is_star && focus_idx == 0) {
+            focus_idx = static_cast<int>(i);
+        }
+    }
+    ui_state_.inspected_body = focus_idx;
+    camera_.focus_body(focus_idx, system(), true, false);
 }
 
 void App::run() {
@@ -577,6 +688,11 @@ void App::render_outliner_node(int body_idx) {
 }
 
 void App::render_ui() {
+    if (spice_mgr_.consume_download_completed()) {
+        ui_state_.show_ephem_download_modal = false;
+        apply_ephemeris_system();
+    }
+
     auto render_draft = render_settings_.values();
 
     render_main_menu_bar(render_draft);
@@ -589,6 +705,10 @@ void App::render_ui() {
     render_delete_body_modal();
     render_create_system_modal();
     render_delete_system_modal();
+    render_export_nbody_modal();
+    render_ephem_setup_modal();
+    render_ephem_download_modal();
+    render_bsp_import_modal();
 
     if (pending_delete_body_ >= 0) {
         delete_body_immediate(pending_delete_body_);
@@ -613,8 +733,15 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         if (ImGui::MenuItem("+ Create New System...")) {
             ui_state_.create_system.reset();
         }
+        if (ImGui::MenuItem("Export to N-Body System...")) {
+            open_export_nbody_modal();
+        }
+        if (ImGui::MenuItem("Import Ephemeris Kernel (.bsp)...")) {
+            ui_state_.bsp_import.reset();
+        }
         bool can_delete_sys = (system().name() != ephemeris::SystemManager::SOLAR_SYSTEM_NAME &&
-                               system().name() != "Ephemeris Mode");
+                               system().name() != "Ephemeris Mode" &&
+                               !system().name().starts_with("Ephemeris: "));
         if (can_delete_sys) {
             ImGui::Separator();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
@@ -664,11 +791,32 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
             if (!result) simulation_error_ = result.error;
             else simulation_error_.clear();
         }
-        bool can_spice = (system().name() == ephemeris::SystemManager::SOLAR_SYSTEM_NAME || current_mode == ephemeris::MotionModel::Spice);
+        bool can_spice = (system().name() == ephemeris::SystemManager::SOLAR_SYSTEM_NAME ||
+                          system().name() == "Ephemeris Mode" ||
+                          current_mode == ephemeris::MotionModel::Spice);
         if (ImGui::MenuItem("NASA SPICE Ephemeris Playback", nullptr, current_mode == ephemeris::MotionModel::Spice, can_spice)) {
-            auto result = simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Spice});
-            if (!result) simulation_error_ = result.error;
-            else simulation_error_.clear();
+            if (current_mode != ephemeris::MotionModel::Spice) {
+                trigger_ephemeris_mode();
+            }
+        }
+        if (ImGui::MenuItem("SPICE Ephemeris Kernel Settings...")) {
+            ui_state_.ephem_setup.reset();
+        }
+        ImGui::Separator();
+        const char* export_physics_label = (current_mode == ephemeris::MotionModel::Spice)
+            ? "Export Ephemeris to N-Body System..."
+            : "Export Current State to N-Body System...";
+        if (ImGui::MenuItem(export_physics_label)) {
+            open_export_nbody_modal();
+        }
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Tools")) {
+        if (ImGui::MenuItem("Import Ephemeris Kernel (.bsp)...")) {
+            ui_state_.bsp_import.reset();
+        }
+        if (ImGui::MenuItem("SPICE Ephemeris Kernel Settings...")) {
+            ui_state_.ephem_setup.reset();
         }
         ImGui::EndMenu();
     }
@@ -1520,8 +1668,18 @@ void App::render_time_hud(rendering::RenderSettings& render_draft) {
     ImGui::SameLine(0.0f, 10.0f * layout.scale);
     const char* hud_mode = "Keplerian";
     if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
-    else if (system().definition().motion_model == ephemeris::MotionModel::NBody) hud_mode = "N-Body";
     ImGui::TextDisabled("| %s", hud_mode);
+
+    ImGui::SameLine(0.0f, 6.0f * layout.scale);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.35f, 0.50f, 0.8f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.45f, 0.65f, 1.0f));
+    if (ImGui::SmallButton("Export to N-Body")) {
+        open_export_nbody_modal();
+    }
+    ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Export current positions & velocities as a new N-Body system");
+    }
 
     ImGui::SameLine(0.0f, 10.0f * layout.scale);
     ImGui::TextDisabled("| %s", camera_.movement_mode == 0 ? "Free Flight" : "Simple Orbit");
@@ -1903,4 +2061,524 @@ void App::render_delete_system_modal() {
     }
 }
 
+void App::open_export_nbody_modal() {
+    auto dt = time::calculate_sim_date(system().definition().epoch_utc, system().time());
+    std::string default_name = std::format("{} ({:04d}-{:02d}-{:02d})", system().name(), dt.year, dt.month, dt.day);
+    ui_state_.export_nbody.reset(default_name);
+}
+
+void App::render_export_nbody_modal() {
+    if (!ui_state_.export_nbody.active) return;
+
+    ImGui::SetNextWindowSize(ImVec2(480.0f, 290.0f), ImGuiCond_Always);
+    ImGui::OpenPopup("Export to N-Body System?###export_nbody_modal");
+    if (ImGui::BeginPopupModal("Export to N-Body System?###export_nbody_modal", &ui_state_.export_nbody.active, ImGuiWindowFlags_NoResize)) {
+        auto& ed = ui_state_.export_nbody;
+
+        ui::heading("Export to N-Body System", "Save current positions & velocities into a standalone N-Body system.");
+
+        const char* current_mode_str = "Analytical Keplerian";
+        if (system().definition().motion_model == ephemeris::MotionModel::Spice) {
+            current_mode_str = "NASA SPICE Ephemeris Playback";
+        } else if (system().definition().motion_model == ephemeris::MotionModel::NBody) {
+            current_mode_str = "IAS15 N-Body Integrator";
+        }
+
+        std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time());
+        ImGui::Text("Source: %s", current_mode_str);
+        ImGui::Text("Sim Epoch: %s", date_str.c_str());
+        ImGui::TextDisabled("Target Motion Model: N-Body (IAS15 Integrator)");
+        ImGui::Spacing();
+
+        ui::field("System Name", [&](const char* id) {
+            char buf[128];
+            std::strncpy(buf, ed.system_name.c_str(), sizeof(buf));
+            buf[sizeof(buf) - 1] = '\0';
+            if (ImGui::InputText(id, buf, sizeof(buf))) {
+                ed.system_name = buf;
+            }
+        });
+
+        ImGui::Checkbox("Switch to new system after export", &ed.switch_after_export);
+
+        if (!ed.error.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", ed.error.c_str());
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float half_w = (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.43f, 1.0f));
+        if (ImGui::Button("Export System", ImVec2(half_w, 32.0f))) {
+            if (ed.system_name.empty()) {
+                ed.error = "System name cannot be empty.";
+            } else if (ed.system_name == ephemeris::SystemManager::SOLAR_SYSTEM_NAME ||
+                       ed.system_name == "Ephemeris Mode" ||
+                       sys_mgr_.system_exists(ed.system_name)) {
+                ed.error = "A system with this name already exists.";
+            } else {
+                bool ok = sys_mgr_.export_snapshot_to_nbody(ed.system_name, system());
+                if (!ok) {
+                    ed.error = "Failed to export system to disk.";
+                } else {
+                    system_names_ = sys_mgr_.list_systems();
+                    std::string new_sys_name = ed.system_name;
+                    bool do_switch = ed.switch_after_export;
+                    ed.active = false;
+                    ImGui::CloseCurrentPopup();
+                    if (do_switch) {
+                        switch_system(new_sys_name);
+                    }
+                }
+            }
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 10.0f);
+        if (ImGui::Button("Cancel", ImVec2(half_w, 32.0f))) {
+            ed.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+namespace {
+
+std::filesystem::path resolve_user_bsp_path(std::string_view raw_input) {
+    std::string trimmed(raw_input);
+    while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t' || trimmed.front() == '"' || trimmed.front() == '\'')) {
+        trimmed.erase(trimmed.begin());
+    }
+    while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\t' || trimmed.back() == '"' || trimmed.back() == '\'')) {
+        trimmed.pop_back();
+    }
+    if (trimmed.empty()) return {};
+    std::filesystem::path p(trimmed);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(p, ec)) return p;
+    std::filesystem::path rel = sf::paths::project_root() / p;
+    if (std::filesystem::is_regular_file(rel, ec)) return rel;
+    return p;
+}
+
+ephemeris::BspInspectResult inspect_bsp_file(const std::filesystem::path& bsp_path) {
+    std::string err;
+    auto sp = ephemeris::SpiceEphemeris::open(err);
+    if (!sp) {
+        ephemeris::BspInspectResult res;
+        res.error = "SPICE runtime unavailable: " + err;
+        return res;
+    }
+    return sp->inspect_bsp(bsp_path);
+}
+
+} // namespace
+
+void App::render_ephem_setup_modal() {
+    if (!ui_state_.ephem_setup.active) return;
+
+    ImGui::SetNextWindowSize(ImVec2(680.0f, 650.0f), ImGuiCond_FirstUseEver);
+    ImGui::OpenPopup("Ephemeris Setup###ephem_setup_modal");
+    if (ImGui::BeginPopupModal("Ephemeris Setup###ephem_setup_modal", &ui_state_.ephem_setup.active)) {
+        auto& draft = ui_state_.ephem_setup;
+        bool in_spice_mode = (!system().empty() &&
+                              system().definition().motion_model == ephemeris::MotionModel::Spice &&
+                              system().definition().custom_bsp_path.empty());
+
+        ui::heading("SPICE Ephemeris Kernel Configuration",
+                    "Configure NASA NAIF default kernels and custom .bsp trajectories for Ephemeris Mode.");
+
+        const auto& defaults = ephemeris::SpiceEphemeris::default_kernels();
+
+        if (ImGui::BeginChild("ephem_kernels_scroll", ImVec2(0.0f, -195.0f), true)) {
+            struct GroupSpec {
+                const char* key;
+                const char* title;
+            };
+            static constexpr GroupSpec kGroups[] = {
+                {"Core", "Core Ephemeris (Essential)"},
+                {"Planetary", "Planetary Moons (Essential)"},
+                {"Inner Moons", "Inner Planet Moons (Optional)"},
+                {"Jupiter Moons", "Jupiter Moons (Optional)"},
+                {"Saturn Moons", "Saturn Moons (Optional)"},
+                {"Uranus Moons", "Uranus Moons (Optional)"},
+                {"Neptune Moons", "Neptune Moons (Optional)"},
+            };
+
+            for (const auto& grp : kGroups) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
+                ImGui::TextUnformatted(grp.title);
+                ImGui::PopStyleColor();
+                ImGui::Separator();
+
+                for (const auto& k : defaults) {
+                    if (k.group != grp.key) continue;
+                    bool enabled = spice_mgr_.is_kernel_enabled(k.filename);
+                    bool downloaded = !spice_mgr_.find_kernel_path(k.filename).empty();
+                    std::string chk_id = "##def_chk_" + k.filename;
+                    if (ImGui::Checkbox(chk_id.c_str(), &enabled)) {
+                        spice_mgr_.set_kernel_enabled(k.filename, enabled);
+                        if (in_spice_mode && (downloaded || !enabled)) {
+                            apply_ephemeris_system();
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::Text("%s - %s", k.filename.c_str(), k.description.c_str());
+                    ImGui::SameLine();
+                    if (downloaded) {
+                        ImGui::TextColored(ImVec4(0.4f, 0.88f, 0.45f, 1.0f), "[Downloaded]");
+                    } else {
+                        ImGui::TextDisabled("[Not Downloaded]");
+                    }
+                }
+                ImGui::Spacing();
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
+            ImGui::TextUnformatted("Additional Custom Kernels (data/kernels/additional/)");
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+
+            auto add_kernels = spice_mgr_.list_additional_kernels();
+            if (add_kernels.empty()) {
+                ImGui::TextDisabled("No custom .bsp files in data/kernels/additional/.");
+            } else {
+                for (const auto& ak : add_kernels) {
+                    bool enabled = ak.enabled;
+                    std::string chk_id = "##add_chk_" + ak.name;
+                    if (ImGui::Checkbox(chk_id.c_str(), &enabled)) {
+                        spice_mgr_.set_kernel_enabled(ak.name, enabled);
+                        if (in_spice_mode) {
+                            apply_ephemeris_system();
+                        }
+                    }
+                    ImGui::SameLine();
+                    ImGui::Text("%s (%.1f KB)", ak.name.c_str(), ak.size_kb);
+                    ImGui::SameLine();
+                    std::string preview_btn = "Preview##prev_" + ak.name;
+                    if (ImGui::SmallButton(preview_btn.c_str())) {
+                        draft.external_bsp_path = ak.path.string();
+                    }
+                }
+            }
+            ImGui::EndChild();
+        }
+
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.78f, 0.95f, 1.0f));
+        ImGui::TextUnformatted("Import / Preview External .bsp Kernel");
+        ImGui::PopStyleColor();
+
+        float avail_w = ImGui::GetContentRegionAvail().x;
+        float btn_import_w = 135.0f;
+        ImGui::SetNextItemWidth(avail_w - btn_import_w - 8.0f);
+        char path_buf[512];
+        std::strncpy(path_buf, draft.external_bsp_path.c_str(), sizeof(path_buf));
+        path_buf[sizeof(path_buf) - 1] = '\0';
+        if (ImGui::InputTextWithHint("##ephem_import_path", "Path to .bsp file...", path_buf, sizeof(path_buf))) {
+            draft.external_bsp_path = path_buf;
+        }
+        ImGui::SameLine(0.0f, 8.0f);
+        if (ImGui::Button("Import & Enable", ImVec2(btn_import_w, 0.0f))) {
+            auto resolved = resolve_user_bsp_path(draft.external_bsp_path);
+            std::string err;
+            if (spice_mgr_.add_additional_kernel(resolved, err)) {
+                draft.error.clear();
+                if (in_spice_mode) {
+                    apply_ephemeris_system();
+                }
+            } else {
+                draft.error = err;
+            }
+        }
+
+        if (draft.external_bsp_path != draft.inspected_external_path) {
+            draft.inspected_external_path = draft.external_bsp_path;
+            draft.external_preview = {};
+            draft.error.clear();
+            if (!draft.external_bsp_path.empty()) {
+                auto resolved = resolve_user_bsp_path(draft.external_bsp_path);
+                draft.external_preview = inspect_bsp_file(resolved);
+                if (!draft.external_preview.valid) {
+                    draft.error = draft.external_preview.error;
+                }
+            }
+        }
+
+        if (ImGui::BeginChild("ephem_setup_preview", ImVec2(0.0f, 68.0f), true)) {
+            if (!draft.error.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", draft.error.c_str());
+            } else if (draft.external_preview.valid) {
+                for (const auto& b : draft.external_preview.bodies) {
+                    const char* kind = (b.id < 0) ? "Spacecraft" : ((b.id == 10) ? "Star" : "Body");
+                    ImGui::Text("%s (NAIF %d) [%s]:  %s  ->  %s",
+                                b.name.c_str(), b.id, kind, b.utc_start.c_str(), b.utc_end.c_str());
+                }
+            } else {
+                ImGui::TextDisabled("Select 'Preview' on an additional kernel or enter a .bsp path above to inspect segments.");
+            }
+            ImGui::EndChild();
+        }
+
+        int enabled_count = 0;
+        int missing_count = static_cast<int>(spice_mgr_.check_missing_kernels().size());
+        for (const auto& k : defaults) {
+            if (spice_mgr_.is_kernel_enabled(k.filename)) {
+                ++enabled_count;
+            }
+        }
+        ImGui::TextDisabled("Enabled Default Kernels: %d / %zu   |   Missing to Download: %d",
+                            enabled_count, defaults.size(), missing_count);
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float third_w = (ImGui::GetContentRegionAvail().x - 16.0f) / 3.0f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.43f, 1.0f));
+        if (ImGui::Button("Save & Launch Ephemeris", ImVec2(third_w, 32.0f))) {
+            spice_mgr_.save_settings();
+            draft.active = false;
+            ImGui::CloseCurrentPopup();
+            trigger_ephemeris_mode();
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 8.0f);
+        if (ImGui::Button("Save & Close", ImVec2(third_w, 32.0f))) {
+            spice_mgr_.save_settings();
+            draft.active = false;
+            ImGui::CloseCurrentPopup();
+            if (in_spice_mode) {
+                trigger_ephemeris_mode();
+            }
+        }
+
+        ImGui::SameLine(0.0f, 8.0f);
+        if (ImGui::Button("Cancel", ImVec2(third_w, 32.0f))) {
+            draft.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::render_ephem_download_modal() {
+    if (!ui_state_.show_ephem_download_modal) return;
+
+    ImGui::SetNextWindowSize(ImVec2(500.0f, 250.0f), ImGuiCond_Always);
+    ImGui::OpenPopup("Downloading SPICE Ephemeris Data###ephem_download_modal");
+    if (ImGui::BeginPopupModal("Downloading SPICE Ephemeris Data###ephem_download_modal", nullptr, ImGuiWindowFlags_NoResize)) {
+        auto dl = spice_mgr_.download_snapshot();
+
+        ui::heading("Downloading NASA NAIF SPICE Kernels",
+                    "Fetching missing ephemeris kernels into data/kernels/default/...");
+
+        ImGui::Text("Status: %s", dl.status_text.empty() ? "Preparing..." : dl.status_text.c_str());
+        ImGui::ProgressBar(std::clamp(dl.progress, 0.0f, 1.0f), ImVec2(-1.0f, 24.0f));
+
+        double cur_mb = static_cast<double>(dl.bytes_current) / (1024.0 * 1024.0);
+        double tot_mb = static_cast<double>(dl.bytes_total) / (1024.0 * 1024.0);
+        ImGui::TextDisabled("Current File: %.2f / %.2f MB   |   Speed: %s",
+                            cur_mb, tot_mb, dl.speed_str.empty() ? "---" : dl.speed_str.c_str());
+
+        ImGui::Spacing();
+        if (!dl.error.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", dl.error.c_str());
+            ImGui::Spacing();
+            float half_w = (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f;
+            if (ImGui::Button("Retry Download", ImVec2(half_w, 30.0f))) {
+                spice_mgr_.clear_download_error();
+                spice_mgr_.start_download_missing();
+            }
+            ImGui::SameLine(0.0f, 10.0f);
+            if (ImGui::Button("Close", ImVec2(half_w, 30.0f))) {
+                ui_state_.show_ephem_download_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            ImGui::Separator();
+            ImGui::Spacing();
+            if (ImGui::Button("Cancel Download", ImVec2(-1.0f, 30.0f))) {
+                spice_mgr_.cancel_download();
+                ui_state_.show_ephem_download_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::render_bsp_import_modal() {
+    if (!ui_state_.bsp_import.active) return;
+
+    ImGui::SetNextWindowSize(ImVec2(660.0f, 520.0f), ImGuiCond_FirstUseEver);
+    ImGui::OpenPopup("Import Ephemeris Kernel (.bsp)###bsp_import_modal");
+    if (ImGui::BeginPopupModal("Import Ephemeris Kernel (.bsp)###bsp_import_modal", &ui_state_.bsp_import.active)) {
+        auto& bd = ui_state_.bsp_import;
+
+        ui::heading("Import & Preview SPICE Kernel (.bsp)",
+                    "Inspect DAF/SPK segments and launch standalone trajectory playback or install to Additional Kernels.");
+
+        auto avail_files = spice_mgr_.list_available_bsp_files();
+        if (bd.custom_path.empty() && !avail_files.empty()) {
+            bd.custom_path = avail_files.front().path.string();
+        }
+
+        ui::field("Quick Select (.bsp)", [&](const char* id) {
+            std::string current_label = "Select discovered .bsp kernel...";
+            for (const auto& f : avail_files) {
+                if (f.path.string() == bd.custom_path) {
+                    current_label = std::format("[{}] {} ({:.0f} KB)", f.category, f.name, f.size_kb);
+                    break;
+                }
+            }
+            if (ImGui::BeginCombo(id, current_label.c_str())) {
+                for (const auto& f : avail_files) {
+                    bool selected = (f.path.string() == bd.custom_path);
+                    std::string item_label = std::format("[{}] {} ({:.0f} KB)", f.category, f.name, f.size_kb);
+                    if (ImGui::Selectable(item_label.c_str(), selected)) {
+                        bd.custom_path = f.path.string();
+                        bd.error.clear();
+                        bd.status_msg.clear();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        });
+
+        ui::field("Kernel File Path", [&](const char* id) {
+            char buf[512];
+            std::strncpy(buf, bd.custom_path.c_str(), sizeof(buf));
+            buf[sizeof(buf) - 1] = '\0';
+            if (ImGui::InputTextWithHint(id, "Enter or paste path to .bsp file...", buf, sizeof(buf))) {
+                bd.custom_path = buf;
+                bd.error.clear();
+                bd.status_msg.clear();
+            }
+        });
+
+        if (bd.custom_path != bd.inspected_path) {
+            bd.inspected_path = bd.custom_path;
+            bd.preview = {};
+            if (!bd.custom_path.empty()) {
+                auto resolved = resolve_user_bsp_path(bd.custom_path);
+                bd.preview = inspect_bsp_file(resolved);
+            }
+        }
+
+        ImGui::Spacing();
+        if (bd.preview.valid) {
+            ImGui::Text("Discovered Segments: %zu bodies/spacecraft   |   Window: %s -> %s (%.1f days)",
+                        bd.preview.bodies.size(),
+                        bd.preview.utc_min.c_str(),
+                        bd.preview.utc_max.c_str(),
+                        bd.preview.duration_days);
+            if (!bd.preview.sidecar.is_null() && !bd.preview.sidecar.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.45f, 1.0f), "[Sidecar Metadata JSON Detected]");
+            }
+        } else {
+            ImGui::TextDisabled("Kernel Preview");
+        }
+
+        if (ImGui::BeginChild("bsp_import_preview_box", ImVec2(0.0f, -85.0f), true)) {
+            if (!bd.preview.error.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", bd.preview.error.c_str());
+            } else if (bd.preview.valid) {
+                if (ImGui::BeginTable("bsp_segments_tbl", 4,
+                                      ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
+                    ImGui::TableSetupColumn("Object Name", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+                    ImGui::TableSetupColumn("NAIF ID", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                    ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 95.0f);
+                    ImGui::TableSetupColumn("Coverage Window (UTC)", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+                    ImGui::TableHeadersRow();
+
+                    for (const auto& b : bd.preview.bodies) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(b.name.c_str());
+
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%d", b.id);
+
+                        ImGui::TableSetColumnIndex(2);
+                        if (b.id < 0) {
+                            ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "Spacecraft");
+                        } else if (b.id == 10) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Star");
+                        } else {
+                            ImGui::TextUnformatted("Planet/Moon");
+                        }
+
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::Text("%s  ->  %s", b.utc_start.c_str(), b.utc_end.c_str());
+                    }
+                    ImGui::EndTable();
+                }
+            } else {
+                ImGui::TextDisabled("Select or enter a valid .bsp file path to preview its SPK ephemeris segments.");
+            }
+            ImGui::EndChild();
+        }
+
+        if (!bd.error.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", bd.error.c_str());
+        } else if (!bd.status_msg.empty()) {
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.45f, 1.0f), "%s", bd.status_msg.c_str());
+        }
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        bool can_act = bd.preview.valid && !bd.preview.bodies.empty();
+        float third_w = (ImGui::GetContentRegionAvail().x - 16.0f) / 3.0f;
+
+        ImGui::BeginDisabled(!can_act);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.43f, 1.0f));
+        if (ImGui::Button("Open Ephemeris Playback", ImVec2(third_w, 32.0f))) {
+            auto resolved = resolve_user_bsp_path(bd.custom_path);
+            open_generic_bsp_playback(resolved);
+            if (ui_state_.bsp_import.error.empty()) {
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 8.0f);
+        if (ImGui::Button("Install to Additional", ImVec2(third_w, 32.0f))) {
+            auto resolved = resolve_user_bsp_path(bd.custom_path);
+            std::string err;
+            if (!spice_mgr_.add_additional_kernel(resolved, err)) {
+                bd.error = err;
+                bd.status_msg.clear();
+            } else {
+                bd.error.clear();
+                bd.status_msg = "Installed and enabled in data/kernels/additional/.";
+                if (!system().empty() &&
+                    system().definition().motion_model == ephemeris::MotionModel::Spice &&
+                    system().definition().custom_bsp_path.empty()) {
+                    apply_ephemeris_system();
+                }
+            }
+        }
+        ImGui::EndDisabled();
+
+        ImGui::SameLine(0.0f, 8.0f);
+        if (ImGui::Button("Cancel", ImVec2(third_w, 32.0f))) {
+            bd.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
 } // namespace sf
+
