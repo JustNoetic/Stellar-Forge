@@ -12,9 +12,16 @@ size_t GeometryKeyHash::operator()(const GeometryKey& key) const noexcept {
     combine(key.generation);
     combine(key.geometry_revision);
     combine(key.body);
+    combine(key.source.identity);
+    combine(key.source.revision);
     combine(std::bit_cast<uint64_t>(key.polar_ratio));
     combine(std::bit_cast<uint64_t>(key.height_amplitude == 0.0 ? 0.0 : key.height_amplitude));
     return size_t(hash);
+}
+
+int32_t GeometryResidency::find(const GeometryKey& key) const {
+    auto found = entries_.find(key);
+    return found == entries_.end() ? -1 : int32_t(found->second.slot);
 }
 
 CachePlan GeometryResidency::request(std::span<const GeometryKey> keys, uint32_t bake_budget) {
@@ -50,6 +57,7 @@ CachePlan GeometryResidency::request(std::span<const GeometryKey> keys, uint32_t
         entries_.emplace(keys[i], Entry{slot, frame_, ages_.begin()});
         plan.slots[i] = int32_t(slot);
         plan.bakes.push_back({i, slot});
+        ++revision_;
     }
     return plan;
 }

@@ -959,9 +959,11 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ui::field("Orbit Opacity##orb_op", [&](const char* id) {
                 ImGui::SliderFloat(id, &render_draft.orbit_opacity, 0.0f, 1.0f, "%.2f");
             });
-            ui::section("Terrain preview", "Synthetic relief on solid bodies");
-            ImGui::Checkbox("Terrain LOD", &render_draft.terrain_enabled);
-            ImGui::BeginDisabled(!render_draft.terrain_enabled);
+            ui::section("Planet Surfaces", "Imported maps and optional synthetic relief");
+            ImGui::Checkbox("Surface Textures", &render_draft.surface_textures_enabled);
+            ImGui::Checkbox("Imported Elevation", &render_draft.terrain_imported_enabled);
+            ImGui::Checkbox("Synthetic Terrain Preview", &render_draft.terrain_enabled);
+            ImGui::BeginDisabled(!render_draft.terrain_enabled && !render_draft.terrain_imported_enabled);
             ImGui::Checkbox("Terrain Tile Colors", &render_draft.terrain_debug_tiles);
             ImGui::Checkbox("FP64 Terrain Reference", &render_draft.terrain_reference_fp64);
             ui::field("Terrain Error##terrain_error", [&](const char* id) {
@@ -981,6 +983,9 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ui::value_row("Geometry Cache", std::format("{} cached / {} reference", terrain.cached_patches, terrain.reference_patches));
             ui::value_row("Geometry Bakes", std::format("{} / {} per frame", terrain.cache_bakes, terrain::MAX_GEOMETRY_BAKES));
             if (terrain.budget_limited) ImGui::TextDisabled("Patch budget reached; using coarser terrain.");
+            const auto& textures = celestial_renderer_.texture_stats();
+            ui::value_row("Surface Maps", std::format("{} bodies / {} resident tiles", textures.sources, textures.resident));
+            ui::value_row("Texture Streaming", std::format("{} uploads / {} waiting", textures.uploads, textures.pending));
         } else if (section_idx == 2) {
             const char* modes[] = {"Free Flight", "Simple Orbit"};
             int cur_mode = camera_.movement_mode;

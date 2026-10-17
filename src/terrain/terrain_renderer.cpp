@@ -1,16 +1,40 @@
 #include "terrain/terrain_renderer.hpp"
 #include "rhi/shader_cache.hpp"
+#include "core/path_utils.hpp"
+#include "core/log.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <unordered_set>
 
 namespace sf::terrain {
+
+namespace {
+
+class SelectionSource final : public TerrainSource {
+public:
+    SelectionSource(const HeightSource& source, std::unordered_map<uint64_t, SurfaceTile>& cache) : source_(source), cache_(cache) {}
+    SourceDomain domain() const noexcept override { return source_.domain(); }
+    SurfaceTile describe(TileId tile, double polar, double amplitude) const override {
+        if (auto entry = cache_.find(tile.key()); entry != cache_.end()) return entry->second;
+        auto value = source_.describe(tile, polar, amplitude);
+        if (cache_.size() == MAX_SOURCE_RECORDS) cache_.clear();
+        cache_.emplace(tile.key(), value);
+        return value;
+    }
+
+private:
+    const HeightSource& source_;
+    std::unordered_map<uint64_t, SurfaceTile>& cache_;
+};
+
+}
 
 static_assert(sizeof(PatchGPU) == 352);
 static_assert(offsetof(PatchGPU, address) == 192);
 static_assert(sizeof(CachedPatchGPU) == 128);
 
-void TerrainRenderer::init(rhi::VkContext& ctx) {
+void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
     std::vector<uint32_t> indices;
     for (uint32_t mask = 0; mask < 16; ++mask) {
         auto grid = grid_indices(mask);
@@ -30,6 +54,8 @@ void TerrainRenderer::init(rhi::VkContext& ctx) {
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     desc.vert_path = "terrain/terrain.vert";
@@ -40,9 +66,17 @@ void TerrainRenderer::init(rhi::VkContext& ctx) {
     desc.macros = {{"TERRAIN_SURFACE", "1"}, {"TERRAIN_CACHED_FP64", "1"}};
     cached_fp64_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     cache_.init(ctx);
+    auto config_path = paths::external_path("data", "terrain.json");
+    if (load_config && std::filesystem::exists(config_path)) {
+        auto config = paths::read_json(config_path);
+        if (!config) throw std::runtime_error("Cannot read data/terrain.json");
+        set_height_source(config->at("body").get<std::string>(),
+            HeightSource::open(paths::external_path(config->at("dataset").get<std::string>())));
+    }
 }
 
 void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
+    stream_.reset();
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, precise_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, reference_pipeline_);
@@ -54,6 +88,24 @@ void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
     ctx.destroy_buffer(indices_);
 }
 
+void TerrainRenderer::set_height_source(std::string body, std::shared_ptr<const HeightSource> source) {
+    if (stream_ && source && body == source_body_ && stream_->source().domain() == source->domain()) return;
+    stream_.reset();
+    source_body_ = std::move(body);
+    reported_error_.clear();
+    if (source) {
+        log::info("Terrain source '{}' bound to '{}' (identity {}, revision {})", source->info().name, source_body_,
+                  source->domain().identity, source->domain().revision);
+        stream_ = std::make_unique<HeightStream>(std::move(source));
+    }
+    selections_.clear();
+}
+
+float TerrainRenderer::relief_extent_au(uint32_t body) const noexcept {
+    for (const auto& [index, extent] : relief_extents_) if (index == body) return extent;
+    return 0.0f;
+}
+
 bool TerrainRenderer::covers(uint32_t body) const noexcept {
     return std::find(bodies_.begin(), bodies_.end(), body) != bodies_.end();
 }
@@ -62,8 +114,15 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                               const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count) {
     prepared_.clear();
     bodies_.clear();
+    relief_extents_.clear();
     stats_ = {};
-    if (!settings.terrain_enabled) return;
+    if (selection_generation_ != system.generation()) {
+        selections_.clear();
+        selection_generation_ = system.generation();
+    }
+    if (!settings.terrain_enabled && (!settings.terrain_imported_enabled || !stream_)) return;
+    std::vector<GeometryKey> retained_keys;
+    std::vector<std::shared_ptr<const HeightGeometry>> retained_heights;
     double tan_y = std::tan(camera.fov_deg * DEG_TO_RAD * 0.5);
     double focal = std::max(1u, extent.height) / (2.0 * tan_y);
     auto eye = camera.eye_pos_render();
@@ -74,6 +133,10 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         if (body.definition.is_star || body.definition.is_black_hole || body.definition.is_spacecraft) continue;
         if (body.definition.type == "Gas Giant" || body.definition.type == "Ice Giant") continue;
         double radius = body.definition.radius_au();
+        const HeightSource* source = settings.terrain_imported_enabled && stream_ && body.definition.name == source_body_ ? &stream_->source() : nullptr;
+        if (!source && !settings.terrain_enabled) continue;
+        if (source && !source->compatible(radius * AU_TO_KM * 1000.0,
+                                          std::clamp(1.0-body.definition.oblateness, .05, 1.0))) continue;
         double distance = glm::length(camera_relative(body.render.position, eye));
         double projected = radius * focal / std::max(distance, 1e-15);
         if (radius > 0.0 && projected >= 8.0) candidates.emplace_back(-projected, i);
@@ -87,6 +150,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         }
         const auto& body = system.body(i);
         double radius = body.definition.radius_au();
+        const HeightSource* source = settings.terrain_imported_enabled && stream_ && body.definition.name == source_body_ ? &stream_->source() : nullptr;
         auto center = camera_relative(body.render.position, eye);
         auto rotation = body_rotation(body.render.pole, body.render.spin_angle_rad);
         SelectionView view;
@@ -99,8 +163,72 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         view.polar_ratio = std::clamp(1.0 - body.definition.oblateness, 0.05, 1.0);
         view.height_amplitude = std::min(double(settings.terrain_height_km) / (radius * AU_TO_KM), 0.01);
         view.max_patches = std::min(remaining, settings.terrain_patch_limit);
+        auto imported_key = [&](TileId tile) {
+            return GeometryKey{system.generation(), body.revisions.geometry, tile.key(), i, view.polar_ratio, 0.0, source->domain()};
+        };
         auto& entry = selections_[i];
-        if (entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry || !(entry.view == view)) {
+        if (source) {
+            view.height_amplitude = std::max(std::abs(source->info().minimum_m), std::abs(source->info().maximum_m)) / source->info().equatorial_radius_m;
+            uint64_t bounds_revision = source->bounds_revision();
+            bool changed = entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry ||
+                entry.bounds_revision != bounds_revision || !(entry.view == view);
+            if (entry.bounds_revision != bounds_revision || entry.generation != system.generation() ||
+                entry.geometry_revision != body.revisions.geometry) entry.descriptions.clear();
+            SelectionSource selection_source(*source, entry.descriptions);
+            if (changed) { entry.desired_valid = false; entry.prefetch.clear(); }
+            std::unordered_set<uint64_t> wanted;
+            auto request = [&](TileId tile) {
+                if (cache_.find(imported_key(tile)) < 0) { wanted.insert(tile.key()); stream_->request(tile); }
+            };
+            bool roots_ready = true;
+            for (uint32_t face = 0; face < 6; ++face) {
+                if (cache_.find(imported_key({face})) < 0) { request({face}); roots_ready = false; }
+            }
+            if (roots_ready && !entry.desired_valid) {
+                auto desired = select(view, selection_source, {{}, [&](TileId tile) { entry.prefetch.push_back(tile); }});
+                std::sort(entry.prefetch.begin(), entry.prefetch.end(), [](TileId a, TileId b) { return a.key() < b.key(); });
+                entry.prefetch.erase(std::unique(entry.prefetch.begin(), entry.prefetch.end()), entry.prefetch.end());
+                entry.desired_valid = true;
+                stats_.selection_nodes += desired.visited;
+            }
+            if (roots_ready) for (auto tile : entry.prefetch) request(tile);
+            if (changed || entry.residency_revision != cache_.revision()) {
+                entry.selection = roots_ready ? select(view, selection_source, {
+                    [&](TileId tile) { return cache_.find(imported_key(tile)) >= 0; }, request}) : Selection{};
+                if (!roots_ready) entry.selection.loading_limited = true;
+                stats_.selection_nodes += entry.selection.visited;
+                ++stats_.selection_rebuilds;
+            }
+            entry.generation = system.generation();
+            entry.geometry_revision = body.revisions.geometry;
+            entry.bounds_revision = bounds_revision;
+            entry.residency_revision = cache_.revision();
+            entry.view = view;
+            auto retain = [&](TileId tile) {
+                auto key = imported_key(tile);
+                if (cache_.find(key) >= 0) {
+                    retained_keys.push_back(key);
+                    retained_heights.push_back({});
+                }
+            };
+            for (uint32_t face = 0; face < 6; ++face) retain({face});
+            std::unordered_set<uint64_t> ancestors;
+            for (const auto& patch : entry.selection.patches) {
+                auto tile = patch.tile;
+                while (tile.level) {
+                    tile = tile.parent();
+                    if (!ancestors.insert(tile.key()).second) break;
+                    retain(tile);
+                }
+            }
+            for (auto& [tile, geometry] : stream_->completed()) {
+                if (wanted.contains(tile.key())) {
+                    retained_keys.push_back(imported_key(tile));
+                    retained_heights.push_back(std::move(geometry));
+                } else stream_->consumed(tile);
+            }
+            if (entry.selection.loading_limited) ++stats_.loading_bodies;
+        } else if (entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry || !(entry.view == view)) {
             auto builds = metadata_.builds();
             entry.selection = select(view, &metadata_);
             stats_.metadata_builds += uint32_t(metadata_.builds() - builds);
@@ -111,9 +239,16 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             ++stats_.selection_rebuilds;
         }
         const auto& selection = entry.selection;
+        if (selection.patches.empty()) continue;
         bodies_.push_back(i);
+        relief_extents_.emplace_back(i, source ? float(std::max(0.0, source->info().maximum_m) / (AU_TO_KM * 1000.0))
+                                             : float(view.height_amplitude * radius));
         stats_.budget_limited |= selection.budget_limited;
         stats_.deepest_level = std::max(stats_.deepest_level, selection.deepest_level);
+        auto eye_rotation = world_to_view * rotation;
+        std::array<double, MAX_LEVEL+1> morph_errors{};
+        if (source) for (uint32_t level = 0; level <= MAX_LEVEL; ++level)
+            morph_errors[level] = source->morph_error(level)*focal/view.target_error_pixels;
         for (const auto& patch : selection.patches) {
             double width = std::ldexp(2.0, -int(patch.tile.level));
             auto anchor = ellipsoid_point(patch.tile.face, -1.0 + (patch.tile.x + 0.5) * width,
@@ -131,7 +266,6 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             gpu.metadata = {i, patch.coarse_edges, settings.terrain_debug_tiles ? 1u : 0u, 0u};
             auto eye_anchor = world_to_view * (center + rotation * (anchor * radius));
             auto high = glm::vec3(eye_anchor);
-            auto eye_rotation = world_to_view * rotation;
             gpu.eye_anchor = {eye_anchor, glm::length(center) > 4.0 * radius ? 1.0 : 0.0};
             gpu.eye_rotation0 = {eye_rotation[0], 0.0};
             gpu.eye_rotation1 = {eye_rotation[1], 0.0};
@@ -141,29 +275,46 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             draw.cached.rotation0 = {glm::vec3(eye_rotation[0]), 0.0f};
             draw.cached.rotation1 = {glm::vec3(eye_rotation[1]), 0.0f};
             draw.cached.rotation2 = {glm::vec3(eye_rotation[2]), 0.0f};
+            if (source) {
+                draw.cached.rotation0.w = float(morph_errors[patch.tile.level ? patch.tile.level-1 : 0]);
+                draw.cached.rotation1.w = float(morph_errors[patch.tile.level > 1 ? patch.tile.level-2 : 0]);
+                draw.cached.rotation2.w = 1.0f;
+                ++stats_.imported_patches;
+            }
             draw.cached.eye = {glm::vec3(view.eye - anchor), float(gpu.rotation_error.w)};
             draw.cached.address = gpu.address;
             draw.cached.metadata = {i, 0u, patch.coarse_edges, settings.terrain_debug_tiles ? 1u : 0u};
             draw.key = {system.generation(), body.revisions.geometry, patch.tile.key(), i, view.polar_ratio, view.height_amplitude};
+            if (source) draw.key = imported_key(patch.tile);
             draw.bake.anchor_polar_ratio = {anchor, view.polar_ratio};
             draw.bake.shape.x = view.height_amplitude;
             draw.bake.address = gpu.address;
             draw.mode = glm::length(center) > 4.0 * radius ? 2u : 1u;
             if (settings.terrain_cached_fp64) draw.mode = 3u;
-            if (settings.terrain_reference_fp64) draw.mode = 0;
+            if (settings.terrain_reference_fp64 && !source) draw.mode = 0;
             prepared_.push_back(draw);
         }
     }
-    if (!settings.terrain_reference_fp64 && !prepared_.empty()) {
+    if ((!settings.terrain_reference_fp64 && !prepared_.empty()) || !retained_keys.empty()) {
         std::vector<GeometryKey> keys;
         std::vector<GeometryBakeGPU> jobs;
+        std::vector<std::shared_ptr<const HeightGeometry>> heights;
         keys.reserve(prepared_.size());
         jobs.reserve(prepared_.size());
         for (const auto& draw : prepared_) {
             keys.push_back(draw.key);
             jobs.push_back(draw.bake);
+            heights.push_back({});
         }
-        auto plan = cache_.prepare(ctx, keys, jobs);
+        keys.insert(keys.end(), retained_keys.begin(), retained_keys.end());
+        heights.insert(heights.end(), retained_heights.begin(), retained_heights.end());
+        jobs.resize(keys.size());
+        auto plan = cache_.prepare(ctx, keys, jobs, heights);
+        for (uint32_t index = 0; index < retained_keys.size(); ++index) {
+            if (retained_heights[index] && plan.slots[prepared_.size()+index] >= 0) {
+                stream_->consumed(TileId::from_key(retained_keys[index].tile));
+            }
+        }
         stats_.cache_hits = plan.hits;
         stats_.cache_misses = plan.misses;
         stats_.cache_bakes = uint32_t(plan.bakes.size());
@@ -177,18 +328,27 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     });
     stats_.patches = uint32_t(prepared_.size());
     stats_.metadata_entries = uint32_t(metadata_.size());
+    if (stream_) {
+        stats_.stream = stream_->stats();
+        if (!stats_.stream.error.empty() && reported_error_ != stats_.stream.error) {
+            reported_error_ = stats_.stream.error;
+            log::error("Terrain source '{}': {}", source_body_, reported_error_);
+        }
+    }
     auto* references = static_cast<PatchGPU*>(patches_[ctx.frame_index()].mapped);
     auto* cached = static_cast<CachedPatchGPU*>(cached_patches_[ctx.frame_index()].mapped);
     for (uint32_t index = 0; index < prepared_.size(); ++index) {
-        std::memcpy(references + index, &prepared_[index].reference, sizeof(PatchGPU));
-        std::memcpy(cached + index, &prepared_[index].cached, sizeof(CachedPatchGPU));
-        if (prepared_[index].mode == 0) ++stats_.reference_patches;
-        else ++stats_.cached_patches;
+        if (prepared_[index].mode == 0) {
+            std::memcpy(references + index, &prepared_[index].reference, sizeof(PatchGPU));
+            ++stats_.reference_patches;
+        } else {
+            std::memcpy(cached + index, &prepared_[index].cached, sizeof(CachedPatchGPU));
+            ++stats_.cached_patches;
+        }
     }
-    if (!prepared_.empty()) {
-        ctx.flush_buffer(patches_[ctx.frame_index()], 0, prepared_.size() * sizeof(PatchGPU));
-        ctx.flush_buffer(cached_patches_[ctx.frame_index()], 0, prepared_.size() * sizeof(CachedPatchGPU));
-    }
+    if (stats_.reference_patches) ctx.flush_buffer(patches_[ctx.frame_index()], 0, stats_.reference_patches*sizeof(PatchGPU));
+    if (stats_.cached_patches) ctx.flush_buffer(cached_patches_[ctx.frame_index()], stats_.reference_patches*sizeof(CachedPatchGPU),
+                                              stats_.cached_patches*sizeof(CachedPatchGPU));
 }
 
 void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene) {

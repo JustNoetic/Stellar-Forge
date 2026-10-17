@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace sf::terrain {
@@ -16,6 +17,7 @@ struct TileId {
     uint32_t x = 0;
     uint32_t y = 0;
     uint64_t key() const noexcept;
+    static TileId from_key(uint64_t key) noexcept;
     TileId parent() const noexcept;
     bool operator==(const TileId&) const = default;
 };
@@ -50,6 +52,7 @@ struct Selection {
     uint32_t deepest_level = 0;
     uint32_t visited = 0;
     bool budget_limited = false;
+    bool loading_limited = false;
 };
 
 glm::dvec3 cube_vector(uint32_t face, double u, double v) noexcept;
@@ -60,7 +63,13 @@ TileBounds bounds(TileId tile, double polar_ratio, double height_amplitude) noex
 bool visible(const TileBounds& tile, const SelectionView& view) noexcept;
 double error_coefficient(double polar_ratio, double height_amplitude) noexcept;
 class TileMetadataCache;
+class TerrainSource;
+struct TileAvailability {
+    std::function<bool(TileId)> ready;
+    std::function<void(TileId)> request;
+};
 Selection select(const SelectionView& view, TileMetadataCache* metadata = nullptr);
+Selection select(const SelectionView& view, const TerrainSource& source, const TileAvailability& availability = {});
 std::vector<uint32_t> grid_indices(uint32_t coarse_edges);
 
 }

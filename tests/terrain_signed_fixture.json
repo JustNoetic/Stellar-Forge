@@ -1,0 +1,17 @@
+{
+  "latitude": "geodetic",
+  "longitude": "east",
+  "orientation": "north-to-south",
+  "registration": "point",
+  "vertical_datum": "ellipsoid",
+  "coverage_deg": [-180, 180, -90, 90],
+  "scale": 0.5,
+  "offset": -300.0,
+  "fill_m": -1000.0,
+  "nodata": -9999,
+  "values": [
+    [100, 100, 100, 100, 100],
+    [-1400, 2400, null, -9999, -1400],
+    [200, 200, 200, 200, 200]
+  ]
+}

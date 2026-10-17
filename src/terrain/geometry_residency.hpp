@@ -5,6 +5,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include "terrain/terrain_source.hpp"
 
 namespace sf::terrain {
 
@@ -15,6 +16,7 @@ struct GeometryKey {
     uint32_t body = 0;
     double polar_ratio = 1.0;
     double height_amplitude = 0.0;
+    SourceDomain source;
     bool operator==(const GeometryKey&) const = default;
 };
 
@@ -42,7 +44,9 @@ public:
     GeometryResidency(GeometryResidency&&) = default;
     GeometryResidency& operator=(GeometryResidency&&) = default;
     CachePlan request(std::span<const GeometryKey> keys, uint32_t bake_budget);
+    int32_t find(const GeometryKey& key) const;
     uint32_t size() const noexcept { return uint32_t(entries_.size()); }
+    uint64_t revision() const noexcept { return revision_; }
 
 private:
     struct Entry {
@@ -52,6 +56,7 @@ private:
     };
     uint32_t capacity_;
     uint64_t frame_ = 0;
+    uint64_t revision_ = 0;
     std::list<GeometryKey> ages_;
     std::unordered_map<GeometryKey, Entry, GeometryKeyHash> entries_;
 };

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <cstdlib>
 
 using namespace sf;
 
@@ -66,8 +67,8 @@ struct RenderProbe {
         window = glfwCreateWindow(256, 256, "Rendering tests", nullptr, nullptr);
         check(window != nullptr, "Hidden test window");
         rhi::ShaderCache::init();
-        vk.init(window, false);
-        renderer.init(vk);
+        vk.init(window, std::getenv("STELLAR_VULKAN_VALIDATION") != nullptr);
+        renderer.init(vk, false);
         rhi::GraphicsPipelineDesc desc{};
         desc.vert_path = "post/fullscreen.vert";
         desc.frag_path = "post/composite.frag";
@@ -648,6 +649,23 @@ int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc >= 4 && std::string_view(argv[1]) == "--terrain-source-benchmark") {
+            terrain_source_benchmark(probe, argv[2], argv[3], argc > 4 && std::string_view(argv[4]) == "--paced");
+            return 0;
+        }
+        if (argc >= 3 && std::string_view(argv[1]) == "--surface-contracts") {
+            surface_contracts(probe, argv[2]);
+            return 0;
+        }
+        if (argc >= 4 && std::string_view(argv[1]) == "--surface-preview") {
+            surface_preview(probe, argv[2], argv[3]);
+            return 0;
+        }
+        if (argc >= 3 && std::string_view(argv[1]) == "--terrain-imported") {
+            streaming_uploads(probe);
+            imported_terrain(probe, argv[2], argc >= 4 ? std::filesystem::path(argv[3]) : std::filesystem::path{});
+            return 0;
+        }
         if (argc >= 2 && std::string_view(argv[1]) == "--terrain-relief-benchmark") {
             terrain_ground_benchmark(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{}, true);
             return 0;

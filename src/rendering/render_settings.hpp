@@ -19,6 +19,8 @@ struct RenderSettings {
     float star_intensity = 1.0f;
     bool vsync = false;
     bool terrain_enabled = false;
+    bool terrain_imported_enabled = true;
+    bool surface_textures_enabled = true;
     bool terrain_debug_tiles = false;
     bool terrain_reference_fp64 = false;
     bool terrain_cached_fp64 = false;

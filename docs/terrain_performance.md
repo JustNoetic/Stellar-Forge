@@ -1,5 +1,90 @@
 # Terrain precision and geometry cache performance
 
+## Tighter imported bounds and selection reuse
+
+Measured before/after on 17 October 2026, Release, i5-12400F / RTX 4060 Ti, 1920 × 1080, 60° FOV, 2-pixel target and the same 1024-patch cap. The source is the existing Earth legacy visual elevation pack, identity `619520292878143246`, data LOD5. No pack rebake, height change, texture-resolution change or relaxed error setting is involved. This probe uses the pack's reference radius/oblateness, a fixed render pole/spin, a camera starting at 0.15 radians on the equator and no color sources. Orbital clearance is two equatorial radii above the sampled surface; ground clearances are above the decoded surface.
+
+Each view waits for resident coverage, measures 120 stationary frames, then 120 frames moving at 100 m/s and virtual 60 Hz. Pass CPU includes prepare/record; GPU includes preparation and celestial rendering/clears. Worker I/O/baking, camera height queries, submit/fence waits, readback, simulation, UI and presentation are excluded. These are offscreen pass measurements, not application FPS. GPU clocks and OS scheduling were uncontrolled; CPU results below are descriptive captures rather than fixed timing thresholds.
+
+| View | CPU mean before → after, ms | Patches before → after |
+| --- | --- | --- |
+| Orbital, stationary | 1.754 → 0.040 | 1023 → 109 |
+| Orbital, moving | 1.766 → 0.181 | 1023 → 109 |
+| 2 km down, stationary | 0.189 → 0.021 | 10 → 10 |
+| 2 km down, moving | 0.189 → 0.113 | 10 → 10 |
+| 2 km horizon, stationary | 0.824 → 0.041 | 232 → 95 |
+| 2 km horizon, moving | 0.839 → 0.207 | 232 → 95 |
+| 1 m down, stationary | 0.345 → 0.035 | 10 → 10 |
+| 1 m horizon, stationary | 1.164 → 0.107 | 331 → 195 |
+
+The old orbital selection exhausted its patch budget in all measured frames; the new one does not. Moving orbital traversal visits fell from 3212 to 340. Stable views perform zero quadtree visits/rebuilds after residency settles. Orbital CPU draw recording was already about 0.011 ms before the change, versus 1.754 ms preparing a moving frame: the main cost was selection/preparation rather than issuing instanced draws. The 2 km downward comparison isolates CPU improvements with an unchanged patch count. Per-body matrix/per-level morph reuse and writing only the active GPU record layout also reduce preparation work.
+
+The actual textured preview was also repeated at the earlier 768 × 768 setup with all 14 sources bound. Earth changed from 896 to 72 imported geometry patches, with CPU mean 2.133 → 0.237 ms. Its 412 resident color pages are unchanged. The before/after Earth images were inspected side by side; mean absolute display-RGB difference is 0.000771 on a 0–1 scale, with 0.051% of pixels differing by more than 0.1 in any channel. That visual comparison includes shading/silhouette changes and complements the geometric bound tests. New images/report are under `scratch/terrain-bounds/surface-after`, with `earth-comparison.png` beside that directory.
+
+Stationary one-meter views still reach LOD23. Free-running one-meter motion retains parent coverage but is streaming-limited: after optimization, down/horizon traces draw approximately 4–10 / 151–195 patches and reach minimum deepest LOD16/20 while loading; before they reached 17/22. Faster frames provide less worker wall time per simulated meter, so those loading counts/detail minima are not equivalent-time quality comparisons. Ready samples retain fine geometry. A separate `--paced` run gives moving frames at least 16.667 ms: down/horizon minima are LOD17/22, with 117/77 loading frames and ready-sample minima LOD23/22. Streaming latency at one meter and 100 m/s remains a limitation; this change does not claim to eliminate it. Paced CPU/GPU timings are not compared against the unpaced baseline.
+
+Captures are `scratch/terrain-bounds/earth-before.json`, `earth-after.json` and `earth-paced.json`. Reproduce with the actual height path in `data/surfaces.json` and a new output filename:
+
+```powershell
+.\build\StellarRenderingTests.exe --terrain-source-benchmark data/tiles/earth/b72a6fa0e156/height scratch/terrain-bounds/capture.json
+.\build\StellarRenderingTests.exe --terrain-source-benchmark data/tiles/earth/b72a6fa0e156/height scratch/terrain-bounds/paced.json --paced
+```
+
+The geometric bounds are derived from interpolation of normalized cube/oblate-normal vectors, with local gradient, parent height residual, encoding and FP64 rounding allowances. Parent/grandparent interpolation, common dataset-level morph thresholds, atomic cross-face balance and resident coverage remain in place. CPU tests sample fine/parent/grandparent triangles across all faces, LOD0–24, negative constant heights and polar ratios 0.05/0.5/1. GPU regressions verify stable selection reuse, lighting-only reuse, error-setting invalidation, moving imported coverage, procedural cached/reference images and physical normal seams. See [bound derivation and cache contracts](terrain.md#imported-geometric-error-and-selection-cost).
+
+All 17 CTests passed; final CPU/imported-GPU terrain checks passed again after generation-cache cleanup. The rebuilt application also retains its startup smoke test.
+
+The sections below retain earlier captures from the more conservative imported implementation and historical procedural versions.
+
+## Imported surface maps
+
+The copied library contains 19 original images (565,306,762 bytes), verified against the original project with SHA-256. The first packs contain color LOD0–3 for 14 bodies and legacy-calibrated Earth elevation LOD5. Raw sources remain under `textures/Solar System`; derived packs are under `data/tiles`, selected by `data/surfaces.json`. Finest color faces are 1024², so these are starter packs rather than the full detail of the 21,600-pixel Earth original.
+
+The color cache adds at most 512 × 132² RGBA8-sRGB texels = 34.03 MiB, a separate 4 MiB completion-managed staging ring, two approximately 1.02 MiB maximum page buffers, and at most 64 completed CPU tile payloads = 4.25 MiB. Queue/index/container overhead is additional. Hardware array-layer limits can reduce the layer count. Height geometry continues sharing the existing 64 MiB pool and 128-admission/frame budget; color admissions are independently capped at 16/frame.
+
+Release captures on the same i5-12400F / RTX 4060 Ti use 768 × 768 HDR/depth, 60° FOV and a camera three equatorial radii from the center. Each body waits for worker/upload convergence, captures an image, then measures 64 stationary pass samples. All 14 color sources share the same cache; views run sequentially, not as independent cold loads. Earth uses imported elevation; Jupiter uses its ordinary sphere. CPU includes surface selection and render recording; GPU includes preparation, attachment clears and celestial drawing. These intervals exclude source-worker CPU, submit/wait, image readback, tone mapping, simulation, UI and presentation. They are isolated pass measurements, not application FPS.
+
+| Body | CPU mean / p95, ms | GPU mean / p95, ms | Imported geometry patches | Resident color tiles |
+| --- | --- | --- | --- | --- |
+| Earth | 2.133 / 2.363 | 1.476 / 4.063 | 896 | 412 |
+| Jupiter | 0.263 / 0.315 | 0.128 / 0.129 | 0 | 512 |
+
+GPU clocks/power management were uncontrolled; the short Earth block includes substantial timing variance. No comparison or speedup against the earlier procedural fixtures is implied. Moon and Mars captures also exercise the same renderer. Full per-body distributions, warmup-frame counts and previews are written by:
+
+```powershell
+.\build\StellarRenderingTests.exe --surface-preview data/surfaces.json scratch/surface-preview-final
+```
+
+All 17 CTests passed. The final surface-only rerun passed after adjusting requests to cover the shader's finest blended level. Its deterministic GPU test forced 448 actual texture-slot evictions across 32 bindings, checking color coverage and bounds throughout. Six Python surface contracts cover lossless/indexed payloads, linear-light filtering, interior/cube borders and corners, pole coordinates, repeatable output and signed normalization of a 16-bit height image. Real-image previews verify Earth elevation is actually selected, which also catches engine/importer reference-radius mismatches. The procedural precision/reference and imported near-ground motion suites remain passing.
+
+## Imported-height streaming foundation
+
+Measured on 17 October 2026 on the same i5-12400F / RTX 4060 Ti, Release, 1920 × 1080, 60° FOV, 2-pixel target and 1024-patch cap. `terrain_imported_contracts` generated a deterministic signed-height dataset with global data LOD2, nested FP32 samples and identity `1420171969660023193`. It exercises the disk/import/residency path; it is not measured Earth elevation. GPU geometry remains 64 MiB / 4837 slots, with a separate 4 MiB completion-managed staging ring and a shared 128-admission/frame budget. There are no GPU height textures.
+
+Reproduce with a new dataset directory and inspect the generated JSON:
+
+```powershell
+python scripts/import_terrain.py scratch/imported-performance-fixture --level 2
+.\build\StellarRenderingTests.exe --terrain-imported scratch/imported-performance-fixture scratch/terrain-benchmark/imported.json
+```
+
+The CTest capture is `scratch/terrain-source-tests/imported-gpu.json`; its dataset directory is recorded in `fixture-path.txt` beside it. The four cases run sequentially with one source, system generation and GPU pool; only the first starts empty. Each stationary view waits for a ready balanced selection, then measures 120 moving samples at a fixed virtual 60 Hz and 100 m/s. Clearance is relative to the decoded imported height surface. Camera-height queries, source worker CPU time, submit/fence waits, readback, simulation, UI and presentation are outside the pass intervals. Worker I/O and FP64 geometry baking run concurrently. The moving trace is free-running rather than paced to real 60 Hz, so source jobs can have much less than 16.7 ms of wall time between virtual steps. CPU and GPU intervals must not be added, and these are not application FPS measurements.
+
+| View / surface clearance | CPU mean / p95, ms | GPU mean / p95, ms | Drawn patches | Minimum deepest LOD / ready-only minimum | Loading frames / 120 |
+|---|---:|---:|---:|---:|---:|
+| Down / 2 km | 0.260 / 0.356 | 0.049 / 0.049 | 10 | 12 / 12 | 0 |
+| Horizon / 2 km | 0.688 / 0.802 | 0.043 / 0.045 | 212 | 12 / 12 | 0 |
+| Down / 1 m | 0.451 / 0.578 | 0.050 / 0.052 | 4–8 | 17 / 22 | 109 |
+| Horizon / 1 m | 1.119 / 1.304 | 0.387 / 0.524 | 276–312 | 22 / 22 | 60 |
+
+All measured frames retained imported parent coverage, with zero procedural fallback and no worker failures. Pending jobs stayed at or below 128, completed blocks at or below 256, and admissions at or below 128/frame. Near-ground motion can temporarily draw a shallower resident ancestor: the downward trace reached LOD17 while loading, while ready samples retained LOD22 or finer. A separate metadata-only one-meter downward regression selects eight patches through LOD23 without budget pressure. Geometry finer than source LOD2 reconstructs its finite height lattice and the oblate surface; it does not add measured detail.
+
+Stationary readiness took approximately 91, 78, 46 and 26 ms in case order; those are sequential-cache observations, not independent cold-source latency guarantees. The largest premeasurement CPU/GPU pass intervals were 1.451/0.627 ms. Worker cumulative geometry builds were 290, 762, 2023 and 2448 after the respective moving traces, with 258 payload reads retained across cases. GPU power management was automatic. Parent fallback bounds frame work and preserves coverage; it does not guarantee requested detail at arbitrary motion speed. The extra desired/resident selections, bounded metadata lookups and CPU worker path make this implementation more expensive than the earlier procedural-only selector on these different surfaces; no procedural/imported speedup is claimed.
+
+All 15 CTests passed, including the original procedural precision/reference images, imported geometry/normal seams, parent coverage under delay and eviction, LOD24 bounds/error containment, corruption/revision checks, and multi-frame staging plus targeted mip/layer readback. The optional GDAL adapter test skipped because Python bindings were unavailable. Khronos validation layers were not installed, so GPU checks used actual submission/readback and CPU synchronization contracts without validation-layer diagnostics. The v1 source format has a bounded flat index and global data levels 0–5; sparse/paged high-resolution Earth datasets remain later work. See [terrain source and streaming contracts](terrain.md#imported-height-sources).
+
+The following sections retain historical procedural-only captures.
+
 Measured on 17 October 2026 with an Intel Core i5-12400F and NVIDIA GeForce RTX 4060 Ti. Release build, 1920 × 1080 offscreen HDR target, 60° vertical FOV except the telescope case, 2-pixel error target and 1024 patches per body. Geometry is synthetic; no disk texture streaming is included.
 
 The original precision/cache tables and the first moving-ground capture below predate balanced refinement. Balanced-refinement results also predate local height bounds. Current selector results are in [local height and error metadata](#local-height-and-error-metadata). Do not treat earlier captures as an equivalent rendering workload.

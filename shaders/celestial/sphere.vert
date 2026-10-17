@@ -4,19 +4,13 @@ layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
 
 #include "common/celestial_scene.glsl"
+#include "common/body_surface.glsl"
 
 layout(location = 0) out vec3 f_world_pos;
 layout(location = 1) out vec3 f_local_pos;
 layout(location = 2) out vec3 f_normal;
 layout(location = 3) out float f_subpixel_factor;
 layout(location = 4) flat out uint f_body_idx;
-
-vec3 rotate_about_axis(vec3 v, vec3 axis, float angle) {
-    if (abs(angle) < 1e-7) return v;
-    float c = cos(angle);
-    float s = sin(angle);
-    return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
-}
 
 void main() {
     uint idx = gl_InstanceIndex;
@@ -40,18 +34,12 @@ void main() {
         return;
     }
 
-    vec3 mesh_pos = rotate_about_axis(in_position, pole, spin);
-    vec3 mesh_norm = rotate_about_axis(in_normal, pole, spin);
+    mat3 rotation = body_surface_rotation(pole, spin);
     f_local_pos = in_position;
 
-    vec3 scaled_pos = mesh_pos;
-    vec3 adj_norm = mesh_norm;
-    if (obl > 0.0) {
-        float pole_proj = dot(mesh_pos, pole);
-        scaled_pos -= pole * (pole_proj * obl);
-        float f_inv = obl / max(1.0 - obl, 1e-4);
-        adj_norm = normalize(mesh_norm + pole * (dot(mesh_norm, pole) * f_inv));
-    }
+    vec3 scale = vec3(1.0, max(1.0-obl, 0.05), 1.0);
+    vec3 scaled_pos = rotation*(in_position*scale);
+    vec3 adj_norm = rotation*normalize(in_normal/scale);
 
     vec3 world_pos = center + scaled_pos * radius;
     f_world_pos = world_pos;

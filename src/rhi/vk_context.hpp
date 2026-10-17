@@ -27,6 +27,7 @@ struct FrameContext {
     uint32_t timer_count = 0;
     std::vector<std::string> timer_names;
     uint64_t serial = 0;
+    uint64_t completion_serial = 0;
 };
 
 struct GpuTimingSample {
@@ -74,6 +75,10 @@ public:
                               VkAccessFlags2 src_access = VK_ACCESS_2_MEMORY_WRITE_BIT,
                               VkPipelineStageFlags2 dst_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                               VkAccessFlags2 dst_access = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT);
+    void transition_image_range(VkCommandBuffer cmd, const Image& image, VkImageSubresourceRange range,
+                                VkImageLayout old_layout, VkImageLayout new_layout,
+                                VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                                VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access);
 
     void memory_barrier(VkCommandBuffer cmd,
                         VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -106,6 +111,8 @@ public:
     }
     std::vector<GpuTimingSample> drain_gpu_timings();
     uint64_t submitted_frames() const noexcept { return submitted_frames_; }
+    uint64_t recording_serial() const noexcept { return recording_serial_; }
+    uint64_t completed_serial() const noexcept { return completed_serial_; }
     bool timestamps_supported() const noexcept { return timestamp_valid_bits_ > 0; }
     const VkPhysicalDeviceProperties& device_properties() const noexcept { return device_props_; }
     const VkPhysicalDeviceDriverProperties& driver_properties() const noexcept { return driver_props_; }
@@ -180,6 +187,9 @@ private:
     std::unordered_map<std::string, double> gpu_timings_ms_;
     bool capture_gpu_timings_ = false;
     uint64_t submitted_frames_ = 0;
+    uint64_t next_serial_ = 1;
+    uint64_t recording_serial_ = 0;
+    uint64_t completed_serial_ = 0;
     std::vector<GpuTimingSample> captured_gpu_timings_;
 };
 

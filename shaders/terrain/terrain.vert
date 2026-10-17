@@ -74,7 +74,9 @@ void main() {
     uint effective_level = coarse_edge && level > 0u ? level - 1u : level;
     if (effective_level > 0u) {
         TerrainScalar parent_width = 4.0 / TerrainScalar(1u << effective_level);
-        TerrainScalar error = parent_width * parent_width * TerrainScalar(tile.eye.w) / max(length(point - TerrainVector(tile.eye.xyz)), 1e-12);
+        TerrainScalar numerator = tile.rotation2.w > 0.5 ? TerrainScalar(coarse_edge ? tile.rotation1.w : tile.rotation0.w)
+            : parent_width * parent_width * TerrainScalar(tile.eye.w);
+        TerrainScalar error = numerator / max(length(point - TerrainVector(tile.eye.xyz)), 1e-12);
         TerrainScalar morph = clamp(error - 1.0, 0.0, 1.0);
         point = mix(parent_position(first, grid, coarse_edge ? 4u : 2u), point, morph);
     }

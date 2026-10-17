@@ -1,10 +1,12 @@
 #pragma once
 
 #include "core/timing.hpp"
+#include "core/path_utils.hpp"
 #include "benchmark/build_info.hpp"
 #include "terrain/geometry_cache.hpp"
 #include <cstdlib>
 #include <numeric>
+#include <thread>
 
 namespace {
 
@@ -25,6 +27,176 @@ ephemeris::LoadedSystem precision_fixture(glm::dvec3 origin = {}, double flatten
     loaded.motions.push_back(motion);
     loaded.definition.name_to_idx[earth.name] = 1;
     return loaded;
+}
+
+glm::vec3 surface_center(const RenderProbe& probe) {
+    auto* pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+    auto offset = 4*(size_t(probe.extent.height/2)*probe.extent.width+probe.extent.width/2);
+    return {glm::unpackHalf2x16(pixels[offset]).x, glm::unpackHalf2x16(pixels[offset+1]).x,
+            glm::unpackHalf2x16(pixels[offset+2]).x};
+}
+
+void surface_contracts(RenderProbe& probe, const std::filesystem::path& fixture_pointer) {
+    std::ifstream pointer(fixture_pointer);
+    std::string location;
+    std::getline(pointer, location);
+    check(bool(pointer), "Surface fixture pointer exists");
+    std::filesystem::path directory(location);
+    auto green = terrain::ColorSource::open(directory/"green");
+    check(green->read({0})->at(1) == 255, "CPU albedo tile decode preserves color data");
+    auto corrupt = std::make_shared<terrain::ColorSource>(*green);
+    corrupt->payload = directory/"corrupt.rgba";
+    std::filesystem::copy_file(green->payload, corrupt->payload, std::filesystem::copy_options::overwrite_existing);
+    { std::fstream file(corrupt->payload, std::ios::binary|std::ios::in|std::ios::out); file.put(char(1)); }
+    bool rejected = false;
+    try { corrupt->read({0}); } catch (const std::exception&) { rejected = true; }
+    check(rejected, "Corrupt albedo never enters the GPU cache");
+    ephemeris::Simulation simulation;
+    auto loaded = precision_fixture();
+    loaded.definition.bodies[1].color_rgb = {1, 0, 0};
+    check(simulation.replace_system(loaded).accepted, "Surface fixture loads");
+    rendering::RenderSettings settings;
+    auto camera = camera_at(3*6378.137*KM_TO_AU);
+    camera.tracking_idx = 1;
+    probe.renderer.set_color_sources({{"Precision terrain", green}});
+    auto settle = [&] {
+        uint32_t quiet = 0;
+        for (uint32_t frame = 0; frame < 600; ++frame) {
+            probe.render(camera, simulation.snapshot(), settings);
+            const auto& stats = probe.renderer.texture_stats();
+            check(stats.uploads <= terrain::COLOR_UPLOADS && stats.pending <= 128 && stats.ready <= 64 &&
+                  stats.resident <= stats.capacity && stats.failed == 0, "Texture streaming respects every cache and upload bound");
+            quiet = stats.pending == 0 && stats.ready == 0 && stats.uploads == 0 ? quiet+1 : 0;
+            if (quiet >= 3) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error("Surface cache failed to converge");
+    };
+    settle();
+    auto center = surface_center(probe);
+    check(center.g > .01f && center.r < .001f && center.b < .001f, "Resident albedo replaces the body color on the sphere");
+    settings.surface_textures_enabled = false;
+    probe.render(camera, simulation.snapshot(), settings);
+    center = surface_center(probe);
+    check(center.r > .01f && center.g < .001f, "Disabling imported color restores the body material");
+    settings.surface_textures_enabled = true;
+    settings.terrain_enabled = true;
+    settings.terrain_height_km = 0;
+    settle();
+    center = surface_center(probe);
+    check(center.g > .01f && center.r < .001f && probe.renderer.terrain_stats().patches > 0,
+          "Terrain geometry samples the same resident color tiles");
+    auto directions = terrain::ColorSource::open(directory/"directions");
+    probe.renderer.set_color_sources({{"Precision terrain", directions}});
+    loaded.definition.bodies[1].pole_ecl = render_to_ecliptic(RenderPosition{glm::normalize(glm::dvec3(.3, .8, .4))}).value;
+    loaded.definition.bodies[1].w0_deg = 37;
+    check(simulation.replace_system(loaded).accepted, "Tilted surface fixture loads");
+    settings.terrain_enabled = false;
+    settle();
+    auto sphere = glm::normalize(surface_center(probe));
+    settings.terrain_enabled = true;
+    settle();
+    auto terrain_color = glm::normalize(surface_center(probe));
+    check(glm::length(sphere-terrain_color) < .015f, "Sphere and terrain preserve tilted body-fixed texture orientation");
+    settings.terrain_enabled = false;
+    std::vector<terrain::ColorBinding> bindings;
+    for (int i = 0; i < 32; ++i) bindings.push_back({"Surface "+std::to_string(i), green});
+    probe.renderer.set_color_sources(std::move(bindings));
+    uint32_t evictions = 0;
+    for (int i = 0; i < 32; ++i) {
+        loaded = precision_fixture();
+        loaded.definition.bodies[1].name = "Surface "+std::to_string(i);
+        check(simulation.replace_system(loaded).accepted, "Eviction fixture body changes");
+        for (int side : {1, -1}) {
+            loaded.motions[0].position = render_to_ecliptic(RenderPosition{{0, 0, side*10.0}});
+            check(simulation.replace_system(loaded).accepted, "Eviction view remains illuminated");
+            camera.cam_pos_rel.z = side*3*6378.137*KM_TO_AU;
+            camera.cam_look_aim = true;
+            uint32_t quiet = 0;
+            for (uint32_t frame = 0; frame < 600; ++frame) {
+                probe.render(camera, simulation.snapshot(), settings);
+                const auto& stats = probe.renderer.texture_stats();
+                evictions += stats.evictions;
+                check(stats.uploads <= terrain::COLOR_UPLOADS && stats.pending <= 128 && stats.ready <= 64 &&
+                      stats.resident <= stats.capacity, "Eviction remains bounded");
+                quiet = !stats.pending && !stats.ready && !stats.uploads ? quiet+1 : 0;
+                if (quiet >= 3) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                check(frame < 599, "Evicting surface cache converges");
+            }
+            auto color = surface_center(probe);
+            check(color.g > .01f && color.r < .001f, "Parent coverage and page ownership survive eviction");
+        }
+    }
+    check(evictions > 0, "Texture fixture exercises actual GPU slot eviction");
+    probe.renderer.set_color_sources({});
+    std::cout << "Surface contracts passed; " << evictions << " GPU texture evictions.\n";
+}
+
+struct TerrainSample {
+    double cpu_prepare_ms, cpu_record_ms, gpu_prepare_ms, gpu_total_ms, gpu_draw_ms;
+    double cpu_ms() const { return cpu_prepare_ms + cpu_record_ms; }
+};
+
+TerrainSample measure_terrain(RenderProbe&, const Camera&, const ephemeris::SystemSnapshot&, const rendering::RenderSettings&);
+nlohmann::json terrain_timing_stats(std::vector<double> samples);
+
+void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, const std::filesystem::path& output) {
+    auto document = paths::read_json(catalog);
+    auto definitions = paths::read_json(paths::external_path("data/system.json"));
+    check(document.has_value() && definitions.has_value(), "Surface preview catalogs exist");
+    std::filesystem::create_directories(output);
+    std::vector<terrain::ColorBinding> bindings;
+    for (const auto& entry : document->at("bodies"))
+        bindings.push_back({entry.at("body"), terrain::ColorSource::open(paths::external_path(entry.at("albedo").get<std::string>()))});
+    probe.renderer.set_color_sources(std::move(bindings));
+    probe.resize({768, 768});
+    nlohmann::json report = nlohmann::json::array();
+    ephemeris::Simulation simulation;
+    rendering::RenderSettings settings;
+    for (const auto& entry : document->at("bodies")) {
+        std::string name = entry.at("body");
+        if (name != "Earth" && name != "Moon" && name != "Mars" && name != "Jupiter") continue;
+        auto definition = std::find_if(definitions->begin(), definitions->end(), [&](const auto& body) { return body.at("name") == name; });
+        check(definition != definitions->end(), "Preview body definition exists");
+        auto loaded = precision_fixture({}, definition->value("oblateness", 0.0));
+        auto& body = loaded.definition.bodies[1];
+        body.name = name;
+        body.radius_rsun = definition->at("r");
+        body.color_rgb = {1, 0, 1};
+        body.w0_deg = name == "Earth" ? -70 : 0;
+        check(simulation.replace_system(loaded).accepted, "Preview system loads");
+        if (entry.contains("height")) probe.renderer.set_height_source(name,
+            terrain::HeightSource::open(paths::external_path(entry.at("height").get<std::string>())));
+        else probe.renderer.set_height_source({}, {});
+        auto camera = camera_at(body.radius_au()*3);
+        camera.tracking_idx = 1;
+        uint32_t quiet = 0, frames = 0;
+        for (; frames < 1800; ++frames) {
+            probe.render(camera, simulation.snapshot(), settings, nullptr, true);
+            const auto& textures = probe.renderer.texture_stats();
+            const auto& terrain = probe.renderer.terrain_stats();
+            quiet = !textures.pending && !textures.ready && !textures.uploads && !terrain.loading_bodies && !terrain.cache_bakes ? quiet+1 : 0;
+            if (quiet >= 8) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(frames < 1800 && probe.renderer.texture_stats().failed == 0, "Real surface maps finish streaming");
+        if (entry.contains("height")) check(probe.renderer.terrain_stats().imported_patches > 0, "Real Earth elevation is drawn");
+        probe.save_preview(output/(name+".ppm"), true);
+        const auto& stats = probe.renderer.texture_stats();
+        nlohmann::json row{{"body", name}, {"warmup_frames", frames}, {"resident_color_tiles", stats.resident},
+            {"texture_capacity", stats.capacity}, {"imported_geometry_patches", probe.renderer.terrain_stats().imported_patches}};
+        std::vector<double> cpu, gpu;
+        for (uint32_t frame = 0; frame < 64; ++frame) {
+            auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
+            cpu.push_back(sample.cpu_ms()); gpu.push_back(sample.gpu_total_ms);
+        }
+        row["cpu_ms"] = terrain_timing_stats(cpu); row["gpu_ms"] = terrain_timing_stats(gpu);
+        report.push_back(row);
+        std::cout << row.dump() << '\n';
+    }
+    std::ofstream file(output/"report.json");
+    file << report.dump(2) << '\n';
 }
 
 bool declares_float64(const std::vector<uint32_t>& spirv) {
@@ -211,11 +383,6 @@ nlohmann::json terrain_timing_stats(std::vector<double> samples) {
             {"p99", samples[size_t((samples.size() - 1) * .99)]}, {"min", samples.front()}, {"max", samples.back()}};
 }
 
-struct TerrainSample {
-    double cpu_prepare_ms, cpu_record_ms, gpu_prepare_ms, gpu_total_ms, gpu_draw_ms;
-    double cpu_ms() const { return cpu_prepare_ms + cpu_record_ms; }
-};
-
 TerrainSample measure_terrain(RenderProbe& probe, const Camera& camera, const ephemeris::SystemSnapshot& system,
                               const rendering::RenderSettings& settings) {
     TerrainSample sample{};
@@ -244,6 +411,271 @@ TerrainSample measure_terrain(RenderProbe& probe, const Camera& camera, const ep
     sample.gpu_total_ms = probe.vk.gpu_time_ms("terrain_total");
     sample.gpu_draw_ms = probe.vk.gpu_time_ms("terrain_draw");
     return sample;
+}
+
+void terrain_source_benchmark(RenderProbe& probe, const std::filesystem::path& dataset, const std::filesystem::path& output, bool paced = false) {
+    check(!std::filesystem::exists(output), "Preserve previous source benchmark captures");
+    auto source = terrain::HeightSource::open(dataset);
+    probe.renderer.set_height_source("Precision terrain", source);
+    probe.resize({1920, 1080});
+    ephemeris::Simulation simulation;
+    auto loaded = precision_fixture({}, 1-source->info().polar_ratio);
+    loaded.definition.bodies[1].radius_rsun = source->info().equatorial_radius_m/(SOLAR_RADIUS_KM*1000);
+    check(simulation.replace_system(loaded).accepted, "Source benchmark reference shape loads");
+    rendering::RenderSettings settings;
+    settings.surface_textures_enabled = false;
+    double radius = source->info().equatorial_radius_m;
+    auto camera_for = [&](double clearance, bool horizon, uint32_t frame) {
+        double angle = .15+100.0*frame/(60.0*radius);
+        glm::dvec3 direction{std::sin(angle), 0, std::cos(angle)};
+        auto tile = terrain::tile_at(direction, source->info().data_level);
+        auto payload = source->read(tile);
+        double n = double(1u << tile.level);
+        double h = terrain::height_sample(payload, ((direction.x/direction.z+1)*.5*n-tile.x)*16, (.5*n-tile.y)*16);
+        auto camera = camera_at(0);
+        camera.cam_pos_rel = direction*((radius+h+clearance)*.001*KM_TO_AU);
+        camera.cam_look_aim = !horizon;
+        camera.tracking_idx = 1;
+        camera.is_near_surface = clearance < radius;
+        camera.up = horizon ? direction : glm::dvec3(0, 1, 0);
+        camera.yaw_actual_deg = -angle*RAD_TO_DEG;
+        return camera;
+    };
+    nlohmann::json report{{"gpu", probe.vk.device_name()}, {"dataset_identity", source->domain().identity},
+        {"framebuffer", {1920,1080}}, {"target_pixels", settings.terrain_error_pixels}, {"paced_60hz", paced},
+        {"method", "serialized offscreen celestial pass; no color sources; stationary then 100 m/s at virtual 60 Hz; excludes worker CPU, camera height queries, waits, readback and presentation"}};
+    for (const auto& [name, clearance, horizon] : std::vector<std::tuple<std::string, double, bool>>{
+             {"orbital", radius*2, false}, {"2km-down", 2000, false}, {"2km-horizon", 2000, true},
+             {"1m-down", 1, false}, {"1m-horizon", 1, true}}) {
+        auto camera = camera_for(clearance, horizon, 0);
+        auto start = SteadyClock::now();
+        bool converged = false;
+        for (uint32_t frame = 0; frame < 10000 && elapsed_ms(start) < 30000; ++frame) {
+            measure_terrain(probe, camera, simulation.snapshot(), settings);
+            const auto& stats = probe.renderer.terrain_stats();
+            if (stats.imported_patches && !stats.loading_bodies && !stats.cache_bakes) { converged = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(converged, "Source benchmark reaches resident coverage");
+        double readiness = elapsed_ms(start);
+        for (bool moving : {false, true}) {
+            std::vector<double> cpu, prepare, record, gpu, patches, nodes, rebuilds;
+            uint32_t loading = 0, budget = 0, minimum_lod = 24, minimum_ready_lod = 24;
+            for (uint32_t frame = 0; frame < 120; ++frame) {
+                auto frame_start = SteadyClock::now();
+                if (moving) camera = camera_for(clearance, horizon, frame);
+                auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
+                const auto& stats = probe.renderer.terrain_stats();
+                check(stats.imported_patches && !stats.reference_patches && !stats.stream.failed, "Source trace retains imported coverage");
+                check(stats.patches <= settings.terrain_patch_limit && stats.cache_bakes <= 128, "Source trace respects budgets");
+                cpu.push_back(sample.cpu_ms()); prepare.push_back(sample.cpu_prepare_ms); record.push_back(sample.cpu_record_ms);
+                gpu.push_back(sample.gpu_total_ms); patches.push_back(stats.patches); nodes.push_back(stats.selection_nodes);
+                rebuilds.push_back(stats.selection_rebuilds); loading += stats.loading_bodies > 0; budget += stats.budget_limited;
+                minimum_lod = std::min(minimum_lod, stats.deepest_level);
+                if (!stats.loading_bodies) minimum_ready_lod = std::min(minimum_ready_lod, stats.deepest_level);
+                if (moving && paced) std::this_thread::sleep_until(frame_start+std::chrono::microseconds(16667));
+            }
+            nlohmann::json row{{"view", name}, {"moving", moving}, {"readiness_ms", readiness},
+                {"cpu_ms", terrain_timing_stats(cpu)}, {"prepare_ms", terrain_timing_stats(prepare)},
+                {"record_ms", terrain_timing_stats(record)}, {"gpu_ms", terrain_timing_stats(gpu)},
+                {"patches", terrain_timing_stats(patches)}, {"selection_nodes", terrain_timing_stats(nodes)},
+                {"selection_rebuilds", terrain_timing_stats(rebuilds)}, {"loading_frames", loading},
+                {"budget_frames", budget}, {"minimum_deepest_lod", minimum_lod}, {"ready_frames", 120-loading},
+                {"minimum_ready_deepest_lod", minimum_ready_lod}};
+            std::cout << row.dump() << '\n';
+            report["results"].push_back(row);
+        }
+    }
+    std::filesystem::create_directories(output.parent_path());
+    check(paths::write_json(output, report), "Source benchmark output is writable");
+}
+
+void imported_terrain(RenderProbe& probe, const std::filesystem::path& dataset, const std::filesystem::path& output) {
+    auto path = dataset;
+    if (!std::filesystem::is_directory(path)) {
+        auto pointer = paths::read_text_file(dataset);
+        check(pointer.has_value(), "Imported terrain fixture path exists");
+        path = *pointer;
+    }
+    auto source = terrain::HeightSource::open(path);
+    probe.renderer.set_height_source("Precision terrain", source);
+    probe.resize({1920, 1080});
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(precision_fixture()).accepted, "Imported GPU fixture");
+    rendering::RenderSettings settings;
+    settings.terrain_enabled = true;
+    settings.terrain_patch_limit = 1024;
+    nlohmann::json report{{"gpu", probe.vk.device_name()}, {"framebuffer", {1920, 1080}},
+        {"dataset_identity", source->domain().identity}, {"dataset_revision", source->domain().revision},
+        {"geometry_bytes", terrain::GEOMETRY_CACHE_BYTES}, {"staging_bytes", 4*1024*1024},
+        {"cache_policy", "one source/generation shared across sequential cases; only the first starts empty"},
+        {"method", "isolated serialized offscreen pass; worker I/O/baking concurrent; not application FPS"}};
+    auto camera_for = [&](double clearance, bool horizon, uint32_t frame) {
+        double angle = .15 + 100.0 * frame / (60.0 * source->info().equatorial_radius_m);
+        glm::dvec3 direction{std::sin(angle), 0, std::cos(angle)};
+        auto tile = terrain::tile_at(direction, source->info().data_level);
+        auto payload = source->read(tile);
+        double n = double(1u << tile.level);
+        double x = ((direction.x/direction.z+1)*.5*n-tile.x)*16;
+        double y = (.5*n-tile.y)*16;
+        double height = terrain::height_sample(payload, x, y);
+        auto camera = camera_at(0);
+        camera.cam_pos_rel = direction * ((source->info().equatorial_radius_m+height+clearance)*.001*KM_TO_AU);
+        camera.tracking_idx = 1;
+        camera.is_near_surface = true;
+        camera.cam_look_aim = !horizon;
+        camera.up = horizon ? direction : glm::dvec3{0, 1, 0};
+        camera.yaw_actual_deg = -angle*RAD_TO_DEG;
+        return camera;
+    };
+    for (const auto& [name, clearance, horizon] : std::vector<std::tuple<std::string, double, bool>>{
+             {"2km-down", 2000, false}, {"2km-horizon", 2000, true}, {"1m-down", 1, false}, {"1m-horizon", 1, true}}) {
+        auto camera = camera_for(clearance, horizon, 0);
+        auto start = SteadyClock::now();
+        uint32_t warm_frames = 0;
+        double cold_cpu = 0, cold_gpu = 0;
+        bool converged = false;
+        for (; warm_frames < 10000 && elapsed_ms(start) < 30000; ++warm_frames) {
+            auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
+            cold_cpu = std::max(cold_cpu, sample.cpu_ms()); cold_gpu = std::max(cold_gpu, sample.gpu_total_ms);
+            const auto& stats = probe.renderer.terrain_stats();
+            check(stats.reference_patches == 0 && stats.stream.failed == 0, "Imported misses never use procedural reconstruction");
+            if (stats.imported_patches && !stats.loading_bodies) { converged = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(converged, "Imported fixture reaches a fully ready balanced selection");
+        double readiness_ms = elapsed_ms(start);
+        uint32_t quiet = 0;
+        for (uint32_t frame = 0; frame < 1000 && quiet < 3; ++frame) {
+            measure_terrain(probe, camera, simulation.snapshot(), settings);
+            const auto& stats = probe.renderer.terrain_stats();
+            quiet = !stats.stream.pending && !stats.stream.ready && !stats.cache_bakes && !stats.loading_bodies ? quiet+1 : 0;
+            if (quiet < 3) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(quiet == 3 && !probe.renderer.terrain_stats().selection_nodes && !probe.renderer.terrain_stats().selection_rebuilds,
+              "Stationary imported terrain reuses both quadtree selections after residency stabilizes");
+        settings.exposure = 1.25f;
+        measure_terrain(probe, camera, simulation.snapshot(), settings);
+        check(!probe.renderer.terrain_stats().selection_rebuilds, "Lighting-only changes retain imported selections");
+        settings.exposure = 1;
+        settings.terrain_error_pixels = 4;
+        measure_terrain(probe, camera, simulation.snapshot(), settings);
+        check(probe.renderer.terrain_stats().selection_rebuilds > 0, "Geometric error changes invalidate imported selections");
+        settings.terrain_error_pixels = 2;
+        measure_terrain(probe, camera, simulation.snapshot(), settings);
+        std::vector<double> cpu, gpu;
+        nlohmann::json frames = nlohmann::json::array();
+        uint32_t min_lod = 24, min_ready_lod = 24, min_patches = 4096, max_patches = 0, loading_frames = 0;
+        for (uint32_t frame = 0; frame < 120; ++frame) {
+            camera = camera_for(clearance, horizon, frame);
+            auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
+            const auto& stats = probe.renderer.terrain_stats();
+            check(stats.imported_patches > 0 && stats.reference_patches == 0, "Moving imported surface retains resident coverage");
+            check(stats.patches <= 1024 && stats.cache_bakes <= 128 && stats.stream.pending <= 128 && stats.stream.ready <= 256,
+                  "Moving imported terrain respects geometry, upload and worker limits");
+            if (clearance == 1 && !stats.loading_bodies && !stats.budget_limited)
+                check(stats.deepest_level >= 21, "Ready imported near-ground views retain fine geometry");
+            cpu.push_back(sample.cpu_ms()); gpu.push_back(sample.gpu_total_ms);
+            min_lod = std::min(min_lod, stats.deepest_level);
+            if (!stats.loading_bodies) min_ready_lod = std::min(min_ready_lod, stats.deepest_level);
+            min_patches = std::min(min_patches, stats.patches); max_patches = std::max(max_patches, stats.patches);
+            loading_frames += stats.loading_bodies > 0;
+            frames.push_back({{"cpu_ms", sample.cpu_ms()}, {"gpu_ms", sample.gpu_total_ms}, {"patches", stats.patches},
+                {"lod", stats.deepest_level}, {"uploads", stats.cache_bakes}, {"loading", stats.loading_bodies},
+                {"pending", stats.stream.pending}, {"ready", stats.stream.ready}});
+        }
+        report["cases"][name] = {{"cpu_ms", terrain_timing_stats(cpu)}, {"gpu_ms", terrain_timing_stats(gpu)},
+            {"readiness_ms", readiness_ms}, {"warm_frames", warm_frames}, {"cold_cpu_max_ms", cold_cpu}, {"cold_gpu_max_ms", cold_gpu},
+            {"patches_min", min_patches}, {"patches_max", max_patches}, {"minimum_deepest_lod", min_lod},
+            {"minimum_ready_deepest_lod", min_ready_lod},
+            {"loading_frames", loading_frames}, {"worker_builds", probe.renderer.terrain_stats().stream.builds},
+            {"payload_reads", probe.renderer.terrain_stats().stream.payload_reads}, {"frames", std::move(frames)}};
+        check(probe.render(camera, simulation.snapshot(), settings) > 1.0, "Imported terrain produces visible pixels");
+        if (!horizon) check(probe.red_at(960, 540) > .001f, "Imported downward surface has no center hole");
+        std::cout << name << ": CPU " << terrain_timing_stats(cpu)["mean"] << " ms, GPU " << terrain_timing_stats(gpu)["mean"]
+                  << " ms, LOD " << min_lod << ", patches " << min_patches << ".." << max_patches << ", readiness " << readiness_ms << " ms.\n";
+    }
+    settings.terrain_debug_tiles = true;
+    for (auto direction : {glm::dvec3(0, 1, 0), glm::normalize(glm::dvec3(1, 0, 1)), glm::normalize(glm::dvec3(1, 1, 1))}) {
+        auto camera = camera_at(0);
+        camera.cam_pos_rel = direction*(source->info().equatorial_radius_m*3*.001*KM_TO_AU);
+        camera.cam_look_aim = true;
+        camera.up = std::abs(direction.y) > .9 ? glm::dvec3(0, 0, 1) : glm::dvec3(0, 1, 0);
+        probe.render(camera, simulation.snapshot(), settings);
+        for (uint32_t y = 535; y <= 545; ++y)
+            for (uint32_t x = 955; x <= 965; ++x) check(probe.red_at(x, y) > .01, "Imported resident cover meets at poles, edges and corners");
+    }
+    if (!output.empty()) {
+        std::filesystem::create_directories(output.parent_path());
+        check(paths::write_json(output, report), "Write imported terrain benchmark");
+    }
+    probe.renderer.set_height_source({}, {});
+    probe.resize(EXTENT);
+}
+
+void streaming_uploads(RenderProbe& probe) {
+    rhi::StagingUploads uploads;
+    uploads.init(probe.vk, 64);
+    auto destination = probe.vk.create_device_buffer(96, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto readback = probe.vk.create_host_buffer(96, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    for (uint32_t frame = 0; frame < 3; ++frame) {
+        VkCommandBuffer cmd;
+        uint32_t index;
+        check(probe.vk.begin_frame(cmd, index), "Begin upload frame");
+        std::array<uint32_t, 8> values;
+        values.fill(frame+1);
+        check(uploads.buffer(cmd, probe.vk, destination, frame*32, std::as_bytes(std::span{values})),
+              "Staging ranges recycle after frame-fence completion");
+        rhi::Image swap;
+        swap.handle = probe.vk.swapchain_image(index);
+        swap.view = probe.vk.swapchain_view(index);
+        swap.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        probe.vk.transition_image(cmd, swap, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        auto attachment = rhi::RenderingAttachment::clear_color(swap);
+        probe.vk.begin_rendering(cmd, probe.vk.swapchain_extent(), {&attachment, 1});
+        probe.vk.end_rendering(cmd);
+        probe.vk.transition_image(cmd, swap, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_NONE, 0);
+        probe.vk.end_frame(cmd, index);
+    }
+    probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
+        probe.vk.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferCopy copy{0, 0, 96};
+        vkCmdCopyBuffer(cmd, destination.handle, readback.handle, 1, &copy);
+        probe.vk.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    });
+    vmaInvalidateAllocation(probe.vk.allocator(), readback.allocation, 0, VK_WHOLE_SIZE);
+    auto* values = static_cast<uint32_t*>(readback.mapped);
+    for (uint32_t index = 0; index < 24; ++index) check(values[index] == index/8+1, "Multi-frame staging preserves every upload");
+    auto image = probe.vk.create_image_2d(4, 4, VK_FORMAT_R32_SFLOAT,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 2, 2);
+    probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, 1};
+        probe.vk.transition_image_range(cmd, image, range, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        std::array<float, 4> pixels{-100, 0, 123, 456};
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1};
+        copy.imageExtent = {2, 2, 1};
+        check(uploads.image(cmd, probe.vk, image, copy, std::as_bytes(std::span{pixels})), "Targeted mip/layer streaming upload");
+        probe.vk.transition_image_range(cmd, image, range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        vkCmdCopyImageToBuffer(cmd, image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle, 1, &copy);
+        probe.vk.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    });
+    vmaInvalidateAllocation(probe.vk.allocator(), readback.allocation, 0, VK_WHOLE_SIZE);
+    auto* pixels = static_cast<float*>(readback.mapped);
+    check(pixels[0] == -100 && pixels[1] == 0 && pixels[2] == 123 && pixels[3] == 456, "Signed FP32 height upload survives targeted subresource copy");
+    probe.vk.destroy_image(image);
+    probe.vk.destroy_buffer(readback);
+    probe.vk.destroy_buffer(destination);
+    uploads.shutdown(probe.vk);
 }
 
 Camera ground_trace_camera(double speed_m_s, double clearance_m, bool horizon, uint32_t frame, double start_angle,

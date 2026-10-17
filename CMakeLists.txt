@@ -158,13 +158,14 @@ target_link_libraries(StellarForge PRIVATE
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
 if(STELLAR_BUILD_TESTS)
     enable_testing()
-    add_executable(StellarTerrainTests tests/terrain_tests.cpp src/terrain/quadtree.cpp src/terrain/tile_metadata.cpp src/terrain/geometry_residency.cpp)
+    add_executable(StellarTerrainTests tests/terrain_tests.cpp src/terrain/quadtree.cpp src/terrain/tile_metadata.cpp src/terrain/geometry_residency.cpp
+        src/terrain/terrain_source.cpp src/terrain/height_stream.cpp src/core/path_utils.cpp)
     target_include_directories(StellarTerrainTests PRIVATE src)
-    target_link_libraries(StellarTerrainTests PRIVATE glm::glm)
+    target_link_libraries(StellarTerrainTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
+    target_compile_definitions(StellarTerrainTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(MINGW)
         target_link_options(StellarTerrainTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
-    add_test(NAME terrain_contracts COMMAND StellarTerrainTests)
     add_executable(StellarEclipseTests tests/eclipse_tests.cpp)
     target_include_directories(StellarEclipseTests PRIVATE src)
     target_link_libraries(StellarEclipseTests PRIVATE glm::glm)
@@ -182,7 +183,24 @@ if(STELLAR_BUILD_TESTS)
     add_test(NAME benchmark_contracts COMMAND StellarBenchmarkTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/benchmark-contracts")
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME terrain_contracts COMMAND StellarTerrainTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt")
+        add_test(NAME terrain_importer_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/terrain_import_tests.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests")
+        set_tests_properties(terrain_importer_contracts PROPERTIES FIXTURES_SETUP terrain_fixture)
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import numpy; from PIL import Image"
+            RESULT_VARIABLE STELLAR_SURFACE_PYTHON_RESULT OUTPUT_QUIET ERROR_QUIET)
+        if(STELLAR_SURFACE_PYTHON_RESULT EQUAL 0)
+            set(STELLAR_SURFACE_FIXTURES_AVAILABLE TRUE)
+            add_test(NAME surface_map_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/surface_map_tests.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scratch/surface-tests")
+            set_tests_properties(surface_map_contracts PROPERTIES FIXTURES_SETUP surface_fixture)
+        else()
+            message(STATUS "Surface-map fixtures disabled: install Python Pillow and NumPy to enable them")
+        endif()
+        set_tests_properties(terrain_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture)
         add_test(NAME benchmark_comparison COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_comparison_tests.py")
+    else()
+        add_test(NAME terrain_contracts COMMAND StellarTerrainTests)
     endif()
     add_executable(StellarStateTests
         tests/state_tests.cpp
@@ -306,15 +324,30 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/terrain/terrain_renderer.cpp
         src/terrain/geometry_cache.cpp
         src/terrain/geometry_residency.cpp
+        src/terrain/terrain_source.cpp
+        src/terrain/height_stream.cpp
+        src/terrain/surface_textures.cpp
         src/rendering/star_catalog.cpp
         src/rhi/shader_cache.cpp
         src/rhi/vk_context.cpp
+        src/rhi/staging_uploads.cpp
     )
     target_include_directories(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,INCLUDE_DIRECTORIES>)
     target_compile_definitions(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,COMPILE_DEFINITIONS>)
     target_link_libraries(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
     target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
     add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME terrain_imported_contracts COMMAND StellarRenderingTests --terrain-imported
+            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/imported-gpu.json")
+        set_tests_properties(terrain_imported_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture TIMEOUT 150)
+        if(STELLAR_SURFACE_FIXTURES_AVAILABLE)
+            add_test(NAME surface_rendering_contracts COMMAND StellarRenderingTests --surface-contracts
+                "${CMAKE_CURRENT_SOURCE_DIR}/scratch/surface-tests/fixture-path.txt")
+            set_tests_properties(surface_rendering_contracts PROPERTIES FIXTURES_REQUIRED surface_fixture TIMEOUT 120)
+        endif()
+    endif()
     add_executable(StellarOrbitRenderingTests
         tests/orbit_rendering_tests.cpp
         src/ephemeris/ias15.cpp

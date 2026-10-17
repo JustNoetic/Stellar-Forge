@@ -12,6 +12,8 @@
 | Panel visibility, widths and scale | App-owned `WorkspaceSettings` | `UiSystem` | UI configuration edits |
 | Inspector selection, draft values, validation messages | App-owned `WorkspaceState` | UI | Selection events, draft edits, Apply/Revert |
 | GPU allocations, pipelines, per-frame upload buffers | Owning renderer/RHI subsystem | Responsible rendering passes | Explicit subsystem lifecycle; independent of simulation definitions |
+| Imported elevation identity, immutable geographic metadata, payload jobs and residency | Renderer-owned `HeightSource` / `HeightStream` / geometry cache; `data/surfaces.json` or legacy `data/terrain.json` binding | Terrain selection and drawing; worker reads immutable source requests | Explicit source binding/replacement; dataset revision keys; residency/envelope revisions invalidate renderer-owned selection/description caches; generation changes clear old tables; bounded worker publication; no mutation of simulation snapshots |
+| Surface image identity, tile reads and GPU page ownership | Renderer-owned `SurfaceTextures` / immutable `ColorSource` bindings; `data/surfaces.json` | Sphere/terrain fragment shading; one worker reads source packs | Source identity/revision and binding index key pages; shared body-fixed pole/spin basis; bounded queues, pinned roots and parent fallback; per-frame page buffers; graphics-queue image barriers and completion-managed staging |
 
 ## Definitions, state and snapshots
 

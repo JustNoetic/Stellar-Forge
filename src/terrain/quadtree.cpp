@@ -1,5 +1,6 @@
 #include "terrain/quadtree.hpp"
 #include "terrain/tile_metadata.hpp"
+#include "terrain/terrain_source.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -10,6 +11,10 @@ namespace sf::terrain {
 
 uint64_t TileId::key() const noexcept {
     return (uint64_t(face) << 61) | (uint64_t(level) << 56) | (uint64_t(x) << 28) | y;
+}
+
+TileId TileId::from_key(uint64_t key) noexcept {
+    return {uint32_t(key >> 61), uint32_t((key >> 56) & 31), uint32_t((key >> 28) & 0xfffffff), uint32_t(key & 0xfffffff)};
 }
 
 TileId TileId::parent() const noexcept {
@@ -118,6 +123,10 @@ int neighbor(const LeafMap& leaves, TileId tile, uint32_t edge) {
 }
 
 Selection select(const SelectionView& input, TileMetadataCache* metadata) {
+    return select(input, ProceduralSource{metadata});
+}
+
+Selection select(const SelectionView& input, const TerrainSource& source, const TileAvailability& availability) {
     SelectionView view = input;
     view.max_level = std::min(view.max_level, MAX_LEVEL);
     view.max_patches = std::clamp(view.max_patches, 6u, MAX_PATCHES);
@@ -141,19 +150,17 @@ Selection select(const SelectionView& input, TileMetadataCache* metadata) {
     std::priority_queue<Request> queue;
     std::vector<size_t> splits;
     std::vector<Candidate> children;
+    std::vector<TileId> prerequisites;
     splits.reserve(64);
     children.reserve(256);
+    prerequisites.reserve(256);
     auto evaluate = [&](TileId tile, Candidate& candidate) {
         ++result.visited;
-        TileMetadata local;
-        if (view.height_amplitude > 0.0) local = metadata ? metadata->get(tile) : tile_metadata(tile);
-        auto bound = view.height_amplitude > 0.0 ? surface_bounds(tile, view.polar_ratio, view.height_amplitude, local)
-                                               : bounds(tile, view.polar_ratio, 0.0);
+        auto description = source.describe(tile, view.polar_ratio, view.height_amplitude);
+        auto bound = description.bounds;
         if (!visible(bound, view)) return false;
-        double coefficient = surface_error_coefficient(view.polar_ratio, view.height_amplitude, local);
-        double width = std::ldexp(2.0, -int(tile.level));
         double distance = std::max(glm::length(bound.center - view.eye) - bound.radius, 1e-12);
-        double error = coefficient * width * width / (GRID_CELLS * GRID_CELLS) * view.focal_pixels / distance;
+        double error = description.geometric_error * view.focal_pixels / distance;
         candidate = {tile, error};
         return true;
     };
@@ -164,8 +171,15 @@ Selection select(const SelectionView& input, TileMetadataCache* metadata) {
     };
     for (uint32_t face = 0; face < 6; ++face) {
         Candidate candidate;
-        if (evaluate({face}, candidate)) add(candidate);
+        if (evaluate({face}, candidate)) {
+            if (availability.ready && !availability.ready({face})) {
+                if (availability.request) availability.request({face});
+                result.loading_limited = true;
+            }
+            add(candidate);
+        }
     }
+    if (result.loading_limited) return result;
     auto schedule = [&](auto&& self, size_t index) -> void {
         if (nodes[index].scheduled) return;
         nodes[index].scheduled = true;
@@ -178,7 +192,9 @@ Selection select(const SelectionView& input, TileMetadataCache* metadata) {
         for (uint32_t y = 0; y < 2; ++y) {
             for (uint32_t x = 0; x < 2; ++x) {
                 Candidate candidate;
-                if (evaluate({tile.face, tile.level + 1, tile.x * 2 + x, tile.y * 2 + y}, candidate)) children.push_back(candidate);
+                TileId child{tile.face, tile.level + 1, tile.x * 2 + x, tile.y * 2 + y};
+                if (availability.ready || availability.request) prerequisites.push_back(child);
+                if (evaluate(child, candidate)) children.push_back(candidate);
             }
         }
     };
@@ -190,11 +206,27 @@ Selection select(const SelectionView& input, TileMetadataCache* metadata) {
         if (request.error <= view.target_error_pixels || tile.level >= view.max_level) continue;
         splits.clear();
         children.clear();
+        prerequisites.clear();
         schedule(schedule, request.index);
         if (leaves.size() - splits.size() + children.size() > view.max_patches) {
             result.budget_limited = true;
             break;
         }
+        bool ready = true;
+        if (availability.ready) {
+            for (auto child : prerequisites) {
+                if (!availability.ready(child)) {
+                    ready = false;
+                    if (availability.request) availability.request(child);
+                }
+            }
+        }
+        if (!ready) {
+            result.loading_limited = true;
+            for (size_t index : splits) nodes[index].scheduled = false;
+            continue;
+        }
+        if (!availability.ready && availability.request) for (auto child : prerequisites) availability.request(child);
         for (size_t index : splits) {
             nodes[index].active = false;
             leaves.erase(nodes[index].candidate.tile.key());

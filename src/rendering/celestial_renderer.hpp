@@ -5,6 +5,7 @@
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
 #include "terrain/terrain_renderer.hpp"
+#include "terrain/surface_textures.hpp"
 #include <array>
 #include <vector>
 #include <glm/glm.hpp>
@@ -39,7 +40,7 @@ struct alignas(16) SceneCelestialUBO {
 
 class CelestialRenderer {
 public:
-    void init(rhi::VkContext& ctx);
+    void init(rhi::VkContext& ctx, bool load_surface_assets = true);
     void shutdown(rhi::VkContext& ctx);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                  const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
@@ -47,6 +48,11 @@ public:
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
+    const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
+    void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
+    void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
+        terrain_.set_height_source(std::move(body), std::move(source));
+    }
 
 private:
     void build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors, uint32_t stacks);
@@ -64,6 +70,7 @@ private:
     rhi::Pipeline sphere_pipeline_{};
     rhi::Pipeline point_pipeline_{};
     terrain::TerrainRenderer terrain_;
+    terrain::SurfaceTextures textures_;
 };
 
 } // namespace sf::rendering

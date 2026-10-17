@@ -24,6 +24,9 @@ struct TerrainStats {
     uint32_t cache_bakes = 0;
     uint32_t cached_patches = 0;
     uint32_t reference_patches = 0;
+    uint32_t imported_patches = 0;
+    uint32_t loading_bodies = 0;
+    StreamStats stream;
 };
 
 struct alignas(32) PatchGPU {
@@ -54,7 +57,7 @@ struct alignas(16) CachedPatchGPU {
 
 class TerrainRenderer {
 public:
-    void init(rhi::VkContext& ctx);
+    void init(rhi::VkContext& ctx, bool load_config = true);
     void shutdown(rhi::VkContext& ctx);
     void prepare(rhi::VkContext& ctx, const Camera& camera, const ephemeris::SystemSnapshot& system,
                  const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count);
@@ -62,11 +65,18 @@ public:
     void bake(VkCommandBuffer cmd, rhi::VkContext& ctx) { cache_.bake(cmd, ctx); }
     bool covers(uint32_t body) const noexcept;
     const TerrainStats& stats() const noexcept { return stats_; }
+    void set_height_source(std::string body, std::shared_ptr<const HeightSource> source);
+    float relief_extent_au(uint32_t body) const noexcept;
 
 private:
     struct SelectionEntry {
         uint64_t generation = 0;
         uint64_t geometry_revision = 0;
+        uint64_t bounds_revision = 0;
+        uint64_t residency_revision = 0;
+        bool desired_valid = false;
+        std::vector<TileId> prefetch;
+        std::unordered_map<uint64_t, SurfaceTile> descriptions;
         SelectionView view;
         Selection selection;
     };
@@ -86,7 +96,12 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> cached_patches_{};
     std::vector<DrawPatch> prepared_;
     std::vector<uint32_t> bodies_;
+    std::vector<std::pair<uint32_t, float>> relief_extents_;
+    std::string source_body_;
+    std::unique_ptr<HeightStream> stream_;
+    std::string reported_error_;
     std::unordered_map<uint32_t, SelectionEntry> selections_;
+    uint64_t selection_generation_ = 0;
     GeometryCache cache_;
     TileMetadataCache metadata_;
     TerrainStats stats_{};

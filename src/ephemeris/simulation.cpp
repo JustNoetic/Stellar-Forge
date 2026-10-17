@@ -771,9 +771,25 @@ void Simulation::prepare_render_state(bool definitions_changed) {
         render.velocity = ecliptic_to_render(snapshot_.motions_[i].velocity);
         if (definitions_changed) render.pole = glm::normalize(ecliptic_to_render(body.pole_ecl));
         double w0 = body.w0_deg * DEG_TO_RAD;
-        if (body.tidally_locked && body.parent_idx >= 0) {
-            auto relative = render.position.value - snapshot_.render_[body.parent_idx].position.value;
-            render.spin_angle_rad = std::atan2(relative.z, relative.x) + PI + w0;
+        if (body.tidally_locked && body.parent_idx >= 0 && static_cast<size_t>(body.parent_idx) < snapshot_.size()) {
+            glm::dvec3 to_parent = snapshot_.render_[body.parent_idx].position.value - render.position.value;
+            glm::dvec3 pole = glm::length(render.pole) > 1e-12 ? glm::normalize(render.pole) : glm::dvec3(0.0, 1.0, 0.0);
+            glm::dvec3 ref = (std::abs(pole.x) < 0.9) ? glm::dvec3(1.0, 0.0, 0.0) : glm::dvec3(0.0, 0.0, 1.0);
+            glm::dvec3 x_axis = glm::normalize(ref - pole * glm::dot(ref, pole));
+            glm::dvec3 z_axis = glm::cross(x_axis, pole);
+
+            glm::dvec3 d_eq = to_parent - pole * glm::dot(to_parent, pole);
+            double len2 = glm::dot(d_eq, d_eq);
+            if (len2 > 1e-24) {
+                glm::dvec3 d_dir = d_eq / std::sqrt(len2);
+                double dx = glm::dot(d_dir, x_axis);
+                double dz = glm::dot(d_dir, z_axis);
+                render.spin_angle_rad = std::atan2(dx, dz) + w0;
+                render.spin_angle_rad = std::fmod(render.spin_angle_rad, TWO_PI);
+                if (render.spin_angle_rad < 0.0) render.spin_angle_rad += TWO_PI;
+            } else {
+                render.spin_angle_rad = w0;
+            }
         } else if (std::abs(body.rotation_period_hr) > 1e-9) {
             double omega = TWO_PI / (body.rotation_period_hr * 3600.0);
             render.spin_angle_rad = std::fmod(w0 + omega * seconds, TWO_PI);

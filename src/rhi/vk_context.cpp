@@ -7,6 +7,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace sf::rhi {
 
@@ -468,6 +469,7 @@ bool VkContext::begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_id
         ScopedTimer timer(timings ? &timings->fence_wait_ms : nullptr);
         VK_CHECK(vkWaitForFences(device_, 1, &frame.in_flight_fence, VK_TRUE, UINT64_MAX));
     }
+    completed_serial_ = std::max(completed_serial_, frame.completion_serial);
 
     VkResult acq;
     {
@@ -485,6 +487,8 @@ bool VkContext::begin_frame(VkCommandBuffer& out_cmd, uint32_t& out_swapchain_id
 
     resolve_gpu_timers(frame);
     frame.serial = submitted_frames_;
+    recording_serial_ = next_serial_++;
+    frame.completion_serial = recording_serial_;
 
     VK_CHECK(vkResetFences(device_, 1, &frame.in_flight_fence));
     VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
@@ -545,6 +549,7 @@ void VkContext::end_frame(VkCommandBuffer cmd, uint32_t swapchain_idx, FrameHost
 
     frame_index_ = (frame_index_ + 1) % FRAMES_IN_FLIGHT;
     ++submitted_frames_;
+    recording_serial_ = 0;
 }
 
 Buffer VkContext::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage,
@@ -715,6 +720,8 @@ void VkContext::destroy_image(Image& image) {
 }
 
 void VkContext::immediate_submit(const std::function<void(VkCommandBuffer)>& fn) {
+    if (recording_serial_ != 0) throw std::logic_error("Immediate submission during frame recording is unsupported");
+    recording_serial_ = next_serial_++;
     VK_CHECK(vkResetFences(device_, 1, &imm_fence_));
     VK_CHECK(vkResetCommandBuffer(imm_cmd_, 0));
 
@@ -735,6 +742,29 @@ void VkContext::immediate_submit(const std::function<void(VkCommandBuffer)>& fn)
 
     VK_CHECK(vkQueueSubmit2(graphics_queue_, 1, &sub_info, imm_fence_));
     VK_CHECK(vkWaitForFences(device_, 1, &imm_fence_, VK_TRUE, UINT64_MAX));
+    completed_serial_ = recording_serial_;
+    recording_serial_ = 0;
+}
+
+void VkContext::transition_image_range(VkCommandBuffer cmd, const Image& image, VkImageSubresourceRange range,
+                                       VkImageLayout old_layout, VkImageLayout new_layout,
+                                       VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                                       VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = src_stage;
+    barrier.srcAccessMask = src_access;
+    barrier.dstStageMask = dst_stage;
+    barrier.dstAccessMask = dst_access;
+    barrier.oldLayout = old_layout;
+    barrier.newLayout = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image.handle;
+    barrier.subresourceRange = range;
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
 void VkContext::transition_image(VkCommandBuffer cmd, Image& image, VkImageLayout new_layout,

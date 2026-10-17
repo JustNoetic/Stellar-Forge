@@ -1,6 +1,7 @@
 #include "rendering/celestial_renderer.hpp"
 #include "rendering/eclipse_candidates.hpp"
 #include "core/constants.hpp"
+#include "core/path_utils.hpp"
 #include "rhi/shader_cache.hpp"
 
 #include <algorithm>
@@ -21,8 +22,9 @@ struct SphereVertex {
 
 } // namespace
 
-void CelestialRenderer::init(rhi::VkContext& ctx) {
+void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     build_sphere_mesh(ctx, 64, 32);
+    textures_.init(ctx);
 
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         scene_ubos_[i] = ctx.create_host_buffer(sizeof(SceneCelestialUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -36,6 +38,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx) {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     rhi::GraphicsPipelineDesc sphere_desc{};
@@ -72,11 +76,17 @@ void CelestialRenderer::init(rhi::VkContext& ctx) {
     point_desc.cull_mode = VK_CULL_MODE_NONE;
 
     point_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
-    terrain_.init(ctx);
+    terrain_.init(ctx, load_surface_assets);
+    if (load_surface_assets) {
+        auto heights = textures_.load_catalog(paths::external_path("data", "surfaces.json"));
+        if (heights.size() > 1) throw std::runtime_error("Only one imported elevation body is supported in this version");
+        if (!heights.empty()) terrain_.set_height_source(heights[0].first, terrain::HeightSource::open(heights[0].second));
+    }
 }
 
 void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     terrain_.shutdown(ctx);
+    textures_.shutdown(ctx);
     rhi::ShaderCache::destroy_pipeline(ctx, point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
@@ -135,6 +145,7 @@ void CelestialRenderer::build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors,
 void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
+    textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled);
     terrain_.prepare(ctx, cam, sys, settings, extent, count);
     terrain_.bake(cmd, ctx);
 }
@@ -209,7 +220,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         if (radius_px <= 1.49f) continue;
         auto receiver_bounds = receiver.pos_radius;
         if (receiver.surface_flags.x != 0u)
-            receiver_bounds.w += std::min(settings.terrain_height_km * float(KM_TO_AU), receiver.pos_radius.w * 0.01f);
+            receiver_bounds.w += terrain_.relief_extent_au(i);
         for (uint32_t s = 0; s < ubo.num_stars; ++s) {
             uint32_t range = (i * ubo.num_stars + s) * 2;
             uint32_t start = static_cast<uint32_t>(eclipse_words_.size());
@@ -240,6 +251,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
         rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU)),
         rhi::PushDescriptorWrite::storage_buffer(2, eclipse_buffer, 0, eclipse_bytes),
+        rhi::PushDescriptorWrite::sampled_image(5, textures_.image(), ctx.sampler_linear_clamp()),
+        rhi::PushDescriptorWrite::storage_buffer(6, textures_.pages(f_idx)),
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipeline_.handle);

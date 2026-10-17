@@ -1,6 +1,9 @@
 #include "terrain/quadtree.hpp"
 #include "terrain/geometry_residency.hpp"
 #include "terrain/tile_metadata.hpp"
+#include "terrain/height_stream.hpp"
+#include "core/path_utils.hpp"
+#include "rhi/upload_ring.hpp"
 #include "rendering/render_settings.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
@@ -11,6 +14,9 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
+#include <thread>
+#include <fstream>
 
 namespace {
 
@@ -346,7 +352,7 @@ void geometry_residency() {
           "Duplicate jobs coalesce and excess misses use the reference path");
     auto next = limited.request(std::vector{a, b}, 1);
     check(next.hits == 1 && next.bakes.size() == 1 && next.slots[1] >= 0, "Deferred geometry converges without invalidating existing entries");
-    for (uint32_t field = 0; field < 6; ++field) {
+    for (uint32_t field = 0; field < 8; ++field) {
         auto changed = a;
         if (field == 0) ++changed.generation;
         if (field == 1) ++changed.geometry_revision;
@@ -354,15 +360,283 @@ void geometry_residency() {
         if (field == 3) ++changed.body;
         if (field == 4) changed.polar_ratio = 0.8;
         if (field == 5) changed.height_amplitude = 0.002;
+        if (field == 6) changed.source.identity = 123;
+        if (field == 7) changed.source.revision = 123;
         check(limited.request(std::vector{changed}, 1).bakes.size() == 1, "Geometry keys include source domain, shape and relief");
     }
     GeometryResidency zero(0);
     check(zero.request(std::vector{a}, 1).slots[0] == -1, "Zero-capacity cache falls back safely");
 }
 
+void staging_residency() {
+    sf::rhi::UploadRing ring(64);
+    check(ring.allocate(32, 1, 0) == 0, "Staging starts at the beginning");
+    check(ring.allocate(32, 2, 0) == 32, "Independent submissions own disjoint staging ranges");
+    check(!ring.allocate(16, 3, 0), "Uncompleted staging is never overwritten");
+    check(ring.allocate(16, 3, 1) == 0, "Completed ranges can wrap and be reused");
+    check(!ring.allocate(48, 4, 1), "Wrap padding respects live allocations");
+    check(ring.allocate(48, 4, 3) == 16, "Draining completion frees the whole ring");
+    check(!ring.allocate(65, 5, 4), "Oversized staging requests are rejected");
 }
 
-int main() {
+void resident_refinement() {
+    SelectionView view;
+    view.cull = false;
+    view.max_patches = 128;
+    view.target_error_pixels = .2;
+    view.max_level = 4;
+    std::unordered_set<uint64_t> resident;
+    std::vector<TileId> pending;
+    auto choose = [&] {
+        pending.clear();
+        return select(view, ProceduralSource{}, {
+            [&](TileId tile) { return resident.contains(tile.key()); },
+            [&](TileId tile) { pending.push_back(tile); }});
+    };
+    check(choose().patches.empty(), "No terrain cover is advertised before roots are ready");
+    for (uint32_t face = 0; face < 6; ++face) resident.insert(TileId{face}.key());
+    auto roots = choose();
+    check(roots.patches.size() == 6 && roots.loading_limited, "Resident parents cover delayed children");
+    resident.insert(pending.front().key());
+    check(choose().patches.size() == 6, "A partially ready sibling group cannot remove its parent");
+    for (int frame = 0; frame < 80; ++frame) {
+        auto selection = choose();
+        topology(selection);
+        check(selection.patches.size() <= view.max_patches, "Loading respects the same patch budget");
+        double area = 0;
+        for (const auto& patch : selection.patches) area += std::ldexp(1.0, -int(2*patch.tile.level));
+        check(std::abs(area-6) < 1e-12, "Loading retains complete nonoverlapping coverage");
+        if (pending.empty()) break;
+        for (size_t i = 0; i < pending.size(); i += 3) resident.insert(pending[i].key());
+    }
+    check(choose().deepest_level > 0, "Out-of-order payload readiness eventually refines terrain");
+    GeometryResidency cache(64);
+    auto key_for = [](TileId tile) { GeometryKey key; key.tile = tile.key(); return key; };
+    view.max_patches = 32;
+    uint32_t admissions = 0;
+    for (uint32_t frame = 0; frame < 100; ++frame) {
+        view.eye = glm::normalize(glm::dvec3(std::cos(frame*.17), .2, std::sin(frame*.17)))*1.01;
+        std::vector<GeometryKey> keys;
+        for (uint32_t face = 0; face < 6; ++face) keys.push_back(key_for({face}));
+        std::vector<TileId> requests;
+        auto selection = select(view, ProceduralSource{}, {
+            [&](TileId tile) { return cache.find(key_for(tile)) >= 0; },
+            [&](TileId tile) { requests.push_back(tile); }});
+        if (!selection.patches.empty()) topology(selection);
+        for (const auto& patch : selection.patches) {
+            auto tile = patch.tile;
+            for (;;) {
+                keys.push_back(key_for(tile));
+                if (!tile.level) break;
+                tile = tile.parent();
+            }
+        }
+        for (auto tile : requests) keys.push_back(key_for(tile));
+        auto plan = cache.request(keys, 8);
+        admissions += uint32_t(plan.bakes.size());
+        check(cache.size() <= 64, "Resident-parent planning stays bounded through eviction");
+        for (uint32_t face = 0; face < 6; ++face) check(cache.find(key_for({face})) >= 0, "Root coverage survives geometry eviction");
+        for (const auto& patch : selection.patches) check(cache.find(key_for(patch.tile)) >= 0, "Cache admission preserves every current draw");
+    }
+    check(admissions > 64, "Moving residency test exercises slot eviction and reuse");
+}
+
+void imported_error_bounds(const HeightSource& source) {
+    std::unordered_map<uint64_t, HeightTile> payloads;
+    auto point = [&](uint32_t face, double u, double v) {
+        auto direction = glm::normalize(cube_vector(face, u, v));
+        auto address = tile_at(direction, source.info().data_level);
+        auto a = glm::abs(direction);
+        glm::dvec2 uv;
+        switch (address.face) {
+        case 0: uv = {-direction.z/a.x, direction.y/a.x}; break;
+        case 1: uv = {direction.z/a.x, direction.y/a.x}; break;
+        case 2: uv = {direction.x/a.y, -direction.z/a.y}; break;
+        case 3: uv = {direction.x/a.y, direction.z/a.y}; break;
+        case 4: uv = {direction.x/a.z, direction.y/a.z}; break;
+        default: uv = {-direction.x/a.z, direction.y/a.z}; break;
+        }
+        if (!payloads.contains(address.key())) payloads.emplace(address.key(), source.read(address));
+        double n = double(1u << address.level);
+        double h = height_sample(payloads.at(address.key()), ((uv.x+1)*.5*n-address.x)*16, ((uv.y+1)*.5*n-address.y)*16);
+        auto scale = glm::dvec3(1, source.info().polar_ratio, 1);
+        return direction*scale+glm::normalize(direction/scale)*(h/source.info().equatorial_radius_m);
+    };
+    for (uint32_t face = 0; face < 6; ++face) for (uint32_t level : {0u, 1u, 2u, 3u, 6u, 12u, 24u}) {
+        uint32_t n = 1u << level;
+        for (uint32_t tx : {0u, n/2, n-1}) for (uint32_t ty : {0u, n/2, n-1}) {
+            TileId tile{face, level, tx, ty};
+            double width = std::ldexp(2.0, -int(level));
+            auto description = source.describe(tile, source.info().polar_ratio, 0);
+            for (uint32_t stride : {1u, 2u, 4u}) {
+                if (stride > (1u << std::min(level, 2u))) continue;
+                double error = source.approximation_error(tile, stride);
+                for (uint32_t x : {0u, 8u, 16-stride}) for (uint32_t y : {0u, 8u, 16-stride}) {
+                    double u = -1+(tx+double(x)/16)*width, v = -1+(ty+double(y)/16)*width;
+                    double step = width*stride/16;
+                    auto a = point(face, u, v), b = point(face, u+step, v);
+                    auto c = point(face, u, v+step), d = point(face, u+step, v+step);
+                    for (auto weights : {glm::dvec3(1./3), glm::dvec3(.1,.2,.7), glm::dvec3(.8,.15,.05)}) {
+                        auto sample = point(face, u+step*weights.y, v+step*weights.z);
+                        auto upper = point(face, u+step*(weights.x+weights.y), v+step*(weights.y+weights.z));
+                        check(glm::length(sample-(a*weights.x+b*weights.y+c*weights.z)) <= error+2e-15 &&
+                              glm::length(upper-(b*weights.x+d*weights.y+c*weights.z)) <= error+2e-15,
+                              "Imported error bounds contain fine, parent and grandparent triangles on every face and oblate shape");
+                        check(glm::length(sample-description.bounds.center) <= description.bounds.radius+2e-15,
+                              "Imported bounds contain sampled interiors at edges, poles and LOD24");
+                    }
+                }
+            }
+        }
+    }
+    for (uint32_t level = 0; level <= MAX_LEVEL; ++level) {
+        double shared = source.morph_error(level);
+        for (uint32_t face = 0; face < 6; ++face)
+            check(shared >= source.approximation_error({face, level, 0, 0}), "Shared morph errors contain local fine-grid errors");
+        if (level) check(shared <= source.morph_error(level-1), "Shared morph errors decrease with level");
+    }
+}
+
+void imported_source(const std::filesystem::path& pointer) {
+    auto path = sf::paths::read_text_file(pointer);
+    check(path.has_value(), "Imported fixture path exists");
+    auto source = HeightSource::open(*path);
+    check(source->info().minimum_m < 0 && source->info().maximum_m > 0, "Imported signed heights retain valleys and peaks");
+    check(source->compatible(6378137, 1-1/298.257223563), "Dataset shape matches its reference ellipsoid");
+    check(!source->compatible(6000000, 1), "Incompatible body edits cannot reuse geographic metadata");
+    imported_error_bounds(*source);
+    auto flat = HeightSource::open(std::filesystem::path(*path).parent_path()/"flat");
+    imported_error_bounds(*flat);
+    check(flat->approximation_error({4}) < 1.01*std::pow(2.0/GRID_CELLS,2), "Flat imported terrain avoids the old inflated curvature allowance");
+    auto revisions = HeightSource::open(*path);
+    check(revisions->bounds_revision() == 0, "Metadata-only source starts without resident payload envelopes");
+    revisions->read({4, revisions->info().data_level, 0, 0});
+    auto first_bounds_revision = revisions->bounds_revision();
+    check(first_bounds_revision > 0, "New payload envelopes invalidate derived selection bounds");
+    revisions->read({4, revisions->info().data_level, 0, 0});
+    check(revisions->bounds_revision() == first_bounds_revision, "Resident envelope hits retain the selection domain");
+    for (const auto& record : source->records()) {
+        auto payload = source->read(record.tile);
+        for (uint32_t y = 0; y <= GRID_CELLS; ++y)
+            for (uint32_t x = 0; x <= GRID_CELLS; ++x) {
+                double h = payload.heights_m[(y+1)*HEIGHT_SIDE+x+1];
+                check(h >= record.minimum_m-1e-5 && h <= record.maximum_m+1e-5, "Imported metadata contains its payload");
+            }
+    }
+    {
+        double angle = .15;
+        glm::dvec3 direction{std::sin(angle), 0, std::cos(angle)};
+        auto tile = tile_at(direction, source->info().data_level);
+        auto payload = source->read(tile);
+        double n = double(1u << tile.level);
+        double height = height_sample(payload, ((direction.x/direction.z+1)*.5*n-tile.x)*16, (.5*n-tile.y)*16);
+        SelectionView view;
+        view.eye = direction*(1+(height+1)/6378137);
+        view.view_from_local = glm::dmat3(glm::lookAt(view.eye, glm::dvec3(0), glm::dvec3(0, 1, 0)));
+        view.focal_pixels = 935;
+        view.tan_half_fov_y = std::tan(30.0*std::acos(-1)/180);
+        view.tan_half_fov_x = view.tan_half_fov_y*1920/1080;
+        view.polar_ratio = source->info().polar_ratio;
+        view.height_amplitude = .001;
+        auto selection = select(view, *source);
+        std::cout << "Imported ground selector: " << selection.patches.size() << " patches, LOD " << selection.deepest_level << ".\n";
+        check(selection.deepest_level >= 21, "Metadata-only selection retains meter-scale imported detail");
+        check(!selection.budget_limited && selection.patches.size() < 128, "Resident virtual bounds avoid spurious near-ground refinement");
+        std::unordered_map<uint64_t, HeightTile> payloads;
+        auto point = [&](double u, double v) {
+            auto d = glm::normalize(cube_vector(4, u, v));
+            auto address = tile_at(d, source->info().data_level);
+            if (!payloads.contains(address.key())) payloads.emplace(address.key(), source->read(address));
+            double h = height_sample(payloads.at(address.key()), ((u+1)*.5*n-address.x)*16, ((v+1)*.5*n-address.y)*16);
+            auto scale = glm::dvec3(1, view.polar_ratio, 1);
+            return d*scale+glm::normalize(d/scale)*(h/6378137);
+        };
+        for (uint32_t level : {0u, 2u, 6u, 18u, 24u}) {
+            auto address = tile_at(direction, level);
+            auto description = source->describe(address, view.polar_ratio, 0);
+            double width = std::ldexp(2.0, -int(level));
+            for (uint32_t y = 0; y < 16; ++y) {
+                for (uint32_t x = 0; x < 16; ++x) {
+                    double u = -1+(address.x+double(x)/16)*width;
+                    double v = -1+(address.y+double(y)/16)*width;
+                    double step = width/16;
+                    auto a = point(u, v), b = point(u+step, v), c = point(u, v+step);
+                    auto sample = point(u+step/3, v+step/3);
+                    check(glm::length(sample-description.bounds.center) <= description.bounds.radius+1e-12,
+                          "Imported displaced bounds contain reconstructed interiors through LOD24");
+                    check(glm::length(sample-(a+b+c)/3.0) <= description.geometric_error+1e-12,
+                          "Imported geometric error contains oblate triangle approximation");
+                }
+            }
+        }
+    }
+    HeightStream stream(source, 16, 8);
+    for (uint32_t face = 0; face < 6; ++face) stream.request({face});
+    auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(10);
+    while (stream.stats().ready < 6 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    auto ready = stream.completed();
+    check(ready.size() == 6 && stream.stats().failed == 0, "Bounded worker loads and bakes root coverage");
+    struct Sample { glm::dvec3 position, normal; };
+    std::unordered_map<std::string, Sample> edges;
+    for (const auto& [tile, geometry] : ready) {
+        auto anchor = ellipsoid_point(tile.face, 0, 0, source->info().polar_ratio);
+        for (uint32_t y = 0; y <= 16; ++y) {
+            for (uint32_t x = 0; x <= 16; ++x) {
+                const auto& vertex = (*geometry)[y*17+x];
+                check(std::abs(glm::length(glm::vec3(vertex.normal))-1) < 1e-5, "Resident heights yield finite unit normals");
+                if (x != 0 && y != 0 && x != 16 && y != 16) continue;
+                auto p = cube_vector(tile.face, -1+double(x)/8, -1+double(y)/8);
+                std::string key = std::to_string(int(p.x*8))+","+std::to_string(int(p.y*8))+","+std::to_string(int(p.z*8));
+                Sample sample{anchor+glm::dvec3(vertex.position), glm::dvec3(vertex.normal)};
+                if (auto prior = edges.find(key); prior != edges.end()) {
+                    check(glm::length(prior->second.position-sample.position)*6378137 < .6, "FP32 patch-local geometry meets across cube faces");
+                    check(glm::length(prior->second.normal-sample.normal) < 1e-6, "Canonical normal evaluation matches at poles and cube corners");
+                } else edges.emplace(key, sample);
+            }
+        }
+    }
+    for (uint32_t x = 0; x < 100; ++x) stream.request({0, 8, x, 0});
+    check(stream.stats().pending <= 8 && stream.stats().ready <= 16, "Producer and completed queues stay bounded");
+    HeightStream small(source, 2, 4);
+    for (uint32_t face = 0; face < 3; ++face) small.request({face});
+    deadline = std::chrono::steady_clock::now()+std::chrono::seconds(10);
+    while (small.stats().builds < 3 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(small.stats().builds == 3 && small.stats().ready == 2, "Completed geometry evicts within its explicit CPU budget");
+    auto copy = pointer.parent_path()/("validation-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::copy(*path, copy, std::filesystem::copy_options::recursive);
+    auto manifest = *sf::paths::read_json(copy/"manifest.json");
+    for (double polar : {.05, .5, 1.0}) {
+        auto altered = manifest;
+        altered["polar_ratio"] = polar;
+        altered["revision"] = source->domain().revision+2;
+        check(sf::paths::write_json(copy/"manifest.json", altered), "Write oblate error fixture");
+        imported_error_bounds(*HeightSource::open(copy));
+    }
+    manifest["revision"] = source->domain().revision+1;
+    check(sf::paths::write_json(copy/"manifest.json", manifest), "Write source replacement fixture");
+    auto changed = HeightSource::open(copy);
+    check(changed->domain() != source->domain(), "Source revisions form independent cache domains");
+    {
+        std::fstream payload(copy/"heights.bin", std::ios::in|std::ios::out|std::ios::binary);
+        char byte;
+        payload.read(&byte, 1);
+        byte ^= 1;
+        payload.seekp(0);
+        payload.write(&byte, 1);
+    }
+    bool rejected = false;
+    try { changed->read({0}); } catch (const std::exception&) { rejected = true; }
+    check(rejected, "Corrupt height payloads are rejected before becoming resident");
+    manifest["tiles"][0][6] = 1000000000;
+    check(sf::paths::write_json(copy/"manifest.json", manifest), "Write invalid metadata fixture");
+    rejected = false;
+    try { HeightSource::open(copy); } catch (const std::exception&) { rejected = true; }
+    check(rejected, "Invalid extrema cannot enter the metadata domain");
+}
+
+}
+
+int main(int argc, char** argv) {
     try {
         mapping();
         grids();
@@ -370,6 +644,9 @@ int main() {
         selections();
         metadata_bounds();
         ground_refinement();
+        staging_residency();
+        resident_refinement();
+        if (argc == 2) imported_source(argv[1]);
         std::cout << "Terrain mapping, bounds, seams, coverage, precision-level and budget contracts passed.\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
