@@ -138,7 +138,7 @@ struct TerrainSample {
     double cpu_ms() const { return cpu_prepare_ms + cpu_record_ms; }
 };
 
-TerrainSample measure_terrain(RenderProbe&, const Camera&, const ephemeris::SystemSnapshot&, const rendering::RenderSettings&);
+TerrainSample measure_terrain(RenderProbe&, const Camera&, const ephemeris::SystemSnapshot&, const rendering::RenderSettings&, uint32_t draw_count = 1);
 nlohmann::json terrain_timing_stats(std::vector<double> samples);
 
 void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, const std::filesystem::path& output) {
@@ -384,7 +384,7 @@ nlohmann::json terrain_timing_stats(std::vector<double> samples) {
 }
 
 TerrainSample measure_terrain(RenderProbe& probe, const Camera& camera, const ephemeris::SystemSnapshot& system,
-                              const rendering::RenderSettings& settings) {
+                              const rendering::RenderSettings& settings, uint32_t draw_count) {
     TerrainSample sample{};
     probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
         probe.vk.transition_image(cmd, probe.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -400,7 +400,8 @@ TerrainSample measure_terrain(RenderProbe& probe, const Camera& camera, const ep
         probe.vk.begin_rendering(cmd, probe.extent, {&color, 1}, &depth);
         auto draw_timer = probe.vk.begin_gpu_timer(cmd, "terrain_draw");
         start = SteadyClock::now();
-        probe.renderer.render(cmd, probe.vk, camera, system, settings, probe.extent);
+        for (uint32_t draw = 0; draw < draw_count; ++draw)
+            probe.renderer.render(cmd, probe.vk, camera, system, settings, probe.extent);
         sample.cpu_record_ms = elapsed_ms(start);
         probe.vk.end_gpu_timer(cmd, draw_timer);
         probe.vk.end_rendering(cmd);

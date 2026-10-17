@@ -137,6 +137,8 @@ public:
     uint32_t frame_index() const noexcept { return frame_index_; }
     const char* device_name() const noexcept { return device_props_.deviceName; }
     bool bresenham_lines_enabled() const noexcept { return bresenham_lines_enabled_; }
+    bool pipeline_statistics_enabled() const noexcept { return pipeline_statistics_enabled_; }
+    void log_pipeline_statistics(VkPipeline pipeline, std::string_view name) const;
 
     VkSampler sampler_linear_clamp() const noexcept { return sampler_linear_clamp_; }
     VkSampler sampler_linear_repeat() const noexcept { return sampler_linear_repeat_; }
@@ -156,6 +158,7 @@ private:
     VkPhysicalDeviceDriverProperties driver_props_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     uint32_t timestamp_valid_bits_ = 0;
     bool bresenham_lines_enabled_ = false;
+    bool pipeline_statistics_enabled_ = false;
     VkDevice device_ = VK_NULL_HANDLE;
     uint32_t graphics_queue_family_ = 0;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;

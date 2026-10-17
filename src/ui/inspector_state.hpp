@@ -349,12 +349,34 @@ struct TimelineScrubState {
     }
 };
 
+struct RingEditState {
+    int body_index = -1;
+    int selected_layer = 0;
+    std::string status_msg;
+    std::string error_msg;
+
+    void sync_body(int idx, int layer_count) {
+        if (body_index != idx) {
+            body_index = idx;
+            selected_layer = 0;
+            status_msg.clear();
+            error_msg.clear();
+        }
+        if (layer_count <= 0) {
+            selected_layer = 0;
+        } else if (selected_layer >= layer_count) {
+            selected_layer = layer_count - 1;
+        }
+    }
+};
+
 struct WorkspaceState {
     int inspected_body = -1;
     bool edit_mode = false;
     bool inspect_barycenter = false;
     int inspector_frame = 0;
     BodyEditDraft body_draft{};
+    RingEditState ring_edit{};
     AddBodyDraft add_body{};
     DeleteBodyPrompt delete_prompt{};
     CreateSystemDraft create_system{};

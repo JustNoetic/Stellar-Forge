@@ -166,9 +166,10 @@ if(STELLAR_BUILD_TESTS)
     if(MINGW)
         target_link_options(StellarTerrainTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
-    add_executable(StellarEclipseTests tests/eclipse_tests.cpp)
+    add_executable(StellarEclipseTests tests/eclipse_tests.cpp src/rendering/ring_optics.cpp src/core/path_utils.cpp)
     target_include_directories(StellarEclipseTests PRIVATE src)
-    target_link_libraries(StellarEclipseTests PRIVATE glm::glm)
+    target_compile_definitions(StellarEclipseTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(StellarEclipseTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
     if(MINGW)
         target_link_options(StellarEclipseTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
@@ -212,6 +213,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/spk_exporter.cpp
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
+        src/rendering/ring_optics.cpp
         src/core/path_utils.cpp
         src/core/time_utils.cpp
     )
@@ -319,6 +321,8 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/rendering/celestial_renderer.cpp
+        src/rendering/ring_optics.cpp
+        src/rendering/ring_renderer.cpp
         src/terrain/quadtree.cpp
         src/terrain/tile_metadata.cpp
         src/terrain/terrain_renderer.cpp

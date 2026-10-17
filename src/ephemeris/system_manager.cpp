@@ -304,6 +304,70 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
         b.color_rgb = hex_to_rgb(col_hex);
         b.color_pole_rgb = hex_to_rgb(j.value("color_pole", col_hex));
 
+        if (j.contains("ring_texture_inner") && j["ring_texture_inner"].is_number()) {
+            b.ring_texture_inner = j["ring_texture_inner"].get<double>();
+        }
+        if (j.contains("ring_texture_outer") && j["ring_texture_outer"].is_number()) {
+            b.ring_texture_outer = j["ring_texture_outer"].get<double>();
+        }
+        bool has_ring_tex = find_ring_texture_path(name, b.name).has_value();
+        if (j.contains("rings") && j["rings"].is_array()) {
+            std::vector<RingLayerDefinition> raw_rings;
+            bool any_explicit_textured = false;
+            for (const auto& rj : j["rings"]) {
+                if (!rj.is_object()) continue;
+                RingLayerDefinition layer{};
+                layer.inner = rj.value("inner", 1.5);
+                layer.outer = rj.value("outer", 2.5);
+                layer.color_rgb = hex_to_rgb(rj.value("color", "#d8ca9d"));
+                layer.opacity = std::max(rj.value("opacity", 0.7f), 0.0f);
+                float raw_scatter = rj.value("scatter", 0.5f);
+                layer.scatter = (raw_scatter > 1.0f) ? 0.35f : std::clamp(raw_scatter, 0.0f, 1.0f);
+                layer.asymmetry = std::clamp(rj.value("asymmetry", 0.75f), -0.99f, 0.99f);
+                layer.backscatter = -std::clamp(std::abs(rj.value("backscatter", -0.45f)), 0.0f, 0.99f);
+                layer.unlit_factor = std::max(rj.value("unlit_factor", 1.0f), 0.0f);
+                layer.hue_shift = std::clamp(rj.value("hue_shift", 0.0f), -1.0f, 1.0f);
+                layer.saturation = std::max(rj.value("saturation", 1.0f), 0.0f);
+                layer.brightness = std::max(rj.value("brightness", 1.0f), 0.0f);
+                layer.alpha_boost = std::max(rj.value("alpha_boost", 1.0f), 0.0f);
+                if (rj.contains("is_textured") && rj["is_textured"].is_boolean()) {
+                    layer.is_textured = rj["is_textured"].get<bool>();
+                    if (layer.is_textured) any_explicit_textured = true;
+                }
+                layer.gradient.clear();
+                if (rj.contains("gradient") && rj["gradient"].is_array()) {
+                    for (const auto& gj : rj["gradient"]) {
+                        if (gj.is_object()) {
+                            layer.gradient.push_back({
+                                std::clamp(gj.value("p", 0.0f), 0.0f, 1.0f),
+                                std::clamp(gj.value("a", 1.0f), 0.0f, 1.0f)
+                            });
+                        }
+                    }
+                    std::sort(layer.gradient.begin(), layer.gradient.end(),
+                              [](const RingGradientStop& a, const RingGradientStop& rhs) { return a.p < rhs.p; });
+                }
+                if (layer.gradient.size() < 2) {
+                    layer.gradient = {{0.0f, 1.0f}, {1.0f, 1.0f}};
+                }
+                raw_rings.push_back(std::move(layer));
+            }
+            if (!any_explicit_textured && (has_ring_tex || (b.ring_texture_inner && b.ring_texture_outer)) && !raw_rings.empty()) {
+                if (b.ring_texture_inner && b.ring_texture_outer) {
+                    double tex_in = *b.ring_texture_inner;
+                    double tex_out = *b.ring_texture_outer;
+                    for (auto& layer : raw_rings) {
+                        if (layer.inner >= tex_in - 0.05 && layer.outer <= tex_out + 0.05) {
+                            layer.is_textured = true;
+                        }
+                    }
+                } else if (has_ring_tex) {
+                    raw_rings[0].is_textured = true;
+                }
+            }
+            b.rings = std::move(raw_rings);
+        }
+
         b.lum_eq = j.value("lum_eq", 0.0);
         b.lum_pole = j.value("lum_pole", 0.0);
         if (j.contains("star_props") && j["star_props"].is_object()) {
@@ -384,6 +448,59 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
     return loaded;
 }
 
+namespace {
+
+void serialize_body_rings(nlohmann::json& j, const BodyDefinition& b) {
+    if (b.ring_texture_inner.has_value()) j["ring_texture_inner"] = *b.ring_texture_inner;
+    else j.erase("ring_texture_inner");
+    if (b.ring_texture_outer.has_value()) j["ring_texture_outer"] = *b.ring_texture_outer;
+    else j.erase("ring_texture_outer");
+    if (!b.rings.empty()) {
+        auto rings_arr = nlohmann::json::array();
+        for (const auto& r : b.rings) {
+            nlohmann::json rj = nlohmann::json::object();
+            rj["inner"] = r.inner;
+            rj["outer"] = r.outer;
+            rj["color"] = rgb_to_hex(r.color_rgb);
+            rj["opacity"] = r.opacity;
+            rj["scatter"] = r.scatter;
+            rj["asymmetry"] = r.asymmetry;
+            rj["backscatter"] = r.backscatter;
+            rj["unlit_factor"] = r.unlit_factor;
+            rj["is_textured"] = r.is_textured;
+            if (std::abs(r.hue_shift) > 1e-5f) rj["hue_shift"] = r.hue_shift;
+            if (std::abs(r.saturation - 1.0f) > 1e-5f) rj["saturation"] = r.saturation;
+            if (std::abs(r.brightness - 1.0f) > 1e-5f) rj["brightness"] = r.brightness;
+            if (std::abs(r.alpha_boost - 1.0f) > 1e-5f) rj["alpha_boost"] = r.alpha_boost;
+            auto grad_arr = nlohmann::json::array();
+            for (const auto& g : r.gradient) {
+                grad_arr.push_back({{"p", g.p}, {"a", g.a}});
+            }
+            rj["gradient"] = std::move(grad_arr);
+            rings_arr.push_back(std::move(rj));
+        }
+        j["rings"] = std::move(rings_arr);
+    } else {
+        j.erase("rings");
+    }
+}
+
+}
+
+std::optional<std::filesystem::path> find_ring_texture_path(std::string_view system_name, std::string_view body_name) {
+    if (body_name.empty()) return std::nullopt;
+    std::error_code ec;
+    if (!system_name.empty()) {
+        auto p1 = sf::paths::external_path("textures", system_name, body_name, "Rings.png");
+        if (std::filesystem::is_regular_file(p1, ec)) return p1;
+    }
+    auto p2 = sf::paths::external_path("textures", "Solar System", body_name, "Rings.png");
+    if (std::filesystem::is_regular_file(p2, ec)) return p2;
+    auto p3 = sf::paths::external_path("textures", std::string(body_name) + "_ring.png");
+    if (std::filesystem::is_regular_file(p3, ec)) return p3;
+    return std::nullopt;
+}
+
 nlohmann::json SystemManager::serialize_definition(const SystemDefinition& definition) {
     auto arr = nlohmann::json::array();
     for (const auto& b : definition.bodies) {
@@ -417,6 +534,7 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["lum_pole"] = b.lum_pole;
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+        serialize_body_rings(j, b);
         if (b.is_star) {
             if (!j.contains("star_props") || !j["star_props"].is_object()) {
                 j["star_props"] = nlohmann::json::object();
@@ -540,6 +658,7 @@ nlohmann::json SystemManager::serialize_snapshot_to_nbody(const SystemSnapshot& 
         j["lum_pole"] = b.lum_pole;
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+        serialize_body_rings(j, b);
 
         if (b.parent_idx < 0) {
             j["motion_model"] = "n_body";

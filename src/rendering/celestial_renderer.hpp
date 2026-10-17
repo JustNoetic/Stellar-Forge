@@ -2,11 +2,13 @@
 
 #include "core/camera.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/ring_renderer.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
 #include "terrain/terrain_renderer.hpp"
 #include "terrain/surface_textures.hpp"
 #include <array>
+#include <span>
 #include <vector>
 #include <glm/glm.hpp>
 
@@ -34,7 +36,7 @@ struct alignas(16) SceneCelestialUBO {
     uint32_t num_stars = 0;
     uint32_t num_bodies = 0;
     uint32_t hdr_enabled = 1;
-    uint32_t pad0 = 0;
+    uint32_t num_ring_hosts = 0;
     glm::mat4 projection{1.0f};
 };
 
@@ -49,10 +51,12 @@ public:
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
+    std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
     void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
         terrain_.set_height_source(std::move(body), std::move(source));
     }
+    void invalidate_ring_textures() noexcept { rings_.invalidate_texture_cache(); }
 
 private:
     void build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors, uint32_t stacks);
@@ -66,11 +70,13 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> eclipse_ssbos_{};
     std::vector<BodyInstanceGPU> body_instances_;
     std::vector<uint32_t> eclipse_words_;
+    std::vector<uint32_t> ring_eclipse_candidate_counts_;
 
     rhi::Pipeline sphere_pipeline_{};
     rhi::Pipeline point_pipeline_{};
     terrain::TerrainRenderer terrain_;
     terrain::SurfaceTextures textures_;
+    RingRenderer rings_;
 };
 
 } // namespace sf::rendering

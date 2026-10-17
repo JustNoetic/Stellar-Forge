@@ -28,6 +28,30 @@ struct DerivedStarProperties {
     double progress_pct = 46.0;
 };
 
+struct RingGradientStop {
+    float p = 0.0f;
+    float a = 1.0f;
+    bool operator==(const RingGradientStop&) const = default;
+};
+
+struct RingLayerDefinition {
+    double inner = 1.5;
+    double outer = 2.5;
+    glm::vec3 color_rgb{0.847f, 0.792f, 0.616f};
+    float opacity = 0.7f;
+    float scatter = 0.5f;
+    float asymmetry = 0.75f;
+    float backscatter = -0.45f;
+    float unlit_factor = 1.0f;
+    bool is_textured = false;
+    float hue_shift = 0.0f;
+    float saturation = 1.0f;
+    float brightness = 1.0f;
+    float alpha_boost = 1.0f;
+    std::vector<RingGradientStop> gradient{{0.0f, 1.0f}, {1.0f, 1.0f}};
+    bool operator==(const RingLayerDefinition&) const = default;
+};
+
 struct BodyDefinition {
     std::string name;
     std::string type = "Terrestrial";
@@ -66,6 +90,10 @@ struct BodyDefinition {
 
     glm::vec3 color_rgb{1.0f, 1.0f, 1.0f};
     glm::vec3 color_pole_rgb{1.0f, 1.0f, 1.0f};
+
+    std::optional<double> ring_texture_inner;
+    std::optional<double> ring_texture_outer;
+    std::vector<RingLayerDefinition> rings;
 
     glm::dvec3 pole_ecl{0.0, 0.0, 1.0};
     nlohmann::json source_json;
@@ -135,6 +163,7 @@ struct JacobiHierarchy;
 class SystemSnapshot {
 public:
     const SystemDefinition& definition() const noexcept { return *definition_; }
+    std::shared_ptr<const SystemDefinition> share_definition() const noexcept { return definition_; }
     size_t size() const noexcept { return motions_.size(); }
     bool empty() const noexcept { return motions_.empty(); }
     const std::string& name() const noexcept { return definition_->name; }
@@ -175,6 +204,7 @@ std::string rgb_to_hex(const glm::vec3& rgb);
 glm::vec3 temperature_to_rgb(double temp_k) noexcept;
 std::string get_spectral_class(double temp_k, std::string_view lum_class = "V");
 DerivedStarProperties derive_star_properties(double mass_msun, double metallicity, double age_gyr);
+std::optional<std::filesystem::path> find_ring_texture_path(std::string_view system_name, std::string_view body_name);
 
 class SystemManager {
 public:

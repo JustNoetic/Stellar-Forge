@@ -641,14 +641,236 @@ void scaling_point_footprint(RenderProbe& probe) {
     std::cout << "Mesh-sized transition and unresolved 3 px footprint passed at 256p, 1080p and 2160p.\n";
 }
 
+void ring_rendering_and_shadows(RenderProbe& probe) {
+    probe.resize(EXTENT);
+    auto loaded = fixture();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{5.0, 2.0, 2.0}});
+
+    ephemeris::BodyDefinition planet;
+    planet.name = "RingedPlanet";
+    planet.type = "Gas Giant";
+    planet.radius_rsun = 0.1;
+    planet.color_rgb = {0.85f, 0.80f, 0.70f};
+    planet.pole_ecl = glm::normalize(glm::dvec3(0.0, -0.5, 0.8660254037844386));
+
+    ephemeris::RingLayerDefinition ring{};
+    ring.inner = 1.4;
+    ring.outer = 2.4;
+    ring.color_rgb = {0.9f, 0.85f, 0.7f};
+    ring.opacity = 1.2f;
+    ring.scatter = 0.5f;
+    ring.asymmetry = 0.75f;
+    ring.backscatter = -0.45f;
+    ring.unlit_factor = 1.0f;
+    ring.is_textured = false;
+    ring.gradient = {{0.0f, 1.0f}, {1.0f, 1.0f}};
+    planet.rings.push_back(ring);
+
+    loaded.definition.name_to_idx[planet.name] = 1;
+    loaded.definition.bodies.push_back(planet);
+    loaded.motions.emplace_back();
+
+    ephemeris::Simulation sim;
+    check(sim.replace_system(loaded).accepted, "Ring rendering fixture");
+
+    double r_au = planet.radius_au();
+    Camera cam = camera_at(r_au * 6.0);
+    rendering::RenderSettings settings{};
+    settings.exposure = 50.0f;
+    settings.show_rings = false;
+    settings.ring_shadows_enabled = false;
+    double flux_no_rings = probe.render(cam, sim.snapshot(), settings);
+    float ansa_no_rings = probe.red_at(184, 128);
+    check(ansa_no_rings == 0.0f, "Off-limb ansa pixel is zero when show_rings is false");
+
+    settings.show_rings = true;
+    double flux_with_rings = probe.render(cam, sim.snapshot(), settings);
+    float ansa_lit = probe.red_at(184, 128);
+    float ansa_shadowed = probe.red_at(72, 128);
+    check(flux_with_rings > flux_no_rings * 1.15, "Enabling show_rings increases total scene radiance");
+    check(ansa_lit > 0.01f, "Sunlit ring ansa pixel has positive HDR radiance");
+
+    // Place Sun directly to +X (with slight +Y elevation) so -X ring ansa lies in planet's shadow cylinder
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{5.0, 0.8, 0.0}});
+    loaded.definition.bodies[1].pole_ecl = glm::normalize(glm::dvec3(0.0, -0.35, 0.9367496997597597));
+    check(sim.replace_system(loaded).accepted, "Ring eclipse fixture");
+    probe.render(cam, sim.snapshot(), settings);
+    ansa_lit = probe.red_at(184, 128);
+    ansa_shadowed = probe.red_at(72, 128);
+    check(ansa_lit > 0.01f, "Sunlit +X ring ansa is bright");
+    check(ansa_shadowed < ansa_lit * 0.05f, "Planet casts umbral shadow across -X ring ansa");
+
+    // Place Sun in front/above so ring casts shadow across sunlit planet hemisphere
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{0.0, 1.5, 5.0}});
+    loaded.definition.bodies[1].pole_ecl = glm::normalize(glm::dvec3(0.0, 0.15, 0.9886859966642594));
+    check(sim.replace_system(loaded).accepted, "Ring surface shadow fixture");
+
+    settings.show_rings = true;
+    settings.ring_shadows_enabled = false;
+    double planet_unshadowed = probe.render(cam, sim.snapshot(), settings);
+
+    settings.ring_shadows_enabled = true;
+    double planet_shadowed = probe.render(cam, sim.snapshot(), settings);
+    check(planet_shadowed < planet_unshadowed * 0.98, "Ring shadow LUT attenuates sunlight on planet surface");
+
+    cam = camera_at(r_au * 1.1);
+    settings.ring_shadows_enabled = false;
+    settings.show_rings = false;
+    probe.render(cam, sim.snapshot(), settings);
+    auto* pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+    std::vector<uint16_t> opaque(pixels, pixels + size_t(EXTENT.width) * EXTENT.height * 4);
+    settings.show_rings = true;
+    probe.render(cam, sim.snapshot(), settings);
+    check(std::equal(opaque.begin(), opaque.end(), pixels), "Opaque planet fully occludes rings at close range");
+
+    cam = camera_at(r_au * 6.0);
+    auto& layers = loaded.definition.bodies[1].rings;
+    layers.front().opacity = 0.1f;
+    check(sim.replace_system(loaded).accepted, "Single-layer reference fixture");
+    probe.render(cam, sim.snapshot(), settings);
+    std::vector<uint16_t> single_layer(pixels, pixels + size_t(EXTENT.width) * EXTENT.height * 4);
+    auto active_layer = layers.front();
+    layers.assign(8, active_layer);
+    for (size_t i = 0; i < 7; ++i) layers[i].opacity = 0.0f;
+    check(sim.replace_system(loaded).accepted, "Sparse eighth-layer fixture");
+    probe.render(cam, sim.snapshot(), settings);
+    check(std::equal(single_layer.begin(), single_layer.end(), pixels), "Only active eighth layer matches a single layer exactly");
+
+    for (auto& layer : layers) layer.opacity = 0.1f;
+    check(sim.replace_system(loaded).accepted, "Eight overlapping ring layers fixture");
+    double eight_flux = probe.render(cam, sim.snapshot(), settings);
+    float eight_ansa = probe.red_at(184, 128);
+    layers.assign(1, active_layer);
+    layers.front().opacity = 1.0f - std::pow(0.9f, 8.0f);
+    check(sim.replace_system(loaded).accepted, "Combined optical-depth reference fixture");
+    probe.render(cam, sim.snapshot(), settings);
+    float combined_ansa = probe.red_at(184, 128);
+    check(eight_ansa > 0.001f && std::abs(eight_ansa - combined_ansa) < combined_ansa * 0.01f,
+          "Eight active ring layers preserve combined interior radiance");
+
+    layers.assign(8, active_layer);
+    auto second_star = loaded.definition.bodies[0];
+    second_star.name = "Second Sun";
+    loaded.definition.name_to_idx[second_star.name] = static_cast<int>(loaded.definition.bodies.size());
+    loaded.definition.bodies.push_back(second_star);
+    loaded.motions.push_back(loaded.motions[0]);
+    check(sim.replace_system(loaded).accepted, "Multiple-star ring fixture");
+    double two_star_flux = probe.render(cam, sim.snapshot(), settings);
+    check(std::abs(two_star_flux / eight_flux - 2.0) < 0.01, "All active ring layers receive both stars' illumination");
+    std::cout << "Ring rendering, planet-on-ring eclipse, and ring-on-planet shadow contracts passed.\n";
+}
+
+void ring_eclipse_candidate_filtering(RenderProbe& probe) {
+    probe.resize(EXTENT);
+    auto loaded = fixture();
+    glm::dvec3 star_pos{0.0, 2.0, 5.0};
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{star_pos});
+    ephemeris::BodyDefinition planet;
+    planet.name = "Ring receiver";
+    planet.radius_rsun = 0.1;
+    planet.pole_ecl = glm::normalize(glm::dvec3(0.0, -0.5, 0.8660254037844386));
+    ephemeris::RingLayerDefinition ring;
+    ring.inner = 1.4;
+    ring.outer = 2.4;
+    ring.opacity = 0.8f;
+    planet.rings.push_back(ring);
+    loaded.definition.name_to_idx[planet.name] = 1;
+    loaded.definition.bodies.push_back(planet);
+    loaded.motions.emplace_back();
+    double radius = planet.radius_au();
+    auto camera = camera_at(radius * 6.0);
+    rendering::RenderSettings settings;
+    settings.exposure = 50.0f;
+    settings.ring_shadows_enabled = false;
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(loaded).accepted, "Ring candidate baseline fixture");
+    probe.render(camera, simulation.snapshot(), settings);
+    auto* pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+    std::vector<uint16_t> baseline(pixels, pixels + size_t(EXTENT.width) * EXTENT.height * 4);
+    float lit = probe.red_at(184, 128);
+    check(lit > 0.01f, "Ring candidate probe is sunlit");
+    check(probe.renderer.ring_eclipse_candidate_counts().size() == 1 &&
+          probe.renderer.ring_eclipse_candidate_counts()[0] == 1, "Host planet retained as a ring blocker");
+
+    auto add_caster = [&](glm::dvec3 position, double caster_radius) {
+        ephemeris::BodyDefinition caster;
+        caster.name = "Blocker " + std::to_string(loaded.definition.bodies.size());
+        caster.radius_rsun = caster_radius / SOLAR_RADII_TO_AU;
+        loaded.definition.name_to_idx[caster.name] = static_cast<int>(loaded.definition.bodies.size());
+        loaded.definition.bodies.push_back(caster);
+        ephemeris::BodyMotion motion;
+        motion.position = render_to_ecliptic(RenderPosition{position});
+        loaded.motions.push_back(motion);
+    };
+    for (int i = 0; i < 24; ++i) add_caster({10.0 + i, 10.0, -10.0}, radius * 0.05);
+    check(simulation.replace_system(loaded).accepted, "Irrelevant ring blocker fixture");
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.ring_eclipse_candidate_counts()[0] == 1, "All distant ring blockers rejected on CPU");
+    check(std::equal(baseline.begin(), baseline.end(), pixels), "Rejected ring blockers leave HDR output unchanged");
+
+    glm::dvec3 pole = glm::normalize(simulation.snapshot().body(1).render.pole);
+    auto inverse_view_proj = glm::inverse(glm::dmat4(camera.proj_matrix(1.0f, camera.compute_near_plane_au()) *
+                                                    camera.view_matrix_eye_relative()));
+    auto near_point = inverse_view_proj * glm::dvec4(2.0 * 184.5 / 256.0 - 1.0, 2.0 * 128.5 / 256.0 - 1.0, 1.0, 1.0);
+    auto ray = glm::normalize(glm::dvec3(near_point) / near_point.w);
+    auto hit = camera.cam_pos_rel - ray * glm::dot(camera.cam_pos_rel, pole) / glm::dot(ray, pole);
+    auto blocker_pos = hit + glm::normalize(star_pos - hit) * (30.0 * radius);
+    add_caster(blocker_pos, radius * 0.2);
+    check(simulation.replace_system(loaded).accepted, "Unrelated ring blocker fixture");
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.ring_eclipse_candidate_counts()[0] == 2, "Unrelated body beyond the old sixteen-caster cutoff retained");
+    float shadowed = probe.red_at(184, 128);
+    check(shadowed < lit * 0.05f, "Unrelated body casts the expected ring umbra");
+
+    for (int i = 0; i < 17; ++i) add_caster(blocker_pos, radius * 0.01);
+    check(simulation.replace_system(loaded).accepted, "Many aligned ring blockers fixture");
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.ring_eclipse_candidate_counts()[0] == 19, "Ring candidate lists are not capped at sixteen");
+
+    auto second_star = loaded.definition.bodies[0];
+    second_star.name = "Second Sun";
+    loaded.definition.name_to_idx[second_star.name] = static_cast<int>(loaded.definition.bodies.size());
+    loaded.definition.bodies.push_back(second_star);
+    ephemeris::BodyMotion second_motion;
+    second_motion.position = render_to_ecliptic(RenderPosition{{5.0, 2.0, 0.0}});
+    loaded.motions.push_back(second_motion);
+    check(simulation.replace_system(loaded).accepted, "Per-star ring blocker fixture");
+    probe.render(camera, simulation.snapshot(), settings);
+    auto counts = probe.renderer.ring_eclipse_candidate_counts();
+    check(counts.size() == 2 && counts[0] == 19 && counts[1] == 1, "Each star uses its own ring blocker list");
+    check(probe.red_at(184, 128) > shadowed + 0.01f, "Unblocked second star illuminates the eclipsed ring");
+    std::cout << "Ring eclipse candidate filtering passed: distant rejection, unrelated blockers, uncapped lists and per-star selection.\n";
+}
+
 }
 
 #include "terrain_gpu_tests.hpp"
+#include "ring_gpu_tests.hpp"
 
 int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc >= 3 && std::string_view(argv[1]) == "--ring-benchmark") {
+            VkExtent2D extent{1920, 1080};
+            if (argc >= 6) extent = {static_cast<uint32_t>(std::stoul(argv[4])), static_cast<uint32_t>(std::stoul(argv[5]))};
+            ring_benchmark(probe, argv[2], argc >= 4 ? std::string_view(argv[3]) : std::string_view{}, extent,
+                           argc >= 7 ? static_cast<uint32_t>(std::stoul(argv[6])) : 1u,
+                           argc >= 8 ? std::string_view(argv[7]) : std::string_view{"optimized"});
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--ring-filtering-only") {
+            ring_filtering_contracts(probe);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--rings-only") {
+            ring_rendering_and_shadows(probe);
+            ring_eclipse_candidate_filtering(probe);
+            ring_system_cache_contracts(probe);
+            ring_filtering_contracts(probe);
+            ring_specialization_contracts(probe);
+            return 0;
+        }
         if (argc >= 4 && std::string_view(argv[1]) == "--terrain-source-benchmark") {
             terrain_source_benchmark(probe, argv[2], argv[3], argc > 4 && std::string_view(argv[4]) == "--paced");
             return 0;
@@ -694,6 +916,11 @@ int main(int argc, char** argv) {
         }
         earth_closeups(probe, {});
         eclipse_lighting(probe);
+        ring_rendering_and_shadows(probe);
+        ring_eclipse_candidate_filtering(probe);
+        ring_system_cache_contracts(probe);
+        ring_filtering_contracts(probe);
+        ring_specialization_contracts(probe);
         if (argc == 2 && std::string_view(argv[1]) == "--eclipse-only") return 0;
         transition_and_distance(probe);
         occlusion(probe);

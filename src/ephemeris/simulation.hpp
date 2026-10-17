@@ -76,6 +76,15 @@ struct ApplyBodyPhysicalProperties {
     int expected_reference_parent = -2;
 };
 
+struct ApplyBodyRings {
+    uint64_t system_generation = 0;
+    int body_index = -1;
+    uint64_t expected_body_revision = 0;
+    std::vector<RingLayerDefinition> rings;
+    std::optional<double> ring_texture_inner;
+    std::optional<double> ring_texture_outer;
+};
+
 struct AddBody {
     uint64_t system_generation = 0;
     BodyDefinition definition;
@@ -114,6 +123,7 @@ public:
     CommandResult apply(ReverseTimeDirection command);
     CommandResult apply(SetMotionModel command);
     CommandResult apply(const ApplyBodyPhysicalProperties& command);
+    CommandResult apply(const ApplyBodyRings& command);
     CommandResult apply(const AddBody& command);
     CommandResult apply(const DeleteBody& command);
     CommandResult apply(JumpToTime command);

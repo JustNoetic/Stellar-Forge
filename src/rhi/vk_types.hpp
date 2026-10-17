@@ -174,8 +174,10 @@ struct GraphicsPipelineDesc {
     bool depth_write = true;
     VkCompareOp depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
     bool alpha_blend = false;
+    bool premultiplied_blend = false;
     bool additive_blend = false;
     bool bresenham_lines = false;
+    bool capture_statistics = false;
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
     VkCullModeFlags cull_mode = VK_CULL_MODE_BACK_BIT;

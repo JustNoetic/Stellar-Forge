@@ -3,6 +3,7 @@
 #include "core/path_utils.hpp"
 #include "core/time_utils.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/ring_optics.hpp"
 #include "ui/inspector_state.hpp"
 #include <cmath>
 #include <filesystem>
@@ -692,6 +693,113 @@ void add_and_delete_contracts() {
     check(!sim.apply(AddBody{99999, ast}).accepted, "Reject stale generation on AddBody");
 }
 
+void ring_state_and_serialization_contracts() {
+    Simulation sim;
+    check(sim.replace_system(SystemManager::parse_system(fixture(), "RingTest")).accepted, "Load fixture for ring tests");
+    int planet = sim.snapshot().find_body("Planet");
+    int sun = sim.snapshot().find_body("Sun");
+    check(planet >= 0 && sun >= 0, "Fixture bodies exist");
+    check(sim.snapshot().body(planet).definition.rings.empty(), "Planet initially has no rings");
+
+    RingLayerDefinition layer{};
+    layer.inner = 1.35;
+    layer.outer = 2.45;
+    layer.color_rgb = {0.82f, 0.76f, 0.60f};
+    layer.opacity = 0.85f;
+    layer.scatter = 0.65f;
+    layer.asymmetry = 0.78f;
+    layer.backscatter = -0.42f;
+    layer.unlit_factor = 1.1f;
+    layer.is_textured = true;
+    layer.hue_shift = 0.12f;
+    layer.saturation = 1.25f;
+    layer.brightness = 0.95f;
+    layer.alpha_boost = 1.4f;
+    layer.gradient = {{0.0f, 0.1f}, {0.5f, 0.9f}, {1.0f, 0.2f}};
+
+    auto gen = sim.snapshot().generation();
+    auto rev_before = sim.snapshot().body(planet).revisions;
+    auto def_rev_before = sim.snapshot().definition_revision();
+
+    // Reject applying rings to a star
+    check(!sim.apply(ApplyBodyRings{gen, sun, sim.snapshot().body(sun).revisions.definition, {layer}}).accepted,
+          "Stars cannot have planetary rings");
+
+    // Reject invalid inner/outer radii
+    RingLayerDefinition bad_layer = layer;
+    bad_layer.inner = 0.95;
+    check(!sim.apply(ApplyBodyRings{gen, planet, rev_before.definition, {bad_layer}}).accepted,
+          "Reject ring inner radius <= 1.0");
+    bad_layer.inner = 2.0;
+    bad_layer.outer = 1.8;
+    check(!sim.apply(ApplyBodyRings{gen, planet, rev_before.definition, {bad_layer}}).accepted,
+          "Reject ring outer radius <= inner radius");
+
+    // Apply valid ring layer
+    auto res = sim.apply(ApplyBodyRings{gen, planet, rev_before.definition, {layer}, 1.35, 2.45});
+    check(res.accepted && res.changed, "ApplyBodyRings accepted");
+    const auto& updated = sim.snapshot().body(planet);
+    check(updated.definition.rings.size() == 1, "Ring layer stored on body definition");
+    check(updated.definition.rings[0] == layer, "Ring layer fields match applied values");
+    check(updated.definition.ring_texture_inner == 1.35 && updated.definition.ring_texture_outer == 2.45,
+          "Ring texture bounds stored");
+    check(updated.revisions.definition == rev_before.definition + 1, "Ring edit increments definition revision");
+    check(updated.revisions.geometry == rev_before.geometry + 1, "Ring edit increments geometry revision");
+    check(updated.revisions.lighting == rev_before.lighting + 1, "Ring edit increments lighting revision");
+    check(updated.revisions.dynamics == rev_before.dynamics, "Ring edit preserves dynamics revision");
+    check(sim.snapshot().definition_revision() == def_rev_before + 1, "Ring edit increments system definition revision");
+
+    // Idempotent re-apply does not mark changed
+    auto res_same = sim.apply(ApplyBodyRings{gen, planet, updated.revisions.definition, {layer}, 1.35, 2.45});
+    check(res_same.accepted && !res_same.changed, "Identical ApplyBodyRings is a no-op");
+
+    // Reject stale revision
+    check(!sim.apply(ApplyBodyRings{gen, planet, rev_before.definition, {}}).accepted,
+          "Stale body revision rejected on ApplyBodyRings");
+
+    // Serialization round-trip
+    auto serialized = SystemManager::serialize_definition(sim.snapshot().definition());
+    auto reloaded = SystemManager::parse_system(serialized, "RingTestReloaded");
+    int r_planet = reloaded.definition.find_body("Planet");
+    check(r_planet >= 0, "Reloaded planet found");
+    const auto& r_def = reloaded.definition.bodies[r_planet];
+    check(r_def.rings.size() == 1, "Reloaded planet has 1 ring layer");
+    check(std::abs(r_def.rings[0].inner - 1.35) < 1e-6 && std::abs(r_def.rings[0].outer - 2.45) < 1e-6,
+          "Reloaded ring bounds preserved");
+    check(std::abs(r_def.rings[0].scatter - 0.65f) < 1e-5f &&
+          std::abs(r_def.rings[0].asymmetry - 0.78f) < 1e-5f &&
+          std::abs(r_def.rings[0].backscatter - (-0.42f)) < 1e-5f &&
+          std::abs(r_def.rings[0].unlit_factor - 1.1f) < 1e-5f,
+          "Reloaded ring phase parameters preserved");
+    check(r_def.rings[0].is_textured &&
+          std::abs(r_def.rings[0].hue_shift - 0.12f) < 1e-5f &&
+          std::abs(r_def.rings[0].saturation - 1.25f) < 1e-5f &&
+          std::abs(r_def.rings[0].brightness - 0.95f) < 1e-5f &&
+          std::abs(r_def.rings[0].alpha_boost - 1.4f) < 1e-5f,
+          "Reloaded ring texture HSBA adjustments preserved");
+    check(r_def.rings[0].gradient.size() == 3, "Reloaded ring gradient stops preserved");
+
+    // PNG round-trip contract
+    auto tmp_png = paths::external_path("scratch", "ring_png_contract_test.png");
+    std::filesystem::create_directories(tmp_png.parent_path());
+    auto profile = rendering::generate_ring_segment_profile(layer, {}, 256);
+    check(rendering::save_ring_png_2d(tmp_png, profile, 8), "Save 2D ring PNG");
+    auto decoded = rendering::load_ring_png_1d(tmp_png, 256);
+    check(decoded.has_value() && decoded->size() == 256, "Decode 1D ring PNG");
+    for (size_t i = 0; i < 256; ++i) {
+        check(glm::length((*decoded)[i] - profile[i]) < 0.02f, "PNG encode/decode preserves 8-bit RGBA profile within quantization");
+    }
+    std::error_code ec;
+    std::filesystem::remove(tmp_png, ec);
+
+    // Check Saturn's Rings.png if present in workspace
+    if (auto saturn_tex = find_ring_texture_path("Solar System", "Saturn")) {
+        auto sat_samples = rendering::load_ring_png_1d(*saturn_tex, rendering::RING_ATLAS_WIDTH);
+        check(sat_samples.has_value() && sat_samples->size() == rendering::RING_ATLAS_WIDTH,
+              "Saturn Rings.png decodes to RING_ATLAS_WIDTH samples");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         units_and_coordinates();
@@ -703,6 +811,7 @@ int main(int argc, char** argv) {
         bring_moons_contracts();
         edits_and_invalidation();
         add_and_delete_contracts();
+        ring_state_and_serialization_contracts();
         serialization_and_validation();
         render_settings();
         ias15_contracts();
@@ -720,6 +829,18 @@ int main(int argc, char** argv) {
 #endif
                 auto result = sim.replace_system(std::move(loaded));
                 if (!result) throw std::runtime_error(entry.path().string() + ": " + result.error);
+                for (size_t bi = 0; bi < sim.snapshot().size(); ++bi) {
+                    const auto& b = sim.snapshot().body(bi);
+                    if (!b.definition.rings.empty()) {
+                        auto rings = b.definition.rings;
+                        rings[0].opacity = std::max(0.01f, rings[0].opacity * 0.95f);
+                        auto r_res = sim.apply(ApplyBodyRings{
+                            sim.snapshot().generation(), static_cast<int>(bi), b.revisions.definition,
+                            rings, b.definition.ring_texture_inner, b.definition.ring_texture_outer
+                        });
+                        if (!r_res) throw std::runtime_error(entry.path().string() + " (" + b.definition.name + " rings): " + r_res.error);
+                    }
+                }
                 check(sim.advance(units::Seconds{1.0}).accepted, "Preset propagation");
                 ++presets;
             }

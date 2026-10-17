@@ -1,7 +1,7 @@
 # Eclipse shadow candidates
 
-Resolved celestial surfaces evaluate finite-source eclipse shadows in
-`shaders/celestial/sphere.frag`. Each receiver/star pair now gets a compact list
+Resolved celestial surfaces and rings evaluate finite-source eclipse shadows in
+`shaders/common/eclipse_shadow.glsl`. Each receiver/star pair gets a compact list
 of potential blockers from `CelestialRenderer`; pixels iterate that list rather
 than every body. The existing umbra/penumbra radii, smooth visibility curve,
 blocker order and multiplicative visibility are unchanged.
@@ -21,6 +21,13 @@ during candidate construction was substantially slower on the measured device.
 Each in-flight frame owns its candidate buffer; capacity grows after that
 frame's fence has completed. Binding 2 contains uint words: first an offset/count
 pair for each `body_index * num_stars + star_index`, followed by blocker indices.
+Ring receivers follow the body receivers, indexed as `num_bodies + host_index`;
+their bounds enclose the full outer ring radius and include the parent planet as
+a possible blocker. They use all rendered nonstellar bodies with positive radius,
+without hierarchy restrictions or per-ring truncation. Ring GPU shadows retain
+oblate-caster projection; surface shadows retain spherical casters. See
+[ring measurements and regressions](ring_performance.md).
+
 Offsets are absolute word indices in this buffer. An empty list returns full
 visibility before doing per-pixel eclipse geometry.
 

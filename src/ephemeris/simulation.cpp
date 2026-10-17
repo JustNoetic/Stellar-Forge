@@ -356,6 +356,83 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     return {true, true, {}};
 }
 
+CommandResult Simulation::apply(const ApplyBodyRings& command) {
+    if (command.system_generation != snapshot_.generation_ || command.body_index < 0 ||
+        static_cast<size_t>(command.body_index) >= snapshot_.size()) {
+        return {false, false, "The edited body belongs to a different system or no longer exists."};
+    }
+    auto index = static_cast<size_t>(command.body_index);
+    if (command.expected_body_revision != snapshot_.revisions_[index].definition) {
+        return {false, false, "The body changed after this draft was opened. Revert to reload its current values."};
+    }
+    const auto& target = snapshot_.definition_->bodies[index];
+    if (target.is_star || target.is_black_hole || target.is_spacecraft) {
+        return {false, false, "Stars, black holes, and spacecraft cannot have planetary rings."};
+    }
+    if (command.rings.size() > 8) {
+        return {false, false, "A body may have at most 8 ring layers."};
+    }
+    if ((command.ring_texture_inner.has_value() && (!std::isfinite(*command.ring_texture_inner) || *command.ring_texture_inner < 1.0)) ||
+        (command.ring_texture_outer.has_value() && (!std::isfinite(*command.ring_texture_outer) || *command.ring_texture_outer <= 1.0)) ||
+        (command.ring_texture_inner.has_value() && command.ring_texture_outer.has_value() &&
+         *command.ring_texture_outer <= *command.ring_texture_inner)) {
+        return {false, false, "Ring texture radial bounds must be finite with outer > inner >= 1.0."};
+    }
+
+    std::vector<RingLayerDefinition> normalized = command.rings;
+    for (auto& layer : normalized) {
+        if (!std::isfinite(layer.inner) || !std::isfinite(layer.outer) ||
+            layer.inner < 1.01 || layer.outer <= layer.inner + 1e-4 ||
+            !finite_vector(glm::dvec3(layer.color_rgb)) ||
+            !std::isfinite(layer.opacity) || layer.opacity < 0.0f ||
+            !std::isfinite(layer.scatter) || layer.scatter < 0.0f ||
+            !std::isfinite(layer.asymmetry) ||
+            !std::isfinite(layer.backscatter) ||
+            !std::isfinite(layer.unlit_factor) || layer.unlit_factor < 0.0f ||
+            !std::isfinite(layer.hue_shift) ||
+            !std::isfinite(layer.saturation) || layer.saturation < 0.0f ||
+            !std::isfinite(layer.brightness) || layer.brightness < 0.0f ||
+            !std::isfinite(layer.alpha_boost) || layer.alpha_boost < 0.0f) {
+            return {false, false, "Ring layer parameters contain invalid or out-of-range values."};
+        }
+        layer.scatter = std::clamp(layer.scatter, 0.0f, 1.0f);
+        layer.asymmetry = std::clamp(layer.asymmetry, -0.99f, 0.99f);
+        layer.backscatter = std::clamp(layer.backscatter, -0.99f, 0.99f);
+        for (const auto& stop : layer.gradient) {
+            if (!std::isfinite(stop.p) || !std::isfinite(stop.a) ||
+                stop.p < 0.0f || stop.p > 1.0f || stop.a < 0.0f || stop.a > 1.0f) {
+                return {false, false, "Ring gradient stops must be finite in [0, 1]."};
+            }
+        }
+        std::sort(layer.gradient.begin(), layer.gradient.end(),
+                  [](const RingGradientStop& a, const RingGradientStop& b) { return a.p < b.p; });
+        if (layer.gradient.size() < 2) {
+            layer.gradient = {{0.0f, 1.0f}, {1.0f, 1.0f}};
+        }
+    }
+
+    const auto& old = snapshot_.definition_->bodies[index];
+    if (old.rings == normalized &&
+        old.ring_texture_inner == command.ring_texture_inner &&
+        old.ring_texture_outer == command.ring_texture_outer) {
+        return {};
+    }
+
+    auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
+    auto& body = updated->bodies[index];
+    body.rings = std::move(normalized);
+    body.ring_texture_inner = command.ring_texture_inner;
+    body.ring_texture_outer = command.ring_texture_outer;
+    snapshot_.definition_ = std::move(updated);
+
+    auto& revisions = snapshot_.revisions_[index];
+    ++revisions.definition;
+    ++revisions.geometry;
+    ++revisions.lighting;
+    ++snapshot_.definition_revision_;
+    return {true, true, {}};
+}
+
 CommandResult Simulation::apply(const AddBody& command) {
     if (command.system_generation != snapshot_.generation_) {
         return {false, false, "The target system changed before adding the body."};

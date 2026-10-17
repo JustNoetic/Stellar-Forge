@@ -320,6 +320,14 @@ Pipeline ShaderCache::create_graphics_pipeline(VkContext& ctx, const GraphicsPip
             b.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
             b.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
             b.alphaBlendOp = VK_BLEND_OP_ADD;
+        } else if (desc.premultiplied_blend) {
+            b.blendEnable = VK_TRUE;
+            b.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            b.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            b.colorBlendOp = VK_BLEND_OP_ADD;
+            b.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            b.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            b.alphaBlendOp = VK_BLEND_OP_ADD;
         } else if (desc.additive_blend) {
             b.blendEnable = VK_TRUE;
             b.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -346,6 +354,8 @@ Pipeline ShaderCache::create_graphics_pipeline(VkContext& ctx, const GraphicsPip
     dyn_render_ci.depthAttachmentFormat = desc.depth_format;
 
     VkGraphicsPipelineCreateInfo gp_ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    if (desc.capture_statistics && ctx.pipeline_statistics_enabled())
+        gp_ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     gp_ci.pNext = &dyn_render_ci;
     gp_ci.stageCount = static_cast<uint32_t>(stages.size());
     gp_ci.pStages = stages.data();
@@ -360,6 +370,11 @@ Pipeline ShaderCache::create_graphics_pipeline(VkContext& ctx, const GraphicsPip
     gp_ci.layout = pipe.layout;
 
     VK_CHECK(vkCreateGraphicsPipelines(ctx.device(), VK_NULL_HANDLE, 1, &gp_ci, nullptr, &pipe.handle));
+    if (desc.capture_statistics) {
+        std::string name = desc.frag_path;
+        for (const auto& [key, value] : desc.macros) name += std::format(" {}={}", key, value);
+        ctx.log_pipeline_statistics(pipe.handle, name);
+    }
 
     for (VkShaderModule m : modules) {
         vkDestroyShaderModule(ctx.device(), m, nullptr);

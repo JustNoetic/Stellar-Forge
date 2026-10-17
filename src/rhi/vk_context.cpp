@@ -174,6 +174,24 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
         }
     }
 
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    pipeline_statistics_enabled_ = false;
+    if (std::getenv("STELLAR_SHADER_STATS")) {
+        if (has_extension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext = &executable_features;
+            vkGetPhysicalDeviceFeatures2(physical_device_, &query);
+            pipeline_statistics_enabled_ = executable_features.pipelineExecutableInfo == VK_TRUE;
+        }
+        if (pipeline_statistics_enabled_) {
+            dev_exts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+            executable_features.pNext = feat13.pNext;
+            feat13.pNext = &executable_features;
+        } else {
+            sf::log::warn("Pipeline executable statistics are unavailable on this device.");
+        }
+    }
+
     VkDeviceCreateInfo dev_ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dev_ci.pNext = &feat2;
     dev_ci.queueCreateInfoCount = 1;
@@ -922,6 +940,38 @@ std::vector<GpuTimingSample> VkContext::drain_gpu_timings() {
     std::vector<GpuTimingSample> result;
     result.swap(captured_gpu_timings_);
     return result;
+}
+
+void VkContext::log_pipeline_statistics(VkPipeline pipeline, std::string_view name) const {
+    if (!pipeline_statistics_enabled_) return;
+    VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    info.pipeline = pipeline;
+    uint32_t count = 0;
+    VK_CHECK(vkGetPipelineExecutablePropertiesKHR(device_, &info, &count, nullptr));
+    std::vector<VkPipelineExecutablePropertiesKHR> executables(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    VK_CHECK(vkGetPipelineExecutablePropertiesKHR(device_, &info, &count, executables.data()));
+    for (uint32_t i = 0; i < count; ++i) {
+        VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        executable.pipeline = pipeline;
+        executable.executableIndex = i;
+        uint32_t statistic_count = 0;
+        VK_CHECK(vkGetPipelineExecutableStatisticsKHR(device_, &executable, &statistic_count, nullptr));
+        std::vector<VkPipelineExecutableStatisticKHR> statistics(statistic_count);
+        std::memset(statistics.data(), 0, statistics.size() * sizeof(VkPipelineExecutableStatisticKHR));
+        for (auto& stat : statistics) stat.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+        VK_CHECK(vkGetPipelineExecutableStatisticsKHR(device_, &executable, &statistic_count, statistics.data()));
+        for (const auto& stat : statistics) {
+            std::string value;
+            switch (stat.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: value = stat.value.b32 ? "true" : "false"; break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: value = std::format("{}", stat.value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: value = std::format("{}", stat.value.u64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: value = std::format("{}", stat.value.f64); break;
+            default: value = "unknown"; break;
+            }
+            sf::log::info("Shader statistics {} [{}]: {} = {} ({})", name, executables[i].name, stat.name, value, stat.description);
+        }
+    }
 }
 
 } // namespace sf::rhi

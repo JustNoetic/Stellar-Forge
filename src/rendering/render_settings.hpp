@@ -27,6 +27,11 @@ struct RenderSettings {
     float terrain_error_pixels = 2.0f;
     float terrain_height_km = 2.0f;
     uint32_t terrain_patch_limit = 1024;
+    bool show_rings = true;
+    bool ring_shadows_enabled = true;
+    bool ring_reference_full_annulus = false;
+    bool ring_reference_finite_source = false;
+    bool ring_reference_base_level = false;
     bool operator==(const RenderSettings&) const = default;
 };
 

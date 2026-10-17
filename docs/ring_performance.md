@@ -1,0 +1,296 @@
+# Ring rendering performance
+
+The first optimization changed the annulus shaders to read individual SSBO fields
+instead of copying a complete `RingHostGPU` into a local variable or a function
+argument. The original host was 976 bytes, including eight segments and sixteen
+shadow casters. Dynamically indexing those local copies was the dominant cost in
+the measured Saturn close-ups. Current hosts are 464 bytes; eclipse candidates
+use the shared planetary candidate buffer described below.
+
+The mesh is planar, so its rasterized depth already describes the ring plane.
+The fragment shader no longer overwrites `gl_FragDepth` and explicitly requests
+early fragment tests. Opaque planet depth can reject hidden ring fragments before
+the texture, eclipse and scattering calculations. The pipeline keeps depth writes
+disabled for transparent rings.
+
+That first optimization preserved scattering equations, texture filtering, ring
+geometry, shadow casters and solar-disc quadrature.
+
+## Measurements
+
+Release, NVIDIA GeForce RTX 4060 Ti, Vulkan 1.4.351, 1920x1080. These are median
+ring-pass GPU times from serialized offscreen captures, with surface ring shadows
+disabled to isolate visible ring rendering. Each mode has 40 warmup frames and
+120 measured frames per repetition, three repetitions in alternating mode order.
+
+| View | Original ring pass | Optimized ring pass |
+|---|---:|---:|
+| Lit side, 5 planet radii | 2.884 ms | 0.478 ms |
+| Transmitted side, 5 planet radii | 2.950 ms | 0.467 ms |
+| Planet fills view, 1.1 planet radii | 0.944 ms | 0.002 ms |
+
+The lit close-up's complete celestial pass decreased from 2.916 ms to 0.511 ms;
+its rings-disabled baseline was 0.033 ms. Keeping the original fragment-depth
+write while using individual SSBO loads measured 0.489 ms for the ring pass,
+isolating the major close-up improvement to eliminating host copies.
+
+Original and optimized RGBA16F captures were bit-identical for all four benchmark
+views: lit, transmitted, occluded and distant. GPU rendering contracts additionally
+check ring radiance, planet shadows on rings, ring shadows on the planet, and exact
+occlusion when the planet fills the view. The CPU radiative transfer contracts and
+application GPU self-test also pass.
+
+## Remaining cost and second optimization
+
+Diagnostic shader replacements measured the following ring-pass medians for the
+same lit close-up, starting with the 0.479 ms shader. These are isolated removals,
+not additive timings: removing code also changes compiler optimization and data
+lifetimes. The replacements are investigation tools, not production options.
+
+| Diagnostic replacement | Ring GPU time |
+|---|---:|
+| Full shader | 0.479 ms |
+| No multiple scattering | 0.459 ms |
+| No eclipse evaluation | 0.427 ms |
+| One texture tap instead of three | 0.457 ms |
+| No opposition factor | 0.477 ms |
+| Replace all radiance calculations with sampled color | 0.370 ms |
+| Only sample profiles and accumulate opacity | 0.106 ms |
+| Constant fragment output, retaining mesh/depth/blending | 0.040 ms |
+
+The expensive path is the general per-fragment layer processing and lighting loop,
+including keeping sampled layers alive across the star/shadow/source loops. The
+multiple-scattering equations alone account for only a small removable part of
+this workload. These experiments do not establish a hardware-counter diagnosis
+such as register spilling or memory-bandwidth saturation.
+
+The second optimization stores just RGB and optical depth in a `vec4[8]`, rather
+than complete sample records containing per-layer uniform properties and temporary
+alpha. A bit mask records positive-depth layers; lighting visits only those layers,
+in the original accumulation order. Compact storage alone measured 0.374 ms, and
+skipping inactive layers reduced it to 0.330 ms.
+
+Eclipse evaluation now tests a conservative spherical penumbra bound before taking
+square roots or evaluating an oblate projected radius. A small outward margin
+keeps boundary candidates for the original exact calculation. The scattering
+equations, three texture taps, solar-disc quadrature and angular/radial mesh
+resolution remain unchanged.
+
+| View | First optimization | Second optimization |
+|---|---:|---:|
+| Lit side | 0.478 ms | 0.305 ms |
+| Transmitted side | 0.468 ms | 0.289 ms |
+
+All four new HDR captures are byte-identical to the first optimization's captures.
+GPU contracts additionally exercise a sole active eighth layer, eight overlapping
+layers against combined optical depth, and additive illumination from two stars.
+Investigation scripts, diagnostic captures and the final capture are retained in
+`scratch/ring-cost/`; `profile.py` through `profile5.py` restore production shader
+sources in `finally` blocks and reject existing capture directories.
+
+## Shared planetary eclipse candidates
+
+Rings now use the planetary renderer's `eclipse_could_shadow` CPU filter and the
+same binding-2 blocker-index buffer. The table contains body receivers followed by
+ring receivers; ring host `h` uses receiver index `num_bodies + h`. Every receiver
+has an independent offset/count range for each scene star. The ring bound is its
+center and outer radius, conservatively enclosing the entire annulus. The parent
+planet remains eligible; all rendered nonstellar bodies with positive radius are
+considered, without a moon-parent restriction or sixteen-blocker truncation.
+
+`common/eclipse_shadow.glsl` shares the GPU range lookup, blocker loop, conservative
+per-pixel rejection and penumbra calculation between spheres, terrain and rings.
+Rings retain their projected oblate-caster radius; planetary surfaces retain their
+existing spherical-caster behavior. Candidate construction reads ordinary CPU
+vectors and uploads the shared table once per frame. The old host caster records
+and moon sorting are removed.
+
+This reduces Saturn's list from sixteen blockers to ten, with one retained for
+Uranus, in the benchmark fixture. The benchmark records these counts in host/star
+order as `ring_eclipse_candidate_counts`. It does **not** produce a meaningful GPU
+speedup in this view: lit-side time measured 0.309 ms versus 0.305 ms previously;
+transmitted-side time measured 0.295 ms versus 0.289 ms. Removing a few inexpensive
+blocker checks does not remove the remaining layer/lighting workload. All four
+HDR captures remain byte-identical; the captures are in `scratch/ring-candidates/`.
+
+GPU regressions verify CPU rejection of 24 irrelevant bodies without image changes,
+an unrelated body casting an umbra, nineteen retained blockers without truncation,
+and distinct nineteen/one blocker lists for two stars. The CPU oracle additionally
+checks 96,000 annulus samples across orientations, scales and large translations.
+
+These measurements exclude presentation, physics, UI, Gaia and orbit lines; they
+are not application FPS. The remaining visible-ring cost still includes the full
+scattering model. GPU timings vary with camera coverage, ring layers, illumination,
+hardware and other workloads. The `rings` timer is nested inside the celestial pass;
+do not add it to its parent.
+
+## Investigating the 0.3 ms plateau
+
+The 0.3 ms measurement was not a hardware floor. The general fragment shader
+carried all eight layer slots, a variable star loop, reflection and transmission,
+and four-sample solar-disc quadrature in one executable. Even where the runtime
+selected a single source direction, the other paths affected generated code and
+temporary storage. Pipeline executable statistics reported 80 fragment registers
+and a 21,248-byte executable for the original indexed-candidate shader. These are
+compiler statistics, not measured occupancy or a proof of register spilling.
+
+Fresh ablations of that shader measured 0.310 ms normally, 0.231 ms without eclipse
+evaluation, 0.225 ms replacing radiance with sampled color, and 0.040 ms with
+constant fragment output. Re-sampling profiles during lighting to eliminate the
+sample array was slower (0.386 ms, 96 registers). Thus the array's presence alone
+was not the explanation, and simply moving more blocker selection onto the CPU
+did not resolve the remaining shader workload.
+
+The renderer now makes two conservative decisions before drawing:
+
+* Static radial strip ranges list only the layers that could contribute to their
+  triangles. Their bounds include the inward angular chord, the shader's maximum
+  filtering footprint (including its minimum physical span), and a numerical
+  margin. Layers retain their original accumulation order. Pipeline capacities
+  are one, two, four or eight layers, so most disjoint ring bands use one slot.
+  Only the index ordering changes; vertices, triangles and mesh resolution stay
+  the same. Ranges are cached with the profiles and merged when adjacent masks
+  match. This trades some additional draw recording for less fragment work.
+* For a flat ring, `abs(dot(N,L)) < star_radius / distance` reduces to the star's
+  absolute height above the ring plane being smaller than its radius. Therefore
+  whether quadrature is needed is constant across the ring. Camera and source
+  side signs are also constant away from a plane crossing. CPU classification
+  uses the actual uploaded FP32 centers, poles and stars, evaluated in double
+  with an outward rounding margin. A single star whose disc cannot cross the
+  plane selects a single-source reflection or transmission executable. Multiple
+  stars keep the general star/side loop. Any potentially crossing disc keeps the
+  original quadrature. Nearly grazing camera views also retain the general
+  full-annulus path, avoiding unstable radial classification.
+
+No scattering equations, texture taps, eclipse candidates or source quadrature
+are removed from scenes that require them. These decisions select equivalent
+shader paths for the current geometry and lighting.
+
+Before the final one-star specialization, the lit close-up measured 0.206 ms;
+the same shader with a full-annulus draw measured 0.224 ms. Forcing the general
+finite-source path measured 0.261 ms with radial ranges and 0.287 ms with the full
+annulus. Radial ranges alone initially measured 0.261 ms, and specializing the
+single-source choice reduced that to 0.211 ms. The successive shader variants
+demonstrate that unused general lighting paths and broad layer processing were
+avoidable costs, not an intrinsic 0.3 ms minimum.
+
+Resolution scaling of the 0.206 ms version measured 0.068 ms at 960x540 and
+0.692 ms at 3840x2160. Repeating sixteen celestial draws in one submission gave
+0.198 ms for the last ring draw, versus 0.277 ms for the forced general reference.
+This small batching improvement, together with the strong resolution dependence,
+locates most remaining cost in fragment work rather than submission latency.
+Batched draws reuse depth and blend over the existing color; they are a diagnostic
+for sustained work, not independent rendered frames or application FPS.
+
+Ablations of the specialized 0.206 ms shader measured 0.137 ms without eclipses,
+0.144 ms with sampled color replacing radiance, 0.176 ms without multiple
+scattering, 0.200 ms with one texture tap, and 0.043 ms with constant output.
+Hard-coding the fixture's one-star loop measured 0.190 ms, motivating the final
+single-star executable selection. These differences overlap and cannot be added
+as independent component timings.
+
+The final single-star path measured **0.191 ms lit** and **0.186 ms transmitted**
+at 1920x1080, versus 0.309/0.295 ms before this investigation (38%/37% less ring
+GPU time). The full lit celestial pass was 0.224 ms with a 0.033 ms rings-disabled
+baseline. Occluded and distant rings each measured approximately 0.001 ms.
+These final four captures enabled executable statistics; a separate lit capture
+with statistics disabled measured **0.197 ms** (36% below the previous 0.309 ms),
+with a 0.229 ms full celestial pass. That repeat is in `final-uninstrumented/`.
+The one-layer single-star reflection executable reports 48 registers and 12,032
+bytes of code, down from the original general shader's 80 registers and 21,248
+bytes. This supports the compiler-complexity diagnosis without claiming measured
+occupancy or a specific cache bottleneck.
+
+Compared with the previous four 1080p HDR captures, lit and transmitted views
+change only 131 and 105 components respectively, each by one FP16 ULP. Occluded
+and distant captures remain byte-identical. The equations and sampling model
+are unchanged; separate compiled paths can round differently.
+
+Investigation captures, source checkpoints, ablations, compiler statistics and
+resolution/batching reports are under `scratch/ring-bottleneck/`. CPU regressions
+sample actual mesh triangles across random layer layouts, overlaps, narrow bands,
+zero-opacity layers and physical scales. A separate lighting oracle checks
+per-fragment source-count and side decisions. GPU comparisons exercise equinox,
+mixed-star illumination, tilted poles and both sides of the grazing fallback
+against forced full-annulus finite-source rendering, allowing at most two FP16
+ULPs for compiler rounding.
+All sixty GPU reference views passed with a maximum difference of one FP16 ULP;
+Vulkan validation reported no errors during that sweep.
+
+The broader suite exposed an independent-system cache lifetime bug: a raw
+definition pointer plus per-simulation revision counters could match a later
+definition allocated at the same address. The ring cache now retains the shared
+immutable definition through `SystemSnapshot::share_definition()`, preventing
+address reuse until the cache changes. A GPU regression alternates twelve
+independent systems with and without rings while their revision counters match.
+The final CPU eclipse/optics contracts, application GPU self-test and full rendering
+contract suite all pass. The full suite includes the sixty reference views and
+the independent-system cache regression.
+
+`STELLAR_SHADER_STATS=1` opts into supported Vulkan pipeline executable statistics
+through the shared RHI; ordinary runs do not enable the feature or capture flags.
+The tested driver reports an implausible high word for its local-memory statistic,
+matching an [NVIDIA developer forum report](https://forums.developer.nvidia.com/t/vkgetpipelineexecutablestatisticskhr-reports-64gb-of-local-memory-size/346960).
+Do not interpret that field as a valid absolute allocation or evidence of spilling.
+
+## Radial profile filtering
+
+The visible ring profiles now have thirteen mip levels, down to one texel per
+profile. The old 4096x64 two-dimensional atlas forced level zero and averaged
+three isolated taps. Its small tap count could miss many alternating bands
+inside one pixel, producing moire and camera-dependent shimmer.
+
+Profiles are now separate layers of a 4096x1 texture array. Only the radial axis
+shrinks through the mip chain, so neighboring profiles never mix. Mips are baked
+on profile rebuild, not every frame. Color is converted to linear light and
+premultiplied by opacity before reduction; filtered samples recover color before
+the existing optical calculations. Transparent texels therefore cannot introduce
+colored fringes. The fragment shader uses `log2(max(fwidth(radius) / layer_span *
+4096, 1))` and the shared trilinear sampler in one `textureLod` lookup. Magnification
+uses the original-resolution level; minification progressively averages fine bands.
+
+The profile array occupies approximately 8 MiB, versus 4 MiB previously. The
+completion-managed staging buffer is sized for complete profile/LUT rebuilds
+across the frames in flight. The steady render path does no CPU mip generation.
+
+A synthetic 128-stop alternating-band fixture compares eight subpixel camera
+positions with an averaged-density reference. The filtered/unfiltered squared
+error ratio is 0.0000237. A separate GPU test keeps minified red and blue layers
+isolated. CPU tests check uniform-color preservation, linear-light reduction,
+opacity conservation and transparent-color rejection. All sixty optimized versus
+general-shader reference views still pass within one FP16 ULP, with no Vulkan
+validation errors. Profile filtering addresses band minification; mesh silhouette
+coverage is a separate rasterization concern.
+
+The final 1080p captures measured 0.194 ms lit and 0.181 ms transmitted, versus
+the previous 0.197 ms lit repeat. Occluded and distant ring passes remain around
+0.001 ms. This filtering has no measurable added cost in that fixture. Captures
+and a before/after crop are retained in `scratch/ring-filtering/`.
+
+## Reproduction
+
+Build with `STELLAR_BUILD_RENDER_TESTS=ON`, then run:
+
+```powershell
+cmake --build build --target StellarForge StellarRenderingTests StellarEclipseTests --parallel 4
+.\build\StellarRenderingTests.exe --ring-benchmark scratch/ring-performance/new-capture
+.\build\StellarRenderingTests.exe --rings-only
+.\build\StellarRenderingTests.exe --ring-filtering-only
+ctest --test-dir build --output-on-failure -R '^(eclipse_contracts|rendering_contracts|simulation_tracking_rendering_contracts)$'
+```
+
+The benchmark refuses to overwrite an output directory. It writes `report.json`,
+raw `.rgba16` HDR images and clamped `.ppm` previews. Optional arguments are
+`[scene [width height [draws_per_submit [render_mode]]]]`. Scene selects `lit`,
+`transmitted`, `occluded` or `distant`; omission runs all four. The extent defaults
+to 1920x1080 and batch size to one. Modes are `optimized` (default), `reference`
+(full annulus and general finite-source path), `full` (full annulus with automatic
+lighting selection), `finite` (radial ranges with the general lighting path), or
+`base` (automatic lighting with the profile sampler forced to mip level zero).
+For example, `--ring-benchmark scratch/ring-performance/batch lit 1920 1080 16 reference`
+tests a batch of sixteen general draws. Each view compares disabled
+rings, visible rings, and visible rings plus surface shadows. The report records
+the local Solar System definition, camera direction/distance, GPU, compiler and
+build type; compare captures with matching fixtures and shader instrumentation.
+Retain shader sources with dirty-tree baselines. Local investigation captures and
+original shader copies are in `scratch/ring-performance/`.

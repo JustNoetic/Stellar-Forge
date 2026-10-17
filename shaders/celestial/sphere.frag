@@ -12,47 +12,11 @@ layout(location = 6) in vec2 f_tile_uv;
 #endif
 
 #include "common/celestial_scene.glsl"
+#include "common/eclipse_shadow.glsl"
 #include "common/surface_textures.glsl"
+#include "common/surface_ring_shadow.glsl"
 
 layout(location = 0) out vec4 out_color;
-
-layout(std430, set = 0, binding = 2) readonly buffer EclipseCandidateBuffer {
-    uint eclipse_words[];
-};
-
-float compute_eclipse_shadow(vec3 frag_pos, vec3 star_pos, float star_radius, uint self_idx, uint star_idx) {
-    uint range = (self_idx * u_scene.num_stars + star_idx) * 2u;
-    uint start = eclipse_words[range];
-    uint count = eclipse_words[range + 1u];
-    if (count == 0u) return 1.0;
-    vec3 to_star = star_pos - frag_pos;
-    float dist_star = length(to_star);
-    if (dist_star <= 1e-9) return 1.0;
-    vec3 L = to_star / dist_star;
-
-    float vis = 1.0;
-    for (uint candidate = 0u; candidate < count; ++candidate) {
-        uint i = eclipse_words[start + candidate];
-        BodyInstanceGPU caster = bodies[i];
-
-        vec3 oc = caster.pos_radius.xyz - frag_pos;
-        float proj = dot(oc, L);
-        if (proj <= 0.0 || proj >= dist_star) continue;
-
-        float d_perp = length(oc - L * proj);
-        float r_caster = caster.pos_radius.w;
-        float r_sun_proj = star_radius * (proj / dist_star);
-        float r_umbra = max(0.0, r_caster - r_sun_proj);
-        float r_penumbra = r_caster + r_sun_proj;
-
-        if (d_perp < r_penumbra) {
-            float t = clamp((d_perp - r_umbra) / max(r_penumbra - r_umbra, 1e-9), 0.0, 1.0);
-            vis *= pow(smoothstep(0.0, 1.0, t), 0.625);
-            if (vis <= 1e-4) return 0.0;
-        }
-    }
-    return vis;
-}
 
 void main() {
 #ifdef TERRAIN_SURFACE
@@ -103,7 +67,11 @@ void main() {
 
         float ndotl = max(dot(N, L), 0.0);
         if (ndotl > 0.0) {
-            float shadow = compute_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s);
+            float shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s, false);
+            if (shadow > 1e-4 && u_scene.num_ring_hosts > 0u) {
+                float sun_ang_rad = star_r / d_au;
+                shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad);
+            }
             float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
             float brdf = surface_reflectance(N, L, V);
             total_light += albedo * star_col * irradiance * brdf * shadow;

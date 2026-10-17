@@ -19,7 +19,7 @@ layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
     uint num_stars;
     uint num_bodies;
     uint hdr_enabled;
-    uint pad0;
+    uint num_ring_hosts;
     mat4 projection;
 } u_scene;
 

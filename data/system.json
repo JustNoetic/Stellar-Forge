@@ -596,7 +596,7 @@
         "outer": 2.26624,
         "color": "#ffffff",
         "opacity": 1.0,
-        "scatter": 1.69,
+        "scatter": 0.35,
         "asymmetry": 0.436,
         "backscatter": -0.65711,
         "gradient": []
@@ -606,7 +606,7 @@
         "outer": 2.32671,
         "color": "#afafaf",
         "opacity": 0.0003,
-        "scatter": 5.71,
+        "scatter": 0.85,
         "asymmetry": 0.959,
         "backscatter": -0.424,
         "gradient": [
@@ -635,7 +635,7 @@
         "opacity": 0.001,
         "scatter": 0.9,
         "asymmetry": 0.984,
-        "backscatter": 0.999,
+        "backscatter": -0.45,
         "gradient": [
           {
             "p": 0.0,
@@ -670,7 +670,7 @@
         "opacity": 0.002,
         "scatter": 1.0,
         "asymmetry": 0.954,
-        "backscatter": 0.999,
+        "backscatter": -0.45,
         "gradient": [
           {
             "p": 0.0,
@@ -1073,7 +1073,7 @@
         "opacity": 0.08,
         "scatter": 0.13,
         "asymmetry": 0.165,
-        "backscatter": 0.72,
+        "backscatter": -0.72,
         "gradient": []
       }
     ],
