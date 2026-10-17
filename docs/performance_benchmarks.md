@@ -39,6 +39,8 @@ simulation failures and missing GPU results reject the run.
 | `analytical` | Running Jacobi analytical propagation | Same overview camera |
 | `nbody` | Running IAS15 | Same overview camera; integrator epsilon recorded |
 | `spice` | Running local SPICE Ephemeris Mode | Same overview camera; explicit opt-in |
+| `earth-full` | Paused analytical Solar System at time zero | Sunward Earth close-up at 1.1 Earth radii; fills the framebuffer |
+| `earth-eclipse` | Paused analytical Solar System at 1.565 years | Same distance; Moon shadow axis centered on Earth's surface |
 
 All scenes use the default FOV and render settings, including Gaia stars and orbit
 lines at 2048 segments. Each repetition reloads its initial system and resets its
@@ -47,6 +49,8 @@ camera. The time step is fixed at 1/60 second, independent of render speed;
 scenes advance during warmup and continue from that epoch during measurement.
 Approach warmup holds the starting distance. A one-frame approach capture samples
 only its starting pose. These are deterministic workloads, not wall-time playback.
+The two Earth close-ups are opt-in. See [eclipse_shadows.md](eclipse_shadows.md)
+for their geometry, exact image checks and eclipse filtering measurements.
 
 ```powershell
 .\build\StellarForge.exe --benchmark --benchmark-scene nbody --benchmark-warp 3600 --benchmark-output exports/benchmarks/nbody-1h
@@ -70,7 +74,7 @@ This is application frame throughput, not a display scanout or input-latency met
 |---|---|
 | `cpu_simulation_ms` | `Simulation::advance`, including prepared render state |
 | `cpu_camera_ms` | Scripted camera pose and normal camera update |
-| `cpu_record_ms` | Render-target checks, UI, renderer preparation and command recording; excludes acquire/fence waits and end-frame submission/present |
+| `cpu_record_ms` | Render-target checks, UI, renderer preparation and command recording; excludes camera update, acquire/fence waits and end-frame submission/present |
 | `cpu_ui_ms` | ImGui frame setup and workspace construction; child of `cpu_record_ms` |
 | `cpu_celestial_ms`, `cpu_gaia_ms`, `cpu_orbits_ms` | Each renderer's CPU preparation and command recording, including its GPU timestamp commands; children of `cpu_record_ms` |
 | `fence_wait_ms`, `acquire_wait_ms` | Separate Vulkan frame pacing waits |

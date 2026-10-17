@@ -2,6 +2,7 @@
 
 #include "core/coordinates.hpp"
 #include "core/units.hpp"
+#include "physics/star_calc.hpp"
 #include <memory>
 #include <span>
 #include <cstdint>
@@ -177,9 +178,13 @@ public:
     std::vector<std::string> list_systems() const;
     LoadedSystem load_system(std::string_view name) const;
     bool save_system(std::string_view name, const SystemDefinition& definition) const;
+    bool system_exists(std::string_view name) const;
+    bool delete_system(std::string_view name) const;
+    bool create_new_system_from_props(std::string_view system_name, std::string_view star_name,
+                                      const physics::StarForgeResult& result,
+                                      const physics::StarParameters& params) const;
     static LoadedSystem parse_system(const nlohmann::json& source, std::string_view name);
     static nlohmann::json serialize_definition(const SystemDefinition& definition);
-
 };
 
 } // namespace sf::ephemeris

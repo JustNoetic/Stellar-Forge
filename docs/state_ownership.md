@@ -25,6 +25,16 @@ Normal interactive playback runs simulation on a worker thread; `--no-simulation
 
 The analytical propagator reuses its previous-motion scratch vector. It does not copy body definitions, strings or JSON on each tick. JSON and definition copying occurs on loading, saving, or explicit physical edits.
 
+The frame order is event polling, simulation publication/submission, UI commands,
+camera update, then scene recording. UI commands can adopt a newer worker snapshot
+while waiting for their result, so camera tracking, spin following and centering
+must update after the UI has finished. No further simulation publication is
+consumed between camera update and scene recording. Updating the camera before
+UI time-warp edits leaves its origin one snapshot behind the rendered body.
+`--self-test` follows Earth and repeatedly changes time warp at the UI phase,
+checking camera/body snapshot agreement before rendering; the opt-in GPU test
+suite runs this as `simulation_tracking_rendering_contracts`.
+
 `Simulation` also owns the cached `JacobiPropagator`. Snapshots share an immutable
 `JacobiHierarchy` containing sibling order and subsystem/inner masses. Sibling
 order is established from the loaded state and remains fixed while moving bodies

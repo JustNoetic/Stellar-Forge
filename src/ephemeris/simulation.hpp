@@ -45,13 +45,25 @@ struct BodyPhysicalProperties {
     bool equatorial_frame = false;
     bool bring_moons = true;
 
+    double temp_k = 5778.0;
+    double lum_eq = 1.0;
+    double lum_pole = 1.0;
+    glm::vec3 color_rgb{1.0f};
+    glm::vec3 color_pole_rgb{1.0f};
+    std::string spectral_class;
+    std::string stage;
+    nlohmann::json star_props;
+
     bool operator==(const BodyPhysicalProperties&) const = default;
 
     static BodyPhysicalProperties from(const BodyDefinition& body) {
         return {units::SolarMasses{body.mass_msun}, units::Kilometres{body.radius_rsun * SOLAR_RADIUS_KM},
                 body.oblateness, body.j2, body.j4, body.type, body.rotation_period_hr, body.tidally_locked,
                 false, body.semi_major_au, body.eccentricity, body.inc_deg, body.omega_node_deg,
-                body.arg_peri_deg, body.mean_anom_deg, false, true};
+                body.arg_peri_deg, body.mean_anom_deg, false, true,
+                body.temp_k, body.lum_eq, body.lum_pole, body.color_rgb, body.color_pole_rgb,
+                body.spectral_class, body.stage,
+                body.source_json.contains("star_props") ? body.source_json["star_props"] : nlohmann::json{}};
     }
 };
 

@@ -156,6 +156,13 @@ target_link_libraries(StellarForge PRIVATE
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
 if(STELLAR_BUILD_TESTS)
     enable_testing()
+    add_executable(StellarEclipseTests tests/eclipse_tests.cpp)
+    target_include_directories(StellarEclipseTests PRIVATE src)
+    target_link_libraries(StellarEclipseTests PRIVATE glm::glm)
+    if(MINGW)
+        target_link_options(StellarEclipseTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    endif()
+    add_test(NAME eclipse_contracts COMMAND StellarEclipseTests)
     add_executable(StellarBenchmarkTests tests/benchmark_tests.cpp src/benchmark/benchmark.cpp src/core/path_utils.cpp)
     target_include_directories(StellarBenchmarkTests PRIVATE src)
     target_compile_definitions(StellarBenchmarkTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -176,6 +183,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
+        src/physics/star_calc.cpp
         src/core/path_utils.cpp
         src/core/time_utils.cpp
     )
@@ -208,6 +216,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
+        src/physics/star_calc.cpp
         src/core/path_utils.cpp
     )
     target_include_directories(StellarOrbitTests PRIVATE src)
@@ -228,6 +237,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
+        src/physics/star_calc.cpp
         src/core/path_utils.cpp
     )
     target_include_directories(StellarHierarchyTests PRIVATE src)
@@ -239,6 +249,19 @@ if(STELLAR_BUILD_TESTS)
         target_link_options(StellarHierarchyTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
     endif()
     add_test(NAME hierarchy_contracts COMMAND StellarHierarchyTests)
+    add_executable(StellarStarCalcTests
+        tests/star_calc_tests.cpp
+        src/physics/star_calc.cpp
+    )
+    target_include_directories(StellarStarCalcTests PRIVATE src)
+    target_compile_definitions(StellarStarCalcTests PRIVATE
+        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
+    )
+    target_link_libraries(StellarStarCalcTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
+    if(MINGW)
+        target_link_options(StellarStarCalcTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    endif()
+    add_test(NAME star_calc_contracts COMMAND StellarStarCalcTests)
     option(STELLAR_TEST_EPHEMERIS "Test against locally installed CSPICE kernels" OFF)
     if(STELLAR_TEST_EPHEMERIS)
         target_compile_definitions(StellarStateTests PRIVATE STELLAR_TEST_EPHEMERIS)
@@ -249,6 +272,8 @@ endif()
 option(STELLAR_BUILD_RENDER_TESTS "Build GPU rendering contract tests (requires Vulkan and a window system)" OFF)
 if(STELLAR_BUILD_RENDER_TESTS)
     enable_testing()
+    add_test(NAME simulation_tracking_rendering_contracts COMMAND StellarForge --self-test)
+    set_tests_properties(simulation_tracking_rendering_contracts PROPERTIES TIMEOUT 30)
     add_executable(StellarRenderingTests
         tests/rendering_tests.cpp
         src/ephemeris/ias15.cpp
@@ -259,6 +284,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
+        src/physics/star_calc.cpp
         src/rendering/celestial_renderer.cpp
         src/rendering/star_catalog.cpp
         src/rhi/shader_cache.cpp
@@ -280,6 +306,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/simulation.cpp
         src/ephemeris/spice_ephemeris.cpp
         src/ephemeris/system_manager.cpp
+        src/physics/star_calc.cpp
         src/rendering/orbit_renderer.cpp
         src/rhi/shader_cache.cpp
         src/rhi/vk_context.cpp

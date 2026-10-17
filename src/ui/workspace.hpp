@@ -26,6 +26,7 @@ struct WorkspaceSettings {
     float outliner_width = 260.0f;
     float inspector_width = 420.0f;
     float scale = 1.0f;
+    bool confirm_delete = true;
 
     void reset_layout() {
         aligned_panels = true;
@@ -35,6 +36,7 @@ struct WorkspaceSettings {
         outliner_width = 260.0f;
         inspector_width = 420.0f;
         scale = 1.0f;
+        confirm_delete = true;
     }
 };
 
@@ -87,6 +89,8 @@ void heading(std::string_view title, std::string_view subtitle = {});
 void section(std::string_view title, std::string_view note = {});
 void value_row(std::string_view label, std::string_view value);
 void metric_text(std::string_view text);
+
+bool render_star_creator_widgets(StarCreatorDraft& draft);
 
 bool drag_float(const char* label, float* v, float v_speed = 1.0f, float v_min = 0.0f, float v_max = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);
 bool drag_float2(const char* label, float v[2], float v_speed = 1.0f, float v_min = 0.0f, float v_max = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);

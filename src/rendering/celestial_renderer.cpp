@@ -1,4 +1,5 @@
 #include "rendering/celestial_renderer.hpp"
+#include "rendering/eclipse_candidates.hpp"
 #include "core/constants.hpp"
 #include "rhi/shader_cache.hpp"
 
@@ -26,11 +27,13 @@ void CelestialRenderer::init(rhi::VkContext& ctx) {
         instance_ssbos_[i] = ctx.create_host_buffer(
             MAX_CELESTIAL_BODIES * sizeof(BodyInstanceGPU),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        eclipse_ssbos_[i] = ctx.create_host_buffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
 
     rhi::DescriptorLayoutBinding bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     rhi::GraphicsPipelineDesc sphere_desc{};
@@ -74,6 +77,7 @@ void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         ctx.destroy_buffer(instance_ssbos_[i]);
+        ctx.destroy_buffer(eclipse_ssbos_[i]);
         ctx.destroy_buffer(scene_ubos_[i]);
     }
     ctx.destroy_buffer(sphere_ibo_);
@@ -151,7 +155,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ubo.num_bodies = count;
     ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
 
-    auto* inst_ptr = static_cast<BodyInstanceGPU*>(instance_ssbos_[f_idx].mapped);
+    body_instances_.resize(count);
+    auto* inst_ptr = body_instances_.data();
 
     for (uint32_t i = 0; i < count; ++i) {
         const auto& b = sys.body(i);
@@ -182,11 +187,40 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         ubo.stars_color_lum[0] = glm::vec4(1.0f, 0.95f, 0.90f, 1.0f);
     }
 
+    eclipse_words_.assign(count * ubo.num_stars * 2, 0u);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& receiver = inst_ptr[i];
+        if (receiver.color_is_star.w > 0.5f || receiver.spin_flags.z > 0.5f) continue;
+        float distance = std::max(glm::length(glm::vec3(receiver.pos_radius)), 1e-12f);
+        float radius_px = receiver.pos_radius.w / distance * fb_h * fov_factor;
+        if (radius_px <= 1.49f) continue;
+        for (uint32_t s = 0; s < ubo.num_stars; ++s) {
+            uint32_t range = (i * ubo.num_stars + s) * 2;
+            uint32_t start = static_cast<uint32_t>(eclipse_words_.size());
+            for (uint32_t j = 0; j < count; ++j) {
+                if (i == j || inst_ptr[j].color_is_star.w > 0.5f) continue;
+                if (eclipse_could_shadow(receiver.pos_radius, ubo.stars_pos_radius[s], inst_ptr[j].pos_radius))
+                    eclipse_words_.push_back(j);
+            }
+            eclipse_words_[range] = start;
+            eclipse_words_[range + 1] = static_cast<uint32_t>(eclipse_words_.size()) - start;
+        }
+    }
+    auto& eclipse_buffer = eclipse_ssbos_[f_idx];
+    VkDeviceSize eclipse_bytes = eclipse_words_.size() * sizeof(uint32_t);
+    if (eclipse_bytes > eclipse_buffer.size) {
+        VkDeviceSize capacity = std::max(eclipse_bytes, eclipse_buffer.size * 2);
+        ctx.destroy_buffer(eclipse_buffer);
+        eclipse_buffer = ctx.create_host_buffer(capacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+    std::memcpy(eclipse_buffer.mapped, eclipse_words_.data(), eclipse_bytes);
+    std::memcpy(instance_ssbos_[f_idx].mapped, body_instances_.data(), count * sizeof(BodyInstanceGPU));
     std::memcpy(scene_ubos_[f_idx].mapped, &ubo, sizeof(SceneCelestialUBO));
 
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
         rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU)),
+        rhi::PushDescriptorWrite::storage_buffer(2, eclipse_buffer, 0, eclipse_bytes),
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipeline_.handle);

@@ -1,10 +1,54 @@
 #pragma once
 
-#include "ephemeris/simulation.hpp"
 #include "core/math_utils.hpp"
+#include "ephemeris/simulation.hpp"
+#include "physics/star_calc.hpp"
+#include <algorithm>
 #include <format>
+#include <string>
 
 namespace sf::ui {
+
+struct StarCreatorDraft {
+    physics::StarParameters params{};
+    physics::StarForgeResult preview{};
+    bool dirty = false;
+
+    void recompute() {
+        preview = physics::StarCalculator::forge(params);
+        dirty = false;
+    }
+
+    void init_from_body(const ephemeris::BodyDefinition& b) {
+        if (b.source_json.contains("star_props") && b.source_json["star_props"].is_object()) {
+            params = physics::StarCalculator::from_json(b.source_json["star_props"]);
+        } else {
+            params = {};
+            params.mass_msun = b.mass_msun > 0.0 ? b.mass_msun : 1.0;
+            params.radius_rsun = b.radius_rsun > 0.0 ? b.radius_rsun : 1.0;
+            params.temp_k = b.temp_k > 0.0 ? b.temp_k : 5778.0;
+            params.lum_lsun = b.lum_eq > 0.0 ? b.lum_eq : 1.0;
+        }
+        recompute();
+    }
+};
+
+struct CreateSystemDraft {
+    bool active = false;
+    std::string system_name = "New System";
+    std::string star_name = "Star";
+    StarCreatorDraft star{};
+    std::string error;
+
+    void reset() {
+        active = true;
+        system_name = "New System";
+        star_name = "Star";
+        star = {};
+        star.recompute();
+        error.clear();
+    }
+};
 
 struct BodyEditDraft {
     int body_index = -1;
@@ -12,6 +56,7 @@ struct BodyEditDraft {
     uint64_t body_revision = 0;
     int reference_parent = -1;
     ephemeris::BodyPhysicalProperties values{};
+    StarCreatorDraft star{};
     bool dirty = false;
     std::string error;
 
@@ -21,6 +66,9 @@ struct BodyEditDraft {
         body_revision = snapshot.body(index).revisions.definition;
         reference_parent = snapshot.reference_parent(index);
         values = ephemeris::BodyPhysicalProperties::from(snapshot.body(index).definition);
+        if (values.type == "Star" || snapshot.body(index).definition.is_star) {
+            star.init_from_body(snapshot.body(index).definition);
+        }
         dirty = false;
         error.clear();
     }
@@ -74,6 +122,7 @@ struct AddBodyDraft {
     double arg_peri_deg = 0.0;
     double mean_anom_deg = 0.0;
 
+    StarCreatorDraft star{};
     std::string error;
 
     void reset_for_parent(const ephemeris::SystemSnapshot& snapshot, int p_idx) {
@@ -110,6 +159,11 @@ struct AddBodyDraft {
         omega_node_deg = static_cast<double>(std::rand() % 360);
         arg_peri_deg = static_cast<double>(std::rand() % 360);
         mean_anom_deg = static_cast<double>(std::rand() % 360);
+        star = {};
+        star.params.mass_msun = 0.5;
+        star.params.radius_rsun = 0.6;
+        star.params.temp_k = 4000.0;
+        star.recompute();
         error.clear();
         recompute_hydrostatic();
     }
@@ -121,6 +175,7 @@ struct AddBodyDraft {
     }
 
     double get_mass_msun() const noexcept {
+        if (type == "Star") return star.preview.mass_msun;
         if (mass_unit == 1) return mass_input * 3.694e-8;
         if (mass_unit == 0) return mass_input * 3.003e-6;
         return mass_input;
@@ -150,8 +205,8 @@ struct AddBodyDraft {
         bdef.type = type;
         bdef.parent_idx = parent_idx;
         bdef.mass_msun = get_mass_msun();
-        bdef.radius_rsun = radius_km / SOLAR_RADIUS_KM;
-        bdef.oblateness = oblateness;
+        bdef.radius_rsun = (type == "Star") ? star.preview.radius_rsun : (radius_km / SOLAR_RADIUS_KM);
+        bdef.oblateness = (type == "Star") ? star.preview.oblateness : oblateness;
         bdef.j2 = j2;
         bdef.j4 = j4;
         bdef.semi_major_au = get_semi_major_au();
@@ -162,10 +217,18 @@ struct AddBodyDraft {
         bdef.mean_anom_deg = mean_anom_deg;
         bdef.rotation_period_hr = rotation_period_hr;
         bdef.tidally_locked = tidally_locked;
-        bdef.color_rgb = color_rgb;
-        bdef.color_pole_rgb = color_rgb;
+        bdef.color_rgb = (type == "Star") ? star.preview.color_rgb : color_rgb;
+        bdef.color_pole_rgb = (type == "Star") ? star.preview.color_pole_rgb : color_rgb;
         bdef.is_star = (type == "Star");
-        bdef.is_black_hole = (type == "Black Hole");
+        bdef.is_black_hole = (type == "Black Hole") || (type == "Star" && star.preview.is_black_hole);
+        if (type == "Star") {
+            bdef.temp_k = star.preview.temp_k;
+            bdef.lum_eq = star.preview.lum_eq_lsun;
+            bdef.lum_pole = star.preview.lum_pole_lsun;
+            bdef.spectral_class = star.preview.spectral_class;
+            bdef.stage = star.preview.stage_name;
+            bdef.source_json["star_props"] = physics::StarCalculator::to_json(star.preview, star.params);
+        }
         return {snapshot.generation(), bdef, frame == 1, axial_tilt_deg};
     }
 };
@@ -185,6 +248,9 @@ struct WorkspaceState {
     BodyEditDraft body_draft{};
     AddBodyDraft add_body{};
     DeleteBodyPrompt delete_prompt{};
+    CreateSystemDraft create_system{};
+    bool confirm_delete_system = false;
+    std::string delete_system_name;
     std::string settings_error;
 
     bool has_selection() const noexcept { return inspected_body >= 0; }
@@ -193,4 +259,4 @@ struct WorkspaceState {
     }
 };
 
-}
+} // namespace sf::ui

@@ -37,6 +37,8 @@ int main(int argc, char** argv) {
         reject({"app", "--benchmark", "--benchmark-output"});
         reject({"app", "--benchmark-scene", "overview"});
         reject({"app", "--benchmark", "--benchmark-scene", "missing"});
+        check(parse({"app", "--benchmark", "--benchmark-scene", "earth-full"}).benchmark.scenes[0] == "earth-full", "Earth close-up scene");
+        check(parse({"app", "--benchmark", "--benchmark-scene", "earth-eclipse"}).benchmark.scenes[0] == "earth-eclipse", "Earth eclipse scene");
         check(parse({"app", "--simulation-thread"}).simulation_thread, "Interactive simulation worker flag");
         check(parse({"app"}).simulation_thread, "Interactive simulation worker is not the default");
         check(!parse({"app", "--no-simulation-thread"}).simulation_thread, "Inline simulation fallback flag");

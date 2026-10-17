@@ -245,6 +245,18 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     body.is_star = (values.type == "Star");
     body.rotation_period_hr = values.rotation_period_hr;
     body.tidally_locked = values.tidally_locked;
+    if (body.is_star) {
+        body.temp_k = values.temp_k;
+        body.lum_eq = values.lum_eq;
+        body.lum_pole = values.lum_pole;
+        body.color_rgb = values.color_rgb;
+        body.color_pole_rgb = values.color_pole_rgb;
+        body.spectral_class = values.spectral_class;
+        body.stage = values.stage;
+        if (!values.star_props.is_null()) {
+            body.source_json["star_props"] = values.star_props;
+        }
+    }
 
     bool dynamics_changed = (before.mass != values.mass || before.oblateness != values.oblateness ||
                              before.j2 != values.j2 || before.j4 != values.j4 ||
@@ -320,7 +332,8 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     auto& revisions = snapshot_.revisions_[index];
     ++revisions.definition;
     if (dynamics_changed) ++revisions.dynamics;
-    if (before.radius != values.radius || before.oblateness != values.oblateness || before.type != values.type) {
+    if (before.radius != values.radius || before.oblateness != values.oblateness || before.type != values.type ||
+        before.color_rgb != values.color_rgb || before.lum_eq != values.lum_eq || before.temp_k != values.temp_k) {
         ++revisions.geometry;
         ++revisions.lighting;
     }

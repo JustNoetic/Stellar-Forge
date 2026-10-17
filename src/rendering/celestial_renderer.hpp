@@ -5,6 +5,7 @@
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
 #include <array>
+#include <vector>
 #include <glm/glm.hpp>
 
 namespace sf::rendering {
@@ -50,6 +51,9 @@ private:
 
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> scene_ubos_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> instance_ssbos_{};
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> eclipse_ssbos_{};
+    std::vector<BodyInstanceGPU> body_instances_;
+    std::vector<uint32_t> eclipse_words_;
 
     rhi::Pipeline sphere_pipeline_{};
     rhi::Pipeline point_pipeline_{};

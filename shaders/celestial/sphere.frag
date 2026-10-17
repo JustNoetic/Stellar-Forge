@@ -10,17 +10,24 @@ layout(location = 4) flat in uint f_body_idx;
 
 layout(location = 0) out vec4 out_color;
 
-float compute_eclipse_shadow(vec3 frag_pos, vec3 star_pos, float star_radius, uint self_idx) {
+layout(std430, set = 0, binding = 2) readonly buffer EclipseCandidateBuffer {
+    uint eclipse_words[];
+};
+
+float compute_eclipse_shadow(vec3 frag_pos, vec3 star_pos, float star_radius, uint self_idx, uint star_idx) {
+    uint range = (self_idx * u_scene.num_stars + star_idx) * 2u;
+    uint start = eclipse_words[range];
+    uint count = eclipse_words[range + 1u];
+    if (count == 0u) return 1.0;
     vec3 to_star = star_pos - frag_pos;
     float dist_star = length(to_star);
     if (dist_star <= 1e-9) return 1.0;
     vec3 L = to_star / dist_star;
 
     float vis = 1.0;
-    for (uint i = 0; i < u_scene.num_bodies; ++i) {
-        if (i == self_idx) continue;
+    for (uint candidate = 0u; candidate < count; ++candidate) {
+        uint i = eclipse_words[start + candidate];
         BodyInstanceGPU caster = bodies[i];
-        if (caster.color_is_star.w > 0.5) continue;
 
         vec3 oc = caster.pos_radius.xyz - frag_pos;
         float proj = dot(oc, L);
@@ -81,7 +88,7 @@ void main() {
 
         float ndotl = max(dot(N, L), 0.0);
         if (ndotl > 0.0) {
-            float shadow = compute_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx);
+            float shadow = compute_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s);
             float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
             float brdf = surface_reflectance(N, L, V);
             total_light += albedo * star_col * irradiance * brdf * shadow;

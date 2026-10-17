@@ -5,6 +5,10 @@
 #include <backends/imgui_impl_vulkan.h>
 #include <imgui_internal.h>
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <format>
 #include <string>
 
 namespace sf::ui {
@@ -19,6 +23,43 @@ void UiSystem::init(GLFWwindow* window, rhi::VkContext& ctx) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    io.Fonts->AddFontDefault();
+
+    ImFontConfig fallback_cfg;
+    fallback_cfg.MergeMode = true;
+    fallback_cfg.PixelSnapH = true;
+    fallback_cfg.OversampleH = 1;
+    fallback_cfg.OversampleV = 1;
+    fallback_cfg.RasterizerMultiply = 1.5f;
+
+    static const ImWchar symbol_ranges[] = {
+        0x00A0, 0x00FF, // Latin-1 Supplement (°, ², ³, etc.)
+        0x0370, 0x03FF, // Greek and Coptic (Ω, ω, ν, etc.)
+        0x2070, 0x209F, // Superscripts and Subscripts
+        0x2200, 0x22FF, // Mathematical Operators (⊕, etc.)
+        0x25A0, 0x25FF, // Geometric Shapes
+        0x2600, 0x26FF, // Miscellaneous Symbols (☉, ☽, ♃, ♄, etc.)
+        0x2700, 0x27BF, // Dingbats
+        0,
+    };
+
+    const char* win_dir = std::getenv("WINDIR");
+    std::filesystem::path fonts_dir = win_dir ? (std::filesystem::path(win_dir) / "Fonts") : "C:\\Windows\\Fonts";
+
+    const std::filesystem::path candidate_fonts[] = {
+        fonts_dir / "seguisym.ttf",
+        fonts_dir / "seguiemj.ttf",
+        fonts_dir / "arial.ttf",
+    };
+
+    for (const auto& font_path : candidate_fonts) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(font_path, ec)) {
+            io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 13.0f, &fallback_cfg, symbol_ranges);
+            break;
+        }
+    }
 
     ImGui_ImplGlfw_InitForVulkan(window, true);
 
@@ -313,6 +354,172 @@ bool drag_float4(const char* label, float v[4], float v_speed, float v_min, floa
     if (ImGui::IsItemActive() && s_active_ui_system) {
         s_active_ui_system->notify_drag_active(ImGui::GetItemID());
     }
+    return changed;
+}
+
+bool render_star_creator_widgets(StarCreatorDraft& draft) {
+    bool changed = false;
+
+    const char* modes[] = {"Evolution Track", "Surface Physics"};
+    int mode_idx = (draft.params.mode == physics::StarCreationMode::Evolution) ? 0 : 1;
+    if (ImGui::Combo("Creation Mode##star_mode", &mode_idx, modes, 2)) {
+        draft.params.mode = (mode_idx == 0) ? physics::StarCreationMode::Evolution : physics::StarCreationMode::Surface;
+        changed = true;
+    }
+
+    ImGui::Spacing();
+
+    if (draft.params.mode == physics::StarCreationMode::Evolution) {
+        float mass_f = static_cast<float>(draft.params.mass_msun);
+        if (drag_float("Mass (M\u2609)##star_mass", &mass_f, 0.05f, 0.01f, 300.0f, "%.4f")) {
+            draft.params.mass_msun = std::max(0.01, static_cast<double>(mass_f));
+            changed = true;
+        }
+
+        float met_f = static_cast<float>(draft.params.metallicity_dex);
+        if (drag_float("[Fe/H] (dex)##star_met", &met_f, 0.01f, -4.0f, 1.0f, "%.3f")) {
+            draft.params.metallicity_dex = static_cast<double>(met_f);
+            changed = true;
+        }
+
+        float age_pct_100 = static_cast<float>(draft.params.age_pct * 100.0);
+        if (drag_float("Life Cycle (%)##star_age", &age_pct_100, 0.1f, -5.0f, 120.0f, "%.1f%%")) {
+            draft.params.age_pct = static_cast<double>(age_pct_100) / 100.0;
+            changed = true;
+        }
+
+        if (draft.params.mass_msun >= 45.0) {
+            ImGui::TextColored(AMBER, "Humphreys-Davidson Limit (Forced Stripping)");
+            if (draft.params.evo_path != physics::EvolutionPath::Stripping) {
+                draft.params.evo_path = physics::EvolutionPath::Stripping;
+                changed = true;
+            }
+        } else if (draft.params.mass_msun >= 25.0) {
+            const char* branches[] = {"Red Supergiant (Standard)", "LBV -> Wolf-Rayet (Stripping)"};
+            int branch_idx = (draft.params.evo_path == physics::EvolutionPath::Standard) ? 0 : 1;
+            if (ImGui::Combo("Evolution Branch##star_branch", &branch_idx, branches, 2)) {
+                draft.params.evo_path = (branch_idx == 0) ? physics::EvolutionPath::Standard : physics::EvolutionPath::Stripping;
+                changed = true;
+            }
+        } else {
+            draft.params.evo_path = physics::EvolutionPath::Standard;
+        }
+
+        float rot_f = static_cast<float>(draft.params.rot_frac);
+        if (drag_float("Rotation (\u03C9/\u03C9_crit)##star_rot", &rot_f, 0.01f, 0.0f, 1.0f, "%.2f")) {
+            draft.params.rot_frac = std::clamp(static_cast<double>(rot_f), 0.0, 1.0);
+            changed = true;
+        }
+
+        float inc_f = static_cast<float>(draft.params.inclination_deg);
+        if (drag_float("Inclination (\u00B0)##star_inc", &inc_f, 0.5f, 0.0f, 90.0f, "%.1f\u00B0")) {
+            draft.params.inclination_deg = std::clamp(static_cast<double>(inc_f), 0.0, 90.0);
+            changed = true;
+        }
+    } else {
+        ImGui::TextDisabled("Lock exactly 2 properties (3rd is solved via Stefan-Boltzmann):");
+
+        int num_locked = (draft.params.locked_rad ? 1 : 0) + (draft.params.locked_temp ? 1 : 0) + (draft.params.locked_lum ? 1 : 0);
+
+        bool c1 = ImGui::Checkbox("##lock_r", &draft.params.locked_rad);
+        ImGui::SameLine();
+        float rad_f = static_cast<float>(draft.params.radius_rsun);
+        if (drag_float("Radius (R\u2609)##s_rad", &rad_f, 0.05f, 0.01f, 2500.0f, "%.4f")) {
+            draft.params.radius_rsun = std::max(0.001, static_cast<double>(rad_f));
+            changed = true;
+        }
+
+        bool c2 = ImGui::Checkbox("##lock_t", &draft.params.locked_temp);
+        ImGui::SameLine();
+        float temp_f = static_cast<float>(draft.params.temp_k);
+        if (drag_float("Temp (K)##s_temp", &temp_f, 10.0f, 500.0f, 100000.0f, "%.0f K")) {
+            draft.params.temp_k = std::max(100.0, static_cast<double>(temp_f));
+            changed = true;
+        }
+
+        bool c3 = ImGui::Checkbox("##lock_l", &draft.params.locked_lum);
+        ImGui::SameLine();
+        float lum_f = static_cast<float>(draft.params.lum_lsun);
+        if (drag_float("Luminosity (L\u2609)##s_lum", &lum_f, 0.05f, 0.0001f, 2000000.0f, "%.4f")) {
+            draft.params.lum_lsun = std::max(1e-6, static_cast<double>(lum_f));
+            changed = true;
+        }
+
+        if (c1 || c2 || c3) {
+            num_locked = (draft.params.locked_rad ? 1 : 0) + (draft.params.locked_temp ? 1 : 0) + (draft.params.locked_lum ? 1 : 0);
+            if (num_locked > 2) {
+                if (c1) { if (draft.params.locked_temp) draft.params.locked_temp = false; else draft.params.locked_lum = false; }
+                else if (c2) { if (draft.params.locked_rad) draft.params.locked_rad = false; else draft.params.locked_lum = false; }
+                else if (c3) { if (draft.params.locked_rad) draft.params.locked_rad = false; else draft.params.locked_temp = false; }
+            }
+            changed = true;
+        }
+
+        if (num_locked != 2) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Select exactly 2 locked properties!");
+        }
+
+        float rot_f = static_cast<float>(draft.params.rot_frac);
+        if (drag_float("Rotation (\u03C9/\u03C9_crit)##star_rot_s", &rot_f, 0.01f, 0.0f, 1.0f, "%.2f")) {
+            draft.params.rot_frac = std::clamp(static_cast<double>(rot_f), 0.0, 1.0);
+            changed = true;
+        }
+
+        float inc_f = static_cast<float>(draft.params.inclination_deg);
+        if (drag_float("Inclination (\u00B0)##star_inc_s", &inc_f, 0.5f, 0.0f, 90.0f, "%.1f\u00B0")) {
+            draft.params.inclination_deg = std::clamp(static_cast<double>(inc_f), 0.0, 90.0);
+            changed = true;
+        }
+    }
+
+    if (changed || draft.preview.mass_msun <= 0.0) {
+        draft.recompute();
+    }
+
+    const auto& pr = draft.preview;
+    ImGui::Separator();
+    section("Stellar Properties", "Live astrophysical model preview");
+
+    ImGui::ColorButton("##star_swatch",
+                       ImVec4(pr.color_rgb.r, pr.color_rgb.g, pr.color_rgb.b, 1.0f),
+                       ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
+                       ImVec2(34.0f, 34.0f));
+    ImGui::SameLine(0.0f, 10.0f);
+    ImGui::BeginGroup();
+    ImGui::TextColored(ACCENT, "%s", pr.spectral_class.c_str());
+    ImGui::TextDisabled("%s", pr.stage_name.c_str());
+    ImGui::EndGroup();
+
+    value_row("Temperature", std::format("{:.0f} K", pr.temp_k));
+    value_row("Luminosity", std::format("{:.4f} L\u2609", pr.lum_lsun));
+    value_row("Radius", std::format("{:.4f} R\u2609 ({:.0f} km)", pr.radius_rsun, pr.radius_rsun * SOLAR_RADIUS_KM));
+    value_row("Mass", std::format("{:.4f} M\u2609", pr.mass_msun));
+    value_row("Surface Gravity", std::format("log g = {:.2f} ({:.1f} m/s\u00B2)", pr.log_g, std::pow(10.0, pr.log_g) / 100.0));
+    value_row("Mean Density", std::format("{:.3f} g/cm\u00B3", pr.density_g_cm3));
+    value_row("Escape Speed", std::format("{:.1f} km/s", pr.escape_vel_km_s));
+
+    if (draft.params.mode == physics::StarCreationMode::Evolution) {
+        if (pr.age_gyr < 0.1) {
+            value_row("Age", std::format("{:.1f} Myr / {:.2f} Gyr ({:.1f}%)", pr.age_gyr * 1000.0, pr.lifespan_gyr, pr.age_pct));
+        } else {
+            value_row("Age", std::format("{:.3f} Gyr / {:.2f} Gyr ({:.1f}%)", pr.age_gyr, pr.lifespan_gyr, pr.age_pct));
+        }
+    }
+
+    if (draft.params.rot_frac > 0.01) {
+        value_row("Oblateness (f)", std::format("{:.4f}", pr.oblateness));
+        value_row("Equatorial Speed", std::format("{:.1f} km/s", pr.v_eq_km_s));
+        value_row("Poles / Equator", std::format("{:.0f} K / {:.0f} K", pr.t_pole_k, pr.t_eq_k));
+    }
+
+    if (pr.is_pulsating) {
+        ImGui::TextColored(AMBER, "Pulsating Star: %s (%s)", pr.pulsation_type.c_str(), pr.pulsation_period_str.c_str());
+    }
+
+    if (pr.hz_inner_au > 0.0) {
+        value_row("Habitable Zone", std::format("{:.2f} AU - {:.2f} AU", pr.hz_inner_au, pr.hz_outer_au));
+    }
+
     return changed;
 }
 

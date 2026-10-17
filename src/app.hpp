@@ -46,6 +46,9 @@ private:
     void render_time_hud(rendering::RenderSettings& render_draft);
     void render_add_body_modal();
     void render_delete_body_modal();
+    void render_create_system_modal();
+    void render_delete_system_modal();
+    void delete_body_immediate(int body_idx);
 
     GLFWwindow* window_ = nullptr;
     rhi::VkContext vk_;
@@ -73,6 +76,7 @@ private:
     benchmark::Options benchmark_;
     std::string simulation_error_;
     units::Seconds frame_dt_{};
+    int pending_delete_body_ = -1;
 };
 
 } // namespace sf

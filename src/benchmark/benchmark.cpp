@@ -79,7 +79,8 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-scene") {
             auto scene = value();
             if (scene == "all") o.scenes = {"overview", "approach", "analytical", "nbody"};
-            else if (scene == "overview" || scene == "approach" || scene == "analytical" || scene == "nbody" || scene == "spice")
+            else if (scene == "overview" || scene == "approach" || scene == "analytical" || scene == "nbody" || scene == "spice"
+                     || scene == "earth-full" || scene == "earth-eclipse")
                 o.scenes = {std::string(scene)};
             else throw std::runtime_error("Unknown benchmark scene: " + std::string(scene));
         } else throw std::runtime_error("Unknown argument: " + std::string(arg));
@@ -99,7 +100,7 @@ std::string_view help() {
   --simulation-thread      Asynchronous simulation worker (interactive default)
   --no-simulation-thread   Run simulation on the main thread for comparison/debugging
   --benchmark-simulation inline|worker|pipeline  Inline, wait per step, or overlap rendering (inline)
-  --benchmark-scene all|overview|approach|analytical|nbody|spice
+  --benchmark-scene all|overview|approach|analytical|nbody|spice|earth-full|earth-eclipse
   --benchmark-width N       Framebuffer width (1920)
   --benchmark-height N      Framebuffer height (1080)
   --benchmark-warmup N      Unmeasured frames per run (300; zero allowed)

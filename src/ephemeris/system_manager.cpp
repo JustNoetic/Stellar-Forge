@@ -297,6 +297,9 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
             b.temp_k = sp.value("temp", 5778.0);
             if (b.lum_eq <= 0.0) b.lum_eq = sp.value("lum_eq", sp.value("lum", 1.0));
             if (b.lum_pole <= 0.0) b.lum_pole = sp.value("lum_pole", sp.value("lum", b.lum_eq));
+            if (b.oblateness <= 0.0 && sp.contains("oblateness")) {
+                b.oblateness = sp.value("oblateness", 0.0);
+            }
         } else if (b.is_star && b.lum_eq <= 0.0) {
             b.lum_eq = 1.0;
             b.lum_pole = 1.0;
@@ -398,6 +401,20 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["lum_pole"] = b.lum_pole;
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+        if (b.is_star) {
+            if (!j.contains("star_props") || !j["star_props"].is_object()) {
+                j["star_props"] = nlohmann::json::object();
+            }
+            j["star_props"]["class"] = b.spectral_class;
+            j["star_props"]["stage"] = b.stage;
+            j["star_props"]["temp"] = b.temp_k;
+            j["star_props"]["lum"] = b.lum_eq;
+            j["star_props"]["lum_eq"] = b.lum_eq;
+            j["star_props"]["lum_pole"] = b.lum_pole;
+            j["star_props"]["radius"] = b.radius_rsun;
+            j["star_props"]["mass"] = b.mass_msun;
+            j["star_props"]["oblateness"] = b.oblateness;
+        }
         arr.push_back(std::move(j));
     }
     return arr;
@@ -405,6 +422,64 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
 
 bool SystemManager::save_system(std::string_view name, const SystemDefinition& definition) const {
     return sf::paths::write_json(sf::paths::external_path("data", "systems", name, "system.json"), serialize_definition(definition), 2);
+}
+
+bool SystemManager::system_exists(std::string_view name) const {
+    if (name == SOLAR_SYSTEM_NAME) return true;
+    std::filesystem::path path = sf::paths::external_path("data", "systems", name, "system.json");
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec);
+}
+
+bool SystemManager::delete_system(std::string_view name) const {
+    if (name == SOLAR_SYSTEM_NAME || name == "Ephemeris Mode") return false;
+    std::filesystem::path dir = sf::paths::external_path("data", "systems", name);
+    std::error_code ec;
+    if (std::filesystem::is_directory(dir, ec)) {
+        return std::filesystem::remove_all(dir, ec) > 0;
+    }
+    return false;
+}
+
+bool SystemManager::create_new_system_from_props(
+    std::string_view system_name, std::string_view star_name,
+    const physics::StarForgeResult& result,
+    const physics::StarParameters& params) const {
+    if (system_name.empty() || system_exists(system_name)) return false;
+
+    std::string s_name = star_name.empty() ? "Star" : std::string(star_name);
+    nlohmann::json star_node;
+    star_node["name"] = s_name;
+    star_node["type"] = "Star";
+    star_node["m"] = result.mass_msun;
+    star_node["r"] = result.radius_rsun;
+    star_node["color"] = result.color_hex;
+    star_node["color_pole"] = physics::StarCalculator::rgb_to_hex(result.color_pole_rgb);
+    star_node["lum_eq"] = result.lum_eq_lsun;
+    star_node["lum_pole"] = result.lum_pole_lsun;
+    star_node["is_root"] = true;
+    star_node["pole_ra"] = 270.0;
+    star_node["pole_dec"] = 66.5607089;
+    star_node["rotation_period"] = 0.0;
+    star_node["W0"] = 0.0;
+    star_node["oblateness"] = result.oblateness;
+    star_node["star_props"] = physics::StarCalculator::to_json(result, params);
+    star_node["sv"] = {
+        {"x", 0.0}, {"y", 0.0}, {"z", 0.0},
+        {"vx", 0.0}, {"vy", 0.0}, {"vz", 0.0}
+    };
+    star_node["epoch"] = "2026-01-01T12:00:00";
+    star_node["motion_model"] = "keplerian";
+
+    nlohmann::json arr = nlohmann::json::array();
+    arr.push_back(std::move(star_node));
+
+    std::filesystem::path dir = sf::paths::external_path("data", "systems", system_name);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    std::filesystem::path path = dir / "system.json";
+    return sf::paths::write_json(path, arr, 2);
 }
 
 }

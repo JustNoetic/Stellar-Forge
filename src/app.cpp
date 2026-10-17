@@ -9,6 +9,7 @@
 #include <cmath>
 #include <exception>
 #include <format>
+#include <stdexcept>
 
 namespace sf {
 
@@ -182,6 +183,11 @@ void App::run() {
         run_benchmark();
         return;
     }
+    if (self_test_) {
+        camera_.focus_body(system().find_body("Earth"), system(), true);
+        auto result = simulation_.apply(ephemeris::SetTimeWarp{86400.0});
+        if (!result) throw std::runtime_error(result.error);
+    }
     double last_time = glfwGetTime();
     uint32_t frames_rendered = 0;
 
@@ -189,7 +195,7 @@ void App::run() {
         glfwPollEvents();
 
         double now = glfwGetTime();
-        frame_dt_ = units::Seconds{std::clamp(now - last_time, 1e-5, 0.25)};
+        frame_dt_ = units::Seconds{self_test_ ? 1.0 / 1700.0 : std::clamp(now - last_time, 1e-5, 0.25)};
         last_time = now;
         auto step = simulation_.advance_async(frame_dt_);
         if (!step) {
@@ -198,7 +204,6 @@ void App::run() {
             sf::log::error("Simulation paused: {}", step.error);
         }
 
-        camera_.update(frame_dt_, system());
         render_frame();
 
         ++frames_rendered;
@@ -363,6 +368,19 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         }
     }
 
+    if (self_test_) {
+        auto result = simulation_.apply(ephemeris::SetTimeWarp{simulation_.clock().warp * 1.25});
+        if (!result) throw std::runtime_error(result.error);
+    }
+    double camera_update_ms = 0.0;
+    {
+        ScopedTimer timer(sample ? &camera_update_ms : nullptr);
+        camera_.update(frame_dt_, system());
+    }
+    if (sample) sample->cpu_camera_ms += camera_update_ms;
+    if (self_test_ && camera_.origin_render != system().body(camera_.tracking_idx).render.position.value)
+        throw std::runtime_error("Camera tracking and rendered body use different snapshots after a time-warp change.");
+
     VkExtent2D ext = vk_.swapchain_extent();
 
     uint32_t t_scene = vk_.begin_gpu_timer(cmd, "gpu_scene_hdr");
@@ -438,7 +456,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
                              VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
 
     vk_.end_gpu_timer(cmd, t_frame);
-    if (sample) sample->cpu_record_ms = elapsed_ms(record_start);
+    if (sample) sample->cpu_record_ms = elapsed_ms(record_start) - camera_update_ms;
     vk_.end_frame(cmd, swapchain_idx, sample ? &sample->host : nullptr);
     return true;
 }
@@ -448,7 +466,8 @@ void App::render_outliner_node(int body_idx) {
     const auto& children = system().reference_hierarchy().children[body_idx];
     bool has_children = !children.empty();
 
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                               ImGuiTreeNodeFlags_AllowOverlap | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (!has_children) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     }
@@ -463,60 +482,91 @@ void App::render_outliner_node(int body_idx) {
         ? std::format("{} [Tracked]", b.definition.name)
         : b.definition.name;
 
+    bool can_delete = (body_idx != system().definition().star_idx && !b.definition.is_star && system().definition().motion_model != ephemeris::MotionModel::Spice);
+    bool can_add = (system().definition().motion_model != ephemeris::MotionModel::Spice);
+
+    float btn_w = 18.0f;
+    float btn_h = 16.0f;
+    float btn_spacing = 3.0f;
+    float total_w = can_delete ? (btn_w * 2.0f + btn_spacing) : btn_w;
+    float right_screen_x = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x - 4.0f;
+    float btn_start_x = right_screen_x - total_w;
+    float clip_right = btn_start_x - 4.0f;
+
+    bool clip_row = can_add && (clip_right > ImGui::GetWindowPos().x + 30.0f);
+    if (clip_row) {
+        ImVec2 win_pos = ImGui::GetWindowPos();
+        ImVec2 win_size = ImGui::GetWindowSize();
+        ImGui::PushClipRect(ImVec2(win_pos.x, win_pos.y), ImVec2(clip_right, win_pos.y + win_size.y), true);
+    }
+
     bool opened = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<intptr_t>(body_idx)), flags, "%s", label.c_str());
-    if (ImGui::IsItemClicked()) {
+
+    if (clip_row) {
+        ImGui::PopClipRect();
+    }
+
+    ImVec2 node_min = ImGui::GetItemRectMin();
+    ImVec2 node_max = ImGui::GetItemRectMax();
+    float row_h = node_max.y - node_min.y;
+    float btn_y = node_min.y + (row_h - btn_h) * 0.5f;
+
+    bool is_hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem);
+    bool is_selected = (ui_state_.inspected_body == body_idx);
+
+    ImVec2 mouse_pos = ImGui::GetIO().MousePos;
+    bool in_button_rect = (can_add && (is_hovered || is_selected) &&
+                           mouse_pos.x >= btn_start_x - 2.0f && mouse_pos.x <= right_screen_x + 4.0f &&
+                           mouse_pos.y >= node_min.y && mouse_pos.y <= node_max.y);
+
+    if (ImGui::IsItemClicked() && !in_button_rect) {
         ui_state_.inspected_body = body_idx;
     }
-    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+    if (is_hovered && !in_button_rect && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
         ui_state_.inspected_body = body_idx;
         camera_.focus_body(body_idx, system(), true);
     }
 
-    bool is_hovered = ImGui::IsItemHovered();
-    bool is_selected = (ui_state_.inspected_body == body_idx);
-    bool can_delete = (body_idx != system().definition().star_idx && !b.definition.is_star && system().definition().motion_model != ephemeris::MotionModel::Spice);
-    bool can_add = (system().definition().motion_model != ephemeris::MotionModel::Spice);
+    if (can_add && (is_hovered || is_selected) && btn_start_x > node_min.x + 30.0f) {
+        ImVec2 saved_cursor = ImGui::GetCursorPos();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+        ImGui::PushID(body_idx);
 
-    if (can_add && (is_hovered || is_selected)) {
-        float btn_w = 18.0f;
-        float btn_h = 16.0f;
-        float total_w = can_delete ? (btn_w * 2.0f + 4.0f) : btn_w;
-        float right_pos = ImGui::GetWindowContentRegionMax().x - total_w - 2.0f;
-        if (right_pos > ImGui::GetCursorPosX()) {
-            ImGui::SameLine(right_pos);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
-            ImGui::PushID(body_idx);
+        ImGui::SetCursorScreenPos(ImVec2(btn_start_x, btn_y));
+        if (ImGui::Button("+", ImVec2(btn_w, btn_h))) {
+            ui_state_.add_body.reset_for_parent(system(), body_idx);
+            ui_state_.add_body.active = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Add orbiting body to %s", b.definition.name.c_str());
+        }
 
-            if (ImGui::Button("+", ImVec2(btn_w, btn_h))) {
-                ui_state_.add_body.reset_for_parent(system(), body_idx);
-                ui_state_.add_body.active = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Add orbiting body to %s", b.definition.name.c_str());
-            }
-
-            if (can_delete) {
-                ImGui::SameLine(0.0f, 4.0f);
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-                if (ImGui::Button("-", ImVec2(btn_w, btn_h))) {
+        if (can_delete) {
+            ImGui::SetCursorScreenPos(ImVec2(btn_start_x + btn_w + btn_spacing, btn_y));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+            if (ImGui::Button("-", ImVec2(btn_w, btn_h))) {
+                if (ui_settings_.confirm_delete) {
                     ui_state_.delete_prompt.active = true;
                     ui_state_.delete_prompt.body_index = body_idx;
                     ui_state_.delete_prompt.body_name = b.definition.name;
                     int fallback = system().reference_parent(body_idx);
                     if (fallback < 0 || fallback == body_idx) fallback = system().definition().star_idx;
                     ui_state_.delete_prompt.fallback_parent_name = system().body(fallback).definition.name;
+                } else {
+                    pending_delete_body_ = body_idx;
                 }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Delete %s", b.definition.name.c_str());
-                }
-                ImGui::PopStyleColor(3);
             }
-
-            ImGui::PopID();
-            ImGui::PopStyleVar();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Delete %s", b.definition.name.c_str());
+            }
+            ImGui::PopStyleColor(3);
         }
+
+        ImGui::PopID();
+        ImGui::PopStyleVar();
+        ImGui::SetCursorPos(saved_cursor);
     }
 
     if (has_children && opened) {
@@ -537,6 +587,13 @@ void App::render_ui() {
     render_time_hud(render_draft);
     render_add_body_modal();
     render_delete_body_modal();
+    render_create_system_modal();
+    render_delete_system_modal();
+
+    if (pending_delete_body_ >= 0) {
+        delete_body_immediate(pending_delete_body_);
+        pending_delete_body_ = -1;
+    }
 
     auto settings_result = render_settings_.apply(render_draft);
     ui_state_.settings_error = settings_result.error;
@@ -551,6 +608,21 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
             if (ImGui::MenuItem(sname.c_str(), nullptr, active) && !active) {
                 switch_system(sname);
             }
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("+ Create New System...")) {
+            ui_state_.create_system.reset();
+        }
+        bool can_delete_sys = (system().name() != ephemeris::SystemManager::SOLAR_SYSTEM_NAME &&
+                               system().name() != "Ephemeris Mode");
+        if (can_delete_sys) {
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+            if (ImGui::MenuItem("- Delete Current System")) {
+                ui_state_.confirm_delete_system = true;
+                ui_state_.delete_system_name = system().name();
+            }
+            ImGui::PopStyleColor();
         }
         ImGui::EndMenu();
     }
@@ -567,12 +639,16 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
                         !system().body(ui_state_.inspected_body).definition.is_star &&
                         system().definition().motion_model != ephemeris::MotionModel::Spice);
         if (ImGui::MenuItem("Delete Selected Body", nullptr, false, can_del)) {
-            ui_state_.delete_prompt.active = true;
-            ui_state_.delete_prompt.body_index = ui_state_.inspected_body;
-            ui_state_.delete_prompt.body_name = system().body(ui_state_.inspected_body).definition.name;
-            int fallback = system().reference_parent(ui_state_.inspected_body);
-            if (fallback < 0 || fallback == ui_state_.inspected_body) fallback = system().definition().star_idx;
-            ui_state_.delete_prompt.fallback_parent_name = system().body(fallback).definition.name;
+            if (ui_settings_.confirm_delete) {
+                ui_state_.delete_prompt.active = true;
+                ui_state_.delete_prompt.body_index = ui_state_.inspected_body;
+                ui_state_.delete_prompt.body_name = system().body(ui_state_.inspected_body).definition.name;
+                int fallback = system().reference_parent(ui_state_.inspected_body);
+                if (fallback < 0 || fallback == ui_state_.inspected_body) fallback = system().definition().star_idx;
+                ui_state_.delete_prompt.fallback_parent_name = system().body(fallback).definition.name;
+            } else {
+                pending_delete_body_ = ui_state_.inspected_body;
+            }
         }
         ImGui::EndMenu();
     }
@@ -734,6 +810,12 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::Checkbox("Show Body Inspector", &ui_settings_.show_inspector);
             ImGui::Checkbox("Show Time Transport HUD", &ui_settings_.show_time_hud);
             ImGui::Checkbox("Show Engine Telemetry Window", &ui_settings_.show_telemetry);
+            ImGui::Separator();
+            ImGui::Checkbox("Confirm Object Deletion", &ui_settings_.confirm_delete);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Require confirmation dialog when deleting celestial bodies. Disable to quickly delete objects.");
+            }
+            ImGui::Separator();
             ImGui::SliderFloat("Outliner Width", &ui_settings_.outliner_width, 180.0f, 500.0f, "%.0f px");
             ImGui::SliderFloat("Inspector Width", &ui_settings_.inspector_width, 300.0f, 700.0f, "%.0f px");
             ImGui::Spacing();
@@ -1019,16 +1101,21 @@ void App::render_body_inspector() {
                 }
 
                 if (draft.values.type == "Star") {
-                    if (ImGui::InputDouble("Mass (M\u2609)", &draft.values.mass.value, 0.01, 0.1, "%.4f")) {
-                        draft.recompute_hydrostatic();
+                    if (ui::render_star_creator_widgets(draft.star)) {
                         draft.dirty = true;
                     }
-                    double rad_rsun = draft.values.radius.value / SOLAR_RADIUS_KM;
-                    if (ImGui::InputDouble("Radius (R\u2609)", &rad_rsun, 0.01, 0.1, "%.4f")) {
-                        draft.values.radius = units::Kilometres{rad_rsun * SOLAR_RADIUS_KM};
-                        draft.recompute_hydrostatic();
-                        draft.dirty = true;
-                    }
+                    const auto& pr = draft.star.preview;
+                    draft.values.mass = units::SolarMasses{pr.mass_msun};
+                    draft.values.radius = units::Kilometres{pr.radius_rsun * SOLAR_RADIUS_KM};
+                    draft.values.oblateness = pr.oblateness;
+                    draft.values.temp_k = pr.temp_k;
+                    draft.values.lum_eq = pr.lum_eq_lsun;
+                    draft.values.lum_pole = pr.lum_pole_lsun;
+                    draft.values.color_rgb = pr.color_rgb;
+                    draft.values.color_pole_rgb = pr.color_pole_rgb;
+                    draft.values.spectral_class = pr.spectral_class;
+                    draft.values.stage = pr.stage_name;
+                    draft.values.star_props = physics::StarCalculator::to_json(pr, draft.star.params);
                 } else {
                     if (ImGui::InputDouble("Mass (M\u2609)", &draft.values.mass.value, 0.0, 0.0, "%.6e")) {
                         draft.recompute_hydrostatic();
@@ -1113,17 +1200,19 @@ void App::render_body_inspector() {
             }
 
             if (!inspect_bary && b.definition.is_star) {
-                ui::section("Stellar properties");
-                ui::metric_text(std::format("Temperature: {:.0f} K", b.definition.temp_k));
-                ui::metric_text(std::format("Luminosity: {:.4f} L\u2609", b.definition.lum_eq));
-                ui::metric_text(std::format("Spectral Cl: {}", b.definition.spectral_class.empty() ? "G2V" : b.definition.spectral_class));
-                ui::metric_text(std::format("Stage: {}", b.definition.stage.empty() ? "Main Sequence" : b.definition.stage));
-                if (b.definition.lum_eq > 0.0) {
-                    double hz_in = std::sqrt(b.definition.lum_eq / 1.78);
-                    double hz_out = std::sqrt(b.definition.lum_eq / 0.32);
-                    ui::metric_text("Habitable Zone (optimistic):");
-                    ui::metric_text(std::format("  Inner: {}", format_distance_au(hz_in, ui_settings_.ly_threshold_au)));
-                    ui::metric_text(std::format("  Outer: {}", format_distance_au(hz_out, ui_settings_.ly_threshold_au)));
+                if (!physical_editing) {
+                    ui::section("Stellar properties");
+                    ui::metric_text(std::format("Temperature: {:.0f} K", b.definition.temp_k));
+                    ui::metric_text(std::format("Luminosity: {:.4f} L\u2609", b.definition.lum_eq));
+                    ui::metric_text(std::format("Spectral Cl: {}", b.definition.spectral_class.empty() ? "G2V" : b.definition.spectral_class));
+                    ui::metric_text(std::format("Stage: {}", b.definition.stage.empty() ? "Main Sequence" : b.definition.stage));
+                    if (b.definition.lum_eq > 0.0) {
+                        double hz_in = std::sqrt(b.definition.lum_eq / 1.78);
+                        double hz_out = std::sqrt(b.definition.lum_eq / 0.32);
+                        ui::metric_text("Habitable Zone (optimistic):");
+                        ui::metric_text(std::format("  Inner: {}", format_distance_au(hz_in, ui_settings_.ly_threshold_au)));
+                        ui::metric_text(std::format("  Outer: {}", format_distance_au(hz_out, ui_settings_.ly_threshold_au)));
+                    }
                 }
             } else if (!inspect_bary) {
                 ui::section("Reflectance", "Estimated from body surface and atmosphere model.");
@@ -1345,12 +1434,16 @@ void App::render_body_inspector() {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
             if (ImGui::Button("Delete This Body##inspector_del", ImVec2(-1.0f, 0.0f))) {
-                ui_state_.delete_prompt.active = true;
-                ui_state_.delete_prompt.body_index = insp_idx;
-                ui_state_.delete_prompt.body_name = b.definition.name;
-                int fallback = system().reference_parent(insp_idx);
-                if (fallback < 0 || fallback == insp_idx) fallback = system().definition().star_idx;
-                ui_state_.delete_prompt.fallback_parent_name = system().body(fallback).definition.name;
+                if (ui_settings_.confirm_delete) {
+                    ui_state_.delete_prompt.active = true;
+                    ui_state_.delete_prompt.body_index = insp_idx;
+                    ui_state_.delete_prompt.body_name = b.definition.name;
+                    int fallback = system().reference_parent(insp_idx);
+                    if (fallback < 0 || fallback == insp_idx) fallback = system().definition().star_idx;
+                    ui_state_.delete_prompt.fallback_parent_name = system().body(fallback).definition.name;
+                } else {
+                    pending_delete_body_ = insp_idx;
+                }
             }
             ImGui::PopStyleColor(3);
         }
@@ -1490,53 +1583,58 @@ void App::render_add_body_modal() {
             ad.recompute_hydrostatic();
         }
 
-        ImGui::ColorEdit3("Color", &ad.color_rgb.x);
-
-        const char* mass_units[] = {"Earth Masses (M\u2295)", "Lunar Masses (M\u263D)", "Solar Masses (M\u2609)"};
-        if (ImGui::Combo("Mass Unit", &ad.mass_unit, mass_units, 3)) {
-            ad.recompute_hydrostatic();
-        }
-        if (ImGui::InputDouble("Mass", &ad.mass_input, 0.01, 0.1, "%.6f")) {
-            if (ad.mass_input < 0.0) ad.mass_input = 0.0;
-            ad.recompute_hydrostatic();
-        }
-
-        if (ImGui::InputDouble("Radius (km)", &ad.radius_km, 10.0, 100.0, "%.1f")) {
-            if (ad.radius_km < 0.1) ad.radius_km = 0.1;
-            ad.recompute_hydrostatic();
-        }
-
-        ui::section("Rotation & Shape");
         double parent_m = system().body(ad.parent_idx).definition.mass_msun;
         double child_m = ad.get_mass_msun();
         double semi_a = ad.get_semi_major_au();
 
-        if (ImGui::Checkbox("Tidally Locked", &ad.tidally_locked)) {
-            ad.recompute_hydrostatic();
-        }
-
-        if (ad.tidally_locked) {
-            double tot_m = parent_m + child_m;
-            double p_years = (tot_m > 0.0 && semi_a > 0.0) ? std::sqrt(semi_a * semi_a * semi_a / tot_m) : 0.0;
-            ad.rotation_period_hr = p_years * 365.25 * 24.0;
-            ImGui::TextDisabled("  Rot Period: %.4f h [Synchronous]", ad.rotation_period_hr);
+        if (ad.type == "Star") {
+            ui::render_star_creator_widgets(ad.star);
         } else {
-            if (ImGui::InputDouble("Rot Period (hours)", &ad.rotation_period_hr, 1.0, 10.0, "%.4f")) {
-                if (ad.rotation_period_hr < 0.0) ad.rotation_period_hr = 0.0;
+            ImGui::ColorEdit3("Color", &ad.color_rgb.x);
+
+            const char* mass_units[] = {"Earth Masses (M\u2295)", "Lunar Masses (M\u263D)", "Solar Masses (M\u2609)"};
+            if (ImGui::Combo("Mass Unit", &ad.mass_unit, mass_units, 3)) {
                 ad.recompute_hydrostatic();
             }
-        }
+            if (ImGui::InputDouble("Mass", &ad.mass_input, 0.01, 0.1, "%.6f")) {
+                if (ad.mass_input < 0.0) ad.mass_input = 0.0;
+                ad.recompute_hydrostatic();
+            }
 
-        ImGui::InputDouble("Axial Tilt (deg)", &ad.axial_tilt_deg, 1.0, 5.0, "%.2f");
+            if (ImGui::InputDouble("Radius (km)", &ad.radius_km, 10.0, 100.0, "%.1f")) {
+                if (ad.radius_km < 0.1) ad.radius_km = 0.1;
+                ad.recompute_hydrostatic();
+            }
 
-        double r_m = ad.radius_km * 1000.0;
-        double vol_m3 = (4.0 / 3.0) * PI * (r_m * r_m * r_m);
-        double mass_kg = child_m * 1.98847e30;
-        double density_g_cm3 = (vol_m3 > 0.0) ? ((mass_kg / vol_m3) / 1000.0) : 0.0;
-        ui::metric_text(std::format("Mean Density: {:.2f} g/cm\u00B3", density_g_cm3));
-        ui::metric_text(std::format("Oblateness (f): {:.5f}", ad.oblateness));
-        if (ad.j2 > 0.0) {
-            ui::metric_text(std::format("J2 Moment: {:.6e}", ad.j2));
+            ui::section("Rotation & Shape");
+
+            if (ImGui::Checkbox("Tidally Locked", &ad.tidally_locked)) {
+                ad.recompute_hydrostatic();
+            }
+
+            if (ad.tidally_locked) {
+                double tot_m = parent_m + child_m;
+                double p_years = (tot_m > 0.0 && semi_a > 0.0) ? std::sqrt(semi_a * semi_a * semi_a / tot_m) : 0.0;
+                ad.rotation_period_hr = p_years * 365.25 * 24.0;
+                ImGui::TextDisabled("  Rot Period: %.4f h [Synchronous]", ad.rotation_period_hr);
+            } else {
+                if (ImGui::InputDouble("Rot Period (hours)", &ad.rotation_period_hr, 1.0, 10.0, "%.4f")) {
+                    if (ad.rotation_period_hr < 0.0) ad.rotation_period_hr = 0.0;
+                    ad.recompute_hydrostatic();
+                }
+            }
+
+            ImGui::InputDouble("Axial Tilt (deg)", &ad.axial_tilt_deg, 1.0, 5.0, "%.2f");
+
+            double r_m = ad.radius_km * 1000.0;
+            double vol_m3 = (4.0 / 3.0) * PI * (r_m * r_m * r_m);
+            double mass_kg = child_m * 1.98847e30;
+            double density_g_cm3 = (vol_m3 > 0.0) ? ((mass_kg / vol_m3) / 1000.0) : 0.0;
+            ui::metric_text(std::format("Mean Density: {:.2f} g/cm\u00B3", density_g_cm3));
+            ui::metric_text(std::format("Oblateness (f): {:.5f}", ad.oblateness));
+            if (ad.j2 > 0.0) {
+                ui::metric_text(std::format("J2 Moment: {:.6e}", ad.j2));
+            }
         }
 
         ui::section("Orbital Elements");
@@ -1568,8 +1666,9 @@ void App::render_add_body_modal() {
         ui::value_row("Periapsis", format_distance_au(p_peri, ui_settings_.ly_threshold_au));
         ui::value_row("Apoapsis", format_distance_au(p_apo, ui_settings_.ly_threshold_au));
 
-        if (parent_m > 0.0 && child_m > 0.0 && ad.radius_km > 0.0) {
-            double roche_au = 2.44 * ad.radius_km / AU_TO_KM * std::cbrt(parent_m / child_m);
+        double eff_r_km = (ad.type == "Star") ? (ad.star.preview.radius_rsun * SOLAR_RADIUS_KM) : ad.radius_km;
+        if (parent_m > 0.0 && child_m > 0.0 && eff_r_km > 0.0) {
+            double roche_au = 2.44 * eff_r_km / AU_TO_KM * std::cbrt(parent_m / child_m);
             if (p_peri < roche_au) {
                 ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Warning: Periapsis is inside Roche limit (%s)", format_distance_au(roche_au, ui_settings_.ly_threshold_au).c_str());
             }
@@ -1626,34 +1725,7 @@ void App::render_delete_body_modal() {
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.95f, 0.35f, 0.35f, 1.0f));
         if (ImGui::Button("Delete Body", ImVec2(half_w, 28.0f))) {
             int del_idx = ui_state_.delete_prompt.body_index;
-            auto cmd = ephemeris::DeleteBody{system().generation(), del_idx};
-            auto res = simulation_.apply(cmd);
-            if (!res) {
-                simulation_error_ = res.error;
-            } else {
-                if (camera_.tracking_idx == del_idx) {
-                    camera_.tracking_idx = -1;
-                    camera_.tracking_barycenter = false;
-                } else if (camera_.tracking_idx > del_idx) {
-                    camera_.tracking_idx -= 1;
-                }
-                if (camera_.centered_idx == del_idx) {
-                    camera_.centered_idx = -1;
-                    camera_.centered_barycenter = false;
-                } else if (camera_.centered_idx > del_idx) {
-                    camera_.centered_idx -= 1;
-                }
-                if (ui_state_.inspected_body == del_idx) {
-                    ui_state_.inspected_body = -1;
-                    ui_state_.edit_mode = false;
-                    ui_state_.inspect_barycenter = false;
-                } else if (ui_state_.inspected_body > del_idx) {
-                    ui_state_.inspected_body -= 1;
-                    if (ui_state_.edit_mode) {
-                        ui_state_.body_draft.reload(system(), ui_state_.inspected_body);
-                    }
-                }
-            }
+            delete_body_immediate(del_idx);
             ui_state_.delete_prompt.active = false;
             ImGui::CloseCurrentPopup();
         }
@@ -1662,6 +1734,168 @@ void App::render_delete_body_modal() {
         ImGui::SameLine(0.0f, 10.0f);
         if (ImGui::Button("Cancel", ImVec2(half_w, 28.0f))) {
             ui_state_.delete_prompt.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::delete_body_immediate(int del_idx) {
+    if (del_idx < 0 || del_idx >= static_cast<int>(system().size())) return;
+    if (del_idx == system().definition().star_idx || system().body(del_idx).definition.is_star) return;
+    if (system().definition().motion_model == ephemeris::MotionModel::Spice) return;
+
+    auto cmd = ephemeris::DeleteBody{system().generation(), del_idx};
+    auto res = simulation_.apply(cmd);
+    if (!res) {
+        simulation_error_ = res.error;
+        return;
+    }
+
+    simulation_error_.clear();
+
+    if (camera_.tracking_idx == del_idx) {
+        camera_.tracking_idx = -1;
+        camera_.tracking_barycenter = false;
+    } else if (camera_.tracking_idx > del_idx) {
+        camera_.tracking_idx -= 1;
+    }
+
+    if (camera_.centered_idx == del_idx) {
+        camera_.centered_idx = -1;
+        camera_.centered_barycenter = false;
+    } else if (camera_.centered_idx > del_idx) {
+        camera_.centered_idx -= 1;
+    }
+
+    if (ui_state_.inspected_body == del_idx) {
+        ui_state_.inspected_body = -1;
+        ui_state_.edit_mode = false;
+        ui_state_.inspect_barycenter = false;
+    } else if (ui_state_.inspected_body > del_idx) {
+        ui_state_.inspected_body -= 1;
+        if (ui_state_.edit_mode) {
+            ui_state_.body_draft.reload(system(), ui_state_.inspected_body);
+        }
+    }
+
+    if (ui_state_.add_body.active) {
+        if (ui_state_.add_body.parent_idx == del_idx) {
+            ui_state_.add_body.active = false;
+        } else if (ui_state_.add_body.parent_idx > del_idx) {
+            ui_state_.add_body.parent_idx -= 1;
+        }
+    }
+
+    if (ui_state_.delete_prompt.active) {
+        if (ui_state_.delete_prompt.body_index == del_idx) {
+            ui_state_.delete_prompt.active = false;
+        } else if (ui_state_.delete_prompt.body_index > del_idx) {
+            ui_state_.delete_prompt.body_index -= 1;
+        }
+    }
+}
+
+void App::render_create_system_modal() {
+    if (!ui_state_.create_system.active) return;
+
+    auto& cs = ui_state_.create_system;
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 650.0f), ImGuiCond_FirstUseEver);
+    ImGui::OpenPopup("Create New Star System###create_system_modal");
+    if (ImGui::BeginPopupModal("Create New Star System###create_system_modal", &cs.active)) {
+        char sys_buf[128];
+        std::strncpy(sys_buf, cs.system_name.c_str(), sizeof(sys_buf) - 1);
+        sys_buf[sizeof(sys_buf) - 1] = '\0';
+        if (ImGui::InputText("System Name", sys_buf, sizeof(sys_buf))) {
+            cs.system_name = sys_buf;
+        }
+
+        char star_buf[128];
+        std::strncpy(star_buf, cs.star_name.c_str(), sizeof(star_buf) - 1);
+        star_buf[sizeof(star_buf) - 1] = '\0';
+        if (ImGui::InputText("Primary Star Name", star_buf, sizeof(star_buf))) {
+            cs.star_name = star_buf;
+        }
+
+        ImGui::Separator();
+        ui::heading("Primary Star Configuration", "Design the central star using astrophysical tracks or surface properties.");
+
+        ui::render_star_creator_widgets(cs.star);
+
+        if (!cs.error.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", cs.error.c_str());
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float half_w = (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.43f, 1.0f));
+        if (ImGui::Button("Create System", ImVec2(half_w, 32.0f))) {
+            if (cs.system_name.empty()) {
+                cs.error = "System name cannot be empty.";
+            } else if (cs.system_name == ephemeris::SystemManager::SOLAR_SYSTEM_NAME ||
+                       cs.system_name == "Ephemeris Mode" ||
+                       sys_mgr_.system_exists(cs.system_name)) {
+                cs.error = "A system with this name already exists.";
+            } else {
+                bool ok = sys_mgr_.create_new_system_from_props(cs.system_name, cs.star_name, cs.star.preview, cs.star.params);
+                if (!ok) {
+                    cs.error = "Failed to write system file to disk.";
+                } else {
+                    system_names_ = sys_mgr_.list_systems();
+                    std::string new_sys_name = cs.system_name;
+                    cs.active = false;
+                    ImGui::CloseCurrentPopup();
+                    switch_system(new_sys_name);
+                }
+            }
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 10.0f);
+        if (ImGui::Button("Cancel", ImVec2(half_w, 32.0f))) {
+            cs.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+void App::render_delete_system_modal() {
+    if (!ui_state_.confirm_delete_system) return;
+
+    ImGui::SetNextWindowSize(ImVec2(400.0f, 180.0f), ImGuiCond_Always);
+    ImGui::OpenPopup("Delete System?###delete_system_modal");
+    if (ImGui::BeginPopupModal("Delete System?###delete_system_modal", &ui_state_.confirm_delete_system, ImGuiWindowFlags_NoResize)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Permanently delete system directory and files?");
+        ImGui::Spacing();
+        ImGui::Text("System: %s", ui_state_.delete_system_name.c_str());
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float half_w = (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.95f, 0.35f, 0.35f, 1.0f));
+        if (ImGui::Button("Delete System", ImVec2(half_w, 28.0f))) {
+            std::string to_delete = ui_state_.delete_system_name;
+            ui_state_.confirm_delete_system = false;
+            ImGui::CloseCurrentPopup();
+            sys_mgr_.delete_system(to_delete);
+            system_names_ = sys_mgr_.list_systems();
+            switch_system(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
+        }
+        ImGui::PopStyleColor(3);
+
+        ImGui::SameLine(0.0f, 10.0f);
+        if (ImGui::Button("Cancel", ImVec2(half_w, 28.0f))) {
+            ui_state_.confirm_delete_system = false;
             ImGui::CloseCurrentPopup();
         }
 

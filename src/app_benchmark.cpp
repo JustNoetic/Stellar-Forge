@@ -1,5 +1,6 @@
 #include "app.hpp"
 #include "benchmark/build_info.hpp"
+#include "benchmark/earth_closeup.hpp"
 #include "core/log.hpp"
 #include "core/path_utils.hpp"
 
@@ -115,13 +116,20 @@ void App::run_benchmark() {
             else if (!spice) require(simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Keplerian}));
             if (spice && system().definition().motion_model != ephemeris::MotionModel::Spice)
                 throw std::runtime_error("SPICE fixture did not load SPICE playback.");
-            bool paused = scene == "overview" || scene == "approach";
+            bool earth_closeup = scene == "earth-full" || scene == "earth-eclipse";
+            if (scene == "earth-eclipse") {
+                require(simulation_.apply(ephemeris::SetPaused{false}));
+                require(simulation_.apply(ephemeris::SetTimeWarp{1.0}));
+                require(simulation_.advance(units::Seconds{benchmark::ECLIPSE_FIXTURE_YEARS * SECONDS_PER_YEAR}));
+            }
+            bool paused = scene == "overview" || scene == "approach" || earth_closeup;
             require(simulation_.apply(ephemeris::SetPaused{paused}));
             require(simulation_.apply(ephemeris::SetTimeWarp{options.warp}));
             camera_ = Camera{};
             camera_.tracking_idx = scene == "approach" ? system().find_body("Earth") : system().star_index();
             if (camera_.tracking_idx < 0) throw std::runtime_error("Benchmark target is missing.");
             camera_.horizon_align = false;
+            if (earth_closeup) camera_ = benchmark::earth_closeup_camera(system(), scene == "earth-eclipse");
             ui_state_ = {};
             ui_state_.inspected_body = system().find_body("Earth");
             frame_dt_ = units::Seconds{options.step_seconds};
@@ -145,6 +153,12 @@ void App::run_benchmark() {
                     {"orbit_opacity", settings.orbit_opacity}, {"orbit_segments", settings.orbit_segments},
                     {"star_point_size", settings.star_point_size}, {"star_intensity", settings.star_intensity}, {"vsync", false}}}
             };
+            if (earth_closeup) {
+                run.fixture["tracking_body"] = "Earth";
+                run.fixture["camera_direction"] = coordinates(glm::normalize(camera_.cam_pos_rel));
+                run.fixture["earth_distance_radii"] = 1.1;
+                run.fixture["earth_view"] = scene == "earth-eclipse" ? "Moon shadow axis surface intersection" : "sunward";
+            }
             if (scene == "nbody") run.fixture["ias15_epsilon"] = simulation_.nbody_epsilon();
             log::info("{}: repetition {}/{}", scene, repetition + 1, options.repeats);
             for (uint32_t index = 0; index < options.warmup + options.frames; ++index) {
@@ -173,7 +187,6 @@ void App::run_benchmark() {
                         double distance = std::exp(std::lerp(std::log(0.1), std::log(target_radius * 4.0), progress));
                         camera_.cam_pos_rel = direction * distance;
                     }
-                    camera_.update(frame_dt_, system());
                 }
                 if (!render_frame(&sample)) throw std::runtime_error("Swapchain changed during benchmark; capture rejected.");
                 sample.frame_ms = elapsed_ms(frame_start);
