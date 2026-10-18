@@ -5,7 +5,7 @@
 
 namespace sf::terrain {
 
-static_assert(sizeof(GeometryBakeGPU) == 96);
+static_assert(sizeof(GeometryBakeGPU) == 64);
 
 void GeometryCache::init(rhi::VkContext& ctx) {
     residency_ = GeometryResidency{GEOMETRY_CACHE_CAPACITY};

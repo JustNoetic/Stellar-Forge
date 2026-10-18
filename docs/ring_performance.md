@@ -267,6 +267,103 @@ the previous 0.197 ms lit repeat. Occluded and distant ring passes remain around
 0.001 ms. This filtering has no measurable added cost in that fixture. Captures
 and a before/after crop are retained in `scratch/ring-filtering/`.
 
+## Surface ring-host candidates
+
+Surface ring shadows now build one host bit mask per body/star pair on the CPU.
+Masks are appended to the existing binding-2 eclipse buffer; the scene UBO records
+their absolute word offset. The surface shader visits set bits in host order and
+skips ring evaluation entirely for an empty mask. Up to sixteen ring hosts remain
+supported. Disabling rings or surface ring shadows builds no masks.
+
+`ring_could_shadow_surface` projects the entire receiving sphere onto the ring
+plane from the star center. For receiver center `R`, radius `a`, star `S`, ring
+center `C`, and unit pole `n`, define `D = S-R`, `d = dot(D,n)`, and
+`f = dot(C-R,n)/d`. The center ray hits `H = R+f*D`. All receiver hits fit a disc
+around `H` with radius bounded by `abs(1-f)*a*length(D)/(abs(d)-a)` when
+`abs(d)>a`. The filter expands that disc by upper bounds on the shader's stellar,
+pixel and radial-profile blur widths. It also includes coordinate-precision
+padding and terrain relief. Parallel/uncertain projections retain the host;
+planes wholly behind the receiver are rejected. The shader's existing small
+light-distance clamp is included in the illumination-angle bounds.
+
+This preserves shadows from a planet's own rings and ring shadows on moons;
+there is no hierarchy or self-host exclusion. Moon-to-ring shadows continue
+through the separate planetary eclipse candidate lists, including offscreen and
+unrelated blockers. Rings and terrain use the same lighting snapshot.
+
+The default penumbra uses a single box filter over the prefix-integral extinction
+LUT, reducing six texture samples to two. It retains finite-star angular size,
+distance-dependent softness, grazing stretch and pixel filtering. Setting
+`ring_shadow_single_box=false` restores the previous three weighted boxes for
+comparisons. `ring_shadow_reference_all_hosts`
+bypasses CPU filtering and supplies every host in the surface shader for HDR and
+timing comparisons. These are diagnostic render settings without UI controls.
+
+CPU contracts compare the host bound against 768,000 randomized surface/interior
+points, including small coordinate scales, grazing light and pixel footprints.
+GPU contracts compare filtered HDR pixels exactly against the all-host reference
+and cover own rings, ring-to-moon shadows, the sixteenth host, independent stars,
+relief and grazing illumination. Existing ring-receiver tests also verify that
+assigning a blocker as a moon preserves its eclipse on the rings.
+
+```powershell
+.\build\StellarRenderingTests.exe --surface-ring-shadows
+.\build\StellarRenderingTests.exe --surface-ring-benchmark scratch/surface-ring-shadows/new-capture
+```
+
+The surface benchmark uses controlled 1080p moon close-ups with four ring hosts,
+including three irrelevant systems. It compares all hosts/three boxes,
+filtered/three boxes and filtered/one box, with rotating mode order, 40 warmup and
+240 measured frames per mode across three repetitions. CPU record timing includes
+candidate construction, mask uploads and draw recording. GPU total includes
+preparation and visible rings; it is not application FPS. The all-host mode skips
+mask construction/upload. HDR equality is required for filtered/three-box
+captures. Reports and clamped previews are retained in the requested directory.
+
+Release measurements on the RTX 4060 Ti at 1920x1080, 2026-10-18:
+
+| Close-up | All hosts, three boxes | Filtered, three boxes | Filtered, single box (default) |
+|---|---:|---:|---:|
+| Moon in ring shadow | 0.144384 ms | 0.106496 ms | 0.096256 ms |
+| Rings irrelevant to moon | 0.116736 ms | 0.062464 ms | 0.062464 ms |
+| Broad stellar penumbra | 0.136192 ms | 0.099328 ms | 0.092160 ms |
+
+These are median total GPU times for the controlled celestial pass. Filtering
+alone preserved every HDR component in all three captures. The single box
+changes the penumbra profile, with the same distance/angle dependence, and saves
+another 0.007–0.010 ms where ring filtering is active. The clamped previews were
+visually inspected before enabling it by default.
+
+CPU record medians were 5.2/6.0/5.5 microseconds without masks and
+5.5/5.4/5.4 microseconds with the default filtered single-box path, in the table's
+scene order. The filtered three-box path measured 6.4/5.5/5.7 microseconds.
+Differences are around the timing variability; these measurements establish no
+material CPU regression for this small fixture, not a CPU speedup or a universal
+overhead bound. CPU filtering scales with shaded receiving bodies, lights and
+ring hosts. Reports and previews are retained in `scratch/surface-ring-shadows/run1/`.
+
+### Grazing moon penumbra rejection
+
+The surface shader previously rejected ray-plane hits using a radial margin of
+`3 * angular_star_radius * hit_distance + 2 * pixel_size` before evaluating the
+actual blurred profile. That margin omitted the ring-plane footprint stretch.
+At grazing illumination it could reject a partially shadowed fragment and create
+a hard edge even though the blur itself was broad. This affected both box-filter
+modes and predates CPU ring-host filtering.
+
+The redundant margin check is removed. `ring_shadow_extinction` now performs the
+radial rejection using its actual half-width, including grazing stretch, before
+any LUT samples. The default remains two LUT reads per surviving intersection;
+CPU host filtering and its conservative blur bounds are unchanged.
+
+The GPU moon regression uses a real-sized star at low ring-plane elevation and
+normalizes a scan across the illuminated moon against a shadows-disabled render.
+The old path jumped by 0.474 in visibility between adjacent pixels and yielded
+only eighteen partial-shadow pixels. The corrected default single-box path has
+a largest step of 0.027 and forty-nine partial-shadow pixels; the three-box
+reference has a largest step of 0.030 and thirty-seven partial-shadow pixels.
+The scan asserts both a broad penumbra and absence of clipped boundaries.
+
 ## Reproduction
 
 Build with `STELLAR_BUILD_RENDER_TESTS=ON`, then run:

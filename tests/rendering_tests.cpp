@@ -281,8 +281,13 @@ void terrain_surfaces(RenderProbe& probe, const std::filesystem::path& output = 
         }
     }
     settings.terrain_enabled = false;
-    probe.render(camera_at(radius * 3.0), simulation.snapshot(), settings);
-    check(probe.renderer.terrain_stats().patches == 0, "Disabling terrain clears the prepared draw list");
+    camera = camera_at(radius*3.0);
+    camera.origin_render = simulation.snapshot().body(1).render.position.value;
+    camera.tracking_idx = 1;
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.terrain_stats().patches > 0 &&
+          probe.renderer.terrain_stats().smooth_patches == probe.renderer.terrain_stats().patches,
+          "Disabling synthetic relief retains smooth quadtree geometry");
     probe.resize(EXTENT);
     std::cout << "Terrain GPU contracts passed: oblate disc, lighting, cube seams, poles, meter precision and bounded patches.\n";
 }
@@ -330,7 +335,8 @@ void earth_closeups(RenderProbe& probe, const std::filesystem::path& output) {
 
 void eclipse_lighting(RenderProbe& probe) {
     rendering::RenderSettings settings;
-    auto center_light = [&](glm::dvec3 caster_position, bool blocker, bool second_star, bool many_bodies = false) {
+    auto center_light = [&](glm::dvec3 caster_position, bool blocker, bool second_star, bool many_bodies = false,
+                            double caster_radius = 0.5, double oblateness = 0.0, glm::dvec3 pole = {0, 1, 0}) {
         ephemeris::LoadedSystem loaded;
         auto add = [&](const char* name, glm::dvec3 position, double radius, bool star) {
             ephemeris::BodyDefinition body;
@@ -345,7 +351,11 @@ void eclipse_lighting(RenderProbe& probe) {
         };
         add("Sun", {0, 0, 100}, 1.0, true);
         add("Receiver", {0, 0, 0}, 1.0, false);
-        if (blocker) add("Caster", caster_position, 0.5, false);
+        if (blocker) {
+            add("Caster", caster_position, caster_radius, false);
+            loaded.definition.bodies.back().oblateness = oblateness;
+            loaded.definition.bodies.back().pole_ecl = render_to_ecliptic(RenderPosition{pole}).value;
+        }
         if (second_star) add("Other sun", {20, 0, 100}, 1.0, true);
         if (many_bodies) {
             for (int i = 0; i < 600; ++i)
@@ -359,6 +369,24 @@ void eclipse_lighting(RenderProbe& probe) {
     float clear = center_light({}, false, false);
     check(clear > 0.1f, "Unshadowed receiver is illuminated");
     check(center_light({0, 0, 10}, true, false) < clear * 0.001f, "Aligned blocker shadows the receiver");
+    float annular = center_light({0, 0, 10}, true, false, false, 0.01);
+    std::cout << "Small-moon annular eclipse visibility: " << annular / clear << '\n';
+    check(annular / clear > 0.98f && annular / clear < 0.995f,
+          "A moon covering about one percent of the stellar disc cannot create a deep eclipse");
+    float annular_offset = center_light({0.025, 0, 10}, true, false, false, 0.01);
+    check(std::abs(annular_offset / annular - 1.0f) < 0.001f,
+          "A small moon wholly inside the stellar disc blocks the same area away from center");
+    float oblate_equator = center_light({0, 0.35, 10}, true, false, false, 0.5, 0.6, {0, 1, 0});
+    float oblate_pole = center_light({0, 0.35, 10}, true, false, false, 0.5, 0.6, {0, 0, 1});
+    float oblate_tilted = center_light({0, 0.35, 10}, true, false, false, 0.5, 0.6, glm::normalize(glm::dvec3(0, 1, 1)));
+    float oblate_rotated = center_light({0.35, 0, 10}, true, false, false, 0.5, 0.6, {1, 0, 0});
+    float oblate_major = center_light({0.35, 0, 10}, true, false, false, 0.5, 0.6, {0, 1, 0});
+    check(oblate_equator > clear * 0.99f, "Flattened parent's polar limb does not cast a false spherical eclipse on its moon");
+    check(oblate_rotated > clear * 0.99f && oblate_major < clear * 0.001f,
+          "Parent pole orientation rotates the ellipse and preserves its equatorial shadow extent");
+    check(oblate_pole < clear * 0.001f, "Pole-on oblate parent casts a circular eclipse");
+    check(oblate_tilted > clear * 0.05f && oblate_tilted < clear * 0.95f,
+          "Tilted parent's projected ellipse produces partial eclipse illumination");
     check(std::abs(center_light({30, 0, 10}, true, false) / clear - 1.0f) < 0.001f, "Rejected lateral blocker preserves illumination");
     check(std::abs(center_light({0, 0, -10}, true, false) / clear - 1.0f) < 0.001f, "Blocker behind receiver casts no shadow");
     check(std::abs(center_light({0, 0, 120}, true, false) / clear - 1.0f) < 0.001f, "Blocker beyond light casts no shadow");
@@ -413,17 +441,18 @@ void occlusion(RenderProbe& probe) {
     ephemeris::Simulation simulation;
     simulation.replace_system(fixture());
     double baseline = probe.render(camera_at(distance), simulation.snapshot(), settings);
-    for (double radius : {0.01, 0.5, 1.4, 1.5}) {
+    for (double radius : {0.01, 0.05, 0.1}) {
         simulation.replace_system(fixture(radius, distance));
         double flux = probe.render(camera_at(distance), simulation.snapshot(), settings);
-        check(std::abs(flux / baseline - 1.0) < 0.002, "Unresolved foreground body does not occlude a point");
+        double expected = 1.0 - (radius / 0.2) * (radius / 0.2);
+        check(std::abs(flux / baseline - expected) < 0.003,
+              "Unresolved stellar transits dim by the occulted area without a caster size cutoff");
     }
-    simulation.replace_system(fixture(2.0, distance));
-    double half = probe.render(camera_at(distance), simulation.snapshot(), settings);
-    check(std::abs(half / baseline - 0.5) < 0.005, "Transitioning occluder fades continuously");
-    simulation.replace_system(fixture(3.0, distance));
-    check(probe.render(camera_at(distance), simulation.snapshot(), settings) < baseline * 0.001,
-          "Resolved foreground mesh occludes a point");
+    for (double radius : {0.5, 1.4, 1.5, 2.0, 3.0}) {
+        simulation.replace_system(fixture(radius, distance));
+        check(probe.render(camera_at(distance), simulation.snapshot(), settings) < baseline * 0.001,
+              "A caster larger than the stellar disc fully occludes an unresolved star at every mesh size");
+    }
     constexpr double FAR_DISTANCE = 1e8;
     settings.exposure = 1e14f;
     simulation.replace_system(fixture());
@@ -437,7 +466,7 @@ void occlusion(RenderProbe& probe) {
         double flux = probe.render(camera_at(FAR_DISTANCE), simulation.snapshot(), settings);
         check(std::abs(flux / far_baseline - 1.0) < 0.002, "Distant overlapping points do not flicker or occlude");
     }
-    std::cout << "Unresolved, transitioning and resolved occlusion passed.\n";
+    std::cout << "Finite stellar transits and unresolved, transitioning and resolved occlusion passed.\n";
 }
 
 void reflected_light(RenderProbe& probe) {
@@ -452,24 +481,22 @@ void reflected_light(RenderProbe& probe) {
     loaded.motions.emplace_back();
     ephemeris::Simulation simulation;
     check(simulation.replace_system(loaded).accepted, "Reflected-light fixture");
-    double distance = SOLAR_RADII_TO_AU * FOCAL / 0.2;
+    double distance = SOLAR_RADII_TO_AU * FOCAL / 24.0;
     double near_flux = probe.render(camera_at(distance), simulation.snapshot(), settings);
     double far_flux = probe.render(camera_at(distance * 2.0), simulation.snapshot(), settings);
     std::cout << "Reflected-light flux near/far: " << near_flux << "/" << far_flux << '\n';
-    check(std::abs(far_flux / near_flux - 0.25) < 0.002, "Reflected light follows observer inverse-square law");
+    check(std::abs(far_flux / near_flux - 0.25) < 0.015, "Resolved quadtree reflectance follows observer inverse-square law");
     double min_transition = 10.0;
     double max_transition = 0.0;
-    for (double radius_px = 1.3; radius_px <= 2.71; radius_px += 0.05) {
+    for (double radius_px : {12.0, 18.0, 24.0, 30.0}) {
         double d = SOLAR_RADII_TO_AU * FOCAL / radius_px;
         double flux = probe.render(camera_at(d), simulation.snapshot(), settings);
         double expected = near_flux * distance * distance / (d * d);
         min_transition = std::min(min_transition, flux / expected);
         max_transition = std::max(max_transition, flux / expected);
-        if (flux / expected <= 0.74 || flux / expected >= 1.26)
-            std::cout << "Reflected-light transition radius/ratio: " << radius_px << "/" << flux / expected << '\n';
-        check(flux / expected > 0.74 && flux / expected < 1.26, "Reflected-light mesh/point continuity");
+        check(flux / expected > 0.9 && flux / expected < 1.1, "Quadtree reflectance remains consistent across resolved LODs");
     }
-    std::cout << "Reflected-light transition range: " << min_transition << " to " << max_transition << '\n';
+    std::cout << "Reflected-light quadtree range: " << min_transition << " to " << max_transition << '\n';
 }
 
 void catalog_calibration(RenderProbe& probe) {
@@ -712,6 +739,12 @@ void ring_rendering_and_shadows(RenderProbe& probe) {
     settings.ring_shadows_enabled = true;
     double planet_shadowed = probe.render(cam, sim.snapshot(), settings);
     check(planet_shadowed < planet_unshadowed * 0.98, "Ring shadow LUT attenuates sunlight on planet surface");
+    auto* shadow_pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+    std::vector<uint16_t> filtered_shadow(shadow_pixels, shadow_pixels + size_t(EXTENT.width) * EXTENT.height * 4);
+    settings.ring_shadow_reference_all_hosts = true;
+    probe.render(cam, sim.snapshot(), settings);
+    check(std::equal(filtered_shadow.begin(), filtered_shadow.end(), shadow_pixels), "Own-ring planet shadows match the all-host reference");
+    settings.ring_shadow_reference_all_hosts = false;
 
     cam = camera_at(r_au * 1.1);
     settings.ring_shadows_enabled = false;
@@ -821,6 +854,13 @@ void ring_eclipse_candidate_filtering(RenderProbe& probe) {
     check(probe.renderer.ring_eclipse_candidate_counts()[0] == 2, "Unrelated body beyond the old sixteen-caster cutoff retained");
     float shadowed = probe.red_at(184, 128);
     check(shadowed < lit * 0.05f, "Unrelated body casts the expected ring umbra");
+    loaded.definition.bodies.back().parent_idx = 1;
+    loaded.definition.bodies.back().parent_id = planet.name;
+    loaded.definition.bodies.back().type = "Moon";
+    check(simulation.replace_system(loaded).accepted, "Moon-to-ring eclipse fixture");
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.red_at(184, 128) == shadowed && probe.renderer.ring_eclipse_candidate_counts()[0] == 2,
+          "Moon casts the same ring eclipse regardless of reference-parent classification");
 
     for (int i = 0; i < 17; ++i) add_caster(blocker_pos, radius * 0.01);
     check(simulation.replace_system(loaded).accepted, "Many aligned ring blockers fixture");
@@ -846,11 +886,39 @@ void ring_eclipse_candidate_filtering(RenderProbe& probe) {
 
 #include "terrain_gpu_tests.hpp"
 #include "ring_gpu_tests.hpp"
+#include "eclipse_gpu_tests.hpp"
 
 int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc == 2 && std::string_view(argv[1]) == "--eclipse-optics") {
+            eclipse_optics_contracts(probe);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--eclipse-benchmark") {
+            eclipse_benchmark(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--eclipse-lighting") {
+            eclipse_optics_contracts(probe);
+            eclipse_lighting(probe);
+            occlusion(probe);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--surface-ring-shadows") {
+            surface_ring_shadow_contracts(probe);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--surface-ring-benchmark") {
+            surface_ring_benchmark(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--smooth-surfaces") {
+            smooth_surface_contracts(probe);
+            reflected_light(probe);
+            return 0;
+        }
         if (argc >= 3 && std::string_view(argv[1]) == "--ring-benchmark") {
             VkExtent2D extent{1920, 1080};
             if (argc >= 6) extent = {static_cast<uint32_t>(std::stoul(argv[4])), static_cast<uint32_t>(std::stoul(argv[5]))};
@@ -864,6 +932,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--rings-only") {
+            surface_ring_shadow_contracts(probe);
             ring_rendering_and_shadows(probe);
             ring_eclipse_candidate_filtering(probe);
             ring_system_cache_contracts(probe);
@@ -871,8 +940,16 @@ int main(int argc, char** argv) {
             ring_specialization_contracts(probe);
             return 0;
         }
+        if (argc >= 2 && std::string_view(argv[1]) == "--bake-benchmark") {
+            geometry_bake_benchmark(probe);
+            return 0;
+        }
         if (argc >= 4 && std::string_view(argv[1]) == "--terrain-source-benchmark") {
             terrain_source_benchmark(probe, argv[2], argv[3], argc > 4 && std::string_view(argv[4]) == "--paced");
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--surface-2km-benchmark") {
+            surface_2km_benchmark(probe, argc >= 3 ? argv[2] : "scratch/surface_2km_bench");
             return 0;
         }
         if (argc >= 3 && std::string_view(argv[1]) == "--surface-contracts") {
@@ -909,13 +986,16 @@ int main(int argc, char** argv) {
             return 0;
         }
         terrain_surfaces(probe);
+        smooth_surface_contracts(probe);
         terrain_precision(probe);
         if (argc == 3 && std::string_view(argv[1]) == "--earth-closeups") {
             earth_closeups(probe, argv[2]);
             return 0;
         }
         earth_closeups(probe, {});
+        eclipse_optics_contracts(probe);
         eclipse_lighting(probe);
+        surface_ring_shadow_contracts(probe);
         ring_rendering_and_shadows(probe);
         ring_eclipse_candidate_filtering(probe);
         ring_system_cache_contracts(probe);

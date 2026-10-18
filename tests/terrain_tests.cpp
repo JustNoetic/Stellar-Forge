@@ -26,6 +26,17 @@ void check(bool value, const char* message) {
 
 using namespace sf::terrain;
 
+void enclosed(const TileBounds& bound, glm::dvec3 point) {
+    for (auto axis : {glm::dvec3(1, 0, 0), glm::dvec3(0, 1, 0), glm::dvec3(0, 0, 1),
+                      bound.direction, glm::normalize(glm::dvec3(.7, -.3, .2))}) {
+        check(std::abs(glm::dot(axis, point-bound.surface_center)) <= bound.support(axis)+2e-14,
+              "Surface enclosure contains displaced samples and parent morph vertices");
+    }
+    check(bound.distance(point) <= 1.1e-12, "Distance lower bound never excludes a surface sample");
+    auto eye = point+glm::dvec3(.001, -.002, .003);
+    check(bound.distance(eye) <= glm::length(eye-point)+3e-14, "Refinement distance stays below sampled surface distance");
+}
+
 void mapping() {
     std::mt19937 random(1979);
     std::uniform_real_distribution<double> coordinate(-1.0, 1.0);
@@ -49,6 +60,7 @@ void mapping() {
                                                   -1.0 + (tile.y + y / 4.0) * w, 0.8);
                     check(glm::length(sample - bound.center) + 0.01 <= bound.radius + 1e-12,
                           "Bounds contain interior samples, corners and full relief range");
+                    enclosed(bound, sample);
                 }
             }
         }
@@ -187,6 +199,7 @@ void metadata_bounds() {
                                     auto point = d * scale + glm::normalize(d / scale) * (amplitude * height);
                                     check(glm::length(point - bound.center) <= bound.radius + 1e-13,
                                           "Local bounds contain displaced interiors and edges even on flattened bodies");
+                                    enclosed(bound, point);
                                 }
                             }
                         }
@@ -231,6 +244,7 @@ void metadata_bounds() {
     TileMetadataCache shared;
     auto selection = select(view, &shared);
     check(!selection.budget_limited && selection.patches.size() < 512, "Local high-relief metadata avoids unnecessary budget exhaustion at two kilometers");
+    check(selection.max_error_pixels <= view.target_error_pixels, "Ready relief leaves meet the screen-space error target");
     topology(selection);
     uint64_t builds = shared.builds();
     auto repeated = select(view, &shared);
@@ -243,6 +257,57 @@ void metadata_bounds() {
         }
         check(level >= 9, "Tight local bounds preserve visible high-relief ground coverage");
     }
+}
+
+void visibility_bounds() {
+    std::mt19937 random(20261018);
+    std::uniform_real_distribution<double> coordinate(-1, 1);
+    uint32_t retained = 0;
+    for (double polar : {.05, .5, .99665, 1.0}) {
+        for (uint32_t trial = 0; trial < 400; ++trial) {
+            uint32_t face = random()%6;
+            double u = coordinate(random), v = coordinate(random);
+            auto direction = glm::normalize(cube_vector(face, u, v));
+            auto scale = glm::dvec3(1, polar, 1);
+            auto normal = glm::normalize(direction/scale);
+            double height = trial%3 == 0 ? -.001 : trial%3 == 1 ? .001 : 0;
+            auto point = direction*scale+normal*height;
+            auto tangent = glm::normalize(glm::cross(normal, std::abs(normal.y) < .9 ? glm::dvec3(0, 1, 0) : glm::dvec3(1, 0, 0)));
+            SelectionView view;
+            view.polar_ratio = polar;
+            view.height_amplitude = std::abs(height);
+            view.eye = point+(normal-tangent*(trial%2 ? 4.0 : 0.0))*(trial%2 ? 1e-7 : .02);
+            auto forward = trial%2 ? tangent-normal*.1 : -normal;
+            auto up = trial%2 ? normal : tangent;
+            view.view_from_local = glm::dmat3(glm::lookAt(glm::dvec3(0), forward, up));
+            view.tan_half_fov_x = 1;
+            view.tan_half_fov_y = .6;
+            for (uint32_t level : {0u, 2u, 8u, 16u, 24u}) {
+                auto tile = tile_at(direction, level);
+                auto bound = surface_bounds(tile, polar, 1, {height, height, 0, 0});
+                enclosed(bound, point);
+                check(visible(bound, view), "Frustum and ellipsoid horizon culling retain visible signed-height ground through LOD24");
+                ++retained;
+            }
+        }
+    }
+    SelectionView view;
+    view.polar_ratio = .5;
+    view.eye = {0, 0, 1.0001};
+    view.view_from_local = glm::dmat3(glm::lookAt(glm::dvec3(0), glm::dvec3(1, 0, 0), glm::dvec3(0, 0, 1)));
+    auto hidden = bounds(tile_at({std::sin(.2), 0, std::cos(.2)}, 12), .5, 0);
+    check(!visible(hidden, view), "Ellipsoid horizon rejects terrain retained by the old polar-radius sphere");
+    auto root = bounds({4}, 1, 0);
+    check(root.distance({0, 0, 1.001}) > .000999999,
+          "Thin enclosure retains a useful ground distance when the eye lies inside the old sphere");
+    view.polar_ratio = 1;
+    auto tile = bounds({4, 8, 128, 128}, 1, 0);
+    auto sphere = tile;
+    sphere.angular_radius = 0;
+    view.eye = tile.center+tile.direction*.001;
+    view.view_from_local = glm::dmat3(glm::lookAt(glm::dvec3(0), tile.direction, glm::dvec3(0, 1, 0)));
+    check(visible(sphere, view) && !visible(tile, view), "Thin surface bounds reject an offscreen patch whose sphere surrounds the eye");
+    check(retained == 8000, "Visibility oracle exercises every configured shape, height and depth");
 }
 
 void ground_refinement() {
@@ -484,6 +549,9 @@ void imported_error_bounds(const HeightSource& source) {
                               "Imported error bounds contain fine, parent and grandparent triangles on every face and oblate shape");
                         check(glm::length(sample-description.bounds.center) <= description.bounds.radius+2e-15,
                               "Imported bounds contain sampled interiors at edges, poles and LOD24");
+                        enclosed(description.bounds, sample);
+                        enclosed(description.bounds, a*weights.x+b*weights.y+c*weights.z);
+                        enclosed(description.bounds, b*weights.x+d*weights.y+c*weights.z);
                     }
                 }
             }
@@ -542,6 +610,7 @@ void imported_source(const std::filesystem::path& pointer) {
         std::cout << "Imported ground selector: " << selection.patches.size() << " patches, LOD " << selection.deepest_level << ".\n";
         check(selection.deepest_level >= 21, "Metadata-only selection retains meter-scale imported detail");
         check(!selection.budget_limited && selection.patches.size() < 128, "Resident virtual bounds avoid spurious near-ground refinement");
+        check(selection.max_error_pixels <= view.target_error_pixels, "Ready imported leaves meet the screen-space error target");
         std::unordered_map<uint64_t, HeightTile> payloads;
         auto point = [&](double u, double v) {
             auto d = glm::normalize(cube_vector(4, u, v));
@@ -643,6 +712,7 @@ int main(int argc, char** argv) {
         geometry_residency();
         selections();
         metadata_bounds();
+        visibility_bounds();
         ground_refinement();
         staging_residency();
         resident_refinement();

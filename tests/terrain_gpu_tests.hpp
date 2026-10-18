@@ -36,6 +36,65 @@ glm::vec3 surface_center(const RenderProbe& probe) {
             glm::unpackHalf2x16(pixels[offset+2]).x};
 }
 
+void smooth_surface_contracts(RenderProbe& probe) {
+    probe.resize({512, 512});
+    ephemeris::Simulation simulation;
+    auto loaded = precision_fixture({}, .3);
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{0, 0, 1e6}});
+    loaded.definition.bodies[0].lum_eq = loaded.definition.bodies[0].lum_pole = 1e12;
+    loaded.definition.bodies[1].type = "Gas Giant";
+    check(simulation.replace_system(loaded).accepted, "Smooth gas giant fixture loads");
+    rendering::RenderSettings settings;
+    settings.terrain_enabled = false;
+    settings.terrain_imported_enabled = false;
+    settings.surface_textures_enabled = false;
+    constexpr double radius = 6378.137*KM_TO_AU;
+    double focal = 512/(2*std::tan(30*DEG_TO_RAD));
+    auto camera = camera_at(radius*3);
+    camera.tracking_idx = 1;
+    check(probe.render(camera, simulation.snapshot(), settings) > 1, "Heightless gas giant renders through the quadtree");
+    auto stats = probe.renderer.terrain_stats();
+    check(stats.drawn_bodies == 1 && stats.smooth_patches == stats.patches && stats.patches > 6,
+          "Default surfaces refine smooth ellipsoids without imported or synthetic height");
+    double limb = focal/std::sqrt(8.0);
+    check(probe.red_at(256+uint32_t(limb*.8), 256) > .001f &&
+          probe.red_at(256, 256+uint32_t(limb*.7*.8)) > .001f &&
+          probe.red_at(256, 256+uint32_t(std::ceil(limb*.7+4))) == 0,
+          "Smooth quadtree geometry follows the analytic oblate silhouette");
+    for (double projected : {8.0, 2.0, .1, 1e-6}) {
+        camera.cam_pos_rel = {0, 0, radius*focal/projected};
+        double flux = probe.render(camera, simulation.snapshot(), settings);
+        const auto& distant = probe.renderer.terrain_stats();
+        check(distant.drawn_bodies == 1 && distant.patches > 0 && distant.smooth_patches == distant.patches,
+              "Every screen size retains quadtree geometry, including subpixel bodies");
+        if (projected <= .1) check(flux == 0, "Subpixel planets never switch to a minimum-size point sprite");
+    }
+    settings.terrain_enabled = true;
+    settings.terrain_height_km = 20;
+    camera.cam_pos_rel = {0, 0, radius*3};
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.terrain_stats().smooth_patches == probe.renderer.terrain_stats().patches,
+          "Gas giants retain smooth geometry when synthetic preview is enabled");
+    settings.terrain_enabled = false;
+    settings.terrain_patch_limit = 4096;
+    loaded = precision_fixture();
+    for (uint32_t i = 2; i < rendering::MAX_CELESTIAL_BODIES; ++i) {
+        auto body = loaded.definition.bodies[1];
+        body.name = "Small surface "+std::to_string(i);
+        body.radius_rsun *= 1e-6;
+        loaded.definition.name_to_idx[body.name] = int(i);
+        loaded.definition.bodies.push_back(body);
+        loaded.motions.emplace_back();
+    }
+    check(simulation.replace_system(loaded).accepted, "Maximum body count surface fixture loads");
+    probe.render(camera, simulation.snapshot(), settings);
+    const auto& crowded = probe.renderer.terrain_stats();
+    check(crowded.drawn_bodies == rendering::MAX_CELESTIAL_BODIES-1 && crowded.patches > 4096 &&
+          crowded.patches <= terrain::MAX_PATCHES, "Patch budgeting reserves quadtree coverage for every distant body");
+    probe.resize(EXTENT);
+    std::cout << "Smooth surface contracts passed: oblate geometry, all distances, no planet points and reserved coarse coverage.\n";
+}
+
 void surface_contracts(RenderProbe& probe, const std::filesystem::path& fixture_pointer) {
     std::ifstream pointer(fixture_pointer);
     std::string location;
@@ -73,8 +132,20 @@ void surface_contracts(RenderProbe& probe, const std::filesystem::path& fixture_
         throw std::runtime_error("Surface cache failed to converge");
     };
     settle();
+    check(probe.renderer.texture_stats().selection_rebuilds == 0 && probe.renderer.texture_stats().selection_nodes == 0,
+          "Stationary texture views reuse selection while residency continues to update");
+    settings.exposure = 2;
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.texture_stats().selection_rebuilds == 0, "Lighting changes retain texture selection");
+    camera.fov_deg = 45;
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.texture_stats().selection_rebuilds > 0, "FOV changes invalidate texture selection");
+    camera.fov_deg = 60;
+    settings.exposure = 1;
+    settle();
     auto center = surface_center(probe);
-    check(center.g > .01f && center.r < .001f && center.b < .001f, "Resident albedo replaces the body color on the sphere");
+    check(center.g > .01f && center.r < .001f && center.b < .001f &&
+          probe.renderer.terrain_stats().smooth_patches > 0, "Heightless quadtree ellipsoids use resident albedo by default");
     settings.surface_textures_enabled = false;
     probe.render(camera, simulation.snapshot(), settings);
     center = surface_center(probe);
@@ -93,11 +164,11 @@ void surface_contracts(RenderProbe& probe, const std::filesystem::path& fixture_
     check(simulation.replace_system(loaded).accepted, "Tilted surface fixture loads");
     settings.terrain_enabled = false;
     settle();
-    auto sphere = glm::normalize(surface_center(probe));
+    auto smooth = glm::normalize(surface_center(probe));
     settings.terrain_enabled = true;
     settle();
     auto terrain_color = glm::normalize(surface_center(probe));
-    check(glm::length(sphere-terrain_color) < .015f, "Sphere and terrain preserve tilted body-fixed texture orientation");
+    check(glm::length(smooth-terrain_color) < .015f, "Smooth and preview geometry preserve tilted body-fixed texture orientation");
     settings.terrain_enabled = false;
     std::vector<terrain::ColorBinding> bindings;
     for (int i = 0; i < 32; ++i) bindings.push_back({"Surface "+std::to_string(i), green});
@@ -213,6 +284,8 @@ bool declares_float64(const std::vector<uint32_t>& spirv) {
 void geometry_bake_precision(RenderProbe& probe) {
     check(!declares_float64(rhi::ShaderCache::compile_to_spirv("terrain/terrain.vert", VK_SHADER_STAGE_VERTEX_BIT)),
           "Cached near-ground draw shader contains no FP64 capability");
+    check(!declares_float64(rhi::ShaderCache::compile_to_spirv("terrain/geometry_cache.comp", VK_SHADER_STAGE_COMPUTE_BIT)),
+          "Terrain compute bake shader contains no FP64 capability");
     check(declares_float64(rhi::ShaderCache::compile_to_spirv("terrain/terrain_reference.vert", VK_SHADER_STAGE_VERTEX_BIT)),
           "Reference shader retains FP64 precision");
     const std::pair<std::string, std::string> cached_double[] = {{"TERRAIN_CACHED_FP64", "1"}};
@@ -227,7 +300,7 @@ void geometry_bake_precision(RenderProbe& probe) {
             terrain::GeometryBakeGPU job;
             double width = std::ldexp(2.0, -24);
             auto anchor = terrain::ellipsoid_point(face, -1.0 + (x + 0.5) * width, -1.0 + (x + 0.5) * width, 0.8);
-            job.anchor_polar_ratio = {anchor, 0.8};
+            job.anchor_polar_ratio = {glm::vec3(anchor), 0.8f};
             job.address = {face, 24u, x, x};
             requests.push_back(job);
             keys.push_back({1, 1, terrain::TileId{face, 24, x, x}.key(), 0, 0.8, 0.0});
@@ -255,10 +328,12 @@ void geometry_bake_precision(RenderProbe& probe) {
     for (size_t i = 0; i < keys.size(); ++i) {
         auto job = requests[i];
         double width = std::ldexp(2.0, -24);
+        auto anchor = terrain::ellipsoid_point(job.address.x, -1.0 + (job.address.z + 0.5) * width,
+                                               -1.0 + (job.address.w + 0.5) * width, 0.8);
         for (uint32_t y = 0; y <= 16; ++y) {
             for (uint32_t x = 0; x <= 16; ++x) {
                 auto expected = terrain::ellipsoid_point(job.address.x, -1.0 + (job.address.z + x / 16.0) * width,
-                                                         -1.0 + (job.address.w + y / 16.0) * width, 0.8) - glm::dvec3(job.anchor_polar_ratio);
+                                                         -1.0 + (job.address.w + y / 16.0) * width, 0.8) - anchor;
                 const auto& vertex = vertices[i * terrain::PATCH_VERTICES + y * 17 + x];
                 double error = glm::length(glm::dvec3(vertex.position) - expected) * 70000000.0;
                 maximum_error_m = std::max(maximum_error_m, error);
@@ -276,6 +351,45 @@ void geometry_bake_precision(RenderProbe& probe) {
     probe.vk.destroy_buffer(readback);
     cache.shutdown(probe.vk);
     std::cout << "LOD24 cache error at 70,000 km radius: " << maximum_error_m << " m.\n";
+}
+
+void geometry_bake_benchmark(RenderProbe& probe) {
+    terrain::GeometryCache cache;
+    cache.init(probe.vk);
+    constexpr uint32_t bakes = terrain::MAX_GEOMETRY_BAKES;
+    constexpr uint32_t iterations = 100;
+    std::vector<terrain::GeometryKey> keys(bakes);
+    std::vector<terrain::GeometryBakeGPU> requests(bakes);
+    for (uint32_t i = 0; i < bakes; ++i) {
+        requests[i].anchor_polar_ratio = {0.5f, 0.5f, 0.5f, 0.8f};
+        requests[i].shape.x = 0.01f;
+        requests[i].address = {i % 6, 12, (i * 17) % 4096, (i * 31) % 4096};
+    }
+    std::vector<double> timings;
+    timings.reserve(iterations);
+    for (uint32_t iter = 0; iter < iterations; ++iter) {
+        for (uint32_t i = 0; i < bakes; ++i) {
+            keys[i] = terrain::GeometryKey{iter + 1, 1, terrain::TileId{i % 6, 12, (i * 17) % 4096, (i * 31) % 4096}.key(), 1, 0.8, 0.01};
+        }
+        auto plan = cache.prepare(probe.vk, keys, requests);
+        check(plan.bakes.size() == bakes, "Benchmark bakes 128 blocks per iteration");
+        probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
+            auto timer = probe.vk.begin_gpu_timer(cmd, "compute_bake");
+            cache.bake(cmd, probe.vk);
+            probe.vk.end_gpu_timer(cmd, timer);
+        });
+        probe.vk.drain_gpu_timings();
+        timings.push_back(probe.vk.gpu_time_ms("compute_bake"));
+    }
+    cache.shutdown(probe.vk);
+    std::sort(timings.begin(), timings.end());
+    double mean = std::accumulate(timings.begin(), timings.end(), 0.0) / timings.size();
+    std::cout << "GPU Compute Bake (128 patches = " << (bakes * 289) << " vertices):\n"
+              << "  Mean:   " << mean << " ms\n"
+              << "  Median: " << timings[timings.size() / 2] << " ms\n"
+              << "  Min:    " << timings.front() << " ms\n"
+              << "  Max:    " << timings.back() << " ms\n"
+              << "  P95:    " << timings[size_t(timings.size() * 0.95)] << " ms\n";
 }
 
 std::vector<uint16_t> capture_pixels(const RenderProbe& probe) {
@@ -297,8 +411,8 @@ void cached_reference_image(RenderProbe& probe, const Camera& camera, const ephe
     auto stats = probe.renderer.terrain_stats();
     check(stats.patches > 0 && stats.reference_patches == 0, "Cache converges to the FP32 draw path");
     probe.render(camera, system, settings);
-    check(probe.renderer.terrain_stats().cache_bakes == 0 && probe.renderer.terrain_stats().selection_rebuilds == 0,
-          "Stationary draws reuse geometry and selection");
+    check(probe.renderer.terrain_stats().cache_bakes == 0 && probe.renderer.terrain_stats().selection_rebuilds == 0 &&
+          probe.renderer.terrain_stats().patch_updates == 0, "Stationary draws reuse geometry, selection and patch records");
     auto cached = capture_pixels(probe);
     double error_sum = 0.0;
     size_t changed = 0;
@@ -445,6 +559,7 @@ void terrain_source_benchmark(RenderProbe& probe, const std::filesystem::path& d
     nlohmann::json report{{"gpu", probe.vk.device_name()}, {"dataset_identity", source->domain().identity},
         {"framebuffer", {1920,1080}}, {"target_pixels", settings.terrain_error_pixels}, {"paced_60hz", paced},
         {"method", "serialized offscreen celestial pass; no color sources; stationary then 100 m/s at virtual 60 Hz; excludes worker CPU, camera height queries, waits, readback and presentation"}};
+    std::filesystem::create_directories(output.parent_path());
     for (const auto& [name, clearance, horizon] : std::vector<std::tuple<std::string, double, bool>>{
              {"orbital", radius*2, false}, {"2km-down", 2000, false}, {"2km-horizon", 2000, true},
              {"1m-down", 1, false}, {"1m-horizon", 1, true}}) {
@@ -485,10 +600,116 @@ void terrain_source_benchmark(RenderProbe& probe, const std::filesystem::path& d
                 {"minimum_ready_deepest_lod", minimum_ready_lod}};
             std::cout << row.dump() << '\n';
             report["results"].push_back(row);
+            if (!moving) {
+                probe.render(camera, simulation.snapshot(), settings);
+                auto preview = output.parent_path()/(output.stem().string()+"-"+name);
+                probe.save_preview(preview.string()+".ppm", true);
+                check(paths::write_binary_file(preview.string()+".rgba16f", probe.readback.mapped,
+                    size_t(probe.extent.width)*probe.extent.height*8), "Source benchmark HDR comparison is writable");
+            }
         }
     }
     std::filesystem::create_directories(output.parent_path());
     check(paths::write_json(output, report), "Source benchmark output is writable");
+}
+
+void surface_2km_benchmark(RenderProbe& probe, const std::filesystem::path& output) {
+    std::filesystem::remove_all(output);
+    auto catalog = paths::read_json(paths::external_path("data/surfaces.json"));
+    auto definitions = paths::read_json(paths::external_path("data/system.json"));
+    check(catalog.has_value() && definitions.has_value(), "Catalogs exist");
+    auto definition = std::find_if(definitions->begin(), definitions->end(), [&](const auto& b) { return b.at("name") == "Earth"; });
+    check(definition != definitions->end(), "Earth definition exists");
+    std::vector<terrain::ColorBinding> bindings;
+    std::string height_rel;
+    for (const auto& entry : catalog->at("bodies")) {
+        if (entry.at("body") == "Earth") {
+            bindings.push_back({"Earth", terrain::ColorSource::open(paths::external_path(entry.at("albedo").get<std::string>()))});
+            if (entry.contains("height")) height_rel = entry.at("height").get<std::string>();
+        }
+    }
+    check(!bindings.empty() && !height_rel.empty(), "Earth bindings exist");
+    probe.renderer.set_color_sources(std::move(bindings));
+    auto source = terrain::HeightSource::open(paths::external_path(height_rel));
+    probe.renderer.set_height_source("Earth", source);
+    probe.resize({1920, 1080});
+    ephemeris::Simulation simulation;
+    auto loaded = precision_fixture({}, definition->value("oblateness", 0.0));
+    auto& body = loaded.definition.bodies[1];
+    body.name = "Earth";
+    body.radius_rsun = definition->at("r");
+    body.color_rgb = {1, 1, 1};
+    body.w0_deg = -70;
+    check(simulation.replace_system(loaded).accepted, "Benchmark system loads");
+    rendering::RenderSettings settings;
+    settings.surface_textures_enabled = true;
+    settings.terrain_enabled = true;
+    settings.terrain_imported_enabled = true;
+    double radius = source->info().equatorial_radius_m;
+    auto camera_for = [&](double clearance, bool horizon, uint32_t frame) {
+        double angle = .15 + 100.0 * frame / (60.0 * radius);
+        glm::dvec3 direction{std::sin(angle), 0, std::cos(angle)};
+        auto tile = terrain::tile_at(direction, source->info().data_level);
+        auto payload = source->read(tile);
+        double n = double(1u << tile.level);
+        double h = terrain::height_sample(payload, ((direction.x/direction.z+1)*.5*n-tile.x)*16, (.5*n-tile.y)*16);
+        auto camera = camera_at(0);
+        camera.cam_pos_rel = direction * ((radius+h+clearance)*.001*KM_TO_AU);
+        camera.cam_look_aim = !horizon;
+        camera.tracking_idx = 1;
+        camera.is_near_surface = clearance < radius;
+        camera.up = horizon ? direction : glm::dvec3(0, 1, 0);
+        camera.yaw_actual_deg = -angle*RAD_TO_DEG;
+        return camera;
+    };
+    nlohmann::json report{{"gpu", probe.vk.device_name()}, {"framebuffer", {1920, 1080}},
+        {"target_pixels", settings.terrain_error_pixels}, {"method", "surface rendering (color + height) at 2km altitude"}};
+    for (const auto& [name, clearance, horizon] : std::vector<std::tuple<std::string, double, bool>>{
+             {"2km-down", 2000, false}, {"2km-horizon", 2000, true}}) {
+        auto camera = camera_for(clearance, horizon, 0);
+        auto start = SteadyClock::now();
+        bool converged = false;
+        for (uint32_t frame = 0; frame < 10000 && elapsed_ms(start) < 30000; ++frame) {
+            measure_terrain(probe, camera, simulation.snapshot(), settings);
+            const auto& textures = probe.renderer.texture_stats();
+            const auto& terrain = probe.renderer.terrain_stats();
+            if (terrain.imported_patches && !terrain.loading_bodies && !terrain.cache_bakes && !textures.pending && !textures.uploads) {
+                converged = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(converged, "Surface benchmark reaches resident coverage");
+        double readiness = elapsed_ms(start);
+        for (bool moving : {false, true}) {
+            std::vector<double> cpu, prepare, record, gpu, patches, nodes, rebuilds, resident_color, color_uploads;
+            uint32_t loading = 0, budget = 0, minimum_lod = 24, minimum_ready_lod = 24;
+            for (uint32_t frame = 0; frame < 120; ++frame) {
+                if (moving) camera = camera_for(clearance, horizon, frame);
+                auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
+                const auto& stats = probe.renderer.terrain_stats();
+                const auto& tex_stats = probe.renderer.texture_stats();
+                cpu.push_back(sample.cpu_ms()); prepare.push_back(sample.cpu_prepare_ms); record.push_back(sample.cpu_record_ms);
+                gpu.push_back(sample.gpu_total_ms); patches.push_back(stats.patches); nodes.push_back(stats.selection_nodes);
+                rebuilds.push_back(stats.selection_rebuilds); loading += stats.loading_bodies > 0; budget += stats.budget_limited;
+                resident_color.push_back(tex_stats.resident); color_uploads.push_back(tex_stats.uploads);
+                minimum_lod = std::min(minimum_lod, stats.deepest_level);
+                if (!stats.loading_bodies) minimum_ready_lod = std::min(minimum_ready_lod, stats.deepest_level);
+            }
+            nlohmann::json row{{"view", name}, {"moving", moving}, {"readiness_ms", readiness},
+                {"cpu_ms", terrain_timing_stats(cpu)}, {"prepare_ms", terrain_timing_stats(prepare)},
+                {"record_ms", terrain_timing_stats(record)}, {"gpu_ms", terrain_timing_stats(gpu)},
+                {"patches", terrain_timing_stats(patches)}, {"resident_color", terrain_timing_stats(resident_color)},
+                {"color_uploads", terrain_timing_stats(color_uploads)},
+                {"selection_nodes", terrain_timing_stats(nodes)}, {"selection_rebuilds", terrain_timing_stats(rebuilds)},
+                {"loading_frames", loading}, {"budget_frames", budget}, {"minimum_deepest_lod", minimum_lod},
+                {"ready_frames", 120-loading}, {"minimum_ready_deepest_lod", minimum_ready_lod}};
+            std::cout << row.dump() << '\n';
+            report["results"].push_back(row);
+        }
+    }
+    std::filesystem::create_directories(output.parent_path());
+    check(paths::write_json(output, report), "Benchmark output is writable");
 }
 
 void imported_terrain(RenderProbe& probe, const std::filesystem::path& dataset, const std::filesystem::path& output) {
@@ -557,7 +778,8 @@ void imported_terrain(RenderProbe& probe, const std::filesystem::path& dataset, 
               "Stationary imported terrain reuses both quadtree selections after residency stabilizes");
         settings.exposure = 1.25f;
         measure_terrain(probe, camera, simulation.snapshot(), settings);
-        check(!probe.renderer.terrain_stats().selection_rebuilds, "Lighting-only changes retain imported selections");
+        check(!probe.renderer.terrain_stats().selection_rebuilds && !probe.renderer.terrain_stats().patch_updates,
+              "Lighting-only changes retain imported selections and patch records");
         settings.exposure = 1;
         settings.terrain_error_pixels = 4;
         measure_terrain(probe, camera, simulation.snapshot(), settings);
@@ -575,14 +797,16 @@ void imported_terrain(RenderProbe& probe, const std::filesystem::path& dataset, 
             check(stats.patches <= 1024 && stats.cache_bakes <= 128 && stats.stream.pending <= 128 && stats.stream.ready <= 256,
                   "Moving imported terrain respects geometry, upload and worker limits");
             if (clearance == 1 && !stats.loading_bodies && !stats.budget_limited)
-                check(stats.deepest_level >= 21, "Ready imported near-ground views retain fine geometry");
+                check(stats.max_error_pixels <= settings.terrain_error_pixels*(1+1e-12),
+                      "Every ready imported patch meets the requested screen-space error");
             cpu.push_back(sample.cpu_ms()); gpu.push_back(sample.gpu_total_ms);
             min_lod = std::min(min_lod, stats.deepest_level);
             if (!stats.loading_bodies) min_ready_lod = std::min(min_ready_lod, stats.deepest_level);
             min_patches = std::min(min_patches, stats.patches); max_patches = std::max(max_patches, stats.patches);
             loading_frames += stats.loading_bodies > 0;
             frames.push_back({{"cpu_ms", sample.cpu_ms()}, {"gpu_ms", sample.gpu_total_ms}, {"patches", stats.patches},
-                {"lod", stats.deepest_level}, {"uploads", stats.cache_bakes}, {"loading", stats.loading_bodies},
+                {"lod", stats.deepest_level}, {"max_error_pixels", stats.max_error_pixels},
+                {"uploads", stats.cache_bakes}, {"loading", stats.loading_bodies},
                 {"pending", stats.stream.pending}, {"ready", stats.stream.ready}});
         }
         report["cases"][name] = {{"cpu_ms", terrain_timing_stats(cpu)}, {"gpu_ms", terrain_timing_stats(gpu)},
@@ -877,8 +1101,8 @@ void terrain_benchmark(RenderProbe& probe, const std::filesystem::path& output) 
             }
         }
         for (uint32_t mode = 0; mode < 4; ++mode) {
-            nlohmann::json row{{"scene", name}, {"mode", mode == 0 ? "sphere" : mode == 1 ? "fp64-reference" : mode == 2 ? "cached" : "cached-fp64"},
-                {"height_km", settings.terrain_height_km}, {"patches", patches[mode]}, {"bakes_in_measured_frames", bakes[mode]},
+            nlohmann::json row{{"scene", name}, {"mode", mode == 0 ? "smooth-quadtree" : mode == 1 ? "fp64-reference" : mode == 2 ? "cached" : "cached-fp64"},
+                {"height_km", mode == 0 ? 0.0f : settings.terrain_height_km}, {"patches", patches[mode]}, {"bakes_in_measured_frames", bakes[mode]},
                 {"fov_degrees", camera.fov_deg},
                 {"selection_rebuilds", rebuilds[mode]}, {"cpu_ms", terrain_timing_stats(cpu[mode])},
                 {"gpu_total_ms", terrain_timing_stats(gpu[mode])}, {"gpu_draw_ms", terrain_timing_stats(draw[mode])}};

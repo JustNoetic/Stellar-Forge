@@ -1,5 +1,7 @@
 # Mesh and point-source rendering
 
+The mesh/point transition described here applies to modeled stars and the existing spacecraft representation. Planets, moons, gas/ice giants and nonstellar black holes always use physical-size quadtree geometry, including subpixel sizes. Their albedo is mapped onto smooth ellipsoids unless elevation is enabled; they never emit planetary point sprites. See [terrain](terrain.md).
+
 All apparent sizes in the celestial renderer are **radii in framebuffer pixels**:
 
 `radius_px = radius_au / distance_au * focal_length_px`
@@ -36,15 +38,15 @@ Gaia's magnitude normalization is anchored to a solar absolute G magnitude of 4.
 
 ## Occlusion
 
-Celestial point sprites are additive and never write depth. Their visibility is computed along the source-center ray against physical foreground ellipsoids, excluding the source itself. A caster's opacity follows its mesh weight; fully unresolved bodies contribute zero. Resolved meshes still hide points. This avoids magnified subpixel silhouettes and unstable raster-depth intersections. Black holes retain their opaque physical silhouette.
+Celestial point sprites are additive and never write depth. Modeled stellar points evaluate finite-source transits against physical foreground bodies, excluding the source itself and bodies beyond it. Shared eclipse optics use analytic circle overlap and numerical projected-ellipse overlap, including fully unresolved casters. Small-caster dimming follows its area relative to the apparent stellar disc. This attenuates integrated stellar flux without drawing an enlarged subpixel silhouette. Oblate casters use their inclination-dependent projected ellipse. See [eclipse optics](eclipse_shadows.md#oblate-parent-eclipses).
 
-This is whole-source visibility, without partial eclipses across a point sprite. Gaia still uses raster depth against meshes; fully unresolved celestial bodies no longer write that depth. Surface-to-light eclipse shadows remain a separate physical calculation.
+Nonstellar point sources retain mesh-weighted center-ray visibility against foreground ellipsoids; unresolved casters contribute zero to that test. Black holes retain their opaque physical silhouette. Planetary quadtree geometry always writes physical raster depth. Local stellar transit attenuation is whole-source flux, without resolving a silhouette inside a point sprite. Gaia uses raster depth against meshes, including samples covered by subpixel quadtree surfaces. Surface-to-light eclipse shadows use the same finite-source overlap functions with independent receiver/star candidate lists.
 
 ## Verification
 
 Enable the optional GPU contracts with `cmake -S . -B build -DSTELLAR_BUILD_RENDER_TESTS=ON`, then build and run `ctest --test-dir build --output-on-failure`. They require Vulkan and a window system, create a hidden window, and inspect rendered HDR pixels for:
 
-- Stellar and reflected-light mesh/point transitions.
+- Stellar mesh/point transitions and resolved quadtree reflected-light scaling.
 - Inverse-square observer falloff above the visibility cutoff.
 - Subpixel stability and flux conservation when changing point size.
 - Unresolved, transitioning and resolved foreground occluders.
@@ -52,6 +54,6 @@ Enable the optional GPU contracts with `cmake -S . -B build -DSTELLAR_BUILD_REND
 - Compact pixel footprints at multiple subpixel offsets, changes in point diameter at 1080p, and a millionfold overexposure through the composite shader.
 - Mesh-sized sprites through the 5-to-3 px handoff and a three-pixel unresolved minimum, at 256p, 1080p and 2160p.
 
-Small mesh rasterization errors remain at a few pixels because the mesh pass has no multisample antialiasing. At the smaller five-pixel resolved diameter, the reflected-light sweep permits 26% sampling error (the centered quarter-phase mesh measures about 25% low); inverse-square flux and point normalization retain their strict checks. The contracts distinguish this existing mesh sampling error from a missing or self-occluded point contribution.
+Small mesh rasterization errors remain at a few pixels because the mesh pass has no multisample antialiasing. Planets now retain that physical sampling behavior instead of switching to an enlarged point. Their reflected-light sweep uses resolved radii of 12–30 pixels and checks area scaling separately from stellar point normalization. `smooth_surface_contracts` additionally verifies quadtree selection down to a radius of `1e-6` pixels and the absence of a minimum-size planetary sprite.
 
 References: [PBRT point lights](https://www.pbr-book.org/4ed/Light_Sources/Point_Lights), [Vulkan fragment depth operations](https://docs.vulkan.org/spec/latest/chapters/fragops.html), and the solar Gaia reference adopted in [A&A 670, A19 (2023)](https://www.aanda.org/articles/aa/pdf/2023/02/aa44250-22.pdf).

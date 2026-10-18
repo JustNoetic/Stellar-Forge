@@ -4,6 +4,212 @@
 
 namespace {
 
+ephemeris::LoadedSystem surface_ring_fixture(uint32_t hosts = 4) {
+    auto loaded = fixture();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{0, 5, 5}});
+    for (uint32_t h = 0; h < hosts; ++h) {
+        ephemeris::BodyDefinition host;
+        host.name = "Surface ring host " + std::to_string(h);
+        host.radius_rsun = 0.1;
+        host.pole_ecl = render_to_ecliptic(RenderPosition{{0, 1, 0}}).value;
+        ephemeris::RingLayerDefinition ring;
+        ring.inner = 1.4;
+        ring.outer = 2.4;
+        ring.opacity = 0.9f;
+        ring.gradient = {{0, 1}, {1, 1}};
+        host.rings.push_back(ring);
+        loaded.definition.name_to_idx[host.name] = static_cast<int>(loaded.definition.bodies.size());
+        loaded.definition.bodies.push_back(host);
+        ephemeris::BodyMotion motion;
+        if (h + 1 < hosts) motion.position = render_to_ecliptic(RenderPosition{{100.0 + 10.0 * h, 100, -100}});
+        loaded.motions.push_back(motion);
+    }
+    ephemeris::BodyDefinition moon;
+    moon.name = "Ring shadow moon";
+    moon.radius_rsun = 0.02;
+    moon.parent_idx = hosts;
+    moon.parent_id = loaded.definition.bodies[hosts].name;
+    loaded.definition.name_to_idx[moon.name] = static_cast<int>(loaded.definition.bodies.size());
+    loaded.definition.bodies.push_back(moon);
+    ephemeris::BodyMotion motion;
+    double radius = 0.1 * SOLAR_RADII_TO_AU;
+    motion.position = render_to_ecliptic(RenderPosition{{2 * radius, -radius, 0}});
+    loaded.motions.push_back(motion);
+    return loaded;
+}
+
+void moon_ring_penumbra_contracts(RenderProbe& probe) {
+    probe.resize({512, 512});
+    auto loaded = surface_ring_fixture(1);
+    double radius = loaded.definition.bodies[1].radius_au();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{5, 0.05, 1.8 * radius}});
+    loaded.definition.bodies.back().radius_rsun = 0.002;
+    loaded.motions.back().position = render_to_ecliptic(RenderPosition{{-6 * radius, -0.076 * radius, 1.8 * radius}});
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(loaded).accepted, "Grazing ring-to-moon penumbra fixture");
+    double moon_radius = loaded.definition.bodies.back().radius_au();
+    auto camera = camera_at(moon_radius * 6);
+    camera.origin_render = ecliptic_to_render(loaded.motions.back().position).value;
+    auto direction = glm::normalize(glm::dvec3(1, 0.01, 0));
+    camera.cam_pos_rel = direction * moon_radius * 6.0;
+    camera.yaw_actual_deg = std::atan2(-direction.z, -direction.x) * RAD_TO_DEG;
+    camera.pitch_actual_deg = std::asin(-direction.y) * RAD_TO_DEG;
+    rendering::RenderSettings settings;
+    settings.surface_textures_enabled = false;
+    settings.exposure = 50;
+    settings.ring_shadows_enabled = false;
+    probe.render(camera, simulation.snapshot(), settings);
+    std::vector<float> lit;
+    for (uint32_t y = 194; y < 318; ++y) lit.push_back(probe.red_at(256, y));
+    settings.ring_shadows_enabled = true;
+    for (bool single_box : {false, true}) {
+        settings.ring_shadow_single_box = single_box;
+        probe.render(camera, simulation.snapshot(), settings);
+        double maximum_step = 0, minimum_visibility = 1, previous = 1;
+        uint32_t partial = 0;
+        for (uint32_t y = 194; y < 318; ++y) {
+            check(lit[y - 194] > 0.01f, "Penumbra scan stays on the illuminated moon surface");
+            double visibility = probe.red_at(256, y) / lit[y - 194];
+            minimum_visibility = std::min(minimum_visibility, visibility);
+            if (y > 194) maximum_step = std::max(maximum_step, std::abs(visibility - previous));
+            partial += visibility > 0.1 && visibility < 0.9;
+            previous = visibility;
+        }
+        std::cout << "Moon ring penumbra " << (single_box ? "single" : "three") << " box: largest pixel step "
+                  << maximum_step << ", partial pixels " << partial << ".\n";
+        check(minimum_visibility < 0.7 && partial > 20, "Finite star produces a broad partial shadow on the moon");
+        check(maximum_step < 0.12, "Grazing ring penumbra has no clipped hard boundary on the moon");
+    }
+}
+
+void surface_ring_shadow_contracts(RenderProbe& probe) {
+    probe.resize({512, 512});
+    auto loaded = surface_ring_fixture(16);
+    ephemeris::Simulation simulation;
+    rendering::RenderSettings settings;
+    settings.ring_shadow_single_box = false;
+    settings.surface_textures_enabled = false;
+    settings.exposure = 50;
+    auto camera = camera_at(0.02 * SOLAR_RADII_TO_AU * 6.0);
+    camera.origin_render = ecliptic_to_render(loaded.motions.back().position).value;
+    auto compare = [&]() {
+        check(simulation.replace_system(loaded).accepted, "Surface ring shadow fixture");
+        settings.ring_shadow_reference_all_hosts = true;
+        probe.render(camera, simulation.snapshot(), settings);
+        auto* pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+        std::vector<uint16_t> reference(pixels, pixels + size_t(probe.extent.width) * probe.extent.height * 4);
+        settings.ring_shadow_reference_all_hosts = false;
+        double flux = probe.render(camera, simulation.snapshot(), settings);
+        check(std::equal(reference.begin(), reference.end(), pixels), "Filtered ring shadows match all-host HDR reference exactly");
+        return flux;
+    };
+    double shadowed = compare();
+    auto masks = probe.renderer.surface_ring_candidate_masks();
+    check(masks.back() == (1u << 15u), "Moon retains the sixteenth ring host and rejects unrelated ring systems");
+    settings.ring_shadows_enabled = false;
+    double unshadowed = probe.render(camera, simulation.snapshot(), settings);
+    check(shadowed < unshadowed * 0.3, "Ring system casts a substantial shadow on a moon");
+    check(probe.renderer.surface_ring_candidate_masks().empty(), "Disabled ring shadows build no masks");
+    settings.ring_shadows_enabled = true;
+    settings.ring_shadow_single_box = true;
+    check(compare() < unshadowed * 0.3, "Single-box blur preserves ring-to-moon shadow");
+    settings.ring_shadow_single_box = false;
+    auto second_star = loaded.definition.bodies[0];
+    second_star.name = "Unblocked star";
+    loaded.definition.name_to_idx[second_star.name] = static_cast<int>(loaded.definition.bodies.size());
+    loaded.definition.bodies.push_back(second_star);
+    ephemeris::BodyMotion star_motion;
+    star_motion.position = render_to_ecliptic(RenderPosition{{5, 2, 0}});
+    loaded.motions.push_back(star_motion);
+    double two_star_flux = compare();
+    masks = probe.renderer.surface_ring_candidate_masks();
+    check(masks[17 * 2] == (1u << 15u) && masks[17 * 2 + 1] == 0u,
+          "Ring-to-moon candidates are independent for each star");
+    check(two_star_flux > shadowed * 2.0, "Second star illuminates a ring-shadowed moon");
+    loaded.definition.bodies.pop_back();
+    loaded.motions.pop_back();
+    loaded.definition.bodies[0].radius_rsun = 100;
+    loaded.motions.back().position = render_to_ecliptic(RenderPosition{{2.2 * 0.1 * SOLAR_RADII_TO_AU, -0.1 * SOLAR_RADII_TO_AU, 0}});
+    camera.origin_render = ecliptic_to_render(loaded.motions.back().position).value;
+    settings.terrain_enabled = true;
+    settings.terrain_height_km = 20;
+    compare();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{5, 0.0001, 0}});
+    compare();
+    moon_ring_penumbra_contracts(probe);
+    std::cout << "Surface ring shadows passed: HDR reference equality, ring-to-moon, sparse host 16, two stars, relief and grazing light.\n";
+    probe.resize(EXTENT);
+}
+
+void surface_ring_benchmark(RenderProbe& probe, const std::filesystem::path& output) {
+    check(!std::filesystem::exists(output), "Preserve surface ring benchmark results");
+    std::filesystem::create_directories(output);
+    probe.resize({1920, 1080});
+    nlohmann::json report{{"gpu", probe.vk.device_properties().deviceName}, {"extent", {1920, 1080}},
+        {"method", "Serialized offscreen draws; 40 warmup + 240 measured frames per mode, three rotating-order repetitions; CPU record includes candidate construction/upload and draw recording; GPU total includes prepare and rings, not application FPS."},
+        {"scenes", nlohmann::json::array()}};
+    for (auto scene : {"moon-shadow", "irrelevant", "penumbra"}) {
+        auto loaded = surface_ring_fixture();
+        double radius = 0.1 * SOLAR_RADII_TO_AU;
+        if (std::string_view(scene) == "irrelevant")
+            loaded.motions.back().position = render_to_ecliptic(RenderPosition{{20 * radius, -radius, 0}});
+        if (std::string_view(scene) == "penumbra") {
+            loaded.definition.bodies[0].radius_rsun = 100;
+            loaded.motions.back().position = render_to_ecliptic(RenderPosition{{2.2 * radius, -radius, 0}});
+        }
+        ephemeris::Simulation simulation;
+        check(simulation.replace_system(loaded).accepted, "Surface ring benchmark fixture");
+        auto camera = camera_at(loaded.definition.bodies.back().radius_au() * 1.1);
+        camera.origin_render = ecliptic_to_render(loaded.motions.back().position).value;
+        rendering::RenderSettings settings;
+        settings.surface_textures_enabled = false;
+        settings.exposure = 50;
+        std::array<std::vector<double>, 3> cpus, gpus;
+        for (uint32_t repeat = 0; repeat < 3; ++repeat)
+            for (uint32_t step = 0; step < 3; ++step) {
+                uint32_t mode = (step + repeat) % 3;
+                settings.ring_shadow_reference_all_hosts = mode == 0;
+                settings.ring_shadow_single_box = mode == 2;
+                for (uint32_t frame = 0; frame < 280; ++frame) {
+                    auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
+                    if (frame < 40) continue;
+                    cpus[mode].push_back(sample.cpu_record_ms);
+                    gpus[mode].push_back(sample.gpu_total_ms);
+                }
+            }
+        nlohmann::json row{{"name", scene}, {"modes", nlohmann::json::array()}};
+        std::vector<uint16_t> reference;
+        for (uint32_t mode = 0; mode < 3; ++mode) {
+            const char* label = mode == 0 ? "all_hosts_three_box" : mode == 1 ? "filtered_three_box" : "filtered_single_box";
+            settings.ring_shadow_reference_all_hosts = mode == 0;
+            settings.ring_shadow_single_box = mode == 2;
+            probe.render(camera, simulation.snapshot(), settings);
+            auto* pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+            size_t components = size_t(probe.extent.width) * probe.extent.height * 4;
+            if (mode == 0) reference.assign(pixels, pixels + components);
+            size_t changed = 0;
+            double squared_error = 0, squared_reference = 0;
+            for (size_t c = 0; c < components; ++c) {
+                changed += reference[c] != pixels[c];
+                double a = glm::unpackHalf2x16(reference[c]).x, b = glm::unpackHalf2x16(pixels[c]).x;
+                if (c % 4 != 3) {
+                    squared_error += (a - b) * (a - b);
+                    squared_reference += a * a;
+                }
+            }
+            if (mode == 1) check(changed == 0, "Benchmark filtered HDR equals all-host reference");
+            row["modes"].push_back({{"name", label}, {"cpu_record_ms", terrain_timing_stats(cpus[mode])},
+                {"gpu_total_ms", terrain_timing_stats(gpus[mode])}, {"changed_components", changed},
+                {"relative_rms", std::sqrt(squared_error / std::max(squared_reference, 1e-20))}});
+            probe.save_preview(output / (std::string(scene) + "-" + label + ".ppm"), true);
+            std::cout << scene << '/' << label << ": CPU " << terrain_timing_stats(cpus[mode])["median"]
+                      << " ms, GPU " << terrain_timing_stats(gpus[mode])["median"] << " ms, changed " << changed << " components.\n";
+        }
+        report["scenes"].push_back(std::move(row));
+        check(paths::write_json(output / "report.json", report), "Write surface ring benchmark report");
+    }
+}
+
 void ring_filtering_contracts(RenderProbe& probe) {
     probe.resize(EXTENT);
     auto loaded = fixture();

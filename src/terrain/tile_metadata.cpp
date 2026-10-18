@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <numbers>
+#include <limits>
 
 namespace sf::terrain {
 namespace {
@@ -68,8 +69,15 @@ TileBounds surface_bounds(TileId tile, double polar_ratio, double height_amplitu
     double normal_variation = std::min(2.0, radius / polar_ratio);
     double maximum_height = std::max(std::abs(low), std::abs(high));
     double local_radius = radius + (high - low) * .5 + maximum_height * normal_variation;
-    if (local_radius >= radius + maximum_height) return {direction * scale, radius + maximum_height};
-    return {direction * scale + normal * middle, local_radius};
+    TileBounds result = local_radius >= radius + maximum_height
+        ? TileBounds{direction * scale, radius + maximum_height}
+        : TileBounds{direction * scale + normal * middle, local_radius};
+    result.surface_center = direction * scale * (1.0-radius*radius*.25) + normal * middle;
+    result.direction = direction;
+    result.angular_radius = radius;
+    result.polar_ratio = polar_ratio;
+    result.padding = (high-low)*.5 + maximum_height*normal_variation + 32*std::numeric_limits<double>::epsilon();
+    return result;
 }
 
 double surface_error_coefficient(double polar_ratio, double height_amplitude, const TileMetadata& metadata) noexcept {

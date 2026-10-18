@@ -109,7 +109,7 @@ void main() {
         if (dist_star <= 1e-5) continue;
         vec3 L = to_star / dist_star;
 
-        float shadow = evaluate_eclipse_shadow(hit_pos, star_pos, star_r, u_scene.num_bodies + f_host_idx, s, true);
+        float shadow = evaluate_eclipse_shadow(hit_pos, star_pos, star_r, u_scene.num_bodies + f_host_idx, s);
         if (shadow <= 1e-4) continue;
 
         float star_ang_rad = clamp(star_r / dist_star, 0.0, 0.999);

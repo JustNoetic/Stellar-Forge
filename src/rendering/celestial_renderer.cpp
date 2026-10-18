@@ -12,6 +12,7 @@
 namespace sf::rendering {
 
 static_assert(sizeof(BodyInstanceGPU) == 96);
+static_assert(terrain::MAX_PATCHES >= MAX_CELESTIAL_BODIES*6);
 
 namespace {
 
@@ -158,6 +159,7 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
     ring_eclipse_candidate_counts_.clear();
+    surface_ring_candidate_masks_.clear();
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
     if (count == 0) {
         return;
@@ -219,6 +221,9 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     }
 
     uint32_t ring_count = settings.show_rings ? rings_.host_count() : 0u;
+    static_assert(MAX_RING_HOSTS < 32);
+    surface_ring_candidate_masks_.assign(ubo.num_ring_hosts > 0u && !settings.ring_shadow_reference_all_hosts
+                                       ? count * ubo.num_stars : 0u, 0u);
     ring_eclipse_candidate_counts_.assign(ring_count * ubo.num_stars, 0u);
     eclipse_words_.assign((count + ring_count) * ubo.num_stars * 2, 0u);
     for (uint32_t i = 0; i < count + ring_count; ++i) {
@@ -228,10 +233,22 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             if (receiver.color_is_star.w > 0.5f || receiver.spin_flags.z > 0.5f) continue;
             float distance = std::max(glm::length(glm::vec3(receiver.pos_radius)), 1e-12f);
             float radius_px = receiver.pos_radius.w / distance * fb_h * fov_factor;
-            if (radius_px <= 1.49f) continue;
+            if (radius_px <= 1.49f && receiver.surface_flags.x == 0u) continue;
             receiver_bounds = receiver.pos_radius;
             if (receiver.surface_flags.x != 0u)
                 receiver_bounds.w += terrain_.relief_extent_au(i);
+            for (uint32_t s = 0; !surface_ring_candidate_masks_.empty() && s < ubo.num_stars; ++s) {
+                uint32_t mask = 0u;
+                for (uint32_t h = 0; h < ubo.num_ring_hosts; ++h) {
+                    const auto& host = rings_.hosts()[h];
+                    if (ring_could_shadow_surface(
+                            receiver_bounds, ubo.stars_pos_radius[s],
+                            {glm::vec3(host.center_min_r), host.pole_max_r.w},
+                            {glm::vec3(host.pole_max_r), host.center_min_r.w}, fb_h * fov_factor))
+                        mask |= 1u << h;
+                }
+                surface_ring_candidate_masks_[i * ubo.num_stars + s] = mask;
+            }
         } else {
             const auto& host = rings_.hosts()[i - count];
             receiver_bounds = glm::vec4(glm::vec3(host.center_min_r), host.pole_max_r.w);
@@ -251,6 +268,11 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
                 ring_eclipse_candidate_counts_[(i - count) * ubo.num_stars + s] = eclipse_words_[range + 1];
         }
     }
+    ubo.ring_shadow_params = {static_cast<uint32_t>(eclipse_words_.size()),
+                              settings.ring_shadow_reference_all_hosts ? 1u : 0u,
+                              settings.ring_shadow_single_box ? 1u : 0u, 0u};
+    ubo.eclipse_params.x = settings.eclipse_reference_smoothstep ? 1u : 0u;
+    eclipse_words_.insert(eclipse_words_.end(), surface_ring_candidate_masks_.begin(), surface_ring_candidate_masks_.end());
     auto& eclipse_buffer = eclipse_ssbos_[f_idx];
     VkDeviceSize eclipse_bytes = eclipse_words_.size() * sizeof(uint32_t);
     if (eclipse_bytes > eclipse_buffer.size) {
@@ -280,13 +302,25 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &sphere_vbo_.handle, &offset);
     vkCmdBindIndexBuffer(cmd, sphere_ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, sphere_index_count_, count, 0, 0, 0);
+    for (uint32_t first = 0; first < count;) {
+        if (terrain_.covers(first)) { ++first; continue; }
+        uint32_t end = first+1;
+        while (end < count && !terrain_.covers(end)) ++end;
+        vkCmdDrawIndexed(cmd, sphere_index_count_, end-first, 0, 0, first);
+        first = end;
+    }
 
     terrain_.render(cmd, ctx, writes);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, point_pipeline_.handle);
     ctx.push_descriptors(cmd, point_pipeline_, writes);
-    vkCmdDraw(cmd, 6, count, 0, 0);
+    for (uint32_t first = 0; first < count;) {
+        if (terrain_.covers(first)) { ++first; continue; }
+        uint32_t end = first+1;
+        while (end < count && !terrain_.covers(end)) ++end;
+        vkCmdDraw(cmd, 6, end-first, 0, first);
+        first = end;
+    }
 
     rhi::PushDescriptorWrite ring_base_writes[] = {
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),

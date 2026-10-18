@@ -67,10 +67,14 @@ void main() {
 
         float ndotl = max(dot(N, L), 0.0);
         if (ndotl > 0.0) {
-            float shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s, false);
+            float shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s);
             if (shadow > 1e-4 && u_scene.num_ring_hosts > 0u) {
                 float sun_ang_rad = star_r / d_au;
-                shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad);
+                uint candidates = u_scene.ring_shadow_params.y != 0u
+                    ? (1u << u_scene.num_ring_hosts) - 1u
+                    : eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars + s];
+                if (candidates != 0u)
+                    shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad, candidates);
             }
             float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
             float brdf = surface_reflectance(N, L, V);

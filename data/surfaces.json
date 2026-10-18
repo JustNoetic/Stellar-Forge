@@ -2,49 +2,49 @@
   "version": 1,
   "bodies": [
     {
+      "body": "Mimas",
+      "albedo": "data/tiles/mimas/3b7776586945/albedo"
+    },
+    {
       "body": "Earth",
-      "albedo": "data/tiles/earth/f401143228df/albedo",
+      "albedo": "data/tiles/earth/1fdcd995226a/albedo",
       "height": "data/tiles/earth/b72a6fa0e156/height"
     },
     {
       "body": "Callisto",
-      "albedo": "data/tiles/callisto/fbcaed0fe87e/albedo"
+      "albedo": "data/tiles/callisto/92d36552ebf0/albedo"
     },
     {
       "body": "Enceladus",
-      "albedo": "data/tiles/enceladus/cb18da8370ce/albedo"
+      "albedo": "data/tiles/enceladus/879073fc3f81/albedo"
     },
     {
       "body": "Europa",
-      "albedo": "data/tiles/europa/37d608ba5eff/albedo"
+      "albedo": "data/tiles/europa/8f3697a08076/albedo"
     },
     {
       "body": "Ganymede",
-      "albedo": "data/tiles/ganymede/7a5b0d1a9db0/albedo"
+      "albedo": "data/tiles/ganymede/e0c410b23dfb/albedo"
     },
     {
       "body": "Io",
-      "albedo": "data/tiles/io/e87c8c3cadc6/albedo"
+      "albedo": "data/tiles/io/e7acc9a5af2d/albedo"
     },
     {
       "body": "Jupiter",
-      "albedo": "data/tiles/jupiter/a015b218cb7d/albedo"
+      "albedo": "data/tiles/jupiter/b256ab72096c/albedo"
     },
     {
       "body": "Mars",
-      "albedo": "data/tiles/mars/8d337a1b66a8/albedo"
+      "albedo": "data/tiles/mars/84903f210ede/albedo"
     },
     {
       "body": "Mercury",
-      "albedo": "data/tiles/mercury/d5e16c0fe84d/albedo"
-    },
-    {
-      "body": "Mimas",
-      "albedo": "data/tiles/mimas/c306af501c4a/albedo"
+      "albedo": "data/tiles/mercury/0c20bda4c860/albedo"
     },
     {
       "body": "Moon",
-      "albedo": "data/tiles/moon/19c7ed7cd56f/albedo"
+      "albedo": "data/tiles/moon/b374244ca088/albedo"
     },
     {
       "body": "Saturn",
@@ -52,11 +52,11 @@
     },
     {
       "body": "Titan",
-      "albedo": "data/tiles/titan/fb120cec319b/albedo"
+      "albedo": "data/tiles/titan/ef32d60bfe2d/albedo"
     },
     {
       "body": "Venus",
-      "albedo": "data/tiles/venus/3c7e6f531ce3/albedo"
+      "albedo": "data/tiles/venus/9515ec8d46c8/albedo"
     }
   ]
 }

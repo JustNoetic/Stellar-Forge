@@ -12,11 +12,14 @@
 namespace sf::terrain {
 
 struct TerrainStats {
+    double max_error_pixels = 0.0;
     uint32_t patches = 0;
+    uint32_t drawn_bodies = 0;
     uint32_t deepest_level = 0;
     bool budget_limited = false;
     uint32_t selection_rebuilds = 0;
     uint32_t selection_nodes = 0;
+    uint32_t patch_updates = 0;
     uint32_t metadata_builds = 0;
     uint32_t metadata_entries = 0;
     uint32_t cache_hits = 0;
@@ -25,6 +28,7 @@ struct TerrainStats {
     uint32_t cached_patches = 0;
     uint32_t reference_patches = 0;
     uint32_t imported_patches = 0;
+    uint32_t smooth_patches = 0;
     uint32_t loading_bodies = 0;
     StreamStats stream;
 };
@@ -69,23 +73,37 @@ public:
     float relief_extent_au(uint32_t body) const noexcept;
 
 private:
-    struct SelectionEntry {
-        uint64_t generation = 0;
-        uint64_t geometry_revision = 0;
-        uint64_t bounds_revision = 0;
-        uint64_t residency_revision = 0;
-        bool desired_valid = false;
-        std::vector<TileId> prefetch;
-        std::unordered_map<uint64_t, SurfaceTile> descriptions;
-        SelectionView view;
-        Selection selection;
-    };
     struct DrawPatch {
         PatchGPU reference;
         CachedPatchGPU cached;
         GeometryKey key;
         GeometryBakeGPU bake;
         uint32_t mode = 0;
+    };
+    struct PatchPlacement {
+        glm::dvec3 anchor;
+        GeometryKey key;
+        GeometryBakeGPU bake;
+    };
+    struct SelectionEntry {
+        uint64_t generation = 0;
+        uint64_t geometry_revision = 0;
+        uint64_t bounds_revision = 0;
+        uint64_t residency_revision = 0;
+        SourceDomain source;
+        bool desired_valid = false;
+        std::vector<TileId> prefetch;
+        std::unordered_map<uint64_t, SurfaceTile> descriptions;
+        SelectionView view;
+        Selection selection;
+        Selection desired;
+        std::vector<PatchPlacement> placements;
+        std::vector<TileId> ancestors;
+        std::vector<DrawPatch> draws;
+        glm::dvec3 draw_center{0};
+        glm::dmat3 draw_rotation{1};
+        glm::dmat3 draw_view{1};
+        uint32_t draw_flags = UINT32_MAX;
     };
     rhi::Pipeline pipeline_{};
     rhi::Pipeline precise_pipeline_{};
@@ -95,7 +113,7 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> patches_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> cached_patches_{};
     std::vector<DrawPatch> prepared_;
-    std::vector<uint32_t> bodies_;
+    std::vector<uint8_t> covered_;
     std::vector<std::pair<uint32_t, float>> relief_extents_;
     std::string source_body_;
     std::unique_ptr<HeightStream> stream_;

@@ -109,50 +109,52 @@ float TerrainRenderer::relief_extent_au(uint32_t body) const noexcept {
 }
 
 bool TerrainRenderer::covers(uint32_t body) const noexcept {
-    return std::find(bodies_.begin(), bodies_.end(), body) != bodies_.end();
+    return body < covered_.size() && covered_[body] != 0;
 }
 
 void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const ephemeris::SystemSnapshot& system,
                               const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count) {
     prepared_.clear();
-    bodies_.clear();
+    covered_.assign(body_count, 0);
     relief_extents_.clear();
     stats_ = {};
     if (selection_generation_ != system.generation()) {
         selections_.clear();
         selection_generation_ = system.generation();
     }
-    if (!settings.terrain_enabled && (!settings.terrain_imported_enabled || !stream_)) return;
     std::vector<GeometryKey> retained_keys;
     std::vector<std::shared_ptr<const HeightGeometry>> retained_heights;
     double tan_y = std::tan(camera.fov_deg * DEG_TO_RAD * 0.5);
     double focal = std::max(1u, extent.height) / (2.0 * tan_y);
     auto eye = camera.eye_pos_render();
     auto world_to_view = camera.view_rotation_double();
+    SelectionView body_view;
+    body_view.eye = {0, 0, 0};
+    body_view.view_from_local = world_to_view;
+    body_view.tan_half_fov_y = tan_y;
+    body_view.tan_half_fov_x = tan_y*std::max(1u, extent.width)/std::max(1u, extent.height);
     std::vector<std::pair<double, uint32_t>> candidates;
     for (uint32_t i = 0; i < body_count; ++i) {
         const auto& body = system.body(i);
-        if (body.definition.is_star || body.definition.is_black_hole || body.definition.is_spacecraft) continue;
-        if (body.definition.type == "Gas Giant" || body.definition.type == "Ice Giant") continue;
+        if (body.definition.is_star || body.definition.is_spacecraft) continue;
         double radius = body.definition.radius_au();
-        const HeightSource* source = settings.terrain_imported_enabled && stream_ && body.definition.name == source_body_ ? &stream_->source() : nullptr;
-        if (!source && !settings.terrain_enabled) continue;
-        if (source && !source->compatible(radius * AU_TO_KM * 1000.0,
-                                          std::clamp(1.0-body.definition.oblateness, .05, 1.0))) continue;
-        double distance = glm::length(camera_relative(body.render.position, eye));
-        double projected = radius * focal / std::max(distance, 1e-15);
-        if (radius > 0.0 && projected >= 8.0) candidates.emplace_back(-projected, i);
+        if (radius > 0.0) {
+            covered_[i] = 1;
+            auto center = camera_relative(body.render.position, eye);
+            if (!visible({center, radius*(1+.01*(1+RELIEF_ROUNDING))}, body_view)) continue;
+            double projected = radius*focal/std::max(glm::length(center), 1e-15);
+            candidates.emplace_back(-projected, i);
+        }
     }
     std::sort(candidates.begin(), candidates.end());
-    for (const auto& [priority, i] : candidates) {
-        uint32_t remaining = MAX_PATCHES - uint32_t(prepared_.size());
-        if (remaining < 6) {
-            stats_.budget_limited = true;
-            continue;
-        }
+    for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+        uint32_t i = candidates[candidate_index].second;
+        uint32_t reserved = uint32_t(candidates.size()-candidate_index-1)*6;
+        uint32_t remaining = MAX_PATCHES-uint32_t(prepared_.size())-reserved;
         const auto& body = system.body(i);
         double radius = body.definition.radius_au();
         const HeightSource* source = settings.terrain_imported_enabled && stream_ && body.definition.name == source_body_ ? &stream_->source() : nullptr;
+        if (source && !source->compatible(radius*AU_TO_KM*1000.0, std::clamp(1.0-body.definition.oblateness, .05, 1.0))) source = nullptr;
         auto center = camera_relative(body.render.position, eye);
         auto rotation = body_rotation(body.render.pole, body.render.spin_angle_rad);
         SelectionView view;
@@ -163,19 +165,22 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         view.focal_pixels = focal;
         view.target_error_pixels = settings.terrain_error_pixels;
         view.polar_ratio = std::clamp(1.0 - body.definition.oblateness, 0.05, 1.0);
-        view.height_amplitude = std::min(double(settings.terrain_height_km) / (radius * AU_TO_KM), 0.01);
+        bool synthetic = settings.terrain_enabled && !body.definition.is_black_hole &&
+            body.definition.type != "Gas Giant" && body.definition.type != "Ice Giant";
+        view.height_amplitude = synthetic ? std::min(double(settings.terrain_height_km)/(radius*AU_TO_KM), 0.01) : 0.0;
         view.max_patches = std::min(remaining, settings.terrain_patch_limit);
         auto imported_key = [&](TileId tile) {
             return GeometryKey{system.generation(), body.revisions.geometry, tile.key(), i, view.polar_ratio, 0.0, source->domain()};
         };
         auto& entry = selections_[i];
+        bool selection_changed = false;
         if (source) {
             view.height_amplitude = std::max(std::abs(source->info().minimum_m), std::abs(source->info().maximum_m)) / source->info().equatorial_radius_m;
             uint64_t bounds_revision = source->bounds_revision();
             bool changed = entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry ||
-                entry.bounds_revision != bounds_revision || !(entry.view == view);
+                entry.bounds_revision != bounds_revision || entry.source != source->domain() || !(entry.view == view);
             if (entry.bounds_revision != bounds_revision || entry.generation != system.generation() ||
-                entry.geometry_revision != body.revisions.geometry) entry.descriptions.clear();
+                entry.geometry_revision != body.revisions.geometry || entry.source != source->domain()) entry.descriptions.clear();
             SelectionSource selection_source(*source, entry.descriptions);
             if (changed) { entry.desired_valid = false; entry.prefetch.clear(); }
             std::unordered_set<uint64_t> wanted;
@@ -187,24 +192,30 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 if (cache_.find(imported_key({face})) < 0) { request({face}); roots_ready = false; }
             }
             if (roots_ready && !entry.desired_valid) {
-                auto desired = select(view, selection_source, {{}, [&](TileId tile) { entry.prefetch.push_back(tile); }});
+                entry.desired = select(view, selection_source, {{}, [&](TileId tile) { entry.prefetch.push_back(tile); }});
                 std::sort(entry.prefetch.begin(), entry.prefetch.end(), [](TileId a, TileId b) { return a.key() < b.key(); });
                 entry.prefetch.erase(std::unique(entry.prefetch.begin(), entry.prefetch.end()), entry.prefetch.end());
                 entry.desired_valid = true;
-                stats_.selection_nodes += desired.visited;
+                stats_.selection_nodes += entry.desired.visited;
             }
-            if (roots_ready) for (auto tile : entry.prefetch) request(tile);
+            bool desired_ready = roots_ready && entry.desired_valid;
+            bool settled = !changed && entry.residency_revision == cache_.revision() && !entry.selection.loading_limited;
+            if (roots_ready && !settled) for (auto tile : entry.prefetch) {
+                if (cache_.find(imported_key(tile)) < 0) { desired_ready = false; request(tile); }
+            }
             if (changed || entry.residency_revision != cache_.revision()) {
-                entry.selection = roots_ready ? select(view, selection_source, {
+                entry.selection = desired_ready ? entry.desired : roots_ready ? select(view, selection_source, {
                     [&](TileId tile) { return cache_.find(imported_key(tile)) >= 0; }, request}) : Selection{};
                 if (!roots_ready) entry.selection.loading_limited = true;
-                stats_.selection_nodes += entry.selection.visited;
+                if (!desired_ready) stats_.selection_nodes += entry.selection.visited;
                 ++stats_.selection_rebuilds;
+                selection_changed = true;
             }
             entry.generation = system.generation();
             entry.geometry_revision = body.revisions.geometry;
             entry.bounds_revision = bounds_revision;
             entry.residency_revision = cache_.revision();
+            entry.source = source->domain();
             entry.view = view;
             auto retain = [&](TileId tile) {
                 auto key = imported_key(tile);
@@ -214,15 +225,19 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 }
             };
             for (uint32_t face = 0; face < 6; ++face) retain({face});
-            std::unordered_set<uint64_t> ancestors;
-            for (const auto& patch : entry.selection.patches) {
-                auto tile = patch.tile;
-                while (tile.level) {
-                    tile = tile.parent();
-                    if (!ancestors.insert(tile.key()).second) break;
-                    retain(tile);
+            if (selection_changed) {
+                std::unordered_set<uint64_t> ancestors;
+                entry.ancestors.clear();
+                for (const auto& patch : entry.selection.patches) {
+                    auto tile = patch.tile;
+                    while (tile.level) {
+                        tile = tile.parent();
+                        if (!ancestors.insert(tile.key()).second) break;
+                        entry.ancestors.push_back(tile);
+                    }
                 }
             }
+            for (auto tile : entry.ancestors) retain(tile);
             for (auto& [tile, geometry] : stream_->completed()) {
                 if (wanted.contains(tile.key())) {
                     retained_keys.push_back(imported_key(tile));
@@ -230,7 +245,8 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 } else stream_->consumed(tile);
             }
             if (entry.selection.loading_limited) ++stats_.loading_bodies;
-        } else if (entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry || !(entry.view == view)) {
+        } else if (entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry ||
+                   entry.source != SourceDomain{} || !(entry.view == view)) {
             auto builds = metadata_.builds();
             entry.selection = select(view, &metadata_);
             stats_.metadata_builds += uint32_t(metadata_.builds() - builds);
@@ -238,37 +254,81 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             entry.view = view;
             entry.generation = system.generation();
             entry.geometry_revision = body.revisions.geometry;
+            entry.source = {};
             ++stats_.selection_rebuilds;
+            selection_changed = true;
         }
-        const auto& selection = entry.selection;
+        Selection bootstrap;
+        if (source && entry.selection.patches.empty() && entry.selection.loading_limited) {
+            view.height_amplitude = 0.0;
+            bootstrap = select(view);
+            source = nullptr;
+            selection_changed = true;
+        }
+        const auto& selection = bootstrap.patches.empty() ? entry.selection : bootstrap;
         if (selection.patches.empty()) continue;
-        bodies_.push_back(i);
+        ++stats_.drawn_bodies;
+        if (selection_changed) {
+            entry.placements.clear();
+            entry.placements.reserve(selection.patches.size());
+            for (const auto& patch : selection.patches) {
+                double width = std::ldexp(2.0, -int(patch.tile.level));
+                PatchPlacement placement;
+                placement.anchor = ellipsoid_point(patch.tile.face, -1.0+(patch.tile.x+.5)*width,
+                    -1.0+(patch.tile.y+.5)*width, view.polar_ratio);
+                placement.key = source ? imported_key(patch.tile)
+                    : GeometryKey{system.generation(), body.revisions.geometry, patch.tile.key(), i, view.polar_ratio, view.height_amplitude};
+                placement.bake.anchor_polar_ratio = {glm::vec3(placement.anchor), float(view.polar_ratio)};
+                placement.bake.shape.x = float(view.height_amplitude);
+                placement.bake.address = {patch.tile.face, patch.tile.level, patch.tile.x, patch.tile.y};
+                entry.placements.push_back(placement);
+            }
+        }
         relief_extents_.emplace_back(i, source ? float(std::max(0.0, source->info().maximum_m) / (AU_TO_KM * 1000.0))
                                              : float(view.height_amplitude * radius));
         stats_.budget_limited |= selection.budget_limited;
+        stats_.max_error_pixels = std::max(stats_.max_error_pixels, selection.max_error_pixels);
         stats_.deepest_level = std::max(stats_.deepest_level, selection.deepest_level);
+        if (source) stats_.imported_patches += uint32_t(selection.patches.size());
+        else if (view.height_amplitude == 0.0) stats_.smooth_patches += uint32_t(selection.patches.size());
+        uint32_t draw_flags = uint32_t(settings.terrain_debug_tiles) | (uint32_t(settings.terrain_cached_fp64) << 1)
+            | (uint32_t(settings.terrain_reference_fp64) << 2);
+        if (!selection_changed && entry.draw_flags == draw_flags && entry.draw_center == center &&
+            entry.draw_rotation == rotation && entry.draw_view == world_to_view) {
+            prepared_.insert(prepared_.end(), entry.draws.begin(), entry.draws.end());
+            continue;
+        }
+        entry.draws.clear();
+        entry.draws.reserve(selection.patches.size());
+        stats_.patch_updates += uint32_t(selection.patches.size());
+        entry.draw_flags = draw_flags;
+        entry.draw_center = center;
+        entry.draw_rotation = rotation;
+        entry.draw_view = world_to_view;
         auto eye_rotation = world_to_view * rotation;
         std::array<double, MAX_LEVEL+1> morph_errors{};
         if (source) for (uint32_t level = 0; level <= MAX_LEVEL; ++level)
             morph_errors[level] = source->morph_error(level)*focal/view.target_error_pixels;
-        for (const auto& patch : selection.patches) {
-            double width = std::ldexp(2.0, -int(patch.tile.level));
-            auto anchor = ellipsoid_point(patch.tile.face, -1.0 + (patch.tile.x + 0.5) * width,
-                                          -1.0 + (patch.tile.y + 0.5) * width, view.polar_ratio);
+        bool distant = glm::length(center) > 4.0*radius;
+        double morph_error = error_coefficient(view.polar_ratio, view.height_amplitude)
+            * focal/(GRID_CELLS*GRID_CELLS*view.target_error_pixels);
+        for (size_t patch_index = 0; patch_index < selection.patches.size(); ++patch_index) {
+            const auto& patch = selection.patches[patch_index];
+            const auto& placement = entry.placements[patch_index];
+            auto anchor = placement.anchor;
             DrawPatch draw;
             auto& gpu = draw.reference;
             gpu.anchor_radius = {center + rotation * (anchor * radius), radius};
             gpu.anchor_polar_ratio = {anchor, view.polar_ratio};
             gpu.rotation_height = {rotation[0], view.height_amplitude};
-            gpu.rotation_error = {rotation[1], error_coefficient(view.polar_ratio, view.height_amplitude)
-                * focal / (GRID_CELLS * GRID_CELLS * view.target_error_pixels)};
+            gpu.rotation_error = {rotation[1], morph_error};
             gpu.rotation_reserved = {rotation[2], 0.0};
             gpu.eye = {view.eye, 0.0};
             gpu.address = {patch.tile.face, patch.tile.level, patch.tile.x, patch.tile.y};
             gpu.metadata = {i, patch.coarse_edges, settings.terrain_debug_tiles ? 1u : 0u, 0u};
-            auto eye_anchor = world_to_view * (center + rotation * (anchor * radius));
+            auto eye_anchor = world_to_view * glm::dvec3(gpu.anchor_radius);
             auto high = glm::vec3(eye_anchor);
-            gpu.eye_anchor = {eye_anchor, glm::length(center) > 4.0 * radius ? 1.0 : 0.0};
+            gpu.eye_anchor = {eye_anchor, distant ? 1.0 : 0.0};
             gpu.eye_rotation0 = {eye_rotation[0], 0.0};
             gpu.eye_rotation1 = {eye_rotation[1], 0.0};
             gpu.eye_rotation2 = {eye_rotation[2], 0.0};
@@ -281,21 +341,18 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 draw.cached.rotation0.w = float(morph_errors[patch.tile.level ? patch.tile.level-1 : 0]);
                 draw.cached.rotation1.w = float(morph_errors[patch.tile.level > 1 ? patch.tile.level-2 : 0]);
                 draw.cached.rotation2.w = 1.0f;
-                ++stats_.imported_patches;
             }
             draw.cached.eye = {glm::vec3(view.eye - anchor), float(gpu.rotation_error.w)};
             draw.cached.address = gpu.address;
             draw.cached.metadata = {i, 0u, patch.coarse_edges, settings.terrain_debug_tiles ? 1u : 0u};
-            draw.key = {system.generation(), body.revisions.geometry, patch.tile.key(), i, view.polar_ratio, view.height_amplitude};
-            if (source) draw.key = imported_key(patch.tile);
-            draw.bake.anchor_polar_ratio = {anchor, view.polar_ratio};
-            draw.bake.shape.x = view.height_amplitude;
-            draw.bake.address = gpu.address;
-            draw.mode = glm::length(center) > 4.0 * radius ? 2u : 1u;
+            draw.key = placement.key;
+            draw.bake = placement.bake;
+            draw.mode = distant ? 2u : 1u;
             if (settings.terrain_cached_fp64) draw.mode = 3u;
             if (settings.terrain_reference_fp64 && !source) draw.mode = 0;
-            prepared_.push_back(draw);
+            entry.draws.push_back(draw);
         }
+        prepared_.insert(prepared_.end(), entry.draws.begin(), entry.draws.end());
     }
     if ((!settings.terrain_reference_fp64 && !prepared_.empty()) || !retained_keys.empty()) {
         std::vector<GeometryKey> keys;

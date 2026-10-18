@@ -14,9 +14,9 @@ inline constexpr uint32_t GEOMETRY_CACHE_BYTES = 64 * 1024 * 1024;
 inline constexpr uint32_t GEOMETRY_CACHE_CAPACITY = GEOMETRY_CACHE_BYTES / (PATCH_VERTICES * GEOMETRY_VERTEX_BYTES);
 inline constexpr uint32_t MAX_GEOMETRY_BAKES = 128;
 
-struct alignas(32) GeometryBakeGPU {
-    glm::dvec4 anchor_polar_ratio{0.0};
-    glm::dvec4 shape{0.0};
+struct alignas(16) GeometryBakeGPU {
+    glm::vec4 anchor_polar_ratio{0.0f};
+    glm::vec4 shape{0.0f};
     glm::uvec4 address{0};
     glm::uvec4 destination{0};
 };

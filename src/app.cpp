@@ -4,6 +4,7 @@
 #include "core/path_utils.hpp"
 #include "core/time_utils.hpp"
 #include "rendering/ring_optics.hpp"
+#include "rendering/ring_generator.hpp"
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
@@ -964,26 +965,27 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
             ImGui::EndDisabled();
-            ui::section("Planet Surfaces", "Imported maps and optional synthetic relief");
+            ui::section("Planet Surfaces", "Quadtree ellipsoids, imported maps and optional synthetic relief");
             ImGui::Checkbox("Surface Textures", &render_draft.surface_textures_enabled);
             ImGui::Checkbox("Imported Elevation", &render_draft.terrain_imported_enabled);
             ImGui::Checkbox("Synthetic Terrain Preview", &render_draft.terrain_enabled);
-            ImGui::BeginDisabled(!render_draft.terrain_enabled && !render_draft.terrain_imported_enabled);
             ImGui::Checkbox("Terrain Tile Colors", &render_draft.terrain_debug_tiles);
             ImGui::Checkbox("FP64 Terrain Reference", &render_draft.terrain_reference_fp64);
             ui::field("Terrain Error##terrain_error", [&](const char* id) {
                 ImGui::SliderFloat(id, &render_draft.terrain_error_pixels, 0.5f, 16.0f, "%.1f px");
             });
+            ImGui::BeginDisabled(!render_draft.terrain_enabled);
             ui::field("Synthetic Relief##terrain_height", [&](const char* id) {
                 ImGui::SliderFloat(id, &render_draft.terrain_height_km, 0.0f, 20.0f, "%.2f km");
             });
+            ImGui::EndDisabled();
             ui::field("Patches per Body##terrain_patches", [&](const char* id) {
                 int limit = static_cast<int>(render_draft.terrain_patch_limit);
                 if (ImGui::SliderInt(id, &limit, 64, 4096)) render_draft.terrain_patch_limit = static_cast<uint32_t>(limit);
             });
-            ImGui::EndDisabled();
             const auto& terrain = celestial_renderer_.terrain_stats();
-            ui::value_row("Terrain Patches", std::format("{} / 4096", terrain.patches));
+            ui::value_row("Terrain Patches", std::format("{} / {}", terrain.patches, terrain::MAX_PATCHES));
+            ui::value_row("Smooth Patches", std::to_string(terrain.smooth_patches));
             ui::value_row("Deepest Terrain Level", std::to_string(terrain.deepest_level));
             ui::value_row("Geometry Cache", std::format("{} cached / {} reference", terrain.cached_patches, terrain.reference_patches));
             ui::value_row("Geometry Bakes", std::format("{} / {} per frame", terrain.cache_bakes, terrain::MAX_GEOMETRY_BAKES));
@@ -1617,7 +1619,7 @@ void App::render_body_inspector() {
                 double r_eq_km = b.definition.radius_au() * AU_TO_KM;
 
                 auto tex_path = ephemeris::find_ring_texture_path(system().name(), b.definition.name);
-                bool has_ring_tex_file = tex_path.has_value();
+                bool has_ring_tex_file = tex_path.has_value() || celestial_renderer_.has_custom_ring_texture(system().name(), b.definition.name);
 
                 auto& re = ui_state_.ring_edit;
                 re.sync_body(insp_idx, static_cast<int>(rings.size()));
@@ -1675,6 +1677,151 @@ void App::render_body_inspector() {
                         ring_changed = true;
                     }
                     ImGui::PopStyleColor(3);
+                }
+
+                ui::section("Procedural Generator", "Synthesize SpaceEngine-style multi-band ring profiles with fine striations.");
+                if (ImGui::CollapsingHeader("Procedural Generator###proc_ring_hdr", rings.empty() ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+                    ImGui::TextWrapped("Generate a new ring profile from a preset or customize parameters, then apply or bake it.");
+                    ImGui::Spacing();
+
+                    auto presets = rendering::get_ring_presets();
+                    int cur_p_idx = std::clamp(re.procedural.preset_idx, 0, static_cast<int>(presets.size()) - 1);
+                    const char* cur_p_name = presets[cur_p_idx].name.data();
+                    if (ImGui::BeginCombo("Ring Preset##proc", cur_p_name)) {
+                        for (int i = 0; i < static_cast<int>(presets.size()); ++i) {
+                            bool sel = (i == cur_p_idx);
+                            if (ImGui::Selectable(presets[i].name.data(), sel)) {
+                                re.procedural.preset_idx = i;
+                                const auto& p = presets[i];
+                                re.procedural.band_count = p.band_count;
+                                re.procedural.gap_count = p.gap_count;
+                                re.procedural.striation_freq = p.striation_freq;
+                                re.procedural.contrast = p.contrast;
+                                re.procedural.base_density = p.base_density;
+                                re.procedural.core_boost = p.core_boost;
+                                re.procedural.inner_mult = p.inner_radius_ratio;
+                                re.procedural.outer_mult = p.outer_radius_ratio;
+                                re.procedural.opacity = p.opacity;
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+
+                    ui::metric_text("Seed");
+                    float seed_w = std::max(60.0f, ImGui::GetContentRegionAvail().x - 85.0f);
+                    ImGui::SetNextItemWidth(seed_w);
+                    ImGui::DragInt("##Seed##proc", &re.procedural.seed, 1.0f, 0, 999999);
+                    ImGui::SameLine(0.0f, 8.0f);
+                    if (ImGui::Button("Random##proc", ImVec2(75.0f, 0.0f))) {
+                        re.procedural.seed = std::rand() % 1000000;
+                    }
+
+                    ImGui::SliderInt("Bands##proc", &re.procedural.band_count, 1, 8);
+                    ImGui::SliderInt("Gaps##proc", &re.procedural.gap_count, 0, 6);
+                    ImGui::SliderFloat("Striations##proc", &re.procedural.striation_freq, 20.0f, 300.0f, "%.0f");
+                    ImGui::SliderFloat("Sharpness##proc", &re.procedural.contrast, 0.5f, 3.5f, "%.2f");
+                    ImGui::SliderFloat("Density (Tau)##proc", &re.procedural.base_density, 0.05f, 8.0f, "%.2f");
+                    ImGui::SliderFloat("Core Opacity##proc", &re.procedural.core_boost, 0.5f, 5.0f, "%.2f");
+
+                    ui::drag_float("Inner (R_eq)##proc", &re.procedural.inner_mult, 0.01f, 1.05f, 4.0f, "%.2f R");
+                    float min_out = re.procedural.inner_mult + 0.05f;
+                    if (re.procedural.outer_mult < min_out) re.procedural.outer_mult = min_out;
+                    ui::drag_float("Outer (R_eq)##proc", &re.procedural.outer_mult, 0.01f, min_out, 8.0f, "%.2f R");
+
+                    float tint_col[3] = {re.procedural.tint.r, re.procedural.tint.g, re.procedural.tint.b};
+                    if (ImGui::ColorEdit3("Tint Color##proc", tint_col)) {
+                        re.procedural.tint = glm::vec3(tint_col[0], tint_col[1], tint_col[2]);
+                    }
+                    ImGui::SliderFloat("Opacity##proc", &re.procedural.opacity, 0.05f, 1.0f, "%.2f");
+
+                    ImGui::Spacing();
+
+                    auto make_config = [&]() {
+                        rendering::ProceduralRingConfig cfg;
+                        cfg.seed = static_cast<uint32_t>(re.procedural.seed);
+                        cfg.band_count = re.procedural.band_count;
+                        cfg.gap_count = re.procedural.gap_count;
+                        cfg.striation_freq = re.procedural.striation_freq;
+                        cfg.contrast = re.procedural.contrast;
+                        cfg.base_density = re.procedural.base_density;
+                        cfg.core_boost = re.procedural.core_boost;
+                        cfg.inner_radius_ratio = re.procedural.inner_mult;
+                        cfg.outer_radius_ratio = re.procedural.outer_mult;
+                        cfg.tint_color = re.procedural.tint;
+                        cfg.opacity = re.procedural.opacity;
+                        const auto& p = rendering::get_ring_preset(re.procedural.preset_idx);
+                        cfg.asymmetry = p.asymmetry;
+                        cfg.backscatter = p.backscatter;
+                        cfg.scatter = p.scatter;
+                        cfg.unlit_factor = p.unlit_factor;
+                        cfg.color_deep = p.color_deep;
+                        cfg.color_mid = p.color_mid;
+                        cfg.color_thin = p.color_thin;
+                        return cfg;
+                    };
+
+                    if (ImGui::Button("Generate & Apply Rings##proc", ImVec2(-1.0f, 0.0f))) {
+                        auto cfg = make_config();
+                        auto result = rendering::generate_procedural_ring_profile(cfg);
+                        celestial_renderer_.set_custom_ring_texture(system().name(), b.definition.name, result.profile);
+                        ephemeris::RingLayerDefinition nl{};
+                        rendering::apply_procedural_ring_layer(result, nl);
+                        rings = {std::move(nl)};
+                        tex_in = rings[0].inner;
+                        tex_out = rings[0].outer;
+                        re.selected_layer = 0;
+                        ring_changed = true;
+                        re.status_msg = "Generated & applied procedural rings.";
+                        re.error_msg.clear();
+                    }
+
+                    if (ImGui::Button("Bake & Save to System Disk##proc", ImVec2(-1.0f, 0.0f))) {
+                        auto cfg = make_config();
+                        auto result = rendering::generate_procedural_ring_profile(cfg);
+                        ephemeris::RingLayerDefinition nl{};
+                        if (rendering::bake_and_save_procedural_ring_texture(system().name(), b.definition.name, result, nl)) {
+                            rings = {std::move(nl)};
+                            tex_in = rings[0].inner;
+                            tex_out = rings[0].outer;
+                            re.selected_layer = 0;
+                            celestial_renderer_.invalidate_ring_textures();
+
+                            auto res = simulation_.apply(ephemeris::ApplyBodyRings{
+                                system().generation(), insp_idx, def_rev, rings, tex_in, tex_out
+                            });
+                            ring_changed = false;
+
+                            std::string save_sys_name = system().name();
+                            if (save_sys_name == "Ephemeris Mode") {
+                                save_sys_name = std::string(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
+                            }
+                            if (!save_sys_name.starts_with("Ephemeris: ") && sys_mgr_.system_exists(save_sys_name)) {
+                                try {
+                                    auto loaded = sys_mgr_.load_system(save_sys_name);
+                                    int s_idx = loaded.definition.find_body(b.definition.name);
+                                    if (s_idx >= 0) {
+                                        loaded.definition.bodies[s_idx].rings = rings;
+                                        loaded.definition.bodies[s_idx].ring_texture_inner = tex_in;
+                                        loaded.definition.bodies[s_idx].ring_texture_outer = tex_out;
+                                        sys_mgr_.save_system(save_sys_name, loaded.definition);
+                                    }
+                                } catch (...) {}
+                            }
+                            if (res) {
+                                re.status_msg = "Baked procedural Rings.png & saved system to disk.";
+                                re.error_msg.clear();
+                            } else {
+                                re.error_msg = res.error;
+                            }
+                        } else {
+                            re.error_msg = "Failed to bake and save procedural Rings.png.";
+                        }
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
                 }
 
                 if (!rings.empty()) {

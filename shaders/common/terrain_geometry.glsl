@@ -12,6 +12,7 @@ dvec3 terrain_cube_vector(uint face, dvec2 uv) {
 dvec3 terrain_surface(uint face, dvec2 uv, double polar_ratio, double amplitude) {
     dvec3 direction = normalize(terrain_cube_vector(face, uv));
     dvec3 base = direction * dvec3(1.0, polar_ratio, 1.0);
+    if (amplitude == 0.0) return base;
     dvec3 normal = normalize(direction / dvec3(1.0, polar_ratio, 1.0));
     vec3 d = vec3(direction);
     float relief = 0.55 * sin(18.0 * d.x + 5.0 * d.y) * cos(14.0 * d.z)

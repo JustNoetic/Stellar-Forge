@@ -214,6 +214,7 @@ if(STELLAR_BUILD_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/rendering/ring_optics.cpp
+        src/rendering/ring_generator.cpp
         src/core/path_utils.cpp
         src/core/time_utils.cpp
     )
@@ -341,6 +342,8 @@ if(STELLAR_BUILD_RENDER_TESTS)
     target_link_libraries(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
     target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
     add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
+    add_test(NAME eclipse_optics_gpu_contracts COMMAND StellarRenderingTests --eclipse-lighting)
+    add_test(NAME smooth_surface_contracts COMMAND StellarRenderingTests --smooth-surfaces)
     if(Python3_Interpreter_FOUND)
         add_test(NAME terrain_imported_contracts COMMAND StellarRenderingTests --terrain-imported
             "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt"

@@ -9,7 +9,7 @@ namespace sf::terrain {
 
 inline constexpr uint32_t GRID_CELLS = 16;
 inline constexpr uint32_t MAX_LEVEL = 24;
-inline constexpr uint32_t MAX_PATCHES = 4096;
+inline constexpr uint32_t MAX_PATCHES = 8192;
 
 struct TileId {
     uint32_t face = 0;
@@ -25,6 +25,13 @@ struct TileId {
 struct TileBounds {
     glm::dvec3 center{0.0};
     double radius = 0.0;
+    glm::dvec3 surface_center{0.0};
+    glm::dvec3 direction{0.0};
+    double angular_radius = 0.0;
+    double polar_ratio = 1.0;
+    double padding = 0.0;
+    double support(glm::dvec3 axis) const noexcept;
+    double distance(glm::dvec3 eye) const noexcept;
 };
 
 struct SelectionView {
@@ -49,6 +56,7 @@ struct Patch {
 
 struct Selection {
     std::vector<Patch> patches;
+    double max_error_pixels = 0.0;
     uint32_t deepest_level = 0;
     uint32_t visited = 0;
     bool budget_limited = false;

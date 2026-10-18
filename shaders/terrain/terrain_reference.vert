@@ -80,7 +80,10 @@ void main() {
     double e = 0.0001;
     dvec3 du = surface(tile, uv + dvec2(e, 0.0)) - surface(tile, uv - dvec2(e, 0.0));
     dvec3 dv = surface(tile, uv + dvec2(0.0, e)) - surface(tile, uv - dvec2(0.0, e));
-    f_normal = vec3(rotation * normalize(cross(du, dv)));
+    dvec3 direction = normalize(cube_vector(tile.address.x, uv));
+    dvec3 normal = tile.rotation_height.w == 0.0 ? normalize(direction / dvec3(1.0, tile.anchor_polar_ratio.w, 1.0))
+                                                : normalize(cross(du, dv));
+    f_normal = vec3(rotation * normal);
     f_body_idx = tile.metadata.x;
     f_subpixel_factor = 0.0;
     uint hash = tile.address.x * 73856093u ^ tile.address.y * 19349663u

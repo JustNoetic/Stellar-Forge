@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <queue>
+#include <limits>
 #include <unordered_map>
 
 namespace sf::terrain {
@@ -69,30 +70,80 @@ glm::dmat3 body_rotation(glm::dvec3 pole, double spin) noexcept {
 }
 
 TileBounds bounds(TileId tile, double polar_ratio, double height_amplitude) noexcept {
-    double width = std::ldexp(2.0, -int(tile.level));
-    auto center = ellipsoid_point(tile.face, -1.0 + (tile.x + 0.5) * width,
-                                 -1.0 + (tile.y + 0.5) * width, polar_ratio);
-    return {center, width / std::sqrt(2.0) + height_amplitude};
+    return surface_bounds(tile, polar_ratio, height_amplitude, TileMetadata{-1.0, 1.0, 0.0, 0.0});
+}
+
+double TileBounds::support(glm::dvec3 axis) const noexcept {
+    if (angular_radius == 0.0) return radius*glm::length(axis);
+    auto scaled = axis*glm::dvec3(1, polar_ratio, 1);
+    double radial = glm::dot(scaled, direction);
+    double tangent = glm::length(scaled-direction*radial);
+    return std::abs(radial)*angular_radius*angular_radius*.25
+        + tangent*std::min(angular_radius, 1.0) + padding*glm::length(axis);
+}
+
+double TileBounds::distance(glm::dvec3 eye) const noexcept {
+    double result = glm::length(center-eye)-radius;
+    if (angular_radius > 0.0) {
+        auto offset = eye-surface_center;
+        double length = glm::length(offset);
+        if (length > 0.0) result = std::max(result, length-support(offset/length));
+    }
+    return std::max(result, 1e-12);
+}
+
+namespace {
+
+class Visibility {
+public:
+    explicit Visibility(const SelectionView& view) : view_(view) {
+        auto local_from_view = glm::transpose(view.view_from_local);
+        planes_ = {glm::dvec3(0, 0, -1), glm::dvec3(1, 0, -view.tan_half_fov_x),
+            glm::dvec3(-1, 0, -view.tan_half_fov_x), glm::dvec3(0, 1, -view.tan_half_fov_y),
+            glm::dvec3(0, -1, -view.tan_half_fov_y)};
+        for (auto& plane : planes_) plane = glm::normalize(local_from_view*plane);
+        scale_ = {1, 1/view.polar_ratio, 1};
+        eye_ = view.eye*scale_;
+        double distance = glm::length(eye_);
+        double occluder = 1.0-view.height_amplitude*(1.0+RELIEF_ROUNDING)/view.polar_ratio;
+        if (occluder > 0.0 && distance > occluder) {
+            axis_ = -eye_/distance;
+            sine_ = occluder/distance;
+            cosine_ = std::sqrt(std::max(0.0, 1.0-sine_*sine_));
+            tangent_distance_ = distance*cosine_;
+        }
+        tolerance_ = 64*std::numeric_limits<double>::epsilon()*(1+glm::length(view.eye));
+    }
+
+    bool visible(const TileBounds& tile) const noexcept {
+        if (!view_.cull) return true;
+        for (auto plane : planes_) {
+            double distance = glm::dot(plane, tile.center-view_.eye);
+            if (distance+tile.radius < -tolerance_) return false;
+            if (tile.angular_radius > 0.0 && distance < tile.radius &&
+                glm::dot(plane, tile.surface_center-view_.eye)+tile.support(plane) < -tolerance_) return false;
+        }
+        if (sine_ == 0.0) return true;
+        auto to_tile = tile.center*scale_-eye_;
+        double radius = tile.radius/view_.polar_ratio;
+        double along = glm::dot(to_tile, axis_);
+        double perpendicular = glm::length(to_tile-axis_*along);
+        bool inside_cone = along*sine_-perpendicular*cosine_ > radius+tolerance_;
+        bool beyond_tangent = glm::length(to_tile)-radius > tangent_distance_+tolerance_;
+        return !(inside_cone && beyond_tangent);
+    }
+
+private:
+    const SelectionView& view_;
+    std::array<glm::dvec3, 5> planes_;
+    glm::dvec3 scale_, eye_, axis_{0};
+    double sine_ = 0, cosine_ = 0, tangent_distance_ = 0, tolerance_ = 0;
+};
+
 }
 
 bool visible(const TileBounds& tile, const SelectionView& view) noexcept {
-    if (!view.cull) return true;
-    auto v = view.view_from_local * (tile.center - view.eye);
-    double depth = -v.z;
-    if (depth + tile.radius <= 0.0) return false;
-    if (std::abs(v.x) - depth * view.tan_half_fov_x > tile.radius * std::sqrt(1.0 + view.tan_half_fov_x * view.tan_half_fov_x)) return false;
-    if (std::abs(v.y) - depth * view.tan_half_fov_y > tile.radius * std::sqrt(1.0 + view.tan_half_fov_y * view.tan_half_fov_y)) return false;
-    double occluder = view.polar_ratio - view.height_amplitude * (1.0 + RELIEF_ROUNDING);
-    double eye_distance = glm::length(view.eye);
-    if (occluder <= 0.0 || eye_distance <= occluder) return true;
-    auto to_tile = tile.center - view.eye;
-    double along = glm::dot(to_tile, -view.eye / eye_distance);
-    double perpendicular = glm::length(to_tile + view.eye / eye_distance * along);
-    double sine = occluder / eye_distance;
-    double cosine = std::sqrt(1.0 - sine * sine);
-    bool inside_cone = along * sine - perpendicular * cosine > tile.radius;
-    bool beyond_tangent = glm::length(to_tile) - tile.radius > eye_distance * cosine;
-    return !(inside_cone && beyond_tangent);
+    return Visibility(view).visible(tile);
 }
 
 double error_coefficient(double polar_ratio, double height_amplitude) noexcept {
@@ -133,6 +184,7 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
     view.polar_ratio = std::clamp(view.polar_ratio, 0.05, 1.0);
     view.height_amplitude = std::clamp(view.height_amplitude, 0.0, 0.01);
     view.target_error_pixels = std::max(view.target_error_pixels, 0.1);
+    Visibility visibility(view);
     struct Candidate { TileId tile; double error; };
     struct Node { Candidate candidate; bool active = true; bool scheduled = false; };
     struct Request {
@@ -158,8 +210,8 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
         ++result.visited;
         auto description = source.describe(tile, view.polar_ratio, view.height_amplitude);
         auto bound = description.bounds;
-        if (!visible(bound, view)) return false;
-        double distance = std::max(glm::length(bound.center - view.eye) - bound.radius, 1e-12);
+        if (!visibility.visible(bound)) return false;
+        double distance = bound.distance(view.eye);
         double error = description.geometric_error * view.focal_pixels / distance;
         candidate = {tile, error};
         return true;
@@ -236,6 +288,7 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
     result.patches.reserve(leaves.size());
     for (const auto& node : nodes) {
         if (!node.active) continue;
+        result.max_error_pixels = std::max(result.max_error_pixels, node.candidate.error);
         Patch patch{node.candidate.tile};
         for (uint32_t edge = 0; edge < 4; ++edge) {
             int other = neighbor(leaves, patch.tile, edge);

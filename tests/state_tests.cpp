@@ -4,6 +4,7 @@
 #include "core/time_utils.hpp"
 #include "rendering/render_settings.hpp"
 #include "rendering/ring_optics.hpp"
+#include "rendering/ring_generator.hpp"
 #include "ui/inspector_state.hpp"
 #include <cmath>
 #include <filesystem>
@@ -800,6 +801,108 @@ void ring_state_and_serialization_contracts() {
     }
 }
 
+void procedural_ring_generator_contracts() {
+    auto presets = rendering::get_ring_presets();
+    check(presets.size() == 7, "Exactly 7 procedural ring presets defined");
+
+    for (size_t i = 0; i < presets.size(); ++i) {
+        const auto& p = presets[i];
+        check(!p.name.empty(), "Preset name non-empty");
+        check(p.band_count >= 1 && p.band_count <= 8, "Preset band count in [1, 8]");
+        check(p.gap_count >= 0 && p.gap_count <= 6, "Preset gap count in [0, 6]");
+        check(p.striation_freq >= 20.0f, "Preset striation frequency valid");
+        check(p.contrast >= 0.5f, "Preset contrast valid");
+        check(p.base_density >= 0.01f, "Preset base density positive");
+        check(p.core_boost >= 0.1f, "Preset core boost positive");
+        check(p.inner_radius_ratio >= 1.05f, "Preset inner radius ratio valid");
+        check(p.outer_radius_ratio > p.inner_radius_ratio, "Preset outer radius ratio exceeds inner");
+        check(p.opacity > 0.0f && p.opacity <= 1.0f, "Preset opacity in (0, 1]");
+        check(p.asymmetry >= -0.99f && p.asymmetry <= 0.99f, "Preset asymmetry valid");
+        check(p.backscatter >= -0.99f && p.backscatter <= 0.0f, "Preset backscatter valid");
+        check(p.scatter >= 0.0f && p.scatter <= 1.0f, "Preset phase balance valid");
+        check(rendering::get_ring_preset(p.name).name == p.name, "Preset lookup by name matches");
+        check(rendering::get_ring_preset(i).name == p.name, "Preset lookup by index matches");
+    }
+
+    const char* expected_names[] = {
+        "Saturnian Ice", "Jovian Silicate Dust", "Uranian Charcoal",
+        "Neptunian Arcs", "Chariklo Centaur", "Warm Tholin Ice", "Custom"
+    };
+    for (const char* name : expected_names) {
+        check(rendering::get_ring_preset(name).name == name, "Expected preset exists");
+    }
+
+    // Generate Saturnian Ice profile
+    auto saturn_cfg = rendering::ProceduralRingConfig::from_preset(rendering::get_ring_preset("Saturnian Ice"), 42);
+    auto saturn_res = rendering::generate_procedural_ring_profile(saturn_cfg, 4096);
+    check(saturn_res.profile.size() == 4096, "Profile size matches requested resolution");
+    check(saturn_res.inner_radius_ratio == saturn_cfg.inner_radius_ratio, "Result inner ratio matches config");
+    check(saturn_res.outer_radius_ratio == saturn_cfg.outer_radius_ratio, "Result outer ratio matches config");
+
+    float alpha_sum = 0.0f;
+    for (size_t i = 0; i < saturn_res.profile.size(); ++i) {
+        const auto& sample = saturn_res.profile[i];
+        check(std::isfinite(sample.r) && sample.r >= 0.0f && sample.r <= 1.0f, "Profile red in [0, 1]");
+        check(std::isfinite(sample.g) && sample.g >= 0.0f && sample.g <= 1.0f, "Profile green in [0, 1]");
+        check(std::isfinite(sample.b) && sample.b >= 0.0f && sample.b <= 1.0f, "Profile blue in [0, 1]");
+        check(std::isfinite(sample.a) && sample.a >= 0.0f && sample.a <= 1.0f, "Profile alpha in [0, 1]");
+        alpha_sum += sample.a;
+    }
+    check(alpha_sum > 10.0f, "Profile has non-trivial optical depth");
+    check(saturn_res.profile.front().a < 0.1f, "Inner boundary fade suppresses extreme edge");
+    check(saturn_res.profile.back().a < 0.1f, "Outer boundary fade suppresses extreme edge");
+
+    // Determinism test: identical seed -> identical output bit-for-bit
+    auto saturn_res2 = rendering::generate_procedural_ring_profile(saturn_cfg, 4096);
+    for (size_t i = 0; i < saturn_res.profile.size(); ++i) {
+        check(saturn_res.profile[i] == saturn_res2.profile[i], "Procedural ring generator is deterministic");
+    }
+
+    // Seed variation test: different seed -> distinct profile
+    saturn_cfg.seed = 43;
+    auto saturn_res_diff = rendering::generate_procedural_ring_profile(saturn_cfg, 4096);
+    float diff_sum = 0.0f;
+    for (size_t i = 0; i < saturn_res.profile.size(); ++i) {
+        diff_sum += glm::length(saturn_res.profile[i] - saturn_res_diff.profile[i]);
+    }
+    check(diff_sum > 1.0f, "Different seeds produce distinctly varied profiles");
+
+    // Ring layer definition and simulation integration
+    ephemeris::RingLayerDefinition proc_layer{};
+    rendering::apply_procedural_ring_layer(saturn_res, proc_layer);
+    check(proc_layer.inner == saturn_res.inner_radius_ratio, "Applied layer inner radius matches");
+    check(proc_layer.outer == saturn_res.outer_radius_ratio, "Applied layer outer radius matches");
+    check(proc_layer.is_textured, "Applied procedural layer marked as textured");
+    check(proc_layer.gradient.size() == 2 && proc_layer.gradient[0].a == 1.0f && proc_layer.gradient[1].a == 1.0f,
+          "Applied procedural layer has full gradient stops");
+
+    Simulation sim;
+    check(sim.replace_system(SystemManager::parse_system(fixture(), "ProcRingSimTest")).accepted, "Load fixture for procedural rings");
+    int planet = sim.snapshot().find_body("Planet");
+    auto app_res = sim.apply(ApplyBodyRings{
+        sim.snapshot().generation(), planet, sim.snapshot().body(planet).revisions.definition,
+        {proc_layer}, proc_layer.inner, proc_layer.outer
+    });
+    check(app_res.accepted, "Simulation successfully accepts applied procedural ring layer");
+    check(sim.snapshot().body(planet).definition.rings.size() == 1, "Planet has 1 procedural ring layer");
+
+    // PNG disk bake and reload round-trip
+    auto test_png_path = paths::external_path("textures", "ProcRingBakeTest", "Planet", "Rings.png");
+    std::filesystem::create_directories(test_png_path.parent_path());
+    ephemeris::RingLayerDefinition baked_layer{};
+    check(rendering::bake_and_save_procedural_ring_texture("ProcRingBakeTest", "Planet", saturn_res, baked_layer, 16),
+          "Bake procedural ring texture to PNG disk");
+    check(std::filesystem::exists(test_png_path), "Baked Rings.png exists on disk");
+    auto reloaded_png = rendering::load_ring_png_1d(test_png_path, 4096);
+    check(reloaded_png.has_value() && reloaded_png->size() == 4096, "Reload baked procedural ring PNG");
+    for (size_t i = 0; i < 4096; i += 64) {
+        check(glm::length((*reloaded_png)[i] - saturn_res.profile[i]) < 0.02f,
+              "Baked and reloaded procedural profile matches original within 8-bit quantization");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(paths::external_path("textures", "ProcRingBakeTest"), ec);
+}
+
 int main(int argc, char** argv) {
     try {
         units_and_coordinates();
@@ -812,6 +915,7 @@ int main(int argc, char** argv) {
         edits_and_invalidation();
         add_and_delete_contracts();
         ring_state_and_serialization_contracts();
+        procedural_ring_generator_contracts();
         serialization_and_validation();
         render_settings();
         ias15_contracts();

@@ -111,6 +111,7 @@ void SurfaceTextures::set_sources(std::vector<ColorBinding> bindings) {
     wake_.notify_all();
     if (worker_.joinable()) worker_.join();
     sources_ = std::move(bindings);
+    selections_.assign(sources_.size(), {});
     slots_ = GeometryResidency{capacity_};
     owners_.fill({});
     offsets_.clear();
@@ -230,7 +231,15 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
                 view.height_amplitude = .01;
                 view.max_level = sources_[s].source->level;
                 view.max_patches = std::max(6u, std::min(remaining, 256u));
-                auto selection = select(view, TextureError{});
+                auto& entry = selections_[s];
+                if (!entry.valid || !(entry.view == view)) {
+                    entry.selection = select(view, TextureError{});
+                    entry.view = view;
+                    entry.valid = true;
+                    ++stats_.selection_rebuilds;
+                    stats_.selection_nodes += entry.selection.visited;
+                }
+                const auto& selection = entry.selection;
                 remaining -= std::min(remaining, uint32_t(selection.patches.size()));
                 for (const auto& patch : selection.patches) {
                     auto tile = patch.tile;

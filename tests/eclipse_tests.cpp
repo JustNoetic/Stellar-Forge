@@ -25,6 +25,82 @@ bool fragment_shadowed(glm::vec3 point, glm::vec4 star, glm::vec4 caster) {
     return perpendicular < caster.w + star.w * (projection / distance);
 }
 
+bool fragment_ring_shadowed(glm::vec3 point, glm::vec4 star, glm::vec4 center_outer,
+                            glm::vec4 pole_inner, float focal) {
+    glm::vec3 light = glm::vec3(star) - point;
+    float distance = std::max(glm::length(light), 1e-5f);
+    light /= distance;
+    glm::vec3 pole(pole_inner);
+    float d = glm::dot(light, pole);
+    if (std::abs(d) <= 1e-6f) return false;
+    float t = glm::dot(glm::vec3(center_outer) - point, pole) / d;
+    if (t <= 0.0f) return false;
+    glm::vec3 hit = point + light * t - glm::vec3(center_outer);
+    float radius = glm::length(hit);
+    float span = std::max(center_outer.w - pole_inner.w, 1e-9f);
+    glm::vec3 radial = radius > 1e-9f ? hit / radius : glm::vec3(1, 0, 0);
+    glm::vec3 planar = light - pole * d;
+    glm::vec3 direction = glm::length(planar) > 1e-6f ? glm::normalize(planar) : radial;
+    float cosine = glm::dot(radial, direction);
+    float mu = std::clamp(std::abs(d), 1.0f / 128.0f, 1.0f);
+    float stretch = std::sqrt(cosine * cosine / (mu * mu) + std::max(0.0f, 1.0f - cosine * cosine));
+    float h = std::max({star.w / distance * t * stretch, 0.75f * glm::length(point) / focal * stretch,
+                        0.75f * span / 4096.0f});
+    return radius + h > pole_inner.w && radius - h < center_outer.w;
+}
+
+void surface_ring_candidate_contracts() {
+    using sf::rendering::ring_could_shadow_surface;
+    check(ring_could_shadow_surface({0, 0, 0, 1}, {0, 100, 100, 1}, {0, 0, 0, 2.4f}, {0, 1, 0, 1.4f}, 1000),
+          "Host surface is retained even when its center lies inside the ring hole");
+    check(ring_could_shadow_surface({2, -1, 0, 0.2f}, {0, 100, 100, 1}, {0, 0, 0, 2.4f}, {0, 1, 0, 1.4f}, 1000),
+          "Ring-to-moon shadow retained");
+    check(!ring_could_shadow_surface({20, -1, 0, 0.2f}, {0, 100, 100, 1}, {0, 0, 0, 2.4f}, {0, 1, 0, 1.4f}, 1000),
+          "Unrelated ring system rejected");
+    check(!ring_could_shadow_surface({2, 1, 0, 0.2f}, {0, 100, 100, 1}, {0, 0, 0, 2.4f}, {0, 1, 0, 1.4f}, 1000),
+          "Ring plane behind the receiver rejected");
+    std::mt19937_64 random(0x517FACEu);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    auto direction = [&]() {
+        double z = 2.0 * unit(random) - 1.0;
+        double phi = 6.283185307179586 * unit(random);
+        double r = std::sqrt(1.0 - z * z);
+        return glm::dvec3(r * std::cos(phi), r * std::sin(phi), z);
+    };
+    size_t shadowed = 0, rejected = 0;
+    for (size_t trial = 0; trial < 12000; ++trial) {
+        double scale = std::pow(10.0, -7.0 + 9.0 * unit(random));
+        auto origin = direction() * scale * (trial % 3 == 0 ? 100000.0 : 10.0);
+        auto center = origin + direction() * scale * (trial % 4 == 0 ? 0.0 : 6.0 * unit(random));
+        auto pole = glm::vec3(direction());
+        glm::vec4 receiver{glm::vec3(origin), float(scale * (0.01 + unit(random)))};
+        glm::vec4 star{glm::vec3(origin + direction() * scale * (3.0 + 10000.0 * unit(random))),
+                       float(scale * std::pow(10.0, -3.0 + 3.0 * unit(random)))};
+        glm::vec4 ring{glm::vec3(center), float(scale * 2.4)};
+        glm::vec4 plane{pole, float(scale * 1.4)};
+        float focal = trial % 2 == 0 ? 200.0f : 4000.0f;
+        bool candidate = ring_could_shadow_surface(receiver, star, ring, plane, focal);
+        rejected += !candidate;
+        for (size_t sample = 0; sample < 64; ++sample) {
+            auto point = glm::vec3(origin + direction() * double(receiver.w) * (sample % 2 ? 1.0 : unit(random)));
+            if (fragment_ring_shadowed(point, star, ring, plane, focal)) {
+                ++shadowed;
+                if (!candidate) {
+                    auto print = [](const char* name, glm::vec4 value) {
+                        std::cerr << name << ": " << value.x << ',' << value.y << ',' << value.z << ',' << value.w << '\n';
+                    };
+                    std::cerr << "Ring oracle trial " << trial << ", focal " << focal << '\n';
+                    print("receiver", receiver); print("star", star); print("ring", ring); print("plane", plane);
+                    print("point", {point, 0});
+                }
+                check(candidate, "Ring candidate filter lost a blurred surface/interior sample");
+            }
+        }
+    }
+    check(shadowed > 1000 && rejected > 1000, "Ring surface oracle exercises retained shadows and rejection");
+    std::cout << "Surface ring bounds: " << shadowed << " blurred samples retained, " << rejected << " configurations rejected.\n";
+}
+
 void ring_eclipse_candidate_contracts() {
     std::mt19937_64 random(0xA66A1u);
     std::uniform_real_distribution<double> unit(0.0, 1.0);
@@ -350,6 +426,7 @@ int main() {
         }
         check(shadowed > 1000 && rejected > 1000, "Randomized oracle covers shadow retention and rejection");
         ring_eclipse_candidate_contracts();
+        surface_ring_candidate_contracts();
         ring_draw_contracts();
         ring_profile_mip_contracts();
         ring_radiative_transfer_contracts();

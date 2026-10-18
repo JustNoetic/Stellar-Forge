@@ -1,5 +1,33 @@
 # Terrain precision and geometry cache performance
 
+## Surface enclosures and preparation reuse
+
+Measured on 18 October 2026, Release, i5-12400F / RTX 4060 Ti, 1920 × 1080, 60° FOV, 2-pixel target and 1024-patch cap. Both versions use Earth elevation identity `619520292878143246`, the existing geometry-bake changes in the working tree, no color sources, and the same source-benchmark fixtures described below. The baseline was rebuilt in `scratch/terrain-culling` with the previous selector/preparation code; the active checkout was preserved. Each view measures 120 stationary and 120 moving samples at 100 m/s; moving samples are paced to at least 16.667 ms. Worker CPU, camera height queries, waits, readback, simulation, UI and presentation are excluded. GPU clocks and host scheduling were uncontrolled; these are descriptive pass timings, not application FPS or timing thresholds.
+
+| View | CPU preparation mean before → after, ms | Drawn patches before → after |
+| --- | --- | --- |
+| Orbital, stationary | 0.0318 → 0.0231 | 109 → 100 |
+| Orbital, moving | 0.4504 → 0.3762 | 109 → 100 |
+| 2 km down, stationary | 0.0314 → 0.0134 | 10 → 6 |
+| 2 km down, moving | 0.2924 → 0.2191 | 10 → 6 |
+| 2 km horizon, stationary | 0.0640 → 0.0268 | 95 → 83 |
+| 2 km horizon, moving | 0.4566 → 0.2934 | 95 → 83 |
+| 1 m down, stationary | 0.0337 → 0.0232 | 10 → 8 |
+| 1 m horizon, stationary | 0.1311 → 0.0894 | 195 → 185 |
+| 1 m horizon, moving | 0.9663 → 0.7422 | 186.8 → 170.8 mean |
+
+Moving traversal visits fell from 340 to 158 in orbit, 655 to 288 at the 2 km horizon, and 1032 to 606 at the 1 m horizon. Thin surface supports improve both frustum rejection and the refinement distance; horizon culling now uses a conservative inner ellipsoid. View-dependent culling constants are computed once per traversal. Imported selection reuses its desired result when all prerequisites are resident. Unchanged selections retain ancestor lists and patch placement data; unchanged transforms/precision/debug flags retain complete draw records. `TerrainStats::patch_updates` reports actual record rebuilding. Color selection separately reuses each source's unchanged `SelectionView`; its node/rebuild counters are available in `TextureStats`, but the timings above exclude color sources.
+
+Stationary HDR readbacks are exactly equal for both horizon views and the 1 m downward view. The 2 km downward mean absolute RGB error is `1.91e-8`; the orbital mean is `3.10e-5`, with 95 of 2,073,600 pixels changing by more than 0.03 in any channel. Before/after orbital and horizon previews were inspected. No stationary capture loses or gains opaque coverage. The 1 m stationary views still reach LOD23. Tighter distance bounds can choose shallower levels at the same conservative error target: 2 km views reach LOD11 rather than LOD12. Paced moving 1 m down/horizon traces remain streaming-limited (116/35 loading frames versus 117/77 before); ready-only minimum deepest levels are 22/21 versus 23/22. These counts include changed selection decisions and do not establish a worker-throughput or streaming-latency improvement.
+
+Captures and HDR/preview comparisons are `scratch/terrain-culling/{before-visual,after}.json`, `comparison.json` and `comparison-*.png`. Reproduce the current measurement using a new output filename:
+
+```powershell
+.\build\StellarRenderingTests.exe --terrain-source-benchmark data/tiles/earth/b72a6fa0e156/height scratch/terrain-culling/new-capture.json --paced
+```
+
+The source benchmark saves stationary PPM and RGBA16F readbacks outside the timed intervals. CPU contracts additionally check enclosure support and conservative distance against signed displaced samples, fine/parent/grandparent triangles, all six faces, LOD0–24 and polar ratios through 0.05; 8,000 visibility cases cover ground retention. GPU contracts check stationary record reuse, texture selection reuse/FOV invalidation, imported resident coverage and cached/reference precision. The signed imported fixture can now choose LOD20 at the 1 m horizon with a maximum conservative error of 1.89131 pixels. Its former fixed LOD21 assertion was tied to the old selection rather than screen-space quality; it now verifies `TerrainStats::max_error_pixels <= target` for every ready, non-budget-limited frame. Separate meter-scale refinement, seam and coverage requirements remain. Per-frame imported reports retain this error metric. The full run passed the other 16 CTests; after updating this quality assertion, all six targeted fixture, CPU terrain, startup, imported GPU and texture-eviction tests passed.
+
 ## Tighter imported bounds and selection reuse
 
 Measured before/after on 17 October 2026, Release, i5-12400F / RTX 4060 Ti, 1920 × 1080, 60° FOV, 2-pixel target and the same 1024-patch cap. The source is the existing Earth legacy visual elevation pack, identity `619520292878143246`, data LOD5. No pack rebake, height change, texture-resolution change or relaxed error setting is involved. This probe uses the pack's reference radius/oblateness, a fixed render pole/spin, a camera starting at 0.15 radians on the equator and no color sources. Orbital clearance is two equatorial radii above the sampled surface; ground clearances are above the decoded surface.

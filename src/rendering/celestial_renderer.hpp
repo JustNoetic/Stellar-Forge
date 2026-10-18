@@ -37,6 +37,8 @@ struct alignas(16) SceneCelestialUBO {
     uint32_t num_bodies = 0;
     uint32_t hdr_enabled = 1;
     uint32_t num_ring_hosts = 0;
+    glm::uvec4 ring_shadow_params{0};
+    glm::uvec4 eclipse_params{0};
     glm::mat4 projection{1.0f};
 };
 
@@ -52,11 +54,18 @@ public:
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
+    std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
     void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
         terrain_.set_height_source(std::move(body), std::move(source));
     }
     void invalidate_ring_textures() noexcept { rings_.invalidate_texture_cache(); }
+    void set_custom_ring_texture(std::string_view system_name, std::string_view body_name, std::vector<glm::vec4> texture_samples) {
+        rings_.set_custom_ring_texture(system_name, body_name, std::move(texture_samples));
+    }
+    bool has_custom_ring_texture(std::string_view system_name, std::string_view body_name) const noexcept {
+        return rings_.has_custom_ring_texture(system_name, body_name);
+    }
 
 private:
     void build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors, uint32_t stacks);
@@ -71,6 +80,7 @@ private:
     std::vector<BodyInstanceGPU> body_instances_;
     std::vector<uint32_t> eclipse_words_;
     std::vector<uint32_t> ring_eclipse_candidate_counts_;
+    std::vector<uint32_t> surface_ring_candidate_masks_;
 
     rhi::Pipeline sphere_pipeline_{};
     rhi::Pipeline point_pipeline_{};

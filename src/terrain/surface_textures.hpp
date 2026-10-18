@@ -47,6 +47,8 @@ struct TextureStats {
     uint32_t failed = 0;
     uint32_t capacity = 0;
     uint32_t evictions = 0;
+    uint32_t selection_rebuilds = 0;
+    uint32_t selection_nodes = 0;
 };
 
 class SurfaceTextures {
@@ -62,6 +64,7 @@ public:
     const TextureStats& stats() const noexcept { return stats_; }
 
 private:
+    struct SelectionEntry { SelectionView view; Selection selection; bool valid = false; };
     struct Completed { GeometryKey key; std::shared_ptr<const ColorTile> payload; };
     GeometryKey key(uint32_t source, TileId tile) const;
     void request(const GeometryKey& key);
@@ -73,6 +76,7 @@ private:
     uint32_t capacity_ = COLOR_SLOTS;
     std::array<std::optional<GeometryKey>, COLOR_SLOTS> owners_;
     std::vector<ColorBinding> sources_;
+    std::vector<SelectionEntry> selections_;
     std::vector<uint32_t> offsets_;
     std::vector<uint32_t> words_;
     TextureStats stats_;

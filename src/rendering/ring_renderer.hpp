@@ -47,6 +47,20 @@ public:
         cached_raw_textures_.clear();
     }
 
+    void set_custom_ring_texture(std::string_view system_name, std::string_view body_name, std::vector<glm::vec4> texture_samples) {
+        std::string sys = system_name.empty() ? "Solar System" : std::string(system_name);
+        std::string cache_key = sys + "/" + std::string(body_name);
+        cached_raw_textures_[cache_key] = std::move(texture_samples);
+        force_rebuild_ = true;
+    }
+
+    bool has_custom_ring_texture(std::string_view system_name, std::string_view body_name) const noexcept {
+        std::string sys = system_name.empty() ? "Solar System" : std::string(system_name);
+        std::string cache_key = sys + "/" + std::string(body_name);
+        auto it = cached_raw_textures_.find(cache_key);
+        return it != cached_raw_textures_.end() && !it->second.empty();
+    }
+
     uint32_t host_count() const noexcept { return active_host_count_; }
     std::span<const RingHostGPU> hosts() const noexcept { return hosts_gpu_; }
     const rhi::Buffer& host_buffer(uint32_t frame) const noexcept { return host_ssbos_[frame]; }

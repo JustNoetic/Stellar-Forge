@@ -1,12 +1,10 @@
 #version 460
 
-#include "common/terrain_geometry.glsl"
-
 layout(local_size_x = 8, local_size_y = 8) in;
 
 struct GeometryBakeGPU {
-    dvec4 anchor_polar_ratio;
-    dvec4 shape;
+    vec4 anchor_polar_ratio;
+    vec4 shape;
     uvec4 address;
     uvec4 destination;
 };
@@ -24,23 +22,85 @@ layout(std430, set = 0, binding = 1) writeonly buffer GeometryCache {
     GeometryVertex vertices[];
 };
 
+vec3 cube_delta_q(uint face, float du, float dv) {
+    switch (face) {
+    case 0u: return vec3(0.0, dv, -du);
+    case 1u: return vec3(0.0, dv, du);
+    case 2u: return vec3(du, 0.0, -dv);
+    case 3u: return vec3(du, 0.0, dv);
+    case 4u: return vec3(du, dv, 0.0);
+    default: return vec3(-du, dv, 0.0);
+    }
+}
+
+vec3 delta_d_stabilized(vec3 d_c, float L_c, vec3 delta_q) {
+    float a = dot(delta_q, d_c) / L_c;
+    float delta_len_sq = dot(delta_q, delta_q);
+    float k = 2.0 * a + delta_len_sq / (L_c * L_c);
+    float sqrt_1_plus_k = sqrt(1.0 + k);
+
+    vec3 delta_q_perp = delta_q - d_c * dot(delta_q, d_c);
+    vec3 perp = delta_q_perp * (1.0 / (L_c * sqrt_1_plus_k));
+
+    float denom = sqrt_1_plus_k * (1.0 + sqrt_1_plus_k);
+    float numer = a * (k / (1.0 + sqrt_1_plus_k)) - delta_len_sq / (L_c * L_c);
+    vec3 par = d_c * (numer / denom);
+
+    return perp + par;
+}
+
+vec3 terrain_surface_offset(vec3 d_c, float L_c, vec3 delta_q, float polar_ratio, float amplitude) {
+    vec3 delta_d = delta_d_stabilized(d_c, L_c, delta_q);
+    vec3 base_offset = vec3(delta_d.x, delta_d.y * polar_ratio, delta_d.z);
+
+    if (amplitude == 0.0) {
+        return base_offset;
+    }
+
+    vec3 direction = normalize(d_c + delta_d);
+    vec3 normal = normalize(vec3(direction.x, direction.y / polar_ratio, direction.z));
+    float relief = 0.55 * sin(18.0 * direction.x + 5.0 * direction.y) * cos(14.0 * direction.z)
+                 + 0.30 * sin(37.0 * direction.y - 11.0 * direction.z) * cos(23.0 * direction.x)
+                 + 0.15 * sin(61.0 * direction.z + 19.0 * direction.x) * cos(47.0 * direction.y);
+
+    return base_offset + normal * (amplitude * relief);
+}
+
 void main() {
     uvec2 grid = gl_GlobalInvocationID.xy;
     if (any(greaterThan(grid, uvec2(16)))) return;
     GeometryBakeGPU job = jobs[gl_GlobalInvocationID.z];
-    double width = 2.0 / double(1u << job.address.y);
-    dvec2 uv = -1.0 + (dvec2(job.address.zw) + dvec2(grid) / 16.0) * width;
-    double b = job.anchor_polar_ratio.w;
-    double amplitude = job.shape.x;
-    dvec3 point = terrain_surface(job.address.x, uv, b, amplitude);
-    double e = 0.0001;
-    dvec3 du = terrain_surface(job.address.x, uv + dvec2(e, 0.0), b, amplitude)
-             - terrain_surface(job.address.x, uv - dvec2(e, 0.0), b, amplitude);
-    dvec3 dv = terrain_surface(job.address.x, uv + dvec2(0.0, e), b, amplitude)
-             - terrain_surface(job.address.x, uv - dvec2(0.0, e), b, amplitude);
+
+    float width = ldexp(2.0, -int(job.address.y));
+    float du = (float(grid.x) / 16.0 - 0.5) * width;
+    float dv = (float(grid.y) / 16.0 - 0.5) * width;
+
+    float b = job.anchor_polar_ratio.w;
+    float amplitude = job.shape.x;
+    vec3 d_c = vec3(job.anchor_polar_ratio.x, job.anchor_polar_ratio.y / b, job.anchor_polar_ratio.z);
+    float face_comp = (job.address.x < 2u) ? abs(d_c.x) : ((job.address.x < 4u) ? abs(d_c.y) : abs(d_c.z));
+    float L_c = 1.0 / face_comp;
+
+    vec3 delta_q = cube_delta_q(job.address.x, du, dv);
+    vec3 offset = terrain_surface_offset(d_c, L_c, delta_q, b, amplitude);
+
+    float e = 0.0001;
+    vec3 dq_up = cube_delta_q(job.address.x, du + e, dv);
+    vec3 dq_um = cube_delta_q(job.address.x, du - e, dv);
+    vec3 dq_vp = cube_delta_q(job.address.x, du, dv + e);
+    vec3 dq_vm = cube_delta_q(job.address.x, du, dv - e);
+
+    vec3 du_vec = terrain_surface_offset(d_c, L_c, dq_up, b, amplitude)
+                - terrain_surface_offset(d_c, L_c, dq_um, b, amplitude);
+    vec3 dv_vec = terrain_surface_offset(d_c, L_c, dq_vp, b, amplitude)
+                - terrain_surface_offset(d_c, L_c, dq_vm, b, amplitude);
+
+    vec3 delta_d = delta_d_stabilized(d_c, L_c, delta_q);
+
     GeometryVertex vertex;
-    vertex.position = vec4(vec3(point - job.anchor_polar_ratio.xyz), 0.0);
-    vertex.normal = vec4(vec3(normalize(cross(du, dv))), 0.0);
-    vertex.direction = vec4(vec3(normalize(terrain_cube_vector(job.address.x, uv))), 0.0);
+    vertex.position = vec4(offset, 0.0);
+    vertex.direction = vec4(normalize(d_c + delta_d), 0.0);
+    vertex.normal = vec4(amplitude == 0.0 ? normalize(vec3(vertex.direction.x, vertex.direction.y / b, vertex.direction.z))
+                                       : normalize(cross(du_vec, dv_vec)), 0.0);
     vertices[job.destination.x * 289u + grid.y * 17u + grid.x] = vertex;
 }

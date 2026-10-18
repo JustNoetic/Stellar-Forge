@@ -29,6 +29,9 @@ struct RenderSettings {
     uint32_t terrain_patch_limit = 1024;
     bool show_rings = true;
     bool ring_shadows_enabled = true;
+    bool eclipse_reference_smoothstep = false;
+    bool ring_shadow_reference_all_hosts = false;
+    bool ring_shadow_single_box = true;
     bool ring_reference_full_annulus = false;
     bool ring_reference_finite_source = false;
     bool ring_reference_base_level = false;

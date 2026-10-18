@@ -349,11 +349,27 @@ struct TimelineScrubState {
     }
 };
 
+struct ProceduralRingDraft {
+    int preset_idx = 0;
+    int seed = 42;
+    int band_count = 4;
+    int gap_count = 3;
+    float striation_freq = 160.0f;
+    float contrast = 1.7f;
+    float base_density = 2.2f;
+    float core_boost = 2.5f;
+    float inner_mult = 1.20f;
+    float outer_mult = 2.30f;
+    glm::vec3 tint{1.0f, 1.0f, 1.0f};
+    float opacity = 1.0f;
+};
+
 struct RingEditState {
     int body_index = -1;
     int selected_layer = 0;
     std::string status_msg;
     std::string error_msg;
+    ProceduralRingDraft procedural{};
 
     void sync_body(int idx, int layer_count) {
         if (body_index != idx) {

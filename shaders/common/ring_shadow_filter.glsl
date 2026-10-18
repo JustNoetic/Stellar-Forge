@@ -36,6 +36,8 @@ float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec
         return 0.0;
     }
 
+    if (u_scene.ring_shadow_params.z != 0u)
+        return clamp(ring_box_extinction(lut, ring_idx, u0, h, mu_coord), 0.0, 1.0);
     float b1 = ring_box_extinction(lut, ring_idx, u0, 0.36 * h, mu_coord);
     float b2 = ring_box_extinction(lut, ring_idx, u0, 0.72 * h, mu_coord);
     float b3 = ring_box_extinction(lut, ring_idx, u0, 1.00 * h, mu_coord);
