@@ -1,0 +1,48 @@
+#version 460
+#include "common/atmosphere.glsl"
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 64) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D output_lut;
+shared vec3 luminance[64];
+shared vec3 feedback[64];
+void main() {
+    ivec2 pixel = ivec2(gl_WorkGroupID.xy);
+    uint lane = gl_LocalInvocationID.z;
+    vec2 uv = vec2(pixel)/vec2(MULTISCATTER_SIZE-1);
+    float mu = uv.x*2.0-1.0;
+    vec3 sun = vec3(sqrt(max(1.0-mu*mu, 0.0)), 0.0, mu);
+    vec3 p = vec3(0.0, 0.0, mix(bottom_radius()+0.001, top_radius()-0.001, uv.y));
+    float z = 1.0-2.0*(float(lane%8u)+0.5)/8.0;
+    float phi = 2.0*ATM_PI*(float(lane/8u)+0.5)/8.0;
+    vec3 d = vec3(sqrt(1.0-z*z)*cos(phi), sqrt(1.0-z*z)*sin(phi), z);
+    vec2 segment = atmosphere_segment(p, d);
+    float dt = (segment.y-segment.x)/24.0;
+    vec3 L = vec3(0.0), f = vec3(0.0), throughput = vec3(1.0);
+    for (int i = 0; i < 24; ++i) {
+        vec3 q = p+d*(segment.x+(float(i)+0.5)*dt);
+        vec3 r, m, e;
+        medium(q, r, m, e);
+        vec3 integral = segment_integral(e, dt);
+        L += throughput*(r+m)*sun_transmittance(transmittance_lut, q, sun)*integral/(4.0*ATM_PI);
+        f += throughput*(r+m)*integral;
+        throughput *= exp(-e*dt);
+    }
+    vec2 ground = sphere_roots(p, d, bottom_radius());
+    if (ground.x > 0.0) {
+        vec3 q = p+d*ground.x;
+        vec3 n = normalize(q);
+        L += throughput*atm.ground_albedo.rgb*max(dot(n, sun), 0.0)*
+             sun_transmittance(transmittance_lut, q+n*0.001, sun)/ATM_PI;
+    }
+    luminance[lane] = L/64.0;
+    feedback[lane] = f/64.0;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (lane < stride) {
+            luminance[lane] += luminance[lane+stride];
+            feedback[lane] += feedback[lane+stride];
+        }
+        barrier();
+    }
+    if (lane == 0u) imageStore(output_lut, pixel, vec4(luminance[0]/max(vec3(1.0)-feedback[0], vec3(0.001)), 1.0));
+}

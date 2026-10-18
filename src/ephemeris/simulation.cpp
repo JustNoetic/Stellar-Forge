@@ -43,7 +43,8 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
         const auto& motion = loaded.motions[i];
         if (body.name.empty() || !definition.name_to_idx.emplace(body.name, static_cast<int>(i)).second ||
             body.parent_idx < -1 || body.parent_idx >= static_cast<int>(i) ||
-            !valid_physical(BodyPhysicalProperties::from(body)) ||
+            !valid_physical(BodyPhysicalProperties::from(body)) || !valid_atmosphere(body.atmosphere) || !body.valid_height_range() ||
+            (body.atmosphere.enabled && (body.is_star || body.is_black_hole || body.is_spacecraft)) ||
             !finite_vector(motion.position.value) || !finite_vector(motion.velocity.value) ||
             !std::isfinite(body.radius_au()) || body.radius_au() <= 0.0 ||
             !finite_vector(body.pole_ecl) || !std::isfinite(glm::length(body.pole_ecl)) || glm::length(body.pole_ecl) < 1e-12 ||
@@ -237,6 +238,8 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
         return {false, false, "Physical values exceed the supported numerical range."};
     }
     auto before = BodyPhysicalProperties::from(old);
+    if (old.height_range_km.x <= -radius_au*AU_TO_KM*std::clamp(1.0-values.oblateness, 0.05, 1.0))
+        return {false, false, "The edited radius or oblateness places the established terrain minimum beyond the body centre."};
     if (before == values) return {};
 
     auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
@@ -433,6 +436,28 @@ CommandResult Simulation::apply(const ApplyBodyRings& command) {
     return {true, true, {}};
 }
 
+CommandResult Simulation::apply(const ApplyBodyAtmosphere& command) {
+    if (command.system_generation != snapshot_.generation_ || command.body_index < 0 ||
+        static_cast<size_t>(command.body_index) >= snapshot_.size())
+        return {false, false, "The edited body belongs to a different system or no longer exists."};
+    size_t index = static_cast<size_t>(command.body_index);
+    if (command.expected_body_revision != snapshot_.revisions_[index].definition)
+        return {false, false, "The body changed after this draft was opened. Revert to reload its current values."};
+    const auto& old = snapshot_.definition_->bodies[index];
+    if (old.is_star || old.is_black_hole || old.is_spacecraft)
+        return {false, false, "Atmospheres are available on planetary bodies only."};
+    if (!valid_atmosphere(command.values))
+        return {false, false, "Invalid atmosphere: check heights, nonnegative coefficients, extinction >= scattering, albedo and asymmetry."};
+    if (old.atmosphere == command.values) return {};
+    auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
+    updated->bodies[index].atmosphere = command.values;
+    snapshot_.definition_ = std::move(updated);
+    ++snapshot_.revisions_[index].definition;
+    ++snapshot_.revisions_[index].lighting;
+    ++snapshot_.definition_revision_;
+    return {true, true, {}};
+}
+
 CommandResult Simulation::apply(const AddBody& command) {
     if (command.system_generation != snapshot_.generation_) {
         return {false, false, "The target system changed before adding the body."};
@@ -441,6 +466,9 @@ CommandResult Simulation::apply(const AddBody& command) {
         return {false, false, "Adding bodies is not supported in SPICE playback mode. Switch to Keplerian or N-Body mode first."};
     }
     const auto& def = command.definition;
+    if (!valid_atmosphere(def.atmosphere) || !def.valid_height_range() ||
+        (def.atmosphere.enabled && (def.is_star || def.is_black_hole || def.is_spacecraft)))
+        return {false, false, "Invalid atmosphere on the new body."};
     if (def.name.empty()) {
         return {false, false, "Body name cannot be empty."};
     }

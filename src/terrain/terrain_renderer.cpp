@@ -251,19 +251,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 }
             };
             for (uint32_t face = 0; face < 6; ++face) retain({face});
-            if (selection_changed) {
-                std::unordered_set<uint64_t> ancestors;
-                entry.ancestors.clear();
-                for (const auto& patch : entry.selection.patches) {
-                    auto tile = patch.tile;
-                    while (tile.level) {
-                        tile = tile.parent();
-                        if (!ancestors.insert(tile.key()).second) break;
-                        entry.ancestors.push_back(tile);
-                    }
-                }
-            }
-            for (auto tile : entry.ancestors) retain(tile);
+            for (auto tile : entry.selection.required_tiles) retain(tile);
             for (auto& [tile, geometry] : active_stream->completed()) {
                 if (wanted.contains(tile.key())) {
                     retained_keys.push_back(imported_key(tile));
@@ -467,6 +455,21 @@ void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span
         vkCmdDrawIndexed(cmd, index_count, end - first, mask * index_count, 0, first);
         first = end;
     }
+}
+
+double TerrainRenderer::minimum_height_km(const ephemeris::BodyDefinition& body, const rendering::RenderSettings& settings) const noexcept {
+    double minimum = std::min(0.0, body.height_range_km.x);
+    if (settings.terrain_imported_enabled) {
+        for (const auto& binding : streams_) {
+            if (binding.body != body.name || !binding.stream) continue;
+            const auto& source = binding.stream->source();
+            if (source.compatible(body.radius_au()*AU_TO_KM*1000.0, std::clamp(1.0-body.oblateness, 0.05, 1.0)))
+                return std::min(minimum, source.info().minimum_m*0.001);
+        }
+    }
+    if (settings.terrain_enabled && !body.is_black_hole && body.type != "Gas Giant" && body.type != "Ice Giant")
+        minimum = std::min(minimum, -std::min(double(settings.terrain_height_km), body.radius_au()*AU_TO_KM*0.01));
+    return minimum;
 }
 
 }

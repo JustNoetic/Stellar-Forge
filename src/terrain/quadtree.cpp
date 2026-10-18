@@ -229,6 +229,7 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
                 result.loading_limited = true;
             }
             add(candidate);
+            if (availability.ready || availability.request) result.required_tiles.push_back({face});
         }
     }
     if (result.loading_limited) return result;
@@ -279,6 +280,7 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
             continue;
         }
         if (!availability.ready && availability.request) for (auto child : prerequisites) availability.request(child);
+        result.required_tiles.insert(result.required_tiles.end(), prerequisites.begin(), prerequisites.end());
         for (size_t index : splits) {
             nodes[index].active = false;
             leaves.erase(nodes[index].candidate.tile.key());

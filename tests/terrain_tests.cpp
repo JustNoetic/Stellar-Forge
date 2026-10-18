@@ -506,6 +506,46 @@ void resident_refinement() {
     check(admissions > 64, "Moving residency test exercises slot eviction and reuse");
 }
 
+void resident_detail_retention() {
+    SelectionView view;
+    view.eye = {0, 0, 1.001};
+    view.max_patches = 128;
+    view.max_level = 12;
+    std::vector<GeometryKey> warm_keys;
+    auto key_for = [](TileId tile) { GeometryKey key; key.tile = tile.key(); return key; };
+    for (uint32_t face = 0; face < 6; ++face) warm_keys.push_back(key_for({face}));
+    auto desired = select(view, ProceduralSource{}, {{}, [&](TileId tile) { warm_keys.push_back(key_for(tile)); }});
+    GeometryResidency cache(uint32_t(warm_keys.size()) + 32);
+    cache.request(warm_keys, uint32_t(warm_keys.size()));
+    auto choose = [&] {
+        return select(view, ProceduralSource{}, {[&](TileId tile) { return cache.find(key_for(tile)) >= 0; }, {}});
+    };
+    auto ready = choose();
+    check(!ready.loading_limited && ready.deepest_level >= 5, "Eviction probe starts with fully loaded ground detail");
+    std::vector<GeometryKey> retained;
+    for (uint32_t face = 0; face < 6; ++face) retained.push_back(key_for({face}));
+    for (auto tile : ready.required_tiles) retained.push_back(key_for(tile));
+    auto protected_count = retained.size();
+    uint32_t admissions = 0;
+    for (uint32_t frame = 0; frame < 8; ++frame) {
+        retained.resize(protected_count);
+        for (uint32_t tile = 0; tile < 64; ++tile) {
+            auto key = key_for({5, 12, frame*64+tile, 0});
+            key.body = 99;
+            retained.push_back(key);
+        }
+        admissions += uint32_t(cache.request(retained, 64).bakes.size());
+    }
+    check(admissions > 64 && cache.size() <= warm_keys.size()+32, "Detail retention probe forces bounded cache eviction");
+    view.eye.z += 1e-10;
+    desired = select(view);
+    auto after = choose();
+    check(!after.loading_limited && after.patches.size() == desired.patches.size(),
+          "Evicting unrelated geometry cannot discard loaded terrain refinement prerequisites");
+    for (size_t index = 0; index < after.patches.size(); ++index)
+        check(after.patches[index].tile == desired.patches[index].tile, "Loaded terrain detail survives cache churn");
+}
+
 void imported_error_bounds(const HeightSource& source) {
     std::unordered_map<uint64_t, HeightTile> payloads;
     auto point = [&](uint32_t face, double u, double v) {
@@ -728,6 +768,7 @@ int main(int argc, char** argv) {
         ground_refinement();
         staging_residency();
         resident_refinement();
+        resident_detail_retention();
         if (argc == 2) imported_source(argv[1]);
         std::cout << "Terrain mapping, bounds, seams, coverage, precision-level and budget contracts passed.\n";
     } catch (const std::exception& error) {

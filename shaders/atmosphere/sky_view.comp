@@ -1,0 +1,35 @@
+#version 460
+#include "common/atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2D radiance_lut;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image2D throughput_lut;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, SKY_SIZE))) return;
+    vec3 p = atm.camera.xyz;
+    vec3 d = sky_direction(pixel);
+    vec2 segment = atmosphere_segment(p, d);
+    vec3 L = vec3(0.0), throughput = vec3(1.0);
+    for (int i = 0; i < 48; ++i) {
+        float t0 = float(i)/48.0, t1 = float(i+1)/48.0;
+        t0 *= t0; t1 *= t1;
+        float dt = (segment.y-segment.x)*(t1-t0);
+        vec3 q = p+d*(segment.x+(segment.y-segment.x)*(t0+t1)*0.5);
+        vec3 r, m, e;
+        medium(q, r, m, e);
+        vec3 source = vec3(0.0);
+        for (uint s = 0u; s < uint(atm.camera.w); ++s) {
+            vec3 sun = atm.sun_direction[s].xyz;
+            float mu = dot(d, sun);
+            vec3 direct = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(mu)+m*mie_phase(mu));
+            vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
+            source += atm.sun_irradiance[s].rgb*(direct+multiple);
+        }
+        L += throughput*source*segment_integral(e, dt);
+        throughput *= exp(-e*dt);
+    }
+    imageStore(radiance_lut, pixel, vec4(min(L, vec3(65000.0)), 1.0));
+    imageStore(throughput_lut, pixel, vec4(throughput, 1.0));
+}

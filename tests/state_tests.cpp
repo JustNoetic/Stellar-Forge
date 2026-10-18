@@ -903,9 +903,66 @@ void procedural_ring_generator_contracts() {
     std::filesystem::remove_all(paths::external_path("textures", "ProcRingBakeTest"), ec);
 }
 
+void atmosphere_state_contracts() {
+    Simulation sim;
+    auto source = fixture();
+    source[0]["height_range_km"] = {-10.984, 8.848};
+    check(sim.replace_system(SystemManager::parse_system(source, "Atmosphere")).accepted, "Atmosphere state fixture");
+    int index = sim.snapshot().find_body("Planet");
+    auto captured = sim.snapshot();
+    auto original = captured.body(index).revisions;
+    ui::AtmosphereEditDraft draft;
+    draft.synchronize(captured, index);
+    draft.values.enabled = true;
+    draft.dirty = true;
+    check(sim.apply(draft.command()).changed, "Enable atmosphere through command");
+    const auto& changed = sim.snapshot().body(index);
+    check(!captured.body(index).definition.atmosphere.enabled && changed.definition.atmosphere.enabled, "Atmosphere edits preserve snapshots");
+    check(changed.revisions.lighting == original.lighting+1 && changed.revisions.dynamics == original.dynamics && changed.revisions.geometry == original.geometry,
+          "Atmosphere edits invalidate lighting without invalidating geometry or motion");
+    check(!sim.apply(draft.command()).accepted, "Stale atmosphere draft is rejected");
+    draft.reload(sim.snapshot(), index);
+    check(!sim.apply(draft.command()).changed, "Identical atmosphere command is inert");
+    auto valid = draft.values;
+    draft.values.mie_extinction.x = -1.0f;
+    check(!sim.apply(draft.command()).accepted, "Reject negative atmosphere extinction");
+    draft.values = valid;
+    draft.values.mie_extinction.x = draft.values.mie_scattering.x*0.5f;
+    check(!sim.apply(draft.command()).accepted, "Reject nonphysical single scattering albedo");
+    draft.values = valid;
+    draft.values.rayleigh_scale_height_km = std::numeric_limits<float>::quiet_NaN();
+    check(!sim.apply(draft.command()).accepted, "Reject nonfinite scale height");
+    draft.values = valid;
+    draft.values.mie_asymmetry = 1.0f;
+    check(!sim.apply(draft.command()).accepted, "Reject singular phase function");
+    draft.values = valid;
+    draft.generation += 1;
+    check(!sim.apply(draft.command()).accepted, "Reject atmosphere edit from another system");
+    auto json = SystemManager::serialize_definition(sim.snapshot().definition());
+    auto roundtrip = SystemManager::parse_system(json, "Roundtrip");
+    check(roundtrip.definition.bodies[roundtrip.definition.find_body("Planet")].atmosphere == valid, "Atmosphere JSON roundtrip");
+    check(roundtrip.definition.bodies[roundtrip.definition.find_body("Planet")].height_range_km == glm::dvec2(-10.984, 8.848), "Established terrain range survives definition serialization");
+    auto exported = SystemManager::serialize_snapshot_to_nbody(sim.snapshot());
+    auto nbody = SystemManager::parse_system(exported, "NBody roundtrip");
+    check(nbody.definition.bodies[nbody.definition.find_body("Planet")].atmosphere == valid, "Atmosphere survives snapshot export");
+    check(nbody.definition.bodies[nbody.definition.find_body("Planet")].height_range_km == glm::dvec2(-10.984, 8.848), "Terrain range survives snapshot export");
+    auto invalid_range = SystemManager::parse_system(source, "Invalid terrain range");
+    invalid_range.definition.bodies[invalid_range.definition.find_body("Planet")].height_range_km = {1.0, -1.0};
+    check(!sim.replace_system(invalid_range).accepted, "Reject reversed terrain ranges");
+    invalid_range.definition.bodies[invalid_range.definition.find_body("Planet")].height_range_km = {-1e10, 0.0};
+    check(!sim.replace_system(invalid_range).accepted, "Reject terrain minimum beyond the body centre");
+    auto invalid = SystemManager::parse_system(fixture(), "Invalid");
+    invalid.definition.bodies[invalid.definition.find_body("Planet")].atmosphere.height_km = -1.0f;
+    check(!sim.replace_system(std::move(invalid)).accepted, "Validate atmospheres on system load");
+    draft.reload(sim.snapshot(), sim.snapshot().find_body("Sun"));
+    draft.values.enabled = true;
+    check(!sim.apply(draft.command()).accepted, "Stars cannot receive planetary atmosphere");
+}
+
 int main(int argc, char** argv) {
     try {
         units_and_coordinates();
+        atmosphere_state_contracts();
         clock_and_snapshots();
         time_and_date_formatting();
         jump_and_timeline_contracts();

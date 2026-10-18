@@ -27,6 +27,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     build_sphere_mesh(ctx, 64, 32);
     textures_.init(ctx);
     rings_.init(ctx);
+    atmospheres_.init(ctx);
 
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         scene_ubos_[i] = ctx.create_host_buffer(sizeof(SceneCelestialUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -88,6 +89,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
 }
 
 void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
+    atmospheres_.shutdown(ctx);
     rings_.shutdown(ctx);
     terrain_.shutdown(ctx);
     textures_.shutdown(ctx);
@@ -153,6 +155,10 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     rings_.prepare(cmd, ctx, cam, sys, count);
     terrain_.prepare(ctx, cam, sys, settings, extent, count);
     terrain_.bake(cmd, ctx);
+    atmosphere_minima_.resize(count);
+    for (uint32_t i = 0; i < count; ++i)
+        atmosphere_minima_[i] = static_cast<float>(terrain_.minimum_height_km(sys.body(i).definition, settings));
+    atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_);
 }
 
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,

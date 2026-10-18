@@ -91,8 +91,8 @@ struct RenderProbe {
         extent = size;
         color = vk.create_image_2d(size.width, size.height, VK_FORMAT_R16G16B16A16_SFLOAT,
                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                                  | VK_IMAGE_USAGE_SAMPLED_BIT);
-        depth = vk.create_image_2d(size.width, size.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+                                  | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+        depth = vk.create_image_2d(size.width, size.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         composite = vk.create_image_2d(size.width, size.height, VK_FORMAT_R16G16B16A16_SFLOAT,
                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         readback = vk.create_host_buffer(static_cast<VkDeviceSize>(size.width) * size.height * 8,
@@ -115,19 +115,20 @@ struct RenderProbe {
 
     double render(const Camera& camera, const ephemeris::SystemSnapshot& system,
                   const rendering::RenderSettings& settings, rendering::StarCatalog* catalog = nullptr,
-                  bool tone_map = false) {
+                  bool tone_map = false, glm::vec3 background = glm::vec3(0.0f), bool atmosphere_only = false) {
         vk.immediate_submit([&](VkCommandBuffer cmd) {
             if (!catalog) renderer.prepare(cmd, vk, camera, system, settings, extent);
             if (catalog) catalog->cull(cmd, vk, camera, units::Years{0.0}, settings, extent);
             vk.transition_image(cmd, color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             vk.transition_image(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-            auto color_attachment = rhi::RenderingAttachment::clear_color(color);
+            auto color_attachment = rhi::RenderingAttachment::clear_color(color, background.r, background.g, background.b);
             auto depth_attachment = rhi::RenderingAttachment::clear_depth_reverse_z(depth);
             vk.begin_rendering(cmd, extent, {&color_attachment, 1}, &depth_attachment);
             vk.set_viewport_and_scissor(cmd, extent);
             if (catalog) catalog->render(cmd, vk, camera, units::Years{0.0}, settings, extent);
-            else renderer.render(cmd, vk, camera, system, settings, extent);
+            else if (!atmosphere_only) renderer.render(cmd, vk, camera, system, settings, extent);
             vk.end_rendering(cmd);
+            if (!catalog) renderer.composite_atmospheres(cmd, vk, color, depth);
             if (tone_map) {
                 vk.transition_image(cmd, color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 vk.transition_image(cmd, composite, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -668,6 +669,135 @@ void scaling_point_footprint(RenderProbe& probe) {
     std::cout << "Mesh-sized transition and unresolved 3 px footprint passed at 256p, 1080p and 2160p.\n";
 }
 
+void atmosphere_contracts(RenderProbe& probe, const std::filesystem::path& output = {}) {
+    if (!output.empty()) std::filesystem::create_directories(output);
+    probe.resize(EXTENT);
+    constexpr double radius = 6378.137*KM_TO_AU;
+    auto make = [&](glm::dvec3 origin = glm::dvec3(0.0)) {
+        auto loaded = fixture();
+        loaded.motions[0].position = render_to_ecliptic(RenderPosition{origin+glm::dvec3(1.0, 0.0, 1.0)});
+        ephemeris::BodyDefinition earth;
+        earth.name = "Atmosphere probe";
+        earth.radius_rsun = radius/SOLAR_RADII_TO_AU;
+        earth.color_rgb = glm::vec3(0.0f);
+        earth.atmosphere.enabled = true;
+        loaded.definition.bodies.push_back(earth);
+        ephemeris::BodyMotion motion;
+        motion.position = render_to_ecliptic(RenderPosition{origin});
+        loaded.motions.push_back(motion);
+        return loaded;
+    };
+    ephemeris::Simulation sim;
+    auto loaded = make();
+    check(sim.replace_system(loaded).accepted, "Atmosphere GPU fixture");
+    Camera cam = camera_at(radius*3.0);
+    rendering::RenderSettings settings;
+    settings.show_atmospheres = false;
+    check(probe.render(cam, sim.snapshot(), settings) == 0.0, "Disabled atmosphere preserves black background");
+    settings.show_atmospheres = true;
+    double day = probe.render(cam, sim.snapshot(), settings);
+    check(day > 1.0, "Sky View LUT produces visible atmospheric radiance from orbit");
+    check(probe.renderer.atmosphere_stats().optical_lut_updates == 1, "First visible atmosphere builds optical LUTs");
+    check(probe.red_at(207, 128) > 0.0f, "Atmosphere is visible beyond the opaque limb");
+    check(probe.red_at(240, 128) == 0.0f, "Atmosphere does not leak beyond its outer boundary");
+    if (!output.empty()) {
+        probe.render(cam, sim.snapshot(), settings, nullptr, true);
+        probe.save_preview(output / "orbit.ppm", true);
+    }
+    double stable = probe.render(cam, sim.snapshot(), settings);
+    check(stable == day && probe.renderer.atmosphere_stats().sky_lut_updates == 0, "Paused frame reuses identical LUTs");
+    settings.exposure = 2.0f;
+    check(std::abs(probe.render(cam, sim.snapshot(), settings)/day-2.0) < 0.003, "Atmosphere exposure applies once");
+    check(probe.renderer.atmosphere_stats().sky_lut_updates == 0, "Exposure does not invalidate physical LUTs");
+    settings.exposure = 1.0f;
+    cam.yaw_actual_deg += 4.0;
+    probe.render(cam, sim.snapshot(), settings);
+    check(probe.renderer.atmosphere_stats().sky_lut_updates == 0 && probe.renderer.atmosphere_stats().optical_lut_updates == 0,
+          "Camera rotation reuses sky and optical LUTs");
+    cam.yaw_actual_deg = 90.0;
+    probe.render(cam, sim.snapshot(), settings);
+    check(probe.renderer.atmosphere_stats().visible == 0, "Offscreen orbital atmospheres skip LUTs and composition");
+    cam = camera_at(radius*3.0);
+    auto binary = loaded;
+    auto companion = binary.definition.bodies[0];
+    companion.name = "Companion";
+    binary.definition.bodies.push_back(companion);
+    binary.motions.push_back(binary.motions[0]);
+    check(sim.replace_system(binary).accepted, "Binary atmosphere fixture");
+    double two = probe.render(cam, sim.snapshot(), settings);
+    check(std::abs(two/day-2.0) < 0.006, "Multiple stars add independent atmospheric radiance");
+    auto vacuum = loaded;
+    auto& a = vacuum.definition.bodies[1].atmosphere;
+    a.rayleigh_scattering = a.mie_scattering = a.mie_extinction = glm::vec3(0.0f);
+    check(sim.replace_system(vacuum).accepted, "Vacuum fixture");
+    check(probe.render(cam, sim.snapshot(), settings) == 0.0, "Zero-density atmosphere is finite and transparent");
+    check(sim.replace_system(loaded).accepted, "Restore atmosphere after coefficient edit");
+    cam = camera_at(radius+KM_TO_AU);
+    cam.yaw_actual_deg = 90.0;
+    double ground_day = probe.render(cam, sim.snapshot(), settings);
+    check(ground_day > 1.0, "Sky View LUT works inside the atmosphere");
+    if (!output.empty()) {
+        probe.render(cam, sim.snapshot(), settings, nullptr, true);
+        probe.save_preview(output / "ground.ppm", true);
+        probe.render(cam, sim.snapshot(), settings);
+    }
+    auto* pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+    size_t center = 4*(128*256+128);
+    check(glm::unpackHalf2x16(pixels[center+2]).x > glm::unpackHalf2x16(pixels[center]).x, "Daylight sky has wavelength-dependent Rayleigh scattering");
+    for (double altitude : {0.001, 50.0, 99.99, 100.01, 101.0, 1000.0}) {
+        cam = camera_at(radius+altitude*KM_TO_AU);
+        cam.yaw_actual_deg = 0.0;
+        check(probe.render(cam, sim.snapshot(), settings) > 0.0, "Atmosphere remains finite and visible across surface and top-boundary views");
+    }
+    cam = camera_at(radius+KM_TO_AU);
+    cam.yaw_actual_deg = 90.0;
+    auto night = loaded;
+    night.motions[0].position = render_to_ecliptic(RenderPosition{{0.0, 0.0, -1.0}});
+    check(sim.replace_system(night).accepted, "Night atmosphere fixture");
+    check(probe.render(cam, sim.snapshot(), settings) < ground_day*0.05, "Planet blocks sunlight on the night side");
+    auto absorption = loaded;
+    absorption.definition.bodies[0].lum_eq = absorption.definition.bodies[0].lum_pole = 0.0;
+    check(sim.replace_system(absorption).accepted, "Atmospheric transmission fixture");
+    probe.render(cam, sim.snapshot(), settings, nullptr, false, glm::vec3(1.0f));
+    pixels = static_cast<const uint16_t*>(probe.readback.mapped);
+    const auto& optical = absorption.definition.bodies[1].atmosphere;
+    for (int c = 0; c < 3; ++c) {
+        double tau = optical.rayleigh_scattering[c]*optical.rayleigh_scale_height_km*std::exp(-1.0/optical.rayleigh_scale_height_km)
+                   + optical.mie_extinction[c]*optical.mie_scale_height_km*std::exp(-1.0/optical.mie_scale_height_km);
+        check(std::abs(glm::unpackHalf2x16(pixels[center+c]).x-std::exp(-tau)) < 0.003,
+              "Zenith RGB transmittance agrees with analytic exponential-column optical depth");
+    }
+    auto occluded = loaded;
+    ephemeris::BodyDefinition caster;
+    caster.name = "Foreground occluder";
+    caster.radius_rsun = radius*0.5/SOLAR_RADII_TO_AU;
+    caster.color_rgb = glm::vec3(0.0f);
+    occluded.definition.bodies.push_back(caster);
+    ephemeris::BodyMotion motion;
+    motion.position = render_to_ecliptic(RenderPosition{{0.0, 0.0, radius*2.0}});
+    occluded.motions.push_back(motion);
+    check(sim.replace_system(occluded).accepted, "Occluded atmosphere fixture");
+    cam = camera_at(radius*3.0);
+    check(probe.render(cam, sim.snapshot(), settings) == 0.0, "Foreground depth fully occludes atmospheric shell");
+    glm::dvec3 origin(1000.0, -2000.0, 3000.0);
+    check(sim.replace_system(make(origin)).accepted, "Translated atmosphere fixture");
+    cam.origin_render = origin;
+    double translated = probe.render(cam, sim.snapshot(), settings);
+    check(std::abs(translated/day-1.0) < 0.005, "Atmosphere preserves precision after large world translation");
+    auto pair = loaded;
+    pair.motions[1].position = render_to_ecliptic(RenderPosition{{-radius*1.5, 0.0, 0.0}});
+    auto second = pair.definition.bodies[1];
+    second.name = "Second atmosphere";
+    pair.definition.bodies.push_back(second);
+    motion.position = render_to_ecliptic(RenderPosition{{radius*1.5, 0.0, 0.0}});
+    pair.motions.push_back(motion);
+    check(sim.replace_system(pair).accepted, "Multiple atmosphere fixture");
+    cam = camera_at(radius*6.0);
+    check(probe.render(cam, sim.snapshot(), settings) > 0.0 && probe.renderer.atmosphere_stats().visible == 2,
+          "Independent atmospheric bodies receive separate LUTs and composite passes");
+    std::cout << "PASS: atmospheric LUTs, orbital limb, ground sky, planet shadow, RGB optics, depth, multiple stars, caching and precision.\n";
+}
+
 void ring_rendering_and_shadows(RenderProbe& probe) {
     probe.resize(EXTENT);
     auto loaded = fixture();
@@ -887,11 +1017,20 @@ void ring_eclipse_candidate_filtering(RenderProbe& probe) {
 #include "terrain_gpu_tests.hpp"
 #include "ring_gpu_tests.hpp"
 #include "eclipse_gpu_tests.hpp"
+#include "atmosphere_gpu_tests.hpp"
 
 int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-surface-preview") {
+            atmosphere_surface_preview(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-benchmark") {
+            atmosphere_benchmark(probe, argv[2]);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--eclipse-optics") {
             eclipse_optics_contracts(probe);
             return 0;
@@ -929,6 +1068,15 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--ring-filtering-only") {
             ring_filtering_contracts(probe);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-preview") {
+            atmosphere_contracts(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--atmospheres-only") {
+            atmosphere_contracts(probe);
+            atmosphere_floor_contracts(probe);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--rings-only") {
@@ -985,6 +1133,7 @@ int main(int argc, char** argv) {
             terrain_surfaces(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
             return 0;
         }
+        atmosphere_contracts(probe);
         terrain_surfaces(probe);
         smooth_surface_contracts(probe);
         terrain_precision(probe);

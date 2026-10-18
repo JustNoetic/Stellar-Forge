@@ -30,6 +30,7 @@ tests/*
 !tests/surface_map_tests.py
 !tests/terrain_signed_fixture.json
 !tests/terrain_gpu_tests.hpp
+!tests/atmosphere_gpu_tests.hpp
 !tests/ring_gpu_tests.hpp
 !tests/rendering_tests.cpp
 !tests/benchmark_comparison_tests.py

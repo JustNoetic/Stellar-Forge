@@ -499,10 +499,10 @@ bool App::render_frame(benchmark::FrameSample* sample) {
 
     uint32_t t_scene = vk_.begin_gpu_timer(cmd, "gpu_scene_hdr");
     vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     vk_.transition_image(cmd, scene_depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
     star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
@@ -539,11 +539,12 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     }
 
     vk_.end_rendering(cmd);
+    celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_);
     vk_.end_gpu_timer(cmd, t_scene);
 
     uint32_t t_post = vk_.begin_gpu_timer(cmd, "gpu_post_composite");
     vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
     vk_.transition_raw_image(cmd, vk_.swapchain_image(swapchain_idx), VK_IMAGE_ASPECT_COLOR_BIT,
@@ -961,6 +962,7 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ui::field("Orbit Opacity##orb_op", [&](const char* id) {
                 ImGui::SliderFloat(id, &render_draft.orbit_opacity, 0.0f, 1.0f, "%.2f");
             });
+            ImGui::Checkbox("Atmospheres", &render_draft.show_atmospheres);
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
@@ -2029,6 +2031,59 @@ void App::render_body_inspector() {
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
+        }
+
+        if (!b.definition.is_star && !b.definition.is_black_hole && !b.definition.is_spacecraft && ImGui::BeginTabItem("Atmosphere")) {
+            ImGui::BeginChild("tab_atmosphere_content", ImVec2(0.0f, -footer_h), false);
+            auto& edit = ui_state_.atmosphere_edit;
+            edit.synchronize(system(), insp_idx);
+            auto& a = edit.values;
+            ui::section("Atmosphere", "Rayleigh and Mie scattering above the reference ellipsoid.");
+            ui::value_row("Terrain minimum", std::format("{:.3f} km", b.definition.height_range_km.x));
+            ImGui::TextWrapped("Optical coefficients are referenced to altitude zero; the model extends below it to cover terrain.");
+            edit.dirty |= ImGui::Checkbox("Enable atmosphere", &a.enabled);
+            ui::field("Height (km)", [&](const char* id) { edit.dirty |= ImGui::InputFloat(id, &a.height_km); });
+            ui::field("Rayleigh scale height (km)", [&](const char* id) { edit.dirty |= ImGui::InputFloat(id, &a.rayleigh_scale_height_km); });
+            ui::field("Mie scale height (km)", [&](const char* id) { edit.dirty |= ImGui::InputFloat(id, &a.mie_scale_height_km); });
+            ui::section("Optical coefficients", "Linear RGB coefficients in inverse kilometres.");
+            ui::field("Rayleigh scattering", [&](const char* id) { edit.dirty |= ImGui::InputFloat3(id, &a.rayleigh_scattering.x, "%.6f"); });
+            ui::field("Mie scattering", [&](const char* id) { edit.dirty |= ImGui::InputFloat3(id, &a.mie_scattering.x, "%.6f"); });
+            ui::field("Mie extinction", [&](const char* id) { edit.dirty |= ImGui::InputFloat3(id, &a.mie_extinction.x, "%.6f"); });
+            ui::field("Mie asymmetry", [&](const char* id) { edit.dirty |= ImGui::SliderFloat(id, &a.mie_asymmetry, -0.99f, 0.99f); });
+            ui::field("Ground albedo", [&](const char* id) { edit.dirty |= ImGui::ColorEdit3(id, &a.ground_albedo.x, ImGuiColorEditFlags_Float); });
+            if (ImGui::Button("Earth optical preset", ImVec2(-1.0f, 0.0f))) {
+                a = {};
+                a.enabled = true;
+                edit.dirty = true;
+            }
+            ImGui::BeginDisabled(!edit.dirty);
+            if (ImGui::Button("Apply atmosphere", ImVec2(-1.0f, 0.0f))) {
+                auto result = simulation_.apply(edit.command());
+                if (result) edit.reload(system(), insp_idx);
+                else edit.error = result.error;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::Button("Revert atmosphere", ImVec2(-1.0f, 0.0f))) edit.reload(system(), insp_idx);
+            ImGui::BeginDisabled(edit.dirty || !sys_mgr_.system_exists(system().name()));
+            if (ImGui::Button("Save atmosphere to system", ImVec2(-1.0f, 0.0f))) {
+                try {
+                    auto saved = sys_mgr_.load_system(system().name());
+                    int index = saved.definition.find_body(system().body(insp_idx).definition.name);
+                    bool ok = index >= 0;
+                    if (ok) {
+                        saved.definition.bodies[index].atmosphere = system().body(insp_idx).definition.atmosphere;
+                        ok = sys_mgr_.save_system(system().name(), saved.definition);
+                    }
+                    edit.error = ok ? "Atmosphere saved to system.json." : "Unable to save atmosphere.";
+                } catch (const std::exception& error) {
+                    edit.error = error.what();
+                }
+            }
+            ImGui::EndDisabled();
+            if (!edit.error.empty()) ImGui::TextWrapped("%s", edit.error.c_str());
+            ImGui::TextDisabled("Composition and refraction will follow in later stages.");
+            ImGui::EndChild();
+            ImGui::EndTabItem();
         }
 
         ImGui::EndTabBar();

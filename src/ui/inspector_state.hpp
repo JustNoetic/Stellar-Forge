@@ -53,6 +53,28 @@ struct CreateSystemDraft {
     }
 };
 
+struct AtmosphereEditDraft {
+    int body_index = -1;
+    uint64_t generation = 0, revision = 0;
+    ephemeris::AtmosphereDefinition values;
+    bool dirty = false;
+    std::string error;
+
+    void reload(const ephemeris::SystemSnapshot& snapshot, int index) {
+        body_index = index;
+        generation = snapshot.generation();
+        revision = snapshot.body(index).revisions.definition;
+        values = snapshot.body(index).definition.atmosphere;
+        dirty = false;
+        error.clear();
+    }
+    void synchronize(const ephemeris::SystemSnapshot& snapshot, int index) {
+        if (generation != snapshot.generation() || body_index != index ||
+            (!dirty && revision != snapshot.body(index).revisions.definition)) reload(snapshot, index);
+    }
+    ephemeris::ApplyBodyAtmosphere command() const { return {generation, body_index, revision, values}; }
+};
+
 struct BodyEditDraft {
     int body_index = -1;
     uint64_t system_generation = 0;
@@ -393,6 +415,7 @@ struct WorkspaceState {
     int inspector_frame = 0;
     BodyEditDraft body_draft{};
     RingEditState ring_edit{};
+    AtmosphereEditDraft atmosphere_edit{};
     AddBodyDraft add_body{};
     DeleteBodyPrompt delete_prompt{};
     CreateSystemDraft create_system{};

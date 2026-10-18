@@ -285,6 +285,12 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
         b.mass_msun = j.value("m", 0.0);
         b.radius_rsun = j.value("r", 1.0);
         b.oblateness = j.value("oblateness", 0.0);
+        if (j.contains("height_range_km")) {
+            const auto& range = j.at("height_range_km");
+            if (!range.is_array() || range.size() != 2) throw std::invalid_argument("height_range_km must contain minimum and maximum heights.");
+            b.height_range_km = {range.at(0).get<double>(), range.at(1).get<double>()};
+        }
+        if (j.contains("atmosphere")) b.atmosphere = j.at("atmosphere").get<AtmosphereDefinition>();
         b.j2 = j.value("J2", 0.0);
         b.j4 = j.value("j4", 0.0);
 
@@ -535,6 +541,8 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
         serialize_body_rings(j, b);
+        j["atmosphere"] = b.atmosphere;
+        j["height_range_km"] = {b.height_range_km.x, b.height_range_km.y};
         if (b.is_star) {
             if (!j.contains("star_props") || !j["star_props"].is_object()) {
                 j["star_props"] = nlohmann::json::object();
@@ -659,6 +667,8 @@ nlohmann::json SystemManager::serialize_snapshot_to_nbody(const SystemSnapshot& 
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
         serialize_body_rings(j, b);
+        j["atmosphere"] = b.atmosphere;
+        j["height_range_km"] = {b.height_range_km.x, b.height_range_km.y};
 
         if (b.parent_idx < 0) {
             j["motion_model"] = "n_body";

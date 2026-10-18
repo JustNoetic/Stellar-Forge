@@ -56,6 +56,7 @@ struct Patch {
 
 struct Selection {
     std::vector<Patch> patches;
+    std::vector<TileId> required_tiles;
     double max_error_pixels = 0.0;
     uint32_t deepest_level = 0;
     uint32_t visited = 0;

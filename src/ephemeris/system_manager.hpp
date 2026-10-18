@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/coordinates.hpp"
+#include "ephemeris/atmosphere.hpp"
 #include "core/units.hpp"
 #include "physics/star_calc.hpp"
 #include <memory>
@@ -94,6 +95,8 @@ struct BodyDefinition {
     std::optional<double> ring_texture_inner;
     std::optional<double> ring_texture_outer;
     std::vector<RingLayerDefinition> rings;
+    AtmosphereDefinition atmosphere;
+    glm::dvec2 height_range_km{0.0};
 
     glm::dvec3 pole_ecl{0.0, 0.0, 1.0};
     nlohmann::json source_json;
@@ -101,6 +104,12 @@ struct BodyDefinition {
     double radius_au() const noexcept {
         double physical = radius_rsun * SOLAR_RADII_TO_AU;
         return is_black_hole ? 2.5980762 * physical : physical;
+    }
+
+    bool valid_height_range() const noexcept {
+        return std::isfinite(height_range_km.x) && std::isfinite(height_range_km.y) &&
+            height_range_km.x <= height_range_km.y &&
+            height_range_km.x > -radius_au()*AU_TO_KM*glm::clamp(1.0-oblateness, 0.05, 1.0);
     }
 };
 

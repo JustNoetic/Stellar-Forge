@@ -73,6 +73,7 @@ public:
     const TerrainStats& stats() const noexcept { return stats_; }
     void set_height_source(std::string body, std::shared_ptr<const HeightSource> source);
     float relief_extent_au(uint32_t body) const noexcept;
+    double minimum_height_km(const ephemeris::BodyDefinition& body, const rendering::RenderSettings& settings) const noexcept;
 
 private:
     struct DrawPatch {
@@ -100,7 +101,6 @@ private:
         Selection selection;
         Selection desired;
         std::vector<PatchPlacement> placements;
-        std::vector<TileId> ancestors;
         std::vector<DrawPatch> draws;
         glm::dvec3 draw_center{0};
         glm::dmat3 draw_rotation{1};

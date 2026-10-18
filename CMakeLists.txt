@@ -322,6 +322,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/rendering/celestial_renderer.cpp
+        src/rendering/atmosphere_renderer.cpp
         src/rendering/ring_optics.cpp
         src/rendering/ring_renderer.cpp
         src/terrain/quadtree.cpp
@@ -342,6 +343,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
     target_link_libraries(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
     target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
     add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
+    add_test(NAME atmosphere_rendering_contracts COMMAND StellarRenderingTests --atmospheres-only)
     add_test(NAME eclipse_optics_gpu_contracts COMMAND StellarRenderingTests --eclipse-lighting)
     add_test(NAME smooth_surface_contracts COMMAND StellarRenderingTests --smooth-surfaces)
     if(Python3_Interpreter_FOUND)

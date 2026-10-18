@@ -120,6 +120,8 @@
   },
   {
     "name": "Earth",
+    "height_range_km": [-10.984, 8.848],
+    "atmosphere": {"enabled": true},
     "type": "Terrestrial",
     "color": "#2c6cff",
     "parentId": "Sun",

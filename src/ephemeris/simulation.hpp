@@ -92,6 +92,13 @@ struct AddBody {
     double axial_tilt_deg = 0.0;
 };
 
+struct ApplyBodyAtmosphere {
+    uint64_t system_generation = 0;
+    int body_index = -1;
+    uint64_t expected_body_revision = 0;
+    AtmosphereDefinition values;
+};
+
 struct DeleteBody {
     uint64_t system_generation = 0;
     int body_index = -1;
@@ -124,6 +131,7 @@ public:
     CommandResult apply(SetMotionModel command);
     CommandResult apply(const ApplyBodyPhysicalProperties& command);
     CommandResult apply(const ApplyBodyRings& command);
+    CommandResult apply(const ApplyBodyAtmosphere& command);
     CommandResult apply(const AddBody& command);
     CommandResult apply(const DeleteBody& command);
     CommandResult apply(JumpToTime command);

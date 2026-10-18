@@ -220,6 +220,7 @@
     "lum_pole": 0.0,
     "m": 3.0034896154649684e-06,
     "name": "Earth",
+    "atmosphere": {"enabled": true},
     "oblateness": 0.00335,
     "omega": 114.207,
     "parentId": "Sun",

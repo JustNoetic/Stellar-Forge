@@ -1,0 +1,18 @@
+#version 460
+#include "common/atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D output_lut;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, TRANSMITTANCE_SIZE))) return;
+    vec3 p, d;
+    transmittance_ray(vec2(pixel)/vec2(TRANSMITTANCE_SIZE-1), p, d);
+    float distance = max(sphere_roots(p, d, top_radius()).y, 0.0);
+    vec3 optical_depth = vec3(0.0);
+    for (int i = 0; i < 64; ++i) {
+        vec3 r, m, e;
+        medium(p+d*(float(i)+0.5)*distance/64.0, r, m, e);
+        optical_depth += e*distance/64.0;
+    }
+    imageStore(output_lut, pixel, vec4(exp(-optical_depth), 1.0));
+}

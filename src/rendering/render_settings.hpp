@@ -28,6 +28,7 @@ struct RenderSettings {
     float terrain_height_km = 2.0f;
     uint32_t terrain_patch_limit = 1024;
     bool show_rings = true;
+    bool show_atmospheres = true;
     bool ring_shadows_enabled = true;
     bool eclipse_reference_smoothstep = false;
     bool ring_shadow_reference_all_hosts = false;

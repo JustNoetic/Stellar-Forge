@@ -2,6 +2,7 @@
 
 #include "core/camera.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
@@ -53,6 +54,10 @@ public:
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
+    const AtmosphereStats& atmosphere_stats() const noexcept { return atmospheres_.stats(); }
+    void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
+        atmospheres_.composite(cmd, ctx, color, depth);
+    }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
     std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
@@ -87,6 +92,8 @@ private:
     terrain::TerrainRenderer terrain_;
     terrain::SurfaceTextures textures_;
     RingRenderer rings_;
+    AtmosphereRenderer atmospheres_;
+    std::vector<float> atmosphere_minima_;
 };
 
 } // namespace sf::rendering
