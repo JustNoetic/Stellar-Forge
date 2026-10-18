@@ -29,6 +29,7 @@ layout(location = 3) out float f_subpixel_factor;
 layout(location = 4) flat out uint f_body_idx;
 layout(location = 5) flat out vec4 f_tile_color;
 layout(location = 6) out vec2 f_tile_uv;
+layout(location = 7) out vec3 f_base_chord;
 
 dvec3 cube_vector(uint face, dvec2 uv) {
     return terrain_cube_vector(face, uv);
@@ -61,6 +62,7 @@ void main() {
     double width = 2.0 / double(1u << level);
     dvec2 uv = -1.0 + (dvec2(tile.address.zw) + dvec2(grid) / 16.0) * width;
     dvec3 point = surface(tile, uv);
+    dvec3 base_chord = normalize(cube_vector(tile.address.x, uv));
     uint mask = tile.metadata.y;
     bool coarse_edge = (grid.y == 0u && (mask & 1u) != 0u)
                     || (grid.x == 16u && (mask & 2u) != 0u)
@@ -72,11 +74,16 @@ void main() {
         double error = parent_width * parent_width * tile.rotation_error.w / max(length(point - tile.eye.xyz), 1e-12);
         double morph = clamp(error - 1.0, 0.0, 1.0);
         point = mix(parent_surface(tile, uv, effective_level), point, morph);
+        PatchGPU base_tile = tile;
+        base_tile.rotation_height.w = 0.0;
+        dvec3 parent_base = parent_surface(base_tile, uv, effective_level)/dvec3(1.0, tile.anchor_polar_ratio.w, 1.0);
+        base_chord = mix(parent_base, base_chord, morph);
     }
     dmat3 rotation = dmat3(tile.rotation_height.xyz, tile.rotation_error.xyz, tile.rotation_reserved.xyz);
     dvec3 relative = tile.anchor_radius.xyz + rotation * ((point - tile.anchor_polar_ratio.xyz) * tile.anchor_radius.w);
     f_world_pos = vec3(relative);
     f_local_pos = vec3(normalize(cube_vector(tile.address.x, uv)));
+    f_base_chord = vec3(base_chord);
     double e = 0.0001;
     dvec3 du = surface(tile, uv + dvec2(e, 0.0)) - surface(tile, uv - dvec2(e, 0.0));
     dvec3 dv = surface(tile, uv + dvec2(0.0, e)) - surface(tile, uv - dvec2(0.0, e));

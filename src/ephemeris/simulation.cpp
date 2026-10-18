@@ -44,6 +44,7 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
         if (body.name.empty() || !definition.name_to_idx.emplace(body.name, static_cast<int>(i)).second ||
             body.parent_idx < -1 || body.parent_idx >= static_cast<int>(i) ||
             !valid_physical(BodyPhysicalProperties::from(body)) || !valid_atmosphere(body.atmosphere) || !body.valid_height_range() ||
+            (body.atmosphere.enabled && body.atmosphere.physical && body.mass_msun <= 0) ||
             (body.atmosphere.enabled && (body.is_star || body.is_black_hole || body.is_spacecraft)) ||
             !finite_vector(motion.position.value) || !finite_vector(motion.velocity.value) ||
             !std::isfinite(body.radius_au()) || body.radius_au() <= 0.0 ||
@@ -228,6 +229,8 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     }
     const auto& old = snapshot_.definition_->bodies[index];
     auto values = command.values;
+    if (old.atmosphere.enabled && old.atmosphere.physical && values.mass.value <= 0)
+        return {false, false, "A hydrostatic atmosphere requires positive body mass."};
     if (old.is_black_hole) {
         if (values.mass.value <= 0.0) return {false, false, "Black hole mass must be positive."};
         values.radius = units::Kilometres{2.95325008 * values.mass.value};
@@ -240,6 +243,8 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     auto before = BodyPhysicalProperties::from(old);
     if (old.height_range_km.x <= -radius_au*AU_TO_KM*std::clamp(1.0-values.oblateness, 0.05, 1.0))
         return {false, false, "The edited radius or oblateness places the established terrain minimum beyond the body centre."};
+    if (old.atmosphere.bottom_altitude_km <= -radius_au*AU_TO_KM*.25)
+        return {false, false, "The edited radius places the atmospheric lower boundary outside the supported domain."};
     if (before == values) return {};
 
     auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
@@ -446,15 +451,20 @@ CommandResult Simulation::apply(const ApplyBodyAtmosphere& command) {
     const auto& old = snapshot_.definition_->bodies[index];
     if (old.is_star || old.is_black_hole || old.is_spacecraft)
         return {false, false, "Atmospheres are available on planetary bodies only."};
-    if (!valid_atmosphere(command.values))
-        return {false, false, "Invalid atmosphere: check heights, nonnegative coefficients, extinction >= scattering, albedo and asymmetry."};
+    if (!valid_atmosphere(command.values) || command.values.bottom_altitude_km <= -old.radius_au()*AU_TO_KM*.25 ||
+        (command.values.enabled && command.values.physical && old.mass_msun <= 0))
+        return {false, false, "Invalid atmosphere: check pressure, temperature, composition, temperature layers, optics and positive body mass."};
     if (old.atmosphere == command.values) return {};
+    bool geometry_changed = old.atmosphere.pressure_reference != command.values.pressure_reference ||
+        old.atmosphere.bottom_altitude_km != command.values.bottom_altitude_km;
     auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
     updated->bodies[index].atmosphere = command.values;
     snapshot_.definition_ = std::move(updated);
     ++snapshot_.revisions_[index].definition;
     ++snapshot_.revisions_[index].lighting;
+    if (geometry_changed) ++snapshot_.revisions_[index].geometry;
     ++snapshot_.definition_revision_;
+    prepare_render_state(true);
     return {true, true, {}};
 }
 
@@ -467,6 +477,7 @@ CommandResult Simulation::apply(const AddBody& command) {
     }
     const auto& def = command.definition;
     if (!valid_atmosphere(def.atmosphere) || !def.valid_height_range() ||
+        (def.atmosphere.enabled && def.atmosphere.physical && def.mass_msun <= 0) ||
         (def.atmosphere.enabled && (def.is_star || def.is_black_hole || def.is_spacecraft)))
         return {false, false, "Invalid atmosphere on the new body."};
     if (def.name.empty()) {
@@ -872,6 +883,14 @@ void Simulation::prepare_render_state(bool definitions_changed) {
     for (size_t i = 0; i < snapshot_.size(); ++i) {
         auto& render = snapshot_.render_[i];
         const auto& body = snapshot_.definition_->bodies[i];
+        if (definitions_changed) {
+            if (body.atmosphere.enabled && body.atmosphere.physical) {
+                double radius = body.radius_au()*AU_TO_KM;
+                if (!render.atmosphere || render.atmosphere->inputs != body.atmosphere ||
+                    render.atmosphere->mass_solar != body.mass_msun || render.atmosphere->radius_km != radius)
+                    render.atmosphere = physics::prepare_atmosphere(body.atmosphere, body.mass_msun, radius);
+            } else render.atmosphere.reset();
+        }
         render.position = ecliptic_to_render(snapshot_.motions_[i].position);
         render.velocity = ecliptic_to_render(snapshot_.motions_[i].velocity);
         if (definitions_changed) render.pole = glm::normalize(ecliptic_to_render(body.pole_ecl));

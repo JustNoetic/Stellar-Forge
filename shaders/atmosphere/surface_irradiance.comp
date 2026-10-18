@@ -1,0 +1,44 @@
+#version 460
+#include "common/atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2DArray surface_lut;
+layout(push_constant) uniform SurfacePush { uint layer; } push;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(128, 32)))) return;
+    vec2 uv = vec2(pixel)/vec2(127, 31);
+    float signed_mu = uv.x*2.0-1.0;
+    float mu = signed_mu*abs(signed_mu);
+    vec3 sun = vec3(sqrt(max(1.0-mu*mu, 0.0)), 0.0, mu);
+    vec3 p = vec3(0.0, 0.0, mix(bottom_radius()+0.001, top_radius()-0.001, uv.y*uv.y));
+    imageStore(surface_lut, ivec3(pixel, int(push.layer)*2), vec4(sun_transmittance(transmittance_lut, p, sun), 1.0));
+    vec3 irradiance = vec3(0.0);
+    for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) {
+        float z = sqrt((float(j)+0.5)/4.0);
+        float phi = 2.0*ATM_PI*(float(k)+0.5)/4.0;
+        vec3 d = vec3(sqrt(1.0-z*z)*cos(phi), sqrt(1.0-z*z)*sin(phi), z);
+        vec2 segment = atmosphere_segment(p, d);
+        float dt = (segment.y-segment.x)/32.0;
+        vec3 L = vec3(0.0), T = vec3(1.0);
+        for (int step = 0; step < 32; ++step) {
+            float start = segment.x+float(step)*dt;
+            int subdivisions = transport_subdivisions(p, d, start, dt);
+            float cell = dt/float(subdivisions);
+            for (int j = 0; j < subdivisions; ++j) {
+                vec3 q = p+d*(start+(float(j)+0.5)*cell);
+                vec3 r, m, e;
+                medium(q, r, m, e);
+                float cosine = dot(d, sun);
+                vec3 source = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(cosine)+aerosol_source(q, cosine));
+                source += textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
+                L += T*source*segment_integral(e, cell);
+                T *= exp(-e*cell);
+            }
+        }
+        irradiance += L*(ATM_PI/16.0);
+    }
+    imageStore(surface_lut, ivec3(pixel, int(push.layer)*2+1), vec4(irradiance, 1.0));
+}

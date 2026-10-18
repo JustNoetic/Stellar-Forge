@@ -4,6 +4,7 @@
 #include "rendering/render_settings.hpp"
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
+#include "rendering/transparency_renderer.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
 #include "terrain/terrain_renderer.hpp"
@@ -54,14 +55,19 @@ public:
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
+    const terrain::TextureStats& normal_stats() const noexcept { return normals_.stats(); }
     const AtmosphereStats& atmosphere_stats() const noexcept { return atmospheres_.stats(); }
     void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
-        atmospheres_.composite(cmd, ctx, color, depth);
+        auto writes = transparency_.writes();
+        atmospheres_.composite(cmd, ctx, color, depth, transparency_.active() ? std::span{writes} : std::span<const rhi::PushDescriptorWrite>{});
+        transparency_.resolve(cmd, ctx, color);
     }
+    const TransparencyRenderer& transparency() const noexcept { return transparency_; }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
     std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
     void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
+        normals_.set_height_source(body, source);
         terrain_.set_height_source(std::move(body), std::move(source));
     }
     void invalidate_ring_textures() noexcept { rings_.invalidate_texture_cache(); }
@@ -91,8 +97,10 @@ private:
     rhi::Pipeline point_pipeline_{};
     terrain::TerrainRenderer terrain_;
     terrain::SurfaceTextures textures_;
+    terrain::SurfaceTextures normals_;
     RingRenderer rings_;
     AtmosphereRenderer atmospheres_;
+    TransparencyRenderer transparency_;
     std::vector<float> atmosphere_minima_;
 };
 

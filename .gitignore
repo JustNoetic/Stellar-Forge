@@ -31,6 +31,8 @@ tests/*
 !tests/terrain_signed_fixture.json
 !tests/terrain_gpu_tests.hpp
 !tests/atmosphere_gpu_tests.hpp
+!tests/particle_optics_tests.hpp
+!tests/atmosphere_migration_tests.py
 !tests/ring_gpu_tests.hpp
 !tests/rendering_tests.cpp
 !tests/benchmark_comparison_tests.py
@@ -40,5 +42,6 @@ tests/*
 !tests/orbit_tests.cpp
 !tests/star_calc_tests.cpp
 !tests/state_tests.cpp
+!shaders/tests/surface_depth.comp
 !tests/fixtures/**
 __pycache__/

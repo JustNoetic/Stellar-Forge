@@ -11,10 +11,12 @@ layout(location = 1) out vec3 f_local_pos;
 layout(location = 2) out vec3 f_normal;
 layout(location = 3) out float f_subpixel_factor;
 layout(location = 4) flat out uint f_body_idx;
+layout(location = 7) out vec3 f_base_chord;
 
 void main() {
     uint idx = gl_InstanceIndex;
     f_body_idx = idx;
+    f_base_chord = in_position;
     BodyInstanceGPU b = bodies[idx];
 
     vec3 center = b.pos_radius.xyz;

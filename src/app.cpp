@@ -214,11 +214,7 @@ void App::apply_ephemeris_system() {
 
     ephemeris::LoadedSystem tmpl{};
     try {
-        if (sys_mgr_.system_exists("Ephemeris Mode")) {
-            tmpl = sys_mgr_.load_system("Ephemeris Mode");
-        } else {
-            tmpl = sys_mgr_.load_system(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
-        }
+        tmpl = sys_mgr_.load_system(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
     } catch (const std::exception& e) {
         simulation_error_ = e.what();
         return;
@@ -534,7 +530,9 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     {
         ScopedTimer timer(sample ? &sample->cpu_orbits_ms : nullptr);
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_orbits") : UINT32_MAX;
-        orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+        auto transparency_writes = celestial_renderer_.transparency().writes();
+        orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext,
+            celestial_renderer_.transparency().active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{});
         vk_.end_gpu_timer(cmd, id);
     }
 
@@ -963,6 +961,16 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
                 ImGui::SliderFloat(id, &render_draft.orbit_opacity, 0.0f, 1.0f, "%.2f");
             });
             ImGui::Checkbox("Atmospheres", &render_draft.show_atmospheres);
+            ImGui::Checkbox("Atmospheric surface lighting", &render_draft.atmosphere_surface_lighting);
+            ImGui::Checkbox("Dual-source atmosphere blending", &render_draft.atmosphere_dual_source);
+            ImGui::Checkbox("Aerial perspective", &render_draft.aerial_perspective_enabled);
+            ImGui::BeginDisabled(!render_draft.aerial_perspective_enabled);
+            const char* aerial_models[] = {"Frustum Volume", "Bruneton (Precomputed 4D)"};
+            int current_aerial_model = render_draft.aerial_perspective_bruneton ? 1 : 0;
+            if (ImGui::Combo("Aerial Model##aerial_model", &current_aerial_model, aerial_models, 2)) {
+                render_draft.aerial_perspective_bruneton = (current_aerial_model == 1);
+            }
+            ImGui::EndDisabled();
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
@@ -970,6 +978,7 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ui::section("Planet Surfaces", "Quadtree ellipsoids, imported maps and optional synthetic relief");
             ImGui::Checkbox("Surface Textures", &render_draft.surface_textures_enabled);
             ImGui::Checkbox("Imported Elevation", &render_draft.terrain_imported_enabled);
+            ImGui::Checkbox("Detailed Terrain Shading", &render_draft.terrain_normal_maps_enabled);
             ImGui::Checkbox("Synthetic Terrain Preview", &render_draft.terrain_enabled);
             ImGui::Checkbox("Terrain Tile Colors", &render_draft.terrain_debug_tiles);
             ImGui::Checkbox("FP64 Terrain Reference", &render_draft.terrain_reference_fp64);
@@ -2038,23 +2047,121 @@ void App::render_body_inspector() {
             auto& edit = ui_state_.atmosphere_edit;
             edit.synchronize(system(), insp_idx);
             auto& a = edit.values;
-            ui::section("Atmosphere", "Rayleigh and Mie scattering above the reference ellipsoid.");
-            ui::value_row("Terrain minimum", std::format("{:.3f} km", b.definition.height_range_km.x));
-            ImGui::TextWrapped("Optical coefficients are referenced to altitude zero; the model extends below it to cover terrain.");
-            edit.dirty |= ImGui::Checkbox("Enable atmosphere", &a.enabled);
-            ui::field("Height (km)", [&](const char* id) { edit.dirty |= ImGui::InputFloat(id, &a.height_km); });
-            ui::field("Rayleigh scale height (km)", [&](const char* id) { edit.dirty |= ImGui::InputFloat(id, &a.rayleigh_scale_height_km); });
-            ui::field("Mie scale height (km)", [&](const char* id) { edit.dirty |= ImGui::InputFloat(id, &a.mie_scale_height_km); });
-            ui::section("Optical coefficients", "Linear RGB coefficients in inverse kilometres.");
-            ui::field("Rayleigh scattering", [&](const char* id) { edit.dirty |= ImGui::InputFloat3(id, &a.rayleigh_scattering.x, "%.6f"); });
-            ui::field("Mie scattering", [&](const char* id) { edit.dirty |= ImGui::InputFloat3(id, &a.mie_scattering.x, "%.6f"); });
-            ui::field("Mie extinction", [&](const char* id) { edit.dirty |= ImGui::InputFloat3(id, &a.mie_extinction.x, "%.6f"); });
-            ui::field("Mie asymmetry", [&](const char* id) { edit.dirty |= ImGui::SliderFloat(id, &a.mie_asymmetry, -0.99f, 0.99f); });
-            ui::field("Ground albedo", [&](const char* id) { edit.dirty |= ImGui::ColorEdit3(id, &a.ground_albedo.x, ImGuiColorEditFlags_Float); });
-            if (ImGui::Button("Earth optical preset", ImVec2(-1.0f, 0.0f))) {
-                a = {};
-                a.enabled = true;
+            ui::section("Atmosphere", "Set the gas conditions and the dust or haze suspended in it.");
+            if (ImGui::Checkbox("Enable atmosphere", &a.enabled)) {
                 edit.dirty = true;
+                if (a.enabled) edit.use_calculated_properties();
+            }
+            if (a.enabled) {
+                ui::section("Surface conditions");
+                if (a.pressure_reference) {
+                    ui::value_row("Pressure datum", "Body radius (altitude zero)");
+                    ui::value_row("Modeled lower boundary", std::format("{:.1f} km", a.bottom_altitude_km));
+                }
+                double pressure_atm = a.pressure_pa/101325.0;
+                ui::field(a.pressure_reference ? "Reference pressure (atm)" : "Surface pressure (atm)", [&](const char* id) {
+                    if (ImGui::InputDouble(id, &pressure_atm, 0, 0, "%.6g")) {
+                        a.pressure_pa = pressure_atm*101325.0;
+                        edit.use_calculated_properties();
+                    }
+                });
+                ui::field(a.pressure_reference ? "Reference temperature (K)" : "Surface temperature (K)", [&](const char* id) {
+                    if (ImGui::InputDouble(id, &a.temperature_k, 0, 0, "%.2f")) {
+                        for (auto& knot : a.temperature_layers) if (knot.x == 0) knot.y = a.temperature_k;
+                        edit.use_calculated_properties();
+                    }
+                });
+                ui::section("Gas composition", "Percentages total 100%. Changing one adjusts the other gases.");
+                static constexpr const char* gas_names[] = {"Nitrogen", "Oxygen", "Argon", "Carbon dioxide", "Methane",
+                    "Hydrogen", "Helium", "Water vapor", "Ammonia", "Ozone", "Sulfur dioxide"};
+                for (size_t i = 0; i < physics::ATMOSPHERIC_GASES.size(); ++i) {
+                    const auto& gas = physics::ATMOSPHERIC_GASES[i];
+                    auto found = a.composition.find(gas.name);
+                    if (found == a.composition.end()) continue;
+                    double total = 0;
+                    for (const auto& [_, weight] : a.composition) total += weight;
+                    double percentage = total > 0 ? found->second/total*100.0 : 0.0;
+                    ui::field(std::format("{} ({}) %", gas_names[i], gas.name), [&](const char* id) {
+                        if (ImGui::InputDouble(id, &percentage, 0, 0, "%.6g")) edit.set_gas_percentage(gas.name, percentage);
+                    });
+                }
+                if (ImGui::BeginCombo("Add gas", "Choose a gas...")) {
+                    for (size_t i = 0; i < physics::ATMOSPHERIC_GASES.size(); ++i) {
+                        const auto& gas = physics::ATMOSPHERIC_GASES[i];
+                        if (!a.composition.contains(gas.name) && ImGui::Selectable(std::format("{} ({})", gas_names[i], gas.name).c_str())) {
+                            a.composition[gas.name] = 0.0;
+                            edit.use_calculated_properties();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::BeginDisabled(a.composition.size() <= 1);
+                if (ImGui::BeginCombo("Remove gas", "Choose a gas...")) {
+                    for (size_t i = 0; i < physics::ATMOSPHERIC_GASES.size(); ++i) {
+                        const auto& gas = physics::ATMOSPHERIC_GASES[i];
+                        if (a.composition.contains(gas.name) && ImGui::Selectable(std::format("{} ({})", gas_names[i], gas.name).c_str()))
+                            edit.remove_gas(gas.name);
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::EndDisabled();
+                ui::section("Dust and haze", "Particles are independent of the gas mixture. Optical depth describes the column above the modeled lower boundary at 550 nm.");
+                if (!a.automatic_aerosols) {
+                    ImGui::TextWrapped("Imported custom optical coefficients are preserved.");
+                    if (ImGui::Button("Replace with particle layers")) {
+                        a.automatic_aerosols = true;
+                        a.aerosols.clear();
+                        edit.use_calculated_properties();
+                    }
+                } else {
+                    int remove = -1;
+                    static constexpr const char* materials[] = {"mineral_dust", "organic_haze", "water", "ice", "sulfate",
+                        "ammonia_ice", "ammonium_hydrosulfide", "methane_ice", "hydrogen_sulfide_ice"};
+                    static constexpr const char* labels[] = {"Mineral dust", "Organic haze", "Water droplets", "Ice particles", "Sulfate droplets",
+                        "Ammonia ice", "Ammonium hydrosulfide", "Methane ice", "Hydrogen sulfide ice"};
+                    for (size_t layer_index = 0; layer_index < a.aerosols.size(); ++layer_index) {
+                        ImGui::PushID(int(layer_index));
+                        auto& layer = a.aerosols[layer_index];
+                        int material = 0;
+                        for (int k = 0; k < 9; ++k) if (layer.material == materials[k]) material = k;
+                        ui::field("Particle material", [&](const char* id) {
+                            if (ImGui::Combo(id, &material, labels, 9)) { layer.material = materials[material]; edit.use_calculated_properties(); }
+                        });
+                        auto input = [&](const char* label, double& value) {
+                            ui::field(label, [&](const char* id) {
+                                if (ImGui::InputDouble(id, &value, 0, 0, "%.5g")) edit.use_calculated_properties();
+                            });
+                        };
+                        input("Optical depth (550 nm)", layer.optical_depth_550);
+                        input("Effective particle radius (um)", layer.effective_radius_um);
+                        input("Size variance", layer.effective_variance);
+                        bool detached = layer.width_km > 0;
+                        if (ImGui::Checkbox("Detached layer", &detached)) {
+                            layer.width_km = detached ? 10.0 : 0.0;
+                            layer.peak_km = detached ? 50.0 : 0.0;
+                            edit.use_calculated_properties();
+                        }
+                        if (detached) { input("Peak altitude (km)", layer.peak_km); input("Layer width (km)", layer.width_km); }
+                        else input("Particle scale height (km)", layer.scale_height_km);
+                        if (ImGui::Button("Remove layer")) remove = int(layer_index);
+                        ImGui::PopID();
+                    }
+                    if (remove >= 0) { a.aerosols.erase(a.aerosols.begin()+remove); edit.use_calculated_properties(); }
+                    ImGui::BeginDisabled(a.aerosols.size() >= ephemeris::MAX_AEROSOL_LAYERS);
+                    if (ImGui::Button("Add particle layer")) {
+                        a.aerosols.push_back({"water", .05, .1, .2, 1.2});
+                        edit.use_calculated_properties();
+                    }
+                    ImGui::EndDisabled();
+                    if (a.aerosols.empty()) ImGui::TextWrapped("Clear gas: no dust or haze layers.");
+                }
+                ui::section("Calculated properties", edit.dirty ? "Apply your changes to update these values." : "Based on the atmosphere and the planet's gravity.");
+                if (auto prepared = b.render.atmosphere) {
+                    ui::value_row("Air density", std::format("{:.4g} kg/m3", prepared->surface.density_kg_m3));
+                    ui::value_row("Gravity", std::format("{:.3f} m/s2", prepared->surface.gravity_m_s2));
+                    ui::value_row("Atmosphere thickness", std::format("{:.2f} km", prepared->height_km));
+                    ui::value_row("Density scale height", std::format("{:.2f} km", prepared->surface.scale_height_km));
+                } else ImGui::TextWrapped("Apply to calculate the atmosphere from these inputs.");
             }
             ImGui::BeginDisabled(!edit.dirty);
             if (ImGui::Button("Apply atmosphere", ImVec2(-1.0f, 0.0f))) {
@@ -2081,7 +2188,6 @@ void App::render_body_inspector() {
             }
             ImGui::EndDisabled();
             if (!edit.error.empty()) ImGui::TextWrapped("%s", edit.error.c_str());
-            ImGui::TextDisabled("Composition and refraction will follow in later stages.");
             ImGui::EndChild();
             ImGui::EndTabItem();
         }

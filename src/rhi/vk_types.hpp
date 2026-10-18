@@ -176,6 +176,7 @@ struct GraphicsPipelineDesc {
     bool alpha_blend = false;
     bool premultiplied_blend = false;
     bool additive_blend = false;
+    bool dual_source_blend = false;
     bool bresenham_lines = false;
     bool capture_statistics = false;
     VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;

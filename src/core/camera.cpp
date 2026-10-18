@@ -214,7 +214,7 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
         } else {
             const auto& b = sys.body(tracking_idx);
             origin_render = b.render.position.value;
-            track_r = b.definition.radius_au();
+            track_r = b.definition.opaque_radius_au();
             track_f = b.definition.oblateness;
             track_pole = b.render.pole;
         }

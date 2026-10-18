@@ -184,6 +184,7 @@ if(STELLAR_BUILD_TESTS)
     add_test(NAME benchmark_contracts COMMAND StellarBenchmarkTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/benchmark-contracts")
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME atmosphere_migration_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/atmosphere_migration_tests.py")
         add_test(NAME terrain_contracts COMMAND StellarTerrainTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt")
         add_test(NAME terrain_importer_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/terrain_import_tests.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests")
@@ -323,6 +324,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/physics/star_calc.cpp
         src/rendering/celestial_renderer.cpp
         src/rendering/atmosphere_renderer.cpp
+        src/rendering/transparency_renderer.cpp
         src/rendering/ring_optics.cpp
         src/rendering/ring_renderer.cpp
         src/terrain/quadtree.cpp
@@ -344,6 +346,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
     target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
     add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
     add_test(NAME atmosphere_rendering_contracts COMMAND StellarRenderingTests --atmospheres-only)
+    add_test(NAME transparency_rendering_contracts COMMAND StellarRenderingTests --transparency-only)
     add_test(NAME eclipse_optics_gpu_contracts COMMAND StellarRenderingTests --eclipse-lighting)
     add_test(NAME smooth_surface_contracts COMMAND StellarRenderingTests --smooth-surfaces)
     if(Python3_Interpreter_FOUND)
@@ -351,6 +354,9 @@ if(STELLAR_BUILD_RENDER_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt"
             "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/imported-gpu.json")
         set_tests_properties(terrain_imported_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture TIMEOUT 150)
+        add_test(NAME terrain_normal_contracts COMMAND StellarRenderingTests --terrain-normals
+            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt")
+        set_tests_properties(terrain_normal_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture TIMEOUT 150)
         if(STELLAR_SURFACE_FIXTURES_AVAILABLE)
             add_test(NAME surface_rendering_contracts COMMAND StellarRenderingTests --surface-contracts
                 "${CMAKE_CURRENT_SOURCE_DIR}/scratch/surface-tests/fixture-path.txt")
@@ -371,6 +377,7 @@ if(STELLAR_BUILD_RENDER_TESTS)
         src/ephemeris/system_manager.cpp
         src/physics/star_calc.cpp
         src/rendering/orbit_renderer.cpp
+        src/rendering/transparency_renderer.cpp
         src/rhi/shader_cache.cpp
         src/rhi/vk_context.cpp
     )

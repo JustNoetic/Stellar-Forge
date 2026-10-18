@@ -39,6 +39,7 @@ public:
     void consumed(TileId tile);
     StreamStats stats() const;
     const HeightSource& source() const noexcept { return *source_; }
+    std::shared_ptr<const HeightSource> share_source() const noexcept { return source_; }
 
 private:
     struct Ready {

@@ -1,0 +1,18 @@
+#version 460
+#include "common/celestial_scene.glsl"
+#include "common/surface_depth.glsl"
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 4) buffer Results {
+    vec4 depths[6];
+};
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    float local_z = (index % 2u == 0u ? 0.7 : -0.7);
+    BodyInstanceGPU b;
+    b.pos_radius = vec4(0.0, 0.0, -2.0, 1.0);
+    b.pole_oblateness = vec4(0.0, 1.0, 0.0, float(index / 2u) * 0.2);
+    vec3 position = vec3(0.0, 0.0, local_z - 2.0);
+    vec4 projected = u_scene.view_proj * vec4(position, 1.0);
+    float original = projected.z / projected.w;
+    depths[index] = vec4(curved_surface_depth(b, position, vec3(0.0, 0.0, local_z), original), original, 0.0, 0.0);
+}

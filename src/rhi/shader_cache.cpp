@@ -312,7 +312,17 @@ Pipeline ShaderCache::create_graphics_pipeline(VkContext& ctx, const GraphicsPip
     for (auto& b : blend_atts) {
         b.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        if (desc.alpha_blend) {
+        if (desc.dual_source_blend) {
+            if (!ctx.dual_source_blend_enabled() || blend_atts.size() != 1)
+                sf::log::fatal("Dual-source blending requires device support and one color attachment");
+            b.blendEnable = VK_TRUE;
+            b.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            b.dstColorBlendFactor = VK_BLEND_FACTOR_SRC1_COLOR;
+            b.colorBlendOp = VK_BLEND_OP_ADD;
+            b.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            b.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            b.alphaBlendOp = VK_BLEND_OP_ADD;
+        } else if (desc.alpha_blend) {
             b.blendEnable = VK_TRUE;
             b.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
             b.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;

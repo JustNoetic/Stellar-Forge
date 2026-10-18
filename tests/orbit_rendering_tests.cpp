@@ -1,5 +1,6 @@
 #include "ephemeris/simulation.hpp"
 #include "rendering/orbit_renderer.hpp"
+#include "rendering/transparency_renderer.hpp"
 #include "rhi/shader_cache.hpp"
 #include <GLFW/glfw3.h>
 #include <glm/gtc/packing.hpp>
@@ -45,6 +46,7 @@ struct Probe {
     GLFWwindow* window = nullptr;
     rhi::VkContext vk;
     rendering::OrbitRenderer renderer;
+    rendering::TransparencyRenderer transparency;
     rhi::Image color, depth;
     rhi::Buffer readback;
 
@@ -57,8 +59,9 @@ struct Probe {
         rhi::ShaderCache::init();
         vk.init(window, false);
         renderer.init(vk);
+        transparency.init(vk);
         color = vk.create_image_2d(extent.width, extent.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
         depth = vk.create_image_2d(extent.width, extent.height, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
         readback = vk.create_host_buffer(extent.width * extent.height * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
@@ -66,6 +69,7 @@ struct Probe {
     ~Probe() {
         vk.wait_idle();
         renderer.shutdown(vk);
+        transparency.shutdown(vk);
         vk.destroy_buffer(readback);
         vk.destroy_image(depth);
         vk.destroy_image(color);
@@ -78,14 +82,18 @@ struct Probe {
     std::vector<float> render(const ephemeris::SystemSnapshot& snapshot, const Camera& camera,
                               const rendering::RenderSettings& settings, float scene_depth = 0.0f) {
         vk.immediate_submit([&](VkCommandBuffer cmd) {
+            transparency.prepare(cmd, vk, extent, !settings.transparency_reference_legacy);
             vk.transition_image(cmd, color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             vk.transition_image(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
             auto color_attachment = rhi::RenderingAttachment::clear_color(color);
             auto depth_attachment = rhi::RenderingAttachment::clear_depth_reverse_z(depth, scene_depth);
             vk.begin_rendering(cmd, extent, {&color_attachment, 1}, &depth_attachment);
             vk.set_viewport_and_scissor(cmd, extent);
-            renderer.render(cmd, vk, camera, snapshot, settings, extent);
+            auto writes = transparency.writes();
+            renderer.render(cmd, vk, camera, snapshot, settings, extent,
+                transparency.active() ? std::span{writes} : std::span<const rhi::PushDescriptorWrite>{});
             vk.end_rendering(cmd);
+            transparency.resolve(cmd, vk, color);
             vk.transition_image(cmd, color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -126,6 +134,13 @@ int main() {
         rendering::RenderSettings settings;
         auto visible = probe.render(simulation.snapshot(), camera, settings);
         check(coverage(visible) > 250, "Osculating curve and reflex are visible");
+        auto statistics = probe.transparency.stats(probe.vk);
+        check(!probe.vk.fragment_stores_enabled() || (statistics.fragments >= coverage(visible) && statistics.overflow == 0),
+              "Real orbit shaders capture visible fragments without overflowing the shared resolver");
+        settings.transparency_reference_legacy = true;
+        auto legacy = probe.render(simulation.snapshot(), camera, settings);
+        check(coverage(visible) == coverage(legacy), "Orbit coverage is preserved by fragment capture and resolve");
+        settings.transparency_reference_legacy = false;
         check(coverage(probe.render(simulation.snapshot(), camera, settings, 1.0f)) == 0, "Opaque reverse-Z scene occludes orbit lines");
         settings.show_orbits = false;
         check(coverage(probe.render(simulation.snapshot(), camera, settings)) == 0, "Visibility toggle suppresses orbit lines");

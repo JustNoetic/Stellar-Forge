@@ -154,21 +154,32 @@ namespace {
 
 using LeafMap = std::unordered_map<uint64_t, size_t>;
 
-int neighbor(const LeafMap& leaves, TileId tile, uint32_t edge) {
-    double width = std::ldexp(2.0, -int(tile.level));
-    double u = -1.0 + (tile.x + 0.5) * width;
-    double v = -1.0 + (tile.y + 0.5) * width;
-    double step = width * 0.50001;
-    if (edge == 0) v -= step;
-    if (edge == 1) u += step;
-    if (edge == 2) v += step;
-    if (edge == 3) u -= step;
-    auto candidate = tile_at(cube_vector(tile.face, u, v), tile.level);
-    for (;;) {
-        if (auto found = leaves.find(candidate.key()); found != leaves.end()) return int(found->second);
-        if (candidate.level == 0) return -1;
-        candidate = candidate.parent();
+int coarser_neighbor(const LeafMap& leaves, TileId tile, uint32_t edge) {
+    if (tile.level == 0) return -1;
+    if (edge == 0 && (tile.y & 1)) return -1;
+    if (edge == 1 && !(tile.x & 1)) return -1;
+    if (edge == 2 && !(tile.y & 1)) return -1;
+    if (edge == 3 && (tile.x & 1)) return -1;
+    tile = tile.parent();
+    TileId candidate = tile;
+    uint32_t n = 1u << tile.level;
+    if (edge == 0 && tile.y > 0) --candidate.y;
+    else if (edge == 1 && tile.x + 1 < n) ++candidate.x;
+    else if (edge == 2 && tile.y + 1 < n) ++candidate.y;
+    else if (edge == 3 && tile.x > 0) --candidate.x;
+    else {
+        double width = std::ldexp(2.0, -int(tile.level));
+        double u = -1.0 + (tile.x + 0.5) * width;
+        double v = -1.0 + (tile.y + 0.5) * width;
+        double step = width * 0.50001;
+        if (edge == 0) v -= step;
+        if (edge == 1) u += step;
+        if (edge == 2) v += step;
+        if (edge == 3) u -= step;
+        candidate = tile_at(cube_vector(tile.face, u, v), tile.level);
     }
+    if (auto found = leaves.find(candidate.key()); found != leaves.end()) return int(found->second);
+    return -1;
 }
 
 }
@@ -238,8 +249,8 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
         nodes[index].scheduled = true;
         auto tile = nodes[index].candidate.tile;
         for (uint32_t edge = 0; edge < 4; ++edge) {
-            int other = neighbor(leaves, tile, edge);
-            if (other >= 0 && nodes[other].candidate.tile.level < tile.level) self(self, size_t(other));
+            int other = coarser_neighbor(leaves, tile, edge);
+            if (other >= 0) self(self, size_t(other));
         }
         splits.push_back(index);
         for (uint32_t y = 0; y < 2; ++y) {
@@ -293,8 +304,7 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
         result.max_error_pixels = std::max(result.max_error_pixels, node.candidate.error);
         Patch patch{node.candidate.tile};
         for (uint32_t edge = 0; edge < 4; ++edge) {
-            int other = neighbor(leaves, patch.tile, edge);
-            if (other >= 0 && nodes[other].candidate.tile.level < patch.tile.level) patch.coarse_edges |= 1u << edge;
+            if (coarser_neighbor(leaves, patch.tile, edge) >= 0) patch.coarse_edges |= 1u << edge;
         }
         result.patches.push_back(patch);
     }

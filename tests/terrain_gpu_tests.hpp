@@ -218,7 +218,7 @@ struct TerrainSample {
 TerrainSample measure_terrain(RenderProbe&, const Camera&, const ephemeris::SystemSnapshot&, const rendering::RenderSettings&, uint32_t draw_count = 1);
 nlohmann::json terrain_timing_stats(std::vector<double> samples);
 
-void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, const std::filesystem::path& output) {
+void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, const std::filesystem::path& output, bool compare_normals = false) {
     auto document = paths::read_json(catalog);
     auto definitions = paths::read_json(paths::external_path("data/system.json"));
     check(document.has_value() && definitions.has_value(), "Surface preview catalogs exist");
@@ -227,13 +227,14 @@ void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, c
     for (const auto& entry : document->at("bodies"))
         bindings.push_back({entry.at("body"), terrain::ColorSource::open(paths::external_path(entry.at("albedo").get<std::string>()))});
     probe.renderer.set_color_sources(std::move(bindings));
-    probe.resize({768, 768});
+    probe.resize(compare_normals ? VkExtent2D{1920, 1080} : VkExtent2D{768, 768});
     nlohmann::json report = nlohmann::json::array();
     ephemeris::Simulation simulation;
     rendering::RenderSettings settings;
     for (const auto& entry : document->at("bodies")) {
         std::string name = entry.at("body");
         if (name != "Earth" && name != "Moon" && name != "Mars" && name != "Jupiter") continue;
+        if (compare_normals && name != "Earth" && name != "Moon") continue;
         auto definition = std::find_if(definitions->begin(), definitions->end(), [&](const auto& body) { return body.at("name") == name; });
         check(definition != definitions->end(), "Preview body definition exists");
         auto loaded = precision_fixture({}, definition->value("oblateness", 0.0));
@@ -242,27 +243,67 @@ void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, c
         body.radius_rsun = definition->at("r");
         body.color_rgb = {1, 0, 1};
         body.w0_deg = name == "Earth" ? -70 : 0;
+        if (compare_normals) {
+            loaded.motions[0].position = render_to_ecliptic(RenderPosition{{10, 3, 4}});
+            settings.terrain_error_pixels = 16;
+            settings.terrain_patch_limit = 64;
+        }
         check(simulation.replace_system(loaded).accepted, "Preview system loads");
         if (entry.contains("height")) probe.renderer.set_height_source(name,
             terrain::HeightSource::open(paths::external_path(entry.at("height").get<std::string>())));
         else probe.renderer.set_height_source({}, {});
-        auto camera = camera_at(body.radius_au()*3);
+        auto camera = camera_at(body.radius_au()*(compare_normals ? 2 : 3));
         camera.tracking_idx = 1;
         uint32_t quiet = 0, frames = 0;
         for (; frames < 1800; ++frames) {
-            probe.render(camera, simulation.snapshot(), settings, nullptr, true);
+            if (compare_normals) measure_terrain(probe, camera, simulation.snapshot(), settings);
+            else probe.render(camera, simulation.snapshot(), settings, nullptr, true);
             const auto& textures = probe.renderer.texture_stats();
             const auto& terrain = probe.renderer.terrain_stats();
-            quiet = !textures.pending && !textures.ready && !textures.uploads && !terrain.loading_bodies && !terrain.cache_bakes ? quiet+1 : 0;
+            const auto& normals = probe.renderer.normal_stats();
+            if (compare_normals && frames % 120 == 0)
+                std::cout << name << " streaming frame " << frames << ": " << normals.resident << " normal tiles, "
+                          << normals.pending << " pending, " << normals.ready << " ready\n" << std::flush;
+            quiet = !textures.pending && !textures.ready && !textures.uploads && !normals.pending && !normals.ready && !normals.uploads && !terrain.loading_bodies && !terrain.cache_bakes ? quiet+1 : 0;
             if (quiet >= 8) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         check(frames < 1800 && probe.renderer.texture_stats().failed == 0, "Real surface maps finish streaming");
         if (entry.contains("height")) check(probe.renderer.terrain_stats().imported_patches > 0, "Real Earth elevation is drawn");
-        probe.save_preview(output/(name+".ppm"), true);
+        if (!compare_normals) probe.save_preview(output/(name+".ppm"), true);
         const auto& stats = probe.renderer.texture_stats();
         nlohmann::json row{{"body", name}, {"warmup_frames", frames}, {"resident_color_tiles", stats.resident},
             {"texture_capacity", stats.capacity}, {"imported_geometry_patches", probe.renderer.terrain_stats().imported_patches}};
+        if (compare_normals) {
+            constexpr uint32_t batch = 128;
+            row["draw_batch"] = batch;
+            row["camera_distance_radii"] = 2;
+            row["normal_tiles"] = probe.renderer.normal_stats().resident;
+            row["normal_capacity"] = probe.renderer.normal_stats().capacity;
+            std::vector<double> draw[2], prepare[2];
+            for (uint32_t repetition = 0; repetition < 4; ++repetition) for (uint32_t block = 0; block < 2; ++block) {
+                uint32_t mode = (block+repetition)%2;
+                settings.terrain_normal_maps_enabled = mode != 0;
+                for (uint32_t frame = 0; frame < 48; ++frame) {
+                    auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings, batch);
+                    if (frame >= 16) { draw[mode].push_back(sample.gpu_draw_ms/batch); prepare[mode].push_back(sample.cpu_prepare_ms); }
+                    check(!probe.renderer.normal_stats().uploads && !probe.renderer.terrain_stats().cache_bakes,
+                          "Shading benchmark measures resident data without geometry or texture uploads");
+                }
+                if (repetition == 3) {
+                    probe.render(camera, simulation.snapshot(), settings, nullptr, true);
+                    probe.save_preview(output/(name+(mode ? "-detailed.ppm" : "-vertex.ppm")), true);
+                }
+            }
+            for (uint32_t mode = 0; mode < 2; ++mode) {
+                row[mode ? "detailed_gpu_draw_ms" : "vertex_gpu_draw_ms"] = terrain_timing_stats(draw[mode]);
+                row[mode ? "detailed_cpu_prepare_ms" : "vertex_cpu_prepare_ms"] = terrain_timing_stats(prepare[mode]);
+            }
+            settings.terrain_normal_maps_enabled = true;
+            report.push_back(row);
+            std::cout << row.dump() << '\n';
+            continue;
+        }
         std::vector<double> cpu, gpu;
         for (uint32_t frame = 0; frame < 64; ++frame) {
             auto sample = measure_terrain(probe, camera, simulation.snapshot(), settings);
@@ -274,6 +315,106 @@ void surface_preview(RenderProbe& probe, const std::filesystem::path& catalog, c
     }
     std::ofstream file(output/"report.json");
     file << report.dump(2) << '\n';
+}
+
+void terrain_normal_contracts(RenderProbe& probe, const std::filesystem::path& pointer_path) {
+    std::ifstream pointer(pointer_path);
+    std::string directory;
+    std::getline(pointer, directory);
+    check(bool(pointer), "Normal-map height fixture exists");
+    auto source = terrain::HeightSource::open(directory);
+    terrain::NormalSource normals(source);
+    for (uint32_t face = 0; face < 6; ++face) {
+        auto bytes = normals.load({face});
+        check(bytes.size() == terrain::COLOR_SIDE*terrain::COLOR_SIDE*8, "Normal tile has the expected bounded payload");
+        for (uint32_t y = 2; y < terrain::COLOR_SIDE-2; y += 13) for (uint32_t x = 2; x < terrain::COLOR_SIDE-2; x += 13) {
+            std::array<int16_t, 4> encoded;
+            std::memcpy(encoded.data(), bytes.data()+8*(y*terrain::COLOR_SIDE+x), 8);
+            glm::dvec3 normal = glm::dvec3(encoded[0], encoded[1], encoded[2])/32767.0;
+            auto direction = glm::normalize(terrain::cube_vector(face, -1+(x-1.5)/64, -1+(y-1.5)/64));
+            auto radial = glm::normalize(direction/glm::dvec3(1, source->info().polar_ratio, 1));
+            check(std::abs(glm::length(normal)-1) < .00006 && glm::dot(normal, radial) > .9,
+                  "Signed normal tiles remain unit length and point outward on every cube face");
+        }
+    }
+    if (normals.level > 0) {
+        auto left = normals.load({4, 1, 0, 0}), right = normals.load({4, 1, 1, 0});
+        for (uint32_t y = 0; y < terrain::COLOR_SIDE; ++y) for (uint32_t x = 0; x < 4; ++x)
+            check(std::memcmp(left.data()+8*(y*terrain::COLOR_SIDE+128+x), right.data()+8*(y*terrain::COLOR_SIDE+x), 8) == 0,
+                  "Neighboring normal gutters agree across a data-tile seam");
+    }
+    auto loaded = precision_fixture({}, 1-source->info().polar_ratio);
+    loaded.definition.bodies[1].radius_rsun = source->info().equatorial_radius_m/(1000*SOLAR_RADIUS_KM);
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{8, 3, 10}});
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(loaded).accepted, "Normal shading fixture loads");
+    auto camera = camera_at(loaded.definition.bodies[1].radius_au()*3);
+    camera.tracking_idx = 1;
+    rendering::RenderSettings settings;
+    settings.surface_textures_enabled = false;
+    settings.terrain_error_pixels = 16;
+    settings.terrain_patch_limit = 64;
+    probe.renderer.set_height_source("Precision terrain", source);
+    uint32_t quiet = 0;
+    for (uint32_t frame = 0; frame < 1800; ++frame) {
+        probe.render(camera, simulation.snapshot(), settings);
+        const auto& n = probe.renderer.normal_stats();
+        const auto& t = probe.renderer.terrain_stats();
+        check(n.uploads <= terrain::COLOR_UPLOADS && n.resident <= n.capacity && n.pending <= 128 && n.ready <= 64 && !n.failed,
+              "Normal streaming respects cache, queue and upload budgets");
+        quiet = !n.pending && !n.ready && !n.uploads && !t.loading_bodies && !t.cache_bakes ? quiet+1 : 0;
+        if (quiet >= 4) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        check(frame < 1799, "Normal and geometry streams converge");
+    }
+    auto* data = static_cast<const uint16_t*>(probe.readback.mapped);
+    size_t size = size_t(probe.extent.width)*probe.extent.height*4;
+    std::vector<uint16_t> detailed(data, data+size);
+    auto patches = probe.renderer.terrain_stats().patches;
+    check(probe.renderer.normal_stats().resident > 6 && probe.renderer.normal_stats().selection_rebuilds == 0,
+          "Normal detail refines independently and stationary selections are reused");
+    settings.terrain_normal_maps_enabled = false;
+    probe.render(camera, simulation.snapshot(), settings);
+    check(probe.renderer.terrain_stats().patches == patches && probe.renderer.terrain_stats().cache_bakes == 0,
+          "Changing shading quality leaves geometry and its cache intact");
+    data = static_cast<const uint16_t*>(probe.readback.mapped);
+    uint32_t changed = 0;
+    for (size_t i = 0; i < size; i += 4) {
+        check((detailed[i+3] == data[i+3]), "Normal maps preserve opaque coverage");
+        if (std::abs(glm::unpackHalf2x16(detailed[i]).x-glm::unpackHalf2x16(data[i]).x) > 1e-5) ++changed;
+    }
+    check(changed > 100, "Coarse geometry retains height shading beyond its interpolated vertex normals");
+    settings.terrain_normal_maps_enabled = true;
+    probe.render(camera, simulation.snapshot(), settings);
+    data = static_cast<const uint16_t*>(probe.readback.mapped);
+    check(std::equal(detailed.begin(), detailed.end(), data), "Resident normal pages restore deterministically after toggling");
+    loaded.definition.bodies[1].pole_ecl = render_to_ecliptic(RenderPosition{{-1, 0, 0}}).value;
+    loaded.definition.bodies[1].w0_deg = 90;
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{-3, 8, 10}});
+    check(simulation.replace_system(loaded).accepted, "Tilted normal-map fixture loads");
+    for (uint32_t frame = 0; frame < 100; ++frame) {
+        probe.render(camera, simulation.snapshot(), settings);
+        const auto& n = probe.renderer.normal_stats();
+        if (frame > 3 && !n.pending && !n.ready && !n.uploads && !probe.renderer.terrain_stats().loading_bodies) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    data = static_cast<const uint16_t*>(probe.readback.mapped);
+    double rotation_error = 0;
+    for (uint32_t y = 110; y < 146; ++y) for (uint32_t x = 110; x < 146; ++x) {
+        size_t before = 4*(y*256+x), after = 4*((255-x)*256+y);
+        rotation_error += std::abs(glm::unpackHalf2x16(detailed[before]).x-glm::unpackHalf2x16(data[after]).x);
+    }
+    check(rotation_error/(36*36) < .003, "Body-fixed normal maps rotate with the pole and lighting");
+    loaded.definition.bodies[1].radius_rsun *= 2;
+    check(simulation.replace_system(loaded).accepted, "Incompatible normal-map fixture loads");
+    probe.render(camera, simulation.snapshot(), settings);
+    std::vector<uint16_t> incompatible(data, data+size);
+    settings.terrain_normal_maps_enabled = false;
+    probe.render(camera, simulation.snapshot(), settings);
+    check(std::equal(incompatible.begin(), incompatible.end(), static_cast<const uint16_t*>(probe.readback.mapped)),
+          "Shape-incompatible height packs cannot affect shading");
+    probe.renderer.set_height_source({}, {});
+    std::cout << "Terrain normal contracts passed: six-face normals, independent detail, bounded streaming, coverage, toggles and compatibility.\n";
 }
 
 bool declares_float64(const std::vector<uint32_t>& spirv) {
@@ -506,13 +647,15 @@ nlohmann::json terrain_timing_stats(std::vector<double> samples) {
 TerrainSample measure_terrain(RenderProbe& probe, const Camera& camera, const ephemeris::SystemSnapshot& system,
                               const rendering::RenderSettings& settings, uint32_t draw_count) {
     TerrainSample sample{};
+    auto raster_settings = settings;
+    raster_settings.transparency_reference_legacy = true;
     probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
         probe.vk.transition_image(cmd, probe.color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         probe.vk.transition_image(cmd, probe.depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
         auto timer = probe.vk.begin_gpu_timer(cmd, "terrain_total");
         auto prepare_timer = probe.vk.begin_gpu_timer(cmd, "terrain_prepare");
         auto start = SteadyClock::now();
-        probe.renderer.prepare(cmd, probe.vk, camera, system, settings, probe.extent);
+        probe.renderer.prepare(cmd, probe.vk, camera, system, raster_settings, probe.extent);
         sample.cpu_prepare_ms = elapsed_ms(start);
         probe.vk.end_gpu_timer(cmd, prepare_timer);
         auto color = rhi::RenderingAttachment::clear_color(probe.color);
@@ -521,7 +664,7 @@ TerrainSample measure_terrain(RenderProbe& probe, const Camera& camera, const ep
         auto draw_timer = probe.vk.begin_gpu_timer(cmd, "terrain_draw");
         start = SteadyClock::now();
         for (uint32_t draw = 0; draw < draw_count; ++draw)
-            probe.renderer.render(cmd, probe.vk, camera, system, settings, probe.extent);
+            probe.renderer.render(cmd, probe.vk, camera, system, raster_settings, probe.extent);
         sample.cpu_record_ms = elapsed_ms(start);
         probe.vk.end_gpu_timer(cmd, draw_timer);
         probe.vk.end_rendering(cmd);

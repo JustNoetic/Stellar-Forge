@@ -15,20 +15,25 @@ void main() {
     for (int i = 0; i < 48; ++i) {
         float t0 = float(i)/48.0, t1 = float(i+1)/48.0;
         t0 *= t0; t1 *= t1;
-        float dt = (segment.y-segment.x)*(t1-t0);
-        vec3 q = p+d*(segment.x+(segment.y-segment.x)*(t0+t1)*0.5);
-        vec3 r, m, e;
-        medium(q, r, m, e);
-        vec3 source = vec3(0.0);
-        for (uint s = 0u; s < uint(atm.camera.w); ++s) {
-            vec3 sun = atm.sun_direction[s].xyz;
-            float mu = dot(d, sun);
-            vec3 direct = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(mu)+m*mie_phase(mu));
-            vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
-            source += atm.sun_irradiance[s].rgb*(direct+multiple);
+        float start = segment.x+(segment.y-segment.x)*t0;
+        float span = (segment.y-segment.x)*(t1-t0);
+        int subdivisions = transport_subdivisions(p, d, start, span);
+        float dt = span/float(subdivisions);
+        for (int j = 0; j < subdivisions; ++j) {
+            vec3 q = p+d*(start+(float(j)+0.5)*dt);
+            vec3 r, m, e;
+            medium(q, r, m, e);
+            vec3 source = vec3(0.0);
+            for (uint s = 0u; s < uint(atm.camera.w); ++s) {
+                vec3 sun = atm.sun_direction[s].xyz;
+                float mu = dot(d, sun);
+                vec3 direct = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(mu)+aerosol_source(q, mu));
+                vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
+                source += atm.sun_irradiance[s].rgb*(direct+multiple);
+            }
+            L += throughput*source*segment_integral(e, dt);
+            throughput *= exp(-e*dt);
         }
-        L += throughput*source*segment_integral(e, dt);
-        throughput *= exp(-e*dt);
     }
     imageStore(radiance_lut, pixel, vec4(min(L, vec3(65000.0)), 1.0));
     imageStore(throughput_lut, pixel, vec4(throughput, 1.0));

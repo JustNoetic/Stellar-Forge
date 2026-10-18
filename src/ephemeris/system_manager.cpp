@@ -209,6 +209,11 @@ std::vector<std::string> SystemManager::list_systems() const {
 }
 
 LoadedSystem SystemManager::load_system(std::string_view name) const {
+    if (name == "Ephemeris Mode") {
+        auto loaded = load_system(SOLAR_SYSTEM_NAME);
+        loaded.definition.name = std::string(name);
+        return loaded;
+    }
     std::filesystem::path path = sf::paths::external_path("data", "systems", name, "system.json");
     if (!std::filesystem::exists(path)) {
         path = sf::paths::external_path("data", "system.json");
@@ -222,6 +227,8 @@ LoadedSystem SystemManager::load_system(std::string_view name) const {
 }
 
 LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::string_view name) {
+    if (raw_arr.is_object() && name == "Ephemeris Mode" && raw_arr.value("source_preset", std::string{}) == SOLAR_SYSTEM_NAME)
+        return SystemManager{}.load_system("Ephemeris Mode");
     if (!raw_arr.is_array() || raw_arr.empty()) throw std::invalid_argument("System must contain at least one body.");
 
     std::unordered_map<std::string, int> raw_map;
@@ -563,6 +570,26 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
 }
 
 bool SystemManager::save_system(std::string_view name, const SystemDefinition& definition) const {
+    if (name == "Ephemeris Mode") {
+        auto solar = load_system(SOLAR_SYSTEM_NAME);
+        for (auto& target : solar.definition.bodies) {
+            int index = definition.find_body(target.name);
+            if (index < 0) continue;
+            auto source = definition.bodies[index];
+            source.spice_id = target.spice_id;
+            source.parent_id = target.parent_id;
+            source.parent_idx = target.parent_idx;
+            source.semi_major_au = target.semi_major_au;
+            source.eccentricity = target.eccentricity;
+            source.inc_deg = target.inc_deg;
+            source.omega_node_deg = target.omega_node_deg;
+            source.arg_peri_deg = target.arg_peri_deg;
+            source.mean_anom_deg = target.mean_anom_deg;
+            source.source_json = target.source_json;
+            target = std::move(source);
+        }
+        return save_system(SOLAR_SYSTEM_NAME, solar.definition);
+    }
     return sf::paths::write_json(sf::paths::external_path("data", "systems", name, "system.json"), serialize_definition(definition), 2);
 }
 

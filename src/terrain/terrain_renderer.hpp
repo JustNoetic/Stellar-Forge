@@ -72,6 +72,7 @@ public:
     bool covers(uint32_t body) const noexcept;
     const TerrainStats& stats() const noexcept { return stats_; }
     void set_height_source(std::string body, std::shared_ptr<const HeightSource> source);
+    std::vector<std::pair<std::string, std::shared_ptr<const HeightSource>>> height_sources() const;
     float relief_extent_au(uint32_t body) const noexcept;
     double minimum_height_km(const ephemeris::BodyDefinition& body, const rendering::RenderSettings& settings) const noexcept;
 

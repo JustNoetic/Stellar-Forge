@@ -1,24 +1,2 @@
 #version 460
-#include "common/atmosphere.glsl"
-layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 1) uniform sampler2D radiance_lut;
-layout(set = 0, binding = 2) uniform sampler2D throughput_lut;
-layout(set = 0, binding = 3) uniform sampler2D scene_depth;
-layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
-void main() {
-    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(hdr_color);
-    if (any(greaterThanEqual(pixel, size))) return;
-    if (texelFetch(scene_depth, pixel, 0).r > 0.0) return;
-    vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
-    vec4 world = atm.inverse_view_projection*vec4(ndc, 1.0, 1.0);
-    vec3 world_direction = normalize(world_to_atmosphere(world.xyz/world.w));
-    vec3 d = vec3(dot(world_direction, atm.axis_x.xyz), dot(world_direction, atm.axis_y.xyz), dot(world_direction, atm.axis_z.xyz));
-    vec2 segment = atmosphere_segment(atm.camera.xyz, d);
-    if (segment.y <= segment.x) return;
-    vec2 uv = sky_uv(d);
-    vec3 L = textureLod(radiance_lut, uv, 0.0).rgb;
-    vec3 T = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
-    vec4 background = imageLoad(hdr_color, pixel);
-    imageStore(hdr_color, pixel, vec4(min(background.rgb*T+L*atm.depth_params.x, vec3(65000.0)), background.a));
-}
+#include "common/atmosphere_composite.glsl"

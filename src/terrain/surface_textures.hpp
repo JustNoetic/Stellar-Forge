@@ -21,21 +21,37 @@ inline constexpr uint32_t COLOR_BODIES = 1024;
 inline constexpr uint32_t COLOR_SOURCES = 32;
 using ColorTile = std::array<uint8_t, COLOR_BYTES>;
 
-struct ColorSource {
+struct SurfaceSource {
+    virtual ~SurfaceSource() = default;
     SourceDomain domain;
     uint32_t level = 0;
     double polar_ratio = 1;
+    virtual uint32_t count() const noexcept = 0;
+    virtual std::vector<std::byte> load(TileId tile) const = 0;
+    uint32_t index(TileId tile) const;
+    virtual bool compatible(double radius_m, double polar) const noexcept;
+};
+
+struct ColorSource final : SurfaceSource {
     std::filesystem::path payload;
     std::vector<uint32_t> checksums;
     static std::shared_ptr<const ColorSource> open(const std::filesystem::path& directory);
     std::shared_ptr<const ColorTile> read(TileId tile) const;
-    uint32_t index(TileId tile) const;
-    uint32_t count() const noexcept { return uint32_t(checksums.size()); }
+    uint32_t count() const noexcept override { return uint32_t(checksums.size()); }
+    std::vector<std::byte> load(TileId tile) const override;
+};
+
+struct NormalSource final : SurfaceSource {
+    explicit NormalSource(std::shared_ptr<const HeightSource> height);
+    uint32_t count() const noexcept override { return 2*((1u << (2*(level+1)))-1); }
+    std::vector<std::byte> load(TileId tile) const override;
+    bool compatible(double radius_m, double polar) const noexcept override;
+    std::shared_ptr<const HeightSource> height;
 };
 
 struct ColorBinding {
     std::string body;
-    std::shared_ptr<const ColorSource> source;
+    std::shared_ptr<const SurfaceSource> source;
 };
 
 struct TextureStats {
@@ -53,9 +69,10 @@ struct TextureStats {
 
 class SurfaceTextures {
 public:
-    void init(rhi::VkContext& ctx);
+    void init(rhi::VkContext& ctx, bool normals = false);
     void shutdown(rhi::VkContext& ctx);
     void set_sources(std::vector<ColorBinding> bindings);
+    void set_height_source(std::string body, std::shared_ptr<const HeightSource> source);
     std::vector<std::pair<std::string, std::filesystem::path>> load_catalog(const std::filesystem::path& path);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                  const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled);
@@ -65,7 +82,7 @@ public:
 
 private:
     struct SelectionEntry { SelectionView view; Selection selection; bool valid = false; };
-    struct Completed { GeometryKey key; std::shared_ptr<const ColorTile> payload; };
+    struct Completed { GeometryKey key; std::vector<std::byte> payload; };
     GeometryKey key(uint32_t source, TileId tile) const;
     void request(const GeometryKey& key);
     void run(std::stop_token stop);
@@ -89,6 +106,7 @@ private:
     std::string error_;
     bool reported_error_ = false;
     bool planning_ = false;
+    bool normals_ = false;
     std::jthread worker_;
 };
 

@@ -152,6 +152,42 @@ void selections() {
     check(visible({{0, 0, -1}, 0.1}, view), "Camera inside body disables horizon occlusion");
 }
 
+void balanced_neighbors() {
+    uint32_t stitched = 0, deepest = 0, loading = 0;
+    for (uint32_t face = 0; face < 6; ++face) {
+        for (auto uv : {glm::dvec2(.23, -.37), glm::dvec2(1, .23), glm::dvec2(1, -1)}) {
+            for (uint32_t level : {1u, 2u, 6u, 12u, 24u}) {
+                SelectionView view;
+                view.polar_ratio = face%3 == 0 ? .05 : face%3 == 1 ? .8 : 1;
+                auto direction = glm::normalize(cube_vector(face, uv.x, uv.y));
+                auto scale = glm::dvec3(1, view.polar_ratio, 1);
+                auto normal = glm::normalize(direction/scale);
+                auto up = std::abs(normal.y) < .9 ? glm::dvec3(0, 1, 0) : glm::dvec3(1, 0, 0);
+                view.eye = direction*scale+normal*1e-12;
+                view.view_from_local = glm::dmat3(glm::lookAt(glm::dvec3(0), -normal, up));
+                view.max_level = level;
+                view.target_error_pixels = .1;
+                view.max_patches = level%2 ? 64 : 512;
+                for (bool delayed : {false, true}) {
+                    TileAvailability availability;
+                    if (delayed) availability.ready = [level](TileId tile) {
+                        return tile.level < level || (tile.x+3*tile.y+tile.face)%5 != 0;
+                    };
+                    auto selection = select(view, ProceduralSource{}, availability);
+                    check(!selection.patches.empty() && selection.patches.size() <= view.max_patches,
+                          "Balanced refinement preserves visible cover within the patch budget");
+                    topology(selection);
+                    deepest = std::max(deepest, selection.deepest_level);
+                    loading += selection.loading_limited;
+                    for (auto patch : selection.patches) stitched += patch.coarse_edges != 0;
+                }
+            }
+        }
+    }
+    check(deepest == MAX_LEVEL && stitched > 0 && loading > 0,
+          "Neighbor oracle exercises LOD24, coarser edges and delayed refinement at face seams and corners");
+}
+
 float relief_at(glm::dvec3 direction) {
     glm::vec3 d{direction};
     return .55f * std::sin(18.f * d.x + 5.f * d.y) * std::cos(14.f * d.z)
@@ -763,6 +799,7 @@ int main(int argc, char** argv) {
         grids();
         geometry_residency();
         selections();
+        balanced_neighbors();
         metadata_bounds();
         visibility_bounds();
         ground_refinement();

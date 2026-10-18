@@ -903,6 +903,118 @@ void procedural_ring_generator_contracts() {
     std::filesystem::remove_all(paths::external_path("textures", "ProcRingBakeTest"), ec);
 }
 
+void atmosphere_physics_contracts() {
+    auto a = physics::earth_physical_atmosphere();
+    constexpr double radius = 6356.766;
+    double mass = 9.80665*radius*radius*1e6/(6.67430e-11*1.98847e30);
+    auto surface = physics::sample_atmosphere(a, mass, radius, 0);
+    check(std::abs(surface.density_kg_m3-1.225) < .001, "Earth gas density matches standard atmosphere");
+    check(std::abs(surface.scale_height_km-8.434) < .02, "Ideal-gas pressure scale height");
+    constexpr double heights[] = {11, 20, 30, 50};
+    constexpr double pressures[] = {22632.1, 5474.89, 1171.87, 75.9448};
+    for (int i = 0; i < 4; ++i) {
+        double h = radius*heights[i]/(radius-heights[i]);
+        auto state = physics::sample_atmosphere(a, mass, radius, h);
+        check(std::abs(state.pressure_pa/pressures[i]-1) < .004, "Sparse layer queries match U.S. Standard Atmosphere pressures");
+    }
+    auto profile = physics::prepare_atmosphere(a, mass, radius);
+    for (double height : {-20.0, -1.0, 0.0, 11.0, 20.0, 30.0, 50.0, 99.0}) {
+        double index = std::clamp((std::asinh(height/profile->profile_domain.z)-profile->profile_domain.x)*profile->profile_domain.y, 0.0, 1.0)*255;
+        size_t lower = std::min(size_t(index), size_t(254));
+        double relative = std::exp(std::lerp(double(profile->log_density[lower].x), double(profile->log_density[lower+1].x), index-lower));
+        auto state = physics::sample_atmosphere(a, mass, radius, height);
+        check(std::abs(relative*surface.number_density_m3/state.number_density_m3-1) < .003, "Prepared log density retains hydrostatic layers above and below datum");
+    }
+    glm::dvec3 ozone_tau(0);
+    for (int i = 0; i < 10000; ++i) {
+        double height = (i+.5)*a.height_km/10000;
+        ozone_tau += glm::dvec3(profile->ozone_absorption)*std::exp(-.5*std::pow((height-a.ozone_peak_km)/a.ozone_width_km, 2))*double(a.height_km)/10000.0;
+    }
+    auto expected = glm::dvec3(1.209e-25, 3.5e-25, 1.582e-26)*(300*2.687e20);
+    check(glm::length(ozone_tau-expected) < 1e-8, "Gaussian ozone conserves the supplied DU column");
+    a.temperature_layers.clear();
+    auto isothermal = physics::sample_atmosphere(a, mass, radius, 40);
+    double expected_p = a.pressure_pa*std::exp(-radius*40/(radius+40)/surface.scale_height_km);
+    check(std::abs(isothermal.pressure_pa/expected_p-1) < 1e-12, "Exact spherical isothermal hydrostatic solution");
+    a.pressure_pa = 0;
+    auto vacuum = physics::prepare_atmosphere(a, mass, radius);
+    check(vacuum->rayleigh == glm::vec3(0) && vacuum->ozone_absorption == glm::vec3(0), "Vacuum has no molecular or ozone opacity");
+    a.pressure_pa = -1;
+    check(!valid_atmosphere(a), "Reject negative physical pressure");
+    a = physics::earth_physical_atmosphere();
+    a.composition["Tholin"] = .1;
+    check(!valid_atmosphere(a), "Aerosol particles are not gas mole fractions");
+
+    Simulation sim;
+    check(sim.replace_system(SystemManager::parse_system(fixture(), "Physical atmosphere")).accepted, "Physical state fixture");
+    int body = sim.snapshot().find_body("Planet");
+    auto apply = [&](const AtmosphereDefinition& values) {
+        return sim.apply(ApplyBodyAtmosphere{sim.snapshot().generation(), body, sim.snapshot().body(body).revisions.definition, values});
+    };
+    a = physics::earth_physical_atmosphere();
+    check(apply(a).changed, "Apply physical atmosphere");
+    auto captured = sim.snapshot();
+    auto prepared = captured.body(body).render.atmosphere;
+    sim.advance(units::Seconds{1});
+    check(sim.snapshot().body(body).render.atmosphere == prepared, "Playback reuses immutable physics profiles");
+    check(!apply(a).changed && sim.snapshot().body(body).render.atmosphere == prepared, "Unchanged physical inputs do no work");
+    a.pressure_pa *= 2;
+    check(apply(a).changed && sim.snapshot().body(body).render.atmosphere != prepared, "Pressure edit rebuilds prepared optics");
+    check(captured.body(body).render.atmosphere == prepared, "Existing snapshots retain their original prepared atmosphere");
+    auto loaded = SystemManager::parse_system(SystemManager::serialize_definition(sim.snapshot().definition()), "Physical roundtrip");
+    check(loaded.definition.bodies[loaded.definition.find_body("Planet")].atmosphere == a, "Physical layers, ozone, mixture and manual aerosols survive persistence");
+    auto properties = BodyPhysicalProperties::from(sim.snapshot().body(body).definition);
+    properties.mass.value = 0;
+    check(!sim.apply(ApplyBodyPhysicalProperties{sim.snapshot().generation(), body, sim.snapshot().body(body).revisions.definition, properties}).accepted,
+        "Reject mass edits that remove hydrostatic support");
+}
+
+void atmosphere_customization_contracts() {
+    nlohmann::json legacy{{"surface_pressure", 1.45}, {"temperature", 94.0},
+        {"composition", {{"N2", .9435}, {"CH4", .0565}}}};
+    auto atmosphere = legacy.get<AtmosphereDefinition>();
+    check(atmosphere.enabled && atmosphere.physical && atmosphere.automatic_aerosols, "Complete legacy gas data enables a calculated atmosphere");
+    check(atmosphere.pressure_pa == 1.45*101325 && atmosphere.temperature_k == 94, "Legacy pressure units and supplied temperature are retained");
+    auto haze = physics::prepare_atmosphere(atmosphere, 6.763e-8, 2574.73);
+    check(haze->aerosols.size() == 1 && haze->aerosols[0].scattering.b/haze->aerosols[0].extinction.b <
+        haze->aerosols[0].scattering.r/haze->aerosols[0].extinction.r,
+        "Legacy methane-rich gas migrates to an explicit absorbing particle column");
+    atmosphere.pressure_pa = 0;
+    auto vacuum = physics::prepare_atmosphere(atmosphere, 6.763e-8, 2574.73);
+    check(vacuum->mie_extinction == glm::vec3(0) && vacuum->aerosols.empty(), "Zero pressure disables particle optics");
+    legacy["enabled"] = false;
+    check(!legacy.get<AtmosphereDefinition>().enabled, "Explicit disabled atmosphere survives complete physical inputs");
+    legacy.erase("enabled");
+    legacy.erase("surface_pressure");
+    check(!legacy.get<AtmosphereDefinition>().enabled, "Partial gas data does not silently enable an atmosphere");
+    check(!nlohmann::json::object().get<AtmosphereDefinition>().enabled, "Empty atmosphere remains disabled");
+    legacy["pressure_pa"] = 101325.0;
+    check(legacy.get<AtmosphereDefinition>().physical && legacy.get<AtmosphereDefinition>().enabled, "Modern physical inputs also infer physical mode and activation");
+    legacy["aerosol_mode"] = "manual";
+    legacy["beta_mie"] = 2e-6;
+    legacy["h_mie"] = 1.7;
+    legacy["mie_g"] = .76;
+    legacy["mie_albedo"] = {.9, .8, .7};
+    auto manual = legacy.get<AtmosphereDefinition>();
+    check(!manual.automatic_aerosols && std::abs(manual.mie_extinction.g-.002f) < 1e-8f &&
+        std::abs(manual.mie_scattering.g-.0016f) < 1e-8f && std::abs(manual.mie_scale_height_km-1.7f) < 1e-6f,
+        "Legacy manual aerosol units, scale height and colored absorption migrate correctly");
+    auto roundtrip = nlohmann::json(manual).get<AtmosphereDefinition>();
+    check(roundtrip == manual, "Automatic activation and imported overrides survive save and reload");
+
+    ui::AtmosphereEditDraft draft;
+    draft.set_gas_percentage("CO2", 25);
+    check(draft.values.physical && draft.values.automatic_height && draft.values.automatic_aerosols &&
+        std::abs(draft.values.composition.at("CO2")-.25) < 1e-12, "Composition edits select calculated properties and preserve the entered percentage");
+    double total = 0;
+    for (auto [_, weight] : draft.values.composition) total += weight;
+    check(std::abs(total-1) < 1e-12, "Changing a percentage balances the remaining gas fractions");
+    draft.remove_gas("CO2");
+    total = 0;
+    for (auto [_, weight] : draft.values.composition) total += weight;
+    check(!draft.values.composition.contains("CO2") && std::abs(total-1) < 1e-12, "Removing a gas retains a complete normalized mixture");
+}
+
 void atmosphere_state_contracts() {
     Simulation sim;
     auto source = fixture();
@@ -959,9 +1071,15 @@ void atmosphere_state_contracts() {
     check(!sim.apply(draft.command()).accepted, "Stars cannot receive planetary atmosphere");
 }
 
+#include "particle_optics_tests.hpp"
+
 int main(int argc, char** argv) {
     try {
         units_and_coordinates();
+        atmosphere_physics_contracts();
+        atmosphere_customization_contracts();
+        particle_optics_contracts();
+        giant_atmosphere_contracts();
         atmosphere_state_contracts();
         clock_and_snapshots();
         time_and_date_formatting();

@@ -1,0 +1,63 @@
+#version 460
+#include "common/transparency.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
+
+bool fragment_before(uint a, uint b) {
+    uvec4 x = fragments[a], y = fragments[b];
+    if (x.z != y.z) return x.z < y.z;
+    if (x.x != y.x) return x.x < y.x;
+    return x.y <= y.y;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(transparency_heads)))) return;
+    uint current = imageLoad(transparency_heads, pixel).x;
+    if (current == TRANSPARENCY_END) return;
+    uint sorted = current;
+    if (fragments[current].w != TRANSPARENCY_END) {
+        for (uint width = 1u; ; width *= 2u) {
+            uint p = sorted;
+            sorted = TRANSPARENCY_END;
+            uint tail = TRANSPARENCY_END;
+            uint merges = 0u;
+            while (p != TRANSPARENCY_END) {
+                ++merges;
+                uint q = p;
+                uint left = 0u;
+                for (uint i = 0u; i < width && q != TRANSPARENCY_END; ++i) {
+                    ++left;
+                    q = fragments[q].w;
+                }
+                uint right = width;
+                while (left > 0u || (right > 0u && q != TRANSPARENCY_END)) {
+                    uint selected;
+                    if (left == 0u) {
+                        selected = q; q = fragments[q].w; --right;
+                    } else if (right == 0u || q == TRANSPARENCY_END) {
+                        selected = p; p = fragments[p].w; --left;
+                    } else if (fragment_before(p, q)) {
+                        selected = p; p = fragments[p].w; --left;
+                    } else {
+                        selected = q; q = fragments[q].w; --right;
+                    }
+                    if (tail == TRANSPARENCY_END) sorted = selected;
+                    else fragments[tail].w = selected;
+                    tail = selected;
+                }
+                p = q;
+            }
+            fragments[tail].w = TRANSPARENCY_END;
+            if (merges <= 1u) break;
+        }
+    }
+    vec4 background = imageLoad(hdr_color, pixel);
+    while (sorted != TRANSPARENCY_END) {
+        uvec4 fragment = fragments[sorted];
+        vec4 color = transparent_color(fragment);
+        background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+        sorted = fragment.w;
+    }
+    imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+}

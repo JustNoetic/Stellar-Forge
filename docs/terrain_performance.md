@@ -1,5 +1,42 @@
 # Terrain precision and geometry cache performance
 
+## Independent per-pixel terrain normals
+
+Measured 19 October 2026, Release, i5-12400F / RTX 4060 Ti, 1920 × 1080, 60-degree FOV. Earth and Moon use the existing catalog albedo/elevation packs, a camera distance of two equatorial radii, 16-pixel geometric error and a 64-patch cap. Both modes draw exactly the same geometry; only `terrain_normal_maps_enabled` changes. Four repetitions alternate mode order, with 48 submissions per block and the first 16 discarded. Each submission draws the scene 128 times; GPU draw timestamps are divided by 128. Each mode has 128 retained samples per body. No geometry bakes or texture uploads occur in measured samples. CPU preparation is once per submission. Streaming warmup, readback, image export, submission waits and presentation are excluded. Clocks are uncontrolled; these offscreen pass measurements are not application FPS or a full-frame timing guarantee.
+
+| Body | Drawn patches | Vertex-normal GPU draw median, ms | Detailed-normal GPU draw median, ms | Added GPU draw, ms | CPU prepare median before → after, ms |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Earth | 62 | 0.07542 | 0.11270 | 0.03728 | 0.2063 → 0.2740 |
+| Moon | 33 | 0.07145 | 0.10396 | 0.03251 | 0.1977 → 0.2533 |
+
+Normal residency is 168/172 tiles respectively, within a separate 256-layer, 34.03 MiB RGBA16-SNORM array. The completion-managed upload ring is 8 MiB, and two bounded page buffers add approximately 2.03 MiB. Fragment derivatives select normal detail independently of mesh LOD; resident data normally adds two filtered normal reads, page lookup and body rotation/normalization. CPU preparation includes the additional stream's page-table/ownership work and reused selection. Normal generation and source reads run on its worker only on misses. Initial loading retains vertex-normal shading until normal roots are available. This benchmark does not measure cold normal generation latency or sustained moving-camera streaming.
+
+Raw distributions, settings and paired images are in `scratch/terrain-normal-final-128/`. `Moon-comparison.png` shows the same coarse mesh with vertex normals on the left and detailed normals on the right. Capture rendering copies readback bytes to cached CPU memory before validating pixels; CPU image scans and exports are outside the timed intervals. Reproduce with a new output directory:
+
+```powershell
+.\build\StellarRenderingTests.exe --terrain-normal-preview data/surfaces.json scratch/terrain-normal-new
+```
+
+All 21 CTests passed with Vulkan validation requested, including the new `terrain_normal_contracts`, imported terrain, surface eviction, rendering, eclipse and atmosphere contracts. Normal contracts cover six-face unit/outward normals, matching neighbor gutters, pole/spin orientation, source shape compatibility, unchanged opaque coverage and geometry/cache behavior when toggling quality.
+
+## Direct coarser-neighbor lookup
+
+Measured 19 October 2026, Release GCC -O3, i5-12400F. Both binaries use the same sources and harness except the neighbor lookup. Three alternating before/after runs; each case uses seven batches. Reported numbers are the mean across three Earth regions of each region's median run time (each run reports its median batch). Five views, 32 samples of 100 m/s camera motion at virtual 60 Hz, cubic terrain clearance, 1080p, 60-degree FOV, 2-pixel target, 1024-patch cap. This CPU benchmark deliberately rebuilds desired selection with bounded renderer-style description memoization. A stationary full renderer can reuse selection entirely. Worker CPU, camera height queries, GPU, drawing and presentation are excluded. Host clocks/scheduling were uncontrolled; these are observed timings, not timing thresholds or application FPS.
+
+| View | Original, ms | Optimized, ms | CPU time reduction |
+| --- | ---: | ---: | ---: |
+| orbit | 0.1247 | 0.0620 | 50.3% |
+| 2km-down | 0.0286 | 0.0177 | 38.0% |
+| 2km-horizon | 0.6364 | 0.2863 | 55.0% |
+| 1m-down | 0.0289 | 0.0181 | 37.2% |
+| 1m-horizon | 0.6810 | 0.3191 | 53.1% |
+
+Balancing and stitch generation only need coarser neighbors. Active leaves are constructed from roots by atomic 2:1-balanced splits, so a coarser adjacent leaf can only be one level above. Edges inside a leaf's own parent cannot have a coarser neighbor. Remaining edges query one adjacent parent-level key, with integer addressing inside a face and the existing cube projection across face seams. This removes equal-level lookups and ancestor walks without changing refinement, culling, budgets, residency or source bounds. The existing standard unordered map remains; no persistent lookup cache or additional memory budget was introduced.
+
+All 45 view/region/cache-mode selection trace hashes match across all six final benchmark runs. Digests cover patch keys, stitch masks, ordered refinement prerequisites, visited count, deepest level, budget pressure and exact maximum-error bits. Another 1,200 deterministic varied-view comparisons match the original selector, including ordered availability requests and loading pressure, budgets 6-8192, levels 0-24, polar ratios 0.05-1, culled/full-sphere views and partial residency. The production CPU tests add 180 cases of independent edge sampling through LOD24 at face interiors, seams and corners, including delayed refinement and extreme flattening. CPU imported terrain, GPU terrain preview, cached/reference precision and imported moving terrain tests pass with Vulkan validation requested; no validation errors were emitted. StellarForge, StellarTerrainTests and StellarRenderingTests build successfully.
+
+Raw runs, source/executable hashes, intermediate experiments and the cold/new-tile tables are in `scratch/terrain-neighbor-optimization-20261019/`.
+
 ## Surface enclosures and preparation reuse
 
 Measured on 18 October 2026, Release, i5-12400F / RTX 4060 Ti, 1920 × 1080, 60° FOV, 2-pixel target and 1024-patch cap. Both versions use Earth elevation identity `619520292878143246`, the existing geometry-bake changes in the working tree, no color sources, and the same source-benchmark fixtures described below. The baseline was rebuilt in `scratch/terrain-culling` with the previous selector/preparation code; the active checkout was preserved. Each view measures 120 stationary and 120 moving samples at 100 m/s; moving samples are paced to at least 16.667 ms. Worker CPU, camera height queries, waits, readback, simulation, UI and presentation are excluded. GPU clocks and host scheduling were uncontrolled; these are descriptive pass timings, not application FPS or timing thresholds.

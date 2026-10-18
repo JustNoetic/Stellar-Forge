@@ -20,6 +20,7 @@ struct RenderSettings {
     bool vsync = false;
     bool terrain_enabled = false;
     bool terrain_imported_enabled = true;
+    bool terrain_normal_maps_enabled = true;
     bool surface_textures_enabled = true;
     bool terrain_debug_tiles = false;
     bool terrain_reference_fp64 = false;
@@ -28,7 +29,12 @@ struct RenderSettings {
     float terrain_height_km = 2.0f;
     uint32_t terrain_patch_limit = 1024;
     bool show_rings = true;
+    bool transparency_reference_legacy = false;
     bool show_atmospheres = true;
+    bool aerial_perspective_enabled = true;
+    bool aerial_perspective_bruneton = true;
+    bool atmosphere_dual_source = false;
+    bool atmosphere_surface_lighting = true;
     bool ring_shadows_enabled = true;
     bool eclipse_reference_smoothstep = false;
     bool ring_shadow_reference_all_hosts = false;

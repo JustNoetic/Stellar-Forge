@@ -7,6 +7,9 @@ layout(location = 1) in vec3 f_normal;
 layout(location = 2) flat in uint f_host_idx;
 
 layout(location = 0) out vec4 out_color;
+#ifdef TRANSPARENCY_CAPTURE
+#include "common/transparency.glsl"
+#endif
 
 #include "common/celestial_scene.glsl"
 #include "common/eclipse_shadow.glsl"
@@ -166,4 +169,7 @@ void main() {
     vec3 final_color = max(total_illum, vec3(0.0)) * exposure;
     float fade_scale = faded_alpha / max(1e-6, physical_alpha);
     out_color = vec4(final_color * fade_scale, faded_alpha);
+#ifdef TRANSPARENCY_CAPTURE
+    if (capture_transparency(out_color)) out_color = vec4(0.0);
+#endif
 }

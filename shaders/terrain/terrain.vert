@@ -45,17 +45,22 @@ layout(location = 3) out float f_subpixel_factor;
 layout(location = 4) flat out uint f_body_idx;
 layout(location = 5) flat out vec4 f_tile_color;
 layout(location = 6) out vec2 f_tile_uv;
+layout(location = 7) out vec3 f_base_chord;
 
-TerrainVector parent_position(uint first, uvec2 grid, uint stride) {
+TerrainVector parent_vertex(uint first, uvec2 grid, uint stride, bool direction) {
     uvec2 origin = min(grid / stride * stride, uvec2(16u - stride));
     TerrainUV f = TerrainUV(grid - origin) / TerrainScalar(stride);
-    TerrainVector b = TerrainVector(vertices[first + origin.y * 17u + origin.x + stride].position.xyz);
-    TerrainVector c = TerrainVector(vertices[first + (origin.y + stride) * 17u + origin.x].position.xyz);
+    GeometryVertex vb = vertices[first + origin.y * 17u + origin.x + stride];
+    GeometryVertex vc = vertices[first + (origin.y + stride) * 17u + origin.x];
+    TerrainVector b = TerrainVector(direction ? vb.direction.xyz : vb.position.xyz);
+    TerrainVector c = TerrainVector(direction ? vc.direction.xyz : vc.position.xyz);
     if (f.x + f.y <= 1.0) {
-        TerrainVector a = TerrainVector(vertices[first + origin.y * 17u + origin.x].position.xyz);
+        GeometryVertex va = vertices[first + origin.y * 17u + origin.x];
+        TerrainVector a = TerrainVector(direction ? va.direction.xyz : va.position.xyz);
         return a * (1.0 - f.x - f.y) + b * f.x + c * f.y;
     }
-    TerrainVector d = TerrainVector(vertices[first + (origin.y + stride) * 17u + origin.x + stride].position.xyz);
+    GeometryVertex vd = vertices[first + (origin.y + stride) * 17u + origin.x + stride];
+    TerrainVector d = TerrainVector(direction ? vd.direction.xyz : vd.position.xyz);
     return d * (f.x + f.y - 1.0) + b * (1.0 - f.y) + c * (1.0 - f.x);
 }
 
@@ -65,6 +70,7 @@ void main() {
     uvec2 grid = uvec2(uint(gl_VertexIndex) % 17u, uint(gl_VertexIndex) / 17u);
     GeometryVertex vertex = vertices[first + uint(gl_VertexIndex)];
     TerrainVector point = TerrainVector(vertex.position.xyz);
+    TerrainVector base_chord = TerrainVector(vertex.direction.xyz);
     uint level = tile.address.y;
     uint mask = tile.metadata.z;
     bool coarse_edge = (grid.y == 0u && (mask & 1u) != 0u)
@@ -78,12 +84,14 @@ void main() {
             : parent_width * parent_width * TerrainScalar(tile.eye.w);
         TerrainScalar error = numerator / max(length(point - TerrainVector(tile.eye.xyz)), 1e-12);
         TerrainScalar morph = clamp(error - 1.0, 0.0, 1.0);
-        point = mix(parent_position(first, grid, coarse_edge ? 4u : 2u), point, morph);
+        point = mix(parent_vertex(first, grid, coarse_edge ? 4u : 2u, false), point, morph);
+        base_chord = mix(parent_vertex(first, grid, coarse_edge ? 4u : 2u, true), base_chord, morph);
     }
     TerrainMatrix rotation = TerrainMatrix(TerrainVector(tile.rotation0.xyz), TerrainVector(tile.rotation1.xyz), TerrainVector(tile.rotation2.xyz));
     TerrainVector eye = (TerrainVector(tile.anchor_high.xyz) + rotation * point * TerrainScalar(tile.anchor_high.w)) + TerrainVector(tile.anchor_low.xyz);
     f_world_pos = transpose(mat3(u_scene.view)) * vec3(eye);
     f_local_pos = vertex.direction.xyz;
+    f_base_chord = vec3(base_chord);
     f_normal = vec3(transpose(TerrainMatrix(u_scene.view)) * rotation * TerrainVector(vertex.normal.xyz));
     f_body_idx = tile.metadata.x;
     f_subpixel_factor = 0.0;

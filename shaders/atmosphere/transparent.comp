@@ -1,0 +1,4 @@
+#version 460
+#define ATMOSPHERE_TRANSPARENCY 1
+#define ATMOSPHERE_TRANSPARENT_ONLY 1
+#include "common/atmosphere_composite.glsl"

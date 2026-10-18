@@ -60,6 +60,31 @@ struct AtmosphereEditDraft {
     bool dirty = false;
     std::string error;
 
+    void use_calculated_properties() {
+        values.physical = true;
+        values.automatic_height = true;
+        dirty = true;
+    }
+    void set_gas_percentage(const std::string& gas, double percentage) {
+        if (!std::isfinite(percentage)) return;
+        double fraction = std::clamp(percentage/100.0, 0.0, 1.0), others = 0;
+        for (const auto& [name, weight] : values.composition) if (name != gas) others += weight;
+        if (others > 0) {
+            for (auto& [name, weight] : values.composition) if (name != gas) weight *= (1-fraction)/others;
+            values.composition[gas] = fraction;
+        } else values.composition[gas] = 1.0;
+        use_calculated_properties();
+    }
+    void remove_gas(const std::string& gas) {
+        if (values.composition.size() <= 1) return;
+        values.composition.erase(gas);
+        double total = 0;
+        for (const auto& [_, weight] : values.composition) total += weight;
+        if (total > 0) for (auto& [_, weight] : values.composition) weight /= total;
+        else values.composition.begin()->second = 1.0;
+        use_calculated_properties();
+    }
+
     void reload(const ephemeris::SystemSnapshot& snapshot, int index) {
         body_index = index;
         generation = snapshot.generation();

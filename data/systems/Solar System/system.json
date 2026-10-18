@@ -102,21 +102,84 @@
     "W0": 131.6405,
     "a": 0.723332,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 0.0002,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "temperature_k": 737.0,
       "composition": {
         "CO2": 0.9648552717092436,
         "N2": 0.034994750787381894,
         "SO2": 0.0001499775033744938
       },
-      "composition_basis": "mole",
-      "equation_of_state": "peng_robinson",
-      "h_mie": 32.4986776986482,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.85,
-      "surface_pressure": 90.79694053787318,
-      "temperature": 737.0
+      "pressure_pa": 9200000.0,
+      "temperature_layers": [
+        [
+          0,
+          737
+        ],
+        [
+          10,
+          658
+        ],
+        [
+          20,
+          580
+        ],
+        [
+          30,
+          495
+        ],
+        [
+          40,
+          416
+        ],
+        [
+          50,
+          340
+        ],
+        [
+          60,
+          260
+        ],
+        [
+          70,
+          230
+        ],
+        [
+          80,
+          200
+        ],
+        [
+          100,
+          180
+        ]
+      ],
+      "aerosols": [
+        {
+          "material": "sulfate",
+          "optical_depth_550": 1,
+          "effective_radius_um": 0.2,
+          "effective_variance": 0.15,
+          "peak_km": 65,
+          "width_km": 5
+        },
+        {
+          "material": "sulfate",
+          "optical_depth_550": 15,
+          "effective_radius_um": 1,
+          "effective_variance": 0.15,
+          "peak_km": 60,
+          "width_km": 5
+        },
+        {
+          "material": "sulfate",
+          "optical_depth_550": 10,
+          "effective_radius_um": 3,
+          "effective_variance": 0.15,
+          "peak_km": 53,
+          "width_km": 3
+        }
+      ]
     },
     "color": "#bcb8ad",
     "color_pole": "#bcb8ad",
@@ -152,27 +215,27 @@
     "W0": 280.8205,
     "a": 1.0,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 2e-06,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "pressure_pa": 101325.0,
+      "temperature_k": 288.15,
       "composition": {
-        "Ar": 0.00999999999,
-        "N2": 0.7799999992200001,
-        "O2": 0.20999999979,
-        "O3": 9.999999990000001e-10
+        "N2": 0.78,
+        "O2": 0.21,
+        "Ar": 0.01
       },
-      "composition_basis": "mole",
-      "h_mie": 1.6860173252603592,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.76,
+      "ground_albedo": [
+        0.3,
+        0.3,
+        0.3
+      ],
       "ozone": {
         "column_du": 300.0,
         "peak_km": 25.0,
         "width_km": 7.0
       },
-      "surface_pressure": 1.0,
-      "temperature": 288.15,
-      "temperature_profile": [
+      "temperature_layers": [
         [
           0.0,
           288.15
@@ -205,7 +268,20 @@
           85.99995290624202,
           186.946
         ]
-      ]
+      ],
+      "automatic_aerosols": false,
+      "mie_scattering": [
+        0.002,
+        0.002,
+        0.002
+      ],
+      "mie_extinction": [
+        0.002,
+        0.002,
+        0.002
+      ],
+      "mie_scale_height_km": 1.2,
+      "mie_asymmetry": 0.8
     },
     "color": "#2c6cff",
     "color_pole": "#2c6cff",
@@ -220,7 +296,7 @@
     "lum_pole": 0.0,
     "m": 3.0034896154649684e-06,
     "name": "Earth",
-    "atmosphere": {"enabled": true},
+
     "oblateness": 0.00335,
     "omega": 114.207,
     "parentId": "Sun",
@@ -280,20 +356,25 @@
     "W0": 77.7855,
     "a": 1.523679,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 4e-05,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "pressure_pa": 636.0,
+      "temperature_k": 214.0,
       "composition": {
         "Ar": 0.01606425702811245,
         "CO2": 0.9568273092369478,
         "N2": 0.02710843373493976
       },
-      "composition_basis": "mole",
-      "h_mie": 12.07754096335513,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.76,
-      "surface_pressure": 0.0062768319763138415,
-      "temperature": 214.0
+      "aerosols": [
+        {
+          "material": "mineral_dust",
+          "optical_depth_550": 0.48,
+          "effective_radius_um": 1.5,
+          "effective_variance": 0.3,
+          "scale_height_km": 12
+        }
+      ]
     },
     "color": "#2c211a",
     "color_pole": "#2c211a",
@@ -393,19 +474,160 @@
     "W0": 5.342,
     "a": 5.2044,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 5e-06,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "temperature_k": 165.0,
       "composition": {
         "H2": 0.898,
         "He": 0.102
       },
-      "composition_basis": "mole",
-      "h_mie": 8.349859496165129,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.8,
-      "surface_pressure": 0.9869232667160128,
-      "temperature": 165.0
+      "reference_pressure_pa": 100000,
+      "bottom_altitude_km": -78.36,
+      "temperature_layers": [
+        [
+          -78.36,
+          330.0
+        ],
+        [
+          -64.63,
+          302.5
+        ],
+        [
+          -52.08,
+          275.0
+        ],
+        [
+          -40.73,
+          247.5
+        ],
+        [
+          -30.56,
+          220.0
+        ],
+        [
+          -22.11,
+          206.25
+        ],
+        [
+          -14.19,
+          192.5
+        ],
+        [
+          -6.82,
+          178.75
+        ],
+        [
+          0.0,
+          165.0
+        ],
+        [
+          4.04,
+          157.5
+        ],
+        [
+          7.89,
+          150.0
+        ],
+        [
+          11.56,
+          142.5
+        ],
+        [
+          15.04,
+          135.0
+        ],
+        [
+          22.71,
+          128.75
+        ],
+        [
+          30.03,
+          122.5
+        ],
+        [
+          36.98,
+          116.25
+        ],
+        [
+          43.57,
+          110.0
+        ],
+        [
+          53.15,
+          120.0
+        ],
+        [
+          63.57,
+          130.0
+        ],
+        [
+          74.83,
+          140.0
+        ],
+        [
+          86.93,
+          150.0
+        ],
+        [
+          99.6,
+          153.75
+        ],
+        [
+          112.6,
+          157.5
+        ],
+        [
+          125.91,
+          161.25
+        ],
+        [
+          139.54,
+          165.0
+        ],
+        [
+          167.23,
+          166.25
+        ],
+        [
+          195.15,
+          167.5
+        ],
+        [
+          223.3,
+          168.75
+        ],
+        [
+          251.69,
+          170.0
+        ]
+      ],
+      "aerosols": [
+        {
+          "material": "ammonia_ice",
+          "optical_depth_550": 4,
+          "effective_radius_um": 1,
+          "effective_variance": 0.2,
+          "peak_km": 11.37,
+          "width_km": 6.2
+        },
+        {
+          "material": "ammonium_hydrosulfide",
+          "optical_depth_550": 12,
+          "effective_radius_um": 3,
+          "effective_variance": 0.2,
+          "peak_km": -18.27,
+          "width_km": 8.66
+        },
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 0.15,
+          "effective_radius_um": 0.15,
+          "effective_variance": 0.2,
+          "peak_km": 55.21,
+          "width_km": 5.29
+        }
+      ]
     },
     "color": "#a2896b",
     "color_pole": "#a2896b",
@@ -699,20 +921,169 @@
     "W0": 108.5911,
     "a": 9.5826,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 3.5e-06,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "temperature_k": 134.0,
       "composition": {
         "CH4": 0.0045,
         "H2": 0.9630000000000001,
         "He": 0.0325
       },
-      "composition_basis": "mole",
-      "h_mie": 15.0,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.8,
-      "surface_pressure": 0.9869232667160128,
-      "temperature": 134.0
+      "reference_pressure_pa": 100000,
+      "bottom_altitude_km": -153.61,
+      "temperature_layers": [
+        [
+          -153.61,
+          270.0
+        ],
+        [
+          -126.68,
+          247.5
+        ],
+        [
+          -102.08,
+          225.0
+        ],
+        [
+          -79.8,
+          202.5
+        ],
+        [
+          -59.85,
+          180.0
+        ],
+        [
+          -43.26,
+          168.5
+        ],
+        [
+          -27.75,
+          157.0
+        ],
+        [
+          -13.33,
+          145.5
+        ],
+        [
+          0.0,
+          134.0
+        ],
+        [
+          7.89,
+          128.0
+        ],
+        [
+          15.41,
+          122.0
+        ],
+        [
+          22.58,
+          116.0
+        ],
+        [
+          29.39,
+          110.0
+        ],
+        [
+          44.29,
+          103.0
+        ],
+        [
+          58.22,
+          96.0
+        ],
+        [
+          71.18,
+          89.0
+        ],
+        [
+          83.16,
+          82.0
+        ],
+        [
+          100.56,
+          91.5
+        ],
+        [
+          119.88,
+          101.0
+        ],
+        [
+          141.12,
+          110.5
+        ],
+        [
+          164.29,
+          120.0
+        ],
+        [
+          188.93,
+          125.0
+        ],
+        [
+          214.6,
+          130.0
+        ],
+        [
+          241.3,
+          135.0
+        ],
+        [
+          269.04,
+          140.0
+        ],
+        [
+          326.11,
+          142.5
+        ],
+        [
+          384.3,
+          145.0
+        ],
+        [
+          443.62,
+          147.5
+        ],
+        [
+          504.08,
+          150.0
+        ]
+      ],
+      "aerosols": [
+        {
+          "material": "ammonia_ice",
+          "optical_depth_550": 8,
+          "effective_radius_um": 1.5,
+          "effective_variance": 0.2,
+          "peak_km": 0.0,
+          "width_km": 13.96
+        },
+        {
+          "material": "ammonium_hydrosulfide",
+          "optical_depth_550": 15,
+          "effective_radius_um": 3,
+          "effective_variance": 0.2,
+          "peak_km": -59.85,
+          "width_km": 18.76
+        },
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 0.1,
+          "effective_radius_um": 0.15,
+          "effective_variance": 0.2,
+          "peak_km": 121.75,
+          "width_km": 10.62
+        },
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 1.5,
+          "effective_radius_um": 0.2,
+          "effective_variance": 0.2,
+          "peak_km": 54.46,
+          "width_km": 10.21
+        }
+      ]
     },
     "color": "#4b4938",
     "color_pole": "#4b4938",
@@ -1033,21 +1404,33 @@
     "W0": 0.0,
     "a": 0.008168,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 0.00012,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "pressure_pa": 146921.25,
+      "temperature_k": 94.0,
       "composition": {
         "Ar": 0.0015,
         "CH4": 0.05650000000000001,
         "N2": 0.9420000000000001
       },
-      "composition_basis": "mole",
-      "h_mie": 48.38138350008105,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "legacy_tholin_hint": 0.05,
-      "mie_g": 0.88,
-      "surface_pressure": 1.45,
-      "temperature": 94.0
+      "aerosols": [
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 6,
+          "effective_radius_um": 0.2,
+          "effective_variance": 0.2,
+          "scale_height_km": 50
+        },
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 0.02,
+          "effective_radius_um": 0.04,
+          "effective_variance": 0.1,
+          "peak_km": 500,
+          "width_km": 20
+        }
+      ]
     },
     "color": "#fbbf24",
     "color_pole": "#fbbf24",
@@ -1338,20 +1721,161 @@
     "W0": 202.4,
     "a": 19.2184,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 9.899999618530272e-06,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "temperature_k": 76.0,
       "composition": {
         "CH4": 0.023000000000000003,
         "H2": 0.825,
         "He": 0.152
       },
-      "composition_basis": "mole",
-      "h_mie": 10.399999618530273,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.7319999933242798,
-      "surface_pressure": 0.9869232667160128,
-      "temperature": 76.0
+      "reference_pressure_pa": 100000,
+      "bottom_altitude_km": -88.0,
+      "temperature_layers": [
+        [
+          -88.0,
+          150.0
+        ],
+        [
+          -72.93,
+          138.75
+        ],
+        [
+          -59.01,
+          127.5
+        ],
+        [
+          -46.26,
+          116.25
+        ],
+        [
+          -34.67,
+          105.0
+        ],
+        [
+          -24.97,
+          97.75
+        ],
+        [
+          -15.96,
+          90.5
+        ],
+        [
+          -7.63,
+          83.25
+        ],
+        [
+          0.0,
+          76.0
+        ],
+        [
+          4.51,
+          73.0
+        ],
+        [
+          8.84,
+          70.0
+        ],
+        [
+          12.98,
+          67.0
+        ],
+        [
+          16.95,
+          64.0
+        ],
+        [
+          25.76,
+          61.25
+        ],
+        [
+          34.2,
+          58.5
+        ],
+        [
+          42.25,
+          55.75
+        ],
+        [
+          49.91,
+          53.0
+        ],
+        [
+          61.04,
+          57.25
+        ],
+        [
+          73.04,
+          61.5
+        ],
+        [
+          85.9,
+          65.75
+        ],
+        [
+          99.65,
+          70.0
+        ],
+        [
+          114.47,
+          76.25
+        ],
+        [
+          130.58,
+          82.5
+        ],
+        [
+          147.97,
+          88.75
+        ],
+        [
+          166.67,
+          95.0
+        ],
+        [
+          206.19,
+          98.75
+        ],
+        [
+          247.36,
+          102.5
+        ],
+        [
+          290.21,
+          106.25
+        ],
+        [
+          334.75,
+          110.0
+        ]
+      ],
+      "aerosols": [
+        {
+          "material": "methane_ice",
+          "optical_depth_550": 4,
+          "effective_radius_um": 1,
+          "effective_variance": 0.2,
+          "peak_km": -11.51,
+          "width_km": 9.08
+        },
+        {
+          "material": "hydrogen_sulfide_ice",
+          "optical_depth_550": 12,
+          "effective_radius_um": 2,
+          "effective_variance": 0.2,
+          "peak_km": -55.02,
+          "width_km": 13.0
+        },
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 0.15,
+          "effective_radius_um": 0.1,
+          "effective_variance": 0.2,
+          "peak_km": 49.91,
+          "width_km": 5.55
+        }
+      ]
     },
     "color": "#06243c",
     "color_pole": "#06243c",
@@ -1603,20 +2127,161 @@
     "W0": 253.2,
     "a": 30.11,
     "atmosphere": {
-      "aerosol_mode": "manual",
-      "beta_mie": 5e-06,
+      "schema_version": 2,
+      "enabled": true,
+      "model": "physical",
+      "temperature_k": 72.0,
       "composition": {
         "CH4": 0.009999999999999998,
         "H2": 0.8,
         "He": 0.19
       },
-      "composition_basis": "mole",
-      "h_mie": 8.0,
-      "height_mode": "auto",
-      "intensity": 1.0,
-      "mie_g": 0.6970000267028809,
-      "surface_pressure": 0.9869232667160128,
-      "temperature": 72.0
+      "reference_pressure_pa": 100000,
+      "bottom_altitude_km": -70.86,
+      "temperature_layers": [
+        [
+          -70.86,
+          150.0
+        ],
+        [
+          -58.37,
+          137.5
+        ],
+        [
+          -46.96,
+          125.0
+        ],
+        [
+          -36.63,
+          112.5
+        ],
+        [
+          -27.38,
+          100.0
+        ],
+        [
+          -19.7,
+          93.0
+        ],
+        [
+          -12.58,
+          86.0
+        ],
+        [
+          -6.01,
+          79.0
+        ],
+        [
+          0.0,
+          72.0
+        ],
+        [
+          3.56,
+          69.5
+        ],
+        [
+          6.99,
+          67.0
+        ],
+        [
+          10.3,
+          64.5
+        ],
+        [
+          13.48,
+          62.0
+        ],
+        [
+          20.62,
+          60.25
+        ],
+        [
+          27.57,
+          58.5
+        ],
+        [
+          34.31,
+          56.75
+        ],
+        [
+          40.85,
+          55.0
+        ],
+        [
+          50.8,
+          63.75
+        ],
+        [
+          62.23,
+          72.5
+        ],
+        [
+          75.14,
+          81.25
+        ],
+        [
+          89.54,
+          90.0
+        ],
+        [
+          105.52,
+          100.0
+        ],
+        [
+          123.22,
+          110.0
+        ],
+        [
+          142.63,
+          120.0
+        ],
+        [
+          163.77,
+          130.0
+        ],
+        [
+          208.69,
+          135.0
+        ],
+        [
+          255.49,
+          140.0
+        ],
+        [
+          304.17,
+          145.0
+        ],
+        [
+          354.76,
+          150.0
+        ]
+      ],
+      "aerosols": [
+        {
+          "material": "methane_ice",
+          "optical_depth_550": 2,
+          "effective_radius_um": 1.5,
+          "effective_variance": 0.2,
+          "peak_km": -9.07,
+          "width_km": 7.17
+        },
+        {
+          "material": "hydrogen_sulfide_ice",
+          "optical_depth_550": 10,
+          "effective_radius_um": 2,
+          "effective_variance": 0.2,
+          "peak_km": -43.72,
+          "width_km": 10.55
+        },
+        {
+          "material": "organic_haze",
+          "optical_depth_550": 0.04,
+          "effective_radius_um": 0.1,
+          "effective_variance": 0.2,
+          "peak_km": 63.35,
+          "width_km": 6.38
+        }
+      ]
     },
     "color": "#1b3e78",
     "color_pole": "#1b3e78",

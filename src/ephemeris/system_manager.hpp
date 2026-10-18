@@ -2,6 +2,7 @@
 
 #include "core/coordinates.hpp"
 #include "ephemeris/atmosphere.hpp"
+#include "physics/atmosphere_physics.hpp"
 #include "core/units.hpp"
 #include "physics/star_calc.hpp"
 #include <memory>
@@ -106,10 +107,15 @@ struct BodyDefinition {
         return is_black_hole ? 2.5980762 * physical : physical;
     }
 
+    double opaque_radius_au() const noexcept {
+        return radius_au()+(atmosphere.pressure_reference ? atmosphere.bottom_altitude_km*KM_TO_AU : 0.0);
+    }
+
     bool valid_height_range() const noexcept {
         return std::isfinite(height_range_km.x) && std::isfinite(height_range_km.y) &&
             height_range_km.x <= height_range_km.y &&
-            height_range_km.x > -radius_au()*AU_TO_KM*glm::clamp(1.0-oblateness, 0.05, 1.0);
+            height_range_km.x > -radius_au()*AU_TO_KM*glm::clamp(1.0-oblateness, 0.05, 1.0) &&
+            atmosphere.bottom_altitude_km > -radius_au()*AU_TO_KM*.25;
     }
 };
 
@@ -135,6 +141,7 @@ struct BodyRenderState {
     RenderVelocity velocity{};
     glm::dvec3 pole{0.0, 1.0, 0.0};
     double spin_angle_rad = 0.0;
+    std::shared_ptr<const physics::PreparedAtmosphere> atmosphere;
 };
 
 struct BodyRevisions {

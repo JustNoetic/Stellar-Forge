@@ -221,6 +221,14 @@ void spice_oracles(const std::filesystem::path& fixture_path, const std::filesys
     std::ifstream fixture_file(fixture_path), preset_file(preset_path);
     auto fixture = nlohmann::json::parse(fixture_file);
     auto preset = nlohmann::json::parse(preset_file);
+    if (preset.is_object() && preset.value("source_preset", std::string{}) == "Solar System") {
+        auto solar = SystemManager{}.load_system("Solar System");
+        SpiceKernelManager manager;
+        std::string error;
+        auto shared = manager.build_ephemeris_system(&solar.definition, "2026-06-03", error);
+        check(!shared.definition.bodies.empty(), "Build shared preset for SPICE oracles: " + error);
+        preset = SystemManager::serialize_definition(shared.definition);
+    }
     for (auto& body : preset) {
         body.erase("sv");
         for (const char* element : {"a", "e", "inc", "Omega", "omega", "M"}) body.erase(element);

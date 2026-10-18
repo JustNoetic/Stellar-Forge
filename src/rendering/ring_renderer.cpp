@@ -67,6 +67,19 @@ void RingRenderer::init(rhi::VkContext& ctx) {
                        {"RING_FIXED_SIDE", light_mode == 2 ? "1" : light_mode == 3 ? "0" : "-1"}};
         pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     }
+    if (ctx.fragment_stores_enabled()) {
+        desc.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
+        desc.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT});
+        for (uint32_t i = 0; i < transparency_pipelines_.size(); ++i) {
+            uint32_t light_mode = i / 4;
+            desc.macros = {{"RING_DRAW_CAPACITY", std::to_string(1u << (i % 4))},
+                {"RING_FINITE_SOURCE", light_mode == 1 ? "1" : "0"},
+                {"RING_SINGLE_STAR", light_mode >= 2 ? "1" : "0"},
+                {"RING_FIXED_SIDE", light_mode == 2 ? "1" : light_mode == 3 ? "0" : "-1"},
+                {"TRANSPARENCY_CAPTURE", "1"}};
+            transparency_pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+        }
+    }
 
     hosts_gpu_.reserve(MAX_RING_HOSTS);
     host_draw_ranges_.reserve(MAX_RING_HOSTS);
@@ -77,6 +90,7 @@ void RingRenderer::shutdown(rhi::VkContext& ctx) {
     cached_definition_.reset();
     staging_.shutdown(ctx);
     for (auto& pipeline : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    for (auto& pipeline : transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     ctx.destroy_image(shadow_lut_);
     ctx.destroy_image(gradient_atlas_);
     for (auto& buf : host_ssbos_) {
@@ -315,7 +329,8 @@ void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camer
 }
 
 void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
-                          std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars) {
+                          std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
+                          std::span<const rhi::PushDescriptorWrite> transparency_writes) {
     if (!settings.show_rings || active_host_count_ == 0) return;
 
     auto timer = ctx.begin_gpu_timer(cmd, "rings");
@@ -324,10 +339,12 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
     writes.push_back(rhi::PushDescriptorWrite::storage_buffer(7, host_ssbos_[f_idx], 0, MAX_RING_HOSTS * sizeof(RingHostGPU)));
     writes.push_back(rhi::PushDescriptorWrite::sampled_image(8, gradient_atlas_, ctx.sampler_linear_clamp()));
     writes.push_back(rhi::PushDescriptorWrite::sampled_image(9, shadow_lut_, ctx.sampler_linear_clamp()));
+    writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
+    auto& pipelines = transparency_writes.empty() ? pipelines_ : transparency_pipelines_;
 
     uint32_t bound_pipeline = 7;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines_[bound_pipeline].handle);
-    ctx.push_descriptors(cmd, pipelines_[bound_pipeline], writes);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[bound_pipeline].handle);
+    ctx.push_descriptors(cmd, pipelines[bound_pipeline], writes);
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_.handle, &offset);
@@ -346,9 +363,9 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
         auto draw = [&](uint32_t first, uint32_t count, uint32_t packed, uint32_t segments, uint32_t pipeline_index) {
             if (bound_pipeline != pipeline_index) {
                 bound_pipeline = pipeline_index;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines_[bound_pipeline].handle);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[bound_pipeline].handle);
             }
-            ctx.push_constants(cmd, pipelines_[bound_pipeline], Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});
+            ctx.push_constants(cmd, pipelines[bound_pipeline], Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});
             vkCmdDrawIndexed(cmd, count, 1, first, 0, 0);
         };
         const auto& host = hosts_gpu_[host_idx];

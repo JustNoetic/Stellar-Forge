@@ -40,7 +40,8 @@ public:
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                  const ephemeris::SystemSnapshot& sys, uint32_t body_count);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
-                std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars);
+                std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
+                std::span<const rhi::PushDescriptorWrite> transparency_writes = {});
 
     void invalidate_texture_cache() noexcept {
         force_rebuild_ = true;
@@ -85,6 +86,7 @@ private:
     uint32_t index_count_ = 0;
 
     std::array<rhi::Pipeline, 16> pipelines_{};
+    std::array<rhi::Pipeline, 16> transparency_pipelines_{};
     rhi::Image gradient_atlas_{};
     rhi::Image shadow_lut_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> host_ssbos_{};

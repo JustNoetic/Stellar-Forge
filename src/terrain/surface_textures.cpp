@@ -60,11 +60,66 @@ std::shared_ptr<const ColorSource> ColorSource::open(const std::filesystem::path
     return result;
 }
 
-uint32_t ColorSource::index(TileId tile) const {
+uint32_t SurfaceSource::index(TileId tile) const {
     if (tile.face >= 6 || tile.level > level || tile.x >= (1u << tile.level) || tile.y >= (1u << tile.level))
-        throw std::runtime_error("Invalid albedo tile address");
+        throw std::runtime_error("Invalid surface tile address");
     uint32_t n = 1u << tile.level;
     return 2*(n*n-1)+tile.face*n*n+tile.y*n+tile.x;
+}
+
+bool SurfaceSource::compatible(double, double polar) const noexcept {
+    return std::abs(polar_ratio-polar) <= 1e-10;
+}
+
+std::vector<std::byte> ColorSource::load(TileId tile) const {
+    auto payload = read(tile);
+    auto bytes = std::as_bytes(std::span{*payload});
+    return {bytes.begin(), bytes.end()};
+}
+
+NormalSource::NormalSource(std::shared_ptr<const HeightSource> source) : height(std::move(source)) {
+    domain = height->domain();
+    level = height->info().data_level;
+    polar_ratio = height->info().polar_ratio;
+}
+
+bool NormalSource::compatible(double radius_m, double polar) const noexcept {
+    return height->compatible(radius_m, polar);
+}
+
+std::vector<std::byte> NormalSource::load(TileId tile) const {
+    index(tile);
+    std::unordered_map<uint64_t, HeightTile> payloads;
+    auto scale = glm::dvec3(1, polar_ratio, 1);
+    auto point = [&](double u, double v) {
+        auto direction = glm::normalize(cube_vector(tile.face, u, v));
+        auto at = tile_at(direction, tile.level);
+        auto axis = cube_vector(at.face, 0, 0);
+        double divisor = glm::dot(direction, axis);
+        double fu = glm::dot(direction, cube_vector(at.face, 1, 0)-axis)/divisor;
+        double fv = glm::dot(direction, cube_vector(at.face, 0, 1)-axis)/divisor;
+        auto found = payloads.find(at.key());
+        if (found == payloads.end()) found = payloads.emplace(at.key(), height->read(at)).first;
+        double n = double(1u << tile.level);
+        double x = ((fu+1)*.5*n-at.x)*GRID_CELLS;
+        double y = ((fv+1)*.5*n-at.y)*GRID_CELLS;
+        double h = height_sample_cubic(found->second, x, y)/height->info().equatorial_radius_m;
+        return direction*scale + glm::normalize(direction/scale)*h;
+    };
+    std::vector<int16_t> values(COLOR_SIDE*COLOR_SIDE*4);
+    double width = std::ldexp(2.0, -int(tile.level));
+    double step = width/height->info().grid_cells*.25;
+    for (uint32_t y = 0; y < COLOR_SIDE; ++y) for (uint32_t x = 0; x < COLOR_SIDE; ++x) {
+        double u = -1+(tile.x+(double(x)-COLOR_GUTTER+.5)/COLOR_CORE)*width;
+        double v = -1+(tile.y+(double(y)-COLOR_GUTTER+.5)/COLOR_CORE)*width;
+        auto du = point(u+step, v)-point(u-step, v);
+        auto dv = point(u, v+step)-point(u, v-step);
+        auto normal = glm::normalize(glm::cross(du, dv));
+        for (uint32_t c = 0; c < 3; ++c)
+            values[4*(y*COLOR_SIDE+x)+c] = int16_t(std::round(std::clamp(normal[c], -1.0, 1.0)*32767));
+    }
+    auto bytes = std::as_bytes(std::span{values});
+    return {bytes.begin(), bytes.end()};
 }
 
 std::shared_ptr<const ColorTile> ColorSource::read(TileId tile) const {
@@ -77,10 +132,11 @@ std::shared_ptr<const ColorTile> ColorSource::read(TileId tile) const {
     return bytes;
 }
 
-void SurfaceTextures::init(rhi::VkContext& ctx) {
-    capacity_ = std::min(COLOR_SLOTS, ctx.device_properties().limits.maxImageArrayLayers);
+void SurfaceTextures::init(rhi::VkContext& ctx, bool normals) {
+    normals_ = normals;
+    capacity_ = std::min(normals ? COLOR_SLOTS/2 : COLOR_SLOTS, ctx.device_properties().limits.maxImageArrayLayers);
     slots_ = GeometryResidency{capacity_};
-    atlas_ = ctx.create_image_2d(COLOR_SIDE, COLOR_SIDE, VK_FORMAT_R8G8B8A8_SRGB,
+    atlas_ = ctx.create_image_2d(COLOR_SIDE, COLOR_SIDE, normals ? VK_FORMAT_R16G16B16A16_SNORM : VK_FORMAT_R8G8B8A8_SRGB,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, capacity_);
     ctx.immediate_submit([&](VkCommandBuffer cmd) {
         ctx.transition_image(cmd, atlas_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -88,8 +144,19 @@ void SurfaceTextures::init(rhi::VkContext& ctx) {
     });
     std::vector<uint32_t> empty(PAGE_WORDS);
     for (auto& page : pages_) page = ctx.create_host_buffer(empty.size()*sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, empty.data());
-    staging_.init(ctx, 4*1024*1024);
+    staging_.init(ctx, (normals ? 8 : 4)*1024*1024);
     words_.resize(COLOR_BODIES*4);
+}
+
+void SurfaceTextures::set_height_source(std::string body, std::shared_ptr<const HeightSource> source) {
+    if (body.empty() && !source) { set_sources({}); return; }
+    auto bindings = sources_;
+    auto found = std::find_if(bindings.begin(), bindings.end(), [&](const auto& binding) { return binding.body == body; });
+    if (found != bindings.end() && source && found->source->domain == source->domain()) return;
+    if (found == bindings.end() && !source) return;
+    std::erase_if(bindings, [&](const auto& binding) { return binding.body == body; });
+    if (source) bindings.push_back({std::move(body), std::make_shared<NormalSource>(std::move(source))});
+    set_sources(std::move(bindings));
 }
 
 void SurfaceTextures::shutdown(rhi::VkContext& ctx) {
@@ -173,14 +240,14 @@ void SurfaceTextures::run(std::stop_token stop) {
             requested = queue_.front();
             queue_.pop_front();
         }
-        std::shared_ptr<const ColorTile> data;
+        std::vector<std::byte> data;
         std::string error;
-        try { data = sources_[requested.body].source->read(TileId::from_key(requested.tile)); }
+        try { data = sources_[requested.body].source->load(TileId::from_key(requested.tile)); }
         catch (const std::exception& failure) { error = failure.what(); }
         {
             std::lock_guard lock(mutex_);
             pending_.erase(requested);
-            if (data) ready_.push_back({requested, std::move(data)});
+            if (!data.empty()) ready_.push_back({requested, std::move(data)});
             else { if (failed_.size() < 128) failed_.insert(requested); if (error_.empty()) error_ = std::move(error); }
         }
     }
@@ -217,7 +284,8 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
             auto body = system.body(body_index);
             for (uint32_t s = 0; s < sources_.size(); ++s) {
                 if (sources_[s].body != body.definition.name ||
-                    std::abs(sources_[s].source->polar_ratio-std::clamp(1-body.definition.oblateness, .05, 1.0)) > 1e-10) continue;
+                    !sources_[s].source->compatible(body.definition.radius_au()*AU_TO_KM*1000,
+                        std::clamp(1-body.definition.oblateness, .05, 1.0))) continue;
                 SelectionView view;
                 auto rotation = body_rotation(body.render.pole, body.render.spin_angle_rad);
                 auto center = camera_relative(body.render.position, camera.eye_pos_render());
@@ -230,7 +298,7 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
                 view.polar_ratio = sources_[s].source->polar_ratio;
                 view.height_amplitude = .0015;
                 view.max_level = sources_[s].source->level;
-                view.max_patches = std::max(6u, std::min(remaining, 256u));
+                view.max_patches = std::max(6u, std::min(normals_ ? remaining/2 : remaining, 256u));
                 auto& entry = selections_[s];
                 if (!entry.valid || !(entry.view == view)) {
                     entry.selection = select(view, TextureError{});
@@ -285,7 +353,7 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, slot, 1};
         copy.imageExtent = {COLOR_SIDE, COLOR_SIDE, 1};
-        if (!staging_.image(cmd, ctx, atlas_, copy, std::as_bytes(std::span{*entry.payload}))) throw std::logic_error("Albedo staging budget exhausted");
+        if (!staging_.image(cmd, ctx, atlas_, copy, entry.payload)) throw std::logic_error("Surface staging budget exhausted");
         ctx.transition_image_range(cmd, atlas_, range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -306,7 +374,8 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
         for (uint32_t i = 0; i < std::min<uint32_t>(system.size(), COLOR_BODIES); ++i) {
             auto body = system.body(i);
             for (uint32_t s = 0; s < sources_.size(); ++s) {
-                if (sources_[s].body != body.definition.name || std::abs(sources_[s].source->polar_ratio-std::clamp(1-body.definition.oblateness, .05, 1.0)) > 1e-10) continue;
+                if (sources_[s].body != body.definition.name || !sources_[s].source->compatible(
+                    body.definition.radius_au()*AU_TO_KM*1000, std::clamp(1-body.definition.oblateness, .05, 1.0))) continue;
                 bool roots = true;
                 for (uint32_t face = 0; face < 6; ++face) roots &= words_[offsets_[s]+face] != 0;
                 if (roots) { words_[i*4] = offsets_[s]; words_[i*4+1] = sources_[s].source->level; }

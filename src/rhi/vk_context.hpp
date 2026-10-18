@@ -52,6 +52,8 @@ public:
     Buffer create_device_buffer(VkDeviceSize size, VkBufferUsageFlags usage, const void* initial_data = nullptr);
     void destroy_buffer(Buffer& buffer);
     void flush_buffer(const Buffer& buffer, VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
+    void copy_buffer(VkCommandBuffer cmd, const Buffer& source, const Buffer& destination, VkDeviceSize size,
+                     VkDeviceSize source_offset = 0, VkDeviceSize destination_offset = 0);
 
     Image create_image_2d(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
                           uint32_t mip_levels = 1, uint32_t array_layers = 1);
@@ -137,6 +139,8 @@ public:
     uint32_t frame_index() const noexcept { return frame_index_; }
     const char* device_name() const noexcept { return device_props_.deviceName; }
     bool bresenham_lines_enabled() const noexcept { return bresenham_lines_enabled_; }
+    bool dual_source_blend_enabled() const noexcept { return dual_source_blend_enabled_; }
+    bool fragment_stores_enabled() const noexcept { return fragment_stores_enabled_; }
     bool pipeline_statistics_enabled() const noexcept { return pipeline_statistics_enabled_; }
     void log_pipeline_statistics(VkPipeline pipeline, std::string_view name) const;
 
@@ -158,6 +162,8 @@ private:
     VkPhysicalDeviceDriverProperties driver_props_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     uint32_t timestamp_valid_bits_ = 0;
     bool bresenham_lines_enabled_ = false;
+    bool dual_source_blend_enabled_ = false;
+    bool fragment_stores_enabled_ = false;
     bool pipeline_statistics_enabled_ = false;
     VkDevice device_ = VK_NULL_HANDLE;
     uint32_t graphics_queue_family_ = 0;

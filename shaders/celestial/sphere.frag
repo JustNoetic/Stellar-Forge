@@ -5,6 +5,7 @@ layout(location = 1) in vec3 f_local_pos;
 layout(location = 2) in vec3 f_normal;
 layout(location = 3) in float f_subpixel_factor;
 layout(location = 4) flat in uint f_body_idx;
+layout(location = 7) in vec3 f_base_chord;
 
 #ifdef TERRAIN_SURFACE
 layout(location = 5) flat in vec4 f_tile_color;
@@ -12,13 +13,19 @@ layout(location = 6) in vec2 f_tile_uv;
 #endif
 
 #include "common/celestial_scene.glsl"
+#include "common/body_surface.glsl"
+#include "common/surface_depth.glsl"
 #include "common/eclipse_shadow.glsl"
 #include "common/surface_textures.glsl"
 #include "common/surface_ring_shadow.glsl"
+#include "common/surface_atmosphere.glsl"
 
 layout(location = 0) out vec4 out_color;
+layout(depth_greater) out float gl_FragDepth;
 
 void main() {
+    BodyInstanceGPU b = bodies[f_body_idx];
+    gl_FragDepth = curved_surface_depth(b, f_world_pos, f_base_chord, gl_FragCoord.z);
 #ifdef TERRAIN_SURFACE
     if (f_tile_color.w > 0.5) {
         vec2 edge = min(f_tile_uv, 1.0 - f_tile_uv);
@@ -31,8 +38,8 @@ void main() {
         discard;
     }
 
-    BodyInstanceGPU b = bodies[f_body_idx];
-    vec3 N = normalize(f_normal);
+    vec3 N = surface_shading_normal(f_body_idx, f_local_pos, normalize(f_normal),
+        body_surface_rotation(body_pole(b), b.spin_flags.x));
     vec3 V = normalize(-f_world_pos);
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;
 
@@ -64,6 +71,10 @@ void main() {
         vec3 to_star = star_pos - f_world_pos;
         float d_au = max(length(to_star), 1e-5);
         vec3 L = to_star / d_au;
+        vec3 transmission, diffuse;
+        surface_atmosphere(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord, L, N, transmission, diffuse);
+        float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
+        total_light += albedo*star_col*irradiance*diffuse;
 
         float ndotl = max(dot(N, L), 0.0);
         if (ndotl > 0.0) {
@@ -76,9 +87,8 @@ void main() {
                 if (candidates != 0u)
                     shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad, candidates);
             }
-            float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
             float brdf = surface_reflectance(N, L, V);
-            total_light += albedo * star_col * irradiance * brdf * shadow;
+            total_light += albedo * star_col * irradiance * brdf * shadow * transmission;
         }
     }
 

@@ -142,6 +142,12 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
     feat2.features.fillModeNonSolid = VK_TRUE;
     feat2.features.multiDrawIndirect = VK_TRUE;
     feat2.features.largePoints = VK_TRUE;
+    VkPhysicalDeviceFeatures supported_features{};
+    vkGetPhysicalDeviceFeatures(physical_device_, &supported_features);
+    fragment_stores_enabled_ = supported_features.fragmentStoresAndAtomics == VK_TRUE;
+    feat2.features.fragmentStoresAndAtomics = fragment_stores_enabled_ ? VK_TRUE : VK_FALSE;
+    dual_source_blend_enabled_ = supported_features.dualSrcBlend == VK_TRUE && device_props_.limits.maxFragmentDualSrcAttachments >= 1;
+    feat2.features.dualSrcBlend = dual_source_blend_enabled_ ? VK_TRUE : VK_FALSE;
 
     std::vector<const char*> dev_exts = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
@@ -629,6 +635,12 @@ void VkContext::destroy_buffer(Buffer& buffer) {
 
 void VkContext::flush_buffer(const Buffer& buffer, VkDeviceSize offset, VkDeviceSize size) {
     if (buffer.mapped != nullptr) VK_CHECK(vmaFlushAllocation(allocator_, buffer.allocation, offset, size));
+}
+
+void VkContext::copy_buffer(VkCommandBuffer cmd, const Buffer& source, const Buffer& destination, VkDeviceSize size,
+                            VkDeviceSize source_offset, VkDeviceSize destination_offset) {
+    VkBufferCopy region{source_offset, destination_offset, size};
+    vkCmdCopyBuffer(cmd, source.handle, destination.handle, 1, &region);
 }
 
 Image VkContext::create_image_2d(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,

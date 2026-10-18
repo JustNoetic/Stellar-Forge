@@ -115,14 +115,17 @@ struct RenderProbe {
 
     double render(const Camera& camera, const ephemeris::SystemSnapshot& system,
                   const rendering::RenderSettings& settings, rendering::StarCatalog* catalog = nullptr,
-                  bool tone_map = false, glm::vec3 background = glm::vec3(0.0f), bool atmosphere_only = false) {
+                  bool tone_map = false, glm::vec3 background = glm::vec3(0.0f), bool atmosphere_only = false,
+                  float opaque_depth = 0.0f) {
+        auto effective = settings;
+        if (std::getenv("STELLAR_TEST_ATMOSPHERE_COMPUTE")) effective.atmosphere_dual_source = false;
         vk.immediate_submit([&](VkCommandBuffer cmd) {
-            if (!catalog) renderer.prepare(cmd, vk, camera, system, settings, extent);
+            if (!catalog) renderer.prepare(cmd, vk, camera, system, effective, extent);
             if (catalog) catalog->cull(cmd, vk, camera, units::Years{0.0}, settings, extent);
             vk.transition_image(cmd, color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
             vk.transition_image(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
             auto color_attachment = rhi::RenderingAttachment::clear_color(color, background.r, background.g, background.b);
-            auto depth_attachment = rhi::RenderingAttachment::clear_depth_reverse_z(depth);
+            auto depth_attachment = rhi::RenderingAttachment::clear_depth_reverse_z(depth, opaque_depth);
             vk.begin_rendering(cmd, extent, {&color_attachment, 1}, &depth_attachment);
             vk.set_viewport_and_scissor(cmd, extent);
             if (catalog) catalog->render(cmd, vk, camera, units::Years{0.0}, settings, extent);
@@ -150,7 +153,8 @@ struct RenderProbe {
                               VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
         });
         vmaInvalidateAllocation(vk.allocator(), readback.allocation, 0, VK_WHOLE_SIZE);
-        auto* pixels = static_cast<const uint16_t*>(readback.mapped);
+        std::vector<uint16_t> pixels(static_cast<size_t>(extent.width)*extent.height*4);
+        std::memcpy(pixels.data(), readback.mapped, pixels.size()*sizeof(uint16_t));
         double sum = 0.0;
         for (size_t i = 0; i < static_cast<size_t>(extent.width) * extent.height; ++i) {
             float red = glm::unpackHalf2x16(pixels[4 * i]).x;
@@ -1018,13 +1022,26 @@ void ring_eclipse_candidate_filtering(RenderProbe& probe) {
 #include "ring_gpu_tests.hpp"
 #include "eclipse_gpu_tests.hpp"
 #include "atmosphere_gpu_tests.hpp"
+#include "transparency_gpu_tests.hpp"
 
 int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc == 2 && std::string_view(argv[1]) == "--transparency-only") {
+            transparency_contracts(probe);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--transparency-benchmark") {
+            transparency_benchmark(probe, argv[2]);
+            return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-surface-preview") {
             atmosphere_surface_preview(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-physics-benchmark") {
+            atmosphere_physics_benchmark(probe, argv[2]);
             return 0;
         }
         if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-benchmark") {
@@ -1075,8 +1092,33 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--atmospheres-only") {
+            pressure_reference_atmosphere_contracts(probe);
+            giant_atmosphere_previews(probe);
+            particle_atmosphere_contracts(probe);
+            particle_atmosphere_previews(probe);
+            physical_atmosphere_contracts(probe);
             atmosphere_contracts(probe);
             atmosphere_floor_contracts(probe);
+            aerial_perspective_contracts(probe);
+            bruneton_perspective_contracts(probe);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--particles-only") {
+            pressure_reference_atmosphere_contracts(probe);
+            particle_atmosphere_contracts(probe);
+            particle_atmosphere_previews(probe);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--particle-atmosphere-preview") {
+            particle_atmosphere_previews(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--giant-atmosphere-preview") {
+            giant_atmosphere_previews(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--atmosphere-aerial-only") {
+            aerial_perspective_contracts(probe);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--rings-only") {
@@ -1102,6 +1144,14 @@ int main(int argc, char** argv) {
         }
         if (argc >= 3 && std::string_view(argv[1]) == "--surface-contracts") {
             surface_contracts(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--terrain-normals") {
+            terrain_normal_contracts(probe, argv[2]);
+            return 0;
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--terrain-normal-preview") {
+            surface_preview(probe, argv[2], argv[3], true);
             return 0;
         }
         if (argc >= 4 && std::string_view(argv[1]) == "--surface-preview") {
@@ -1133,6 +1183,7 @@ int main(int argc, char** argv) {
             terrain_surfaces(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
             return 0;
         }
+        physical_atmosphere_contracts(probe);
         atmosphere_contracts(probe);
         terrain_surfaces(probe);
         smooth_surface_contracts(probe);

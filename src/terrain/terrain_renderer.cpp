@@ -58,6 +58,10 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     desc.vert_path = "terrain/terrain.vert";
@@ -88,6 +92,12 @@ void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
     cache_.shutdown(ctx);
     metadata_.clear();
     ctx.destroy_buffer(indices_);
+}
+
+std::vector<std::pair<std::string, std::shared_ptr<const HeightSource>>> TerrainRenderer::height_sources() const {
+    std::vector<std::pair<std::string, std::shared_ptr<const HeightSource>>> sources;
+    for (const auto& binding : streams_) if (binding.stream) sources.emplace_back(binding.body, binding.stream->share_source());
+    return sources;
 }
 
 void TerrainRenderer::set_height_source(std::string body, std::shared_ptr<const HeightSource> source) {
@@ -149,6 +159,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     for (uint32_t i = 0; i < body_count; ++i) {
         const auto& body = system.body(i);
         if (body.definition.is_star || body.definition.is_spacecraft) continue;
+        if (body.definition.atmosphere.pressure_reference) continue;
         double radius = body.definition.radius_au();
         if (radius > 0.0) {
             auto center = camera_relative(body.render.position, eye);

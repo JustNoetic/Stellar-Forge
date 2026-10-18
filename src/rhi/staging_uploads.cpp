@@ -43,7 +43,7 @@ bool StagingUploads::image(VkCommandBuffer cmd, VkContext& ctx, const Image& des
     case VK_FORMAT_R8_UNORM: texel_bytes = 1; break;
     case VK_FORMAT_R8G8_UNORM: texel_bytes = 2; break;
     case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: texel_bytes = 4; break;
-    case VK_FORMAT_R16G16B16A16_SFLOAT: texel_bytes = 8; break;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_SNORM: texel_bytes = 8; break;
     case VK_FORMAT_R32G32B32A32_SFLOAT: texel_bytes = 16; break;
     default: return false;
     }
