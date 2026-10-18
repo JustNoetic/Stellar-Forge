@@ -139,10 +139,11 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         if (body.definition.is_star || body.definition.is_spacecraft) continue;
         double radius = body.definition.radius_au();
         if (radius > 0.0) {
-            covered_[i] = 1;
             auto center = camera_relative(body.render.position, eye);
             if (!visible({center, radius*(1+.01*(1+RELIEF_ROUNDING))}, body_view)) continue;
             double projected = radius*focal/std::max(glm::length(center), 1e-15);
+            if (projected < TERRAIN_MIN_PROJECTED_RADIUS_PX) continue;
+            covered_[i] = 1;
             candidates.emplace_back(-projected, i);
         }
     }

@@ -1,6 +1,6 @@
 # Mesh and point-source rendering
 
-The mesh/point transition described here applies to modeled stars and the existing spacecraft representation. Planets, moons, gas/ice giants and nonstellar black holes always use physical-size quadtree geometry, including subpixel sizes. Their albedo is mapped onto smooth ellipsoids unless elevation is enabled; they never emit planetary point sprites. See [terrain](terrain.md).
+The mesh/point transition described here applies to modeled stars, spacecraft, and celestial bodies (planets, moons, gas/ice giants) as they shrink. Resolved bodies (projected radius $\ge 2.5$ px) use quadtree geometry. When bodies shrink below $2.5$ px radius, terrain preparation on the CPU is culled completely, and bodies transition through the complementary mesh/point sprite handoff down to $1.5$ px radius, where they become pure point lights. See [terrain](terrain.md).
 
 All apparent sizes in the celestial renderer are **radii in framebuffer pixels**:
 
@@ -54,6 +54,6 @@ Enable the optional GPU contracts with `cmake -S . -B build -DSTELLAR_BUILD_REND
 - Compact pixel footprints at multiple subpixel offsets, changes in point diameter at 1080p, and a millionfold overexposure through the composite shader.
 - Mesh-sized sprites through the 5-to-3 px handoff and a three-pixel unresolved minimum, at 256p, 1080p and 2160p.
 
-Small mesh rasterization errors remain at a few pixels because the mesh pass has no multisample antialiasing. Planets now retain that physical sampling behavior instead of switching to an enlarged point. Their reflected-light sweep uses resolved radii of 12–30 pixels and checks area scaling separately from stellar point normalization. `smooth_surface_contracts` additionally verifies quadtree selection down to a radius of `1e-6` pixels and the absence of a minimum-size planetary sprite.
+Small mesh rasterization errors remain at a few pixels because the mesh pass has no multisample antialiasing. Their reflected-light sweep uses resolved radii of 12–30 pixels and checks area scaling separately from stellar point normalization. `smooth_surface_contracts` additionally verifies resolved quadtree selection down to 2.5 pixels, CPU terrain preparation culling for subpixel bodies and point light transitions, and faint signal attenuation for imperceptible bodies.
 
 References: [PBRT point lights](https://www.pbr-book.org/4ed/Light_Sources/Point_Lights), [Vulkan fragment depth operations](https://docs.vulkan.org/spec/latest/chapters/fragops.html), and the solar Gaia reference adopted in [A&A 670, A19 (2023)](https://www.aanda.org/articles/aa/pdf/2023/02/aa44250-22.pdf).

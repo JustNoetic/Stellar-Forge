@@ -11,6 +11,8 @@
 
 namespace sf::terrain {
 
+inline constexpr double TERRAIN_MIN_PROJECTED_RADIUS_PX = 2.5;
+
 struct TerrainStats {
     double max_error_pixels = 0.0;
     uint32_t patches = 0;

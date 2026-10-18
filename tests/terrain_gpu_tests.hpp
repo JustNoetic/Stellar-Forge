@@ -65,9 +65,15 @@ void smooth_surface_contracts(RenderProbe& probe) {
         camera.cam_pos_rel = {0, 0, radius*focal/projected};
         double flux = probe.render(camera, simulation.snapshot(), settings);
         const auto& distant = probe.renderer.terrain_stats();
-        check(distant.drawn_bodies == 1 && distant.patches > 0 && distant.smooth_patches == distant.patches,
-              "Every screen size retains quadtree geometry, including subpixel bodies");
-        if (projected <= .1) check(flux == 0, "Subpixel planets never switch to a minimum-size point sprite");
+        if (projected >= terrain::TERRAIN_MIN_PROJECTED_RADIUS_PX) {
+            check(distant.drawn_bodies == 1 && distant.patches > 0 && distant.smooth_patches == distant.patches,
+                  "Resolved bodies retain quadtree geometry");
+        } else {
+            check(distant.drawn_bodies == 0 && distant.patches == 0,
+                  "Bodies turning into point lights cull terrain preparation on the CPU");
+            if (projected == 1e-6) check(flux == 0, "Imperceptible bodies fade to zero flux");
+            else check(flux > 0, "Distant and subpixel bodies transition to point lights");
+        }
     }
     settings.terrain_enabled = true;
     settings.terrain_height_km = 20;
@@ -89,10 +95,10 @@ void smooth_surface_contracts(RenderProbe& probe) {
     check(simulation.replace_system(loaded).accepted, "Maximum body count surface fixture loads");
     probe.render(camera, simulation.snapshot(), settings);
     const auto& crowded = probe.renderer.terrain_stats();
-    check(crowded.drawn_bodies == rendering::MAX_CELESTIAL_BODIES-1 && crowded.patches > 4096 &&
-          crowded.patches <= terrain::MAX_PATCHES, "Patch budgeting reserves quadtree coverage for every distant body");
+    check(crowded.drawn_bodies == 1 && crowded.patches > 0 && crowded.patches <= settings.terrain_patch_limit,
+          "Tiny imperceptible bodies cull terrain preparation and do not consume quadtree patches");
     probe.resize(EXTENT);
-    std::cout << "Smooth surface contracts passed: oblate geometry, all distances, no planet points and reserved coarse coverage.\n";
+    std::cout << "Smooth surface contracts passed: oblate geometry, point light terrain culling, and resolved quadtree coverage.\n";
 }
 
 void surface_contracts(RenderProbe& probe, const std::filesystem::path& fixture_pointer) {
