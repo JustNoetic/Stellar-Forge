@@ -82,9 +82,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     point_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
     terrain_.init(ctx, load_surface_assets);
     if (load_surface_assets) {
-        auto heights = textures_.load_catalog(paths::external_path("data", "surfaces.json"));
-        if (heights.size() > 1) throw std::runtime_error("Only one imported elevation body is supported in this version");
-        if (!heights.empty()) terrain_.set_height_source(heights[0].first, terrain::HeightSource::open(heights[0].second));
+        for (const auto& [body, path] : textures_.load_catalog(paths::external_path("data", "surfaces.json")))
+            terrain_.set_height_source(body, terrain::HeightSource::open(path));
     }
 }
 

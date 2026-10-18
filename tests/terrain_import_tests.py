@@ -27,10 +27,15 @@ def fixture(output):
 class TerrainImportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        import numpy as np
         cls.directory = Path(tempfile.mkdtemp(prefix="fixture-", dir=SCRATCH))
         cls.manifest = fixture(cls.directory / "dataset")
         terrain.import_tiles(cls.directory / "flat", 2, 6378137, 1-1/298.257223563, 0,
             lambda lon, lat, d: -1500, {"fixture": "constant-negative-height"}, "Flat signed height")
+        cls.dense = terrain.import_tiles(cls.directory / "dense", 1, 6378137, 1-1/298.257223563, 0,
+            lambda lon, lat, d: -600+1800*d[0]*d[2]+350*np.sin(7*d[1])*np.cos(5*d[0]),
+            {"fixture": "dense-cubic-height-v1"}, "Dense cubic height fixture",
+            cells=128, gutter=2, reconstruction="cubic-bspline")
         cls.payload = (cls.directory / "dataset/heights.bin").read_bytes()
         cls.records = {tuple(row[:4]): row for row in cls.manifest["tiles"]}
         (SCRATCH / "fixture-path.txt").write_text(str(cls.directory / "dataset"), encoding="utf-8")

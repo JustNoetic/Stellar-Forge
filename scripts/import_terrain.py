@@ -82,15 +82,20 @@ class Raster:
 
 
 class ImageRaster:
-    def __init__(self, path, scale, offset):
+    def __init__(self, path, scale=None, offset=0.0, height_range_m=None):
         import numpy as np
         from PIL import Image
         Image.MAX_IMAGE_PIXELS = 268435456
         with Image.open(path) as image:
             self.values = np.asarray(image if image.mode in ("I;16", "I", "F", "L") else image.convert("L"))
         self.height, self.width = self.values.shape
-        self.scale, self.offset = scale, offset
-        if not math.isfinite(scale) or not math.isfinite(offset):
+        if height_range_m is not None:
+            low, high = float(height_range_m[0]), float(height_range_m[1])
+            denom = 65535.0 if self.values.dtype == np.uint16 else 255.0
+            scale = (high - low) / denom
+            offset = low
+        self.scale, self.offset = float(scale), float(offset)
+        if not math.isfinite(self.scale) or not math.isfinite(self.offset):
             raise ValueError("Image elevation requires finite explicit scale and offset")
 
     def sample(self, longitude, latitude):
@@ -188,7 +193,259 @@ class GdalRaster:
                    for dx, dy, weight in ((0, 0, (1-u)*(1-v)), (1, 0, u*(1-v)), (0, 1, (1-u)*v), (1, 1, u*v)))
 
 
-def import_tiles(output, level, radius, polar, prime, sampler, provenance, name):
+def _cube_vec(face, u, v):
+    import numpy as np
+    one = np.ones_like(u)
+    return ((one, v, -u), (-one, v, u), (u, one, -v), (u, -one, v), (u, v, one), (-u, v, -one))[face]
+
+
+def _face_uv_vec(px, py, pz):
+    import numpy as np
+    ax, ay, az = np.abs(px), np.abs(py), np.abs(pz)
+    a = np.maximum(np.maximum(ax, ay), az)
+    cond_x = ax == a
+    cond_y = (~cond_x) & (ay == a)
+    c_face = np.where(cond_x, np.where(px >= 0, 0, 1),
+             np.where(cond_y, np.where(py >= 0, 2, 3),
+                              np.where(pz >= 0, 4, 5)))
+    cu = np.where(cond_x, np.where(px >= 0, -pz / a, pz / a),
+         np.where(cond_y, px / a,
+                          np.where(pz >= 0, px / a, -px / a)))
+    cv = np.where(cond_x, py / a,
+         np.where(cond_y, np.where(py >= 0, -pz / a, pz / a),
+                          py / a))
+    return c_face, cu, cv
+
+
+def _midpoint_residual_2x(g):
+    import numpy as np
+    a, b, c, d = g[0:-1:2, 0:-1:2], g[0:-1:2, 2::2], g[2::2, 0:-1:2], g[2::2, 2::2]
+    r1 = np.abs(g[0:-1:2, 1::2] - 0.5 * (a + b))
+    r2 = np.abs(g[1::2, 0:-1:2] - 0.5 * (a + c))
+    r3 = np.abs(g[1::2, 2::2] - 0.5 * (b + d))
+    r4 = np.abs(g[2::2, 1::2] - 0.5 * (c + d))
+    r5 = np.abs(g[1::2, 1::2] - 0.5 * (b + c))
+    return np.maximum(np.maximum(np.maximum(r1, r2), np.maximum(r3, r4)), r5)
+
+
+def import_dense_tiles(output, level, radius, polar, prime, sampler, provenance, name,
+                       cells=128, gutter=2, reconstruction="cubic-bspline", raster=None, cuda_sampler=None):
+    import numpy as np
+    count = 2 * (4**(level+1)-1)
+    if not 0 <= level <= 5 or count > MAX_TILES:
+        raise ValueError("Version 1 supports data levels 0..5 and at most 16,384 metadata records")
+    if not (math.isfinite(radius) and radius > 0 and .05 <= polar <= 1 and math.isfinite(prime)):
+        raise ValueError("Invalid reference ellipsoid or prime meridian")
+    output = Path(output)
+    if output.exists():
+        raise ValueError("Output must be a new directory")
+
+    side = cells + 1 + 2 * gutter
+    finest = cells * (1 << level)
+    fside = finest + 1
+
+    if cuda_sampler is None:
+        try:
+            from scripts.cuda_tile_sampler import is_cuda_available, CudaTileSampler
+            if is_cuda_available()[0]:
+                cuda_sampler = CudaTileSampler()
+        except Exception:
+            cuda_sampler = None
+
+    if raster is not None and cuda_sampler is not None:
+        face_grids, encoding_error = cuda_sampler.sample_height_faces(
+            raster.values, finest, polar, prime, raster.scale, raster.offset
+        )
+    else:
+        face_grids = np.empty((6, fside, fside), dtype=np.float32)
+        encoding_error = 0.0
+        axis = -1.0 + 2.0 * np.arange(fside, dtype=np.float64) / finest
+        for face in range(6):
+            for y0 in range(0, fside, 256):
+                y1 = min(fside, y0 + 256)
+                u, v = np.meshgrid(axis, axis[y0:y1])
+                px, py, pz = _cube_vec(face, u, v)
+                length = np.sqrt(px*px + py*py + pz*pz)
+                dx, dy, dz = px / length, py / length, pz / length
+                lat = np.degrees(np.arctan2(dy / polar, np.hypot(dx, dz)))
+                lon = np.degrees(np.arctan2(dx, dz) + prime)
+                if raster is not None:
+                    rx = ((lon + 180.0) % 360.0) / 360.0 * raster.width - 0.5
+                    ry = np.clip((90.0 - lat) / 180.0 * raster.height - 0.5, 0.0, raster.height - 1.0)
+                    ix0 = np.floor(rx).astype(np.int64)
+                    iy0 = np.floor(ry).astype(np.int64)
+                    fx, fy = rx - ix0, ry - iy0
+                    ix1 = (ix0 + 1) % raster.width
+                    iy1 = np.minimum(iy0 + 1, raster.height - 1)
+                    ix0 = ix0 % raster.width
+                    s00 = raster.values[iy0, ix0].astype(np.float64)
+                    s10 = raster.values[iy0, ix1].astype(np.float64)
+                    s01 = raster.values[iy1, ix0].astype(np.float64)
+                    s11 = raster.values[iy1, ix1].astype(np.float64)
+                    orig = ((s00*(1.0-fx) + s10*fx)*(1.0-fy) + (s01*(1.0-fx) + s11*fx)*fy)*raster.scale + raster.offset
+                else:
+                    try:
+                        orig = np.asarray(sampler(lon, lat, (dx, dy, dz)), dtype=np.float64)
+                        if orig.shape != lon.shape:
+                            raise TypeError()
+                    except Exception:
+                        orig = np.empty_like(lon, dtype=np.float64)
+                        for r in range(orig.shape[0]):
+                            for c in range(orig.shape[1]):
+                                orig[r, c] = sampler(float(lon[r, c]), float(lat[r, c]), (float(dx[r, c]), float(dy[r, c]), float(dz[r, c])))
+                enc = orig.astype(np.float32)
+                encoding_error = max(encoding_error, float(np.max(np.abs(enc.astype(np.float64) - orig))))
+                face_grids[face, y0:y1, :] = enc
+
+    # Enforce exact canonical seam and corner identity across all 6 faces
+    axis_idx = np.arange(fside, dtype=np.int64)
+    axis_u = -1.0 + 2.0 * axis_idx / finest
+    for _ in range(2):
+        for face in range(6):
+            for edge_y, edge_x in (
+                (np.zeros(fside, dtype=np.int64), axis_idx),
+                (np.full(fside, finest, dtype=np.int64), axis_idx),
+                (axis_idx, np.zeros(fside, dtype=np.int64)),
+                (axis_idx, np.full(fside, finest, dtype=np.int64)),
+            ):
+                u = axis_u[edge_x]
+                v = axis_u[edge_y]
+                px, py, pz = _cube_vec(face, u, v)
+                c_face, cu, cv = _face_uv_vec(px, py, pz)
+                cx = np.rint((cu + 1.0) * (finest * 0.5)).astype(np.int64)
+                cy = np.rint((cv + 1.0) * (finest * 0.5)).astype(np.int64)
+                face_grids[face, edge_y, edge_x] = face_grids[c_face, cy, cx]
+
+    if not np.all(np.isfinite(face_grids)) or float(np.max(np.abs(face_grids))) >= radius * 0.01:
+        raise ValueError("Height is nonfinite or exceeds the supported one-percent relief envelope")
+
+    def continuous_vec(face, u, v):
+        px, py, pz = _cube_vec(face, u, v)
+        c_face, cu, cv = _face_uv_vec(px, py, pz)
+        x = (cu + 1.0) * (finest * 0.5)
+        y = (cv + 1.0) * (finest * 0.5)
+        ix = np.minimum(np.floor(x).astype(np.int64), finest - 1)
+        iy = np.minimum(np.floor(y).astype(np.int64), finest - 1)
+        fx, fy = x - ix, y - iy
+        a = face_grids[c_face, iy, ix].astype(np.float64)
+        b = face_grids[c_face, iy, ix + 1].astype(np.float64)
+        c = face_grids[c_face, iy + 1, ix].astype(np.float64)
+        d = face_grids[c_face, iy + 1, ix + 1].astype(np.float64)
+        res = np.where(fx + fy <= 1.0, a * (1.0 - fx - fy) + b * fx + c * fy, d * (fx + fy - 1.0) + b * (1.0 - fy) + c * (1.0 - fx))
+        return res.astype(np.float32)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="terrain-import-", dir=output.parent) as temporary:
+        temporary = Path(temporary)
+        records = {}
+        offsets = {}
+        offset = 0
+        tile_bytes = side * side * 4
+        for depth in range(level + 1):
+            for face in range(6):
+                for y in range(1 << depth):
+                    for x in range(1 << depth):
+                        offsets[face, depth, x, y] = offset
+                        offset += tile_bytes
+
+        gx_arr = np.arange(-gutter, cells + gutter + 1, dtype=np.int64)
+        gy_arr = np.arange(-gutter, cells + gutter + 1, dtype=np.int64)
+        step = cells // 16
+
+        payload_path = temporary / "heights.bin"
+        with payload_path.open("w+b") as payload:
+            payload.truncate(offset)
+            for depth in range(level, -1, -1):
+                n = 1 << depth
+                width = 2.0 / n
+                stride = 1 << (level - depth)
+                for face in range(6):
+                    face_tiles = np.empty((n * n, side, side), dtype=np.float32)
+                    face_meta = []
+                    for ty in range(n):
+                        fy_arr = (ty * cells + gy_arr) * stride
+                        iy_valid = (fy_arr >= 0) & (fy_arr <= finest)
+                        vy0, vy1 = int(np.argmax(iy_valid)), int(len(iy_valid) - 1 - np.argmax(iy_valid[::-1]))
+                        for tx in range(n):
+                            fx_arr = (tx * cells + gx_arr) * stride
+                            idx = ty * n + tx
+                            if fx_arr[0] >= 0 and fx_arr[-1] <= finest and fy_arr[0] >= 0 and fy_arr[-1] <= finest:
+                                tile_vals = face_grids[face, fy_arr[0]:fy_arr[-1]+1:stride, fx_arr[0]:fx_arr[-1]+1:stride]
+                                face_tiles[idx] = tile_vals
+                            else:
+                                ix_valid = (fx_arr >= 0) & (fx_arr <= finest)
+                                vx0, vx1 = int(np.argmax(ix_valid)), int(len(ix_valid) - 1 - np.argmax(ix_valid[::-1]))
+                                tile_vals = face_tiles[idx]
+                                tile_vals[vy0:vy1+1, vx0:vx1+1] = face_grids[
+                                    face, fy_arr[vy0]:fy_arr[vy1]+1:stride, fx_arr[vx0]:fx_arr[vx1]+1:stride
+                                ]
+                                oob_gy, oob_gx = np.where(~(iy_valid[:, None] & ix_valid[None, :]))
+                                u = -1.0 + (tx + gx_arr[oob_gx] / cells) * width
+                                v = -1.0 + (ty + gy_arr[oob_gy] / cells) * width
+                                tile_vals[oob_gy, oob_gx] = continuous_vec(face, u, v)
+
+                            core64 = face_tiles[idx, gutter:gutter+cells+1, gutter:gutter+cells+1].astype(np.float64)
+                            low, high = float(core64.min()), float(core64.max())
+                            a, b, c, d = core64[:-1, :-1], core64[:-1, 1:], core64[1:, :-1], core64[1:, 1:]
+                            gradient = float(max(np.hypot(b - a, c - a).max(), np.hypot(d - c, d - b).max())) * (cells / width)
+
+                            if depth == level:
+                                if step == 8:
+                                    err_l2 = _midpoint_residual_2x(core64).reshape(4, 16, 4, 16).max(axis=(1, 3))
+                                    err_l1 = _midpoint_residual_2x(core64[::2, ::2]).reshape(2, 16, 2, 16).max(axis=(1, 3)) + err_l2.reshape(2, 2, 2, 2).max(axis=(1, 3))
+                                    error = float(_midpoint_residual_2x(core64[::4, ::4]).max() + err_l1.max())
+                                else:
+                                    error = 0.0
+                            else:
+                                error = 0.0
+                                child_res = _midpoint_residual_2x(core64[::step//2, ::step//2]).reshape(2, 8, 2, 8).max(axis=(1, 3))
+                                for cy in range(2):
+                                    for cx in range(2):
+                                        child = records[face, depth + 1, tx * 2 + cx, ty * 2 + cy]
+                                        low = min(low, child[6])
+                                        high = max(high, child[7])
+                                        error = max(error, float(child_res[cy, cx]) + child[8])
+                                        gradient = max(gradient, child[9])
+                            face_meta.append((tx, ty, low, high, error, gradient))
+
+                    bytes_2d = np.ascontiguousarray(face_tiles).view(np.uint8).reshape(n * n, tile_bytes)
+                    if cuda_sampler is not None:
+                        csums = cuda_sampler.checksum_tiles(bytes_2d)
+                    else:
+                        csums = [checksum(bytes_2d[i].tobytes()) for i in range(n * n)]
+
+                    payload.seek(offsets[face, depth, 0, 0])
+                    payload.write(bytes_2d.tobytes())
+                    for i, (tx, ty, low, high, error, gradient) in enumerate(face_meta):
+                        key = face, depth, tx, ty
+                        records[key] = [*key, offsets[key], int(csums[i]), low, high, error, gradient]
+
+        manifest = dict(version=1, encoding="float32-le", reconstruction=reconstruction, grid_cells=cells,
+                        gutter=gutter, height_units="m", vertical_datum="ellipsoid", projection="engine-oblate-cube-v1",
+                        scale=1, offset=0, coverage="global-filled",
+                        orientation="x-east-y-north-z-prime", latitude="geodetic", missing_policy="fill",
+                        name=name, equatorial_radius_m=radius, polar_ratio=polar, prime_meridian_rad=prime,
+                        encoding_error_m=encoding_error, data_level=level, provenance=provenance,
+                        tiles=[records[key] for key in offsets])
+        if isinstance(manifest["provenance"].get("nodata"), float) and not math.isfinite(manifest["provenance"]["nodata"]):
+            manifest["provenance"]["nodata"] = str(manifest["provenance"]["nodata"])
+        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
+        with payload_path.open("rb") as payload:
+            for chunk in iter(lambda: payload.read(1024*1024), b""):
+                digest.update(chunk)
+        manifest["identity"] = int.from_bytes(digest.digest()[:8], "little") or 1
+        manifest["revision"] = 1
+        (temporary / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False)+"\n", encoding="utf-8")
+        os.rename(temporary, output)
+    return manifest
+
+
+def import_tiles(output, level, radius, polar, prime, sampler, provenance, name,
+                 cells=CELLS, gutter=1, reconstruction="nested-triangles", raster=None, cuda_sampler=None):
+    if cells != CELLS or gutter != 1 or reconstruction != "nested-triangles" or raster is not None:
+        return import_dense_tiles(output, level, radius, polar, prime, sampler, provenance, name,
+                                  cells=cells, gutter=gutter, reconstruction=reconstruction,
+                                  raster=raster, cuda_sampler=cuda_sampler)
     count = 2 * (4**(level+1)-1)
     if not 0 <= level <= 5 or count > MAX_TILES:
         raise ValueError("Version 1 supports data levels 0..5 and at most 16,384 metadata records")

@@ -40,10 +40,17 @@ private:
 };
 
 inline constexpr uint32_t HEIGHT_SIDE = GRID_CELLS + 3;
+inline constexpr uint32_t DENSE_HEIGHT_CELLS = 128;
+inline constexpr uint32_t DENSE_HEIGHT_GUTTER = 2;
+inline constexpr uint32_t DENSE_HEIGHT_SIDE = DENSE_HEIGHT_CELLS + 1 + 2 * DENSE_HEIGHT_GUTTER;
 inline constexpr size_t MAX_SOURCE_RECORDS = 16384;
 
 struct HeightTile {
-    std::array<float, HEIGHT_SIDE * HEIGHT_SIDE> heights_m{};
+    uint32_t cells = GRID_CELLS;
+    uint32_t gutter = 1;
+    uint32_t side = HEIGHT_SIDE;
+    bool cubic = false;
+    std::vector<float> heights_m = std::vector<float>(HEIGHT_SIDE * HEIGHT_SIDE, 0.0f);
 };
 
 struct HeightRecord {
@@ -67,6 +74,10 @@ struct HeightSourceInfo {
     double encoding_error_m = 0.0;
     double maximum_gradient_m = 0.0;
     uint32_t data_level = 0;
+    uint32_t grid_cells = GRID_CELLS;
+    uint32_t gutter = 1;
+    uint32_t finest_level = 0;
+    bool cubic = false;
     std::array<double, MAX_LEVEL + 1> shared_height_error_m{};
 };
 
@@ -86,16 +97,27 @@ public:
     std::span<const HeightRecord> records() const noexcept { return records_; }
 
 private:
+    double approximation_error_with_height(TileId tile, uint32_t stride, double low_m, double high_m, double grad_m, double height_error) const noexcept;
+    struct Envelope {
+        std::shared_ptr<const HeightTile> payload;
+        std::array<float, 256> mip_min{};
+        std::array<float, 256> mip_max{};
+        std::array<float, 256> mip_grad{};
+        std::array<float, 256> mip_err8{};
+        std::array<float, 256> mip_err4{};
+        std::array<float, 256> mip_err2{};
+    };
     HeightSourceInfo info_;
     std::filesystem::path payload_;
     std::vector<HeightRecord> records_;
     std::array<size_t, MAX_LEVEL + 1> level_offsets_{};
     mutable std::mutex envelope_mutex_;
     mutable std::atomic<uint64_t> bounds_revision_{0};
-    mutable std::list<std::pair<uint64_t, std::shared_ptr<const HeightTile>>> envelopes_;
+    mutable std::list<std::pair<uint64_t, Envelope>> envelopes_;
 };
 
 double height_sample(const HeightTile& payload, double x, double y) noexcept;
+double height_sample_cubic(const HeightTile& payload, double x, double y) noexcept;
 uint32_t height_checksum(std::span<const std::byte> bytes) noexcept;
 
 }

@@ -228,7 +228,7 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
                 view.focal_pixels = focal;
                 view.target_error_pixels = 1.0;
                 view.polar_ratio = sources_[s].source->polar_ratio;
-                view.height_amplitude = .01;
+                view.height_amplitude = .0015;
                 view.max_level = sources_[s].source->level;
                 view.max_patches = std::max(6u, std::min(remaining, 256u));
                 auto& entry = selections_[s];

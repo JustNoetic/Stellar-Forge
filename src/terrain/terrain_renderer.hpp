@@ -107,6 +107,11 @@ private:
         glm::dmat3 draw_view{1};
         uint32_t draw_flags = UINT32_MAX;
     };
+    struct StreamBinding {
+        std::string body;
+        std::unique_ptr<HeightStream> stream;
+        std::string reported_error;
+    };
     rhi::Pipeline pipeline_{};
     rhi::Pipeline precise_pipeline_{};
     rhi::Pipeline reference_pipeline_{};
@@ -117,9 +122,7 @@ private:
     std::vector<DrawPatch> prepared_;
     std::vector<uint8_t> covered_;
     std::vector<std::pair<uint32_t, float>> relief_extents_;
-    std::string source_body_;
-    std::unique_ptr<HeightStream> stream_;
-    std::string reported_error_;
+    std::vector<StreamBinding> streams_;
     std::unordered_map<uint32_t, SelectionEntry> selections_;
     uint64_t selection_generation_ = 0;
     GeometryCache cache_;

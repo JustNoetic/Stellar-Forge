@@ -164,8 +164,10 @@ def discover_available_bodies(root, definitions):
         source = next((path for path in sorted(folder.iterdir()) if path.stem.casefold() == folder.name.casefold()
                        and path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")), None)
         if source is not None:
-            height = folder/(folder.name+"_heightmap.png")
-            has_height = height.exists() and "height_range_km" in definitions[folder.name]
+            height_stem = f"{folder.name}_heightmap".casefold()
+            height = next((path for path in sorted(folder.iterdir()) if path.stem.casefold() == height_stem
+                           and path.suffix.lower() in (".png", ".tif", ".tiff", ".jpg", ".jpeg", ".webp")), None)
+            has_height = height is not None and "height_range_km" in definitions[folder.name]
             items.append({
                 "body": folder.name,
                 "folder": folder,
@@ -294,8 +296,7 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
     else:
         if selected_names:
             items = [item for item in items if item["body"] in selected_names]
-        target_lod = level if level is not None else 3
-        jobs = [(item, target_lod) for item in items]
+        jobs = [(item, level if level is not None else recommended_lod(item["source"])) for item in items]
 
     print(f"\nProcessing {len(jobs)} bodies on {backend_str}...")
     existing = json.loads(catalog_path.read_text()) if catalog_path.exists() else {"version": 1, "bodies": []}
@@ -313,21 +314,23 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
         if item["has_height"]:
             low, high = (float(v)*1000 for v in body["height_range_km"])
             radius_m = float(body["r"])*solar_radius_m
-            height_tag = hashlib.sha256(f"{file_hash(item['height_path'])}:{polar}:{radius_m}:{low}:{high}:5".encode()).hexdigest()[:12]
+            height_lod = level if level is not None else recommended_lod(item["height_path"])
+            height_tag = hashlib.sha256(f"{file_hash(item['height_path'])}:{polar}:{radius_m}:{low}:{high}:{height_lod}:{CORE}:cubic-v1".encode()).hexdigest()[:12]
             height_output = output_root/item["body"].lower()/height_tag/"height"
             if not height_output.exists() or rebake:
                 if height_output.exists():
                     shutil.rmtree(height_output)
-                raster = ImageRaster(item["height_path"], (high-low)/255, low)
-                import_tiles(height_output, 5, radius_m, polar, 0,
+                raster = ImageRaster(item["height_path"], height_range_m=(low, high))
+                import_tiles(height_output, height_lod, radius_m, polar, 0,
                     lambda lon, lat, direction: raster.sample(lon, lat),
-                    dict(source_sha256=file_hash(item["height_path"]), scale=(high-low)/255, offset=low,
+                    dict(source_sha256=file_hash(item["height_path"]), scale=raster.scale, offset=raster.offset,
                          interpretation="legacy-visual-range-no-geoid-correction", source_height_range_m=[low, high]),
-                    item["body"]+" legacy visual elevation")
+                    item["body"]+" legacy visual elevation",
+                    cells=CORE, gutter=GUTTER, reconstruction="cubic-bspline", raster=raster, cuda_sampler=sampler)
             binding["height"] = height_output.resolve().relative_to(project).as_posix()
 
         existing_map[item["body"]] = binding
-        print(f"  [OK] {item['body']}: albedo LOD 0..{lod}" + (" + elevation" if "height" in binding else ""), flush=True)
+        print(f"  [OK] {item['body']}: albedo LOD 0..{lod}" + (f" + elevation LOD 0..{height_lod} ({CORE}x{CORE})" if "height" in binding else ""), flush=True)
 
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     catalog_path.write_text(json.dumps(dict(version=1, bodies=list(existing_map.values())), indent=2)+"\n", encoding="utf-8")

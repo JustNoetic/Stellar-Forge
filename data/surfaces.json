@@ -8,7 +8,7 @@
     {
       "body": "Earth",
       "albedo": "data/tiles/earth/1fdcd995226a/albedo",
-      "height": "data/tiles/earth/b72a6fa0e156/height"
+      "height": "data/tiles/earth/95cebe9dca5b/height"
     },
     {
       "body": "Callisto",
@@ -44,7 +44,8 @@
     },
     {
       "body": "Moon",
-      "albedo": "data/tiles/moon/b374244ca088/albedo"
+      "albedo": "data/tiles/moon/b374244ca088/albedo",
+      "height": "data/tiles/moon/0e9bc7e4c99a/height"
     },
     {
       "body": "Saturn",

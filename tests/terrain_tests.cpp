@@ -576,6 +576,18 @@ void imported_source(const std::filesystem::path& pointer) {
     auto flat = HeightSource::open(std::filesystem::path(*path).parent_path()/"flat");
     imported_error_bounds(*flat);
     check(flat->approximation_error({4}) < 1.01*std::pow(2.0/GRID_CELLS,2), "Flat imported terrain avoids the old inflated curvature allowance");
+    auto dense_path = std::filesystem::path(*path).parent_path()/"dense";
+    if (std::filesystem::exists(dense_path)) {
+        auto dense = HeightSource::open(dense_path);
+        check(dense->info().grid_cells == DENSE_HEIGHT_CELLS && dense->info().gutter == DENSE_HEIGHT_GUTTER &&
+              dense->info().cubic && dense->info().finest_level == dense->info().data_level + 3,
+              "Dense height source exposes 128x128 cubic-bspline metadata");
+        imported_error_bounds(*dense);
+        auto tile_payload = dense->read({4, dense->info().data_level, 0, 0});
+        double c0 = height_sample_cubic(tile_payload, 4.25, 7.75);
+        check(c0 >= dense->info().minimum_m && c0 <= dense->info().maximum_m,
+              "Uniform cubic B-spline height reconstruction remains within convex hull bounds");
+    }
     auto revisions = HeightSource::open(*path);
     check(revisions->bounds_revision() == 0, "Metadata-only source starts without resident payload envelopes");
     revisions->read({4, revisions->info().data_level, 0, 0});

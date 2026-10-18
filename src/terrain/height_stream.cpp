@@ -20,19 +20,19 @@ public:
     uint64_t reads = 0;
 
     HeightGeometry bake(TileId tile) {
-        touched_.clear();
         const auto& info = source_.info();
+        uint32_t level = info.cubic ? std::min(tile.level, info.data_level) : info.data_level;
         double width = std::ldexp(2.0, -int(tile.level));
         auto anchor = ellipsoid_point(tile.face, -1+(tile.x+.5)*width, -1+(tile.y+.5)*width, info.polar_ratio);
-        double spacing = std::ldexp(2.0 / GRID_CELLS, -int(info.data_level));
+        double spacing = std::ldexp(2.0 / info.grid_cells, -int(level)) * (info.cubic ? 0.25 : 1.0);
         HeightGeometry result;
         for (uint32_t y = 0; y <= GRID_CELLS; ++y) {
             for (uint32_t x = 0; x <= GRID_CELLS; ++x) {
                 double u = -1+(tile.x+double(x)/GRID_CELLS)*width, v = -1+(tile.y+double(y)/GRID_CELLS)*width;
                 auto coordinates = canonical(cube_vector(tile.face, u, v));
-                auto p = point(coordinates.face, coordinates.u, coordinates.v);
-                auto du = point(coordinates.face, coordinates.u+spacing, coordinates.v) - point(coordinates.face, coordinates.u-spacing, coordinates.v);
-                auto dv = point(coordinates.face, coordinates.u, coordinates.v+spacing) - point(coordinates.face, coordinates.u, coordinates.v-spacing);
+                auto p = point(coordinates.face, coordinates.u, coordinates.v, level, false);
+                auto du = point(coordinates.face, coordinates.u+spacing, coordinates.v, level, info.cubic) - point(coordinates.face, coordinates.u-spacing, coordinates.v, level, info.cubic);
+                auto dv = point(coordinates.face, coordinates.u, coordinates.v+spacing, level, info.cubic) - point(coordinates.face, coordinates.u, coordinates.v-spacing, level, info.cubic);
                 result[y*(GRID_CELLS+1)+x] = {glm::vec4(glm::vec3(p-anchor), 0),
                     glm::vec4(glm::vec3(glm::normalize(glm::cross(du, dv))), 0),
                     glm::vec4(glm::vec3(glm::normalize(cube_vector(tile.face, u, v))), 0)};
@@ -42,16 +42,16 @@ public:
     }
 
 private:
-    glm::dvec3 point(uint32_t face, double u, double v) {
+    glm::dvec3 point(uint32_t face, double u, double v, uint32_t level, bool cubic) {
         const auto& info = source_.info();
         auto direction = glm::normalize(cube_vector(face, u, v));
         auto at = canonical(direction);
-        auto tile = tile_at(direction, info.data_level);
+        auto tile = tile_at(direction, level);
         const auto& payload = get(tile);
-        double n = double(1u << info.data_level);
+        double n = double(1u << level);
         double x = ((at.u+1)*.5*n-tile.x)*GRID_CELLS;
         double y = ((at.v+1)*.5*n-tile.y)*GRID_CELLS;
-        double height = height_sample(payload, x, y) / info.equatorial_radius_m;
+        double height = (cubic ? height_sample_cubic(payload, x, y) : height_sample(payload, x, y)) / info.equatorial_radius_m;
         auto scale = glm::dvec3(1, info.polar_ratio, 1);
         return direction*scale + glm::normalize(direction/scale)*height;
     }
@@ -60,12 +60,10 @@ private:
         for (auto i = payloads_.begin(); i != payloads_.end(); ++i) {
             if (i->first == tile) {
                 payloads_.splice(payloads_.begin(), payloads_, i);
-                if (touched_.insert(tile.key()).second) source_.retain_envelope(tile, payloads_.front().second);
                 return payloads_.front().second;
             }
         }
         auto payload = source_.read(tile);
-        touched_.insert(tile.key());
         ++reads;
         if (payloads_.size() == 64) payloads_.pop_back();
         payloads_.emplace_front(tile, std::move(payload));
@@ -74,7 +72,6 @@ private:
 
     const HeightSource& source_;
     std::list<std::pair<TileId, HeightTile>> payloads_;
-    std::unordered_set<uint64_t> touched_;
 };
 
 }

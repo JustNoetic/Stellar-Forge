@@ -78,7 +78,7 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
 }
 
 void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
-    stream_.reset();
+    streams_.clear();
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, precise_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, reference_pipeline_);
@@ -91,14 +91,25 @@ void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
 }
 
 void TerrainRenderer::set_height_source(std::string body, std::shared_ptr<const HeightSource> source) {
-    if (stream_ && source && body == source_body_ && stream_->source().domain() == source->domain()) return;
-    stream_.reset();
-    source_body_ = std::move(body);
-    reported_error_.clear();
-    if (source) {
-        log::info("Terrain source '{}' bound to '{}' (identity {}, revision {})", source->info().name, source_body_,
-                  source->domain().identity, source->domain().revision);
-        stream_ = std::make_unique<HeightStream>(std::move(source));
+    if (body.empty() && !source) {
+        streams_.clear();
+        selections_.clear();
+        return;
+    }
+    auto found = std::find_if(streams_.begin(), streams_.end(), [&](const StreamBinding& entry) { return entry.body == body; });
+    if (!source) {
+        if (found != streams_.end()) streams_.erase(found);
+        selections_.clear();
+        return;
+    }
+    if (found != streams_.end() && found->stream && found->stream->source().domain() == source->domain()) return;
+    log::info("Terrain source '{}' bound to '{}' (identity {}, revision {})", source->info().name, body,
+              source->domain().identity, source->domain().revision);
+    if (found != streams_.end()) {
+        found->stream = std::make_unique<HeightStream>(std::move(source));
+        found->reported_error.clear();
+    } else {
+        streams_.push_back({std::move(body), std::make_unique<HeightStream>(std::move(source)), {}});
     }
     selections_.clear();
 }
@@ -124,6 +135,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     }
     std::vector<GeometryKey> retained_keys;
     std::vector<std::shared_ptr<const HeightGeometry>> retained_heights;
+    std::vector<HeightStream*> retained_streams;
     double tan_y = std::tan(camera.fov_deg * DEG_TO_RAD * 0.5);
     double focal = std::max(1u, extent.height) / (2.0 * tan_y);
     auto eye = camera.eye_pos_render();
@@ -154,8 +166,20 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         uint32_t remaining = MAX_PATCHES-uint32_t(prepared_.size())-reserved;
         const auto& body = system.body(i);
         double radius = body.definition.radius_au();
-        const HeightSource* source = settings.terrain_imported_enabled && stream_ && body.definition.name == source_body_ ? &stream_->source() : nullptr;
-        if (source && !source->compatible(radius*AU_TO_KM*1000.0, std::clamp(1.0-body.definition.oblateness, .05, 1.0))) source = nullptr;
+        HeightStream* active_stream = nullptr;
+        if (settings.terrain_imported_enabled) {
+            for (auto& binding : streams_) {
+                if (binding.body == body.definition.name && binding.stream) {
+                    active_stream = binding.stream.get();
+                    break;
+                }
+            }
+        }
+        const HeightSource* source = active_stream ? &active_stream->source() : nullptr;
+        if (source && !source->compatible(radius*AU_TO_KM*1000.0, std::clamp(1.0-body.definition.oblateness, .05, 1.0))) {
+            source = nullptr;
+            active_stream = nullptr;
+        }
         auto center = camera_relative(body.render.position, eye);
         auto rotation = body_rotation(body.render.pole, body.render.spin_angle_rad);
         SelectionView view;
@@ -186,7 +210,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             if (changed) { entry.desired_valid = false; entry.prefetch.clear(); }
             std::unordered_set<uint64_t> wanted;
             auto request = [&](TileId tile) {
-                if (cache_.find(imported_key(tile)) < 0) { wanted.insert(tile.key()); stream_->request(tile); }
+                if (cache_.find(imported_key(tile)) < 0) { wanted.insert(tile.key()); active_stream->request(tile); }
             };
             bool roots_ready = true;
             for (uint32_t face = 0; face < 6; ++face) {
@@ -223,6 +247,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 if (cache_.find(key) >= 0) {
                     retained_keys.push_back(key);
                     retained_heights.push_back({});
+                    retained_streams.push_back(active_stream);
                 }
             };
             for (uint32_t face = 0; face < 6; ++face) retain({face});
@@ -239,11 +264,12 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 }
             }
             for (auto tile : entry.ancestors) retain(tile);
-            for (auto& [tile, geometry] : stream_->completed()) {
+            for (auto& [tile, geometry] : active_stream->completed()) {
                 if (wanted.contains(tile.key())) {
                     retained_keys.push_back(imported_key(tile));
                     retained_heights.push_back(std::move(geometry));
-                } else stream_->consumed(tile);
+                    retained_streams.push_back(active_stream);
+                } else active_stream->consumed(tile);
             }
             if (entry.selection.loading_limited) ++stats_.loading_bodies;
         } else if (entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry ||
@@ -371,8 +397,8 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         jobs.resize(keys.size());
         auto plan = cache_.prepare(ctx, keys, jobs, heights);
         for (uint32_t index = 0; index < retained_keys.size(); ++index) {
-            if (retained_heights[index] && plan.slots[prepared_.size()+index] >= 0) {
-                stream_->consumed(TileId::from_key(retained_keys[index].tile));
+            if (retained_heights[index] && plan.slots[prepared_.size()+index] >= 0 && retained_streams[index]) {
+                retained_streams[index]->consumed(TileId::from_key(retained_keys[index].tile));
             }
         }
         stats_.cache_hits = plan.hits;
@@ -388,11 +414,18 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     });
     stats_.patches = uint32_t(prepared_.size());
     stats_.metadata_entries = uint32_t(metadata_.size());
-    if (stream_) {
-        stats_.stream = stream_->stats();
-        if (!stats_.stream.error.empty() && reported_error_ != stats_.stream.error) {
-            reported_error_ = stats_.stream.error;
-            log::error("Terrain source '{}': {}", source_body_, reported_error_);
+    for (auto& binding : streams_) {
+        if (!binding.stream) continue;
+        auto s = binding.stream->stats();
+        stats_.stream.pending += s.pending;
+        stats_.stream.ready += s.ready;
+        stats_.stream.failed += s.failed;
+        stats_.stream.builds += s.builds;
+        stats_.stream.payload_reads += s.payload_reads;
+        if (stats_.stream.error.empty() && !s.error.empty()) stats_.stream.error = s.error;
+        if (!s.error.empty() && binding.reported_error != s.error) {
+            binding.reported_error = s.error;
+            log::error("Terrain source '{}': {}", binding.body, binding.reported_error);
         }
     }
     auto* references = static_cast<PatchGPU*>(patches_[ctx.frame_index()].mapped);
