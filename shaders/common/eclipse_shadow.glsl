@@ -31,7 +31,7 @@ float evaluate_eclipse_shadow(vec3 frag_pos, vec3 star_pos, float star_radius,
         vec4 pole_oblateness = bodies[i].pole_oblateness;
         float obl = clamp(pole_oblateness.w, 0.0, 0.95);
         vec3 pole = length(pole_oblateness.xyz) > 1e-4 ? normalize(pole_oblateness.xyz) : vec3(0, 1, 0);
-        vis *= eclipse_caster_visibility(r_eq, r_eq * (1.0 - obl), pole, L, perp_vec, r_sun_proj);
+        vis *= eclipse_caster_visibility(r_eq, r_eq * (1.0 - obl), pole, L, perp_vec, r_sun_proj, u_scene.eclipse_params.x != 0u);
         if (vis <= 1e-4) return 0.0;
     }
     return vis;

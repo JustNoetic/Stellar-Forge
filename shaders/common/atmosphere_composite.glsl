@@ -17,6 +17,9 @@ layout(set = 0, binding = 7) uniform sampler2D transmittance_lut;
 layout(set = 0, binding = 8) uniform sampler2D multiscatter_lut;
 layout(set = 0, binding = 9) uniform sampler3D bruneton_rayleigh_lut;
 layout(set = 0, binding = 10) uniform sampler3D bruneton_mie_lut;
+#include "atmosphere_shadow.glsl"
+layout(set = 0, binding = 16) uniform sampler2DArray shadow_deficit_lut;
+layout(set = 0, binding = 17) uniform sampler2DArray shadow_endpoint_lut;
 #ifdef ATMOSPHERE_TRANSPARENCY
 #include "common/transparency.glsl"
 #endif
@@ -191,16 +194,35 @@ bool atmosphere_transport(ivec2 pixel, ivec2 size, float depth, out vec3 L, out 
     vec2 uv = sky_uv(d);
     L = textureLod(radiance_lut, uv, 0.0).rgb;
     T = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
+    float path = segment.y-segment.x;
     if (depth > 0.0) {
         vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
         float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
-        float path = min(distance, segment.y)-segment.x;
+        path = min(distance, segment.y)-segment.x;
         if (path <= 0.0) return false;
         if (atm.depth_params.z > 0.5) {
             bruneton_aerial_transport(d, segment, path, L, T);
         } else {
             aerial_transport(ndc*0.5+0.5, d, segment, path, L, T);
         }
+    }
+    if (shadow_flags.x != 0u) {
+        vec3 fraction = vec3(0.0);
+        bool cached = false;
+        for (int layer = 0; layer < 2; ++layer) {
+            if (texelFetch(shadow_endpoint_lut, ivec3(pixel, layer), 0).r == depth) {
+                fraction = texelFetch(shadow_deficit_lut, ivec3(pixel, layer), 0).rgb;
+                cached = true;
+                break;
+            }
+        }
+        if (!cached) {
+            vec3 unused;
+            bvec2 supported;
+            fraction = atmosphere_shadow_deficit(d, segment, path, pixel, 0u, 0.0, unused, supported);
+        }
+        vec3 deficit = L * fraction;
+        L = max(L - deficit, vec3(0.0));
     }
     return true;
 }

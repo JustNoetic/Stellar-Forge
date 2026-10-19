@@ -274,6 +274,60 @@ void ring_draw_contracts() {
     check(specialized > 100, "Lighting oracle exercises specialized fragments across scales and poses");
 }
 
+void ringshine_sampling_contracts() {
+    using namespace sf::rendering;
+    for (double ratio : {-2.0, -1.99, -1.5, -1.01, -1.0, -0.99, 0.0, 0.99, 1.0, 1.01, 1.5, 1.99, 2.0}) {
+        glm::vec4 offsets, weights, mirrored_offsets, mirrored_weights;
+        int count = ringshine_source_samples(ratio * 0.001, 0.001, offsets, weights);
+        int mirrored_count = ringshine_source_samples(-ratio * 0.001, 0.001, mirrored_offsets, mirrored_weights);
+        check(count == mirrored_count && std::abs(glm::dot(weights, glm::vec4(1)) - 1.0f) < 1e-6f,
+              "Finite-star source weights conserve flux across both equinox boundaries");
+        double moment = 0, mirrored_moment = 0;
+        for (int i = 0; i < count; ++i) {
+            check(weights[i] >= 0.0f && std::isfinite(offsets[i]) && std::abs(offsets[i]) <= 1.0f,
+                  "Finite-star samples have bounded positions and nonnegative weights");
+            moment += weights[i] * offsets[i];
+            mirrored_moment += mirrored_weights[i] * mirrored_offsets[i];
+        }
+        check(std::abs(moment) < 1e-6 && std::abs(moment + mirrored_moment) < 1e-6,
+              "Uniform stellar disk has zero polar centroid and mirrored elevations agree");
+    }
+    std::vector<sf::ephemeris::RingLayerDefinition> layers(2);
+    layers[0].inner = 1.4;
+    layers[0].outer = 2.4;
+    layers[1].inner = 1.6;
+    layers[1].outer = 1.601;
+    for (uint32_t bands : {4u, 10u, 32u, 1024u}) {
+        auto samples = build_ringshine_radial_samples(layers, bands);
+        check(samples.size() == 4 * bands, "Radial quadrature honors the requested budget when boundaries fit");
+        double total = 0, narrow = 0;
+        uint32_t narrow_count = 0;
+        for (auto sample : samples) {
+            check(sample.x > 1.4 && sample.x < 2.4 && sample.y > 0, "Radial quadrature stays inside occupied annuli");
+            total += sample.y;
+            if (sample.x >= 1.6 && sample.x <= 1.601) {
+                narrow += sample.y;
+                ++narrow_count;
+            }
+        }
+        check(std::abs(total - 1.0) < 1e-6 && std::abs(narrow - 0.001) < 1e-9 && narrow_count >= 4,
+              "Quadrature preserves total width and fully integrates a narrow embedded layer");
+    }
+    layers[0].opacity = 0;
+    auto samples = build_ringshine_radial_samples(layers, 10);
+    double width = 0;
+    for (auto sample : samples) width += sample.y;
+    check(std::abs(width - 0.001) < 1e-9, "Transparent layers do not expand the ringshine integration domain");
+    layers.resize(8);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        layers[i].inner = 1.4 + i * 0.1;
+        layers[i].outer = 1.6 + i * 0.1;
+        layers[i].opacity = 1;
+    }
+    samples = build_ringshine_radial_samples(layers, 4);
+    check(samples.size() > 16 && samples.size() <= 60, "Boundary coverage can increase the minimum budget and reports the actual samples");
+}
+
 void ring_radiative_transfer_contracts() {
     using namespace sf::rendering;
 
@@ -312,6 +366,20 @@ void ring_radiative_transfer_contracts() {
     float t_plus  = ring_transfer(1.2f, 0.6f, 0.6f + 1e-4f, false);
     check(std::abs(t_exact - 0.5f * (t_minus + t_plus)) < 1e-5f, "Transmission slab transfer is continuous at mu_s == mu_v");
 
+    for (float tau : {1e-4f, 0.01f, 0.1f, 1.0f, 10.0f}) {
+        for (float mu_s : {1e-5f, 1e-4f, 0.001f, 0.1f, 0.5f, 1.0f}) {
+            for (float mu_v : {1e-5f, 0.001f, 0.1f, 0.5f, 0.50001f, 1.0f}) {
+                double xs = double(tau) / mu_s, xv = double(tau) / mu_v;
+                double d = xs - xv;
+                double expected = std::abs(d) < 1e-10 ? xv * std::exp(-xv)
+                    : xv / std::abs(d) * std::exp(-std::min(xs, xv)) * -std::expm1(-std::abs(d));
+                double actual = ring_transfer(tau, mu_s, mu_v, false);
+                check(std::isfinite(actual) && std::abs(actual - expected) <= 2e-5 * expected + 1e-12,
+                      "Transmission matches the independent double-precision slab solution, including grazing incidence");
+            }
+        }
+    }
+
     for (bool same_side : {true, false}) {
         float mu_a = 0.35f, mu_b = 0.82f, tau = 1.4f;
         float rab = mu_b * ring_transfer(tau, mu_a, mu_b, same_side);
@@ -319,7 +387,7 @@ void ring_radiative_transfer_contracts() {
         check(std::abs(rab - rba) < 1e-6f, "Single-scattering slab satisfies Helmholtz reciprocity");
     }
 
-    // 3. Analytic finite-slab Chandrasekhar X/Y multiple scattering
+    // 3. Approximate multiple scattering
     glm::vec3 albedo{0.8f, 0.7f, 0.5f};
     glm::vec3 ms_zero = ring_multiple_scattering(0.0f, 0.5f, 0.5f, true, albedo);
     check(glm::length(ms_zero) < 1e-6f, "Multiple scattering vanishes at zero optical depth");
@@ -349,8 +417,38 @@ void ring_radiative_transfer_contracts() {
           "Dense B-ring is significantly brighter than optically thin C-ring on the lit side");
     check(glm::length(unlit_c) > glm::length(unlit_b) * 4.0f,
           "Near-opaque B-ring is significantly darker than optically thin C-ring on the unlit side");
-    check(unlit_b.r / std::max(unlit_b.b, 1e-6f) < 2.0f,
-          "Unlit dense B-ring avoids excessive orange chromatic compounding");
+    check(glm::length(ring_radiance_rgb(1.6f, 0.35f, 0.22f, 0.35f, sat_props, glm::vec3(0), true, false)) == 0,
+          "Black absorbing ring material scatters no light on the unlit side");
+    for (bool same_side : {false, true}) {
+        float tau = 0.4f, mu_s = 0.35f, mu_v = 0.6f, theta = -0.3f;
+        glm::vec3 color(1e-4f);
+        glm::vec4 props{0.436f, -0.657f, 0.35f, 1.0f};
+        float phase = ring_phase_dhg(theta, props.z, props.x, props.y, tau, false);
+        float opposition = same_side ? ring_opposition_factor(-theta, tau) : 1.0f;
+        float expected = 0.25f * color.r * phase * opposition * ring_transfer(tau, mu_s, mu_v, same_side);
+        float actual = ring_radiance_rgb(tau, mu_v, mu_s, theta, props, color, false, same_side).r;
+        check(std::abs(actual - expected) < 5e-4f * expected,
+              "Low-albedo material approaches the standard quarter-scaled single-scattering response on both sides");
+    }
+    for (float mu_s : {0.01f, 0.1f, 0.5f, 1.0f}) {
+        for (float tau : {0.001f, 0.1f, 1.0f, 4.0f}) {
+            double outgoing = 0;
+            for (int i = 0; i < 128; ++i) {
+                float mu_v = (i + 0.5f) / 128;
+                for (int j = 0; j < 32; ++j) {
+                    float horizontal = -std::sqrt((1 - mu_s * mu_s) * (1 - mu_v * mu_v))
+                        * std::cos((j + 0.5) * 6.283185307179586 / 32);
+                    for (bool side : {false, true}) {
+                        float theta = horizontal + (side ? -1 : 1) * mu_s * mu_v;
+                        outgoing += ring_radiance_rgb(tau, mu_v, mu_s, theta,
+                            glm::vec4(0, 0, 0, 1), glm::vec3(1), false, side).r * mu_v * 2.0 / (128 * 32 * mu_s);
+                    }
+                }
+            }
+            check(outgoing + std::exp(-tau / mu_s) <= 1.002,
+                  "White isotropic ring does not emit more hemispherical flux than the incoming beam");
+        }
+    }
 
     // 4. Opposition surge (SHOE + CBOE) monotonicity and boundedness
     float opp_90 = ring_opposition_factor(0.0f, 1.0f);
@@ -429,6 +527,7 @@ int main() {
         surface_ring_candidate_contracts();
         ring_draw_contracts();
         ring_profile_mip_contracts();
+        ringshine_sampling_contracts();
         ring_radiative_transfer_contracts();
         std::cout << "Eclipse bounds and ring radiative transfer contracts passed: " << shadowed
                   << " shadowed samples retained; " << rejected << " configurations rejected.\n";

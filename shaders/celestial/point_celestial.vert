@@ -23,7 +23,7 @@ float point_visibility(vec3 center, uint self_idx, float stellar_radius) {
             if (dot(perpendicular, perpendicular) > bound * bound * 1.00002) continue;
             float oblateness = clamp(caster.pole_oblateness.w, 0.0, 0.95);
             visibility *= eclipse_caster_visibility(caster.pos_radius.w, caster.pos_radius.w * (1.0 - oblateness),
-                                                   body_pole(caster), ray, perpendicular, source_radius);
+                                                   body_pole(caster), ray, perpendicular, source_radius, u_scene.eclipse_params.x != 0u);
             if (visibility <= 1e-4) return 0.0;
             continue;
         }

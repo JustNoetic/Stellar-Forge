@@ -75,6 +75,10 @@ inline std::complex<double> particle_refractive_index(const std::string& materia
     if (material == "water") return {1.333, -1e-8};
     if (material == "ice") return {1.31, -1e-8};
     if (material == "sulfate") return {1.44, -1e-8};
+    if (material == "sulfate_with_uv_absorber") {
+        constexpr double absorption[] = {1e-8, 5e-4, 5e-3};
+        return {1.44, -absorption[channel]};
+    }
     if (material == "ammonia_ice") return {1.44, -1e-8};
     if (material == "methane_ice") return {1.30, -1e-8};
     if (material == "ammonium_hydrosulfide") return {1.70, -1e-5};

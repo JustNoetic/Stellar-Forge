@@ -9,6 +9,24 @@
 
 namespace sf::rendering {
 
+struct RingHostGPU;
+
+struct alignas(16) AtmosphereShadowHeaderGPU {
+    glm::vec4 eye_focal{};
+    glm::uvec4 flags{};
+    std::array<glm::vec4, 16> stars{};
+    std::array<glm::uvec4, 16> ranges{};
+    glm::mat4 previous_projection{1.0f};
+    glm::uvec4 temporal{};
+    glm::vec4 history{};
+};
+
+struct alignas(16) AtmosphereShadowCasterGPU {
+    glm::vec4 position_radius{};
+    glm::vec4 pole_inner{};
+    glm::vec4 support{};
+};
+
 struct alignas(16) AtmosphereParametersGPU {
     glm::vec4 radii_heights{};
     glm::vec4 reference_shape{};
@@ -38,6 +56,7 @@ struct AtmosphereStats {
     uint32_t aerial_lut_updates = 0;
     uint32_t bruneton_lut_updates = 0;
     uint32_t surface_lut_updates = 0;
+    uint32_t shadow_updates = 0;
 };
 
 class AtmosphereRenderer {
@@ -46,7 +65,8 @@ public:
     void shutdown(rhi::VkContext& ctx);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                  const ephemeris::SystemSnapshot& system, const RenderSettings& settings, VkExtent2D extent,
-                 std::span<const float> minimum_heights_km = {});
+                 std::span<const float> minimum_heights_km = {}, std::span<const RingHostGPU> rings = {},
+                 const rhi::Image* ring_shadow_lut = nullptr);
     void composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                    std::span<const rhi::PushDescriptorWrite> transparency_writes = {});
     const AtmosphereStats& stats() const noexcept { return stats_; }
@@ -59,9 +79,15 @@ private:
         rhi::Image aerial_radiance, aerial_optical_depth;
         rhi::Image bruneton_rayleigh, bruneton_mie;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> uniforms;
+        std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> shadows;
+        rhi::Image shadow_fraction, shadow_depth;
+        AtmosphereShadowHeaderGPU shadow_header{};
+        std::vector<AtmosphereShadowCasterGPU> shadow_casters;
+        bool shadow_active = false;
         AtmosphereParametersGPU cached{};
         std::shared_ptr<const ephemeris::SystemDefinition> definition;
         uint64_t generation = 0, geometry_revision = 0, lighting_revision = 0;
+        uint64_t last_used = 0;
         uint32_t body_index = 0;
         bool valid = false;
         bool aerial_valid = false;
@@ -69,13 +95,21 @@ private:
     };
     std::vector<std::unique_ptr<Tables>> tables_;
     std::vector<Tables*> active_;
+    std::array<Tables*, 32> surface_layers_{};
+    uint64_t prepare_serial_ = 0;
     rhi::Pipeline transmittance_pipeline_, multiscatter_pipeline_, sky_pipeline_, composite_pipeline_;
     rhi::Pipeline aerial_pipeline_, bruneton_pipeline_;
     rhi::Pipeline dual_source_pipeline_, surface_pipeline_;
     rhi::Pipeline transparent_pipeline_, composite_transparency_pipeline_;
+    rhi::Pipeline shadow_pipeline_, shadow_transparency_pipeline_;
+    struct RetiredShadow { rhi::Image image; uint64_t serial; };
+    std::vector<RetiredShadow> retired_shadows_;
     rhi::Image surface_lut_;
+    rhi::Image stbn_tex_;
+    rhi::Image dummy_stbn_;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> surface_records_;
     bool dual_source_ = false;
+    const rhi::Image* ring_shadow_lut_ = nullptr;
     AtmosphereStats stats_;
 };
 

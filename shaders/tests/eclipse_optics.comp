@@ -16,7 +16,7 @@ void main() {
     vec3 pole = normalize(s.pole_source.xyz);
     vec3 perpendicular = vec3(s.radii_center.zw, 0.0);
     float result = eclipse_caster_visibility(s.radii_center.x, s.radii_center.y, pole,
-                                           vec3(0, 0, 1), perpendicular, s.pole_source.w);
+                                           vec3(0, 0, 1), perpendicular, s.pole_source.w, u_scene.eclipse_params.x != 0u);
     float radius = oblate_caster_radius(s.radii_center.x, s.radii_center.y, pole, vec3(0, 0, 1), perpendicular);
     float reference = eclipse_reference_visibility(radius, s.pole_source.w, length(perpendicular));
     results[i] = vec4(result, reference, 0, 0);

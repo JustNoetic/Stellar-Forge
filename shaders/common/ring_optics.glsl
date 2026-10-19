@@ -13,11 +13,11 @@ float ring_transfer(float tau_val, float mu_s, float mu_v, bool same_side) {
     float tau = max(tau_val, 0.0);
     float ms = max(mu_s, 1e-5);
     float mv = max(mu_v, 1e-5);
-    float xs = min(tau / ms, 80.0);
-    float xv = min(tau / mv, 80.0);
+    float xs = tau / ms;
+    float xv = tau / mv;
 
     if (same_side) {
-        float a = xs + xv;
+        float a = min(xs + xv, 80.0);
         float one_minus_exp = (a < 1e-3)
             ? a * (1.0 - 0.5 * a + (1.0 / 6.0) * a * a)
             : (1.0 - exp(-a));
@@ -29,7 +29,11 @@ float ring_transfer(float tau_val, float mu_s, float mu_v, bool same_side) {
         float xm = 0.5 * (xs + xv);
         return xv * exp(-xm) * (1.0 + (d * d) / 24.0);
     }
-    return xv * (exp(-xv) - exp(-xs)) / d;
+    float ad = abs(d);
+    float one_minus_exp = ad < 1e-2
+        ? ad * (1.0 - 0.5 * ad + ad * ad / 6.0)
+        : 1.0 - exp(-ad);
+    return (xv / ad) * exp(-min(xs, xv)) * one_minus_exp;
 }
 
 float ring_opposition_factor(float cos_alpha, float tau_val) {
@@ -120,23 +124,12 @@ vec3 ring_radiance_rgb(float total_tau, float mu_v, float sun_elev, float cos_th
     float scatter = props.z;
     float unlit_factor = props.w;
 
-    vec3 eff_rgb = linear_rgb;
-    if (is_textured && !same_side) {
-        float core_factor = smoothstep(0.60, 1.80, total_tau);
-        float luma = max(dot(linear_rgb, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
-        vec3 chroma = linear_rgb / luma;
-        vec3 chroma_unlit = mix(chroma, vec3(1.0), 0.65 * core_factor);
-        float unlit_luma = pow(luma, 0.35) * 0.60;
-        eff_rgb = unlit_luma * chroma_unlit;
-    }
-
-    float eff_scatter = same_side ? (scatter * 0.30) : scatter;
-    float phase = ring_phase_dhg(cos_theta, eff_scatter, g_fwd, g_back, total_tau, is_textured);
+    vec3 eff_rgb = clamp(linear_rgb, vec3(0.0), vec3(1.0));
+    float phase = ring_phase_dhg(cos_theta, scatter, g_fwd, g_back, total_tau, is_textured);
     float opp = same_side ? ring_opposition_factor(-cos_theta, total_tau) : 1.0;
     float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
 
-    float ss_scale = same_side ? 0.38 : 0.25;
-    vec3 ss = eff_rgb * (ss_scale * phase * opp * transfer);
+    vec3 ss = eff_rgb * (0.25 * phase * opp * transfer);
     vec3 ms = ring_multiple_scattering(total_tau, mu_s, mu_v, same_side, eff_rgb);
     float side_scale = same_side ? 1.0 : unlit_factor;
     return (ss + ms) * side_scale;

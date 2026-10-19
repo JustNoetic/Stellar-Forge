@@ -5,17 +5,53 @@
     "Omega": 0.0,
     "W0": 153.4228,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#fff2e6",
     "color_pole": "#fff2e6",
     "e": 0.0,
     "epoch": "2026-10-17T12:00:00",
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "is_root": true,
     "j4": 0.0,
     "lum_eq": 1.0,
     "lum_pole": 1.0,
     "m": 1.0,
-    "motion_model": "n_body",
+    "motion_model": "keplerian",
     "name": "Sun",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -68,9 +104,45 @@
     "Omega": 48.331,
     "W0": 306.9062,
     "a": 0.387098,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#232323",
     "color_pole": "#232323",
     "e": 0.20563,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 7.005,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -102,88 +174,92 @@
     "W0": 131.6405,
     "a": 0.723332,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "temperature_k": 737.0,
+      "aerosols": [
+        {
+          "effective_radius_um": 0.2,
+          "effective_variance": 0.15,
+          "material": "sulfate_with_uv_absorber",
+          "optical_depth_550": 1.0,
+          "peak_km": 65.0,
+          "width_km": 5.0
+        },
+        {
+          "effective_radius_um": 1.0,
+          "effective_variance": 0.15,
+          "material": "sulfate",
+          "optical_depth_550": 15.0,
+          "peak_km": 60.0,
+          "width_km": 5.0
+        },
+        {
+          "effective_radius_um": 3.0,
+          "effective_variance": 0.15,
+          "material": "sulfate",
+          "optical_depth_550": 10.0,
+          "peak_km": 53.0,
+          "width_km": 3.0
+        }
+      ],
       "composition": {
         "CO2": 0.9648552717092436,
         "N2": 0.034994750787381894,
         "SO2": 0.0001499775033744938
       },
+      "enabled": true,
+      "model": "physical",
       "pressure_pa": 9200000.0,
+      "schema_version": 2,
+      "temperature_k": 737.0,
       "temperature_layers": [
         [
-          0,
-          737
+          0.0,
+          737.0
         ],
         [
-          10,
-          658
+          10.0,
+          658.0
         ],
         [
-          20,
-          580
+          20.0,
+          580.0
         ],
         [
-          30,
-          495
+          30.0,
+          495.0
         ],
         [
-          40,
-          416
+          40.0,
+          416.0
         ],
         [
-          50,
-          340
+          50.0,
+          340.0
         ],
         [
-          60,
-          260
+          60.0,
+          260.0
         ],
         [
-          70,
-          230
+          70.0,
+          230.0
         ],
         [
-          80,
-          200
+          80.0,
+          200.0
         ],
         [
-          100,
-          180
+          100.0,
+          180.0
         ]
-      ],
-      "aerosols": [
-        {
-          "material": "sulfate",
-          "optical_depth_550": 1,
-          "effective_radius_um": 0.2,
-          "effective_variance": 0.15,
-          "peak_km": 65,
-          "width_km": 5
-        },
-        {
-          "material": "sulfate",
-          "optical_depth_550": 15,
-          "effective_radius_um": 1,
-          "effective_variance": 0.15,
-          "peak_km": 60,
-          "width_km": 5
-        },
-        {
-          "material": "sulfate",
-          "optical_depth_550": 10,
-          "effective_radius_um": 3,
-          "effective_variance": 0.15,
-          "peak_km": 53,
-          "width_km": 3
-        }
       ]
     },
     "color": "#bcb8ad",
     "color_pole": "#bcb8ad",
     "e": 0.006772,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 3.39458,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -215,26 +291,22 @@
     "W0": 280.8205,
     "a": 1.0,
     "atmosphere": {
-      "schema_version": 2,
+      "aerosols": [],
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
       "enabled": true,
       "model": "physical",
-      "pressure_pa": 101325.0,
-      "temperature_k": 288.15,
-      "composition": {
-        "N2": 0.78,
-        "O2": 0.21,
-        "Ar": 0.01
-      },
-      "ground_albedo": [
-        0.3,
-        0.3,
-        0.3
-      ],
       "ozone": {
         "column_du": 300.0,
         "peak_km": 25.0,
         "width_km": 7.0
       },
+      "pressure_pa": 101325.0,
+      "schema_version": 2,
+      "temperature_k": 288.15,
       "temperature_layers": [
         [
           0.0,
@@ -268,20 +340,7 @@
           85.99995290624202,
           186.946
         ]
-      ],
-      "automatic_aerosols": false,
-      "mie_scattering": [
-        0.002,
-        0.002,
-        0.002
-      ],
-      "mie_extinction": [
-        0.002,
-        0.002,
-        0.002
-      ],
-      "mie_scale_height_km": 1.2,
-      "mie_asymmetry": 0.8
+      ]
     },
     "color": "#2c6cff",
     "color_pole": "#2c6cff",
@@ -296,7 +355,6 @@
     "lum_pole": 0.0,
     "m": 3.0034896154649684e-06,
     "name": "Earth",
-
     "oblateness": 0.00335,
     "omega": 114.207,
     "parentId": "Sun",
@@ -322,9 +380,45 @@
     "Omega": 125.08,
     "W0": 0.0,
     "a": 0.00257,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#1e1e1e",
     "color_pole": "#1e1e1e",
     "e": 0.0554,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 5.16,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -356,29 +450,33 @@
     "W0": 77.7855,
     "a": 1.523679,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "pressure_pa": 636.0,
-      "temperature_k": 214.0,
+      "aerosols": [
+        {
+          "effective_radius_um": 1.5,
+          "effective_variance": 0.3,
+          "material": "mineral_dust",
+          "optical_depth_550": 0.48,
+          "scale_height_km": 12.0
+        }
+      ],
       "composition": {
         "Ar": 0.01606425702811245,
         "CO2": 0.9568273092369478,
         "N2": 0.02710843373493976
       },
-      "aerosols": [
-        {
-          "material": "mineral_dust",
-          "optical_depth_550": 0.48,
-          "effective_radius_um": 1.5,
-          "effective_variance": 0.3,
-          "scale_height_km": 12
-        }
-      ]
+      "enabled": true,
+      "model": "physical",
+      "pressure_pa": 636.0,
+      "schema_version": 2,
+      "temperature_k": 214.0
     },
     "color": "#2c211a",
     "color_pole": "#2c211a",
     "e": 0.0934,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.85,
     "j4": -1.5e-05,
     "lum_eq": 0.0,
@@ -410,9 +508,45 @@
     "Omega": 169.2,
     "W0": 0.0,
     "a": 6.3e-05,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#bfafb2",
     "color_pole": "#bfafb2",
     "e": 0.015,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.1,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -441,9 +575,45 @@
     "Omega": 54.3,
     "W0": 0.0,
     "a": 0.000157,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#e7ded0",
     "color_pole": "#e7ded0",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.8,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -474,16 +644,18 @@
     "W0": 5.342,
     "a": 5.2044,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "temperature_k": 165.0,
+      "aerosols": [],
+      "bottom_altitude_km": -78.36,
+      "cloud_deck_pressure_pa": 25000.0,
       "composition": {
         "H2": 0.898,
         "He": 0.102
       },
-      "reference_pressure_pa": 100000,
-      "bottom_altitude_km": -78.36,
+      "enabled": true,
+      "model": "physical",
+      "reference_pressure_pa": 100000.0,
+      "schema_version": 2,
+      "temperature_k": 165.0,
       "temperature_layers": [
         [
           -78.36,
@@ -601,37 +773,15 @@
           251.69,
           170.0
         ]
-      ],
-      "aerosols": [
-        {
-          "material": "ammonia_ice",
-          "optical_depth_550": 4,
-          "effective_radius_um": 1,
-          "effective_variance": 0.2,
-          "peak_km": 11.37,
-          "width_km": 6.2
-        },
-        {
-          "material": "ammonium_hydrosulfide",
-          "optical_depth_550": 12,
-          "effective_radius_um": 3,
-          "effective_variance": 0.2,
-          "peak_km": -18.27,
-          "width_km": 8.66
-        },
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 0.15,
-          "effective_radius_um": 0.15,
-          "effective_variance": 0.2,
-          "peak_km": 55.21,
-          "width_km": 5.29
-        }
       ]
     },
     "color": "#a2896b",
     "color_pole": "#a2896b",
     "e": 0.0489,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.303,
     "j4": -0.000586609,
     "lum_eq": 0.0,
@@ -663,9 +813,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.002819,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#fcd34d",
     "color_pole": "#fcd34d",
     "e": 0.004,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -695,9 +881,45 @@
     "Omega": 184.0,
     "W0": 0.0,
     "a": 0.004486,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#fef3c7",
     "color_pole": "#fef3c7",
     "e": 0.009,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.5,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -727,9 +949,45 @@
     "Omega": 58.5,
     "W0": 0.0,
     "a": 0.007155,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#a8a29e",
     "color_pole": "#a8a29e",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -759,9 +1017,45 @@
     "Omega": 309.1,
     "W0": 0.0,
     "a": 0.012585,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#78716c",
     "color_pole": "#78716c",
     "e": 0.007,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.3,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -791,9 +1085,45 @@
     "Omega": 282.9,
     "W0": 0.0,
     "a": 0.001213,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#e65f5c",
     "color_pole": "#e65f5c",
     "e": 0.003,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.4,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -823,9 +1153,45 @@
     "Omega": 340.4,
     "W0": 0.0,
     "a": 0.001483,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#5c544e",
     "color_pole": "#5c544e",
     "e": 0.018,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.1,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -855,9 +1221,45 @@
     "Omega": 214.5,
     "W0": 0.0,
     "a": 0.000862,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#78716c",
     "color_pole": "#78716c",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -887,9 +1289,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.000856,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#57534e",
     "color_pole": "#57534e",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -921,17 +1359,19 @@
     "W0": 108.5911,
     "a": 9.5826,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "temperature_k": 134.0,
+      "aerosols": [],
+      "bottom_altitude_km": -153.61,
+      "cloud_deck_pressure_pa": 12000.0,
       "composition": {
         "CH4": 0.0045,
         "H2": 0.9630000000000001,
         "He": 0.0325
       },
-      "reference_pressure_pa": 100000,
-      "bottom_altitude_km": -153.61,
+      "enabled": true,
+      "model": "physical",
+      "reference_pressure_pa": 100000.0,
+      "schema_version": 2,
+      "temperature_k": 134.0,
       "temperature_layers": [
         [
           -153.61,
@@ -1049,45 +1489,15 @@
           504.08,
           150.0
         ]
-      ],
-      "aerosols": [
-        {
-          "material": "ammonia_ice",
-          "optical_depth_550": 8,
-          "effective_radius_um": 1.5,
-          "effective_variance": 0.2,
-          "peak_km": 0.0,
-          "width_km": 13.96
-        },
-        {
-          "material": "ammonium_hydrosulfide",
-          "optical_depth_550": 15,
-          "effective_radius_um": 3,
-          "effective_variance": 0.2,
-          "peak_km": -59.85,
-          "width_km": 18.76
-        },
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 0.1,
-          "effective_radius_um": 0.15,
-          "effective_variance": 0.2,
-          "peak_km": 121.75,
-          "width_km": 10.62
-        },
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 1.5,
-          "effective_radius_um": 0.2,
-          "effective_variance": 0.2,
-          "peak_km": 54.46,
-          "width_km": 10.21
-        }
       ]
     },
     "color": "#4b4938",
     "color_pole": "#4b4938",
     "e": 0.0565,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 2.485,
     "j4": -0.00093583,
     "lum_eq": 0.0,
@@ -1105,8 +1515,8 @@
     "ring_texture_outer": 2.26624,
     "rings": [
       {
-        "asymmetry": 0.07999999821186066,
-        "backscatter": -0.23000000417232513,
+        "asymmetry": -0.47999998927116394,
+        "backscatter": -0.5899999737739563,
         "color": "#ffffff",
         "gradient": [
           {
@@ -1122,7 +1532,7 @@
         "is_textured": true,
         "opacity": 1.0,
         "outer": 2.26624,
-        "scatter": 0.699999988079071,
+        "scatter": 0.75,
         "unlit_factor": 1.0
       },
       {
@@ -1149,14 +1559,14 @@
         ],
         "inner": 2.31985,
         "is_textured": false,
-        "opacity": 0.0003000000142492354,
+        "opacity": 0.001061990624293685,
         "outer": 2.32671,
         "scatter": 0.8500000238418579,
         "unlit_factor": 1.0
       },
       {
-        "asymmetry": 0.984000027179718,
-        "backscatter": -0.44999998807907104,
+        "asymmetry": 0.9900000095367432,
+        "backscatter": 0.0,
         "color": "#a7aac3",
         "gradient": [
           {
@@ -1186,14 +1596,14 @@
         ],
         "inner": 2.32568,
         "is_textured": false,
-        "opacity": 0.0010000000474974513,
+        "opacity": 0.000329988804878667,
         "outer": 3.276,
-        "scatter": 0.8999999761581421,
+        "scatter": 1.0,
         "unlit_factor": 1.0
       },
       {
-        "asymmetry": 0.9539999961853027,
-        "backscatter": -0.44999998807907104,
+        "asymmetry": 0.9900000095367432,
+        "backscatter": -0.0,
         "color": "#a9bbe1",
         "gradient": [
           {
@@ -1219,7 +1629,7 @@
         ],
         "inner": 2.82288,
         "is_textured": false,
-        "opacity": 0.0020000000949949026,
+        "opacity": 0.0002971870417241007,
         "outer": 6.49158,
         "scatter": 1.0,
         "unlit_factor": 1.0
@@ -1243,9 +1653,45 @@
     "Omega": 66.2,
     "W0": 0.0,
     "a": 0.001243,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#9ca3af",
     "color_pole": "#9ca3af",
     "e": 0.02,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.6,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1275,9 +1721,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.001594,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#f3f4f6",
     "color_pole": "#f3f4f6",
     "e": 0.005,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1307,9 +1789,45 @@
     "Omega": 273.0,
     "W0": 0.0,
     "a": 0.001972,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#e5e7eb",
     "color_pole": "#e5e7eb",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.1,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1339,9 +1857,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.002525,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#d1d5db",
     "color_pole": "#d1d5db",
     "e": 0.002,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1371,9 +1925,45 @@
     "Omega": 133.7,
     "W0": 0.0,
     "a": 0.003524,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#9ca3af",
     "color_pole": "#9ca3af",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.3,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1404,37 +1994,41 @@
     "W0": 0.0,
     "a": 0.008168,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "pressure_pa": 146921.25,
-      "temperature_k": 94.0,
+      "aerosols": [
+        {
+          "effective_radius_um": 0.2,
+          "effective_variance": 0.2,
+          "material": "organic_haze",
+          "optical_depth_550": 6.0,
+          "scale_height_km": 50.0
+        },
+        {
+          "effective_radius_um": 0.04,
+          "effective_variance": 0.1,
+          "material": "organic_haze",
+          "optical_depth_550": 0.02,
+          "peak_km": 500.0,
+          "width_km": 20.0
+        }
+      ],
       "composition": {
         "Ar": 0.0015,
         "CH4": 0.05650000000000001,
         "N2": 0.9420000000000001
       },
-      "aerosols": [
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 6,
-          "effective_radius_um": 0.2,
-          "effective_variance": 0.2,
-          "scale_height_km": 50
-        },
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 0.02,
-          "effective_radius_um": 0.04,
-          "effective_variance": 0.1,
-          "peak_km": 500,
-          "width_km": 20
-        }
-      ]
+      "enabled": true,
+      "model": "physical",
+      "pressure_pa": 146921.25,
+      "schema_version": 2,
+      "temperature_k": 94.0
     },
     "color": "#fbbf24",
     "color_pole": "#fbbf24",
     "e": 0.029,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.3,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1464,9 +2058,45 @@
     "Omega": 87.1,
     "W0": 0.0,
     "a": 0.009903,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#a8a29e",
     "color_pole": "#a8a29e",
     "e": 0.105,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.6,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1496,9 +2126,45 @@
     "Omega": 86.5,
     "W0": 0.0,
     "a": 0.023808,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#4b5563",
     "color_pole": "#4b5563",
     "e": 0.028,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 7.6,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1528,9 +2194,45 @@
     "Omega": 192.7,
     "W0": 0.0,
     "a": 0.086428,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#374151",
     "color_pole": "#374151",
     "e": 0.164,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 175.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1560,9 +2262,45 @@
     "Omega": 260.8,
     "W0": 0.0,
     "a": 0.002524,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#e2e8f0",
     "color_pole": "#e2e8f0",
     "e": 0.007,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1592,9 +2330,45 @@
     "Omega": 242.1,
     "W0": 0.0,
     "a": 0.001972,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#f1f5f9",
     "color_pole": "#f1f5f9",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1624,9 +2398,45 @@
     "Omega": 326.6,
     "W0": 0.0,
     "a": 0.001972,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#f8fafc",
     "color_pole": "#f8fafc",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.5,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1656,9 +2466,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.001301,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#cbd5e1",
     "color_pole": "#cbd5e1",
     "e": 0.002,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1688,9 +2534,45 @@
     "Omega": 167.5,
     "W0": 0.0,
     "a": 0.002524,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#94a3b8",
     "color_pole": "#94a3b8",
     "e": 0.019,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1721,17 +2603,19 @@
     "W0": 202.4,
     "a": 19.2184,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "temperature_k": 76.0,
+      "aerosols": [],
+      "bottom_altitude_km": -88.0,
+      "cloud_deck_pressure_pa": 50000.0,
       "composition": {
         "CH4": 0.023000000000000003,
         "H2": 0.825,
         "He": 0.152
       },
-      "reference_pressure_pa": 100000,
-      "bottom_altitude_km": -88.0,
+      "enabled": true,
+      "model": "physical",
+      "reference_pressure_pa": 100000.0,
+      "schema_version": 2,
+      "temperature_k": 76.0,
       "temperature_layers": [
         [
           -88.0,
@@ -1849,37 +2733,15 @@
           334.75,
           110.0
         ]
-      ],
-      "aerosols": [
-        {
-          "material": "methane_ice",
-          "optical_depth_550": 4,
-          "effective_radius_um": 1,
-          "effective_variance": 0.2,
-          "peak_km": -11.51,
-          "width_km": 9.08
-        },
-        {
-          "material": "hydrogen_sulfide_ice",
-          "optical_depth_550": 12,
-          "effective_radius_um": 2,
-          "effective_variance": 0.2,
-          "peak_km": -55.02,
-          "width_km": 13.0
-        },
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 0.15,
-          "effective_radius_um": 0.1,
-          "effective_variance": 0.2,
-          "peak_km": 49.91,
-          "width_km": 5.55
-        }
       ]
     },
     "color": "#06243c",
     "color_pole": "#06243c",
     "e": 0.0463,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.773,
     "j4": -2.8e-05,
     "lum_eq": 0.0,
@@ -1934,9 +2796,45 @@
     "Omega": 216.1,
     "W0": 0.0,
     "a": 0.000575,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#3a3a3a",
     "color_pole": "#3a3a3a",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.3,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1966,9 +2864,45 @@
     "Omega": 100.9,
     "W0": 0.0,
     "a": 0.000868,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#d4d4d4",
     "color_pole": "#d4d4d4",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 4.4,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -1998,9 +2932,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.001276,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#f0f0f0",
     "color_pole": "#f0f0f0",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2030,9 +3000,45 @@
     "Omega": 174.8,
     "W0": 0.0,
     "a": 0.001778,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#2f2f2f",
     "color_pole": "#2f2f2f",
     "e": 0.004,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.1,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2062,9 +3068,45 @@
     "Omega": 29.5,
     "W0": 0.0,
     "a": 0.002916,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#c7c7c7",
     "color_pole": "#c7c7c7",
     "e": 0.002,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.1,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2094,9 +3136,45 @@
     "Omega": 76.8,
     "W0": 0.0,
     "a": 0.0039,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#a8a29e",
     "color_pole": "#a8a29e",
     "e": 0.002,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.1,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2127,17 +3205,19 @@
     "W0": 253.2,
     "a": 30.11,
     "atmosphere": {
-      "schema_version": 2,
-      "enabled": true,
-      "model": "physical",
-      "temperature_k": 72.0,
+      "aerosols": [],
+      "bottom_altitude_km": -70.86,
+      "cloud_deck_pressure_pa": 50000.0,
       "composition": {
         "CH4": 0.009999999999999998,
         "H2": 0.8,
         "He": 0.19
       },
-      "reference_pressure_pa": 100000,
-      "bottom_altitude_km": -70.86,
+      "enabled": true,
+      "model": "physical",
+      "reference_pressure_pa": 100000.0,
+      "schema_version": 2,
+      "temperature_k": 72.0,
       "temperature_layers": [
         [
           -70.86,
@@ -2255,37 +3335,15 @@
           354.76,
           150.0
         ]
-      ],
-      "aerosols": [
-        {
-          "material": "methane_ice",
-          "optical_depth_550": 2,
-          "effective_radius_um": 1.5,
-          "effective_variance": 0.2,
-          "peak_km": -9.07,
-          "width_km": 7.17
-        },
-        {
-          "material": "hydrogen_sulfide_ice",
-          "optical_depth_550": 10,
-          "effective_radius_um": 2,
-          "effective_variance": 0.2,
-          "peak_km": -43.72,
-          "width_km": 10.55
-        },
-        {
-          "material": "organic_haze",
-          "optical_depth_550": 0.04,
-          "effective_radius_um": 0.1,
-          "effective_variance": 0.2,
-          "peak_km": 63.35,
-          "width_km": 6.38
-        }
       ]
     },
     "color": "#1b3e78",
     "color_pole": "#1b3e78",
     "e": 0.009456,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 1.7679,
     "j4": -3.3e-05,
     "lum_eq": 0.0,
@@ -2317,9 +3375,45 @@
     "Omega": 178.1,
     "W0": 0.0,
     "a": 0.002371,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#d3d3d3",
     "color_pole": "#d3d3d3",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 157.3,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2349,9 +3443,45 @@
     "Omega": 41.4,
     "W0": 0.0,
     "a": 0.000322,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#888888",
     "color_pole": "#888888",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 4.7,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2381,9 +3511,45 @@
     "Omega": 130.6,
     "W0": 0.0,
     "a": 0.000335,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#808080",
     "color_pole": "#808080",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2413,9 +3579,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.000351,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#7d7d7d",
     "color_pole": "#7d7d7d",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2445,9 +3647,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.000414,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#7a7a7a",
     "color_pole": "#7a7a7a",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2477,9 +3715,45 @@
     "Omega": 312.0,
     "W0": 0.0,
     "a": 0.000491,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#6e6e6e",
     "color_pole": "#6e6e6e",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.2,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2509,9 +3783,45 @@
     "Omega": 0.5,
     "W0": 0.0,
     "a": 0.000704,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#555555",
     "color_pole": "#555555",
     "e": 0.001,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.3,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2541,9 +3851,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.000786,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#505050",
     "color_pole": "#505050",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2573,9 +3919,45 @@
     "Omega": 110.3,
     "W0": 304.5,
     "a": 39.482,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#a8a29e",
     "color_pole": "#a8a29e",
     "e": 0.2488,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 17.16,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2606,9 +3988,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.000131,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#a99e94",
     "color_pole": "#a99e94",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2637,9 +4055,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#aaaaaa",
     "color_pole": "#aaaaaa",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2668,9 +4122,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#bbbbbb",
     "color_pole": "#bbbbbb",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2699,9 +4189,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#cccccc",
     "color_pole": "#cccccc",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2730,9 +4256,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#dddddd",
     "color_pole": "#dddddd",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2761,9 +4323,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#ddaaaa",
     "color_pole": "#ddaaaa",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,
@@ -2792,9 +4390,45 @@
     "Omega": 0.0,
     "W0": 0.0,
     "a": 0.0,
+    "atmosphere": {
+      "automatic_aerosols": true,
+      "composition": {
+        "Ar": 0.01,
+        "N2": 0.78,
+        "O2": 0.21
+      },
+      "enabled": false,
+      "height_km": 100.0,
+      "mie_asymmetry": 0.800000011920929,
+      "mie_extinction": [
+        0.00443999981507659,
+        0.00443999981507659,
+        0.00443999981507659
+      ],
+      "mie_scale_height_km": 1.2000000476837158,
+      "mie_scattering": [
+        0.003996000159531832,
+        0.003996000159531832,
+        0.003996000159531832
+      ],
+      "model": "optical",
+      "pressure_pa": 101325.0,
+      "rayleigh_scale_height_km": 8.0,
+      "rayleigh_scattering": [
+        0.005801999941468239,
+        0.013558000326156616,
+        0.03310000151395798
+      ],
+      "schema_version": 2,
+      "temperature_k": 288.15
+    },
     "color": "#ffffff",
     "color_pole": "#ffffff",
     "e": 0.0,
+    "height_range_km": [
+      0.0,
+      0.0
+    ],
     "inc": 0.0,
     "j4": 0.0,
     "lum_eq": 0.0,

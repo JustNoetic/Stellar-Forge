@@ -81,6 +81,23 @@ void smooth_surface_contracts(RenderProbe& probe) {
     probe.render(camera, simulation.snapshot(), settings);
     check(probe.renderer.terrain_stats().smooth_patches == probe.renderer.terrain_stats().patches,
           "Gas giants retain smooth geometry when synthetic preview is enabled");
+    auto& atmosphere = loaded.definition.bodies[1].atmosphere;
+    atmosphere.physical = atmosphere.pressure_reference = true;
+    atmosphere.bottom_altitude_km = -1000;
+    check(simulation.replace_system(loaded).accepted, "Pressure-defined smooth giant fixture loads");
+    for (bool reference : {false, true}) {
+        settings.terrain_reference_fp64 = reference;
+        probe.render(camera, simulation.snapshot(), settings);
+        const auto& cloud = probe.renderer.terrain_stats();
+        check(cloud.drawn_bodies == 1 && cloud.patches > 6 && cloud.smooth_patches == cloud.patches,
+              "Pressure-defined giants refine a smooth cloud boundary in cached and reference paths");
+        double opaque = simulation.snapshot().body(1).opaque_radius_au();
+        double cloud_limb = focal*opaque/std::sqrt(9*radius*radius-opaque*opaque);
+        check(probe.red_at(256+uint32_t(cloud_limb*.8), 256) > .001f &&
+              probe.red_at(256+uint32_t((cloud_limb+limb)*.5), 256) == 0,
+              "Giant quadtree silhouette follows the opaque boundary below the reference radius");
+    }
+    settings.terrain_reference_fp64 = false;
     settings.terrain_enabled = false;
     settings.terrain_patch_limit = 4096;
     loaded = precision_fixture();
@@ -152,6 +169,22 @@ void surface_contracts(RenderProbe& probe, const std::filesystem::path& fixture_
     auto center = surface_center(probe);
     check(center.g > .01f && center.r < .001f && center.b < .001f &&
           probe.renderer.terrain_stats().smooth_patches > 0, "Heightless quadtree ellipsoids use resident albedo by default");
+    for (const char* type : {"Gas Giant", "Ice Giant"}) {
+        auto giant = loaded;
+        giant.definition.bodies[1].type = type;
+        giant.definition.bodies[1].atmosphere.physical = true;
+        giant.definition.bodies[1].atmosphere.pressure_reference = true;
+        giant.definition.bodies[1].atmosphere.bottom_altitude_km = -80;
+        check(simulation.replace_system(giant).accepted, "Mapped pressure-defined giant fixture loads");
+        settle();
+        center = surface_center(probe);
+        const auto& cloud = probe.renderer.terrain_stats();
+        check(center.g > .01f && center.r < .001f && center.b < .001f &&
+              cloud.drawn_bodies == 1 && cloud.smooth_patches == cloud.patches && cloud.patches > 6,
+              "Mapped gas and ice giants retain resident albedo on refined smooth cloud geometry");
+    }
+    check(simulation.replace_system(loaded).accepted, "Terrestrial surface fixture restored");
+    settle();
     settings.surface_textures_enabled = false;
     probe.render(camera, simulation.snapshot(), settings);
     center = surface_center(probe);

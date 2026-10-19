@@ -962,6 +962,18 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             });
             ImGui::Checkbox("Atmospheres", &render_draft.show_atmospheres);
             ImGui::Checkbox("Atmospheric surface lighting", &render_draft.atmosphere_surface_lighting);
+            ImGui::Checkbox("Atmospheric shadows", &render_draft.atmosphere_shadows_enabled);
+            ImGui::BeginDisabled(!render_draft.atmosphere_shadows_enabled);
+            const char* shadow_noise_types[] = {"Interleaved Gradient Noise (IGN)", "Spatiotemporal Blue Noise (STBN)"};
+            int current_noise_type = static_cast<int>(render_draft.atmosphere_shadow_noise_type);
+            if (ImGui::Combo("Shadow noise##shadow_noise", &current_noise_type, shadow_noise_types, 2)) {
+                render_draft.atmosphere_shadow_noise_type = static_cast<uint32_t>(current_noise_type);
+            }
+            const char* shadow_samples[] = {"4", "8", "16"};
+            int shadow_quality = render_draft.atmosphere_shadow_samples == 4 ? 0 : render_draft.atmosphere_shadow_samples == 8 ? 1 : 2;
+            if (ImGui::Combo("Shadow samples", &shadow_quality, shadow_samples, 3))
+                render_draft.atmosphere_shadow_samples = 4u << shadow_quality;
+            ImGui::EndDisabled();
             ImGui::Checkbox("Dual-source atmosphere blending", &render_draft.atmosphere_dual_source);
             ImGui::Checkbox("Aerial perspective", &render_draft.aerial_perspective_enabled);
             ImGui::BeginDisabled(!render_draft.aerial_perspective_enabled);
@@ -974,6 +986,22 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
+            ImGui::Checkbox("Ringshine", &render_draft.ringshine_enabled);
+            ImGui::BeginDisabled(!render_draft.ringshine_enabled);
+            ui::field("Ringshine Bands##ringshine_bands", [&](const char* id) {
+                int bands = static_cast<int>(render_draft.ringshine_band_count);
+                if (ImGui::SliderInt(id, &bands, 4, 1024, "%d", ImGuiSliderFlags_Logarithmic))
+                    render_draft.ringshine_band_count = static_cast<uint32_t>(bands);
+            });
+            ui::value_row("Requested Radial Samples", std::format("{} per host", 4 * render_draft.ringshine_band_count));
+            auto samples = celestial_renderer_.ringshine_sample_counts();
+            if (!samples.empty()) {
+                auto [minimum, maximum] = std::minmax_element(samples.begin(), samples.end());
+                ui::value_row("Active Radial Samples", *minimum == *maximum
+                    ? std::format("{} per host", *minimum)
+                    : std::format("{} to {} per host", *minimum, *maximum));
+            }
+            ImGui::EndDisabled();
             ImGui::EndDisabled();
             ui::section("Planet Surfaces", "Quadtree ellipsoids, imported maps and optional synthetic relief");
             ImGui::Checkbox("Surface Textures", &render_draft.surface_textures_enabled);
@@ -1070,6 +1098,8 @@ void App::render_viewport_overlays() {
             ui::value_row("Present Mode", pm_str);
             ui::value_row("Gaia Stars Loaded", std::format("{}", star_catalog_.count()));
             ui::value_row("GPU Scene HDR", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_scene_hdr")));
+            ui::value_row("GPU Ringshine Bake", std::format("{:.3f} ms", vk_.gpu_time_ms("ringshine_bake")));
+            ui::value_row("Ringshine Tiles Baked", std::format("{}", celestial_renderer_.ringshine_frame_bake_count()));
             ui::value_row("GPU Composite", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_post_composite")));
             ui::value_row("GPU Dear ImGui", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_ui")));
         }
@@ -1744,7 +1774,12 @@ void App::render_body_inspector() {
                     if (ImGui::ColorEdit3("Tint Color##proc", tint_col)) {
                         re.procedural.tint = glm::vec3(tint_col[0], tint_col[1], tint_col[2]);
                     }
-                    ImGui::SliderFloat("Opacity##proc", &re.procedural.opacity, 0.05f, 1.0f, "%.2f");
+                    if (ui::drag_float("Opacity##proc", &re.procedural.opacity, 0.005f, 0.0f, 10.0f, "%.8f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat)) {
+                        re.procedural.opacity = std::clamp(re.procedural.opacity, 0.0f, 10.0f);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Logarithmic opacity drag (0 to 10).\nHold Alt for 100x fine-tuning down to 0.00000001.\nHold Shift for fast scrub.\nCtrl+Click to type exact value.");
+                    }
 
                     ImGui::Spacing();
 
@@ -1870,8 +1905,12 @@ void App::render_body_inspector() {
                         }
                     }
 
-                    if (ImGui::SliderFloat("Opacity / Optical Depth", &layer.opacity, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+                    if (ui::drag_float("Opacity / Optical Depth", &layer.opacity, 0.005f, 0.0f, 10.0f, "%.8f", ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_NoRoundToFormat)) {
+                        layer.opacity = std::clamp(layer.opacity, 0.0f, 10.0f);
                         ring_changed = true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Logarithmic opacity drag (0 to 10).\nHold Alt for 100x fine-tuning down to 0.00000001.\nHold Shift for fast scrub.\nCtrl+Click to type exact value.");
                     }
 
                     ui::section("Radiative Transfer & Phase", "3-parameter Double Henyey-Greenstein + Chandrasekhar X/Y slab.");
@@ -2057,6 +2096,15 @@ void App::render_body_inspector() {
                 if (a.pressure_reference) {
                     ui::value_row("Pressure datum", "Body radius (altitude zero)");
                     ui::value_row("Modeled lower boundary", std::format("{:.1f} km", a.bottom_altitude_km));
+                    if (a.cloud_deck_pressure_pa > 0) {
+                        double cloud_bar = a.cloud_deck_pressure_pa/100000;
+                        ui::field("Visible cloud pressure (bar)", [&](const char* id) {
+                            if (ImGui::InputDouble(id, &cloud_bar, 0, 0, "%.4g")) {
+                                a.cloud_deck_pressure_pa = cloud_bar*100000;
+                                edit.use_calculated_properties();
+                            }
+                        });
+                    }
                 }
                 double pressure_atm = a.pressure_pa/101325.0;
                 ui::field(a.pressure_reference ? "Reference pressure (atm)" : "Surface pressure (atm)", [&](const char* id) {
@@ -2116,16 +2164,16 @@ void App::render_body_inspector() {
                 } else {
                     int remove = -1;
                     static constexpr const char* materials[] = {"mineral_dust", "organic_haze", "water", "ice", "sulfate",
-                        "ammonia_ice", "ammonium_hydrosulfide", "methane_ice", "hydrogen_sulfide_ice"};
+                        "ammonia_ice", "ammonium_hydrosulfide", "methane_ice", "hydrogen_sulfide_ice", "sulfate_with_uv_absorber"};
                     static constexpr const char* labels[] = {"Mineral dust", "Organic haze", "Water droplets", "Ice particles", "Sulfate droplets",
-                        "Ammonia ice", "Ammonium hydrosulfide", "Methane ice", "Hydrogen sulfide ice"};
+                        "Ammonia ice", "Ammonium hydrosulfide", "Methane ice", "Hydrogen sulfide ice", "Sulfate + UV absorber (approx.)"};
                     for (size_t layer_index = 0; layer_index < a.aerosols.size(); ++layer_index) {
                         ImGui::PushID(int(layer_index));
                         auto& layer = a.aerosols[layer_index];
                         int material = 0;
-                        for (int k = 0; k < 9; ++k) if (layer.material == materials[k]) material = k;
+                        for (int k = 0; k < int(std::size(materials)); ++k) if (layer.material == materials[k]) material = k;
                         ui::field("Particle material", [&](const char* id) {
-                            if (ImGui::Combo(id, &material, labels, 9)) { layer.material = materials[material]; edit.use_calculated_properties(); }
+                            if (ImGui::Combo(id, &material, labels, int(std::size(labels)))) { layer.material = materials[material]; edit.use_calculated_properties(); }
                         });
                         auto input = [&](const char* label, double& value) {
                             ui::field(label, [&](const char* id) {

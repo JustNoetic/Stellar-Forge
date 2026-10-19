@@ -7,7 +7,7 @@ layout(location = 1) out vec3 f_normal;
 layout(location = 2) flat out uint f_host_idx;
 
 #include "common/celestial_scene.glsl"
-#include "common/surface_ring_shadow.glsl"
+#include "common/ring_hosts.glsl"
 #include "common/ring_push.glsl"
 
 void main() {

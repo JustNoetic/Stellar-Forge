@@ -2,6 +2,8 @@
 
 Physical records store pressure (Pa), temperature (K), gas mole weights, optional temperature/ozone profiles and independent particle columns. An empty `aerosols` array means clear gas. Gas edits preserve authored particles. Zero pressure disables all atmosphere rendering, retaining the existing vacuum convention.
 
+Bundled Solar System particle populations are retained only for Venus, Titan and Mars. Earth and the four giants use clear molecular gas; Earth's manual Mie haze is removed. Giant cloud textures remain the visible reflective boundary. Ephemeris Mode shares these definitions. Custom particle layers remain available in the inspector.
+
 ```json
 {
   "schema_version": 2,
@@ -35,8 +37,9 @@ Representative refractive indices at 680/550/440 nm:
 | Water | 1.333 | 1e-8 in each channel |
 | Ice | 1.31 | 1e-8 in each channel |
 | Sulfate | 1.44 | 1e-8 in each channel |
+| Sulfate with UV absorber (effective proxy) | 1.44 | 1e-8 / 5e-4 / 5e-3 |
 
-These are approximate samples, not digitized retrieval tables or exact measurements at these wavelengths. Tholin samples reflect the visible range in [Khare et al. (1984)](https://hitran.org/data/Aerosols/Aerosols%20data%20from%20previous%20HITRAN/Aerosols-2016/papers/khare_tholins_1984.pdf); dust properties vary ([Wolff et al. 2009](https://doi.org/10.1029/2009JE003350)). Martian nonspherical dust, Titan aggregates and ice facets need measured phase functions or other solvers. Sulfate excludes Venus's unidentified blue/UV absorber. No RGB sky color is prescribed.
+These are approximate samples, not digitized retrieval tables or exact measurements at these wavelengths. Tholin samples reflect the visible range in [Khare et al. (1984)](https://hitran.org/data/Aerosols/Aerosols%20data%20from%20previous%20HITRAN/Aerosols-2016/papers/khare_tholins_1984.pdf); dust properties vary ([Wolff et al. 2009](https://doi.org/10.1029/2009JE003350)). Martian nonspherical dust, Titan aggregates and ice facets need measured phase functions or other solvers. Plain sulfate excludes Venus's unidentified blue/UV absorber; the separate effective mixture approximates its visible blue absorption without identifying its chemistry. See [giant atmospheres](giant_atmospheres.md). No RGB sky color is prescribed.
 
 Each population has 128 phase samples at `theta = pi * t²`, concentrated near forward scattering. Linear interpolation in cosine is normalized to unit solid-angle integral per channel. All atmosphere passes use these densities, extinction and angular sources. Absorption contributes only to extinction. The uniform block is 13,344 bytes, below Vulkan's guaranteed 16 KiB minimum. Multiple scattering retains the isotropic closure.
 

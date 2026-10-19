@@ -12,13 +12,7 @@ THERMAL = {
     "Uranus": [(10, 150), (3, 105), (1, 76), (.5, 64), (.1, 53), (.01, 70), (.001, 95), (.00001, 110)],
     "Neptune": [(10, 150), (3, 100), (1, 72), (.5, 62), (.1, 55), (.01, 90), (.001, 130), (.00001, 150)],
 }
-CLOUDS = {
-    "Jupiter": [("ammonia_ice", 4, 1, .6), ("ammonium_hydrosulfide", 12, 3, 2), ("organic_haze", .15, .15, .05)],
-    "Saturn": [("ammonia_ice", 8, 1.5, 1), ("ammonium_hydrosulfide", 15, 3, 3),
-               ("organic_haze", .1, .15, .03), ("organic_haze", 1.5, .2, .25)],
-    "Uranus": [("methane_ice", 4, 1, 1.5), ("hydrogen_sulfide_ice", 12, 2, 5), ("organic_haze", .15, .1, .1)],
-    "Neptune": [("methane_ice", 2, 1.5, 1.5), ("hydrogen_sulfide_ice", 10, 2, 5), ("organic_haze", .04, .1, .03)],
-}
+CLOUD_DECK_BAR = {"Jupiter": .25, "Saturn": .12, "Uranus": .5, "Neptune": .5}
 
 
 def pressure_geometry(body, thermal, pressure):
@@ -52,9 +46,11 @@ def atmosphere_for(body):
         result["temperature_layers"] = [[0, 737], [10, 658], [20, 580], [30, 495], [40, 416], [50, 340], [60, 260], [70, 230], [80, 200], [100, 180]]
         result["aerosols"] = [dict(material="sulfate", optical_depth_550=tau, effective_radius_um=size,
             effective_variance=.15, peak_km=peak, width_km=width) for tau, size, peak, width in [(1, .2, 65, 5), (15, 1, 60, 5), (10, 3, 53, 3)]]
+        result["aerosols"][0]["material"] = "sulfate_with_uv_absorber"
         return result
     thermal = THERMAL[body["name"]]
     result["reference_pressure_pa"] = 100000
+    result["cloud_deck_pressure_pa"] = CLOUD_DECK_BAR[body["name"]]*100000
     result["bottom_altitude_km"] = round(pressure_geometry(body, thermal, 10)[0], 2)
     pressures = []
     for (p0, _), (p1, _) in zip(thermal, thermal[1:]):
@@ -62,10 +58,6 @@ def atmosphere_for(body):
     pressures.append(thermal[-1][0])
     result["temperature_layers"] = [[round(h, 2), round(t, 2)] for h, t, _ in (pressure_geometry(body, thermal, p) for p in pressures)]
     result["aerosols"] = []
-    for material, tau, radius, pressure in CLOUDS[body["name"]]:
-        height, _, scale = pressure_geometry(body, thermal, pressure)
-        result["aerosols"].append(dict(material=material, optical_depth_550=tau, effective_radius_um=radius,
-            effective_variance=.2, peak_km=round(height, 2), width_km=round(scale*.3, 2)))
     return result
 
 

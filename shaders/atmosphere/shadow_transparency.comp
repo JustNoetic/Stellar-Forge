@@ -1,0 +1,3 @@
+#version 460
+#define ATMOSPHERE_SHADOW_TRANSPARENCY
+#include "common/atmosphere_shadow_pass.glsl"

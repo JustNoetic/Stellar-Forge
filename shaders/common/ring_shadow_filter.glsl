@@ -12,7 +12,7 @@ float ring_box_extinction(sampler2DArray lut, int ring_idx, float u_center, floa
     return max(0.0, hi - lo) / max(2.0 * half_width, 1e-6);
 }
 
-float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec3 pole, vec3 L,
+vec3 ring_shadow_coordinates(vec3 hit_rel, vec3 pole, vec3 L,
                              float mu_s, float t_hit, vec2 bounds, float sun_ang_rad, float px_world_size) {
     float span = max(bounds.y - bounds.x, 1e-9);
     float r_hit = length(hit_rel);
@@ -32,11 +32,19 @@ float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec
     float min_u = max(0.75 * max(px_u, 1.0 / 4096.0), 0.75 / 4096.0);
     float h = max(footprint_u, min_u);
 
+    return vec3(u0, h, mu_coord);
+}
+
+float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec3 pole, vec3 L,
+                             float mu_s, float t_hit, vec2 bounds, float sun_ang_rad, float px_world_size, bool single_box) {
+    vec3 coordinates = ring_shadow_coordinates(hit_rel, pole, L, mu_s, t_hit, bounds, sun_ang_rad, px_world_size);
+    float u0 = coordinates.x, h = coordinates.y, mu_coord = coordinates.z;
+
     if (u0 + h <= 0.0 || u0 - h >= 1.0) {
         return 0.0;
     }
 
-    if (u_scene.ring_shadow_params.z != 0u)
+    if (single_box)
         return clamp(ring_box_extinction(lut, ring_idx, u0, h, mu_coord), 0.0, 1.0);
     float b1 = ring_box_extinction(lut, ring_idx, u0, 0.36 * h, mu_coord);
     float b2 = ring_box_extinction(lut, ring_idx, u0, 0.72 * h, mu_coord);

@@ -474,4 +474,235 @@ void ring_benchmark(RenderProbe& probe, const std::filesystem::path& output, std
     check(paths::write_json(output / "report.json", report), "Write ring benchmark report");
 }
 
+void ring_radiometry_contracts(RenderProbe& probe) {
+    probe.resize(EXTENT);
+    auto loaded = fixture();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{5.0, 0.0, 5.0}});
+    loaded.definition.bodies[0].color_rgb = glm::vec3(1);
+    ephemeris::BodyDefinition planet;
+    planet.name = "Ring radiometry host";
+    planet.radius_rsun = 0.1;
+    planet.color_rgb = glm::vec3(0);
+    planet.pole_ecl = render_to_ecliptic(RenderPosition{{0.0, 0.0, 1.0}}).value;
+    ephemeris::RingLayerDefinition ring;
+    ring.inner = 1.4;
+    ring.outer = 2.4;
+    ring.color_rgb = glm::vec3(0.01f);
+    ring.opacity = 0.2f;
+    ring.asymmetry = 0;
+    ring.backscatter = 0;
+    ring.scatter = 0;
+    planet.rings.push_back(ring);
+    loaded.definition.name_to_idx[planet.name] = 1;
+    loaded.definition.bodies.push_back(planet);
+    loaded.motions.emplace_back();
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(loaded).accepted, "Ring radiometry fixture");
+    double radius = planet.radius_au(), distance = radius * 6.0;
+    auto camera = camera_at(distance);
+    rendering::RenderSettings settings;
+    settings.surface_textures_enabled = false;
+    settings.ringshine_enabled = false;
+    settings.exposure = 1e6f;
+    probe.render(camera, simulation.snapshot(), settings);
+    constexpr uint32_t x = EXTENT.width / 2 + 60, y = EXTENT.height / 2;
+    glm::dvec3 hit{(x + 0.5 - EXTENT.width / 2.0) * distance / FOCAL,
+                  -(y + 0.5 - EXTENT.height / 2.0) * distance / FOCAL, 0};
+    glm::dvec3 to_star = glm::dvec3(5, 0, 5) - hit;
+    glm::dvec3 light = glm::normalize(to_star), view = glm::normalize(glm::dvec3(0, 0, distance) - hit);
+    float tau = -std::log(1.0f - ring.opacity);
+    float transfer = light.z / (light.z + view.z) * -std::expm1(-tau * (1.0 / light.z + 1.0 / view.z));
+    float albedo = std::pow(0.01f, 2.2f);
+    double response = 0.25 * albedo * transfer * rendering::ring_opposition_factor(glm::dot(light, view), tau);
+    double expected = response / glm::dot(to_star, to_star) * settings.exposure;
+    double actual = probe.red_at(x, y);
+    check(actual > 0 && std::abs(actual - expected) < expected * 0.003,
+          "Visible-ring radiance matches the physical single-scattering scale without an extra pi");
+    std::cout << "Ring radiometry GPU/reference ratio: " << actual / expected << ".\n";
+}
+
+void ringshine_contracts(RenderProbe& probe) {
+    probe.resize(EXTENT);
+    auto loaded = fixture();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{5.0, 2.0, 0.0}});
+
+    ephemeris::BodyDefinition planet;
+    planet.name = "RingshineHost";
+    planet.type = "Gas Giant";
+    planet.radius_rsun = 0.1;
+    planet.color_rgb = {0.85f, 0.80f, 0.70f};
+    planet.pole_ecl = render_to_ecliptic(RenderPosition{{0.0, 1.0, 0.0}}).value;
+
+    ephemeris::RingLayerDefinition ring{};
+    ring.inner = 1.4;
+    ring.outer = 2.4;
+    ring.color_rgb = {0.9f, 0.85f, 0.7f};
+    ring.opacity = 1.0f;
+    ring.scatter = 0.5f;
+    ring.asymmetry = 0.75f;
+    ring.backscatter = -0.45f;
+    ring.unlit_factor = 1.0f;
+    ring.gradient = {{0.0f, 1.0f}, {1.0f, 1.0f}};
+    planet.rings.push_back(ring);
+    loaded.definition.name_to_idx[planet.name] = 1;
+    loaded.definition.bodies.push_back(planet);
+    loaded.motions.emplace_back();
+
+    ephemeris::Simulation sim;
+    check(sim.replace_system(loaded).accepted, "Ringshine fixture");
+
+    double r_au = planet.radius_au();
+    auto cam = camera_at(r_au * 6.0);
+    rendering::RenderSettings settings{};
+    settings.exposure = 50.0f;
+    settings.surface_textures_enabled = false;
+    settings.ring_shadows_enabled = false;
+    settings.ringshine_enabled = false;
+    probe.render(cam, sim.snapshot(), settings);
+    std::vector<float> dark_baseline;
+    for (uint32_t y = 0; y < EXTENT.height; ++y)
+        for (uint32_t x = 0; x < EXTENT.width; ++x) dark_baseline.push_back(probe.red_at(x, y));
+
+    settings.ringshine_enabled = true;
+    auto hidden_camera = cam;
+    hidden_camera.yaw_actual_deg = 90;
+    uint32_t before_visible = probe.renderer.ringshine_bake_count();
+    probe.render(hidden_camera, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() == before_visible &&
+        probe.renderer.ringshine_frame_bake_count() == 0, "Offscreen receivers do not bake ringshine");
+    auto tiny_camera = camera_at(r_au*1e6);
+    probe.render(tiny_camera, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() == before_visible &&
+        probe.renderer.ringshine_frame_bake_count() == 0, "Unresolved receivers do not bake ringshine");
+    probe.render(cam, sim.snapshot(), settings);
+    double night_gain = 0;
+    uint32_t night_pixels = 0;
+    double mask_radius = 0.85 * FOCAL / std::sqrt(35.0);
+    auto night_pixel = [&](uint32_t x, uint32_t y) {
+        double dx = x + 0.5 - EXTENT.width / 2.0, dy = y + 0.5 - EXTENT.height / 2.0;
+        return dx * dx + dy * dy < mask_radius * mask_radius && std::abs(dy) > 2.0
+            && dark_baseline[y * EXTENT.width + x] <= 1e-7f;
+    };
+    for (uint32_t y = 0; y < EXTENT.height; ++y)
+        for (uint32_t x = 0; x < EXTENT.width; ++x) {
+            double v = probe.red_at(x, y);
+            if (!night_pixel(x, y)) continue;
+            double gain = v - dark_baseline[y * EXTENT.width + x];
+            night_gain += gain;
+            night_pixels += gain > 1e-7;
+        }
+    check(night_gain > 1e-5 && night_pixels > 10, "Ringshine adds measurable flux to masked night-side planet pixels");
+    check(probe.renderer.ringshine_sample_counts().size() == 1 && probe.renderer.ringshine_sample_counts()[0] == 40,
+          "Default ten bands expose forty actual radial samples");
+    uint32_t bakes_enabled = probe.renderer.ringshine_bake_count();
+
+    probe.render(cam, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() == bakes_enabled,
+          "Identical successive renders reuse the ringshine cache without rebaking");
+    probe.render(hidden_camera, sim.snapshot(), settings);
+    probe.render(cam, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() == bakes_enabled,
+        "Temporarily hidden receivers retain their ringshine tiles");
+
+    settings.ringshine_band_count = 20;
+    probe.render(cam, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() > bakes_enabled && probe.renderer.ringshine_sample_counts()[0] == 80,
+          "Band quality edits rebake ringshine and expose the new sample count");
+    uint32_t before_hidden_edit = probe.renderer.ringshine_bake_count();
+    settings.ringshine_band_count = 24;
+    probe.render(hidden_camera, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() == before_hidden_edit,
+        "Quality changes defer offscreen receiver bakes");
+    auto edge_camera = cam;
+    edge_camera.yaw_actual_deg += 34;
+    probe.render(edge_camera, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() > before_hidden_edit &&
+        probe.renderer.ringshine_frame_bake_count() == 1,
+        "A partially visible receiver refreshes its stale ringshine tile before drawing");
+    settings.ringshine_band_count = 20;
+
+    settings.ringshine_enabled = false;
+    probe.render(cam, sim.snapshot(), settings);
+    uint32_t any_lit = 0;
+    for (uint32_t y = 0; y < EXTENT.height; ++y)
+        for (uint32_t x = 0; x < EXTENT.width; ++x)
+            any_lit += night_pixel(x, y) && probe.red_at(x, y) > 1e-7f;
+    check(any_lit == 0, "Disabling ringshine removes all night-side light");
+
+    settings.ringshine_enabled = true;
+    loaded.definition.bodies[1].rings[0].opacity = 0.3f;
+    check(sim.replace_system(loaded).accepted, "Ringshine invalidation fixture");
+    probe.render(cam, sim.snapshot(), settings);
+    check(probe.renderer.ringshine_bake_count() > bakes_enabled,
+          "Ring material edits invalidate the ringshine cache");
+    loaded.definition.bodies[1].rings[0].opacity = 1e-6f;
+    auto narrow = ring;
+    narrow.inner = 1.6;
+    narrow.outer = 1.601;
+    loaded.definition.bodies[1].rings.push_back(narrow);
+    check(sim.replace_system(loaded).accepted, "Narrow ringshine layer fixture");
+    auto night_flux = [&]() {
+        probe.render(cam, sim.snapshot(), settings);
+        double sum = 0;
+        for (uint32_t y = 0; y < EXTENT.height; ++y)
+            for (uint32_t x = 0; x < EXTENT.width; ++x)
+                if (night_pixel(x, y)) sum += probe.red_at(x, y);
+        return sum;
+    };
+    settings.ringshine_band_count = 4;
+    double coarse = night_flux();
+    settings.ringshine_band_count = 128;
+    double fine = night_flux();
+    check(coarse > 1e-7 && std::abs(coarse - fine) < fine * 0.03,
+          "Narrow opaque layer contributes at minimum quality and converges with radial refinement");
+
+    loaded.definition.bodies[1].rings = {ring};
+    auto& reference_ring = loaded.definition.bodies[1].rings[0];
+    reference_ring.color_rgb = glm::vec3(0.01f);
+    reference_ring.opacity = 0.2f;
+    reference_ring.asymmetry = reference_ring.backscatter = reference_ring.scatter = 0;
+    check(sim.replace_system(loaded).accepted, "Ringshine absolute-radiance fixture");
+    settings.ringshine_band_count = 32;
+    settings.exposure = 1e6f;
+    probe.render(cam, sim.snapshot(), settings);
+    constexpr uint32_t sample_x = EXTENT.width / 2 - 20, sample_y = EXTENT.height / 2 - 10;
+    glm::dvec3 origin(0, 0, 6);
+    glm::dvec3 ray = glm::normalize(glm::dvec3((sample_x + 0.5 - EXTENT.width / 2.0) / FOCAL,
+        -(sample_y + 0.5 - EXTENT.height / 2.0) / FOCAL, -1));
+    double b = glm::dot(origin, ray);
+    glm::dvec3 point = origin + ray * (-b - std::sqrt(b * b - 35));
+    glm::dvec3 light = glm::normalize(glm::dvec3(5, 2, 0));
+    check(glm::dot(point, light) < 0, "Absolute ringshine reference point is on the night side");
+    double integral = 0;
+    constexpr uint32_t radial_count = 256, azimuth_count = 2048;
+    double tau = -std::log1p(-0.2), particle_albedo = std::pow(0.01, 2.2);
+    double dr = (ring.outer - ring.inner) / radial_count, da = TWO_PI / azimuth_count;
+    for (uint32_t i = 0; i < radial_count; ++i) {
+        double radius = ring.inner + (i + 0.5) * dr;
+        for (uint32_t j = 0; j < azimuth_count; ++j) {
+            double angle = (j + 0.5) * da;
+            glm::dvec3 patch(radius * std::cos(angle), 0, radius * std::sin(angle));
+            double toward_star = glm::dot(patch, light);
+            if (toward_star < 0 && toward_star * toward_star > radius * radius - 1) continue;
+            glm::dvec3 delta = patch - point;
+            double distance2 = glm::dot(delta, delta), distance = std::sqrt(distance2);
+            double mu_planet = glm::dot(point, delta) / distance;
+            if (mu_planet <= 0) continue;
+            double mu_ring = point.y / distance;
+            double transfer = light.y / (light.y + mu_ring)
+                * -std::expm1(-tau * (1.0 / light.y + 1.0 / mu_ring));
+            double opposition = rendering::ring_opposition_factor(-glm::dot(light, delta) / distance, tau);
+            integral += 0.25 * particle_albedo * opposition * transfer
+                * mu_planet * mu_ring / distance2 * radius * dr * da;
+        }
+    }
+    glm::dvec3 star_delta = glm::dvec3(5, 2, 0) - point * r_au;
+    double expected = planet.color_rgb.r * integral / PI / glm::dot(star_delta, star_delta) * settings.exposure;
+    double actual = probe.red_at(sample_x, sample_y);
+    check(expected > 0 && std::abs(actual - expected) < 0.1 * expected,
+          "Ringshine agrees with an independent area integral and one Lambert division, allowing surface albedo bands");
+    std::cout << "Ringshine GPU/independent-area-integral ratio: " << actual / expected << ".\n";
+    std::cout << "Ringshine contracts passed: masked night-side flux, toggle, cache/quality edits and narrow-layer convergence.\n";
+}
+
 }

@@ -100,6 +100,12 @@ void giant_atmosphere_contracts() {
         const auto& copy = ephem.definition.bodies[ephem.definition.find_body(b.name)];
         check(copy.atmosphere == b.atmosphere && copy.mass_msun == b.mass_msun && copy.radius_rsun == b.radius_rsun &&
             copy.rings == b.rings && copy.color_rgb == b.color_rgb, "Ephemeris physical definitions match the Solar System source");
+        if (b.atmosphere.enabled && b.atmosphere.physical && b.name != "Venus" && b.name != "Titan" && b.name != "Mars") {
+            auto prepared = physics::prepare_atmosphere(b.atmosphere, b.mass_msun, b.radius_au()*AU_TO_KM);
+            check(b.atmosphere.automatic_aerosols && prepared->aerosols.empty() &&
+                prepared->mie_scattering == glm::vec3(0) && prepared->mie_extinction == glm::vec3(0),
+                "Only Venus, Titan and Mars retain preset particles; other enabled worlds use clear gas");
+        }
     }
     const auto& venus = solar.definition.bodies[solar.definition.find_body("Venus")];
     auto at60 = physics::sample_atmosphere(venus.atmosphere, venus.mass_msun, venus.radius_au()*AU_TO_KM, 60);
@@ -108,7 +114,7 @@ void giant_atmosphere_contracts() {
     check(venus.atmosphere.aerosols.size() == 3 && venus.atmosphere.automatic_aerosols,
         "Venus uses explicit sulfuric-acid cloud populations");
     for (const auto& cloud : venus.atmosphere.aerosols)
-        check(cloud.material == "sulfate" && cloud.peak_km >= 48 && cloud.peak_km <= 70,
+        check(cloud.material.starts_with("sulfate") && cloud.peak_km >= 48 && cloud.peak_km <= 70,
             "Venus cloud populations are elevated above the hot lower atmosphere");
     for (const char* name : {"Jupiter", "Saturn", "Uranus", "Neptune"}) {
         const auto& body = solar.definition.bodies[solar.definition.find_body(name)];
@@ -121,17 +127,10 @@ void giant_atmosphere_contracts() {
         check(bottom.pressure_pa > 9.8e5 && bottom.pressure_pa < 1.02e6 && bottom.temperature_k > a.temperature_k,
             "Signed hydrostatic thermal profiles reach approximately ten bar at the lower boundary");
         auto prepared = physics::prepare_atmosphere(a, body.mass_msun, radius);
-        check(prepared->aerosols.size() == a.aerosols.size() && prepared->aerosols.size() >= 3,
-            "Giant cloud and haze populations prepare independently");
-        for (size_t i = 0; i < a.aerosols.size(); ++i) {
-            const auto& layer = prepared->aerosols[i];
-            double column = 0, step = (prepared->height_km-a.bottom_altitude_km)/40000;
-            for (int k = 0; k < 40000; ++k)
-                column += layer.extinction.g*physics::aerosol_density(layer.shape, a.bottom_altitude_km+(k+.5)*step)*step;
-            check(std::abs(column/a.aerosols[i].optical_depth_550-1) < 1e-5,
-                "Cloud columns are normalized above the modeled lower boundary, including negative altitudes");
-        }
-        check(nlohmann::json(a).get<AtmosphereDefinition>() == a, "Pressure datum, signed thermal knots and clouds roundtrip");
+        auto deck = physics::sample_atmosphere(a, body.mass_msun, radius, prepared->opaque_altitude_km);
+        check(a.cloud_deck_pressure_pa > 0 && std::abs(deck.pressure_pa/a.cloud_deck_pressure_pa-1) < 1e-8,
+            "Visible giant cloud boundary derives its altitude from hydrostatic pressure");
+        check(nlohmann::json(a).get<AtmosphereDefinition>() == a, "Pressure datum, signed thermal knots and clear gas roundtrip");
         for (double height : {a.bottom_altitude_km, a.bottom_altitude_km*.5, 0.0, 100.0}) {
             double index = std::clamp((std::asinh(height/prepared->profile_domain.z)-prepared->profile_domain.x)*prepared->profile_domain.y, 0.0, 1.0)*255;
             size_t lower = std::min(size_t(index), size_t(254));
@@ -141,6 +140,27 @@ void giant_atmosphere_contracts() {
                 "Prepared molecular density resolves the signed giant domain");
         }
     }
+    auto absorbing = physics::prepare_aerosol(venus.atmosphere.aerosols.front());
+    check(absorbing.scattering.b/absorbing.extinction.b < absorbing.scattering.r/absorbing.extinction.r,
+        "Venus upper cloud absorber removes more blue than red light");
+    Simulation deck_sim;
+    check(deck_sim.replace_system(solar).accepted, "Editable cloud-deck fixture");
+    int jupiter_index = deck_sim.snapshot().find_body("Jupiter");
+    auto before_deck = deck_sim.snapshot().body(jupiter_index);
+    auto deck_inputs = before_deck.definition.atmosphere;
+    auto previous_geometry = before_deck.revisions.geometry;
+    double previous_radius = before_deck.opaque_radius_au();
+    deck_inputs.cloud_deck_pressure_pa *= .5;
+    check(deck_sim.apply(ApplyBodyAtmosphere{deck_sim.snapshot().generation(), jupiter_index,
+        before_deck.revisions.definition, deck_inputs}).accepted, "Cloud-top pressure edit applies");
+    auto after_deck = deck_sim.snapshot().body(jupiter_index);
+    check(after_deck.opaque_radius_au() > previous_radius && after_deck.revisions.geometry > previous_geometry,
+        "Cloud-top pressure edits update visible geometry and its revision");
+    deck_inputs.automatic_height = false;
+    deck_inputs.height_km = 1;
+    check(!deck_sim.apply(ApplyBodyAtmosphere{deck_sim.snapshot().generation(), jupiter_index,
+        after_deck.revisions.definition, deck_inputs}).accepted,
+        "Cloud tops above an explicit atmospheric ceiling are rejected before mutation");
 #ifdef STELLAR_TEST_EPHEMERIS
     auto manifest_path = paths::external_path("data", "ephemeris.json");
     auto manifest = paths::read_text_file(manifest_path);

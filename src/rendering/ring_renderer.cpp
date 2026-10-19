@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <format>
 
 namespace sf::rendering {
 
@@ -80,6 +81,44 @@ void RingRenderer::init(rhi::VkContext& ctx) {
             transparency_pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
         }
     }
+    for (auto& atlas : ringshine_atlases_) {
+        atlas = ctx.create_image_2d(
+            RINGSHINE_TILE_WIDTH * 16, RINGSHINE_TILE_HEIGHT * MAX_RING_HOSTS,
+            VK_FORMAT_R32G32B32A32_SFLOAT,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    }
+    ctx.immediate_submit([&](VkCommandBuffer imm) {
+        for (auto& atlas : ringshine_atlases_) {
+            ctx.transition_image(imm, atlas, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(imm, atlas.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            ctx.transition_image(imm, atlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+    });
+
+    rhi::GraphicsPipelineDesc bake_desc{};
+    bake_desc.vert_path = "post/fullscreen.vert";
+    bake_desc.frag_path = "post/ringshine_map.frag";
+    bake_desc.bindings = {
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+    };
+    bake_desc.push_constant_size = 80;
+    bake_desc.color_formats = {VK_FORMAT_R32G32B32A32_SFLOAT};
+    bake_desc.depth_format = VK_FORMAT_UNDEFINED;
+    bake_desc.depth_test = false;
+    bake_desc.depth_write = false;
+    bake_desc.cull_mode = VK_CULL_MODE_NONE;
+    ringshine_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, bake_desc);
+    for (auto& buffer : ringshine_radial_buffers_) {
+        buffer = ctx.create_host_buffer(MAX_RING_HOSTS * 4096 * sizeof(glm::vec2), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
 
     hosts_gpu_.reserve(MAX_RING_HOSTS);
     host_draw_ranges_.reserve(MAX_RING_HOSTS);
@@ -89,10 +128,13 @@ void RingRenderer::init(rhi::VkContext& ctx) {
 void RingRenderer::shutdown(rhi::VkContext& ctx) {
     cached_definition_.reset();
     staging_.shutdown(ctx);
+    rhi::ShaderCache::destroy_pipeline(ctx, ringshine_pipeline_);
     for (auto& pipeline : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     for (auto& pipeline : transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     ctx.destroy_image(shadow_lut_);
     ctx.destroy_image(gradient_atlas_);
+    for (auto& atlas : ringshine_atlases_) ctx.destroy_image(atlas);
+    for (auto& buffer : ringshine_radial_buffers_) ctx.destroy_buffer(buffer);
     for (auto& buf : host_ssbos_) {
         ctx.destroy_buffer(buf);
     }
@@ -254,6 +296,7 @@ void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, co
                                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
 
+    ringshine_profile_serial_++;
     cached_definition_ = sys.share_definition();
     cached_generation_ = sys.generation();
     cached_definition_revision_ = sys.definition_revision();
@@ -384,6 +427,174 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
         }
     }
     ctx.end_gpu_timer(cmd, timer);
+}
+
+
+namespace {
+
+struct RingshinePush {
+    glm::uvec4 tile;
+    glm::vec4 host_params;
+    glm::vec4 solar;
+    glm::vec4 disk_offset;
+    glm::vec4 disk_weight;
+};
+static_assert(sizeof(RingshinePush) == 80);
+
+double quantize_elevation(double elevation) {
+    return std::stod(std::format("{:.5f}", elevation));
+}
+
+double quantize_sin_radius(double value) {
+    return std::stod(std::format("{:.6g}", value));
+}
+}
+
+void RingRenderer::bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingshineJob& job) {
+    const RingHostGPU& host = hosts_gpu_[job.host_idx];
+    RingshinePush push{};
+    push.tile = glm::uvec4(job.host_idx, job.star_col, ringshine_radial_ranges_[job.host_idx]);
+    push.host_params = glm::vec4(
+        static_cast<float>(job.key.inner),
+        static_cast<float>(job.key.outer),
+        1.0f,
+        static_cast<float>(job.key.flattening));
+    push.solar = glm::vec4(
+        static_cast<float>(job.key.elevation),
+        static_cast<float>(job.key.sin_radius),
+        static_cast<float>(host.counts_indices.z),
+        static_cast<float>(job.key.bands));
+    ringshine_source_samples(job.key.elevation, job.key.sin_radius, push.disk_offset, push.disk_weight);
+
+    uint32_t f_idx = ctx.frame_index();
+    auto& atlas = ringshine_atlases_[f_idx];
+    ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    rhi::RenderingAttachment att = rhi::RenderingAttachment::load_color(atlas);
+    ctx.begin_rendering(cmd, VkExtent2D{RINGSHINE_TILE_WIDTH * 16, RINGSHINE_TILE_HEIGHT * MAX_RING_HOSTS}, {&att, 1}, nullptr);
+    VkViewport vp{};
+    vp.width = static_cast<float>(RINGSHINE_TILE_WIDTH);
+    vp.height = static_cast<float>(RINGSHINE_TILE_HEIGHT);
+    vp.x = static_cast<float>(job.star_col * RINGSHINE_TILE_WIDTH);
+    vp.y = static_cast<float>(job.host_idx * RINGSHINE_TILE_HEIGHT);
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    VkRect2D scissor{{static_cast<int32_t>(vp.x), static_cast<int32_t>(vp.y)},
+                     {RINGSHINE_TILE_WIDTH, RINGSHINE_TILE_HEIGHT}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ringshine_pipeline_.handle);
+    rhi::PushDescriptorWrite writes[] = {
+        rhi::PushDescriptorWrite::storage_buffer(7, host_ssbos_[f_idx], 0, MAX_RING_HOSTS * sizeof(RingHostGPU)),
+        rhi::PushDescriptorWrite::sampled_image(8, gradient_atlas_, ctx.sampler_linear_clamp()),
+        rhi::PushDescriptorWrite::storage_buffer(10, ringshine_radial_buffers_[f_idx]),
+    };
+    ctx.push_descriptors(cmd, ringshine_pipeline_, writes);
+    ctx.push_constants(cmd, ringshine_pipeline_, push);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    ctx.end_rendering(cmd);
+
+    ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    ringshine_cache_[f_idx][{job.host_idx, job.star_col}] = job.key;
+    ringshine_bakes_++;
+}
+
+void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                                    const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
+                                    uint32_t body_count, VkExtent2D extent) {
+    ringshine_frame_bakes_ = 0;
+    if (!settings.ringshine_enabled || !settings.show_rings || active_host_count_ == 0) return;
+    uint32_t f_idx = ctx.frame_index();
+    auto& cache = ringshine_cache_[f_idx];
+    uint32_t bands = std::clamp(settings.ringshine_band_count, 4u, 1024u);
+    if (ringshine_radial_profile_serial_ != ringshine_profile_serial_ || ringshine_radial_bands_ != bands) {
+        ringshine_radial_samples_.clear();
+        ringshine_radial_ranges_.clear();
+        ringshine_sample_counts_.clear();
+        for (const auto& host : hosts_gpu_) {
+            auto layers = std::span(sys.body(host.counts_indices.x).definition.rings).first(host.counts_indices.z);
+            auto samples = build_ringshine_radial_samples(layers, bands);
+            ringshine_radial_ranges_.emplace_back(ringshine_radial_samples_.size(), samples.size());
+            ringshine_sample_counts_.push_back(static_cast<uint32_t>(samples.size()));
+            ringshine_radial_samples_.insert(ringshine_radial_samples_.end(), samples.begin(), samples.end());
+        }
+        ringshine_radial_profile_serial_ = ringshine_profile_serial_;
+        ringshine_radial_bands_ = bands;
+        ++ringshine_radial_serial_;
+    }
+    if (ringshine_radial_upload_serials_[f_idx] != ringshine_radial_serial_) {
+        size_t bytes = ringshine_radial_samples_.size() * sizeof(glm::vec2);
+        if (bytes > 0) {
+            std::memcpy(ringshine_radial_buffers_[f_idx].mapped, ringshine_radial_samples_.data(), bytes);
+            ctx.flush_buffer(ringshine_radial_buffers_[f_idx], 0, bytes);
+        }
+        ringshine_radial_upload_serials_[f_idx] = ringshine_radial_serial_;
+    }
+
+    std::vector<glm::dvec3> star_pos;
+    std::vector<double> star_radius;
+    bool has_real_star = false;
+    for (uint32_t bi = 0; bi < body_count && star_pos.size() < 16; ++bi) {
+        const auto& def = sys.body(bi).definition;
+        if (!def.is_star) continue;
+        has_real_star = true;
+        star_pos.push_back(sys.body(bi).render.position.value);
+        star_radius.push_back(def.opaque_radius_au());
+    }
+    if (!has_real_star) return;
+
+    double tan_y = std::tan(cam.fov_deg*DEG_TO_RAD*0.5);
+    double tan_x = tan_y*double(extent.width)/std::max(1u, extent.height);
+    double focal = double(extent.height)/(2.0*tan_y);
+    glm::dvec3 eye = cam.eye_pos_render().value;
+    std::vector<RingshineJob> jobs;
+    for (uint32_t h = 0; h < active_host_count_; ++h) {
+        const RingHostGPU& host = hosts_gpu_[h];
+        uint32_t bi = host.counts_indices.x;
+        if (bi >= body_count) continue;
+        glm::dvec3 center = sys.body(bi).render.position.value;
+        const auto body_view = sys.body(bi);
+        const auto& body = body_view.definition;
+        double radius = std::max(body.radius_au(), body_view.opaque_radius_au()) +
+            std::max(0.0, body.height_range_km.y)*KM_TO_AU;
+        glm::dvec3 to_body = center-eye;
+        double depth = glm::dot(to_body, cam.forward_dir());
+        if (depth+radius <= 0.0 ||
+            std::abs(glm::dot(to_body, cam.right_dir())) > depth*tan_x+radius*std::sqrt(1.0+tan_x*tan_x) ||
+            std::abs(glm::dot(to_body, cam.up_dir())) > depth*tan_y+radius*std::sqrt(1.0+tan_y*tan_y)) continue;
+        if (depth > radius && radius/(depth-radius)*focal <= 1.5) continue;
+        glm::dvec3 pole = glm::length(sys.body(bi).render.pole) > 1e-9
+            ? glm::normalize(sys.body(bi).render.pole) : glm::dvec3(0.0, 1.0, 0.0);
+        const auto& mapping = host_mappings_[h];
+        for (uint32_t s = 0; s < star_pos.size(); ++s) {
+            glm::dvec3 dir = star_pos[s] - center;
+            double dist = glm::length(dir);
+            if (dist <= 1e-12) continue;
+            double elevation = std::clamp(glm::dot(dir, pole) / dist, -1.0, 1.0);
+            RingshineTileKey key{};
+            key.profile_serial = ringshine_profile_serial_;
+            key.inner = mapping.min_r_ratio;
+            key.outer = mapping.max_r_ratio;
+            key.flattening = std::clamp(sys.body(bi).definition.oblateness, 0.0, 0.95);
+            key.bands = std::clamp(settings.ringshine_band_count, 4u, 1024u);
+            key.elevation = quantize_elevation(elevation);
+            key.sin_radius = quantize_sin_radius(std::clamp(star_radius[s] / dist, 0.0, 0.999));
+
+            auto it = cache.find({h, s});
+            if (it == cache.end() || !(it->second == key)) {
+                jobs.push_back({h, s, key});
+            }
+        }
+    }
+    for (auto it = cache.begin(); it != cache.end();) {
+        if (it->first.first < active_host_count_ && it->first.second < star_pos.size()) ++it;
+        else it = cache.erase(it);
+    }
+    for (const auto& job : jobs) {
+        bake_ringshine_tile(cmd, ctx, job);
+    }
+    ringshine_frame_bakes_ = static_cast<uint32_t>(jobs.size());
 }
 
 } // namespace sf::rendering

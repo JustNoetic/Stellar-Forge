@@ -1023,6 +1023,7 @@ void ring_eclipse_candidate_filtering(RenderProbe& probe) {
 #include "eclipse_gpu_tests.hpp"
 #include "atmosphere_gpu_tests.hpp"
 #include "transparency_gpu_tests.hpp"
+#include "atmosphere_shadow_gpu_tests.hpp"
 
 int main(int argc, char** argv) {
     try {
@@ -1092,6 +1093,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--atmospheres-only") {
+            atmosphere_shadow_contracts(probe);
+            atmosphere_cache_order_contracts(probe);
             pressure_reference_atmosphere_contracts(probe);
             giant_atmosphere_previews(probe);
             particle_atmosphere_contracts(probe);
@@ -1101,6 +1104,18 @@ int main(int argc, char** argv) {
             atmosphere_floor_contracts(probe);
             aerial_perspective_contracts(probe);
             bruneton_perspective_contracts(probe);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--atmosphere-cache-only") {
+            atmosphere_cache_order_contracts(probe);
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--atmosphere-shadows") {
+            atmosphere_shadow_contracts(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
+            return 0;
+        }
+        if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--atmosphere-shadow-benchmark") {
+            atmosphere_shadow_benchmark(probe, argv[2], argc == 4 ? uint32_t(std::stoul(argv[3])) : 16u);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--particles-only") {
@@ -1121,13 +1136,20 @@ int main(int argc, char** argv) {
             aerial_perspective_contracts(probe);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--ringshine-only") {
+            ring_radiometry_contracts(probe);
+            ringshine_contracts(probe);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--rings-only") {
+            ring_radiometry_contracts(probe);
             surface_ring_shadow_contracts(probe);
             ring_rendering_and_shadows(probe);
             ring_eclipse_candidate_filtering(probe);
             ring_system_cache_contracts(probe);
             ring_filtering_contracts(probe);
             ring_specialization_contracts(probe);
+            ringshine_contracts(probe);
             return 0;
         }
         if (argc >= 2 && std::string_view(argv[1]) == "--bake-benchmark") {
@@ -1183,6 +1205,7 @@ int main(int argc, char** argv) {
             terrain_surfaces(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
             return 0;
         }
+        atmosphere_cache_order_contracts(probe);
         physical_atmosphere_contracts(probe);
         atmosphere_contracts(probe);
         terrain_surfaces(probe);
@@ -1201,6 +1224,8 @@ int main(int argc, char** argv) {
         ring_system_cache_contracts(probe);
         ring_filtering_contracts(probe);
         ring_specialization_contracts(probe);
+        ring_radiometry_contracts(probe);
+        ringshine_contracts(probe);
         if (argc == 2 && std::string_view(argv[1]) == "--eclipse-only") return 0;
         transition_and_distance(probe);
         occlusion(probe);

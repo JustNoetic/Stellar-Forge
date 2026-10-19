@@ -74,15 +74,20 @@ class AtmosphereMigrationTests(unittest.TestCase):
                 self.assertEqual(atmosphere["schema_version"], 2)
                 for key in ("legacy_tholin_hint", "intensity", "composition_basis", "height_mode", "surface_pressure"):
                     self.assertNotIn(key, atmosphere)
-                if body["name"] in ("Mars", "Titan"):
+                if body["name"] in ("Venus", "Mars", "Titan"):
                     self.assertTrue(atmosphere["aerosols"])
+                elif atmosphere.get("enabled") and atmosphere.get("model") == "physical":
+                    self.assertEqual(atmosphere["aerosols"], [])
+                    for key in ("automatic_aerosols", "mie_scattering", "mie_extinction", "beta_mie"):
+                        self.assertNotIn(key, atmosphere)
 
     def test_pressure_reference_and_alias_migration_are_lossless(self):
         record = dict(schema_version=2, model="physical", reference_pressure_pa=100000,
-                      temperature_k=165, composition={"H2": 1}, bottom_altitude_km=-80, aerosols=[])
+                      temperature_k=165, composition={"H2": 1}, bottom_altitude_km=-80, cloud_deck_pressure_pa=25000, aerosols=[])
         migrated = migration.migrate(record)
         self.assertEqual(migrated["reference_pressure_pa"], 100000)
         self.assertEqual(migrated["bottom_altitude_km"], -80)
+        self.assertEqual(migrated["cloud_deck_pressure_pa"], 25000)
         self.assertNotIn("pressure_pa", migrated)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/"system.json"

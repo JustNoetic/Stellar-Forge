@@ -1,0 +1,2 @@
+#version 460
+#include "common/atmosphere_shadow_pass.glsl"

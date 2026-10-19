@@ -62,6 +62,7 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     desc.vert_path = "terrain/terrain.vert";
@@ -159,8 +160,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     for (uint32_t i = 0; i < body_count; ++i) {
         const auto& body = system.body(i);
         if (body.definition.is_star || body.definition.is_spacecraft) continue;
-        if (body.definition.atmosphere.pressure_reference) continue;
-        double radius = body.definition.radius_au();
+        double radius = body.opaque_radius_au();
         if (radius > 0.0) {
             auto center = camera_relative(body.render.position, eye);
             if (!visible({center, radius*(1+.01*(1+RELIEF_ROUNDING))}, body_view)) continue;
@@ -176,9 +176,9 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         uint32_t reserved = uint32_t(candidates.size()-candidate_index-1)*6;
         uint32_t remaining = MAX_PATCHES-uint32_t(prepared_.size())-reserved;
         const auto& body = system.body(i);
-        double radius = body.definition.radius_au();
+        double radius = body.opaque_radius_au();
         HeightStream* active_stream = nullptr;
-        if (settings.terrain_imported_enabled) {
+        if (settings.terrain_imported_enabled && !body.definition.atmosphere.pressure_reference) {
             for (auto& binding : streams_) {
                 if (binding.body == body.definition.name && binding.stream) {
                     active_stream = binding.stream.get();
@@ -201,7 +201,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         view.focal_pixels = focal;
         view.target_error_pixels = settings.terrain_error_pixels;
         view.polar_ratio = std::clamp(1.0 - body.definition.oblateness, 0.05, 1.0);
-        bool synthetic = settings.terrain_enabled && !body.definition.is_black_hole &&
+        bool synthetic = settings.terrain_enabled && !body.definition.atmosphere.pressure_reference && !body.definition.is_black_hole &&
             body.definition.type != "Gas Giant" && body.definition.type != "Ice Giant";
         view.height_amplitude = synthetic ? std::min(double(settings.terrain_height_km)/(radius*AU_TO_KM), 0.01) : 0.0;
         view.max_patches = std::min(remaining, settings.terrain_patch_limit);
@@ -469,6 +469,7 @@ void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span
 }
 
 double TerrainRenderer::minimum_height_km(const ephemeris::BodyDefinition& body, const rendering::RenderSettings& settings) const noexcept {
+    if (body.atmosphere.pressure_reference) return 0.0;
     double minimum = std::min(0.0, body.height_range_km.x);
     if (settings.terrain_imported_enabled) {
         for (const auto& binding : streams_) {

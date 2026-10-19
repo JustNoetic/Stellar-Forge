@@ -31,6 +31,7 @@ tests/*
 !tests/terrain_signed_fixture.json
 !tests/terrain_gpu_tests.hpp
 !tests/atmosphere_gpu_tests.hpp
+!tests/atmosphere_shadow_gpu_tests.hpp
 !tests/particle_optics_tests.hpp
 !tests/atmosphere_migration_tests.py
 !tests/ring_gpu_tests.hpp

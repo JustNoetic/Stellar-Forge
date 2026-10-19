@@ -18,6 +18,8 @@ inline constexpr uint32_t MAX_RING_HOSTS = 16;
 inline constexpr uint32_t MAX_RING_SEGMENTS = 8;
 inline constexpr uint32_t RING_ANGULAR_SEGMENTS = 128;
 inline constexpr uint32_t RING_RADIAL_SUBDIVISIONS = 32;
+inline constexpr uint32_t RINGSHINE_TILE_WIDTH = 128;
+inline constexpr uint32_t RINGSHINE_TILE_HEIGHT = 65;
 inline constexpr float RING_MAX_ALPHA = 0.99999994f;
 
 struct RingDrawRange {
@@ -54,6 +56,10 @@ glm::vec3 ring_slab_x(float mu, float tau_val, glm::vec3 w0) noexcept;
 glm::vec3 ring_multiple_scattering(float tau_val, float mu_s, float mu_v, bool same_side, glm::vec3 linear_rgb) noexcept;
 glm::vec3 ring_radiance_rgb(float total_tau, float mu_v, float sun_elev, float cos_theta,
                             glm::vec4 props, glm::vec3 linear_rgb, bool is_textured, bool same_side) noexcept;
+
+int ringshine_source_samples(double elevation, double sin_radius, glm::vec4& offsets, glm::vec4& weights);
+std::vector<glm::vec2> build_ringshine_radial_samples(std::span<const ephemeris::RingLayerDefinition> layers,
+                                                    uint32_t band_count);
 
 float sample_ring_gradient(std::span<const ephemeris::RingGradientStop> stops, float p) noexcept;
 glm::vec4 apply_hsba_pixel(glm::vec4 rgba, float hue_shift, float saturation, float brightness,

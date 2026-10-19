@@ -35,7 +35,14 @@ struct RenderSettings {
     bool aerial_perspective_bruneton = true;
     bool atmosphere_dual_source = false;
     bool atmosphere_surface_lighting = true;
+    bool atmosphere_shadows_enabled = true;
+    bool atmosphere_shadow_reference = false;
+    bool atmosphere_shadow_temporal = true;
+    uint32_t atmosphere_shadow_noise_type = 0;
+    uint32_t atmosphere_shadow_samples = 16;
     bool ring_shadows_enabled = true;
+    bool ringshine_enabled = true;
+    uint32_t ringshine_band_count = 10;
     bool eclipse_reference_smoothstep = false;
     bool ring_shadow_reference_all_hosts = false;
     bool ring_shadow_single_box = true;
@@ -51,6 +58,10 @@ public:
     uint64_t revision() const noexcept { return revision_; }
 
     CommandResult apply(const RenderSettings& candidate) {
+        if (candidate.atmosphere_shadow_samples != 4 && candidate.atmosphere_shadow_samples != 8 && candidate.atmosphere_shadow_samples != 16)
+            return {false, false, "Atmospheric shadows use 4, 8 or 16 samples."};
+        if (candidate.atmosphere_shadow_noise_type > 1)
+            return {false, false, "Atmospheric shadow noise type must be 0 (IGN) or 1 (STBN)."};
         if (!std::isfinite(candidate.terrain_error_pixels) || candidate.terrain_error_pixels < 0.5f || candidate.terrain_error_pixels > 16.0f ||
             !std::isfinite(candidate.terrain_height_km) || candidate.terrain_height_km < 0.0f || candidate.terrain_height_km > 20.0f ||
             candidate.terrain_patch_limit < 64 || candidate.terrain_patch_limit > 4096) {
@@ -64,6 +75,9 @@ public:
             !std::isfinite(candidate.star_point_size) || candidate.star_point_size < 1.5f || candidate.star_point_size > 6.0f ||
             !std::isfinite(candidate.star_intensity) || candidate.star_intensity < 0.0f) {
             return {false, false, "Exposure and intensity must be finite and nonnegative; star size must be 1.5 to 6 pixels."};
+        }
+        if (candidate.ringshine_band_count < 4 || candidate.ringshine_band_count > 1024) {
+            return {false, false, "Ringshine bands must be 4 to 1024."};
         }
         if (candidate == values_) return {};
         values_ = candidate;

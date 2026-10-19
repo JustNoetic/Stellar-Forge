@@ -19,8 +19,6 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 8) uniform sampler2DArray u_ring_gradients;
 
-const float PI = 3.14159265358979323846;
-
 struct RingSample {
     vec3 linear_color;
     float alpha;
@@ -89,7 +87,7 @@ void main() {
         total_faded_tau += ring_tau(layer_sample.alpha * fade);
     }
 
-    if (total_tau <= 1e-6) {
+    if (total_tau <= 1e-12) {
         discard;
     }
 
@@ -162,12 +160,12 @@ void main() {
         }
 
         float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (dist_star * dist_star)) : 1.0;
-        total_illum += star_col * direct_illum * (PI * irradiance * shadow);
+        total_illum += star_col * direct_illum * (irradiance * shadow);
     }
 
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;
     vec3 final_color = max(total_illum, vec3(0.0)) * exposure;
-    float fade_scale = faded_alpha / max(1e-6, physical_alpha);
+    float fade_scale = faded_alpha / max(1e-12, physical_alpha);
     out_color = vec4(final_color * fade_scale, faded_alpha);
 #ifdef TRANSPARENCY_CAPTURE
     if (capture_transparency(out_color)) out_color = vec4(0.0);

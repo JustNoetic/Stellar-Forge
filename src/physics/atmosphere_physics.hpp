@@ -97,10 +97,19 @@ inline GasState sample_atmosphere(const ephemeris::AtmosphereDefinition& a, doub
     return {p, t, g, p/(BOLTZMANN*t), p*molar_mass/(GAS_CONSTANT*t), GAS_CONSTANT*t/(molar_mass*g*1000)};
 }
 
+inline bool valid_cloud_deck_domain(const ephemeris::AtmosphereDefinition& a, double mass_solar, double radius_km) {
+    if (a.cloud_deck_pressure_pa == 0) return true;
+    if (!(mass_solar > 0 && radius_km > 0 && a.pressure_pa > 0)) return false;
+    double gravity = 6.67430e-11*1.98847e30*mass_solar/(radius_km*radius_km*1e6);
+    return hydrostatic_log_pressure(a, gravity, radius_km, a.automatic_height ? 10000 : a.height_km) <=
+        std::log(a.cloud_deck_pressure_pa)-std::log(a.pressure_pa);
+}
+
 struct PreparedAtmosphere {
     ephemeris::AtmosphereDefinition inputs;
     double mass_solar = 0, radius_km = 0;
     float height_km = 100;
+    double opaque_altitude_km = 0;
     GasState surface;
     glm::vec3 rayleigh{}, mixed_absorption{}, ozone_absorption{};
     glm::vec4 profile_domain{};
@@ -165,11 +174,24 @@ inline std::shared_ptr<const PreparedAtmosphere> prepare_atmosphere(const epheme
                 residual += glm::max(layer.extinction.r, glm::max(layer.extinction.g, layer.extinction.b))*
                     aerosol_density(layer.shape, top)*std::sqrt(2*std::numbers::pi*(radius_km+top)*scale_height);
             }
-            if (residual < 1e-5) break;
+            if (residual < 1e-5 && (a.cloud_deck_pressure_pa == 0 || state.pressure_pa <= a.cloud_deck_pressure_pa)) break;
             top = std::min(10000.0, top*1.1+1);
         }
     }
     result->height_km = float(std::min(top, 10000.0));
+    result->opaque_altitude_km = a.bottom_altitude_km;
+    if (a.cloud_deck_pressure_pa > 0) {
+        double target = std::log(a.cloud_deck_pressure_pa)-std::log(a.pressure_pa);
+        double lower = 0, upper = result->height_km;
+        if (hydrostatic_log_pressure(a, result->surface.gravity_m_s2, radius_km, upper) > target)
+            throw std::invalid_argument("Cloud deck pressure lies above the modeled atmosphere");
+        for (int i = 0; i < 48; ++i) {
+            double middle = (lower+upper)*.5;
+            if (hydrostatic_log_pressure(a, result->surface.gravity_m_s2, radius_km, middle) > target) lower = middle;
+            else upper = middle;
+        }
+        result->opaque_altitude_km = (lower+upper)*.5;
+    }
     double scale = std::max(.01, std::min(10.0, result->surface.scale_height_km));
     double minimum = std::max(-radius_km*.25, std::min(-50.0, a.bottom_altitude_km));
     double start = std::asinh(minimum/scale), span = std::asinh(result->height_km/scale)-start;

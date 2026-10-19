@@ -2,6 +2,122 @@
 
 namespace {
 
+void atmosphere_cache_order_contracts(RenderProbe& probe) {
+    auto loaded = fixture();
+    loaded.definition.bodies[0].mass_msun = 1.0;
+    constexpr double radius_km = 6378.137;
+    const double radius = radius_km*KM_TO_AU;
+    for (int i = 0; i < 3; ++i) {
+        ephemeris::BodyDefinition planet;
+        planet.name = "Cache atmosphere " + std::to_string(i);
+        planet.radius_rsun = radius_km/SOLAR_RADIUS_KM;
+        planet.mass_msun = 3.0034896154649684e-6;
+        planet.atmosphere = physics::earth_physical_atmosphere();
+        planet.atmosphere.automatic_height = false;
+        planet.atmosphere.pressure_pa *= i+1;
+        loaded.definition.bodies.push_back(planet);
+        loaded.motions.emplace_back();
+        loaded.motions.back().position = render_to_ecliptic(RenderPosition{
+            {i == 0 ? -3*radius : 3*radius, 0.0, i == 2 ? 100*radius : 0.0}});
+    }
+    ephemeris::Simulation sim;
+    check(sim.replace_system(loaded).accepted, "Atmosphere cache order fixture");
+    rendering::AtmosphereRenderer renderer;
+    renderer.init(probe.vk);
+    rendering::RenderSettings settings;
+    auto cam = camera_at(20*radius);
+    cam.cam_pos_rel.x = -4*radius;
+    auto prepare = [&] {
+        probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
+            renderer.prepare(cmd, probe.vk, cam, sim.snapshot(), settings, EXTENT);
+        });
+        return renderer.stats();
+    };
+    auto records = [&] {
+        const auto* data = static_cast<const glm::vec4*>(renderer.surface_records(probe.vk.frame_index()).mapped);
+        return std::array{data[1], data[2], data[3]};
+    };
+    auto cold = prepare();
+    check(cold.visible == 2 && cold.optical_lut_updates == 2 && cold.bruneton_lut_updates == 2 &&
+        cold.surface_lut_updates == 2, "Both visible atmospheres warm their optical and surface caches");
+    auto layers = records();
+    check(layers[0].w > 0 && layers[1].w > 0 && layers[0].w != layers[1].w,
+        "Physical atmospheres own distinct surface irradiance layers");
+    auto reused = [&](uint32_t visible) {
+        auto stats = prepare();
+        if (stats.visible != visible || stats.optical_lut_updates || stats.bruneton_lut_updates || stats.surface_lut_updates)
+            std::cerr << "Cache reuse: visible " << stats.visible << '/' << visible << ", optical " << stats.optical_lut_updates
+                << ", Bruneton " << stats.bruneton_lut_updates << ", surface " << stats.surface_lut_updates << '\n';
+        check(stats.visible == visible && stats.optical_lut_updates == 0 && stats.bruneton_lut_updates == 0 &&
+            stats.surface_lut_updates == 0, "Visibility and distance ordering reuse expensive atmosphere tables");
+    };
+    cam.cam_pos_rel.x = 4*radius;
+    reused(2);
+    check(records()[0] == layers[0] && records()[1] == layers[1],
+        "Distance order swaps preserve each body's surface irradiance layer");
+    cam.cam_pos_rel.x = -4*radius;
+    cam.fov_deg = 10;
+    cam.yaw_actual_deg = std::atan2(-20.0, 1.0)*RAD_TO_DEG;
+    reused(1);
+    cam.fov_deg = 60;
+    cam.yaw_actual_deg = -90;
+    reused(2);
+    cam.pitch_actual_deg = 90;
+    reused(0);
+    cam.pitch_actual_deg = 0;
+    reused(2);
+    auto motions = loaded.motions;
+    motions[3].position = render_to_ecliptic(RenderPosition{{0.0, 0.0, -10*radius}});
+    check(sim.apply(ephemeris::SyncTimelineState{units::Years{0}, std::move(motions)}).accepted,
+        "A third atmosphere enters ahead of the warmed entries in distance order");
+    auto added = prepare();
+    check(added.visible == 3 && added.optical_lut_updates == 1 && added.bruneton_lut_updates == 1 &&
+        added.surface_lut_updates == 1, "Only the newly visible atmosphere builds expensive tables");
+    check(records()[0] == layers[0] && records()[1] == layers[1],
+        "A newly visible atmosphere does not steal existing surface layers");
+    auto optical = sim.snapshot().body(1).definition.atmosphere;
+    optical.pressure_pa *= 1.1;
+    check(sim.apply(ephemeris::ApplyBodyAtmosphere{sim.snapshot().generation(), 1,
+        sim.snapshot().body(1).revisions.definition, optical}).accepted, "Optical edit after reordering");
+    auto edited = prepare();
+    check(edited.optical_lut_updates >= 1 && edited.bruneton_lut_updates >= 1 && edited.surface_lut_updates >= 1,
+        "Real optical edits still invalidate cached transport and surface lighting");
+    loaded = fixture();
+    for (int i = 0; i < 20; ++i) {
+        ephemeris::BodyDefinition planet;
+        planet.name = "Cache pressure " + std::to_string(i);
+        planet.radius_rsun = radius_km/SOLAR_RADIUS_KM;
+        planet.atmosphere.enabled = true;
+        loaded.definition.bodies.push_back(planet);
+        loaded.motions.emplace_back();
+        double angle = i*18*DEG_TO_RAD;
+        double distance = (i == 0 ? 120 : 100)*radius;
+        loaded.motions.back().position = render_to_ecliptic(RenderPosition{
+            {std::cos(angle)*distance, 0.0, std::sin(angle)*distance}});
+    }
+    check(sim.replace_system(loaded).accepted, "Atmosphere cache pressure fixture");
+    settings.aerial_perspective_enabled = false;
+    cam = camera_at(0);
+    cam.fov_deg = 1;
+    for (int i = 0; i < 20; ++i) {
+        cam.yaw_actual_deg = i*18;
+        auto stats = prepare();
+        check(stats.visible == 1 && stats.optical_lut_updates == 1,
+            "Cache pressure warms one newly visible atmosphere at a time");
+    }
+    reused(1);
+    cam.fov_deg = 20;
+    cam.yaw_actual_deg = -9;
+    auto pressure = prepare();
+    check(pressure.visible == 2 && pressure.optical_lut_updates == 1,
+        "An evicted atmosphere entering first does not evict a later visible cache hit");
+    cam.fov_deg = 1;
+    cam.yaw_actual_deg = 342;
+    reused(1);
+    renderer.shutdown(probe.vk);
+    std::cout << "PASS: atmosphere caches survive distance swaps, hidden bodies, visibility insertion and cache pressure.\n";
+}
+
 void curved_surface_depth_contracts(RenderProbe& probe) {
     rendering::SceneCelestialUBO scene;
     scene.view_proj = camera_at(2.0).proj_matrix(1.0f, 0.1f);
@@ -855,7 +971,9 @@ void pressure_reference_atmosphere_contracts(RenderProbe& probe) {
     settings.terrain_enabled = true;
     camera = camera_at(radius*3*KM_TO_AU);
     probe.render(camera, sim.snapshot(), settings);
-    check(probe.renderer.terrain_stats().patches == 0, "Pressure-defined atmospheres do not draw solid terrain at the one-bar radius");
+    const auto& terrain = probe.renderer.terrain_stats();
+    check(terrain.drawn_bodies == 1 && terrain.patches > 0 && terrain.smooth_patches == terrain.patches,
+          "Pressure-defined atmospheres render a smooth quadtree at the opaque boundary");
     std::cout << "PASS: pressure-reference atmospheres and finite transport below the one-bar datum.\n";
 }
 
@@ -882,10 +1000,11 @@ void giant_atmosphere_previews(RenderProbe& probe, const std::filesystem::path& 
         settings.show_rings = false;
         probe.render(camera, sim.snapshot(), settings);
         auto center = surface_center(probe);
+        if (!output.empty()) std::cout << name << " reference RGB: " << center.r << ' ' << center.g << ' ' << center.b << '\n';
         for (int c = 0; c < 3; ++c) check(std::isfinite(center[c]) && center[c] > 1e-6f && center[c] < 10,
             "Venus and giant atmospheres render finite illuminated discs");
-        if (std::string(name) == "Saturn") check(center.r > center.b*1.3f,
-            "Saturn's upper tropospheric haze produces warm rather than blue or green reference-disc radiance");
+        if (std::string(name) == "Venus") check(center.r > center.b*1.015f,
+            "Venus upper cloud absorption yields a pale warm reference disc");
         if (std::string(name) == "Uranus" || std::string(name) == "Neptune") check(center.b > center.r*1.3f,
             "Methane-rich ice giants retain blue-green reference-disc radiance");
         if (!output.empty()) probe.save_preview(output/(std::string(name)+"-orbit.ppm"), true);
@@ -893,8 +1012,38 @@ void giant_atmosphere_previews(RenderProbe& probe, const std::filesystem::path& 
         auto stats = probe.renderer.atmosphere_stats();
         probe.render(camera, sim.snapshot(), settings);
         check(probe.renderer.atmosphere_stats().optical_lut_updates == 0 &&
-            probe.renderer.atmosphere_stats().sky_lut_updates == 0, "Static thick cloud profiles reuse atmosphere tables");
-        check(stats.optical_lut_updates >= 1, "Reference clouds prepare their optics");
+            probe.renderer.atmosphere_stats().sky_lut_updates == 0, "Static atmosphere profiles reuse atmosphere tables");
+        check(stats.optical_lut_updates >= 1, "Reference atmospheres prepare their optics");
+        if (planet.atmosphere.cloud_deck_pressure_pa > 0) {
+            const auto& terrain = probe.renderer.terrain_stats();
+            check(terrain.drawn_bodies == 1 && terrain.patches > 6 && terrain.smooth_patches == terrain.patches,
+                "Solar System gas and ice giants refine their derived cloud boundary with quadtree LOD");
+            auto dimmed = loaded;
+            dimmed.definition.bodies[1].color_rgb *= .5f;
+            ephemeris::Simulation dimmed_sim;
+            check(dimmed_sim.replace_system(dimmed).accepted, "Dim cloud reflectance fixture");
+            probe.render(camera, dimmed_sim.snapshot(), settings);
+            auto dim = surface_center(probe);
+            check(glm::length(center-dim)/glm::length(center) > .2f,
+                "Clear gas preserves visible cloud-deck reflectance contrast");
+        }
+        if (!output.empty()) {
+            auto catalog = paths::read_json(paths::external_path("data", "surfaces.json"));
+            if (catalog) for (const auto& entry : catalog->at("bodies")) {
+                if (entry.at("body").get<std::string>() != name) continue;
+                probe.renderer.set_color_sources({{name, terrain::ColorSource::open(paths::external_path(entry.at("albedo").get<std::string>()))}});
+            }
+            int quiet = 0;
+            for (int frame = 0; frame < 180 && quiet < 3; ++frame) {
+                probe.render(camera, sim.snapshot(), settings);
+                const auto& streaming = probe.renderer.texture_stats();
+                quiet = streaming.pending == 0 && streaming.ready == 0 ? quiet+1 : 0;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            check(quiet == 3, "Giant preview cloud textures reach stable residency");
+            probe.save_preview(output/(std::string(name)+"-textured.ppm"), true);
+            probe.renderer.set_color_sources({});
+        }
     }
     if (!output.empty()) paths::write_json(output/"samples.json", report, 2);
     std::cout << "PASS: Venus and four giant reference views, finite cloud radiance and cache reuse.\n";

@@ -22,6 +22,7 @@ layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
     uint num_ring_hosts;
     uvec4 ring_shadow_params;
     uvec4 eclipse_params;
+    uvec4 ringshine_params;
     mat4 projection;
 } u_scene;
 

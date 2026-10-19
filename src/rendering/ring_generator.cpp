@@ -174,7 +174,7 @@ ProceduralRingResult generate_procedural_ring_profile(
     float core_boost = std::clamp(cfg.core_boost, 0.1f, 6.0f);
     float inner_ratio = std::clamp(cfg.inner_radius_ratio, 1.05f, 20.0f);
     float outer_ratio = std::clamp(cfg.outer_radius_ratio, inner_ratio + 0.01f, 50.0f);
-    float opacity = std::clamp(cfg.opacity, 0.01f, 2.0f);
+    float opacity = std::clamp(cfg.opacity, 0.0f, 10.0f);
 
     std::mt19937 rng(cfg.seed & 0x7fffffffu);
     auto rand_f = [&](float low, float high) -> float {

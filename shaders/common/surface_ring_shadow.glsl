@@ -1,24 +1,6 @@
 #include "ring_shadow_filter.glsl"
 
-struct RingSegmentGPU {
-    vec4 bounds_opacity_scatter;
-    vec4 phase_row;
-    vec4 color_flags;
-};
-
-struct RingHostGPU {
-    vec4 center_min_r;
-    vec4 pole_max_r;
-    vec4 tangent_radius;
-    vec4 bitangent_oblateness;
-    uvec4 counts_indices;
-    RingSegmentGPU segments[8];
-};
-
-layout(std430, set = 0, binding = 7) readonly buffer RingHostBuffer {
-    RingHostGPU ring_hosts[];
-};
-
+#include "ring_hosts.glsl"
 layout(set = 0, binding = 9) uniform sampler2DArray u_ring_shadow_lut;
 
 float compute_surface_ring_shadow(vec3 frag_pos, vec3 L, float sun_ang_rad, uint candidates) {
@@ -40,7 +22,7 @@ float compute_surface_ring_shadow(vec3 frag_pos, vec3 L, float sun_ang_rad, uint
             if (t > 0.0) {
                 vec3 hit_rel = (frag_pos + L * t) - r_center;
                 float ext = ring_shadow_extinction(u_ring_shadow_lut, lut_layer, hit_rel, r_pole,
-                                                   L, abs(d), t, r_bounds, sun_ang_rad, px_world_size);
+                                                   L, abs(d), t, r_bounds, sun_ang_rad, px_world_size, u_scene.ring_shadow_params.z != 0u);
                 ring_atten *= (1.0 - ext);
                 if (ring_atten <= 1e-4) return 0.0;
             }

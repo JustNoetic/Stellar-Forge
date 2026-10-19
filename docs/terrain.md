@@ -6,6 +6,8 @@ When a body's projected radius drops below 2.5 pixels (5 px diameter), it enters
 
 Initial imported-root loading uses smooth quadtree coverage until the imported roots are admitted. Once imported coverage is available, the existing balanced resident-parent mechanism applies. Geometry-cache misses use the same quadtree grid through the reference shader. `TerrainStats::drawn_bodies/smooth_patches` report these paths. Per-body route lookup is indexed, and offscreen or subpixel bodies are culled before allocating refinement budgets. `MAX_PATCHES >= 6*MAX_CELESTIAL_BODIES` is enforced at compile time.
 
+Pressure-defined gas/ice giants use the prepared opaque cloud radius for quadtree culling, LOD selection and patch placement, matching the sphere/point handoff and atmosphere boundary. Their albedo maps retain the existing body-fixed orientation. Imported elevation and synthetic preview remain disabled for this smooth reflective boundary.
+
 Synthetic relief remains opt-in; imported elevation supports multiple named bodies simultaneously. Camera surface avoidance and picking still use the reference ellipsoid, so the camera can enter raised terrain. **Synthetic Relief** and the procedural FP64 switch do not alter imported heights.
 
 ## Source assets and baked packs

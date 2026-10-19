@@ -51,6 +51,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     rhi::GraphicsPipelineDesc sphere_desc{};
@@ -163,12 +164,15 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled);
     normals_.prepare(cmd, ctx, cam, sys, extent, settings.terrain_imported_enabled && settings.terrain_normal_maps_enabled);
     rings_.prepare(cmd, ctx, cam, sys, count);
+    uint32_t ringshine_timer = ctx.begin_gpu_timer(cmd, "ringshine_bake");
+    rings_.update_ringshine(cmd, ctx, cam, sys, settings, count, extent);
+    ctx.end_gpu_timer(cmd, ringshine_timer);
     terrain_.prepare(ctx, cam, sys, settings, extent, count);
     terrain_.bake(cmd, ctx);
     atmosphere_minima_.resize(count);
     for (uint32_t i = 0; i < count; ++i)
         atmosphere_minima_[i] = static_cast<float>(terrain_.minimum_height_km(sys.body(i).definition, settings));
-    atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_);
+    atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut());
     transparency_.prepare(cmd, ctx, extent, !settings.transparency_reference_legacy && !sys.empty() &&
         ((settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
 }
@@ -203,14 +207,14 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ubo.num_bodies = count;
     ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
     ubo.num_ring_hosts = (settings.show_rings && settings.ring_shadows_enabled) ? rings_.host_count() : 0u;
-
+    ubo.ringshine_params = {settings.ringshine_enabled && settings.show_rings ? 1u : 0u, rings_.host_count(), 0u, 0u};
     body_instances_.resize(count);
     auto* inst_ptr = body_instances_.data();
 
     for (uint32_t i = 0; i < count; ++i) {
         const auto& b = sys.body(i);
         glm::vec3 rel_eye = glm::vec3(camera_relative(b.render.position, cam.eye_pos_render()));
-        float r_au = static_cast<float>(b.definition.opaque_radius_au());
+        float r_au = static_cast<float>(b.opaque_radius_au());
 
         BodyInstanceGPU inst{};
         inst.pos_radius = glm::vec4(rel_eye, r_au);
@@ -316,6 +320,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::storage_buffer(11, normals_.pages(f_idx)),
         rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(f_idx)),
+        rhi::PushDescriptorWrite::sampled_image(16, rings_.ringshine_atlas(f_idx), ctx.sampler_linear_clamp()),
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipeline_.handle);

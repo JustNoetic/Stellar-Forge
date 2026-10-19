@@ -25,7 +25,7 @@ struct AerosolLayer {
 
 inline bool valid_aerosol(const AerosolLayer& p) {
     return (p.material == "mineral_dust" || p.material == "organic_haze" || p.material == "water" ||
-        p.material == "ice" || p.material == "sulfate" || p.material == "ammonia_ice" ||
+        p.material == "ice" || p.material == "sulfate" || p.material == "sulfate_with_uv_absorber" || p.material == "ammonia_ice" ||
         p.material == "ammonium_hydrosulfide" || p.material == "methane_ice" || p.material == "hydrogen_sulfide_ice") &&
         std::isfinite(p.optical_depth_550) && p.optical_depth_550 >= 0 && p.optical_depth_550 <= 1000 &&
         std::isfinite(p.effective_radius_um) && p.effective_radius_um >= .005 && p.effective_radius_um <= 10 &&
@@ -66,6 +66,7 @@ struct AtmosphereDefinition {
     double temperature_k = 288.15;
     bool pressure_reference = false;
     double bottom_altitude_km = 0;
+    double cloud_deck_pressure_pa = 0;
     std::map<std::string, double> composition{{"N2", 0.78}, {"O2", 0.21}, {"Ar", 0.01}};
     std::vector<glm::dvec2> temperature_layers;
     std::vector<AerosolLayer> aerosols;
@@ -84,6 +85,8 @@ struct AtmosphereDefinition {
 };
 
 inline bool valid_atmosphere(const AtmosphereDefinition& a) {
+    if (!std::isfinite(a.cloud_deck_pressure_pa) || a.cloud_deck_pressure_pa < 0 ||
+        (a.cloud_deck_pressure_pa > 0 && (!a.pressure_reference || a.cloud_deck_pressure_pa > a.pressure_pa))) return false;
     if (!std::isfinite(a.bottom_altitude_km) || a.bottom_altitude_km > 0 || a.bottom_altitude_km < -1000 ||
         (a.pressure_reference && !a.physical) || (!a.pressure_reference && a.bottom_altitude_km != 0)) return false;
     if (a.aerosols.size() > MAX_AEROSOL_LAYERS || (!a.aerosols.empty() && !(a.physical && a.automatic_aerosols))) return false;
@@ -147,6 +150,7 @@ inline void to_json(nlohmann::json& j, const AtmosphereDefinition& a) {
         if (a.pressure_reference) {
             j["reference_pressure_pa"] = a.pressure_pa;
             j["bottom_altitude_km"] = a.bottom_altitude_km;
+            if (a.cloud_deck_pressure_pa > 0) j["cloud_deck_pressure_pa"] = a.cloud_deck_pressure_pa;
         } else j["pressure_pa"] = a.pressure_pa;
         j["temperature_k"] = a.temperature_k;
         j["composition"] = a.composition;
@@ -181,6 +185,7 @@ inline void from_json(const nlohmann::json& j, AtmosphereDefinition& a) {
         a.pressure_pa = j.at("reference_pressure_pa").get<double>();
     }
     a.bottom_altitude_km = j.value("bottom_altitude_km", 0.0);
+    a.cloud_deck_pressure_pa = j.value("cloud_deck_pressure_pa", 0.0);
     a.temperature_k = j.value("temperature_k", j.value("temperature", 288.15));
     a.composition = j.value("composition", a.composition);
     if (j.contains("aerosols")) a.aerosols = j.at("aerosols").get<std::vector<AerosolLayer>>();

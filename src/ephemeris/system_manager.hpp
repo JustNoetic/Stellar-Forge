@@ -115,7 +115,8 @@ struct BodyDefinition {
         return std::isfinite(height_range_km.x) && std::isfinite(height_range_km.y) &&
             height_range_km.x <= height_range_km.y &&
             height_range_km.x > -radius_au()*AU_TO_KM*glm::clamp(1.0-oblateness, 0.05, 1.0) &&
-            atmosphere.bottom_altitude_km > -radius_au()*AU_TO_KM*.25;
+            atmosphere.bottom_altitude_km > -radius_au()*AU_TO_KM*.25 &&
+            physics::valid_cloud_deck_domain(atmosphere, mass_msun, radius_au()*AU_TO_KM);
     }
 };
 
@@ -156,6 +157,10 @@ struct BodyView {
     const BodyMotion& motion;
     const BodyRenderState& render;
     const BodyRevisions& revisions;
+    double opaque_radius_au() const noexcept {
+        return render.atmosphere && definition.atmosphere.pressure_reference ?
+            definition.radius_au()+render.atmosphere->opaque_altitude_km*KM_TO_AU : definition.opaque_radius_au();
+    }
 };
 
 struct ReferenceHierarchy {

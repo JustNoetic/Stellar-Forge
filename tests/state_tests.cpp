@@ -169,6 +169,12 @@ void render_settings() {
     draft.vsync = true;
     check(store.apply(draft).changed && store.revision() == revision + 2, "Commit vsync setting update");
     check(store.values().vsync, "Store reflects vsync state");
+    draft.ringshine_band_count = 3;
+    check(!store.apply(draft).accepted, "Reject undersized ringshine sample budget");
+    draft.ringshine_band_count = 1025;
+    check(!store.apply(draft).accepted, "Reject excessive ringshine sample budget");
+    draft.ringshine_band_count = 24;
+    check(store.apply(draft).changed && store.values().ringshine_band_count == 24, "Commit ringshine quality setting");
 }
 
 void ias15_contracts() {
@@ -780,6 +786,13 @@ void ring_state_and_serialization_contracts() {
           "Reloaded ring texture HSBA adjustments preserved");
     check(r_def.rings[0].gradient.size() == 3, "Reloaded ring gradient stops preserved");
 
+    // Ultra-low opacity contract (e.g. 0.00000001f / 1e-8f)
+    RingLayerDefinition low_op_layer = layer;
+    low_op_layer.opacity = 1e-8f;
+    auto res_low_op = sim.apply(ApplyBodyRings{gen, planet, sim.snapshot().body(planet).revisions.definition, {low_op_layer}, 1.35, 2.45});
+    check(res_low_op.accepted && res_low_op.changed, "ApplyBodyRings with 1e-8 opacity accepted");
+    check(sim.snapshot().body(planet).definition.rings[0].opacity == 1e-8f, "Ring layer preserves 1e-8 opacity");
+
     // PNG round-trip contract
     auto tmp_png = paths::external_path("scratch", "ring_png_contract_test.png");
     std::filesystem::create_directories(tmp_png.parent_path());
@@ -866,6 +879,11 @@ void procedural_ring_generator_contracts() {
         diff_sum += glm::length(saturn_res.profile[i] - saturn_res_diff.profile[i]);
     }
     check(diff_sum > 1.0f, "Different seeds produce distinctly varied profiles");
+
+    // Procedural ring generator ultra-low opacity contract
+    saturn_cfg.opacity = 1e-8f;
+    auto saturn_res_low_op = rendering::generate_procedural_ring_profile(saturn_cfg, 4096);
+    check(saturn_res_low_op.opacity == 1e-8f, "Procedural ring profile preserves 1e-8 opacity");
 
     // Ring layer definition and simulation integration
     ephemeris::RingLayerDefinition proc_layer{};

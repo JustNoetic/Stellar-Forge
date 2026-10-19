@@ -21,7 +21,7 @@ def migrate(record, body_name="", solar_presets=False):
         result["bottom_altitude_km"] = record.get("bottom_altitude_km", 0)
     result["temperature_k"] = record.get("temperature_k", record.get("temperature", 288.15))
     result["composition"] = record.get("composition", {"N2": .78, "O2": .21, "Ar": .01})
-    for key in ("ground_albedo", "ozone"):
+    for key in ("ground_albedo", "ozone", "cloud_deck_pressure_pa"):
         if key in record:
             result[key] = record[key]
     layers = record.get("temperature_layers", record.get("temperature_profile", []))

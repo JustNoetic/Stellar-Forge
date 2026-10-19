@@ -36,11 +36,11 @@ float eclipse_segment_area(float radius, float chord, float height) {
     return radius * radius * atan(height, chord) - chord * height;
 }
 
-float eclipse_disc_visibility(float caster_radius, float projected_star_radius, float separation) {
+float eclipse_disc_visibility(float caster_radius, float projected_star_radius, float separation, bool reference_smoothstep) {
     if (caster_radius <= 0.0) return 1.0;
     if (separation >= caster_radius + projected_star_radius) return 1.0;
     if (projected_star_radius <= 0.0) return 0.0;
-    if (u_scene.eclipse_params.x != 0u)
+    if (reference_smoothstep)
         return eclipse_reference_visibility(caster_radius, projected_star_radius, separation);
     float r = caster_radius / projected_star_radius;
     float d = separation / projected_star_radius;
@@ -93,18 +93,18 @@ float eclipse_ellipse_visibility(vec2 axes, vec2 center, float source_radius) {
 }
 
 float eclipse_caster_visibility(float equatorial, float polar, vec3 pole, vec3 L,
-                                vec3 perpendicular, float source_radius) {
+                                vec3 perpendicular, float source_radius, bool reference_smoothstep) {
     if (equatorial - polar <= equatorial * 1e-5)
-        return eclipse_disc_visibility(equatorial, source_radius, length(perpendicular));
+        return eclipse_disc_visibility(equatorial, source_radius, length(perpendicular), reference_smoothstep);
     float cosine = clamp(dot(pole, L), -1.0, 1.0);
     float minor = sqrt(polar * polar + (equatorial * equatorial - polar * polar) * cosine * cosine);
     vec3 projected_pole = pole - L * cosine;
     float pole_length = length(projected_pole);
     if (pole_length < 1e-6 || equatorial - minor <= equatorial * 1e-5)
-        return eclipse_disc_visibility(equatorial, source_radius, length(perpendicular));
-    if (u_scene.eclipse_params.x != 0u) {
+        return eclipse_disc_visibility(equatorial, source_radius, length(perpendicular), reference_smoothstep);
+    if (reference_smoothstep) {
         float radius = oblate_caster_radius(equatorial, polar, pole, L, perpendicular);
-        return eclipse_disc_visibility(radius, source_radius, length(perpendicular));
+        return eclipse_disc_visibility(radius, source_radius, length(perpendicular), reference_smoothstep);
     }
     vec3 minor_direction = projected_pole / pole_length;
     float y = dot(perpendicular, minor_direction);

@@ -16,6 +16,24 @@ float smoothstep_f(float edge0, float edge1, float x) noexcept {
     return t * t * (3.0f - 2.0f * t);
 }
 
+double disk_cdf(double y) {
+    return 0.5 + (std::asin(y) + y * std::sqrt(std::max(0.0, 1.0 - y * y))) / 3.14159265358979323846;
+}
+
+double disk_moment(double y) {
+    return -2.0 / (3.0 * 3.14159265358979323846) * std::pow(std::max(0.0, 1.0 - y * y), 1.5);
+}
+
+double inverse_disk_cdf(double value) {
+    double lo = -1.0, hi = 1.0;
+    for (int i = 0; i < 40; ++i) {
+        double mid = 0.5 * (lo + hi);
+        if (disk_cdf(mid) < value) lo = mid;
+        else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
 uint32_t read_be32(const uint8_t* p) noexcept {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
 }
@@ -352,11 +370,11 @@ float ring_transfer(float tau_val, float mu_s, float mu_v, bool same_side) noexc
     float tau = std::max(tau_val, 0.0f);
     float ms = std::max(mu_s, 1e-5f);
     float mv = std::max(mu_v, 1e-5f);
-    float xs = std::min(tau / ms, 80.0f);
-    float xv = std::min(tau / mv, 80.0f);
+    float xs = tau / ms;
+    float xv = tau / mv;
 
     if (same_side) {
-        float a = xs + xv;
+        float a = std::min(xs + xv, 80.0f);
         float one_minus_exp = (a < 1e-3f)
             ? a * (1.0f - 0.5f * a + (1.0f / 6.0f) * a * a)
             : (1.0f - std::exp(-a));
@@ -368,7 +386,11 @@ float ring_transfer(float tau_val, float mu_s, float mu_v, bool same_side) noexc
         float xm = 0.5f * (xs + xv);
         return xv * std::exp(-xm) * (1.0f + (d * d) / 24.0f);
     }
-    return xv * (std::exp(-xv) - std::exp(-xs)) / d;
+    float ad = std::abs(d);
+    float one_minus_exp = ad < 1e-2f
+        ? ad * (1.0f - 0.5f * ad + ad * ad / 6.0f)
+        : -std::expm1(-ad);
+    return (xv / ad) * std::exp(-std::min(xs, xv)) * one_minus_exp;
 }
 
 float ring_opposition_factor(float cos_alpha, float tau_val) noexcept {
@@ -465,26 +487,105 @@ glm::vec3 ring_radiance_rgb(float total_tau, float mu_v, float sun_elev, float c
     float scatter = props.z;
     float unlit_factor = props.w;
 
-    glm::vec3 eff_rgb = linear_rgb;
-    if (is_textured && !same_side) {
-        float core_factor = smoothstep_f(0.60f, 1.80f, total_tau);
-        float luma = std::max(glm::dot(linear_rgb, glm::vec3(0.2126f, 0.7152f, 0.0722f)), 1e-4f);
-        glm::vec3 chroma = linear_rgb / luma;
-        glm::vec3 chroma_unlit = chroma * (1.0f - 0.65f * core_factor) + glm::vec3(0.65f * core_factor);
-        float unlit_luma = std::pow(luma, 0.35f) * 0.60f;
-        eff_rgb = unlit_luma * chroma_unlit;
-    }
-
-    float eff_scatter = same_side ? (scatter * 0.30f) : scatter;
-    float phase = ring_phase_dhg(cos_theta, eff_scatter, g_fwd, g_back, total_tau, is_textured);
+    glm::vec3 eff_rgb = glm::clamp(linear_rgb, glm::vec3(0.0f), glm::vec3(1.0f));
+    float phase = ring_phase_dhg(cos_theta, scatter, g_fwd, g_back, total_tau, is_textured);
     float opp = same_side ? ring_opposition_factor(-cos_theta, total_tau) : 1.0f;
     float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
 
-    float ss_scale = same_side ? 0.38f : 0.25f;
-    glm::vec3 ss = eff_rgb * (ss_scale * phase * opp * transfer);
+    glm::vec3 ss = eff_rgb * (0.25f * phase * opp * transfer);
     glm::vec3 ms = ring_multiple_scattering(total_tau, mu_s, mu_v, same_side, eff_rgb);
     float side_scale = same_side ? 1.0f : unlit_factor;
     return (ss + ms) * side_scale;
+}
+
+int ringshine_source_samples(double elevation, double sin_radius, glm::vec4& offsets, glm::vec4& weights) {
+    offsets = glm::vec4(0.0f);
+    weights = glm::vec4(0.0f);
+    if (sin_radius <= 1e-6 || std::abs(elevation) >= 2.0 * sin_radius) {
+        weights.x = 1.0f;
+        return 1;
+    }
+    double boundary = std::clamp(-elevation / sin_radius, -1.0, 1.0);
+    double faces[2][2] = {{-1.0, boundary}, {boundary, 1.0}};
+    for (int face = 0; face < 2; ++face) {
+        double lo = faces[face][0], hi = faces[face][1];
+        double area = disk_cdf(hi) - disk_cdf(lo);
+        if (area < 1e-14) continue;
+        double middle = inverse_disk_cdf(disk_cdf(lo) + 0.5 * area);
+        double parts[2][2] = {{lo, middle}, {middle, hi}};
+        for (int part = 0; part < 2; ++part) {
+            double left = parts[part][0], right = parts[part][1];
+            double weight = disk_cdf(right) - disk_cdf(left);
+            if (weight <= 0.0) continue;
+            int slot = 2 * face + part;
+            offsets[slot] = static_cast<float>((disk_moment(right) - disk_moment(left)) / weight);
+            weights[slot] = static_cast<float>(weight);
+        }
+    }
+    return 4;
+}
+
+std::vector<glm::vec2> build_ringshine_radial_samples(std::span<const ephemeris::RingLayerDefinition> layers,
+                                                    uint32_t band_count) {
+    layers = layers.first(std::min<size_t>(layers.size(), MAX_RING_SEGMENTS));
+    std::vector<double> boundaries;
+    for (const auto& layer : layers) {
+        double inner = std::max(layer.inner, 1.000001);
+        if (layer.opacity <= 0.0f || layer.outer <= inner) continue;
+        boundaries.push_back(inner);
+        boundaries.push_back(layer.outer);
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    struct Interval {
+        double inner;
+        double outer;
+        double span;
+        double remainder = 0.0;
+        uint32_t bands = 1;
+    };
+    std::vector<Interval> intervals;
+    double total_span = 0.0;
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        double inner = boundaries[i - 1], outer = boundaries[i], middle = 0.5 * (inner + outer);
+        if (std::none_of(layers.begin(), layers.end(), [&](const auto& layer) {
+                return layer.opacity > 0.0f && middle > layer.inner && middle < layer.outer;
+            })) continue;
+        double span = std::log((outer - 1.0) / (inner - 1.0));
+        intervals.push_back({inner, outer, span});
+        total_span += span;
+    }
+    if (intervals.empty()) return {};
+    uint32_t budget = std::max(std::clamp(band_count, 4u, 1024u), static_cast<uint32_t>(intervals.size()));
+    uint32_t remaining = budget - static_cast<uint32_t>(intervals.size()), assigned = 0;
+    for (auto& interval : intervals) {
+        double extra = remaining * interval.span / total_span;
+        uint32_t whole = static_cast<uint32_t>(extra);
+        interval.bands += whole;
+        interval.remainder = extra - whole;
+        assigned += whole;
+    }
+    for (; assigned < remaining; ++assigned) {
+        auto it = std::max_element(intervals.begin(), intervals.end(), [](const auto& a, const auto& b) {
+            return a.remainder < b.remainder;
+        });
+        ++it->bands;
+        it->remainder = -1.0;
+    }
+    constexpr double nodes[] = {0.06943184420297371, 0.33000947820757187, 0.6699905217924281, 0.9305681557970262};
+    constexpr double weights[] = {0.17392742256872693, 0.32607257743127307, 0.32607257743127307, 0.17392742256872693};
+    std::vector<glm::vec2> samples;
+    samples.reserve(4 * budget);
+    for (const auto& interval : intervals) {
+        for (uint32_t band = 0; band < interval.bands; ++band) {
+            for (uint32_t q = 0; q < 4; ++q) {
+                double t = (band + nodes[q]) / interval.bands;
+                double gap = (interval.inner - 1.0) * std::exp(t * interval.span);
+                samples.emplace_back(1.0 + gap, gap * interval.span * weights[q] / interval.bands);
+            }
+        }
+    }
+    return samples;
 }
 
 float sample_ring_gradient(std::span<const ephemeris::RingGradientStop> stops, float p) noexcept {

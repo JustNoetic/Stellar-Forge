@@ -7,9 +7,11 @@
 #include "rhi/staging_uploads.hpp"
 #include "rhi/vk_context.hpp"
 #include <array>
+#include <map>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sf::rendering {
@@ -42,6 +44,9 @@ public:
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
                 std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
                 std::span<const rhi::PushDescriptorWrite> transparency_writes = {});
+    void update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                          const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, uint32_t body_count,
+                          VkExtent2D extent);
 
     void invalidate_texture_cache() noexcept {
         force_rebuild_ = true;
@@ -67,6 +72,10 @@ public:
     const rhi::Buffer& host_buffer(uint32_t frame) const noexcept { return host_ssbos_[frame]; }
     const rhi::Image& gradient_atlas() const noexcept { return gradient_atlas_; }
     const rhi::Image& shadow_lut() const noexcept { return shadow_lut_; }
+    const rhi::Image& ringshine_atlas(uint32_t frame) const noexcept { return ringshine_atlases_[frame]; }
+    uint32_t ringshine_bake_count() const noexcept { return ringshine_bakes_; }
+    uint32_t ringshine_frame_bake_count() const noexcept { return ringshine_frame_bakes_; }
+    std::span<const uint32_t> ringshine_sample_counts() const noexcept { return ringshine_sample_counts_; }
 
 private:
     struct CachedHostMapping {
@@ -78,8 +87,25 @@ private:
         std::vector<RingDrawRange> draw_ranges;
     };
 
+    struct RingshineTileKey {
+        uint64_t profile_serial = 0;
+        double inner = 0.0;
+        double outer = 0.0;
+        double flattening = 0.0;
+        uint32_t bands = 0;
+        double elevation = 0.0;
+        double sin_radius = 0.0;
+        bool operator==(const RingshineTileKey&) const = default;
+    };
+    struct RingshineJob {
+        uint32_t host_idx = 0;
+        uint32_t star_col = 0;
+        RingshineTileKey key{};
+    };
+
     void build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segments, uint32_t radial_subdivisions);
     void rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count);
+    void bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingshineJob& job);
 
     rhi::Buffer vbo_{};
     rhi::Buffer ibo_{};
@@ -89,6 +115,19 @@ private:
     std::array<rhi::Pipeline, 16> transparency_pipelines_{};
     rhi::Image gradient_atlas_{};
     rhi::Image shadow_lut_{};
+    std::array<rhi::Image, rhi::FRAMES_IN_FLIGHT> ringshine_atlases_{};
+    rhi::Pipeline ringshine_pipeline_{};
+    std::array<std::map<std::pair<uint32_t, uint32_t>, RingshineTileKey>, rhi::FRAMES_IN_FLIGHT> ringshine_cache_;
+    uint32_t ringshine_bakes_ = 0;
+    uint32_t ringshine_frame_bakes_ = 0;
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> ringshine_radial_buffers_{};
+    std::array<uint64_t, rhi::FRAMES_IN_FLIGHT> ringshine_radial_upload_serials_{};
+    std::vector<glm::vec2> ringshine_radial_samples_;
+    std::vector<glm::uvec2> ringshine_radial_ranges_;
+    std::vector<uint32_t> ringshine_sample_counts_;
+    uint64_t ringshine_radial_serial_ = 0;
+    uint64_t ringshine_radial_profile_serial_ = 0;
+    uint32_t ringshine_radial_bands_ = 0;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> host_ssbos_{};
     rhi::StagingUploads staging_;
 
@@ -100,6 +139,7 @@ private:
     std::shared_ptr<const ephemeris::SystemDefinition> cached_definition_;
     uint64_t cached_generation_ = 0;
     uint64_t cached_definition_revision_ = 0;
+    uint64_t ringshine_profile_serial_ = 0;
     bool force_rebuild_ = true;
 };
 

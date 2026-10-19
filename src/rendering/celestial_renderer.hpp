@@ -41,6 +41,7 @@ struct alignas(16) SceneCelestialUBO {
     uint32_t num_ring_hosts = 0;
     glm::uvec4 ring_shadow_params{0};
     glm::uvec4 eclipse_params{0};
+    glm::uvec4 ringshine_params{0};
     glm::mat4 projection{1.0f};
 };
 
@@ -64,7 +65,10 @@ public:
     }
     const TransparencyRenderer& transparency() const noexcept { return transparency_; }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
-    std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
+     std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
+    uint32_t ringshine_bake_count() const noexcept { return rings_.ringshine_bake_count(); }
+    uint32_t ringshine_frame_bake_count() const noexcept { return rings_.ringshine_frame_bake_count(); }
+    std::span<const uint32_t> ringshine_sample_counts() const noexcept { return rings_.ringshine_sample_counts(); }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
     void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
         normals_.set_height_source(body, source);

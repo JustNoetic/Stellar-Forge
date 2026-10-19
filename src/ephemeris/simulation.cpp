@@ -243,7 +243,8 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     auto before = BodyPhysicalProperties::from(old);
     if (old.height_range_km.x <= -radius_au*AU_TO_KM*std::clamp(1.0-values.oblateness, 0.05, 1.0))
         return {false, false, "The edited radius or oblateness places the established terrain minimum beyond the body centre."};
-    if (old.atmosphere.bottom_altitude_km <= -radius_au*AU_TO_KM*.25)
+    if (old.atmosphere.bottom_altitude_km <= -radius_au*AU_TO_KM*.25 ||
+        !physics::valid_cloud_deck_domain(old.atmosphere, values.mass.value, radius_au*AU_TO_KM))
         return {false, false, "The edited radius places the atmospheric lower boundary outside the supported domain."};
     if (before == values) return {};
 
@@ -452,11 +453,13 @@ CommandResult Simulation::apply(const ApplyBodyAtmosphere& command) {
     if (old.is_star || old.is_black_hole || old.is_spacecraft)
         return {false, false, "Atmospheres are available on planetary bodies only."};
     if (!valid_atmosphere(command.values) || command.values.bottom_altitude_km <= -old.radius_au()*AU_TO_KM*.25 ||
+        !physics::valid_cloud_deck_domain(command.values, old.mass_msun, old.radius_au()*AU_TO_KM) ||
         (command.values.enabled && command.values.physical && old.mass_msun <= 0))
         return {false, false, "Invalid atmosphere: check pressure, temperature, composition, temperature layers, optics and positive body mass."};
     if (old.atmosphere == command.values) return {};
     bool geometry_changed = old.atmosphere.pressure_reference != command.values.pressure_reference ||
-        old.atmosphere.bottom_altitude_km != command.values.bottom_altitude_km;
+        old.atmosphere.bottom_altitude_km != command.values.bottom_altitude_km ||
+        old.atmosphere.cloud_deck_pressure_pa > 0 || command.values.cloud_deck_pressure_pa > 0;
     auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
     updated->bodies[index].atmosphere = command.values;
     snapshot_.definition_ = std::move(updated);
