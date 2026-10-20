@@ -11,13 +11,16 @@ layout(std430, set = 0, binding = 11) readonly buffer AtmosphereShadows {
     uvec4 shadow_flags;
     vec4 shadow_stars[16];
     uvec4 shadow_ranges[16];
-    mat4 shadow_previous_projection;
     uvec4 shadow_temporal;
-    vec4 shadow_history_params;
     AtmosphereShadowCaster shadow_casters[];
 };
 layout(set = 0, binding = 12) uniform sampler2DArray atmosphere_ring_shadow_lut;
 layout(set = 0, binding = 20) uniform sampler3D u_stbn_tex;
+
+vec3 normalized_shadow_loss(vec3 loss, vec3 energy) {
+    vec3 denominator = max(energy, vec3(1e-20));
+    return mix(clamp(loss/denominator, vec3(0.0), vec3(1.0)), vec3(1.0), equal(loss, denominator));
+}
 
 vec3 atmosphere_to_physical(vec3 p) {
     vec3 world = atm.axis_x.xyz*p.x+atm.axis_y.xyz*p.y+atm.axis_z.xyz*p.z;
@@ -181,13 +184,13 @@ vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
                 medium(q, r, m, e);
                 float radius = clamp(length(q), bottom_radius(), top_radius());
                 float mu = clamp(dot(q, direction)/radius, -1.0, 1.0);
-                vec3 view_transmission = bruneton_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
+                vec3 view_transmission = segment_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
                 if (midpoint < 2.0) {
                     vec3 sr, sm, se;
                     medium((entry+q)*0.5, sr, sm, se);
                     view_transmission = mix(exp(-se*midpoint), view_transmission, smoothstep(0.5, 2.0, midpoint));
                 }
-                vec3 direct = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(phase_mu)+aerosol_source(q, phase_mu));
+                vec3 direct = sun_transmittance(transmittance_lut, q, sun, atm.sun_direction[s].w)*(r*rayleigh_phase(phase_mu)+aerosol_source(q, phase_mu));
                 vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
                 vec3 weight = view_transmission*atm.sun_irradiance[s].rgb*(direct+multiple)*step;
                 total_energy += weight;
@@ -235,7 +238,7 @@ vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
                 medium(q, r, m, e);
                 float radius = clamp(length(q), bottom_radius(), top_radius());
                 float mu = clamp(dot(q, direction)/radius, -1.0, 1.0);
-                vec3 view_transmission = bruneton_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
+                vec3 view_transmission = segment_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
                 if (midpoint < 2.0) {
                     vec3 sr, sm, se;
                     medium((entry+q)*0.5, sr, sm, se);
@@ -243,7 +246,7 @@ vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
                 }
                 vec3 sun = atm.sun_direction[s].xyz;
                 float phase_mu = dot(direction, sun);
-                vec3 direct = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(phase_mu)+aerosol_source(q, phase_mu));
+                vec3 direct = sun_transmittance(transmittance_lut, q, sun, atm.sun_direction[s].w)*(r*rayleigh_phase(phase_mu)+aerosol_source(q, phase_mu));
                 vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
                 vec3 weight = view_transmission*atm.sun_irradiance[s].rgb*(direct+multiple)*step;
                 total_energy += weight;
@@ -254,7 +257,7 @@ vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
         }
     }
     if (total_energy.r > 1e-20 || total_energy.g > 1e-20 || total_energy.b > 1e-20)
-        return clamp(total_loss / max(total_energy, vec3(1e-20)), vec3(0.0), vec3(1.0));
+        return normalized_shadow_loss(total_loss, total_energy);
     return vec3(0.0);
 }
 
@@ -324,8 +327,43 @@ float shadow_random(ivec2 pixel, uint sample_index, uint star_index, uint sequen
     return base;
 }
 
-vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 pixel, uint sequence,
-                              float prefix_path, out vec3 prefix_deficit, out bvec2 supported) {
+float shadow_sample_budget(vec3 entry, vec3 direction, float path, uint maximum, out float contributing_span) {
+    contributing_span = path;
+    if (shadow_temporal.w == 0u || maximum <= 4u || atm.camera.w > 1.0) return float(maximum);
+    if (transport_subdivisions(entry, direction, 0.0, path) > 1) return float(maximum);
+    float closest = clamp(-dot(entry, direction), 0.0, path);
+    vec3 p = entry+direction*closest;
+    float radius = max(length(p), bottom_radius());
+    float height = radius-atm.reference_shape.x;
+    vec3 r, m, e;
+    medium(p, r, m, e);
+    float rayleigh_weight = dot(r, vec3(1.0));
+    float mie_weight = dot(atm.mie_extinction.rgb, vec3(1.0))*exp(-max(height, 0.0)/atm.radii_heights.w);
+    float weight = rayleigh_weight+mie_weight;
+    float inverse_scale = rayleigh_weight/atm.radii_heights.z+mie_weight/atm.radii_heights.w;
+    for (int layer = 0; layer < int(atm.aerosol_count.x); ++layer) {
+        float w = dot(atm.aerosol_extinction[layer].rgb, vec3(1.0))*particle_density(layer, height);
+        float scale = atm.aerosol_shape[layer].z > 0.0 ? atm.aerosol_shape[layer].z : atm.aerosol_shape[layer].x;
+        weight += w;
+        inverse_scale += w/max(scale, 0.001);
+    }
+    float scale = clamp(weight > 1e-20 ? weight/max(inverse_scale, 1e-20) : atm.radii_heights.z,
+                        0.001, top_radius()-bottom_radius());
+    float mu = dot(p, direction)/radius;
+    float slant = inversesqrt(mu*mu+scale/radius);
+    contributing_span = min(path, 4.0*scale*slant);
+    float complexity = min(path/scale, slant);
+    return mix(4.0, float(maximum), smoothstep(1.5, 8.0, complexity));
+}
+
+struct AtmosphereShadowEstimate {
+    vec3 energy, loss, prefix_energy, prefix_loss;
+};
+
+vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 pixel, uint sequence,
+                               float prefix_path, out vec3 prefix_deficit, out bvec2 supported,
+                               out AtmosphereShadowEstimate estimate) {
+    estimate = AtmosphereShadowEstimate(vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
     supported = bvec2(false);
     prefix_deficit = vec3(0.0);
     if (shadow_flags.x == 0u) return vec3(0.0);
@@ -339,7 +377,9 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
     float entry_radius = clamp(length(entry), bottom_radius(), top_radius());
     float entry_mu = clamp(dot(entry, direction)/entry_radius, -1.0, 1.0);
     bool hits_ground = entry_mu < 0.0 && entry_radius*entry_radius*(entry_mu*entry_mu-1.0)+bottom_radius()*bottom_radius() >= 0.0;
-    uint samples = shadow_temporal.z <= 4u ? 4u : shadow_temporal.z <= 8u ? 8u : 16u;
+    uint maximum = shadow_temporal.z <= 4u ? 4u : shadow_temporal.z <= 8u ? 8u : 16u;
+    float contributing_span = path;
+    float base_budget = -1.0;
 
     vec3 total_energy = vec3(0.0);
     vec3 total_loss = vec3(0.0);
@@ -352,13 +392,6 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
         uint count = range.y+range.w;
         vec4 star = shadow_stars[s];
         vec3 sun = atm.sun_direction[s].xyz;
-        float phase_mu = dot(direction, sun);
-        float rayleigh_factor = rayleigh_phase(phase_mu);
-        vec3 mie_factor = atm.mie_scattering.rgb*mie_phase(phase_mu);
-        vec3 particle_factor[4];
-        for (int layer = 0; layer < int(atm.aerosol_count.x); ++layer)
-            particle_factor[layer] = atm.aerosol_scattering[layer].rgb*particle_phase(layer, phase_mu);
-
         vec2 interval = count > 0u ? atmosphere_shadow_next(range, origin, physical_direction, star, vec2(0.0, path)) : vec2(0.0);
         bool has_shadow = count > 0u && interval.y > interval.x;
         if (!has_shadow) {
@@ -367,6 +400,29 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
             supported.x = true;
             if (prefix_path > 0.0) supported.y = true;
         }
+
+        if (base_budget < 0.0) {
+            base_budget = prefix_path > 0.0 ? float(maximum)
+                        : shadow_sample_budget(entry, direction, path, maximum, contributing_span);
+        }
+        float budget = base_budget;
+        if (budget < float(maximum) && has_shadow) {
+            float representative = clamp(-dot(entry, direction), interval.x, interval.y);
+            float step = atmosphere_shadow_step(origin+physical_direction*representative, physical_direction, star, range, contributing_span);
+            budget = max(budget, min(float(maximum), contributing_span/max(8.0*step, 0.001)));
+        }
+        uint samples = maximum;
+        if (budget < float(maximum)) {
+            float rounding = shadow_random(pixel+ivec2(73, 29), 0u, s+1u, 0u);
+            samples = clamp(uint(floor(budget+rounding)), 4u, maximum);
+        }
+
+        float phase_mu = dot(direction, sun);
+        float rayleigh_factor = rayleigh_phase(phase_mu);
+        vec3 mie_factor = atm.mie_scattering.rgb*mie_phase(phase_mu);
+        vec3 particle_factor[4];
+        for (int layer = 0; layer < int(atm.aerosol_count.x); ++layer)
+            particle_factor[layer] = atm.aerosol_scattering[layer].rgb*particle_phase(layer, phase_mu);
 
         float first = 0.0;
         float last = path;
@@ -401,7 +457,7 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
             medium(q_pos, r, m, e);
             float radius = clamp(length(q_pos), bottom_radius(), top_radius());
             float mu = clamp(dot(q_pos, direction) / radius, -1.0, 1.0);
-            vec3 view_transmittance = bruneton_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
+            vec3 view_transmittance = segment_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
             if (t < 2.0) {
                 vec3 sr, sm, se;
                 medium((entry + q_pos) * 0.5, sr, sm, se);
@@ -413,7 +469,7 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
             for (int layer = 0; layer < int(atm.aerosol_count.x); ++layer)
                 scattering += particle_factor[layer] * particle_density(layer, height);
 
-            vec3 direct = sun_transmittance(transmittance_lut, q_pos, sun) * scattering;
+            vec3 direct = sun_transmittance(transmittance_lut, q_pos, sun, atm.sun_direction[s].w) * scattering;
             vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q_pos, sun), 0.0).rgb * (r + m);
             vec3 weight = view_transmittance * atm.sun_irradiance[s].rgb * (direct + multiple) * ds;
 
@@ -429,10 +485,18 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
         }
     }
 
+    estimate = AtmosphereShadowEstimate(total_energy, total_loss, total_prefix_energy, total_prefix_loss);
     if (total_prefix_energy.r > 1e-20 || total_prefix_energy.g > 1e-20 || total_prefix_energy.b > 1e-20)
-        prefix_deficit = clamp(total_prefix_loss / max(total_prefix_energy, vec3(1e-20)), vec3(0.0), vec3(1.0));
+        prefix_deficit = normalized_shadow_loss(total_prefix_loss, total_prefix_energy);
     if (total_energy.r > 1e-20 || total_energy.g > 1e-20 || total_energy.b > 1e-20)
-        return clamp(total_loss / max(total_energy, vec3(1e-20)), vec3(0.0), vec3(1.0));
+        return normalized_shadow_loss(total_loss, total_energy);
     return vec3(0.0);
+}
+
+vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 pixel, uint sequence,
+                              float prefix_path, out vec3 prefix_deficit, out bvec2 supported) {
+    AtmosphereShadowEstimate unused;
+    return atmosphere_shadow_estimate(direction, segment, path, pixel, sequence,
+        prefix_path, prefix_deficit, supported, unused);
 }
 

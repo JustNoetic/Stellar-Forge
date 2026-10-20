@@ -964,25 +964,27 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::Checkbox("Atmospheric surface lighting", &render_draft.atmosphere_surface_lighting);
             ImGui::Checkbox("Atmospheric shadows", &render_draft.atmosphere_shadows_enabled);
             ImGui::BeginDisabled(!render_draft.atmosphere_shadows_enabled);
+            ImGui::Checkbox("Progressive atmosphere shadows", &render_draft.atmosphere_shadow_temporal);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refines stationary views over 64 frames. Camera, lighting and shadow changes reset immediately. Uses native sampling while enabled.");
             const char* shadow_noise_types[] = {"Interleaved Gradient Noise (IGN)", "Spatiotemporal Blue Noise (STBN)"};
             int current_noise_type = static_cast<int>(render_draft.atmosphere_shadow_noise_type);
             if (ImGui::Combo("Shadow noise##shadow_noise", &current_noise_type, shadow_noise_types, 2)) {
                 render_draft.atmosphere_shadow_noise_type = static_cast<uint32_t>(current_noise_type);
             }
             const char* shadow_samples[] = {"4", "8", "16"};
+            ImGui::Checkbox("Adaptive shadow samples", &render_draft.atmosphere_shadow_adaptive);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses fewer samples for short or vertical atmospheric columns. Grazing rays and sharp shadows retain more samples.");
+            ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
+            ImGui::Checkbox("Atmospheric shadow VRS", &render_draft.atmosphere_shadow_vrs);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses smooth shadow fractions between pixels. Depth edges, narrow shadow detail and transparent endpoints use native resolution.");
+            ImGui::EndDisabled();
             int shadow_quality = render_draft.atmosphere_shadow_samples == 4 ? 0 : render_draft.atmosphere_shadow_samples == 8 ? 1 : 2;
-            if (ImGui::Combo("Shadow samples", &shadow_quality, shadow_samples, 3))
+            if (ImGui::Combo(render_draft.atmosphere_shadow_adaptive ? "Maximum shadow samples" : "Shadow samples", &shadow_quality, shadow_samples, 3))
                 render_draft.atmosphere_shadow_samples = 4u << shadow_quality;
             ImGui::EndDisabled();
             ImGui::Checkbox("Dual-source atmosphere blending", &render_draft.atmosphere_dual_source);
             ImGui::Checkbox("Aerial perspective", &render_draft.aerial_perspective_enabled);
-            ImGui::BeginDisabled(!render_draft.aerial_perspective_enabled);
-            const char* aerial_models[] = {"Frustum Volume", "Bruneton (Precomputed 4D)"};
-            int current_aerial_model = render_draft.aerial_perspective_bruneton ? 1 : 0;
-            if (ImGui::Combo("Aerial Model##aerial_model", &current_aerial_model, aerial_models, 2)) {
-                render_draft.aerial_perspective_bruneton = (current_aerial_model == 1);
-            }
-            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds atmospheric scattered light over surfaces. Atmospheric extinction remains active when disabled.");
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);

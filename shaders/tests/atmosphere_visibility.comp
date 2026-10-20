@@ -1,0 +1,18 @@
+#version 460
+#include "common/atmosphere.glsl"
+layout(local_size_x = 1) in;
+layout(std430, set = 0, binding = 1) buffer Results { vec4 visibility[]; };
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    float heights[3] = float[3](0.01, 1.0, 100.0);
+    float angular_radii[3] = float[3](0.001, 0.00465, 0.02);
+    float offsets[5] = float[5](-2.0, -0.5, 0.0, 0.5, 2.0);
+    float radius = atm.reference_shape.x+heights[index/15u];
+    vec3 p = vec3(0.0, 0.0, radius);
+    radius = length(p);
+    float angular_radius = angular_radii[(index/5u)%3u];
+    float horizon = -sqrt(max((radius-atm.reference_shape.x)*(radius+atm.reference_shape.x), 0.0))/radius;
+    float mu = horizon+offsets[index%5u]*atm.reference_shape.x/radius*angular_radius;
+    vec3 sun = vec3(sqrt(max(1.0-mu*mu, 0.0)), 0.0, mu);
+    visibility[index] = vec4(sun_visibility(p, sun, angular_radius), sphere_roots(p, sun, bottom_radius()).x, 0.0, 0.0);
+}

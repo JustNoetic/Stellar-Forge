@@ -41,9 +41,9 @@ Representative refractive indices at 680/550/440 nm:
 
 These are approximate samples, not digitized retrieval tables or exact measurements at these wavelengths. Tholin samples reflect the visible range in [Khare et al. (1984)](https://hitran.org/data/Aerosols/Aerosols%20data%20from%20previous%20HITRAN/Aerosols-2016/papers/khare_tholins_1984.pdf); dust properties vary ([Wolff et al. 2009](https://doi.org/10.1029/2009JE003350)). Martian nonspherical dust, Titan aggregates and ice facets need measured phase functions or other solvers. Plain sulfate excludes Venus's unidentified blue/UV absorber; the separate effective mixture approximates its visible blue absorption without identifying its chemistry. See [giant atmospheres](giant_atmospheres.md). No RGB sky color is prescribed.
 
-Each population has 128 phase samples at `theta = pi * t²`, concentrated near forward scattering. Linear interpolation in cosine is normalized to unit solid-angle integral per channel. All atmosphere passes use these densities, extinction and angular sources. Absorption contributes only to extinction. The uniform block is 13,344 bytes, below Vulkan's guaranteed 16 KiB minimum. Multiple scattering retains the isotropic closure.
+Each population has 128 phase samples at `theta = pi * t²`, concentrated near forward scattering. Linear interpolation in cosine is normalized to unit solid-angle integral per channel. All atmosphere passes use these densities, extinction and angular sources. Absorption contributes only to extinction. The uniform block is 13,328 bytes, below Vulkan's guaranteed 16 KiB minimum. Multiple scattering retains the isotropic closure.
 
-Bruneton aerial tables factor out the first population's RGB phase. The remaining height-dependent ratio is baked into the existing Mie texture and the reference phase restored at the exact pixel angle. A single population's forward lobe is preserved without extra angular bins; several populations retain eight-bin residual angular interpolation. Manual scalar-phase optics keep their original factorization.
+The horizon-mapped aerial LUT integrates every population's RGB phase directly at each angular column direction. Bicubic reconstruction filters the resulting cumulative radiance; very narrow forward lobes remain limited by angular resolution. There is no first-population phase factorization or eight-bin residual interpolation.
 
 Bundled Mars has a representative dust column of 0.48 and 1.5 um effective radius. Titan has a main organic column plus small particles at 500 km. These are illustrative static profiles, not observational fits. Ephemeris Mode shares all physical definitions directly from Solar System. Fixed quadrature can underresolve thin layers and grazing paths. Optical height includes particle tails and detached layers, retaining the 10,000 km cap.
 
@@ -55,7 +55,7 @@ The loader accepts version-1 records. Legacy automatic haze migrates once to exp
 
 - `StellarStateTests`: published Mie benchmarks, Rayleigh limit, energy and column conservation, spectral angular response, particle invariance, persistence, invalid inputs, UI ownership and bundled presets.
 - `atmosphere_migration_contracts`: manual optics, repair scope, idempotence, duplicate consolidation and unrelated-data preservation.
-- `StellarRenderingTests --particles-only`: analytic exponential/Gaussian extinction at finite endpoints in both aerial models, compositor agreement and cache reuse.
+- `StellarRenderingTests --particles-only`: analytic exponential/Gaussian extinction at finite endpoints in the horizon-mapped aerial LUT, compositor agreement and cache reuse.
 - `StellarRenderingTests --atmospheres-only`: particle plus existing physical/legacy atmosphere contracts.
 - `StellarRenderingTests --particle-atmosphere-preview scratch/particle-atmospheres`: matched-irradiance Mars/Titan day, sunset and orbit PPM diagnostics and linear HDR samples. Images use linear clamped color, not calibrated photographic color.
 

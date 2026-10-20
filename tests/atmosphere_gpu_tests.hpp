@@ -38,17 +38,17 @@ void atmosphere_cache_order_contracts(RenderProbe& probe) {
         return std::array{data[1], data[2], data[3]};
     };
     auto cold = prepare();
-    check(cold.visible == 2 && cold.optical_lut_updates == 2 && cold.bruneton_lut_updates == 2 &&
+    check(cold.visible == 2 && cold.optical_lut_updates == 2 && cold.aerial_lut_updates == 2 &&
         cold.surface_lut_updates == 2, "Both visible atmospheres warm their optical and surface caches");
     auto layers = records();
     check(layers[0].w > 0 && layers[1].w > 0 && layers[0].w != layers[1].w,
         "Physical atmospheres own distinct surface irradiance layers");
     auto reused = [&](uint32_t visible) {
         auto stats = prepare();
-        if (stats.visible != visible || stats.optical_lut_updates || stats.bruneton_lut_updates || stats.surface_lut_updates)
+        if (stats.visible != visible || stats.optical_lut_updates || stats.surface_lut_updates)
             std::cerr << "Cache reuse: visible " << stats.visible << '/' << visible << ", optical " << stats.optical_lut_updates
-                << ", Bruneton " << stats.bruneton_lut_updates << ", surface " << stats.surface_lut_updates << '\n';
-        check(stats.visible == visible && stats.optical_lut_updates == 0 && stats.bruneton_lut_updates == 0 &&
+                << ", surface " << stats.surface_lut_updates << '\n';
+        check(stats.visible == visible && stats.optical_lut_updates == 0 &&
             stats.surface_lut_updates == 0, "Visibility and distance ordering reuse expensive atmosphere tables");
     };
     cam.cam_pos_rel.x = 4*radius;
@@ -71,8 +71,8 @@ void atmosphere_cache_order_contracts(RenderProbe& probe) {
     check(sim.apply(ephemeris::SyncTimelineState{units::Years{0}, std::move(motions)}).accepted,
         "A third atmosphere enters ahead of the warmed entries in distance order");
     auto added = prepare();
-    check(added.visible == 3 && added.optical_lut_updates == 1 && added.bruneton_lut_updates == 1 &&
-        added.surface_lut_updates == 1, "Only the newly visible atmosphere builds expensive tables");
+    check(added.visible == 3 && added.optical_lut_updates == 1 && added.aerial_lut_updates >= 1 &&
+        added.surface_lut_updates == 1, "Only the newly visible atmosphere builds optical and surface tables");
     check(records()[0] == layers[0] && records()[1] == layers[1],
         "A newly visible atmosphere does not steal existing surface layers");
     auto optical = sim.snapshot().body(1).definition.atmosphere;
@@ -80,7 +80,7 @@ void atmosphere_cache_order_contracts(RenderProbe& probe) {
     check(sim.apply(ephemeris::ApplyBodyAtmosphere{sim.snapshot().generation(), 1,
         sim.snapshot().body(1).revisions.definition, optical}).accepted, "Optical edit after reordering");
     auto edited = prepare();
-    check(edited.optical_lut_updates >= 1 && edited.bruneton_lut_updates >= 1 && edited.surface_lut_updates >= 1,
+    check(edited.optical_lut_updates >= 1 && edited.aerial_lut_updates >= 1 && edited.surface_lut_updates >= 1,
         "Real optical edits still invalidate cached transport and surface lighting");
     loaded = fixture();
     for (int i = 0; i < 20; ++i) {
@@ -169,7 +169,6 @@ void aerial_perspective_contracts(RenderProbe& probe) {
     ephemeris::Simulation sim;
     check(sim.replace_system(loaded).accepted, "Finite transport fixture");
     rendering::RenderSettings settings;
-    settings.aerial_perspective_bruneton = false;
     auto sample = [&](const Camera& camera, double distance, glm::vec3 background = glm::vec3(1.0f)) {
         float depth = camera.compute_near_plane_au()/float(distance*KM_TO_AU);
         probe.render(camera, sim.snapshot(), settings, nullptr, false, background, true, depth);
@@ -237,11 +236,14 @@ void aerial_perspective_contracts(RenderProbe& probe) {
           "Aerial radiance exposure applies once without rebaking");
     cam.yaw_actual_deg += 0.2;
     sample(cam, 100.0);
-    check(probe.renderer.atmosphere_stats().aerial_lut_updates == 1 && probe.renderer.atmosphere_stats().sky_lut_updates == 0,
-          "Rotation refreshes the frustum volume independently of the sky LUT");
+    check(probe.renderer.atmosphere_stats().aerial_lut_updates == 0 && probe.renderer.atmosphere_stats().sky_lut_updates == 0,
+          "Rotation reuses the horizon volume and sky LUT");
     settings.aerial_perspective_enabled = false;
-    check(sample(cam, 100.0) == glm::vec3(1.0f), "Sky-only toggle preserves opaque pixels");
-    cam.yaw_actual_deg += 0.2;
+    auto extinction_only = sample(cam, 100.0);
+    check(extinction_only.r > 0.0f && extinction_only.r < 1.0f &&
+        sample(cam, 100.0, glm::vec3(0)) == glm::vec3(0),
+        "Disabling aerial perspective retains extinction without adding surface inscattering");
+    cam.cam_pos_rel.z += 0.1*KM_TO_AU;
     sample(cam, 100.0);
     settings.aerial_perspective_enabled = true;
     sample(cam, 100.0);
@@ -291,7 +293,7 @@ void aerial_perspective_contracts(RenderProbe& probe) {
     for (size_t pixel = 0; pixel < mask.size(); pixel += 4) {
         if (mask[pixel] == 0 && mask[pixel+1] == 0 && mask[pixel+2] == 0) continue;
         for (int c = 0; c < 4; ++c) check(pixels[pixel+c] == sky_only[pixel+c],
-            "Padded aerial transport never spills onto background sky or limb pixels");
+            "Horizon aerial transport never spills onto background sky or limb pixels");
         ++background_checks;
     }
     check(background_checks > 10000, "Full-resolution surface mask protects the surrounding sky");
@@ -357,15 +359,47 @@ void aerial_perspective_contracts(RenderProbe& probe) {
     std::cout << "PASS: finite-distance aerial RGB extinction/scattering, near geometry, vacuum entry, horizon, cache and exposure.\n";
 }
 
-void bruneton_perspective_contracts(RenderProbe& probe) {
+void horizon_perspective_contracts(RenderProbe& probe, const std::filesystem::path& output = {}) {
     curved_surface_depth_contracts(probe);
+    rendering::AtmosphereParametersGPU parameters;
+    parameters.radii_heights = {6378.137f, 6478.137f, 8.0f, 1.2f};
+    parameters.reference_shape = {6378.137f, 1.0f, 6378.137f, 0.0f};
+    auto uniform = probe.vk.create_host_buffer(sizeof(parameters), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &parameters);
+    auto visibility = probe.vk.create_host_buffer(45*sizeof(glm::vec4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    rhi::DescriptorLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT}};
+    auto pipeline = rhi::ShaderCache::create_compute_pipeline(probe.vk, "tests/atmosphere_visibility.comp", bindings);
+    probe.vk.immediate_submit([&](VkCommandBuffer cmd) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+        rhi::PushDescriptorWrite writes[] = {rhi::PushDescriptorWrite::uniform_buffer(0, uniform),
+            rhi::PushDescriptorWrite::storage_buffer(1, visibility)};
+        probe.vk.push_descriptors(cmd, pipeline, writes);
+        vkCmdDispatch(cmd, 45, 1, 1);
+        probe.vk.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+    });
+    vmaInvalidateAllocation(probe.vk.allocator(), visibility.allocation, 0, VK_WHOLE_SIZE);
+    auto* values = static_cast<const glm::vec4*>(visibility.mapped);
+    for (int row = 0; row < 45; row += 5) {
+        check(values[row].x == 0.0f && values[row+4].x == 1.0f, "Host shadow converges to full night and daylight");
+        check(values[row+1].y > 0.0f && values[row+1].x > 0.0f && values[row+1].x < 0.5f,
+            "Partially visible stars remain lit even when the central solar ray intersects the planet");
+        if (std::abs(values[row+2].x-0.5f) >= 0.002f || values[row+3].x <= 0.5f || values[row+3].x >= 1.0f)
+            std::cerr << "Solar visibility row " << row << ": " << values[row+1].x << ',' << values[row+2].x << ',' << values[row+3].x << '\n';
+        check(std::abs(values[row+2].x-0.5f) < 0.002f && values[row+3].x > 0.5f && values[row+3].x < 1.0f,
+            "Solar visibility crosses the altitude-dependent horizon smoothly for different stellar sizes");
+    }
+    rhi::ShaderCache::destroy_pipeline(probe.vk, pipeline);
+    probe.vk.destroy_buffer(visibility);
+    probe.vk.destroy_buffer(uniform);
     probe.resize({257, 257});
     constexpr double radius_km = 6378.137;
     auto loaded = fixture();
     loaded.motions[0].position = render_to_ecliptic(RenderPosition{{1.0, 0.0, 1.0}});
     loaded.definition.bodies[0].lum_eq = loaded.definition.bodies[0].lum_pole = 0.0;
     ephemeris::BodyDefinition body;
-    body.name = "Bruneton transport contracts";
+    body.name = "Horizon transport contracts";
     body.color_rgb = glm::vec3(0.0f);
     body.color_pole_rgb = glm::vec3(0.0f);
     body.radius_rsun = radius_km/SOLAR_RADIUS_KM;
@@ -374,9 +408,8 @@ void bruneton_perspective_contracts(RenderProbe& probe) {
     loaded.definition.bodies.push_back(body);
     loaded.motions.emplace_back();
     ephemeris::Simulation sim;
-    check(sim.replace_system(loaded).accepted, "Bruneton transport fixture");
+    check(sim.replace_system(loaded).accepted, "Horizon transport fixture");
     rendering::RenderSettings settings;
-    settings.aerial_perspective_bruneton = true;
     auto sample = [&](const Camera& camera, double distance, glm::vec3 background = glm::vec3(1.0f)) {
         float depth = camera.compute_near_plane_au()/float(distance*KM_TO_AU);
         probe.render(camera, sim.snapshot(), settings, nullptr, false, background, true, depth);
@@ -395,10 +428,10 @@ void bruneton_perspective_contracts(RenderProbe& probe) {
             double m = below+a.mie_scale_height_km*std::exp(-std::max(altitude, 0.0)/a.mie_scale_height_km)*(-std::expm1(-(span-below)/a.mie_scale_height_km));
             for (int c = 0; c < 3; ++c) {
                 double expected = std::exp(-a.rayleigh_scattering[c]*r-a.mie_extinction[c]*m);
-                check(std::abs(actual[c]-expected) < 0.005, "Bruneton finite RGB extinction matches analytic columns");
+                check(std::abs(actual[c]-expected) < 0.005, "Horizon finite RGB extinction matches analytic columns");
             }
-            if (distance != 0.01) check(probe.renderer.atmosphere_stats().bruneton_lut_updates == 0 && probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
-                "Changing distance reuses the Bruneton 4D LUT without updating volume");
+            if (distance != 0.01) check(probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
+                "Changing distance reuses the horizon LUT without updating volume");
         }
     }
     Camera cam = camera_at((radius_km+1.0)*KM_TO_AU);
@@ -415,31 +448,31 @@ void bruneton_perspective_contracts(RenderProbe& probe) {
         }
         for (int c = 0; c < 3; ++c) {
             check(std::abs(actual[c]-std::exp(-tau[c])) < 0.012,
-                "Bruneton near-horizon finite extinction agrees with numerical integration");
+                "Horizon near-horizon finite extinction agrees with numerical integration");
         }
     }
     cam = camera_at(radius_km*3.0*KM_TO_AU);
-    check(sample(cam, 100.0) == glm::vec3(1.0f), "Bruneton vacuum foreground receives no atmosphere");
+    check(sample(cam, 100.0) == glm::vec3(1.0f), "Horizon vacuum foreground receives no atmosphere");
     auto orbital = sample(cam, radius_km*2.0-1.0);
     const auto& a = body.atmosphere;
     for (int c = 0; c < 3; ++c) {
         double tau = a.rayleigh_scattering[c]*8.0*(std::exp(-1.0/8.0)-std::exp(-100.0/8.0))
                    + a.mie_extinction[c]*1.2*(std::exp(-1.0/1.2)-std::exp(-100.0/1.2));
-        check(std::abs(orbital[c]-std::exp(-tau)) < 0.008, "Bruneton orbital volume entry matches analytic transport");
+        check(std::abs(orbital[c]-std::exp(-tau)) < 0.008, "Horizon orbital volume entry matches analytic transport");
     }
     loaded.definition.bodies[0].lum_eq = loaded.definition.bodies[0].lum_pole = 1.0;
-    check(sim.replace_system(loaded).accepted, "Lit Bruneton fixture");
+    check(sim.replace_system(loaded).accepted, "Lit Horizon fixture");
     cam = camera_at((radius_km+1.0)*KM_TO_AU);
     cam.yaw_actual_deg = 0.0;
     cam.is_near_surface = true;
     auto L = sample(cam, 100.0, glm::vec3(0.0f));
-    check(L.r > 0.001f && L.b > L.r, "Bruneton finite surfaces receive colored atmospheric scattering");
+    check(L.r > 0.001f && L.b > L.r, "Horizon finite surfaces receive colored atmospheric scattering");
     auto stable = sample(cam, 100.0, glm::vec3(0.0f));
-    check(stable == L && probe.renderer.atmosphere_stats().bruneton_lut_updates == 0, "Paused Bruneton reuses LUT");
+    check(stable == L && probe.renderer.atmosphere_stats().aerial_lut_updates == 0, "Paused Horizon reuses LUT");
     settings.exposure = 2.0f;
     auto exposed = sample(cam, 100.0, glm::vec3(0.0f));
-    check(glm::length(exposed-2.0f*L) < 0.002f && probe.renderer.atmosphere_stats().bruneton_lut_updates == 0,
-          "Exposure applies to Bruneton transport without rebaking");
+    check(glm::length(exposed-2.0f*L) < 0.002f && probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
+          "Exposure applies to Horizon transport without rebaking");
     settings.exposure = 1.0f;
     for (double altitude : {0.01, 1.0, 12.0}) {
         cam = camera_at((radius_km+altitude)*KM_TO_AU);
@@ -469,24 +502,41 @@ void bruneton_perspective_contracts(RenderProbe& probe) {
             previous = current;
         }
         std::cout << "Horizon scattering altitude " << altitude << " maximum jump " << maximum_jump << '\n';
-        check(maximum_jump < 0.004f, "Bruneton finite scattering stays continuous across the ground/sky LUT boundary");
+        check(maximum_jump < 0.004f, "Horizon finite scattering stays continuous across the ground/sky LUT boundary");
     }
     cam = camera_at((radius_km+1.0)*KM_TO_AU);
     cam.is_near_surface = true;
     cam.yaw_actual_deg = 0.0;
+    sample(cam, 100.0);
     cam.yaw_actual_deg += 0.2;
     sample(cam, 100.0);
-    check(probe.renderer.atmosphere_stats().bruneton_lut_updates == 0 && probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
-          "Rotation reuses the Bruneton 4D table without rebaking");
+    check(probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
+          "Rotation reuses the horizon table without rebaking");
+    cam.fov_deg = 75.0;
+    sample(cam, 100.0);
+    check(probe.renderer.atmosphere_stats().aerial_lut_updates == 0 && probe.renderer.atmosphere_stats().sky_lut_updates == 0,
+          "Changing FOV reuses the full angular transport domain");
+    cam.fov_deg = 60.0;
     cam.cam_pos_rel.z += 10.0*KM_TO_AU;
     sample(cam, 100.0);
-    check(probe.renderer.atmosphere_stats().bruneton_lut_updates == 0 && probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
-          "Translation reuses the Bruneton 4D table without rebaking");
+    check(probe.renderer.atmosphere_stats().aerial_lut_updates == 1,
+          "Translation rebuilds the camera-position-dependent horizon table");
     auto edited = sim.snapshot().body(1).definition.atmosphere;
     edited.mie_asymmetry = 0.75f;
     check(sim.apply(ephemeris::ApplyBodyAtmosphere{sim.snapshot().generation(), 1, sim.snapshot().body(1).revisions.definition, edited}).accepted, "Apply optical change");
     sample(cam, 100.0);
-    check(probe.renderer.atmosphere_stats().bruneton_lut_updates == 1, "Optical edit rebakes Bruneton table");
+    check(probe.renderer.atmosphere_stats().aerial_lut_updates == 1, "Optical edit rebakes Horizon table");
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{1.0, 0.5, 1.0}});
+    check(sim.replace_system(loaded).accepted, "Asymmetric azimuth lighting fixture");
+    cam = camera_at((radius_km+1.0)*KM_TO_AU);
+    cam.is_near_surface = true;
+    cam.yaw_actual_deg = 180.0;
+    cam.pitch_actual_deg = -0.0001;
+    auto seam_left = sample(cam, 100.0, glm::vec3(0));
+    cam.pitch_actual_deg = 0.0001;
+    auto seam_right = sample(cam, 100.0, glm::vec3(0));
+    check(glm::length(seam_right-seam_left) < 0.0001f && probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
+          "Periodic bicubic filtering preserves continuity across the azimuth seam");
     probe.resize({640, 480});
     cam = camera_at(radius_km*2.2*KM_TO_AU);
     settings.show_atmospheres = false;
@@ -505,10 +555,10 @@ void bruneton_perspective_contracts(RenderProbe& probe) {
     for (size_t pixel = 0; pixel < mask.size(); pixel += 4) {
         if (mask[pixel] == 0 && mask[pixel+1] == 0 && mask[pixel+2] == 0) continue;
         for (int c = 0; c < 4; ++c) check(pixels[pixel+c] == sky_only[pixel+c],
-            "Bruneton transport never spills onto background sky or limb pixels");
+            "Horizon transport never spills onto background sky or limb pixels");
         ++background_checks;
     }
-    check(background_checks > 10000, "Bruneton full-resolution surface mask protects surrounding sky");
+    check(background_checks > 10000, "Horizon full-resolution surface mask protects surrounding sky");
     loaded.motions[0].position = render_to_ecliptic(RenderPosition{{-1.0, 0.0, 0.0}});
     check(sim.replace_system(loaded).accepted, "Terminator fixture");
     cam = camera_at(radius_km*3.0*KM_TO_AU);
@@ -522,13 +572,19 @@ void bruneton_perspective_contracts(RenderProbe& probe) {
         float g = glm::unpackHalf2x16(pixels[idx+1]).x;
         float b = glm::unpackHalf2x16(pixels[idx+2]).x;
         float luma = 0.2126f*r + 0.7152f*g + 0.0722f*b;
-        check(luma <= prev_luma + 0.001f, "Bruneton terminator profile is monotonically decreasing across day-night boundary");
+        check(luma <= prev_luma + 0.001f, "Horizon terminator profile is monotonically decreasing across day-night boundary");
         if (prev_luma < 1e8f) {
-            check(std::abs(luma - prev_luma) < 0.08f, "Bruneton terminator luminance transitions continuously without stair-step banding");
+            check(std::abs(luma - prev_luma) < 0.08f, "Horizon terminator luminance transitions continuously without stair-step banding");
         }
         prev_luma = luma;
     }
-    std::cout << "PASS: Bruneton 4D precomputed aerial perspective contracts.\n";
+    if (!output.empty()) {
+        std::filesystem::create_directories(output);
+        probe.resize({768, 768});
+        probe.render(cam, sim.snapshot(), settings, nullptr, true);
+        probe.save_preview(output/"terminator.ppm", true);
+    }
+    std::cout << "PASS: Horizon-mapped cumulative aerial perspective contracts.\n";
 }
 
 void atmosphere_floor_contracts(RenderProbe& probe) {
@@ -669,12 +725,7 @@ void atmosphere_surface_preview(RenderProbe& probe, const std::filesystem::path&
         probe.render(cam, sim.snapshot(), settings, nullptr, true);
         probe.save_preview(output / (std::string(orbit ? "orbit" : "horizon")+"-surface.ppm"), true);
         settings.show_atmospheres = true;
-        settings.aerial_perspective_bruneton = false;
         probe.render(cam, sim.snapshot(), settings, nullptr, true);
-        probe.save_preview(output / (std::string(orbit ? "orbit" : "horizon")+"-atmosphere-frustum.ppm"), true);
-        settings.aerial_perspective_bruneton = true;
-        probe.render(cam, sim.snapshot(), settings, nullptr, true);
-        probe.save_preview(output / (std::string(orbit ? "orbit" : "horizon")+"-atmosphere-bruneton.ppm"), true);
         probe.save_preview(output / (std::string(orbit ? "orbit" : "horizon")+"-atmosphere.ppm"), true);
     }
     std::cout << "PASS: textured Earth orbital and horizon atmosphere previews exported.\n";
@@ -751,18 +802,15 @@ void physical_atmosphere_contracts(RenderProbe& probe) {
 
     settings.atmosphere_surface_lighting = true;
     settings.aerial_perspective_enabled = true;
-    for (bool bruneton : {false, true}) {
-        settings.aerial_perspective_bruneton = bruneton;
-        settings.atmosphere_dual_source = false;
-        probe.render(cam, sim.snapshot(), settings, nullptr, false, {.2f, .3f, .4f});
-        auto* mapped = static_cast<const uint16_t*>(probe.readback.mapped);
-        std::vector<uint16_t> compute(mapped, mapped+size_t(probe.extent.width)*probe.extent.height*4);
-        settings.atmosphere_dual_source = true;
-        probe.render(cam, sim.snapshot(), settings, nullptr, false, {.2f, .3f, .4f});
-        mapped = static_cast<const uint16_t*>(probe.readback.mapped);
-        for (size_t i = 0; i < compute.size(); ++i) check(std::abs(glm::unpackHalf2x16(mapped[i]).x-glm::unpackHalf2x16(compute[i]).x) < .001,
-            "Dual-source and compute transport agree over opaque surfaces, sky and RGB backgrounds");
-    }
+    settings.atmosphere_dual_source = false;
+    probe.render(cam, sim.snapshot(), settings, nullptr, false, {.2f, .3f, .4f});
+    auto* mapped = static_cast<const uint16_t*>(probe.readback.mapped);
+    std::vector<uint16_t> compute(mapped, mapped+size_t(probe.extent.width)*probe.extent.height*4);
+    settings.atmosphere_dual_source = true;
+    probe.render(cam, sim.snapshot(), settings, nullptr, false, {.2f, .3f, .4f});
+    mapped = static_cast<const uint16_t*>(probe.readback.mapped);
+    for (size_t i = 0; i < compute.size(); ++i) check(std::abs(glm::unpackHalf2x16(mapped[i]).x-glm::unpackHalf2x16(compute[i]).x) < .001,
+        "Dual-source and compute transport agree over opaque surfaces, sky and RGB backgrounds");
     loaded.definition.bodies[1].atmosphere.pressure_pa = 0;
     check(sim.replace_system(loaded).accepted, "Physical vacuum fixture");
     cam = camera_at((radius+1)*KM_TO_AU);
@@ -816,58 +864,52 @@ void particle_atmosphere_contracts(RenderProbe& probe) {
     camera.yaw_actual_deg = 90;
     camera.is_near_surface = true;
     rendering::RenderSettings settings;
-    for (bool bruneton : {false, true}) {
-        settings.aerial_perspective_bruneton = bruneton;
-        for (double path : {.1, 2.0, 20.0, 100.0, 200.0}) {
-            glm::dvec3 tau(0);
-            for (int i = 0; i < 16384; ++i) {
-                double height = 1+(i+.5)*path/16384;
-                double relative = std::exp(-radius*height/(radius+height)/physical->surface.scale_height_km);
-                tau += glm::dvec3(physical->rayleigh)*relative*(path/16384);
-            }
-            for (const auto& layer : physical->aerosols) {
-                double column;
-                if (layer.shape.z > 0) {
-                    double scale = std::sqrt(2.0)*layer.shape.z;
-                    column = layer.shape.z*std::sqrt(std::numbers::pi/2)*
-                        (std::erf((1+path-layer.shape.y)/scale)-std::erf((1-layer.shape.y)/scale));
-                } else column = layer.shape.x*(std::exp(-1/layer.shape.x)-std::exp(-(1+path)/layer.shape.x));
-                tau += glm::dvec3(layer.extinction)*column;
-            }
-            float depth = camera.compute_near_plane_au()/float(path*KM_TO_AU);
-            probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(1), true, depth);
-            auto actual = surface_center(probe);
-            for (int c = 0; c < 3; ++c) {
-                if (std::abs(actual[c]-std::exp(-tau[c])) >= .008)
-                    std::cerr << "Particle transport " << bruneton << " path " << path << " channel " << c << ": " << actual[c] << " vs " << std::exp(-tau[c]) << '\n';
-                check(std::abs(actual[c]-std::exp(-tau[c])) < .008,
-                    "Layered GPU extinction agrees with analytic exponential and Gaussian columns in both aerial models");
-            }
+    for (double path : {.1, 2.0, 20.0, 100.0, 200.0}) {
+        glm::dvec3 tau(0);
+        for (int i = 0; i < 16384; ++i) {
+            double height = 1+(i+.5)*path/16384;
+            double relative = std::exp(-radius*height/(radius+height)/physical->surface.scale_height_km);
+            tau += glm::dvec3(physical->rayleigh)*relative*(path/16384);
+        }
+        for (const auto& layer : physical->aerosols) {
+            double column;
+            if (layer.shape.z > 0) {
+                double scale = std::sqrt(2.0)*layer.shape.z;
+                column = layer.shape.z*std::sqrt(std::numbers::pi/2)*
+                    (std::erf((1+path-layer.shape.y)/scale)-std::erf((1-layer.shape.y)/scale));
+            } else column = layer.shape.x*(std::exp(-1/layer.shape.x)-std::exp(-(1+path)/layer.shape.x));
+            tau += glm::dvec3(layer.extinction)*column;
+        }
+        float depth = camera.compute_near_plane_au()/float(path*KM_TO_AU);
+        probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(1), true, depth);
+        auto actual = surface_center(probe);
+        for (int c = 0; c < 3; ++c) {
+            if (std::abs(actual[c]-std::exp(-tau[c])) >= .008)
+                std::cerr << "Particle transport " << " path " << path << " channel " << c << ": " << actual[c] << " vs " << std::exp(-tau[c]) << '\n';
+            check(std::abs(actual[c]-std::exp(-tau[c])) < .008,
+                "Layered GPU extinction agrees with analytic exponential and Gaussian columns in the horizon aerial model");
         }
     }
     loaded.definition.bodies[0].lum_eq = loaded.definition.bodies[0].lum_pole = 1;
     check(sim.replace_system(loaded).accepted, "Illuminated particle atmosphere fixture");
     camera.yaw_actual_deg = 0;
-    for (bool bruneton : {false, true}) {
-        settings.aerial_perspective_bruneton = bruneton;
-        settings.atmosphere_dual_source = false;
-        probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(.2f), true);
-        auto* mapped = static_cast<const uint16_t*>(probe.readback.mapped);
-        std::vector<uint16_t> compute(mapped, mapped+size_t(probe.extent.width)*probe.extent.height*4);
-        settings.atmosphere_dual_source = true;
-        probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(.2f), true);
-        mapped = static_cast<const uint16_t*>(probe.readback.mapped);
-        for (size_t i = 0; i < compute.size(); ++i) check(std::abs(glm::unpackHalf2x16(mapped[i]).x-glm::unpackHalf2x16(compute[i]).x) < .002,
-            "Layered phase transport agrees between compute and dual-source composition");
-        check(probe.renderer.atmosphere_stats().optical_lut_updates == 0, "Compositor changes reuse particle optics");
-    }
+    settings.atmosphere_dual_source = false;
+    probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(.2f), true);
+    auto* mapped = static_cast<const uint16_t*>(probe.readback.mapped);
+    std::vector<uint16_t> compute(mapped, mapped+size_t(probe.extent.width)*probe.extent.height*4);
+    settings.atmosphere_dual_source = true;
+    probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(.2f), true);
+    mapped = static_cast<const uint16_t*>(probe.readback.mapped);
+    for (size_t i = 0; i < compute.size(); ++i) check(std::abs(glm::unpackHalf2x16(mapped[i]).x-glm::unpackHalf2x16(compute[i]).x) < .002,
+        "Layered phase transport agrees between compute and dual-source composition");
+    check(probe.renderer.atmosphere_stats().optical_lut_updates == 0, "Compositor changes reuse particle optics");
     auto changed = sim.snapshot().body(1).definition.atmosphere;
     changed.aerosols[0].effective_radius_um = .8;
     check(sim.apply(ephemeris::ApplyBodyAtmosphere{sim.snapshot().generation(), 1,
         sim.snapshot().body(1).revisions.definition, changed}).changed, "Particle radius edit is applied atomically");
     probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(.2f), true);
-    check(probe.renderer.atmosphere_stats().optical_lut_updates == 1 && probe.renderer.atmosphere_stats().bruneton_lut_updates == 1,
-        "Particle phase edits invalidate optics and Bruneton transport");
+    check(probe.renderer.atmosphere_stats().optical_lut_updates == 1 && probe.renderer.atmosphere_stats().aerial_lut_updates == 1,
+        "Particle phase edits invalidate optics and Horizon transport");
     probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(.2f), true);
     check(probe.renderer.atmosphere_stats().optical_lut_updates == 0, "Unchanged particles reuse optical tables");
 }
@@ -944,28 +986,25 @@ void pressure_reference_atmosphere_contracts(RenderProbe& probe) {
     camera.yaw_actual_deg = 90;
     camera.is_near_surface = true;
     rendering::RenderSettings settings;
-    for (bool bruneton : {false, true}) {
-        settings.aerial_perspective_bruneton = bruneton;
-        for (double path : {1.0, 25.0, 120.0}) {
-            glm::dvec3 tau(0);
-            for (int i = 0; i < 32768; ++i) {
-                double height = -30+(i+.5)*path/32768;
-                auto gas = physics::sample_atmosphere(a, body.mass_msun, radius, height);
-                tau += glm::dvec3(physical->rayleigh)*(gas.number_density_m3/physical->surface.number_density_m3)*(path/32768);
-            }
-            const auto& particles = physical->aerosols[0];
-            double column = 10*std::sqrt(std::numbers::pi/2)*
-                (std::erf((-30+path+20)/(std::sqrt(2.0)*10))-std::erf((-30+20)/(std::sqrt(2.0)*10)));
-            tau += glm::dvec3(particles.extinction)*column;
-            float depth = camera.compute_near_plane_au()/float(path*KM_TO_AU);
-            probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(1), true, depth);
-            auto actual = surface_center(probe);
-            for (int c = 0; c < 3; ++c) {
-                if (std::abs(actual[c]-std::exp(-tau[c])) >= .012)
-                    std::cerr << "Pressure reference transport " << bruneton << " path " << path << " c " << c << ": " << actual[c] << " vs " << std::exp(-tau[c]) << '\n';
-                check(std::abs(actual[c]-std::exp(-tau[c])) < .012,
-                    "GPU molecular and cloud transmission below one bar matches independent signed-column integration");
-            }
+    for (double path : {1.0, 25.0, 120.0}) {
+        glm::dvec3 tau(0);
+        for (int i = 0; i < 32768; ++i) {
+            double height = -30+(i+.5)*path/32768;
+            auto gas = physics::sample_atmosphere(a, body.mass_msun, radius, height);
+            tau += glm::dvec3(physical->rayleigh)*(gas.number_density_m3/physical->surface.number_density_m3)*(path/32768);
+        }
+        const auto& particles = physical->aerosols[0];
+        double column = 10*std::sqrt(std::numbers::pi/2)*
+            (std::erf((-30+path+20)/(std::sqrt(2.0)*10))-std::erf((-30+20)/(std::sqrt(2.0)*10)));
+        tau += glm::dvec3(particles.extinction)*column;
+        float depth = camera.compute_near_plane_au()/float(path*KM_TO_AU);
+        probe.render(camera, sim.snapshot(), settings, nullptr, false, glm::vec3(1), true, depth);
+        auto actual = surface_center(probe);
+        for (int c = 0; c < 3; ++c) {
+            if (std::abs(actual[c]-std::exp(-tau[c])) >= .012)
+                std::cerr << "Pressure reference transport " << " path " << path << " c " << c << ": " << actual[c] << " vs " << std::exp(-tau[c]) << '\n';
+            check(std::abs(actual[c]-std::exp(-tau[c])) < .012,
+                "GPU molecular and cloud transmission below one bar matches independent signed-column integration");
         }
     }
     settings.terrain_enabled = true;

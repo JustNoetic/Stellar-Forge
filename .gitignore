@@ -30,6 +30,7 @@ tests/*
 !tests/surface_map_tests.py
 !tests/terrain_signed_fixture.json
 !tests/terrain_gpu_tests.hpp
+!tests/transparency_gpu_tests.hpp
 !tests/atmosphere_gpu_tests.hpp
 !tests/atmosphere_shadow_gpu_tests.hpp
 !tests/particle_optics_tests.hpp
@@ -44,5 +45,8 @@ tests/*
 !tests/star_calc_tests.cpp
 !tests/state_tests.cpp
 !shaders/tests/surface_depth.comp
+!shaders/tests/atmosphere_visibility.comp
+!shaders/tests/atmosphere_shadow_budget.comp
+!shaders/tests/atmosphere_shadow_vrs.comp
 !tests/fixtures/**
 __pycache__/

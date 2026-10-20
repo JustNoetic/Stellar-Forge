@@ -193,15 +193,18 @@ struct RenderProbe {
         uint32_t x0 = (extent.width - width) / 2;
         uint32_t y0 = (extent.height - height) / 2;
         file << "P6\n" << width << ' ' << height << "\n255\n";
-        auto* pixels = static_cast<const uint16_t*>(readback.mapped);
+        std::vector<uint16_t> pixels(size_t(extent.width)*extent.height*4);
+        std::memcpy(pixels.data(), readback.mapped, pixels.size()*sizeof(uint16_t));
+        std::vector<char> rgb(size_t(width)*height*3);
         for (uint32_t y = y0; y < y0 + height; ++y) {
             for (uint32_t x = x0; x < x0 + width; ++x) {
                 for (uint32_t c = 0; c < 3; ++c) {
                     float v = glm::unpackHalf2x16(pixels[4 * (static_cast<size_t>(y) * extent.width + x) + c]).x;
-                    file.put(static_cast<char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f));
+                    rgb[(size_t(y-y0)*width+(x-x0))*3+c] = static_cast<char>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
                 }
             }
         }
+        file.write(rgb.data(), static_cast<std::streamsize>(rgb.size()));
     }
 };
 
@@ -1025,11 +1028,87 @@ void ring_eclipse_candidate_filtering(RenderProbe& probe) {
 #include "transparency_gpu_tests.hpp"
 #include "atmosphere_shadow_gpu_tests.hpp"
 
+namespace {
+
+void atmosphere_endpoint_contracts(RenderProbe& probe) {
+    if (!probe.vk.fragment_stores_enabled()) {
+        std::cout << "SKIP: atmosphere endpoint contracts require fragment storage atomics.\n";
+        return;
+    }
+    probe.resize({257, 257});
+    TransparencyProbe transparent(probe);
+    auto loaded = fixture();
+    loaded.motions[0].position = render_to_ecliptic(RenderPosition{{1, 0, 1}});
+    ephemeris::BodyDefinition body;
+    body.name = "Atmosphere endpoint host";
+    body.radius_rsun = 6378.137/SOLAR_RADIUS_KM;
+    body.atmosphere.enabled = true;
+    loaded.definition.bodies.push_back(body);
+    loaded.motions.emplace_back();
+    ephemeris::Simulation simulation;
+    check(simulation.replace_system(loaded).accepted, "Atmosphere endpoint fixture");
+    rendering::RenderSettings settings;
+    settings.atmosphere_shadows_enabled = false;
+    auto camera = camera_at((6378.137+1.0)*KM_TO_AU);
+    camera.is_near_surface = true;
+    for (bool dual : {false, true}) {
+        settings.atmosphere_dual_source = dual;
+        settings.aerial_perspective_enabled = false;
+        camera.yaw_actual_deg = 90;
+        constexpr double distance = 10.0;
+        float depth = camera.compute_near_plane_au()/float(distance*KM_TO_AU);
+        const auto& a = body.atmosphere;
+        glm::dvec3 tau = glm::dvec3(a.rayleigh_scattering)*double(a.rayleigh_scale_height_km)*
+            std::exp(-1.0/a.rayleigh_scale_height_km)*(-std::expm1(-distance/a.rayleigh_scale_height_km))+
+            glm::dvec3(a.mie_extinction)*double(a.mie_scale_height_km)*
+            std::exp(-1.0/a.mie_scale_height_km)*(-std::expm1(-distance/a.mie_scale_height_km));
+        glm::vec3 expected = glm::exp(-tau);
+        probe.render(camera, simulation.snapshot(), settings, nullptr, false, glm::vec3(1), true, depth);
+        check(glm::length(surface_center(probe)-expected) < 0.003f,
+            "Disabling aerial inscattering preserves analytic finite RGB extinction in both blend modes");
+        probe.render(camera, simulation.snapshot(), settings, nullptr, false, glm::vec3(0), true, depth);
+        check(surface_center(probe) == glm::vec3(0), "Disabled aerial perspective adds no surface inscattering");
+        check(probe.renderer.atmosphere_stats().aerial_lut_updates == 0,
+            "Extinction without aerial perspective requires no aerial scattering bake");
+        for (float alpha : {0.25f, 1.0f}) {
+            TransparentTestLayer layer{glm::vec4(glm::vec3(1), alpha), {depth, 0, 0, 0}};
+            auto actual = transparent.render(camera, simulation.snapshot(), settings, {&layer, 1});
+            probe.render(camera, simulation.snapshot(), settings, nullptr, false, glm::vec3(0), true);
+            check(glm::length(actual-(alpha*expected+(1-alpha)*surface_center(probe))) < 0.003f,
+                "Transparent surfaces retain RGB extinction and opacity with aerial perspective disabled");
+        }
+        settings.aerial_perspective_enabled = true;
+        camera.yaw_actual_deg = 0;
+        depth = camera.compute_near_plane_au()/float(5000*KM_TO_AU);
+        glm::vec3 background(0.25f, 0.5f, 0.75f);
+        probe.render(camera, simulation.snapshot(), settings, nullptr, false, background, true);
+        auto sky = surface_center(probe);
+        probe.render(camera, simulation.snapshot(), settings, nullptr, false, background, true, depth);
+        check(glm::length(surface_center(probe)-sky) < 0.001f,
+            "Opaque objects beyond atmosphere exit receive the same complete column as the sky");
+        for (float alpha : {0.25f, 1.0f}) {
+            TransparentTestLayer layer{glm::vec4(background, alpha), {depth, 0, 0, 0}};
+            auto actual = transparent.render(camera, simulation.snapshot(), settings, {&layer, 1}, background);
+            check(glm::length(actual-sky) < 0.001f,
+                "A transparent surface beyond atmosphere exit cannot introduce a scattering brightness seam");
+        }
+    }
+    probe.resize(EXTENT);
+    std::cout << "Atmosphere endpoint contracts passed: independent extinction, complete-column continuity, opacity, horizon LUT and both blend paths.\n";
+}
+
+}
+
 int main(int argc, char** argv) {
     try {
         std::cout << std::unitbuf;
         RenderProbe probe;
+        if (argc == 2 && std::string_view(argv[1]) == "--atmosphere-endpoints-only") {
+            atmosphere_endpoint_contracts(probe);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--transparency-only") {
+            atmosphere_endpoint_contracts(probe);
             transparency_contracts(probe);
             return 0;
         }
@@ -1090,9 +1169,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--atmosphere-preview") {
             atmosphere_contracts(probe, argv[2]);
+            horizon_perspective_contracts(probe, argv[2]);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--atmospheres-only") {
+            atmosphere_endpoint_contracts(probe);
             atmosphere_shadow_contracts(probe);
             atmosphere_cache_order_contracts(probe);
             pressure_reference_atmosphere_contracts(probe);
@@ -1103,7 +1184,7 @@ int main(int argc, char** argv) {
             atmosphere_contracts(probe);
             atmosphere_floor_contracts(probe);
             aerial_perspective_contracts(probe);
-            bruneton_perspective_contracts(probe);
+            horizon_perspective_contracts(probe);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--atmosphere-cache-only") {
@@ -1112,6 +1193,10 @@ int main(int argc, char** argv) {
         }
         if (argc >= 2 && std::string_view(argv[1]) == "--atmosphere-shadows") {
             atmosphere_shadow_contracts(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--atmosphere-progressive-only") {
+            atmosphere_progressive_shadow_contracts(probe, argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
             return 0;
         }
         if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--atmosphere-shadow-benchmark") {
@@ -1134,6 +1219,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--atmosphere-aerial-only") {
             aerial_perspective_contracts(probe);
+            horizon_perspective_contracts(probe);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--ringshine-only") {

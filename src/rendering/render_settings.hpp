@@ -32,12 +32,13 @@ struct RenderSettings {
     bool transparency_reference_legacy = false;
     bool show_atmospheres = true;
     bool aerial_perspective_enabled = true;
-    bool aerial_perspective_bruneton = true;
     bool atmosphere_dual_source = false;
     bool atmosphere_surface_lighting = true;
     bool atmosphere_shadows_enabled = true;
     bool atmosphere_shadow_reference = false;
     bool atmosphere_shadow_temporal = true;
+    bool atmosphere_shadow_adaptive = true;
+    bool atmosphere_shadow_vrs = true;
     uint32_t atmosphere_shadow_noise_type = 0;
     uint32_t atmosphere_shadow_samples = 16;
     bool ring_shadows_enabled = true;

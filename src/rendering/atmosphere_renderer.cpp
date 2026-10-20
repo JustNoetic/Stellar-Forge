@@ -11,16 +11,16 @@
 
 namespace sf::rendering {
 
-static_assert(sizeof(AtmosphereParametersGPU) == 13344);
+static_assert(sizeof(AtmosphereParametersGPU) == 13328);
 static_assert(sizeof(AtmosphereParametersGPU) <= 16384);
-static_assert(sizeof(AtmosphereShadowHeaderGPU) == 640);
+static_assert(sizeof(AtmosphereShadowHeaderGPU) == 560);
 static_assert(sizeof(AtmosphereShadowCasterGPU) == 48);
 
 static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::SystemSnapshot& system,
                             uint32_t receiver, glm::dvec3 eye, float outer, float focal,
                             const RenderSettings& settings, std::span<const RingHostGPU> rings,
                             AtmosphereShadowHeaderGPU& previous, std::vector<AtmosphereShadowCasterGPU>& previous_casters,
-                            uint32_t sequence) {
+                            uint32_t sequence, bool& unchanged) {
     AtmosphereShadowHeaderGPU header;
     const auto origin = system.body(receiver).render.position.value;
     header.eye_focal = {glm::vec3((eye-origin)*AU_TO_KM), focal};
@@ -28,7 +28,7 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
                     settings.eclipse_reference_smoothstep ? 1u : 0u, settings.atmosphere_shadow_reference ? 1u : 0u};
     uint32_t effective_sequence = (settings.atmosphere_shadow_temporal && !settings.atmosphere_shadow_reference) ? sequence : 0u;
     header.temporal = {effective_sequence, settings.atmosphere_shadow_noise_type,
-                       settings.atmosphere_shadow_samples, 0u};
+                       settings.atmosphere_shadow_samples, settings.atmosphere_shadow_adaptive ? 1u : 0u};
     std::vector<AtmosphereShadowCasterGPU> casters;
     uint32_t star_index = 0;
     for (uint32_t s = 0; s < system.size() && star_index < header.stars.size(); ++s) {
@@ -78,7 +78,6 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
         }
         range.w = uint32_t(casters.size())-range.z;
     }
-    header.history = glm::vec4(1.0f);
     VkDeviceSize bytes = sizeof(header)+casters.size()*sizeof(AtmosphereShadowCasterGPU);
     if (buffer.size < bytes) {
         VkDeviceSize capacity = std::max(bytes, buffer.size*2);
@@ -88,6 +87,11 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
     std::memcpy(buffer.mapped, &header, sizeof(header));
     if (!casters.empty()) std::memcpy(static_cast<std::byte*>(buffer.mapped)+sizeof(header), casters.data(), bytes-sizeof(header));
     ctx.flush_buffer(buffer, 0, bytes);
+    auto previous_key = previous;
+    previous_key.temporal.x = header.temporal.x;
+    unchanged = std::memcmp(&previous_key, &header, sizeof(header)) == 0 &&
+        previous_casters.size() == casters.size() && (casters.empty() ||
+        std::memcmp(previous_casters.data(), casters.data(), casters.size()*sizeof(AtmosphereShadowCasterGPU)) == 0);
     previous = header;
     previous_casters = std::move(casters);
     return !previous_casters.empty();
@@ -110,15 +114,16 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage}, {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
-        {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage},
+        {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage},
         {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {20, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}};
     transmittance_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/transmittance.comp", trans);
     multiscatter_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/multiscatter.comp", multi);
     sky_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/sky_view.comp", sky);
-    aerial_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/aerial_perspective.comp", sky);
-    bruneton_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/scattering.comp", sky);
+    std::vector<rhi::DescriptorLayoutBinding> aerial(std::begin(sky), std::end(sky));
+    aerial.push_back({5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    aerial_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/aerial_perspective.comp", aerial);
     composite_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/composite.comp", composite);
     const rhi::DescriptorLayoutBinding shadow[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
@@ -131,6 +136,21 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     shadow_transparency.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_transparency.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
     shadow_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_transparency.comp", shadow_transparency);
+    auto accumulate = std::vector<rhi::DescriptorLayoutBinding>(std::begin(shadow), std::end(shadow));
+    accumulate.push_back({23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    accumulate.push_back({24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    shadow_accumulate_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate.comp", accumulate, sizeof(uint32_t));
+    accumulate.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    accumulate.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_accumulate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate_transparency.comp", accumulate, sizeof(uint32_t));
+    shadow_coarse_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow);
+    std::vector<rhi::DescriptorLayoutBinding> shadow_vrs(std::begin(shadow), std::end(shadow));
+    shadow_vrs.push_back({21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
+    shadow_vrs.push_back({22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
+    shadow_vrs_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", shadow_vrs);
+    shadow_vrs.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    shadow_vrs.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_vrs_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs);
     std::vector<rhi::DescriptorLayoutBinding> transparent_bindings(std::begin(composite), std::end(composite));
     transparent_bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     transparent_bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
@@ -186,12 +206,13 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
         ctx.destroy_image(t->throughput);
         ctx.destroy_image(t->aerial_radiance);
         ctx.destroy_image(t->aerial_optical_depth);
-        ctx.destroy_image(t->bruneton_rayleigh);
-        ctx.destroy_image(t->bruneton_mie);
+        ctx.destroy_image(t->aerial_range);
         for (auto& u : t->uniforms) ctx.destroy_buffer(u);
         for (auto& shadow : t->shadows) ctx.destroy_buffer(shadow);
         ctx.destroy_image(t->shadow_fraction);
         ctx.destroy_image(t->shadow_depth);
+        ctx.destroy_image(t->shadow_energy);
+        ctx.destroy_image(t->shadow_loss);
     }
     tables_.clear();
     active_.clear();
@@ -200,7 +221,6 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, multiscatter_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sky_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, aerial_pipeline_);
-    rhi::ShaderCache::destroy_pipeline(ctx, bruneton_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, transparent_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, composite_transparency_pipeline_);
@@ -208,6 +228,13 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, surface_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_transparency_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_accumulate_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_accumulate_transparency_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_coarse_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_transparency_pipeline_);
+    ctx.destroy_image(shadow_coarse_fraction_);
+    ctx.destroy_image(shadow_coarse_guide_);
     for (auto& retired : retired_shadows_) ctx.destroy_image(retired.image);
     retired_shadows_.clear();
     ctx.destroy_image(surface_lut_);
@@ -219,8 +246,9 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
 void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                                  const ephemeris::SystemSnapshot& system, const RenderSettings& settings, VkExtent2D extent,
                                  std::span<const float> minimum_heights_km, std::span<const RingHostGPU> rings,
-                                 const rhi::Image* ring_shadow_lut) {
+                                 const rhi::Image* ring_shadow_lut, uint64_t ring_shadow_revision) {
     active_.clear();
+    ++prepare_serial_;
     std::erase_if(retired_shadows_, [&](auto& entry) {
         if (entry.serial > ctx.completed_serial()) return false;
         ctx.destroy_image(entry.image);
@@ -228,11 +256,22 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
     });
     ring_shadow_lut_ = ring_shadow_lut ? ring_shadow_lut : &surface_lut_;
     stats_ = {};
+    shadow_vrs_enabled_ = settings.atmosphere_shadow_vrs;
+    shadow_temporal_enabled_ = settings.atmosphere_shadow_temporal && !settings.atmosphere_shadow_reference;
     dual_source_ = settings.atmosphere_dual_source && bool(dual_source_pipeline_);
     auto& records = surface_records_[ctx.frame_index()];
     std::memset(records.mapped, 0, 1024*sizeof(glm::vec4));
     ctx.flush_buffer(records);
-    if (!settings.show_atmospheres || system.empty()) return;
+    if (!settings.show_atmospheres || system.empty()) {
+        for (auto& table : tables_) {
+            for (auto* image : {&table->shadow_fraction, &table->shadow_depth, &table->shadow_energy, &table->shadow_loss}) {
+                if (*image) retired_shadows_.push_back({*image, ctx.recording_serial()});
+                *image = {};
+            }
+            table->shadow_history_valid = false;
+        }
+        return;
+    }
     struct Candidate { uint32_t index; double distance; };
     std::vector<Candidate> candidates;
     double tan_y = std::tan(camera.fov_deg*DEG_TO_RAD*0.5);
@@ -260,7 +299,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
     std::sort(candidates.begin(), candidates.end(), [](auto a, auto b) { return a.distance > b.distance; });
     constexpr size_t retained_budget = 256 * 1024 * 1024;
     constexpr size_t table_bytes = 256*64*16 + 32*32*8 + 2*192*108*8 +
-        2*64*36*64*8 + 2*256*128*32*8 + sizeof(AtmosphereParametersGPU)*rhi::FRAMES_IN_FLIGHT;
+        2*192*108*64*8 + 192*108*4 + sizeof(AtmosphereParametersGPU)*rhi::FRAMES_IN_FLIGHT;
     const size_t capacity = std::max(candidates.size(), retained_budget/table_bytes);
     const auto definition = system.share_definition();
     std::vector<size_t> slots(candidates.size(), SIZE_MAX);
@@ -296,7 +335,6 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             reserved[slot] = true;
         }
     }
-    ++prepare_serial_;
     std::vector<size_t> surface_slots(candidates.size(), SIZE_MAX);
     std::array<bool, 32> surface_reserved{};
     for (size_t i = 0; i < candidates.size() && i < surface_layers_.size(); ++i) {
@@ -340,18 +378,14 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             t->multiscatter = image(32, 32);
             t->sky = image(192, 108);
             t->throughput = image(192, 108);
-            t->aerial_radiance = ctx.create_image_3d(64, 36, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
+            t->aerial_radiance = ctx.create_image_3d(192, 108, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
-            t->aerial_optical_depth = ctx.create_image_3d(64, 36, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
+            t->aerial_optical_depth = ctx.create_image_3d(192, 108, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
-            t->bruneton_rayleigh = ctx.create_image_3d(256, 128, 32, VK_FORMAT_R16G16B16A16_SFLOAT,
-                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
-            t->bruneton_mie = ctx.create_image_3d(256, 128, 32, VK_FORMAT_R16G16B16A16_SFLOAT,
-                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+            t->aerial_range = image(192, 108, VK_FORMAT_R32_SFLOAT);
             readable(t->aerial_radiance);
             readable(t->aerial_optical_depth);
-            readable(t->bruneton_rayleigh);
-            readable(t->bruneton_mie);
+            readable(t->aerial_range);
             for (auto& u : t->uniforms) u = ctx.create_host_buffer(sizeof(AtmosphereParametersGPU), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
             for (auto& shadow : t->shadows) shadow = ctx.create_host_buffer(sizeof(AtmosphereShadowHeaderGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             tables_.push_back(std::move(t));
@@ -414,7 +448,8 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             if (d < 1e-12) continue;
             glm::dvec3 direction = glm::normalize(atmosphere_space(delta/d));
             uint32_t index = static_cast<uint32_t>(p.camera.w++);
-            p.sun_direction[index] = {glm::vec3(glm::dot(direction, x), glm::dot(direction, y), glm::dot(direction, z)), 0.0f};
+            p.sun_direction[index] = {glm::vec3(glm::dot(direction, x), glm::dot(direction, y), glm::dot(direction, z)),
+                float(std::asin(std::clamp(star.opaque_radius_au()/d, 1e-7, 1.0)))};
             float irradiance = settings.hdr_enabled ? static_cast<float>(std::max(star.definition.lum_eq, 0.0)/(d*d)) : 1.0f;
             p.sun_irradiance[index] = {star.definition.color_rgb*(irradiance*static_cast<float>(PI)), 0.0f};
         }
@@ -422,16 +457,21 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         p.inverse_view_projection = glm::inverse(view_projection);
         p.depth_params.x = settings.hdr_enabled ? settings.exposure : 1.0f;
         p.depth_params.y = settings.aerial_perspective_enabled ? 1.0f : 0.0f;
-        p.depth_params.z = (settings.aerial_perspective_enabled && settings.aerial_perspective_bruneton) ? 1.0f : 0.0f;
-        p.aerial_params.x = std::asinh(2.0f*std::sqrt(std::max(0.0f, (p.radii_heights.y-bottom)*(p.radii_heights.y+bottom))));
+        bool shadows_unchanged = false;
         t.shadow_active = prepare_shadows(ctx, t.shadows[ctx.frame_index()], system, candidate.index, eye, radius+height,
                         float(focal), settings, ring_shadow_lut ? rings : std::span<const RingHostGPU>{},
-                        t.shadow_header, t.shadow_casters, uint32_t(prepare_serial_));
+                        t.shadow_header, t.shadow_casters, uint32_t(prepare_serial_), shadows_unchanged);
         auto& uniform = t.uniforms[ctx.frame_index()];
         std::memcpy(uniform.mapped, &p, sizeof(p));
         ctx.flush_buffer(uniform);
         bool identity_dirty = t.definition != system.share_definition() || t.generation != system.generation() ||
             t.body_index != candidate.index || t.geometry_revision != b.revisions.geometry || t.lighting_revision != b.revisions.lighting;
+        t.shadow_history_reusable = shadow_temporal_enabled_ && t.shadow_history_valid && !identity_dirty &&
+            t.shadow_recorded_prepare+1 == prepare_serial_ && shadows_unchanged &&
+            std::memcmp(&p, &t.cached, sizeof(p)) == 0 &&
+            t.shadow_ring_revision == ring_shadow_revision && t.shadow_ring_image == ring_shadow_lut_->handle;
+        t.shadow_ring_revision = ring_shadow_revision;
+        t.shadow_ring_image = ring_shadow_lut_->handle;
         bool optics_dirty = !t.valid || identity_dirty || p.reference_shape != t.cached.reference_shape || p.radii_heights != t.cached.radii_heights || p.rayleigh != t.cached.rayleigh ||
             p.mie_scattering != t.cached.mie_scattering || p.mie_extinction != t.cached.mie_extinction || p.ground_albedo != t.cached.ground_albedo ||
             p.mixed_absorption != t.cached.mixed_absorption || p.ozone_absorption != t.cached.ozone_absorption ||
@@ -440,11 +480,8 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             p.aerosol_scattering != t.cached.aerosol_scattering || p.aerosol_extinction != t.cached.aerosol_extinction ||
             p.aerosol_phase != t.cached.aerosol_phase;
         bool sky_dirty = optics_dirty || p.camera != t.cached.camera || p.sun_direction != t.cached.sun_direction || p.sun_irradiance != t.cached.sun_irradiance;
-        bool aerial_dirty = !t.aerial_valid || sky_dirty || p.inverse_view_projection != t.cached.inverse_view_projection ||
-            p.axis_x != t.cached.axis_x || p.axis_y != t.cached.axis_y || p.axis_z != t.cached.axis_z || p.world_pole != t.cached.world_pole;
-        bool bruneton_dirty = !t.bruneton_valid || optics_dirty;
+        bool aerial_dirty = !t.aerial_valid || sky_dirty;
         if (aerial_dirty) t.aerial_valid = false;
-        if (bruneton_dirty) t.bruneton_valid = false;
         auto ubo = rhi::PushDescriptorWrite::uniform_buffer(0, uniform);
         auto sampler = ctx.sampler_linear_clamp();
         if (optics_dirty) {
@@ -494,37 +531,24 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             ctx.end_gpu_timer(cmd, sky_timer);
             ++stats_.sky_lut_updates;
         }
-        if (settings.aerial_perspective_enabled && !settings.aerial_perspective_bruneton && aerial_dirty) {
+        if (settings.aerial_perspective_enabled && aerial_dirty) {
             uint32_t aerial_timer = ctx.begin_gpu_timer(cmd, "atmosphere_aerial");
             writable(t.aerial_radiance);
             writable(t.aerial_optical_depth);
+            writable(t.aerial_range);
             rhi::PushDescriptorWrite writes[] = {ubo,
                 rhi::PushDescriptorWrite::sampled_image(1, t.transmittance, sampler),
                 rhi::PushDescriptorWrite::sampled_image(2, t.multiscatter, sampler),
                 rhi::PushDescriptorWrite::storage_image(3, t.aerial_radiance),
-                rhi::PushDescriptorWrite::storage_image(4, t.aerial_optical_depth)};
-            bake(aerial_pipeline_, writes, 8, 9, 1);
+                rhi::PushDescriptorWrite::storage_image(4, t.aerial_optical_depth),
+                rhi::PushDescriptorWrite::storage_image(5, t.aerial_range)};
+            bake(aerial_pipeline_, writes, 24, 27);
             readable(t.aerial_radiance);
             readable(t.aerial_optical_depth);
+            readable(t.aerial_range);
             ctx.end_gpu_timer(cmd, aerial_timer);
             ++stats_.aerial_lut_updates;
             t.aerial_valid = true;
-        }
-        if (settings.aerial_perspective_enabled && settings.aerial_perspective_bruneton && bruneton_dirty) {
-            uint32_t bruneton_timer = ctx.begin_gpu_timer(cmd, "atmosphere_aerial");
-            writable(t.bruneton_rayleigh);
-            writable(t.bruneton_mie);
-            rhi::PushDescriptorWrite writes[] = {ubo,
-                rhi::PushDescriptorWrite::sampled_image(1, t.transmittance, sampler),
-                rhi::PushDescriptorWrite::sampled_image(2, t.multiscatter, sampler),
-                rhi::PushDescriptorWrite::storage_image(3, t.bruneton_rayleigh),
-                rhi::PushDescriptorWrite::storage_image(4, t.bruneton_mie)};
-            bake(bruneton_pipeline_, writes, 32, 16, 8);
-            readable(t.bruneton_rayleigh);
-            readable(t.bruneton_mie);
-            ctx.end_gpu_timer(cmd, bruneton_timer);
-            ++stats_.bruneton_lut_updates;
-            t.bruneton_valid = true;
         }
         t.cached = p;
         t.definition = system.share_definition();
@@ -539,10 +563,11 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
     ctx.end_gpu_timer(cmd, timer);
     for (auto& table : tables_) {
         if (table->last_used == prepare_serial_ && table->shadow_active) continue;
-        if (table->shadow_fraction) retired_shadows_.push_back({table->shadow_fraction, ctx.recording_serial()});
-        table->shadow_fraction = {};
-        if (table->shadow_depth) retired_shadows_.push_back({table->shadow_depth, ctx.recording_serial()});
-        table->shadow_depth = {};
+        for (auto* image : {&table->shadow_fraction, &table->shadow_depth, &table->shadow_energy, &table->shadow_loss}) {
+            if (*image) retired_shadows_.push_back({*image, ctx.recording_serial()});
+            *image = {};
+        }
+        table->shadow_history_valid = false;
     }
     ctx.flush_buffer(records);
     stats_.visible = static_cast<uint32_t>(active_.size());
@@ -565,15 +590,30 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 1, 2);
                 ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
+            t->shadow_history_reusable = false;
         }
-        auto& header = t->shadow_header;
-        header.history.y = 1.0f;
-        header.history.z = 1.0f;
-        std::memcpy(t->shadows[ctx.frame_index()].mapped, &header, sizeof(header));
-        ctx.flush_buffer(t->shadows[ctx.frame_index()], 0, sizeof(header));
+        const auto& header = t->shadow_header;
+        bool temporal = shadow_temporal_enabled_;
+        for (auto* image : {&t->shadow_energy, &t->shadow_loss}) {
+            bool resize = image->extent.width != color.extent.width || image->extent.height != color.extent.height;
+            if (*image && (!temporal || resize)) {
+                retired_shadows_.push_back({*image, ctx.recording_serial()});
+                *image = {};
+            }
+            if (temporal && !*image) {
+                *image = ctx.create_image_2d(color.extent.width, color.extent.height, VK_FORMAT_R32G32B32A32_SFLOAT,
+                    VK_IMAGE_USAGE_STORAGE_BIT, 1, 2);
+                t->shadow_history_reusable = false;
+                ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_GENERAL);
+            }
+        }
+        bool vrs = !temporal && shadow_vrs_enabled_ && header.flags.w == 0u && t->cached.camera.w == 1.0f &&
+                   color.extent.width >= 64 && color.extent.height >= 64;
         ctx.transition_image(cmd, t->shadow_fraction, VK_IMAGE_LAYOUT_GENERAL);
         ctx.transition_image(cmd, t->shadow_depth, VK_IMAGE_LAYOUT_GENERAL);
-        auto& pipeline = transparency_writes.empty() ? shadow_pipeline_ : shadow_transparency_pipeline_;
+        auto& pipeline = temporal ? (transparency_writes.empty() ? shadow_accumulate_pipeline_ : shadow_accumulate_transparency_pipeline_)
+                             : vrs ? (transparency_writes.empty() ? shadow_vrs_pipeline_ : shadow_vrs_transparency_pipeline_)
+                             : (transparency_writes.empty() ? shadow_pipeline_ : shadow_transparency_pipeline_);
         auto& stbn = stbn_tex_ ? stbn_tex_ : dummy_stbn_;
         std::vector<rhi::PushDescriptorWrite> writes{
             rhi::PushDescriptorWrite::uniform_buffer(0, t->uniforms[ctx.frame_index()]),
@@ -585,16 +625,58 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             rhi::PushDescriptorWrite::storage_image(18, t->shadow_fraction),
             rhi::PushDescriptorWrite::storage_image(19, t->shadow_depth),
             rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
-        writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
         uint32_t shadow_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadows");
+        if (temporal) {
+            ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            writes.push_back(rhi::PushDescriptorWrite::storage_image(23, t->shadow_energy));
+            writes.push_back(rhi::PushDescriptorWrite::storage_image(24, t->shadow_loss));
+            ctx.push_constants(cmd, pipeline, uint32_t(t->shadow_history_reusable));
+            if (!t->shadow_history_reusable) ++stats_.shadow_history_resets;
+        }
+        if (vrs) {
+            uint32_t width = (color.extent.width+1)/2, height = (color.extent.height+1)/2;
+            if (shadow_coarse_fraction_.extent.width != width || shadow_coarse_fraction_.extent.height != height) {
+                for (auto* image : {&shadow_coarse_fraction_, &shadow_coarse_guide_}) {
+                    if (*image) retired_shadows_.push_back({*image, ctx.recording_serial()});
+                    *image = ctx.create_image_2d(width, height,
+                        image == &shadow_coarse_fraction_ ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                }
+            }
+            ctx.transition_image(cmd, shadow_coarse_fraction_, VK_IMAGE_LAYOUT_GENERAL);
+            ctx.transition_image(cmd, shadow_coarse_guide_, VK_IMAGE_LAYOUT_GENERAL);
+            auto coarse_writes = writes;
+            std::erase_if(coarse_writes, [](auto write) { return write.binding == 18 || write.binding == 19; });
+            coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(18, shadow_coarse_fraction_));
+            coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(19, shadow_coarse_guide_));
+            uint32_t coarse_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_coarse");
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadow_coarse_pipeline_.handle);
+            ctx.push_descriptors(cmd, shadow_coarse_pipeline_, coarse_writes);
+            vkCmdDispatch(cmd, (width+7)/8, (height+7)/8, 1);
+            ctx.end_gpu_timer(cmd, coarse_timer);
+            for (auto* image : {&shadow_coarse_fraction_, &shadow_coarse_guide_})
+                ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            writes.push_back(rhi::PushDescriptorWrite::sampled_image(21, shadow_coarse_fraction_, ctx.sampler_nearest_clamp()));
+            writes.push_back(rhi::PushDescriptorWrite::sampled_image(22, shadow_coarse_guide_, ctx.sampler_nearest_clamp()));
+            ++stats_.shadow_vrs_updates;
+        }
+        writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
+        uint32_t resolve_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_resolve");
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
         ctx.push_descriptors(cmd, pipeline, writes);
         vkCmdDispatch(cmd, (color.extent.width+7)/8, (color.extent.height+7)/8, 1);
+        ctx.end_gpu_timer(cmd, resolve_timer);
         for (auto* image : {&t->shadow_fraction, &t->shadow_depth})
             ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         ctx.end_gpu_timer(cmd, shadow_timer);
+        t->shadow_history_valid = temporal;
+        t->shadow_recorded_prepare = prepare_serial_;
         ++stats_.shadow_updates;
     }
     if (dual_source_ && !transparency_writes.empty()) {
@@ -609,8 +691,7 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 rhi::PushDescriptorWrite::sampled_image(6, t->aerial_optical_depth, ctx.sampler_linear_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(7, t->transmittance, ctx.sampler_linear_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(8, t->multiscatter, ctx.sampler_linear_clamp()),
-                rhi::PushDescriptorWrite::sampled_image(9, t->bruneton_rayleigh, ctx.sampler_linear_clamp()),
-                rhi::PushDescriptorWrite::sampled_image(10, t->bruneton_mie, ctx.sampler_linear_clamp()),
+                rhi::PushDescriptorWrite::sampled_image(9, t->aerial_range, ctx.sampler_linear_clamp()),
                 rhi::PushDescriptorWrite::storage_buffer(11, t->shadows[ctx.frame_index()]),
                 rhi::PushDescriptorWrite::sampled_image(12, *ring_shadow_lut_, ctx.sampler_linear_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(16, t->shadow_active ? t->shadow_fraction : surface_lut_, ctx.sampler_nearest_clamp()),
@@ -641,8 +722,7 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             rhi::PushDescriptorWrite::sampled_image(6, t->aerial_optical_depth, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(7, t->transmittance, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(8, t->multiscatter, ctx.sampler_linear_clamp()),
-            rhi::PushDescriptorWrite::sampled_image(9, t->bruneton_rayleigh, ctx.sampler_linear_clamp()),
-            rhi::PushDescriptorWrite::sampled_image(10, t->bruneton_mie, ctx.sampler_linear_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(9, t->aerial_range, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::storage_buffer(11, t->shadows[ctx.frame_index()]),
             rhi::PushDescriptorWrite::sampled_image(12, *ring_shadow_lut_, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(16, t->shadow_active ? t->shadow_fraction : surface_lut_, ctx.sampler_nearest_clamp()),

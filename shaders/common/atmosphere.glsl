@@ -2,12 +2,7 @@ const float ATM_PI = 3.141592653589793;
 const ivec2 TRANSMITTANCE_SIZE = ivec2(256, 64);
 const ivec2 MULTISCATTER_SIZE = ivec2(32);
 const ivec2 SKY_SIZE = ivec2(192, 108);
-const ivec3 AERIAL_SIZE = ivec3(64, 36, 64);
-const ivec3 SCATTERING_SIZE = ivec3(256, 128, 32);
-const int SCATTERING_NU_SIZE = 8;
-const int SCATTERING_MU_S_SIZE = 32;
-const int SCATTERING_MU_SIZE = 128;
-const int SCATTERING_R_SIZE = 32;
+const ivec3 AERIAL_SIZE = ivec3(192, 108, 64);
 
 layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 radii_heights;
@@ -25,7 +20,6 @@ layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 sun_irradiance[16];
     mat4 inverse_view_projection;
     vec4 depth_params;
-    vec4 aerial_params;
     vec4 mixed_absorption;
     vec4 ozone_absorption;
     vec4 ozone_params;
@@ -102,20 +96,8 @@ vec3 view_direction(vec2 ndc) {
     return atmosphere_direction(world.xyz/world.w);
 }
 
-float aerial_focus(vec3 d, vec2 segment) {
-    float altitude = clamp((atm.camera.z-atm.reference_shape.x)/(top_radius()-atm.reference_shape.x), 0.0, 1.0);
-    return max(0.0, min(-dot(atm.camera.xyz, d), segment.y)-segment.x)*altitude*altitude;
-}
-
-float aerial_distance(float fraction, float focus) {
-    float slice = fraction*float(AERIAL_SIZE.z-1);
-    float coordinate = slice <= 31.0 ? slice/31.0-1.0 : (slice-31.0)/32.0;
-    return max(0.0, focus+sinh(coordinate*atm.aerial_params.x));
-}
-
-float aerial_coordinate(float distance, float focus) {
-    float coordinate = asinh(max(distance, 0.0)-focus)/atm.aerial_params.x;
-    return clamp((31.0+(coordinate <= 0.0 ? coordinate*31.0 : coordinate*32.0))/float(AERIAL_SIZE.z-1), 0.0, 1.0);
+float aerial_distance(float fraction, float range) {
+    return range*(atm.camera.z < top_radius() ? fraction*fraction : fraction);
 }
 
 vec3 segment_integral(vec3 extinction, float dt) {
@@ -145,23 +127,25 @@ void transmittance_ray(vec2 uv, out vec3 p, out vec3 d) {
     d = vec3(sqrt(max(1.0-mu*mu, 0.0)), 0.0, mu);
 }
 
-float sun_visibility(vec3 p, vec3 sun) {
-    vec2 ground = sphere_roots(p, sun, bottom_radius());
-    if (ground.x > 0.0) return 0.0;
+float sun_visibility(vec3 p, vec3 sun, float angular_radius) {
     float r = length(p);
     float shadow_radius = min(atm.reference_shape.z > 0.0 ? atm.reference_shape.z : atm.reference_shape.x, r);
-    float sin_horiz_sq = max(1.0 - (shadow_radius * shadow_radius) / (r * r), 0.0);
+    float sin_horiz_sq = max((r-shadow_radius)*(r+shadow_radius)/(r*r), 0.0);
     float mu_horiz = -sqrt(sin_horiz_sq);
     float mu = dot(p, sun) / r;
-    float delta = (mu - mu_horiz) / max(sqrt(sin_horiz_sq), 0.01);
-    return smoothstep(-0.005, 0.005, delta);
+    float width = max(shadow_radius/r*angular_radius, 1e-7);
+    return smoothstep(-width, width, mu-mu_horiz);
 }
 
-vec3 sun_transmittance(sampler2D lut, vec3 p, vec3 sun) {
-    float vis = sun_visibility(p, sun);
+vec3 sun_transmittance(sampler2D lut, vec3 p, vec3 sun, float angular_radius) {
+    float vis = sun_visibility(p, sun, angular_radius);
     if (vis <= 0.0) return vec3(0.0);
     float r = length(p);
     return vis * exp(-textureLod(lut, transmittance_uv(r, dot(p, sun)/r), 0.0).rgb);
+}
+
+vec3 sun_transmittance(sampler2D lut, vec3 p, vec3 sun) {
+    return sun_transmittance(lut, p, sun, 0.01);
 }
 
 vec2 multiscatter_uv(vec3 p, vec3 sun) {
@@ -211,10 +195,6 @@ vec3 particle_phase(int layer, float mu) {
     float mu_a = cos(ATM_PI*a*a), mu_b = cos(ATM_PI*b*b);
     float blend = clamp((mu_a-mu)/max(mu_a-mu_b, 1e-8), 0.0, 1.0);
     return mix(atm.aerosol_phase[layer*128+i].rgb, atm.aerosol_phase[layer*128+i+1].rgb, blend);
-}
-
-vec3 aerosol_reference_phase(float mu) {
-    return atm.aerosol_count.x > 0.0 ? max(particle_phase(0, mu), vec3(1e-8)) : vec3(mie_phase(mu));
 }
 
 vec3 aerosol_source(vec3 p, float mu) {
@@ -269,80 +249,7 @@ vec2 sky_uv(vec3 direction) {
     return vec2((0.5+x*float(SKY_SIZE.x-1))/float(SKY_SIZE.x), y/float(SKY_SIZE.y));
 }
 
-void bruneton_unpack(float u_r, float u_mu, float u_mus, float u_nu, bool hits_ground,
-                     out float r, out float mu, out float mu_s, out float nu) {
-    float H = sqrt(max((top_radius() - bottom_radius()) * (top_radius() + bottom_radius()), 0.0));
-    float rho = H * u_r;
-    r = sqrt(rho * rho + bottom_radius() * bottom_radius());
-
-    if (hits_ground) {
-        float x = clamp(u_mu * 2.0, 0.0, 1.0);
-        float d = (r - bottom_radius()) + x * (rho - (r - bottom_radius()));
-        mu = d < 1e-5 ? -1.0 : clamp((bottom_radius() * bottom_radius() - r * r - d * d) / (2.0 * r * d), -1.0, 1.0);
-    } else {
-        float x = clamp((u_mu - 0.5) * 2.0, 0.0, 1.0);
-        float d = (top_radius() - r) + x * (rho + H - (top_radius() - r));
-        mu = d < 1e-5 ? 1.0 : clamp((top_radius() * top_radius() - r * r - d * d) / (2.0 * r * d), -1.0, 1.0);
-    }
-
-    float mu_s_min = -sqrt(max(1.0 - (bottom_radius() * bottom_radius()) / (top_radius() * top_radius()), 0.0));
-    mu_s = mu_s_min + u_mus * (1.0 - mu_s_min);
-    mu_s = clamp(mu_s, -1.0, 1.0);
-
-    float sin_mu = sqrt(max(1.0 - mu * mu, 0.0));
-    float sin_s = sqrt(max(1.0 - mu_s * mu_s, 0.0));
-    float nu_min = mu * mu_s - sin_mu * sin_s;
-    float nu_max = mu * mu_s + sin_mu * sin_s;
-    nu = clamp(nu_min + u_nu * (nu_max - nu_min), -1.0, 1.0);
-}
-
-void bruneton_coords(float r, float mu, float mu_s, float nu, bool hits_ground,
-                     out vec3 uvw0, out vec3 uvw1, out float f_nu) {
-    float H = sqrt(max((top_radius() - bottom_radius()) * (top_radius() + bottom_radius()), 0.0));
-    float rho = sqrt(max(r * r - bottom_radius() * bottom_radius(), 0.0));
-    float u_r = clamp(rho / max(H, 1e-6), 0.0, 1.0);
-    float w = (0.5 + u_r * float(SCATTERING_R_SIZE - 1)) / float(SCATTERING_R_SIZE);
-
-    float v;
-    if (hits_ground) {
-        float d = -r * mu - sqrt(max(r * r * (mu * mu - 1.0) + bottom_radius() * bottom_radius(), 0.0));
-        float x = clamp((d - (r - bottom_radius())) / max(rho - (r - bottom_radius()), 1e-5), 0.0, 1.0);
-        v = (0.5 + x * float(SCATTERING_MU_SIZE / 2 - 1)) / float(SCATTERING_MU_SIZE);
-    } else {
-        float d = -r * mu + sqrt(max(r * r * (mu * mu - 1.0) + top_radius() * top_radius(), 0.0));
-        float x = clamp((d - (top_radius() - r)) / max(rho + H - (top_radius() - r), 1e-5), 0.0, 1.0);
-        v = (float(SCATTERING_MU_SIZE / 2) + 0.5 + x * float(SCATTERING_MU_SIZE / 2 - 1)) / float(SCATTERING_MU_SIZE);
-    }
-
-    float mu_s_min = -sqrt(max(1.0 - (bottom_radius() * bottom_radius()) / (top_radius() * top_radius()), 0.0));
-    float u_mus = clamp((mu_s - mu_s_min) / max(1.0 - mu_s_min, 1e-6), 0.0, 1.0);
-    float u_mus_tex = (0.5 + u_mus * float(SCATTERING_MU_S_SIZE - 1)) / float(SCATTERING_MU_S_SIZE);
-
-    float sin_mu = sqrt(max(1.0 - mu * mu, 0.0));
-    float sin_s = sqrt(max(1.0 - mu_s * mu_s, 0.0));
-    float nu_min = mu * mu_s - sin_mu * sin_s;
-    float nu_max = mu * mu_s + sin_mu * sin_s;
-    float denom = nu_max - nu_min;
-    float u_nu = denom > 1e-5 ? clamp((nu - nu_min) / denom, 0.0, 1.0) : 0.5;
-
-    float coord_nu = u_nu * float(SCATTERING_NU_SIZE - 1);
-    int k = min(int(coord_nu), SCATTERING_NU_SIZE - 2);
-    f_nu = coord_nu - float(k);
-
-    float ux0 = (float(k) + u_mus_tex) / float(SCATTERING_NU_SIZE);
-    float ux1 = (float(k + 1) + u_mus_tex) / float(SCATTERING_NU_SIZE);
-    uvw0 = vec3(ux0, v, w);
-    uvw1 = vec3(ux1, v, w);
-}
-
-vec3 sample_bruneton_scattering(sampler3D lut, float r, float mu, float mu_s, float nu, bool hits_ground) {
-    vec3 uvw0, uvw1;
-    float f_nu;
-    bruneton_coords(r, mu, mu_s, nu, hits_ground, uvw0, uvw1, f_nu);
-    return mix(textureLod(lut, uvw0, 0.0).rgb, textureLod(lut, uvw1, 0.0).rgb, f_nu);
-}
-
-vec3 bruneton_transmittance(sampler2D lut, float rx, float mux, float rp, float mup, bool hits_ground) {
+vec3 segment_transmittance(sampler2D lut, float rx, float mux, float rp, float mup, bool hits_ground) {
     if (hits_ground) {
         vec3 tp = textureLod(lut, transmittance_uv(rp, -mup), 0.0).rgb;
         vec3 tx = textureLod(lut, transmittance_uv(rx, -mux), 0.0).rgb;
@@ -351,5 +258,43 @@ vec3 bruneton_transmittance(sampler2D lut, float rx, float mux, float rp, float 
         vec3 tx = textureLod(lut, transmittance_uv(rx, mux), 0.0).rgb;
         vec3 tp = textureLod(lut, transmittance_uv(rp, mup), 0.0).rgb;
         return exp(-max(tx - tp, vec3(0.0)));
+    }
+}
+
+vec2 angular_segment(ivec2 pixel, vec3 d) {
+    vec2 outer = sphere_roots(atm.camera.xyz, d, top_radius());
+    if (outer.y <= 0.0) return vec2(0.0);
+    float start = max(outer.x, 0.0), end = outer.y;
+    bool ground = atm.camera.z >= top_radius() ? pixel.y < SKY_SIZE.y/2 : pixel.y >= SKY_SIZE.y/2;
+    if (ground) {
+        vec2 roots = sphere_roots(atm.camera.xyz, d, bottom_radius());
+        end = min(end, roots.x >= 0.0 ? roots.x : -dot(atm.camera.xyz, d));
+    }
+    return vec2(start, max(start, end));
+}
+
+void integrate_atmosphere(sampler2D transmittance_lut, sampler2D multiscatter_lut,
+                          vec3 d, float start, float span, inout vec3 L, inout vec3 tau) {
+    if (span <= 0.0) return;
+    for (int step = 0; step < 2; ++step) {
+        float offset = start+float(step)*span*0.5;
+        int subdivisions = transport_subdivisions(atm.camera.xyz, d, offset, span*0.5);
+        float dt = span*0.5/float(subdivisions);
+        for (int j = 0; j < subdivisions; ++j) {
+            vec3 q = atm.camera.xyz+d*(offset+(float(j)+0.5)*dt);
+            vec3 r, m, e;
+            medium(q, r, m, e);
+            vec3 source = vec3(0.0);
+            for (uint s = 0u; s < uint(atm.camera.w); ++s) {
+                vec3 sun = atm.sun_direction[s].xyz;
+                float mu = dot(d, sun);
+                vec3 direct = sun_transmittance(transmittance_lut, q, sun, atm.sun_direction[s].w)
+                            *(r*rayleigh_phase(mu)+aerosol_source(q, mu));
+                vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
+                source += atm.sun_irradiance[s].rgb*(direct+multiple);
+            }
+            L += exp(-tau)*source*segment_integral(e, dt);
+            tau += e*dt;
+        }
     }
 }

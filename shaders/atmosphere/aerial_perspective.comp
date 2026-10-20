@@ -5,43 +5,21 @@ layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
 layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
 layout(rgba16f, set = 0, binding = 3) uniform writeonly image3D radiance_lut;
 layout(rgba16f, set = 0, binding = 4) uniform writeonly image3D optical_depth_lut;
+layout(r32f, set = 0, binding = 5) uniform writeonly image2D range_lut;
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, AERIAL_SIZE.xy))) return;
-    vec2 uv = vec2(pixel)/vec2(AERIAL_SIZE.xy-1);
-    vec3 d = view_direction(uv*2.0-1.0);
-    vec2 segment = atmosphere_segment(atm.camera.xyz, d);
-    float length = segment.y-segment.x;
-    float focus = aerial_focus(d, segment);
+    vec3 d = sky_direction(pixel);
+    vec2 segment = angular_segment(pixel, d);
+    float range = segment.y-segment.x;
+    imageStore(range_lut, pixel, vec4(range));
     vec3 L = vec3(0.0), tau = vec3(0.0);
     float previous = 0.0;
     imageStore(radiance_lut, ivec3(pixel, 0), vec4(0.0));
     imageStore(optical_depth_lut, ivec3(pixel, 0), vec4(0.0));
     for (int slice = 1; slice < AERIAL_SIZE.z; ++slice) {
-        float end = min(aerial_distance(float(slice)/float(AERIAL_SIZE.z-1), focus), length);
-        float dt = (end-previous)*0.5;
-        if (dt > 0.0) {
-            for (int step = 0; step < 2; ++step) {
-                float start = segment.x+previous+float(step)*dt;
-                int subdivisions = transport_subdivisions(atm.camera.xyz, d, start, dt);
-                float cell = dt/float(subdivisions);
-                for (int j = 0; j < subdivisions; ++j) {
-                    vec3 q = atm.camera.xyz+d*(start+(float(j)+0.5)*cell);
-                    vec3 r, m, e;
-                    medium(q, r, m, e);
-                    vec3 source = vec3(0.0);
-                    for (uint s = 0u; s < uint(atm.camera.w); ++s) {
-                        vec3 sun = atm.sun_direction[s].xyz;
-                        float mu = dot(d, sun);
-                        vec3 direct = sun_transmittance(transmittance_lut, q, sun)*(r*rayleigh_phase(mu)+aerosol_source(q, mu));
-                        vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
-                        source += atm.sun_irradiance[s].rgb*(direct+multiple);
-                    }
-                    L += exp(-tau)*source*segment_integral(e, cell);
-                    tau += e*cell;
-                }
-            }
-        }
+        float end = aerial_distance(float(slice)/float(AERIAL_SIZE.z-1), range);
+        integrate_atmosphere(transmittance_lut, multiscatter_lut, d, segment.x+previous, end-previous, L, tau);
         previous = end;
         imageStore(radiance_lut, ivec3(pixel, slice), vec4(min(L, vec3(65000.0)), 1.0));
         imageStore(optical_depth_lut, ivec3(pixel, slice), vec4(min(tau, vec3(65000.0)), 1.0));

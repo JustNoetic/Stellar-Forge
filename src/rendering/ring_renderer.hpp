@@ -72,6 +72,7 @@ public:
     const rhi::Buffer& host_buffer(uint32_t frame) const noexcept { return host_ssbos_[frame]; }
     const rhi::Image& gradient_atlas() const noexcept { return gradient_atlas_; }
     const rhi::Image& shadow_lut() const noexcept { return shadow_lut_; }
+    uint64_t shadow_revision() const noexcept { return ringshine_profile_serial_; }
     const rhi::Image& ringshine_atlas(uint32_t frame) const noexcept { return ringshine_atlases_[frame]; }
     uint32_t ringshine_bake_count() const noexcept { return ringshine_bakes_; }
     uint32_t ringshine_frame_bake_count() const noexcept { return ringshine_frame_bakes_; }

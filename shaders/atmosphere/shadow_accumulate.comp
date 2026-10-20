@@ -1,0 +1,3 @@
+#version 460
+#define ATMOSPHERE_SHADOW_ACCUMULATE
+#include "common/atmosphere_shadow_pass.glsl"

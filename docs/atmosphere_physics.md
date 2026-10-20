@@ -26,7 +26,7 @@ An optional ozone layer specifies `column_du`, `peak_km`, and Gaussian standard 
 
 Automatic optical height extends past temperature knots, six ozone standard deviations and eight detached-particle standard deviations, then checks molecular/particle tangent-tail estimates against `1e-5` optical depth, capped at 10000 km. This is a bounded rendering cutoff, not an exobase or escape model. Manual height remains available. Very weakly bound or strongly non-isothermal columns need another model. Pressure zero suppresses all gas, ozone and particles.
 
-All transmittance, multiple-scattering, sky, aerial and surface-irradiance bakes use the same GPU medium evaluator, including absorption in extinction but excluding it from scattering sources. Both aerial models retain finite-distance endpoints.
+All transmittance, multiple-scattering, sky, aerial and surface-irradiance bakes use the same GPU medium evaluator, including absorption in extinction but excluding it from scattering sources. The horizon-mapped aerial LUT retains finite-distance endpoints.
 
 ## Surface light and composition
 
@@ -36,11 +36,11 @@ Diffuse irradiance integrates 16 cosine-distributed directions with 32 transport
 
 Vulkan dual-source composition writes scattered radiance to color output index 0 and RGB transmission to index 1. Blend factors `ONE, SRC1_COLOR` evaluate `S + T * background`, preserving destination alpha. The device feature and attachment limit are checked, enabled when available, and exposed through the shared RHI pipeline description. A render setting selects it; unsupported devices use compute. Compute remains the default because the measured graphics path is slower on the RTX 4060 Ti. Both paths share `common/atmosphere_composite.glsl`.
 
-Physical preparation, density arrays and surface-table bakes happen on input edits. Sun motion reuses optical and surface tables, while sky-view updates follow the existing lighting key. Camera rotation reuses sky and Bruneton tables; frustum aerial volumes still update when their view changes. Profile sampling adds work to medium evaluation during bakes and the short-segment aerial fallback. Surface lookups and composition execute each frame. Performance is therefore not literally free outside rebuilds.
+Physical preparation, density arrays and surface-table bakes happen on input edits. Sun motion reuses optical and surface tables, while sky-view updates follow the existing lighting key. Camera rotation and FOV changes reuse sky and aerial tables; translation refreshes their altitude/local-lighting-dependent columns. Profile sampling adds work to medium evaluation during bakes and the short-segment extinction fallback. Surface lookups and composition execute each frame. Performance is therefore not literally free outside rebuilds.
 
 ## Validation and references
 
-The existing frustum mesh-curvature comparison reproduced a maximum absolute HDR error of `0.00219727` with the original medium and surface shaders and forced compute composition. The new paths reproduce the same error. That low-resolution angular reconstruction contract uses a `0.0025` absolute tolerance, including FP16 quantization, instead of its previously failing `0.0015` threshold; its dense transport and exact-depth contracts remain separate.
+The curved-surface regression uses a `0.0025` absolute HDR tolerance, including FP16 quantization and angular reconstruction. Independent dense-transport and exact-depth contracts remain separate.
 
 `StellarRenderingTests --atmosphere-physics-benchmark scratch/atmosphere-physics/costs.json` compares manual/physical media, both compositors, cached frames, translation and input edits at 1920x1080. Two repetitions use 6 warmup plus 16 measured frames each. Serialized timer results exclude readback and presentation and are not application frame times. GPU clock variation is visible across different workloads.
 
@@ -48,7 +48,7 @@ The following timings are the historical pre-particle baseline; they do not meas
 
 Dual-source composition measured approximately 0.167 ms versus compute's 0.154 ms for the physical ground cases. In the physical orbital cached case it measured 0.367 ms versus 0.291 ms; higher-clock orbital input-edit cases measured 0.091 ms versus 0.072 ms. This supports keeping compute as the default on this device while retaining dual-source composition as a tested option.
 
-`StellarStateTests` covers complete/incomplete JSON activation, explicit disabled states, original aerosol-unit migration, percentage balancing, automatic methane haze and vacuum, standard-atmosphere pressures, exact spherical isothermal pressure, signed prepared-density interpolation, ozone-column conservation, vacuum, invalid mixtures/pressure, atomic edits, immutable profile reuse and physical persistence. `StellarRenderingTests --atmospheres-only` adds independent numerical physical transmission, direct surface attenuation, twilight irradiance, vacuum, cache reuse, and pixel comparisons between graphics and compute composition in both aerial models. `STELLAR_VULKAN_VALIDATION=1` requests Vulkan validation; `STELLAR_TEST_ATMOSPHERE_COMPUTE=1` forces the compute compositor in the rendering probe for diagnostics.
+`StellarStateTests` covers complete/incomplete JSON activation, explicit disabled states, original aerosol-unit migration, percentage balancing, automatic methane haze and vacuum, standard-atmosphere pressures, exact spherical isothermal pressure, signed prepared-density interpolation, ozone-column conservation, vacuum, invalid mixtures/pressure, atomic edits, immutable profile reuse and physical persistence. `StellarRenderingTests --atmospheres-only` adds independent numerical physical transmission, direct surface attenuation, twilight irradiance, vacuum, cache reuse, and pixel comparisons between graphics and compute composition with the horizon-mapped aerial LUT. `STELLAR_VULKAN_VALIDATION=1` requests Vulkan validation; `STELLAR_TEST_ATMOSPHERE_COMPUTE=1` forces the compute compositor in the rendering probe for diagnostics.
 
 - [U.S. Standard Atmosphere 1976](https://ntrs.nasa.gov/citations/19770009539)
 - [Bruneton scattering implementation and spectral reference data](https://ebruneton.github.io/precomputed_atmospheric_scattering/atmosphere/demo/demo.cc.html)
