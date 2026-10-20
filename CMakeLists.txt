@@ -7,6 +7,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -155,235 +159,25 @@ target_link_libraries(StellarForge PRIVATE
     ${STELLAR_PLATFORM_LIBS}
 )
 
+# --- Testing ---
 option(STELLAR_BUILD_TESTS "Build CPU state and numerical contract tests" ON)
-if(STELLAR_BUILD_TESTS)
+option(STELLAR_BUILD_RENDER_TESTS "Build GPU rendering contract tests (requires Vulkan and a window system)" OFF)
+option(STELLAR_TEST_EPHEMERIS "Test against locally installed CSPICE kernels" OFF)
+
+if((STELLAR_BUILD_TESTS OR STELLAR_BUILD_RENDER_TESTS) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
-    add_executable(StellarTerrainTests tests/terrain_tests.cpp src/terrain/quadtree.cpp src/terrain/tile_metadata.cpp src/terrain/geometry_residency.cpp
-        src/terrain/terrain_source.cpp src/terrain/height_stream.cpp src/core/path_utils.cpp)
-    target_include_directories(StellarTerrainTests PRIVATE src)
-    target_link_libraries(StellarTerrainTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
-    target_compile_definitions(StellarTerrainTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    if(MINGW)
-        target_link_options(StellarTerrainTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_executable(StellarEclipseTests tests/eclipse_tests.cpp src/rendering/ring_optics.cpp src/core/path_utils.cpp)
-    target_include_directories(StellarEclipseTests PRIVATE src)
-    target_compile_definitions(StellarEclipseTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(StellarEclipseTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
-    if(MINGW)
-        target_link_options(StellarEclipseTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_test(NAME eclipse_contracts COMMAND StellarEclipseTests)
-    add_executable(StellarBenchmarkTests tests/benchmark_tests.cpp src/benchmark/benchmark.cpp src/core/path_utils.cpp)
-    target_include_directories(StellarBenchmarkTests PRIVATE src)
-    target_compile_definitions(StellarBenchmarkTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(StellarBenchmarkTests PRIVATE nlohmann_json::nlohmann_json)
-    if(MINGW)
-        target_link_options(StellarBenchmarkTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_test(NAME benchmark_contracts COMMAND StellarBenchmarkTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/benchmark-contracts")
-    find_package(Python3 QUIET COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME atmosphere_migration_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/atmosphere_migration_tests.py")
-        add_test(NAME terrain_contracts COMMAND StellarTerrainTests "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt")
-        add_test(NAME terrain_importer_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/terrain_import_tests.py"
-            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests")
-        set_tests_properties(terrain_importer_contracts PROPERTIES FIXTURES_SETUP terrain_fixture)
-        execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import numpy; from PIL import Image"
-            RESULT_VARIABLE STELLAR_SURFACE_PYTHON_RESULT OUTPUT_QUIET ERROR_QUIET)
-        if(STELLAR_SURFACE_PYTHON_RESULT EQUAL 0)
-            set(STELLAR_SURFACE_FIXTURES_AVAILABLE TRUE)
-            add_test(NAME surface_map_contracts COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/surface_map_tests.py"
-                "${CMAKE_CURRENT_SOURCE_DIR}/scratch/surface-tests")
-            set_tests_properties(surface_map_contracts PROPERTIES FIXTURES_SETUP surface_fixture)
-        else()
-            message(STATUS "Surface-map fixtures disabled: install Python Pillow and NumPy to enable them")
-        endif()
-        set_tests_properties(terrain_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture)
-        add_test(NAME benchmark_comparison COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_comparison_tests.py")
-    else()
-        add_test(NAME terrain_contracts COMMAND StellarTerrainTests)
-    endif()
-    add_executable(StellarStateTests
-        tests/state_tests.cpp
-        src/ephemeris/ias15.cpp
-        src/ephemeris/reference_hierarchy.cpp
-        src/ephemeris/jacobi.cpp
-        src/ephemeris/simulation.cpp
-        src/ephemeris/spice_ephemeris.cpp
-        src/ephemeris/spk_exporter.cpp
-        src/ephemeris/system_manager.cpp
-        src/physics/star_calc.cpp
-        src/rendering/ring_optics.cpp
-        src/rendering/ring_generator.cpp
-        src/core/path_utils.cpp
-        src/core/time_utils.cpp
-    )
-    target_include_directories(StellarStateTests PRIVATE src)
-    target_compile_definitions(StellarStateTests PRIVATE
-        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_link_libraries(StellarStateTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${STELLAR_PLATFORM_LIBS})
-    if(MINGW)
-        target_link_options(StellarStateTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_test(NAME state_contracts COMMAND StellarStateTests "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
-    get_target_property(STELLAR_RUNNER_TEST_SOURCES StellarStateTests SOURCES)
-    list(FILTER STELLAR_RUNNER_TEST_SOURCES EXCLUDE REGEX "tests/state_tests.cpp$")
-    add_executable(StellarSimulationRunnerTests tests/simulation_runner_tests.cpp
-        src/ephemeris/simulation_runner.cpp ${STELLAR_RUNNER_TEST_SOURCES})
-    target_include_directories(StellarSimulationRunnerTests PRIVATE src)
-    target_compile_definitions(StellarSimulationRunnerTests PRIVATE
-        $<TARGET_PROPERTY:StellarStateTests,COMPILE_DEFINITIONS>)
-    target_link_libraries(StellarSimulationRunnerTests PRIVATE $<TARGET_PROPERTY:StellarStateTests,LINK_LIBRARIES>)
-    target_link_options(StellarSimulationRunnerTests PRIVATE $<TARGET_PROPERTY:StellarStateTests,LINK_OPTIONS>)
-    add_test(NAME simulation_worker_contracts COMMAND StellarSimulationRunnerTests)
-    set_tests_properties(simulation_worker_contracts PROPERTIES TIMEOUT 60)
-    add_executable(StellarOrbitTests
-        tests/orbit_tests.cpp
-        src/ephemeris/ias15.cpp
-        src/ephemeris/reference_hierarchy.cpp
-        src/ephemeris/jacobi.cpp
-        src/ephemeris/orbit_curves.cpp
-        src/ephemeris/simulation.cpp
-        src/ephemeris/spice_ephemeris.cpp
-        src/ephemeris/spk_exporter.cpp
-        src/ephemeris/system_manager.cpp
-        src/physics/star_calc.cpp
-        src/core/path_utils.cpp
-        src/core/time_utils.cpp
-    )
-    target_include_directories(StellarOrbitTests PRIVATE src)
-    target_compile_definitions(StellarOrbitTests PRIVATE
-        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_link_libraries(StellarOrbitTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${STELLAR_PLATFORM_LIBS})
-    if(MINGW)
-        target_link_options(StellarOrbitTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_test(NAME orbit_contracts COMMAND StellarOrbitTests "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${CMAKE_CURRENT_SOURCE_DIR}/data/systems")
-    add_executable(StellarHierarchyTests
-        tests/hierarchy_tests.cpp
-        src/ephemeris/ias15.cpp
-        src/ephemeris/jacobi.cpp
-        src/ephemeris/reference_hierarchy.cpp
-        src/ephemeris/orbit_curves.cpp
-        src/ephemeris/simulation.cpp
-        src/ephemeris/spice_ephemeris.cpp
-        src/ephemeris/spk_exporter.cpp
-        src/ephemeris/system_manager.cpp
-        src/physics/star_calc.cpp
-        src/core/path_utils.cpp
-        src/core/time_utils.cpp
-    )
-    target_include_directories(StellarHierarchyTests PRIVATE src)
-    target_compile_definitions(StellarHierarchyTests PRIVATE
-        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_link_libraries(StellarHierarchyTests PRIVATE glm::glm nlohmann_json::nlohmann_json ${STELLAR_PLATFORM_LIBS})
-    if(MINGW)
-        target_link_options(StellarHierarchyTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_test(NAME hierarchy_contracts COMMAND StellarHierarchyTests)
-    add_executable(StellarStarCalcTests
-        tests/star_calc_tests.cpp
-        src/physics/star_calc.cpp
-    )
-    target_include_directories(StellarStarCalcTests PRIVATE src)
-    target_compile_definitions(StellarStarCalcTests PRIVATE
-        GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_ENABLE_EXPERIMENTAL NOMINMAX WIN32_LEAN_AND_MEAN
-    )
-    target_link_libraries(StellarStarCalcTests PRIVATE glm::glm nlohmann_json::nlohmann_json)
-    if(MINGW)
-        target_link_options(StellarStarCalcTests PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
-    endif()
-    add_test(NAME star_calc_contracts COMMAND StellarStarCalcTests)
-    option(STELLAR_TEST_EPHEMERIS "Test against locally installed CSPICE kernels" OFF)
-    if(STELLAR_TEST_EPHEMERIS)
-        target_compile_definitions(StellarStateTests PRIVATE STELLAR_TEST_EPHEMERIS)
-        add_test(NAME ephemeris_contracts COMMAND StellarOrbitTests "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures" "${CMAKE_CURRENT_SOURCE_DIR}/data/systems" --spice)
-    endif()
+    add_subdirectory(tests)
 endif()
 
-option(STELLAR_BUILD_RENDER_TESTS "Build GPU rendering contract tests (requires Vulkan and a window system)" OFF)
-if(STELLAR_BUILD_RENDER_TESTS)
-    enable_testing()
-    add_test(NAME simulation_tracking_rendering_contracts COMMAND StellarForge --self-test)
-    set_tests_properties(simulation_tracking_rendering_contracts PROPERTIES TIMEOUT 30)
-    add_executable(StellarRenderingTests
-        tests/rendering_tests.cpp
-        src/ephemeris/ias15.cpp
-        src/ephemeris/reference_hierarchy.cpp
-        src/ephemeris/jacobi.cpp
-        src/core/camera.cpp
-        src/core/path_utils.cpp
-        src/core/time_utils.cpp
-        src/ephemeris/simulation.cpp
-        src/ephemeris/spice_ephemeris.cpp
-        src/ephemeris/system_manager.cpp
-        src/physics/star_calc.cpp
-        src/rendering/celestial_renderer.cpp
-        src/rendering/atmosphere_renderer.cpp
-        src/rendering/transparency_renderer.cpp
-        src/rendering/ring_optics.cpp
-        src/rendering/ring_renderer.cpp
-        src/terrain/quadtree.cpp
-        src/terrain/tile_metadata.cpp
-        src/terrain/terrain_renderer.cpp
-        src/terrain/geometry_cache.cpp
-        src/terrain/geometry_residency.cpp
-        src/terrain/terrain_source.cpp
-        src/terrain/height_stream.cpp
-        src/terrain/surface_textures.cpp
-        src/rendering/star_catalog.cpp
-        src/rhi/shader_cache.cpp
-        src/rhi/vk_context.cpp
-        src/rhi/staging_uploads.cpp
-    )
-    target_include_directories(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,INCLUDE_DIRECTORIES>)
-    target_compile_definitions(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,COMPILE_DEFINITIONS>)
-    target_link_libraries(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
-    target_link_options(StellarRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
-    add_test(NAME rendering_contracts COMMAND StellarRenderingTests)
-    add_test(NAME atmosphere_rendering_contracts COMMAND StellarRenderingTests --atmospheres-only)
-    add_test(NAME transparency_rendering_contracts COMMAND StellarRenderingTests --transparency-only)
-    add_test(NAME eclipse_optics_gpu_contracts COMMAND StellarRenderingTests --eclipse-lighting)
-    add_test(NAME smooth_surface_contracts COMMAND StellarRenderingTests --smooth-surfaces)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME terrain_imported_contracts COMMAND StellarRenderingTests --terrain-imported
-            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt"
-            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/imported-gpu.json")
-        set_tests_properties(terrain_imported_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture TIMEOUT 150)
-        add_test(NAME terrain_normal_contracts COMMAND StellarRenderingTests --terrain-normals
-            "${CMAKE_CURRENT_SOURCE_DIR}/scratch/terrain-source-tests/fixture-path.txt")
-        set_tests_properties(terrain_normal_contracts PROPERTIES FIXTURES_REQUIRED terrain_fixture TIMEOUT 150)
-        if(STELLAR_SURFACE_FIXTURES_AVAILABLE)
-            add_test(NAME surface_rendering_contracts COMMAND StellarRenderingTests --surface-contracts
-                "${CMAKE_CURRENT_SOURCE_DIR}/scratch/surface-tests/fixture-path.txt")
-            set_tests_properties(surface_rendering_contracts PROPERTIES FIXTURES_REQUIRED surface_fixture TIMEOUT 120)
-        endif()
-    endif()
-    add_executable(StellarOrbitRenderingTests
-        tests/orbit_rendering_tests.cpp
-        src/ephemeris/ias15.cpp
-        src/ephemeris/reference_hierarchy.cpp
-        src/ephemeris/jacobi.cpp
-        src/core/camera.cpp
-        src/core/path_utils.cpp
-        src/core/time_utils.cpp
-        src/ephemeris/orbit_curves.cpp
-        src/ephemeris/simulation.cpp
-        src/ephemeris/spice_ephemeris.cpp
-        src/ephemeris/system_manager.cpp
-        src/physics/star_calc.cpp
-        src/rendering/orbit_renderer.cpp
-        src/rendering/transparency_renderer.cpp
-        src/rhi/shader_cache.cpp
-        src/rhi/vk_context.cpp
-    )
-    target_include_directories(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,INCLUDE_DIRECTORIES>)
-    target_compile_definitions(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,COMPILE_DEFINITIONS>)
-    target_link_libraries(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_LIBRARIES>)
-    target_link_options(StellarOrbitRenderingTests PRIVATE $<TARGET_PROPERTY:StellarForge,LINK_OPTIONS>)
-    add_test(NAME orbit_rendering_contracts COMMAND StellarOrbitRenderingTests)
-endif()
+# --- Deployment / Packaging Staging ---
+install(TARGETS StellarForge RUNTIME DESTINATION .)
+install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/bake_textures.bat" DESTINATION .)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data" DESTINATION .)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders" DESTINATION .
+    PATTERN "tests" EXCLUDE
+)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scripts" DESTINATION .
+    PATTERN "__pycache__" EXCLUDE
+    PATTERN "*.pyc" EXCLUDE
+)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/textures" DESTINATION .)

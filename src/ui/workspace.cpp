@@ -1,4 +1,5 @@
 #include "ui/workspace.hpp"
+#include "core/path_utils.hpp"
 
 #include <GLFW/glfw3.h>
 #include <backends/imgui_impl_glfw.h>
@@ -21,6 +22,9 @@ void UiSystem::init(GLFWwindow* window, rhi::VkContext& ctx) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    std::filesystem::create_directories(paths::external_path("cache"));
+    static std::string ini_path = paths::external_path("cache", "imgui.ini").string();
+    io.IniFilename = ini_path.c_str();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 

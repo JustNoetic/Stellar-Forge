@@ -7,4 +7,8 @@ if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 cmake --build build --parallel
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
-.\build\StellarForge.exe %*
+if exist "build\bin\StellarForge.exe" (
+    .\build\bin\StellarForge.exe %*
+) else (
+    .\build\StellarForge.exe %*
+)
