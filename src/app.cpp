@@ -501,7 +501,6 @@ bool App::render_frame(benchmark::FrameSample* sample) {
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
-    star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
     double celestial_prepare_ms = 0.0;
     {
         ScopedTimer timer(sample ? &celestial_prepare_ms : nullptr);
@@ -509,6 +508,8 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext);
         vk_.end_gpu_timer(cmd, id);
     }
+    auto refraction_writes = celestial_renderer_.refraction_writes(vk_);
+    star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
 
     auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, 0.0f, 0.0f, 0.0f, 1.0f);
     auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0.0f);
@@ -524,7 +525,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     {
         ScopedTimer timer(sample ? &sample->cpu_gaia_ms : nullptr);
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_gaia") : UINT32_MAX;
-        star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext);
+        star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
         vk_.end_gpu_timer(cmd, id);
     }
     {
@@ -532,7 +533,8 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_orbits") : UINT32_MAX;
         auto transparency_writes = celestial_renderer_.transparency().writes();
         orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext,
-            celestial_renderer_.transparency().active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{});
+            celestial_renderer_.transparency().active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{},
+            refraction_writes);
         vk_.end_gpu_timer(cmd, id);
     }
 
@@ -985,6 +987,8 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::Checkbox("Dual-source atmosphere blending", &render_draft.atmosphere_dual_source);
             ImGui::Checkbox("Aerial perspective", &render_draft.aerial_perspective_enabled);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds atmospheric scattered light over surfaces. Atmospheric extinction remains active when disabled.");
+            ImGui::Checkbox("Atmospheric refraction", &render_draft.refraction_enabled);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bends apparent positions of stars, bodies, terrain, rings and orbits through the nearest physical atmosphere.");
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);

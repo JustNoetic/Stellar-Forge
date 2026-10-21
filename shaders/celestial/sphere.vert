@@ -5,6 +5,7 @@ layout(location = 1) in vec3 in_normal;
 
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
+#include "common/refraction.glsl"
 
 layout(location = 0) out vec3 f_world_pos;
 layout(location = 1) out vec3 f_local_pos;
@@ -12,6 +13,7 @@ layout(location = 2) out vec3 f_normal;
 layout(location = 3) out float f_subpixel_factor;
 layout(location = 4) flat out uint f_body_idx;
 layout(location = 7) out vec3 f_base_chord;
+layout(location = 8) out vec3 f_apparent_pos;
 
 void main() {
     uint idx = gl_InstanceIndex;
@@ -33,6 +35,7 @@ void main() {
         f_world_pos = vec3(0.0);
         f_local_pos = vec3(0.0);
         f_normal = vec3(0.0, 1.0, 0.0);
+        f_apparent_pos = vec3(0.0);
         return;
     }
 
@@ -46,5 +49,7 @@ void main() {
     vec3 world_pos = center + scaled_pos * radius;
     f_world_pos = world_pos;
     f_normal = adj_norm;
-    gl_Position = u_scene.view_proj * vec4(world_pos, 1.0);
+    vec3 apparent = refract_position(world_pos);
+    f_apparent_pos = apparent;
+    gl_Position = u_scene.view_proj * vec4(apparent, 1.0);
 }

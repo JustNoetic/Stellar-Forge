@@ -1,6 +1,7 @@
 #version 460
 
 #include "common/point_source.glsl"
+#include "common/refraction.glsl"
 
 struct StarGpuRecord {
     dvec4 pos0;
@@ -48,6 +49,8 @@ void main() {
     float intensity = s.pm_flux.w * pc.flux_calib / d2;
 
     vec3 dir_eye = dist_eye > 1e-9 ? (rel_eye / dist_eye) : vec3(0.0, 0.0, -1.0);
+    vec4 apparent = refract_direction(dir_eye);
+    dir_eye = apparent.xyz;
     vec4 clip = pc.view_proj * vec4(dir_eye, 1.0);
 
     if (clip.w <= 0.0) {
@@ -66,6 +69,7 @@ void main() {
     bool on_screen = all(lessThanEqual(abs(ndc), vec2(1.0) + pad_ndc));
 
     float eff_exposure = (pc.hdr_enabled != 0u) ? pc.exposure : 1.0;
+    intensity *= apparent.w;
     vec3 flux = s.color.rgb * (intensity * pc.intensity_scale * eff_exposure);
     float fade = point_signal_fade(flux, radius);
 

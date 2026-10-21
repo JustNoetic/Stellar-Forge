@@ -6,6 +6,7 @@ layout(location = 2) in vec3 f_normal;
 layout(location = 3) in float f_subpixel_factor;
 layout(location = 4) flat in uint f_body_idx;
 layout(location = 7) in vec3 f_base_chord;
+layout(location = 8) in vec3 f_apparent_pos;
 
 #ifdef TERRAIN_SURFACE
 layout(location = 5) flat in vec4 f_tile_color;
@@ -26,7 +27,7 @@ layout(depth_greater) out float gl_FragDepth;
 
 void main() {
     BodyInstanceGPU b = bodies[f_body_idx];
-    gl_FragDepth = curved_surface_depth(b, f_world_pos, f_base_chord, gl_FragCoord.z);
+    gl_FragDepth = curved_surface_depth(b, f_world_pos, f_apparent_pos, f_base_chord, gl_FragCoord.z);
 #ifdef TERRAIN_SURFACE
     if (f_tile_color.w > 0.5) {
         vec2 edge = min(f_tile_uv, 1.0 - f_tile_uv);

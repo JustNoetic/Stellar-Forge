@@ -2,6 +2,7 @@
 
 #include "core/camera.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/refraction_renderer.hpp"
 #include "rhi/vk_context.hpp"
 #include <array>
 #include <filesystem>
@@ -22,10 +23,12 @@ public:
     void shutdown(rhi::VkContext& ctx);
 
     void cull(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-              units::Years sim_time, const RenderSettings& settings, VkExtent2D extent);
+              units::Years sim_time, const RenderSettings& settings, VkExtent2D extent,
+              std::span<const rhi::PushDescriptorWrite> refraction_writes = {});
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) const;
+                units::Years sim_time, const RenderSettings& settings, VkExtent2D extent,
+                std::span<const rhi::PushDescriptorWrite> refraction_writes = {}) const;
 
     bool loaded() const noexcept { return loaded_; }
     uint32_t count() const noexcept { return count_; }
@@ -39,6 +42,7 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> visible_index_buffers_{};
     rhi::Pipeline cull_pipeline_{};
     rhi::Pipeline pipeline_{};
+    RefractionFallback refraction_fallback_;
 };
 
 } // namespace sf::rendering

@@ -2,6 +2,7 @@
 #extension GL_ARB_gpu_shader_fp64 : require
 
 #include "common/orbit_curve.glsl"
+#include "common/refraction.glsl"
 
 layout(std430, set = 0, binding = 0) readonly buffer Orbits { OrbitData orbits[]; };
 layout(push_constant) uniform Push {
@@ -18,7 +19,7 @@ void main() {
     OrbitData orbit = orbits[gl_InstanceIndex];
     float t = float(gl_VertexIndex) / pc.parameters.x;
     dvec3 position = orbit_curve_point(orbit, t);
-    gl_Position = pc.view_projection * vec4(vec3(position - pc.eye.xyz), 1.0);
+    gl_Position = pc.view_projection * vec4(refract_position(vec3(position - pc.eye.xyz)), 1.0);
     float alpha;
     if (orbit.d4.z > 0.5) alpha = mix(pc.parameters.z, 1.0, t);
     else if (t > float(orbit.d4.x)) alpha = pc.parameters.z;

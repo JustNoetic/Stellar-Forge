@@ -30,6 +30,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     rings_.init(ctx);
     atmospheres_.init(ctx);
     transparency_.init(ctx);
+    refraction_.init(ctx);
 
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         scene_ubos_[i] = ctx.create_host_buffer(sizeof(SceneCelestialUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
@@ -52,6 +53,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
     };
 
     rhi::GraphicsPipelineDesc sphere_desc{};
@@ -97,6 +100,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
 }
 
 void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
+    refraction_.shutdown(ctx);
     transparency_.shutdown(ctx);
     atmospheres_.shutdown(ctx);
     rings_.shutdown(ctx);
@@ -161,13 +165,14 @@ void CelestialRenderer::build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors,
 void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
+    refraction_.prepare(cmd, ctx, cam, sys, settings);
     textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled);
     normals_.prepare(cmd, ctx, cam, sys, extent, settings.terrain_imported_enabled && settings.terrain_normal_maps_enabled);
-    rings_.prepare(cmd, ctx, cam, sys, count);
+    rings_.prepare(cmd, ctx, cam, sys, count, refraction_.host().body);
     uint32_t ringshine_timer = ctx.begin_gpu_timer(cmd, "ringshine_bake");
     rings_.update_ringshine(cmd, ctx, cam, sys, settings, count, extent);
     ctx.end_gpu_timer(cmd, ringshine_timer);
-    terrain_.prepare(ctx, cam, sys, settings, extent, count);
+    terrain_.prepare(ctx, cam, sys, settings, extent, count, &refraction_.host());
     terrain_.bake(cmd, ctx);
     atmosphere_minima_.resize(count);
     for (uint32_t i = 0; i < count; ++i)
@@ -308,6 +313,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ctx.flush_buffer(instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU));
     ctx.flush_buffer(scene_ubos_[f_idx], 0, sizeof(SceneCelestialUBO));
 
+    auto refraction = refraction_.writes(ctx);
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
         rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU)),
@@ -321,6 +327,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(f_idx)),
         rhi::PushDescriptorWrite::sampled_image(16, rings_.ringshine_atlas(f_idx), ctx.sampler_linear_clamp()),
+        refraction[0],
+        refraction[1],
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipeline_.handle);
@@ -348,10 +356,14 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         first = end;
     }
 
+    auto refraction_rays = refraction_.ray_writes(ctx);
     rhi::PushDescriptorWrite ring_base_writes[] = {
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
         rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU)),
         rhi::PushDescriptorWrite::storage_buffer(2, eclipse_buffer, 0, eclipse_bytes),
+        refraction[0],
+        refraction[1],
+        refraction_rays[0], refraction_rays[1], refraction_rays[2],
     };
     auto transparency_writes = transparency_.writes();
     rings_.render(cmd, ctx, settings, ring_base_writes, {ubo.stars_pos_radius, ubo.num_stars},

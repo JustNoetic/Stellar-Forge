@@ -2,6 +2,7 @@
 
 #include "common/celestial_scene.glsl"
 #include "common/eclipse_optics.glsl"
+#include "common/refraction.glsl"
 
 layout(location = 0) out vec2 f_pixel_offset;
 layout(location = 1) flat out float f_point_radius;
@@ -14,6 +15,7 @@ float point_visibility(vec3 center, uint self_idx, float stellar_radius) {
     for (uint i = 0; i < u_scene.num_bodies; ++i) {
         if (i == self_idx) continue;
         BodyInstanceGPU caster = bodies[i];
+        if (refraction_active() && all(equal(caster.pos_radius.xyz, u_refraction.host.xyz))) continue;
         if (stellar_radius > 0.0) {
             float along = dot(caster.pos_radius.xyz, ray);
             if (along <= 0.0 || along >= distance) continue;
@@ -88,7 +90,9 @@ void main() {
     if (b.spin_flags.z > 0.5 || weight <= 0.0) return;
 
     vec3 center = b.pos_radius.xyz;
-    vec4 clip = u_scene.view_proj * vec4(center, 1.0);
+    vec4 apparent = refract_point(center);
+    if (apparent.w <= 0.0) return;
+    vec4 clip = u_scene.view_proj * vec4(apparent.xyz, 1.0);
     if (clip.w <= 0.0) return;
 
     float half_size = max(radius_px, 0.5 * u_scene.point_params.x);
@@ -105,7 +109,7 @@ void main() {
                             + (1.0 - polar_radius * polar_radius) * pole_view * pole_view);
     vec3 flux = disc_radiance(b, V) * (POINT_PI * radius_px * radius_px * area_scale);
     if (u_scene.hdr_enabled != 0u) flux *= u_scene.screen_params.w;
-    flux *= point_signal_fade(flux, half_size) * weight * visibility;
+    flux *= point_signal_fade(flux, half_size) * weight * visibility * apparent.w;
     if (max(flux.r, max(flux.g, flux.b)) <= 0.0) return;
 
     vec2 center_px = (clip.xy / clip.w * 0.5 + 0.5) * u_scene.screen_params.xy;

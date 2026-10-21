@@ -1,0 +1,27 @@
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "common/refraction_solve.glsl"
+
+layout(std140, set = 0, binding = 0) uniform RefractionParameters {
+    vec4 host;
+    vec4 pole;
+    vec4 frame;
+    vec4 mapping;
+    vec4 model;
+    vec4 profile;
+    vec4 escape;
+} u_refraction;
+layout(set = 0, binding = 1) uniform sampler2D travel_table;
+layout(set = 0, binding = 2) uniform sampler2D row_table;
+layout(set = 0, binding = 3) uniform sampler2D profile_table;
+layout(rg32f, set = 0, binding = 4) uniform writeonly image2D observer_table;
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (cell.x >= REFRACTION_OBSERVER_WIDTH || cell.y >= REFRACTION_OBSERVER_HEIGHT) return;
+    RefractionGPU g = RefractionGPU(u_refraction.host, u_refraction.pole, u_refraction.frame, u_refraction.mapping,
+                                    u_refraction.model, u_refraction.profile, u_refraction.escape);
+    vec2 value = refraction_observer_cell(travel_table, row_table, profile_table, g, cell.x, cell.y);
+    imageStore(observer_table, cell, vec4(value, 0.0, 0.0));
+}

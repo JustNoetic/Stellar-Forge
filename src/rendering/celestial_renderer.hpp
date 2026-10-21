@@ -4,6 +4,7 @@
 #include "rendering/render_settings.hpp"
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
+#include "rendering/refraction_renderer.hpp"
 #include "rendering/transparency_renderer.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
@@ -58,12 +59,19 @@ public:
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     const terrain::TextureStats& normal_stats() const noexcept { return normals_.stats(); }
     const AtmosphereStats& atmosphere_stats() const noexcept { return atmospheres_.stats(); }
+    void resolve_transparency(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
+        transparency_.resolve(cmd, ctx, color, depth);
+    }
     void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
         auto writes = transparency_.writes();
         atmospheres_.composite(cmd, ctx, color, depth, transparency_.active() ? std::span{writes} : std::span<const rhi::PushDescriptorWrite>{});
-        transparency_.resolve(cmd, ctx, color);
+        transparency_.resolve(cmd, ctx, color, depth);
     }
     const TransparencyRenderer& transparency() const noexcept { return transparency_; }
+    std::array<rhi::PushDescriptorWrite, 2> refraction_writes(rhi::VkContext& ctx) const { return refraction_.writes(ctx); }
+    const RefractionHost& refraction_host() const noexcept { return refraction_.host(); }
+    uint32_t refraction_observer_builds() const noexcept { return refraction_.observer_builds(); }
+    const RefractionRenderer& refraction() const noexcept { return refraction_; }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
      std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
     uint32_t ringshine_bake_count() const noexcept { return rings_.ringshine_bake_count(); }
@@ -105,6 +113,7 @@ private:
     RingRenderer rings_;
     AtmosphereRenderer atmospheres_;
     TransparencyRenderer transparency_;
+    RefractionRenderer refraction_;
     std::vector<float> atmosphere_minima_;
 };
 

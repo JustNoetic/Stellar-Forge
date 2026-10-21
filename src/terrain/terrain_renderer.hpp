@@ -2,6 +2,7 @@
 
 #include "core/camera.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/refraction_tables.hpp"
 #include "rhi/vk_context.hpp"
 #include "terrain/quadtree.hpp"
 #include "terrain/geometry_cache.hpp"
@@ -66,7 +67,8 @@ public:
     void init(rhi::VkContext& ctx, bool load_config = true);
     void shutdown(rhi::VkContext& ctx);
     void prepare(rhi::VkContext& ctx, const Camera& camera, const ephemeris::SystemSnapshot& system,
-                 const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count);
+                 const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count,
+                 const rendering::RefractionHost* refraction = nullptr);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene);
     void bake(VkCommandBuffer cmd, rhi::VkContext& ctx) { cache_.bake(cmd, ctx); }
     bool covers(uint32_t body) const noexcept;

@@ -1,6 +1,7 @@
 #version 460
 
 #include "common/celestial_scene.glsl"
+#include "common/refraction.glsl"
 
 #ifdef TERRAIN_CACHED_FP64
 #define TerrainScalar double
@@ -46,6 +47,7 @@ layout(location = 4) flat out uint f_body_idx;
 layout(location = 5) flat out vec4 f_tile_color;
 layout(location = 6) out vec2 f_tile_uv;
 layout(location = 7) out vec3 f_base_chord;
+layout(location = 8) out vec3 f_apparent_pos;
 
 TerrainVector parent_vertex(uint first, uvec2 grid, uint stride, bool direction) {
     uvec2 origin = min(grid / stride * stride, uvec2(16u - stride));
@@ -100,10 +102,13 @@ void main() {
     vec3 color = 0.25 + 0.65 * vec3(hash & 255u, (hash >> 8u) & 255u, (hash >> 16u) & 255u) / 255.0;
     f_tile_color = vec4(color, float(tile.metadata.w));
     f_tile_uv = vec2(grid) / 16.0;
-    gl_Position = u_scene.projection * vec4(vec3(eye), 1.0);
+    vec3 apparent = refract_position(f_world_pos);
+    f_apparent_pos = apparent;
+    vec3 shift = mat3(u_scene.view) * (apparent - f_world_pos);
+    gl_Position = u_scene.projection * vec4(vec3(eye) + shift, 1.0);
 #if defined(TERRAIN_PRECISE_PROJECTION) || defined(TERRAIN_CACHED_FP64)
     dvec3 precise_eye = dvec3(tile.anchor_high.xyz) + dvec3(tile.anchor_low.xyz)
-        + dmat3(rotation) * dvec3(point) * double(tile.anchor_high.w);
+        + dmat3(rotation) * dvec3(point) * double(tile.anchor_high.w) + dvec3(shift);
     gl_Position = vec4(dmat4(u_scene.projection) * dvec4(precise_eye, 1.0));
 #endif
 }

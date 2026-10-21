@@ -63,6 +63,8 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
     };
     reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     desc.vert_path = "terrain/terrain.vert";
@@ -135,7 +137,8 @@ bool TerrainRenderer::covers(uint32_t body) const noexcept {
 }
 
 void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const ephemeris::SystemSnapshot& system,
-                              const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count) {
+                              const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count,
+                              const rendering::RefractionHost* refraction) {
     prepared_.clear();
     covered_.assign(body_count, 0);
     relief_extents_.clear();
@@ -149,13 +152,16 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     std::vector<HeightStream*> retained_streams;
     double tan_y = std::tan(camera.fov_deg * DEG_TO_RAD * 0.5);
     double focal = std::max(1u, extent.height) / (2.0 * tan_y);
+    int refraction_body = refraction ? refraction->body : -1;
+    double refraction_pad = refraction_body >= 0 ? refraction->max_displacement : 0.0;
+    auto padded = [&](double tangent) { return refraction_pad > 0.0 ? std::tan(std::min(std::atan(tangent)+refraction_pad, 1.5)) : tangent; };
     auto eye = camera.eye_pos_render();
     auto world_to_view = camera.view_rotation_double();
     SelectionView body_view;
     body_view.eye = {0, 0, 0};
     body_view.view_from_local = world_to_view;
-    body_view.tan_half_fov_y = tan_y;
-    body_view.tan_half_fov_x = tan_y*std::max(1u, extent.width)/std::max(1u, extent.height);
+    body_view.tan_half_fov_y = padded(tan_y);
+    body_view.tan_half_fov_x = padded(tan_y*std::max(1u, extent.width)/std::max(1u, extent.height));
     std::vector<std::pair<double, uint32_t>> candidates;
     for (uint32_t i = 0; i < body_count; ++i) {
         const auto& body = system.body(i);
@@ -196,11 +202,14 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         SelectionView view;
         view.eye = glm::transpose(rotation) * (-center / radius);
         view.view_from_local = world_to_view * rotation;
-        view.tan_half_fov_y = tan_y;
-        view.tan_half_fov_x = tan_y * std::max(1u, extent.width) / std::max(1u, extent.height);
+        view.tan_half_fov_y = padded(tan_y);
+        view.tan_half_fov_x = padded(tan_y * std::max(1u, extent.width) / std::max(1u, extent.height));
         view.focal_pixels = focal;
         view.target_error_pixels = settings.terrain_error_pixels;
         view.polar_ratio = std::clamp(1.0 - body.definition.oblateness, 0.05, 1.0);
+        if (int(i) == refraction_body) {
+            view.occluder_scale = std::clamp(refraction->lowest_visible_chord_km/std::max(refraction->ground_radius_km, 1e-9), 0.0, 1.0);
+        }
         bool synthetic = settings.terrain_enabled && !body.definition.atmosphere.pressure_reference && !body.definition.is_black_hole &&
             body.definition.type != "Gas Giant" && body.definition.type != "Ice Giant";
         view.height_amplitude = synthetic ? std::min(double(settings.terrain_height_km)/(radius*AU_TO_KM), 0.01) : 0.0;

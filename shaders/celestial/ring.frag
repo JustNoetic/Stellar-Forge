@@ -1,6 +1,8 @@
 #version 460
 
+#ifdef TRANSPARENCY_CAPTURE
 layout(early_fragment_tests) in;
+#endif
 
 layout(location = 0) in vec3 f_local_pos;
 layout(location = 1) in vec3 f_normal;
@@ -16,6 +18,7 @@ layout(location = 0) out vec4 out_color;
 #include "common/surface_ring_shadow.glsl"
 #include "common/ring_optics.glsl"
 #include "common/ring_push.glsl"
+#include "common/ring_refraction.glsl"
 
 layout(set = 0, binding = 8) uniform sampler2DArray u_ring_gradients;
 
@@ -52,11 +55,16 @@ void main() {
     vec3 host_center = ring_hosts[f_host_idx].center_min_r.xyz;
     vec3 pole_n = normalize(f_normal);
 
-    vec3 ray_dir = normalize(f_local_pos + host_center);
+    vec3 ray_dir, hit_local, apparent_pos;
+    float pixel_angle = 1.0/max(u_scene.screen_params.y*u_scene.screen_params.z, 1.0);
+    if (!ring_refracted_hit(f_local_pos, host_center, pole_n, pixel_angle, hit_local, ray_dir, apparent_pos)) discard;
     float d_n = dot(ray_dir, pole_n);
-    float t_local = abs(d_n) > 1e-7 ? (-dot(f_local_pos, pole_n) / d_n) : 0.0;
-    vec3 hit_local = f_local_pos + ray_dir * t_local;
     vec3 hit_pos = host_center + hit_local;
+    vec4 clip = u_scene.view_proj*vec4(apparent_pos, 1.0);
+    if (clip.w <= 0.0) discard;
+    float fragment_depth = refraction_active() ? clip.z/clip.w : gl_FragCoord.z;
+    if (fragment_depth < 0.0 || fragment_depth > 1.0) discard;
+    gl_FragDepth = fragment_depth;
 
     float r = length(hit_local);
     float footprint = fwidth(r);
@@ -168,6 +176,6 @@ void main() {
     float fade_scale = faded_alpha / max(1e-12, physical_alpha);
     out_color = vec4(final_color * fade_scale, faded_alpha);
 #ifdef TRANSPARENCY_CAPTURE
-    if (capture_transparency(out_color)) out_color = vec4(0.0);
+    if (capture_transparency(out_color, fragment_depth)) out_color = vec4(0.0);
 #endif
 }

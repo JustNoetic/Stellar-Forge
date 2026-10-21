@@ -13,6 +13,7 @@ void TransparencyRenderer::init(rhi::VkContext& ctx) {
         {15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT}};
     clear_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/clear.comp", bindings, sizeof(uint32_t));
     bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT});
+    bindings.push_back({3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT});
     resolve_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/resolve.comp", bindings);
     for (auto& buffer : counters_) buffer = ctx.create_host_buffer(16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
@@ -72,14 +73,16 @@ std::array<rhi::PushDescriptorWrite, 2> TransparencyRenderer::writes() const {
             rhi::PushDescriptorWrite::storage_buffer(15, fragments_)};
 }
 
-void TransparencyRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color) {
+void TransparencyRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
     if (!active_) return;
     auto timer = ctx.begin_gpu_timer(cmd, "transparency_resolve");
     ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL);
+    ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     ctx.memory_barrier(cmd);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_.handle);
     auto resources = writes();
-    rhi::PushDescriptorWrite descriptors[] = {resources[0], resources[1], rhi::PushDescriptorWrite::storage_image(4, color)};
+    rhi::PushDescriptorWrite descriptors[] = {resources[0], resources[1], rhi::PushDescriptorWrite::storage_image(4, color),
+        rhi::PushDescriptorWrite::sampled_image(3, depth, ctx.sampler_nearest_clamp())};
     ctx.push_descriptors(cmd, resolve_, descriptors);
     vkCmdDispatch(cmd, (color.extent.width+7)/8, (color.extent.height+7)/8, 1);
     ctx.memory_barrier(cmd);

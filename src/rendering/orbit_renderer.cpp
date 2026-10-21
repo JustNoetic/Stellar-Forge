@@ -24,7 +24,10 @@ void OrbitRenderer::init(rhi::VkContext& ctx) {
     rhi::GraphicsPipelineDesc desc;
     desc.vert_path = "celestial/orbit.vert";
     desc.frag_path = "celestial/orbit.frag";
-    desc.bindings = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1}};
+    refraction_fallback_.init(ctx);
+    desc.bindings = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+                     {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+                     {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1}};
     desc.push_constant_size = sizeof(OrbitPush);
     desc.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     desc.bresenham_lines = true;
@@ -45,11 +48,13 @@ void OrbitRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, transparency_pipeline_);
     for (auto& buffer : buffers_) ctx.destroy_buffer(buffer);
+    refraction_fallback_.shutdown(ctx);
 }
 
 void OrbitRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                             const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
-                            std::span<const rhi::PushDescriptorWrite> transparency_writes) {
+                            std::span<const rhi::PushDescriptorWrite> transparency_writes,
+                            std::span<const rhi::PushDescriptorWrite> refraction_writes) {
     if (!settings.show_orbits || sys.empty()) return;
     if (generation_ != sys.generation() || state_revision_ != sys.state_revision() || definition_revision_ != sys.definition_revision() ||
         hierarchy_revision_ != sys.hierarchy_revision()) {
@@ -92,6 +97,9 @@ void OrbitRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camer
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
     std::vector<rhi::PushDescriptorWrite> writes{rhi::PushDescriptorWrite::storage_buffer(0, buffer)};
     writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
+    auto fallback = refraction_fallback_.writes(ctx);
+    if (refraction_writes.empty()) refraction_writes = fallback;
+    writes.insert(writes.end(), refraction_writes.begin(), refraction_writes.end());
     ctx.push_descriptors(cmd, pipeline, writes);
     ctx.push_constants(cmd, pipeline, push);
     vkCmdDraw(cmd, settings.orbit_segments + 1, count, 0, 0);

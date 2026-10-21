@@ -105,7 +105,7 @@ public:
         scale_ = {1, 1/view.polar_ratio, 1};
         eye_ = view.eye*scale_;
         double distance = glm::length(eye_);
-        double occluder = 1.0-view.height_amplitude*(1.0+RELIEF_ROUNDING)/view.polar_ratio;
+        double occluder = (1.0-view.height_amplitude*(1.0+RELIEF_ROUNDING)/view.polar_ratio)*view.occluder_scale;
         if (occluder > 0.0 && distance > occluder) {
             axis_ = -eye_/distance;
             sine_ = occluder/distance;

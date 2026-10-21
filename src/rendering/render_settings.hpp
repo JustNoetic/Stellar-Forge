@@ -32,6 +32,7 @@ struct RenderSettings {
     bool transparency_reference_legacy = false;
     bool show_atmospheres = true;
     bool aerial_perspective_enabled = true;
+    bool refraction_enabled = true;
     bool atmosphere_dual_source = false;
     bool atmosphere_surface_lighting = true;
     bool atmosphere_shadows_enabled = true;

@@ -17,7 +17,7 @@ public:
     void init(rhi::VkContext& ctx);
     void shutdown(rhi::VkContext& ctx);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, VkExtent2D extent, bool enabled);
-    void resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color);
+    void resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth);
     bool active() const noexcept { return active_; }
     std::array<rhi::PushDescriptorWrite, 2> writes() const;
     const rhi::Buffer& fragments() const noexcept { return fragments_; }

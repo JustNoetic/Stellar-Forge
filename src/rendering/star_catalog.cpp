@@ -155,6 +155,8 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
     };
     cull_pipeline_ = rhi::ShaderCache::create_compute_pipeline(
         ctx, "celestial/starfield_cull.comp", cull_bindings, sizeof(StarfieldPushConstants));
@@ -165,6 +167,8 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
     desc.bindings = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
     };
     desc.push_constant_size = sizeof(StarfieldPushConstants);
     desc.color_formats = {VK_FORMAT_R16G16B16A16_SFLOAT};
@@ -176,6 +180,7 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
     desc.cull_mode = VK_CULL_MODE_NONE;
 
     pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+    refraction_fallback_.init(ctx);
     loaded_ = true;
 
     sf::log::info("Loaded {} Gaia DR3 stars into GPU SSBO ({:.1f} MB)", count_,
@@ -184,6 +189,7 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
 }
 
 void StarCatalog::shutdown(rhi::VkContext& ctx) {
+    if (loaded_) refraction_fallback_.shutdown(ctx);
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, cull_pipeline_);
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
@@ -229,7 +235,8 @@ StarfieldPushConstants make_push_constants(const Camera& cam, units::Years sim_t
 } // namespace
 
 void StarCatalog::cull(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                       units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) {
+                       units::Years sim_time, const RenderSettings& settings, VkExtent2D extent,
+                       std::span<const rhi::PushDescriptorWrite> refraction_writes) {
     if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
         return;
     }
@@ -254,7 +261,13 @@ void StarCatalog::cull(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& c
         rhi::PushDescriptorWrite::storage_buffer(0, star_ssbo_),
         rhi::PushDescriptorWrite::storage_buffer(1, indirect_buf),
         rhi::PushDescriptorWrite::storage_buffer(2, visible_buf),
+        {},
+        {},
     };
+    auto fallback = refraction_fallback_.writes(ctx);
+    if (refraction_writes.empty()) refraction_writes = fallback;
+    writes[3] = refraction_writes[0];
+    writes[4] = refraction_writes[1];
     ctx.push_descriptors(cmd, cull_pipeline_, writes);
     ctx.push_constants(cmd, cull_pipeline_, pc);
 
@@ -270,7 +283,8 @@ void StarCatalog::cull(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& c
 }
 
 void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                         units::Years sim_time, const RenderSettings& settings, VkExtent2D extent) const {
+                         units::Years sim_time, const RenderSettings& settings, VkExtent2D extent,
+                         std::span<const rhi::PushDescriptorWrite> refraction_writes) const {
     if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
         return;
     }
@@ -285,7 +299,13 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::storage_buffer(0, star_ssbo_),
         rhi::PushDescriptorWrite::storage_buffer(1, visible_buf),
+        {},
+        {},
     };
+    auto fallback = refraction_fallback_.writes(ctx);
+    if (refraction_writes.empty()) refraction_writes = fallback;
+    writes[2] = refraction_writes[0];
+    writes[3] = refraction_writes[1];
     ctx.push_descriptors(cmd, pipeline_, writes);
     ctx.push_constants(cmd, pipeline_, pc);
     vkCmdDrawIndirect(cmd, indirect_buf.handle, 0, 1, sizeof(VkDrawIndirectCommand));

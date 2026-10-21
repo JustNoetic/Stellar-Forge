@@ -43,6 +43,7 @@ struct SelectionView {
     double target_error_pixels = 2.0;
     double polar_ratio = 1.0;
     double height_amplitude = 0.0;
+    double occluder_scale = 1.0;
     uint32_t max_level = MAX_LEVEL;
     uint32_t max_patches = 1024;
     bool cull = true;

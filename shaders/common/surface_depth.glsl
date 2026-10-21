@@ -1,4 +1,4 @@
-float curved_surface_depth(BodyInstanceGPU b, vec3 world_pos, vec3 base_chord, float depth) {
+float curved_surface_depth(BodyInstanceGPU b, vec3 world_pos, vec3 apparent_pos, vec3 base_chord, float depth) {
     vec3 pole = body_pole(b);
     float flattening = 1.0/max(1.0-b.pole_oblateness.w, 0.05)-1.0;
     vec3 origin = -b.pos_radius.xyz/b.pos_radius.w;
@@ -15,7 +15,7 @@ float curved_surface_depth(BodyInstanceGPU b, vec3 world_pos, vec3 base_chord, f
     if (curvature > 1e-7 && discriminant >= 0.0 && dot(point, scaled_ray) < 0.0) {
         float distance = (-dot(origin, scaled_ray)-sqrt(discriminant))/a;
         if (distance > 0.0) {
-            vec4 projected = u_scene.view_proj*vec4(ray*(distance*b.pos_radius.w), 1.0);
+            vec4 projected = u_scene.view_proj*vec4(normalize(apparent_pos)*(distance*b.pos_radius.w), 1.0);
             return max(depth, clamp(projected.z/projected.w, 0.0, 1.0));
         }
     }

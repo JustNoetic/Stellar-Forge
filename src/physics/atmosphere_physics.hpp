@@ -2,6 +2,7 @@
 
 #include "ephemeris/atmosphere.hpp"
 #include "physics/particle_optics.hpp"
+#include "physics/atmosphere_refraction.hpp"
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -117,7 +118,87 @@ struct PreparedAtmosphere {
     glm::vec3 mie_scattering{}, mie_extinction{};
     float mie_scale_height_km = 1.2f, mie_asymmetry = .8f;
     std::vector<PreparedAerosol> aerosols;
+    std::shared_ptr<const PreparedRefraction> refraction;
 };
+
+inline constexpr size_t REFRACTION_PROFILE_SAMPLES = 1024;
+
+inline std::shared_ptr<const PreparedRefraction> prepare_atmosphere_refraction(const PreparedAtmosphere& prepared) {
+    const auto& a = prepared.inputs;
+    if (!a.physical || !(a.pressure_pa > 0) || !(prepared.surface.number_density_m3 > 0)) return nullptr;
+    RefractionInput input;
+    input.radius_km = prepared.radius_km;
+    input.scale_km = prepared.profile_domain.z;
+    input.top_km = prepared.height_km;
+    double profile_minimum = input.scale_km*std::sinh(double(prepared.profile_domain.x));
+    if (a.pressure_reference) input.bottom_km = input.ground_km = std::max(prepared.opaque_altitude_km, profile_minimum);
+    else {
+        input.ground_km = 0;
+        input.bottom_km = std::max(profile_minimum, -12.0);
+    }
+    if (!(input.top_km > input.ground_km)) return nullptr;
+    double total = 0, lorentz_lorenz = 0;
+    for (const auto& [_, weight] : a.composition) total += weight;
+    for (const auto& gas : ATMOSPHERIC_GASES) {
+        auto entry = a.composition.find(gas.name);
+        if (entry == a.composition.end()) continue;
+        double n2 = gas.refractive_index*gas.refractive_index;
+        lorentz_lorenz += entry->second/total*(n2-1)/(n2+2);
+    }
+    lorentz_lorenz *= prepared.surface.number_density_m3/(101325.0/(BOLTZMANN*273.15));
+    input.lorentz_lorenz = lorentz_lorenz*standard_air_dispersion();
+    double s0 = std::asinh(input.bottom_km/input.scale_km), s1 = std::asinh(input.top_km/input.scale_km);
+    std::vector<double> heights(REFRACTION_PROFILE_SAMPLES);
+    for (size_t i = 0; i < heights.size(); ++i)
+        heights[i] = input.scale_km*std::sinh(s0+(s1-s0)*double(i)/double(heights.size()-1));
+    double gravity = prepared.surface.gravity_m_s2, radius = prepared.radius_km;
+    double coefficient = mixture_molar_mass(a)*gravity*1000/GAS_CONSTANT;
+    auto derivative = [&](double z) {
+        double factor = radius/(radius+z);
+        return -coefficient*factor*factor/atmosphere_temperature(a, z);
+    };
+    auto integrate = [&](double from, double to) {
+        std::vector<double> cuts{from};
+        for (auto knot : a.temperature_layers)
+            if ((knot.x-from)*(knot.x-to) < 0) cuts.push_back(knot.x);
+        cuts.push_back(to);
+        std::sort(cuts.begin(), cuts.end(), [&](double x, double y) { return to > from ? x < y : x > y; });
+        double sum = 0;
+        for (size_t k = 1; k < cuts.size(); ++k) {
+            int count = std::max(1, int(std::ceil(std::abs(cuts[k]-cuts[k-1])/.25)));
+            double step = (cuts[k]-cuts[k-1])/count;
+            for (int j = 0; j < count; ++j) {
+                double z = cuts[k-1]+j*step;
+                sum += step*(derivative(z)+4*derivative(z+.5*step)+derivative(z+step))/6;
+            }
+        }
+        return sum;
+    };
+    std::vector<double> log_pressure(heights.size());
+    size_t origin = size_t(std::lower_bound(heights.begin(), heights.end(), 0.0)-heights.begin());
+    if (a.temperature_layers.empty()) {
+        for (size_t i = 0; i < heights.size(); ++i)
+            log_pressure[i] = hydrostatic_log_pressure(a, gravity, radius, heights[i]);
+    } else {
+        double previous = 0, value = 0;
+        for (size_t i = origin; i < heights.size(); ++i) {
+            value += integrate(previous, heights[i]);
+            previous = heights[i];
+            log_pressure[i] = value;
+        }
+        previous = 0;
+        value = 0;
+        for (size_t i = origin; i-- > 0;) {
+            value += integrate(previous, heights[i]);
+            previous = heights[i];
+            log_pressure[i] = value;
+        }
+    }
+    input.log_density.resize(heights.size());
+    for (size_t i = 0; i < heights.size(); ++i)
+        input.log_density[i] = log_pressure[i]+std::log(a.temperature_k/atmosphere_temperature(a, heights[i]));
+    return std::make_shared<const PreparedRefraction>(prepare_refraction(std::move(input)));
+}
 
 inline std::shared_ptr<const PreparedAtmosphere> prepare_atmosphere(const ephemeris::AtmosphereDefinition& a,
                                                                    double mass_solar, double radius_km) {
@@ -201,6 +282,7 @@ inline std::shared_ptr<const PreparedAtmosphere> prepare_atmosphere(const epheme
         double t = atmosphere_temperature(a, height);
         result->log_density[i].x = float(hydrostatic_log_pressure(a, result->surface.gravity_m_s2, radius_km, height)+std::log(a.temperature_k/t));
     }
+    result->refraction = prepare_atmosphere_refraction(*result);
     return result;
 }
 

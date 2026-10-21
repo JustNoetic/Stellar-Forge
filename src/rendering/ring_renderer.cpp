@@ -10,7 +10,7 @@
 namespace sf::rendering {
 
 void RingRenderer::init(rhi::VkContext& ctx) {
-    build_annulus_mesh(ctx, RING_ANGULAR_SEGMENTS, RING_RADIAL_SUBDIVISIONS);
+    mesh_ = build_annulus_mesh(ctx, RING_ANGULAR_SEGMENTS, RING_RADIAL_SUBDIVISIONS);
 
     std::vector<RingHostGPU> empty_hosts(MAX_RING_HOSTS);
     for (auto& buf : host_ssbos_) {
@@ -52,6 +52,11 @@ void RingRenderer::init(rhi::VkContext& ctx) {
         {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     desc.push_constant_size = sizeof(uint32_t) * 4;
     desc.depth_test = true;
@@ -138,11 +143,11 @@ void RingRenderer::shutdown(rhi::VkContext& ctx) {
     for (auto& buf : host_ssbos_) {
         ctx.destroy_buffer(buf);
     }
-    ctx.destroy_buffer(ibo_);
-    ctx.destroy_buffer(vbo_);
+    ctx.destroy_buffer(mesh_.indices);
+    ctx.destroy_buffer(mesh_.vertices);
 }
 
-void RingRenderer::build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segments, uint32_t radial_subdivisions) {
+RingRenderer::AnnulusMesh RingRenderer::build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segments, uint32_t radial_subdivisions) {
     std::vector<glm::vec3> verts;
     std::vector<uint32_t> indices;
     verts.reserve(static_cast<size_t>(angular_segments + 1) * (radial_subdivisions + 1));
@@ -174,9 +179,11 @@ void RingRenderer::build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segm
         }
     }
 
-    index_count_ = static_cast<uint32_t>(indices.size());
-    vbo_ = ctx.create_device_buffer(verts.size() * sizeof(glm::vec3), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts.data());
-    ibo_ = ctx.create_device_buffer(indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data());
+    AnnulusMesh mesh;
+    mesh.index_count = static_cast<uint32_t>(indices.size());
+    mesh.vertices = ctx.create_device_buffer(verts.size() * sizeof(glm::vec3), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, verts.data());
+    mesh.indices = ctx.create_device_buffer(indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data());
+    return mesh;
 }
 
 void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count) {
@@ -304,7 +311,8 @@ void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, co
 }
 
 void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                           const ephemeris::SystemSnapshot& sys, uint32_t body_count) {
+                           const ephemeris::SystemSnapshot& sys, uint32_t body_count, int refraction_body) {
+    refraction_body_ = refraction_body;
     if (force_rebuild_ || cached_definition_.get() != &sys.definition() ||
         cached_generation_ != sys.generation() || cached_definition_revision_ != sys.definition_revision()) {
         rebuild_profiles(cmd, ctx, sys, body_count);
@@ -389,10 +397,6 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[bound_pipeline].handle);
     ctx.push_descriptors(cmd, pipelines[bound_pipeline], writes);
 
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_.handle, &offset);
-    vkCmdBindIndexBuffer(cmd, ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
-
     std::vector<uint32_t> order(active_host_count_);
     for (uint32_t i = 0; i < active_host_count_; ++i) order[i] = i;
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
@@ -412,14 +416,19 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
             vkCmdDrawIndexed(cmd, count, 1, first, 0, 0);
         };
         const auto& host = hosts_gpu_[host_idx];
+        bool refracted = refraction_body_ >= 0;
+        const auto& mesh = mesh_;
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertices.handle, &offset);
+        vkCmdBindIndexBuffer(cmd, mesh.indices.handle, 0, VK_INDEX_TYPE_UINT32);
         auto classification = classify_ring_draw(glm::vec3(host.center_min_r), glm::vec3(host.pole_max_r), host.pole_max_r.w, stars);
         if (stars.size() != 1 && classification.lighting != RingLightingMode::FiniteSource)
             classification.lighting = RingLightingMode::Point;
         uint32_t pipeline_base = settings.ring_reference_finite_source ? 4u : uint32_t(classification.lighting) * 4u;
-        if (settings.ring_reference_full_annulus || !classification.radial_ranges) {
+        if (refracted || settings.ring_reference_full_annulus || !classification.radial_ranges) {
             uint32_t packed = 0;
             for (uint32_t s = 0; s < host.counts_indices.z; ++s) packed |= s << (s * 3u);
-            draw(0, index_count_, packed, host.counts_indices.z, pipeline_base + 3u);
+            draw(0, mesh.index_count, packed, host.counts_indices.z, pipeline_base + 3u);
         } else {
             for (const auto& range : host_draw_ranges_[host_idx])
                 draw(range.first_index, range.index_count, range.packed_segments, range.segment_count,

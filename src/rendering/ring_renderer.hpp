@@ -40,7 +40,7 @@ public:
     void shutdown(rhi::VkContext& ctx);
 
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                 const ephemeris::SystemSnapshot& sys, uint32_t body_count);
+                 const ephemeris::SystemSnapshot& sys, uint32_t body_count, int refraction_body = -1);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
                 std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
                 std::span<const rhi::PushDescriptorWrite> transparency_writes = {});
@@ -104,13 +104,16 @@ private:
         RingshineTileKey key{};
     };
 
-    void build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segments, uint32_t radial_subdivisions);
+    struct AnnulusMesh {
+        rhi::Buffer vertices{}, indices{};
+        uint32_t index_count = 0;
+    };
+    AnnulusMesh build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segments, uint32_t radial_subdivisions);
     void rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count);
     void bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingshineJob& job);
 
-    rhi::Buffer vbo_{};
-    rhi::Buffer ibo_{};
-    uint32_t index_count_ = 0;
+    AnnulusMesh mesh_{};
+    int refraction_body_ = -1;
 
     std::array<rhi::Pipeline, 16> pipelines_{};
     std::array<rhi::Pipeline, 16> transparency_pipelines_{};

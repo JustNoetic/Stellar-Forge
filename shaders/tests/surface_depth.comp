@@ -14,5 +14,5 @@ void main() {
     vec3 position = vec3(0.0, 0.0, local_z - 2.0);
     vec4 projected = u_scene.view_proj * vec4(position, 1.0);
     float original = projected.z / projected.w;
-    depths[index] = vec4(curved_surface_depth(b, position, vec3(0.0, 0.0, local_z), original), original, 0.0, 0.0);
+    depths[index] = vec4(curved_surface_depth(b, position, position, vec3(0.0, 0.0, local_z), original), original, 0.0, 0.0);
 }

@@ -19,7 +19,7 @@ uvec2 pack_transparent_color(vec4 color) {
 }
 
 #ifdef TRANSPARENCY_CAPTURE
-bool capture_transparency(vec4 color) {
+bool capture_transparency(vec4 color, float depth) {
     if (color.a <= 0.0) return true;
     uint index = atomicAdd(fragment_count, 1u);
     if (index >= fragment_capacity) {
@@ -27,7 +27,9 @@ bool capture_transparency(vec4 color) {
         return false;
     }
     uint previous = imageAtomicExchange(transparency_heads, ivec2(gl_FragCoord.xy), index);
-    fragments[index] = uvec4(pack_transparent_color(color), floatBitsToUint(gl_FragCoord.z), previous);
+    fragments[index] = uvec4(pack_transparent_color(color), floatBitsToUint(depth), previous);
     return true;
 }
+
+bool capture_transparency(vec4 color) { return capture_transparency(color, gl_FragCoord.z); }
 #endif
