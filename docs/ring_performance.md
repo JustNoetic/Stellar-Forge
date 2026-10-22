@@ -1,5 +1,59 @@
 # Ring rendering performance
 
+## Planetshine cost correction (2026-10-21)
+
+The first planetshine implementation evaluated the full RGB ring response for four
+host disk samples per star and up to four external sources, for every active material
+at every fragment. This repeated multiple-scattering, opposition, phase and slab
+calculations and passed the local material sample array through the secondary helper.
+Copying the 224-byte body record into a dynamically indexed shader local added further
+compiler pressure. Correctness tests did not expose the resulting timing regression.
+
+The revised path computes smooth incident light in `ring.vert`, using the existing
+128×32 annulus mesh and `common/ring_planetshine.glsl`. It accumulates RGB flux and
+luminance-weighted direction moments separately on the two physical faces, then
+interpolates four vectors. Host directions are evaluated only per vertex; the subsequent
+crescent correction replaces the fixed four samples with two phase-aware disk lobes.
+Refraction solves the physical lighting position at vertices and exposes its table
+samplers to the vertex stage; upload/observer barriers cover both graphics stages.
+
+Fragments evaluate at most two single-scattering slab transfers, shared by all active
+layers. Layers retain sampled linear colors, optical-depth weights, unlit-side factors
+and the DHG phase, broadened using the host angular size. Secondary light omits the
+empirical multiple-scattering and opposition terms. Direct stellar scattering is
+unchanged. This trades secondary angular detail and multiple scattering for lower cost;
+it is not an equivalent numerical optimization of the original secondary response.
+
+RTX 4060 Ti, 1920×1080 Saturn close-ups, serialized offscreen ring GPU timestamps:
+
+| View | Initial shine off | Initial shine on | Revised shine off | Revised shine on |
+|---|---:|---:|---:|---:|
+| Lit | 0.230 ms | 0.952 ms | 0.216 ms | 0.286 ms |
+| Transmitted | 0.222 ms | 0.779 ms | 0.196 ms | 0.260 ms |
+
+The incremental shine cost drops from 0.56–0.72 ms to 0.065–0.070 ms in these fixtures.
+These are medians across three alternating-order on/off repetitions, with 30 warmup
+and 70 measured frames per repetition. Atmospheres, ringshine, surface textures and
+ring shadows are disabled to isolate this path. This is ring GPU time, not application
+FPS or a universal overhead bound. The timing helper uses ordinary premultiplied
+rasterization and excludes the OIT resolve; OIT is checked separately for correctness.
+Captures include both on and off modes with the
+same shader. Intermediate full-scattering face grouping measured 0.474/0.429 ms;
+moving that grouping to vertices measured 0.369/0.341 ms before simplifying the
+secondary scattering response.
+
+Local reports and initial shader snapshots are in `tests/shine-perf/` and `tests/`.
+Reproduce with `StellarRenderingTests --shine-ring-benchmark tests/shine-perf/new.json`;
+the output must not exist. `--shine-only` verifies all secondary-light consumers and
+both atmosphere composition paths; `--rings-only` checks the 60 direct-light reference
+views, material filtering, eclipses, radiometry and ringshine.
+
+Vulkan-validation runs of both suites pass. The broader refraction GPU run passes the
+observer, sunrise, terrain, globe, zoomed limb and narrow Saturn ring checks, but fails
+`background_ring_pixel_contracts` at zero visible ring flux. Restoring both saved
+pre-optimization ring shaders reproduces that same failure; it is not evidence of a
+regression introduced by this optimization. That background-ring issue remains open.
+
 The first optimization changed the annulus shaders to read individual SSBO fields
 instead of copying a complete `RingHostGPU` into a local variable or a function
 argument. The original host was 976 bytes, including eight segments and sixteen
@@ -268,6 +322,10 @@ the previous 0.197 ms lit repeat. Occluded and distant ring passes remain around
 and a before/after crop are retained in `scratch/ring-filtering/`.
 
 ## Surface ring-host candidates
+
+The box-filter timings below describe the earlier implementation. The current
+default uses a tunable distance-dependent blur; see
+[ring shadow blur](ring_shadows.md) for its algorithm and verification.
 
 Surface ring shadows now build one host bit mask per body/star pair on the CPU.
 Masks are appended to the existing binding-2 eclipse buffer; the scene UBO records

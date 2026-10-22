@@ -297,8 +297,10 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
         prev_spin_track_idx = -1;
     }
 
-    if (horizon_align && is_near_surface) {
-        double align_strength = 1.0 - (reference_altitude_au / ROT_FOLLOW_ALT_AU);
+    horizon_settling = false;
+    horizon_roll_error_deg = 0.0;
+    if (horizon_align && is_near_surface && dt_sec > 0.0 && !key_q && !key_e) {
+        double align_strength = std::clamp(1.0-reference_altitude_au/ROT_FOLLOW_ALT_AU, 0.0, 1.0);
         glm::dvec3 fwd_al = forward_dir();
         glm::dvec3 local_up = oblate_surface_normal(cam_pos_rel, track_f, track_pole);
         glm::dvec3 target_up = local_up - glm::dot(local_up, fwd_al) * fwd_al;
@@ -307,14 +309,15 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
             target_up /= nt;
             glm::dvec3 cur_up = up_dir();
             double c_dot = std::clamp(glm::dot(cur_up, target_up), -1.0, 1.0);
-            double angle = std::acos(c_dot);
-            if (angle > 1e-6) {
-                glm::dvec3 rot_axis = glm::cross(cur_up, target_up);
-                if (glm::dot(rot_axis, fwd_al) < 0.0) {
-                    angle = -angle;
-                }
-                double d_ang = angle * std::min(1.0, 1.5 * align_strength * dt_sec);
-                up = glm::normalize(rodrigues_rotation(fwd_al, d_ang) * cur_up);
+            double angle = std::atan2(glm::dot(fwd_al, glm::cross(cur_up, target_up)), c_dot);
+            double remaining = std::abs(angle)*std::exp(-(8.0+4.0*align_strength)*dt_sec);
+            if (remaining <= 1e-5) {
+                up = target_up;
+            } else {
+                double d_ang = angle*-std::expm1(-(8.0+4.0*align_strength)*dt_sec);
+                up = glm::normalize(rodrigues_rotation(fwd_al, d_ang)*cur_up);
+                horizon_settling = true;
+                horizon_roll_error_deg = remaining*RAD_TO_DEG;
             }
         }
     }

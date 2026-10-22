@@ -27,6 +27,8 @@ struct Camera {
     bool cam_look_aim = true;
     bool horizon_align = true;
     bool is_near_surface = false;
+    bool horizon_settling = false;
+    double horizon_roll_error_deg = 0.0;
 
     int tracking_idx = 0;
     bool tracking_barycenter = false;

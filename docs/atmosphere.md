@@ -18,6 +18,11 @@ Sky directions use a radial camera basis independent of view orientation. Inside
 
 Camera/body subtraction and the radial basis are computed in double precision before packing kilometres to float. Resources are lazy; body-owned cache slots are independent of the far-to-near composition list. All visible cache entries are reserved before assigning misses. Recently hidden entries remain resident within a 256 MiB table-payload budget, with least-recently-used inactive entries reused on pressure; stale system identities are reused first. Simultaneously visible atmospheres may exceed that budget, and allocated resources retain that high-water mark to avoid destroying resources in flight. Surface-irradiance array layers have separate stable ownership; layer reassignment rebuilds only surface irradiance. Optical cache identity retains the immutable system definition and includes generation, body index, geometry/lighting revisions, radii and coefficients. Sky and aerial cache identities add altitude and local star directions, apparent angular radii and irradiance. Their angular domain is independent of view orientation, projection and viewport resolution. Uniform buffers are separate for each frame in flight; LUT access stays ordered on the graphics queue. Rotation, FOV changes and exposure reuse both tables; translation rebuilds them when altitude or local lighting changes. Scene depth, terrain LOD and unrelated object motion are excluded from all transport cache keys. Atmospheres below half a pixel projected radius skip preparation and composition.
 
+Atmospheric scattering currently includes stellar illumination only. Planetshine and
+ringshine are applied to surfaces and rings; their atmospheric scattering paths and
+experimental secondary-radiance LUTs were removed. There are no additional atmospheric
+shine images, source uploads, or cache dependencies. See [secondary lighting](secondary_lighting.md).
+
 ## Finite-distance aerial perspective
 
 The aerial LUT uses the cumulative angular-column approach inspected in KSA's `AerialPerspectiveLut.comp` and `AtmosphereLuts.glsl`. Its XY domain shares the sky-view mapping: azimuth and horizon-focused zenith angle, with separate ground/sky halves and a compressed orbital limb. Camera rotation and FOV changes therefore do not move the integration grid.

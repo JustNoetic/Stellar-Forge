@@ -7,6 +7,8 @@ struct BodyInstanceGPU {
     vec4 pole_color_lum;
     vec4 spin_flags;
     uvec4 surface_flags;
+    vec4 shine_direction[4];
+    vec4 shine_irradiance[4];
 };
 
 layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {

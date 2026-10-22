@@ -8,6 +8,11 @@ layout(location = 0) in vec3 f_local_pos;
 layout(location = 1) in vec3 f_normal;
 layout(location = 2) flat in uint f_host_idx;
 
+layout(location = 3) in vec3 f_shine_top;
+layout(location = 4) in vec3 f_shine_bottom;
+layout(location = 5) in vec3 f_shine_top_direction;
+layout(location = 6) in vec3 f_shine_bottom_direction;
+
 layout(location = 0) out vec4 out_color;
 #ifdef TRANSPARENCY_CAPTURE
 #include "common/transparency.glsl"
@@ -50,6 +55,7 @@ RingSample sample_ring_segment(RingSegmentGPU seg, float r, float footprint) {
     s.tau = ring_tau(s.alpha);
     return s;
 }
+
 
 void main() {
     vec3 host_center = ring_hosts[f_host_idx].center_min_r.xyz;
@@ -169,6 +175,38 @@ void main() {
 
         float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (dist_star * dist_star)) : 1.0;
         total_illum += star_col * direct_illum * (irradiance * shadow);
+    }
+
+    if (u_scene.ringshine_params.z != 0u) {
+        vec3 same_flux = cam_side >= 0.0 ? f_shine_top : f_shine_bottom;
+        vec3 other_flux = cam_side >= 0.0 ? f_shine_bottom : f_shine_top;
+        vec3 same_direction = cam_side >= 0.0 ? f_shine_top_direction : f_shine_bottom_direction;
+        vec3 other_direction = cam_side >= 0.0 ? f_shine_bottom_direction : f_shine_top_direction;
+        bool has_same = any(greaterThan(same_flux, vec3(0.0)));
+        bool has_other = any(greaterThan(other_flux, vec3(0.0)));
+        vec3 same_light = same_direction/max(length(same_direction), 1e-20);
+        vec3 other_light = other_direction/max(length(other_direction), 1e-20);
+        float same_elevation = dot(pole_n, same_light), other_elevation = dot(pole_n, other_light);
+        float same_phase = clamp(-dot(same_light, V), -1.0, 1.0);
+        float other_phase = clamp(-dot(other_light, V), -1.0, 1.0);
+        float same_transfer = has_same ? 0.25*ring_transfer(total_tau, max(abs(same_elevation), 1e-5), mu_v, true) : 0.0;
+        float other_transfer = has_other ? 0.25*ring_transfer(total_tau, max(abs(other_elevation), 1e-5), mu_v, false) : 0.0;
+        float angular_radius = clamp(ring_hosts[f_host_idx].tangent_radius.w/max(r, 1e-12), 0.0, 1.0);
+        float broaden = 1.0/(1.0+1.2*angular_radius);
+        uint remaining = active_mask;
+        while (remaining != 0u) {
+            uint slot = uint(findLSB(remaining));
+            uint i = (u_push.packed_segments >> (slot*3u)) & 7u;
+            remaining &= remaining-1u;
+            RingSegmentGPU seg = ring_hosts[f_host_idx].segments[i];
+            float same_phase_response = has_same ? ring_phase_dhg(same_phase, seg.bounds_opacity_scatter.w,
+                seg.phase_row.x*broaden, seg.phase_row.y*broaden, total_tau, seg.color_flags.w > 0.5) : 0.0;
+            float other_phase_response = has_other ? ring_phase_dhg(other_phase, seg.bounds_opacity_scatter.w,
+                seg.phase_row.x*broaden, seg.phase_row.y*broaden, total_tau, seg.color_flags.w > 0.5) : 0.0;
+            vec3 response = samples[slot].xyz*(same_flux*(same_transfer*same_phase_response)
+                +other_flux*(other_transfer*other_phase_response*seg.phase_row.z));
+            total_illum += (samples[slot].w/total_tau)*response;
+        }
     }
 
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;

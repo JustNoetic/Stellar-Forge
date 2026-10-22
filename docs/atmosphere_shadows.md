@@ -4,7 +4,7 @@
 
 Atmospheric shadows use the original normalized solar loss fraction architecture:
 $$\text{fraction} = \text{clamp}\left(\frac{\sum_s \text{loss}_s}{\sum_s \text{energy}_s}, 0.0, 1.0\right)$$
-where each star $s$ evaluates its scattered energy and shadow loss along the visible ray column. In composition, the exact direct solar loss $\Delta L = L \times \text{fraction}$ is subtracted from the clear-atmosphere radiance $L$.
+where each star $s$ evaluates its scattered energy and shadow loss along the visible ray column. In composition, the modeled scattering loss $\Delta L = L \times \text{fraction}$ is subtracted from the clear-atmosphere radiance $L$.
 
 ## Mathematical formulation and benefits
 
@@ -15,18 +15,56 @@ where each star $s$ evaluates its scattered energy and shadow loss along the vis
    $$t = s_{\text{first}} + (s_{\text{last}} - s_{\text{first}}) \cdot \frac{q}{1 + c(1 - q)}$$
    $$ds = (s_{\text{last}} - s_{\text{first}}) \cdot \frac{1 + c}{(1 + c(1 - q))^2 \cdot N}$$
    with $c = 1.5 \cdot \text{dist} \cdot (\bar{\beta}_e)_0$. The exact distance Jacobian $ds$ eliminates numerical root-finding loops and binary searches, achieving accurate integration even at 4 and 16 samples.
-5. **Immediate motion response**: Progressive refinement retains history only for identical rendering inputs. Camera, projection, atmosphere, lighting, caster and ring-profile changes restart from the current native estimate. There is no reprojection or history blend across changed columns. Fixed single-frame integration remains available by disabling Progressive atmosphere shadows.
-6. **Memory footprint**: The native shadow output uses two 2-layer textures (`shadow_fraction` at RGBA16F and `shadow_depth` at R32F), 24 B/px together (47.5 MiB at 1080p). Progressive mode adds 64 B/px of full-precision integral history (126.6 MiB at 1080p); VRS instead adds the shared scratch storage described below.
+5. **Immediate scene-motion response**: Eye translation, projection, atmosphere, lighting, caster and ring-profile changes restart from the current native estimate. Optional rotation-only reconstruction reuses compatible sky columns when the eye and scene inputs remain unchanged. Fixed single-frame integration remains available by disabling Progressive atmosphere shadows.
+6. **Memory footprint**: The native shadow output uses two 2-layer textures (`shadow_fraction` at RGBA16F and `shadow_depth` at R32F), 24 B/px together (47.5 MiB at 1080p). Progressive mode adds 64 B/px of full-precision integral history (126.6 MiB at 1080p). Rotation adds a lazily allocated, shared 32 B/px scratch pair (63.3 MiB at 1080p, 253.1 MiB at 4K); VRS instead adds the shared scratch storage described below.
+
+## Estimator bias and per-sample work
+
+The native march estimates an RGB energy-weighted blocked fraction, not absolute sky radiance. Each sample evaluates local molecular/aerosol density and scattering, observer transmittance from the optical-depth LUT, solar transmittance and host visibility, the multiple-scattering LUT, and external body/ring visibility. Its weight is observer transmittance times stellar irradiance times the sum of direct and multiple-scattering sources times the distance weight. The same weight enters the energy denominator and, multiplied by the blocked fraction, the loss numerator. The clear radiance being corrected comes from the sky/aerial LUT at composition; the shadow march does not fetch that cumulative radiance at each sample.
+
+This normalized ratio generally has finite-sample bias: the expectation of a ratio need not equal the ratio of the integrals. Shared numerator/denominator samples cancel much of their common energy variation and preserve the sampled clear/umbra identities. Rational or tangent-focused sampling, one shared IGN/STBN jitter across the ray/star's strata, analytic finite-disc body visibility and filtered ring extinction also reduce visible noise. LUT transport is deterministic and approximate; low noise alone does not establish physical accuracy. Progressive history sums energy and loss before dividing, reducing integration error without removing LUT/model approximations. A short transparent prefix can contain no samples on an individual frame, and narrow shadow features can fall between sample positions even when the full ray looks smooth.
+
+External visibility multiplies the combined direct and multiple-scattering weight. Suppressing cached diffuse fill this way is a local approximation, not an eclipse-aware multiple-scattering solution. Likewise, multiple-star weighting uses the marched energy to apportion the combined LUT baseline; exact per-star isolation would require agreement between those transport representations. Samples outside shadow bounds still contribute to the energy denominator; skipping their transport without an equivalent full-column energy integral would change the estimator. The dense diagnostic uses the same transport approximations and tests integration quality rather than independent physical correctness. Its reference flag expands candidate intervals to the whole column, preserving the full-column denominator.
+
+The native path skips interval merging for a single caster, since its sole interval is already complete. IGN/STBN jitter is evaluated once per ray/star outside the sample loop; the removed sample-index argument was unused, so this retains the existing sample sequence. These changes preserve sample budgets, distance proposals, visibility and normalization.
+
+On the RTX 4060 Ti at 1920x1080 with a 16-sample ceiling, a before/after run of the seven-scene shadow benchmark measured 4.0–9.6% lower fresh single-frame shadow-pass time across the six shadowed scenes and fixed/adaptive/VRS modes. Refining progressive mode improved by 3.6–5.9%; completed-history times were effectively unchanged. Each version used three alternating shadow-on/off repetitions, eight warmup and sixteen measured frames (64 warmup for completed history). These synthetic single-caster measurements exclude presentation/readback and do not establish application FPS or multiple-caster gains. Reports are `tests/shadow-audit/baseline-16.json` and `tests/shadow-audit/candidate-16.json`.
+
+The full `--atmosphere-shadows` suite passed before and after the cleanup with identical diagnostic logs and 59 byte-identical saved PPM previews. This includes adaptive 4/8/16-sample comparisons, dense references, VRS, progressive convergence, multiple stars, finite and transparent endpoints, and history invalidation.
 
 ## Progressive refinement
 
 `atmosphere_shadow_temporal` (Progressive atmosphere shadows, enabled by default) accumulates the existing jittered integration over 64 stationary frames. It stores RGB energy and loss separately in two RGBA32F two-layer storage images, then divides accumulated loss by accumulated energy. It never averages per-frame normalized fractions. Counts and endpoint depths occupy the alpha channels. Each invocation owns its pixel's two endpoints, allowing in-place history updates without ping-pong images. Explicit compute read/write barriers order successive frames.
 
-CPU validation compares the complete atmosphere uniforms, shadow inputs excluding the jitter sequence, retained definition identity/generation/revisions, ring profile upload revision and image identity, and consecutive preparation/composition. There are no movement tolerances. A GPU comparison of both endpoint depths resets the pixel when either changes, including transparent fragments appearing or disappearing. Opaque and nearest-transparent integrals have separate storage and share a conservative pixel reset and sample sequence. Additional transparent endpoints retain their native fallback.
+CPU validation compares the complete atmosphere uniforms, shadow inputs excluding the jitter sequence, retained definition identity/generation/revisions, ring profile upload revision and image identity, and consecutive preparation/composition. The atmosphere-relative eye position is also compared in double precision, without movement tolerances. A GPU comparison of both endpoint depths resets the pixel when either changes, including transparent fragments appearing or disappearing. Opaque and nearest-transparent integrals have separate storage and share a conservative pixel reset and sample sequence. Additional transparent endpoints retain their native fallback.
 
 The first frame uses sequence zero and is identical to frozen native integration. Subsequent frames use the pixel's accumulated count as the jitter sequence. At 64 samples of the estimator, the pixel retains its output until invalidated. This stops residual flicker and avoids further transport evaluation for completed columns. Clear and full-umbra identities follow from the same accumulated numerator/denominator operations; a single noisy zero or one estimate does not override valid history.
 
-Progressive mode uses native integration and bypasses VRS. Disabling it restores the existing single-frame VRS path and releases history through completion-based retirement. The extra memory is per visible shadowed atmosphere; continuously changing simulation or camera inputs can prevent refinement and incur history traffic without a convergence benefit. This mode guarantees no reuse across changed inputs represented by the renderer, not temporal reconstruction during motion.
+Progressive mode uses native integration and bypasses VRS. Disabling it restores the single-frame VRS path and releases history through completion-based retirement. **Animate shadow jitter** (`atmosphere_shadow_animate_jitter`, enabled by default) advances the IGN/STBN sample positions each prepared frame without accumulating history, including while simulation time is paused. Disable it to freeze the single-frame noise pattern at sequence zero for inspection and deterministic comparisons. Progressive refinement advances its own sample sequence regardless of this control, and dense-reference integration stays deterministic. Disable VRS too for a native-resolution sampling comparison. Integral history is per visible shadowed atmosphere; continuously changing simulation inputs or eye translation can prevent refinement and incur history traffic without a convergence benefit.
+
+### Rotation-only sky reuse
+
+`atmosphere_shadow_rotation` (**Reuse history while turning**, enabled by default) allows camera rotation with exactly unchanged atmosphere-relative eye coordinates, projection, atmosphere/lighting/caster/ring inputs and frame continuity. The strict stationary key remains in use when rotation reuse is disabled. Multiple-star atmospheres retain the native reset path during rotation.
+
+`shadow_reproject.comp` gathers previous energy/loss integrals onto the current grid using the previous-view/current-inverse-view homography. It reads the original history and writes two separate RGBA32F scratch images before the native accumulation pass modifies any history. Explicit compute read/write barriers separate those accesses and sequential scratch reuse by different atmospheres. Scratch is shared across bodies, allocated only after qualifying rotation, and completion-retired on resize or mode disable; stationary frames need no reprojection dispatch.
+
+Reuse is restricted to sky endpoints without transparent fragments, and all contributing bilinear taps must meet these checks:
+
+- Previous-view clip coverage and in-bounds taps, valid history count, matching sky classification, and no previous transparent prefix.
+- Matching analytical ground-hit classification, log2 atmospheric path difference at most 0.02, and atmospheric entry difference at most 1% of max(path, entry distance, 1 km). Outside the atmosphere the latter includes the vacuum approach distance; it is not scaled solely by the shorter scattering column.
+- The existing conservative penumbra/plane-crossing spatial guards on both current and previous rays; RGB fraction range at most 0.02 across previous taps.
+
+The gather interpolates per-frame energy/loss means and conservatively uses the minimum tap age, capped at eight frames of prior weight. A fresh current-ray estimate rejects history if its RGB fraction differs by more than 0.05 or its energy differs by more than 75% of the larger estimate. The broad energy threshold accommodates sparse-estimator variance; it is not a radiance-error bound. Finite opaque/transparent endpoints, newly visible columns, narrow shadow detail and failed checks use fresh integration. A rejected fresh estimate is retained without old history.
+
+Rotation always evaluates new integration samples. Accepted columns advance the global IGN/STBN sequence rather than repeating a count-capped jitter position. When rotation stops, the native stationary path resumes refinement to 64 frames and freezes. Capped history weight limits repeated interpolation blur; the spatial and fresh-estimate guards remain conservative heuristics, not a guarantee of identical current-ray radiance. Disable rotation reuse for strict stationary-only accumulation. The extra pass and scratch traffic trade GPU time and memory for smoother compatible sky columns.
+
+### History diagnostics and auto horizon
+
+Enable **Show Engine Telemetry Window** in settings to inspect history. **Reset inputs (current)** identifies changes to camera, projection, atmosphere, lighting, casters, ring profile uploads, sampling/transport settings, definitions, viewport or frame continuity. Multiple reasons can apply to one frame. These labels do not relax the strict history key.
+
+The telemetry also shows refining/completed atmospheric columns, the minimum/maximum accumulated frame counts, depth-only pixel resets, and **Rotation reuse / fallback** column counts. Pixel statistics come from the latest completed GPU frame, so they can trail the current CPU reset reasons. Counters are reduced within each 8x8 workgroup, accumulated across visible atmosphere bodies, and read from per-frame mapped buffers only after their completion serial has passed. Closing telemetry disables the GPU counter work; no synchronous readback or GPU wait is added. Transparent endpoint changes contribute to the same depth-reset count.
+
+Auto horizon uses exponential roll correction at 8..12 inverse seconds throughout its 200 km activation range. Once the residual roll falls below 0.00001 radians, the camera adopts the exact target up vector. This removes the altitude-boundary slowdown and the drifting tail that prevented stationary history from converging. Manual Q/E roll suspends alignment until released. **Auto horizon** in telemetry distinguishes inactive alignment, manual roll, settling and settled views. Unpaused motion and deliberate camera movement still invalidate history normally.
 
 ## Adaptive sample allocation
 
@@ -55,6 +93,17 @@ One scratch pair is shared sequentially across all atmosphere bodies: RGBA16F fr
 
 The guards are conservative heuristics, not a universal radiance-error bound. Integration jitter can reduce reuse, sharp shadows can stay mostly native, and the extra dispatch/guide traffic can slightly increase cost when little reuse is possible. The UI toggle provides an immediate native comparison. This optimization does not change sky-view LUT resolution or address its preexisting banding.
 
+## Rotation measurements
+
+RTX 4060 Ti, 1920x1080, 16-sample ceiling, adaptive integration, telemetry counters off. Serialized offscreen runs use 64 stationary frames followed by 8 rotating warmup and 16 measured frames. Median shadow-pass times include reprojection and fresh integration; these are synthetic GPU timings, not application FPS.
+
+| View | Strict fresh integration while turning (ms) | Rotation reuse (ms) | Nested reprojection pass (ms) |
+| --- | ---: | ---: | ---: |
+| Inside atmosphere, zenith eclipse | 1.043 | 1.530 | 0.435 |
+| Orbital rings | 0.779 | 0.898 | 0.098 |
+
+At 257x255 and a four-sample ceiling, the smooth zenith eclipse fixture reused about 85% of columns during a 24-frame combined yaw/roll sequence. Average RGB-vector RMSE against dense current-view integration decreased from approximately 0.00553 to 0.00441 across both blend paths and noise choices. The broad orbital ring fixture remained close to the fresh result: limb and shadow-detail guards rejected much of that view. These are fixture-specific observations, not universal noise/error bounds. The focused rotation command writes comparison previews and `rotation-benchmark.json` when an output directory is supplied.
+
 ## Candidate culling and intervals
 
 `CelestialRenderer::prepare` supplies the prepared ring hosts and ring extinction atlas. Each body-owned atmosphere table has a separate per-frame shadow SSBO. Body/star candidates use `eclipse_could_shadow` with the entire outer atmosphere as receiver. Ring candidates use the conservative surface predicate with the same outer bound, pixel footprint and prepared ring hosts. Candidates do not depend on caster visibility, hierarchy or mesh contribution. The receiver body itself is excluded because `sun_transmittance` already includes host shadowing. Body and star coordinates are subtracted in double precision before packing atmosphere-relative physical kilometres; oblate atmosphere integration points are transformed back to physical coordinates for shadow tests.
@@ -66,14 +115,19 @@ A full-resolution compute pass produces two prefix corrections: layer 0 for the 
 ## Verification and cost
 
 ```powershell
-.\build\StellarRenderingTests.exe --atmosphere-shadows scratch/atmosphere-shadows/normalized
-.\build\StellarRenderingTests.exe --atmosphere-shadow-benchmark scratch/atmosphere-shadows/benchmark-normalized.json 16
-.\build\StellarRenderingTests.exe --atmosphere-progressive-only scratch/shadow-progressive
+.\build\bin\tests\StellarRenderingTests.exe --atmosphere-shadows tests/atmosphere-shadows/normalized
+.\build\bin\tests\StellarRenderingTests.exe --atmosphere-shadow-benchmark tests/atmosphere-shadows/benchmark-normalized.json 16
+.\build\bin\tests\StellarRenderingTests.exe --atmosphere-progressive-only tests/shadow-progressive
+.\build\bin\tests\StellarRenderingTests.exe --camera-horizon-only
+.\build\bin\tests\StellarRenderingTests.exe --atmosphere-rotation-only tests/shadow-rotation
 ```
 
 The focused test suite tests:
 
 - Progressive first-frame equivalence, dense-reference convergence, frozen completion, both blend paths/noise choices, and immediate resets for camera, projection, light, endpoints, resize, visibility and ring-profile uploads.
+- Diagnostic input categories, GPU age/completion/depth counters, diagnostics toggling without history invalidation, and completed near-surface history after auto horizon settles.
+- Camera roll convergence at 30/60/144 FPS across the activation range, bitwise stable settled matrices, manual roll, zero-time and vertical-view behavior.
+- Rotation-only current-view comparisons against dense transport in both blend/noise modes, stationary completion after rotation, transparent/narrow-ring/multi-star fallback, double-precision eye/projection/light/caster invalidation, shared scratch across atmospheres and viewport sizes, normal frames in flight, and retained sky history during auto-horizon alignment.
 - VRS reconstruction checks for fraction discontinuities, coverage, depth class, path/entry mismatch and borders.
 - Native/VRS image comparisons at 257×259 and 1920×1080, frozen jitter, narrow ring detail, independent stars and transparent endpoints.
 - Shared VRS scratch across two atmosphere bodies, odd/even resizes and tiny-viewport bypass.

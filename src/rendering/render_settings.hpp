@@ -38,16 +38,21 @@ struct RenderSettings {
     bool atmosphere_shadows_enabled = true;
     bool atmosphere_shadow_reference = false;
     bool atmosphere_shadow_temporal = true;
+    bool atmosphere_shadow_animate_jitter = true;
+    bool atmosphere_shadow_rotation = true;
     bool atmosphere_shadow_adaptive = true;
     bool atmosphere_shadow_vrs = true;
     uint32_t atmosphere_shadow_noise_type = 0;
     uint32_t atmosphere_shadow_samples = 16;
     bool ring_shadows_enabled = true;
     bool ringshine_enabled = true;
+    bool planetshine_enabled = true;
     uint32_t ringshine_band_count = 10;
     bool eclipse_reference_smoothstep = false;
     bool ring_shadow_reference_all_hosts = false;
-    bool ring_shadow_single_box = true;
+    float ring_shadow_softness = 1.25f;
+    bool ring_shadow_single_box = false;
+    bool ring_shadow_reference_linear = false;
     bool ring_reference_full_annulus = false;
     bool ring_reference_finite_source = false;
     bool ring_reference_base_level = false;
@@ -60,6 +65,8 @@ public:
     uint64_t revision() const noexcept { return revision_; }
 
     CommandResult apply(const RenderSettings& candidate) {
+        if (!std::isfinite(candidate.ring_shadow_softness) || candidate.ring_shadow_softness < 0.25f || candidate.ring_shadow_softness > 4.0f)
+            return {false, false, "Ring shadow softness must be 0.25 to 4."};
         if (candidate.atmosphere_shadow_samples != 4 && candidate.atmosphere_shadow_samples != 8 && candidate.atmosphere_shadow_samples != 16)
             return {false, false, "Atmospheric shadows use 4, 8 or 16 samples."};
         if (candidate.atmosphere_shadow_noise_type > 1)

@@ -5,13 +5,14 @@
 #include "rhi/shader_cache.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <vector>
 
 namespace sf::rendering {
 
-static_assert(sizeof(BodyInstanceGPU) == 96);
+static_assert(sizeof(BodyInstanceGPU) == 224);
 static_assert(terrain::MAX_PATCHES >= MAX_CELESTIAL_BODIES*6);
 
 namespace {
@@ -163,7 +164,8 @@ void CelestialRenderer::build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors,
 }
 
 void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent) {
+                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
+                                bool shadow_diagnostics) {
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
     refraction_.prepare(cmd, ctx, cam, sys, settings);
     textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled);
@@ -177,7 +179,8 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     atmosphere_minima_.resize(count);
     for (uint32_t i = 0; i < count; ++i)
         atmosphere_minima_[i] = static_cast<float>(terrain_.minimum_height_km(sys.body(i).definition, settings));
-    atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision());
+    planetshine_ = prepare_planetshine(sys, settings.planetshine_enabled, settings.hdr_enabled);
+    atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics);
     transparency_.prepare(cmd, ctx, extent, !settings.transparency_reference_legacy && !sys.empty() &&
         ((settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
 }
@@ -212,7 +215,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ubo.num_bodies = count;
     ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
     ubo.num_ring_hosts = (settings.show_rings && settings.ring_shadows_enabled) ? rings_.host_count() : 0u;
-    ubo.ringshine_params = {settings.ringshine_enabled && settings.show_rings ? 1u : 0u, rings_.host_count(), 0u, 0u};
+    ubo.ringshine_params = {settings.ringshine_enabled && settings.show_rings ? 1u : 0u, rings_.host_count(), settings.planetshine_enabled ? 1u : 0u, 0u};
     body_instances_.resize(count);
     auto* inst_ptr = body_instances_.data();
 
@@ -231,6 +234,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
                                     b.definition.is_black_hole ? 1.0f : 0.0f,
                                     static_cast<float>(i));
         inst.surface_flags.x = terrain_.covers(i) ? 1u : 0u;
+        if (i < planetshine_.size()) inst.planetshine = planetshine_[i];
         inst_ptr[i] = inst;
 
         if (b.definition.is_star && ubo.num_stars < MAX_SCENE_STARS) {
@@ -270,7 +274,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
                     if (ring_could_shadow_surface(
                             receiver_bounds, ubo.stars_pos_radius[s],
                             {glm::vec3(host.center_min_r), host.pole_max_r.w},
-                            {glm::vec3(host.pole_max_r), host.center_min_r.w}, fb_h * fov_factor))
+                            {glm::vec3(host.pole_max_r), host.center_min_r.w}, fb_h * fov_factor, settings.ring_shadow_softness))
                         mask |= 1u << h;
                 }
                 surface_ring_candidate_masks_[i * ubo.num_stars + s] = mask;
@@ -296,7 +300,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     }
     ubo.ring_shadow_params = {static_cast<uint32_t>(eclipse_words_.size()),
                               settings.ring_shadow_reference_all_hosts ? 1u : 0u,
-                              settings.ring_shadow_single_box ? 1u : 0u, 0u};
+                              (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u),
+                              std::bit_cast<uint32_t>(settings.ring_shadow_softness)};
     ubo.eclipse_params.x = settings.eclipse_reference_smoothstep ? 1u : 0u;
     eclipse_words_.insert(eclipse_words_.end(), surface_ring_candidate_masks_.begin(), surface_ring_candidate_masks_.end());
     auto& eclipse_buffer = eclipse_ssbos_[f_idx];

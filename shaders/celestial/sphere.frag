@@ -87,7 +87,7 @@ void main() {
                     ? (1u << u_scene.num_ring_hosts) - 1u
                     : eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars + s];
                 if (candidates != 0u)
-                    shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad, candidates);
+                    shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad, d_au, candidates);
             }
         }
 
@@ -135,6 +135,15 @@ void main() {
             }
         }
         total_light += ringshine_light;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        if (!any(greaterThan(b.shine_irradiance[i].rgb, vec3(0.0)))) continue;
+        vec3 light = b.shine_direction[i].xyz;
+        vec3 transmission, diffuse;
+        surface_atmosphere(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord, light, N, transmission, diffuse);
+        total_light += albedo*b.shine_irradiance[i].rgb
+                     *(surface_reflectance(N, light, V)*transmission+diffuse);
     }
 
     vec3 rgb = total_light * exposure * mesh_weight;

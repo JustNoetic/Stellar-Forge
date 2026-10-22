@@ -2,6 +2,7 @@
 
 #include "core/camera.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/planetshine.hpp"
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
 #include "rendering/refraction_renderer.hpp"
@@ -27,6 +28,7 @@ struct alignas(16) BodyInstanceGPU {
     glm::vec4 pole_color_lum{1.0f};
     glm::vec4 spin_flags{0.0f};
     glm::uvec4 surface_flags{0};
+    PlanetshineGPU planetshine{};
 };
 
 struct alignas(16) SceneCelestialUBO {
@@ -51,7 +53,8 @@ public:
     void init(rhi::VkContext& ctx, bool load_surface_assets = true);
     void shutdown(rhi::VkContext& ctx);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
+                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
+                 bool shadow_diagnostics = false);
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
@@ -59,6 +62,7 @@ public:
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     const terrain::TextureStats& normal_stats() const noexcept { return normals_.stats(); }
     const AtmosphereStats& atmosphere_stats() const noexcept { return atmospheres_.stats(); }
+    ShadowHistoryDiagnostics shadow_history_diagnostics(rhi::VkContext& ctx) const { return atmospheres_.shadow_history_diagnostics(ctx); }
     void resolve_transparency(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
         transparency_.resolve(cmd, ctx, color, depth);
     }
@@ -115,6 +119,7 @@ private:
     TransparencyRenderer transparency_;
     RefractionRenderer refraction_;
     std::vector<float> atmosphere_minima_;
+    std::vector<PlanetshineGPU> planetshine_;
 };
 
 } // namespace sf::rendering

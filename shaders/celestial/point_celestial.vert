@@ -71,6 +71,9 @@ vec3 disc_radiance(BodyInstanceGPU b, vec3 V) {
                 total += b.color_is_star.rgb * u_scene.stars_color_lum[s].rgb
                          * irradiance * surface_reflectance(N, to_star / distance, V);
             }
+            for (int k = 0; k < 4; ++k)
+                total += b.color_is_star.rgb*b.shine_irradiance[k].rgb
+                       *surface_reflectance(N, b.shine_direction[k].xyz, V);
         }
     }
     return total / float(SAMPLES);

@@ -505,7 +505,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     {
         ScopedTimer timer(sample ? &celestial_prepare_ms : nullptr);
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_terrain_prepare") : UINT32_MAX;
-        celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+        celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext, ui_settings_.show_telemetry);
         vk_.end_gpu_timer(cmd, id);
     }
     auto refraction_writes = celestial_renderer_.refraction_writes(vk_);
@@ -967,7 +967,15 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::Checkbox("Atmospheric shadows", &render_draft.atmosphere_shadows_enabled);
             ImGui::BeginDisabled(!render_draft.atmosphere_shadows_enabled);
             ImGui::Checkbox("Progressive atmosphere shadows", &render_draft.atmosphere_shadow_temporal);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refines stationary views over 64 frames. Camera, lighting and shadow changes reset immediately. Uses native sampling while enabled.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refines stationary views over 64 frames. Moving the eye, lighting or shadows resets immediately. Disable to see single-frame shadow sampling without history.");
+            ImGui::BeginDisabled(!render_draft.atmosphere_shadow_temporal);
+            ImGui::Checkbox("Reuse history while turning", &render_draft.atmosphere_shadow_rotation);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reprojects smooth sky shadows while rotating in place. Depth edges, narrow shadows and transparent endpoints use fresh integration while turning.");
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
+            ImGui::Checkbox("Animate shadow jitter", &render_draft.atmosphere_shadow_animate_jitter);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With progressive shadows off, changes the raymarch sample positions every frame. Disable to freeze the noise pattern.");
+            ImGui::EndDisabled();
             const char* shadow_noise_types[] = {"Interleaved Gradient Noise (IGN)", "Spatiotemporal Blue Noise (STBN)"};
             int current_noise_type = static_cast<int>(render_draft.atmosphere_shadow_noise_type);
             if (ImGui::Combo("Shadow noise##shadow_noise", &current_noise_type, shadow_noise_types, 2)) {
@@ -989,9 +997,15 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds atmospheric scattered light over surfaces. Atmospheric extinction remains active when disabled.");
             ImGui::Checkbox("Atmospheric refraction", &render_draft.refraction_enabled);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bends apparent positions of stars, bodies, terrain, rings and orbits through the nearest physical atmosphere.");
+            ImGui::Checkbox("Planetshine", &render_draft.planetshine_enabled);
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
+            ImGui::BeginDisabled(!render_draft.ring_shadows_enabled);
+            ui::field("Shadow Softness##ring_shadow_softness", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.ring_shadow_softness, 0.25f, 4.0f, "%.2fx");
+            });
+            ImGui::EndDisabled();
             ImGui::Checkbox("Ringshine", &render_draft.ringshine_enabled);
             ImGui::BeginDisabled(!render_draft.ringshine_enabled);
             ui::field("Ringshine Bands##ringshine_bands", [&](const char* id) {
@@ -1094,7 +1108,7 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
 
 void App::render_viewport_overlays() {
     if (ui_settings_.show_telemetry) {
-        ImGui::SetNextWindowSize(ImVec2(340.0f, 220.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(460.0f, 440.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Engine Telemetry", &ui_settings_.show_telemetry)) {
             ui::heading("GPU Telemetry", vk_.device_name());
             ui::value_row("Frame Rate", std::format("{:.1f} FPS", ImGui::GetIO().Framerate));
@@ -1108,6 +1122,41 @@ void App::render_viewport_overlays() {
             ui::value_row("Ringshine Tiles Baked", std::format("{}", celestial_renderer_.ringshine_frame_bake_count()));
             ui::value_row("GPU Composite", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_post_composite")));
             ui::value_row("GPU Dear ImGui", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_ui")));
+            ui::section("Atmosphere shadow history", "Pixel counts use the latest completed GPU frame.");
+            const auto& settings = render_settings_.values();
+            const auto& stats = celestial_renderer_.atmosphere_stats();
+            ui::value_row("Auto horizon", !camera_.horizon_align || !camera_.is_near_surface ? "Inactive" :
+                camera_.key_q || camera_.key_e ? "Manual roll" : camera_.horizon_settling ?
+                std::format("Settling ({:.4f} deg)", camera_.horizon_roll_error_deg) : "Settled");
+            if (!settings.show_atmospheres || !settings.atmosphere_shadows_enabled || !settings.atmosphere_shadow_temporal || settings.atmosphere_shadow_reference) {
+                ui::value_row("Progressive history", "Off");
+            } else if (stats.shadow_updates == 0) {
+                ui::value_row("Progressive history", "No visible shadowed atmosphere");
+            } else {
+                const std::pair<uint32_t, const char*> labels[] = {
+                    {rendering::ShadowHistoryInitial, "initial history"}, {rendering::ShadowHistoryInterrupted, "interrupted frames"},
+                    {rendering::ShadowHistoryCamera, "camera"}, {rendering::ShadowHistoryProjection, "projection"},
+                    {rendering::ShadowHistoryAtmosphere, "atmosphere"}, {rendering::ShadowHistoryLighting, "lighting"},
+                    {rendering::ShadowHistoryCasters, "casters"}, {rendering::ShadowHistoryRings, "ring profile"},
+                    {rendering::ShadowHistorySampling, "sampling settings"}, {rendering::ShadowHistoryViewport, "viewport"},
+                    {rendering::ShadowHistoryDefinition, "system definition"}, {rendering::ShadowHistoryTransport, "transport settings"}};
+                std::string reasons;
+                for (auto [mask, label] : labels) if (stats.shadow_history_reset_reasons & mask) {
+                    if (!reasons.empty()) reasons += ", ";
+                    reasons += label;
+                }
+                ui::value_row("Reset inputs (current)", reasons.empty() ? "None" : reasons);
+                auto history = celestial_renderer_.shadow_history_diagnostics(vk_);
+                if (history.valid && history.columns != 0) {
+                    ui::value_row("Refining / complete columns", std::format("{} / {}", history.refining, history.complete));
+                    ui::value_row("History weight (frames)", std::format("{}..{} / 64", history.minimum_frames, history.maximum_frames));
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turning reuse caps prior history at eight frames. Stationary views refine to 64 frames.");
+                    ui::value_row("Depth resets (completed)", std::format("{}", history.depth_resets));
+                    ui::value_row("Rotation reuse / fallback", std::format("{} / {}", history.reprojected, history.reprojection_rejected));
+                } else {
+                    ui::value_row("Pixel history", history.valid ? "No atmospheric columns" : "Waiting for GPU counters");
+                }
+            }
         }
         ImGui::End();
     }

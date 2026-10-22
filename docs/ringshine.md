@@ -109,7 +109,7 @@ perturbs them. Star column order matches the celestial renderer's star collectio
 | Radial sample SSBO | binding 10 (bake only), `(radius, dr_weight)` per node in host equatorial radii |
 | Ringshine atlas | **binding 16** (`u_ringshine_map`, sphere/terrain pipelines) |
 | Push constants (bake) | 80 B: tile (host, star, node offset, node count), host_params (inner/outer ratios, enable, flattening), solar (elevation, sin radius, segments, bands), disk_offset, disk_weight |
-| Scene UBO | `ringshine_params` = (enabled, host_count, 0, 0) |
+| Scene UBO | `ringshine_params` = (ringshine_enabled, host_count, planetshine_enabled, 0) |
 | Setting | `RenderSettings::ringshine_enabled` (default on), `ringshine_band_count` (default 10, clamp 4–1024, validated in `apply`) |
 
 ## Consumer
@@ -123,6 +123,10 @@ then add
 $$L_{ringshine} = \text{albedo} \cdot \frac{M(\phi, \ell)}{\pi} \cdot \text{star color} \cdot \frac{L}{d^2}$$
 
 gated on `ringshine_params.x != 0` (independent of the ring-shadow toggle).
+
+The ringshine atlas is consumed by surface shading. Atmospheric ringshine is currently
+removed, and the scheduler uses opaque-surface/terrain receiver bounds. See
+`docs/secondary_lighting.md` for the remaining planetshine paths and their limits.
 
 ## Contracts (`tests/ring_gpu_tests.hpp::ringshine_contracts`)
 

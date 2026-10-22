@@ -100,14 +100,10 @@ float atmosphere_shadow_visibility(vec3 p, uint star_index) {
     float footprint = length(p-shadow_eye_focal.xyz)/shadow_eye_focal.w;
     for (uint j = 0u; j < range.w; ++j) {
         AtmosphereShadowCaster caster = shadow_casters[range.z+j];
-        float denominator = dot(light, caster.pole_inner.xyz);
-        if (abs(denominator) <= 1e-6) continue;
-        float hit = dot(caster.position_radius.xyz-p, caster.pole_inner.xyz)/denominator;
-        if (hit <= 0.0) continue;
-        vec3 hit_rel = (p-caster.position_radius.xyz)+light*hit;
-        visibility *= 1.0-ring_shadow_extinction(atmosphere_ring_shadow_lut, int(caster.support.y),
-            hit_rel, caster.pole_inner.xyz, light, abs(denominator), hit,
-            vec2(caster.pole_inner.w, caster.position_radius.w), star.w/distance, footprint, shadow_flags.y != 0u);
+        visibility *= 1.0-ring_receiver_extinction(atmosphere_ring_shadow_lut, int(caster.support.y),
+            p-caster.position_radius.xyz, caster.pole_inner.xyz, light,
+            vec2(caster.pole_inner.w, caster.position_radius.w), star.w/distance, distance, footprint,
+            (shadow_flags.y & 1u) != 0u, caster.support.z, (shadow_flags.y & 2u) != 0u);
         if (visibility <= 1e-4) return 0.0;
     }
     return visibility;
@@ -135,7 +131,7 @@ float atmosphere_shadow_step(vec3 p, vec3 direction, vec4 star, uvec4 range, flo
         vec2 bounds = vec2(caster.pole_inner.w, caster.position_radius.w);
         float footprint = length(p-shadow_eye_focal.xyz)/shadow_eye_focal.w;
         vec3 uv = ring_shadow_coordinates(hit_rel, pole, light, abs(denominator)/distance,
-            max(fraction, 0.0)*distance, bounds, star.w/distance, footprint);
+            max(fraction, 0.0)*distance, bounds, star.w/distance, footprint, caster.support.z, (shadow_flags.y & 2u) != 0u);
         float end_denominator = denominator-dot(direction, pole)*step;
         float minimum_denominator = min(abs(denominator), abs(end_denominator));
         if (denominator*end_denominator <= 0.0) minimum_denominator = 1e-6;
@@ -270,7 +266,7 @@ vec2 atmosphere_shadow_next(uvec4 range, vec3 origin, vec3 direction, vec4 star,
             ring, origin, direction, star, domain);
         if (candidate.y > candidate.x && candidate.x < interval.x) interval = candidate;
     }
-    if (interval.y <= interval.x) return interval;
+    if (interval.y <= interval.x || count == 1u) return interval;
     for (uint merge = 0u; merge < count; ++merge) {
         float previous = interval.y;
         for (uint j = 0u; j < count; ++j) {
@@ -304,7 +300,7 @@ float get_ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
 
-float shadow_random(ivec2 pixel, uint sample_index, uint star_index, uint sequence) {
+float shadow_random(ivec2 pixel, uint star_index, uint sequence) {
     float base = 0.0;
     if (shadow_temporal.y == 1u) {
         ivec3 sz = textureSize(u_stbn_tex, 0);
@@ -413,7 +409,7 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
         }
         uint samples = maximum;
         if (budget < float(maximum)) {
-            float rounding = shadow_random(pixel+ivec2(73, 29), 0u, s+1u, 0u);
+            float rounding = shadow_random(pixel+ivec2(73, 29), s+1u, 0u);
             samples = clamp(uint(floor(budget+rounding)), 4u, maximum);
         }
 
@@ -433,9 +429,9 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
         float concentration = 1.5 * dist * dot(e0, vec3(1.0 / 3.0));
         bool optical_sampling = concentration > 1e-3 && (dot(a, direction) <= 0.0 || concentration > 1.0);
         float closest = clamp(-dot(entry, direction), first, last);
+        float jitter = shadow_random(pixel, s, sequence);
 
         for (uint i = 0u; i < samples; ++i) {
-            float jitter = shadow_random(pixel, i, s, sequence);
             float q = (float(i) + jitter) / float(samples);
             float t;
             float ds;

@@ -20,13 +20,15 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
                             uint32_t receiver, glm::dvec3 eye, float outer, float focal,
                             const RenderSettings& settings, std::span<const RingHostGPU> rings,
                             AtmosphereShadowHeaderGPU& previous, std::vector<AtmosphereShadowCasterGPU>& previous_casters,
-                            uint32_t sequence, bool& unchanged) {
+                            uint32_t sequence, uint32_t& changes) {
     AtmosphereShadowHeaderGPU header;
     const auto origin = system.body(receiver).render.position.value;
     header.eye_focal = {glm::vec3((eye-origin)*AU_TO_KM), focal};
-    header.flags = {settings.atmosphere_shadows_enabled ? 1u : 0u, settings.ring_shadow_single_box ? 1u : 0u,
+    header.flags = {settings.atmosphere_shadows_enabled ? 1u : 0u,
+                    (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u),
                     settings.eclipse_reference_smoothstep ? 1u : 0u, settings.atmosphere_shadow_reference ? 1u : 0u};
-    uint32_t effective_sequence = (settings.atmosphere_shadow_temporal && !settings.atmosphere_shadow_reference) ? sequence : 0u;
+    uint32_t effective_sequence = !settings.atmosphere_shadow_reference &&
+        (settings.atmosphere_shadow_temporal || settings.atmosphere_shadow_animate_jitter) ? sequence : 0u;
     header.temporal = {effective_sequence, settings.atmosphere_shadow_noise_type,
                        settings.atmosphere_shadow_samples, settings.atmosphere_shadow_adaptive ? 1u : 0u};
     std::vector<AtmosphereShadowCasterGPU> casters;
@@ -60,20 +62,20 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
                 glm::vec4 receiver_eye(glm::vec3(origin-eye), outer*float(KM_TO_AU));
                 glm::vec4 light_eye(glm::vec3(star.render.position.value-eye), light.w*float(KM_TO_AU));
                 if (!ring_could_shadow_surface(receiver_eye, light_eye,
-                    {glm::vec3(ring.center_min_r), ring.pole_max_r.w}, {pole, ring.center_min_r.w}, focal)) continue;
+                    {glm::vec3(ring.center_min_r), ring.pole_max_r.w}, {pole, ring.center_min_r.w}, focal, settings.ring_shadow_softness)) continue;
                 double light_distance = glm::length(glm::dvec3(light));
-                double denominator = std::abs(glm::dot(glm::dvec3(light), glm::dvec3(pole)))-outer;
+                double denominator = std::abs(glm::dot(glm::dvec3(light), glm::dvec3(pole)))-outer-light.w;
                 float support = -1.0f;
                 if (light_distance > outer && denominator > 1e-6*(light_distance+outer)) {
-                    double minimum_mu = denominator/(light_distance+outer);
+                    double minimum_mu = denominator/(light_distance+outer+light.w);
                     double hit_distance = (std::abs(glm::dot(glm::dvec3(center), glm::dvec3(pole)))+outer)/minimum_mu;
-                    double stretch = 1.0/std::max(minimum_mu, 1.0/128.0);
-                    double stellar_blur = light.w/(light_distance-outer)*hit_distance*stretch;
+                    double stretch = 1.0/minimum_mu;
+                    double stellar_blur = 2.0*std::max(settings.ring_shadow_softness, 1.0f)*light.w/(light_distance-outer)*hit_distance*stretch;
                     double pixel_blur = 0.75*(glm::length(glm::dvec3(header.eye_focal))+outer)/focal*stretch;
                     double profile_blur = 0.75*(radius-inner)/4096.0;
                     support = float(radius+std::max({stellar_blur, pixel_blur, profile_blur})+0.01);
                 }
-                casters.push_back({{center, radius}, {pole, inner}, {support, float(ring.counts_indices.y), 0, 0}});
+                casters.push_back({{center, radius}, {pole, inner}, {support, float(ring.counts_indices.y), settings.ring_shadow_softness, 0}});
             }
         }
         range.w = uint32_t(casters.size())-range.z;
@@ -87,11 +89,18 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
     std::memcpy(buffer.mapped, &header, sizeof(header));
     if (!casters.empty()) std::memcpy(static_cast<std::byte*>(buffer.mapped)+sizeof(header), casters.data(), bytes-sizeof(header));
     ctx.flush_buffer(buffer, 0, bytes);
+    changes = 0;
+    if (glm::vec3(previous.eye_focal) != glm::vec3(header.eye_focal)) changes |= ShadowHistoryCamera;
+    if (previous.eye_focal.w != header.eye_focal.w) changes |= ShadowHistoryProjection;
+    if (previous.flags != header.flags || glm::uvec3(previous.temporal.y, previous.temporal.z, previous.temporal.w) !=
+        glm::uvec3(header.temporal.y, header.temporal.z, header.temporal.w)) changes |= ShadowHistorySampling;
+    if (previous.stars != header.stars) changes |= ShadowHistoryLighting;
+    if (previous.ranges != header.ranges || previous_casters.size() != casters.size() || (!casters.empty() &&
+        std::memcmp(previous_casters.data(), casters.data(), casters.size()*sizeof(AtmosphereShadowCasterGPU)) != 0))
+        changes |= ShadowHistoryCasters;
     auto previous_key = previous;
     previous_key.temporal.x = header.temporal.x;
-    unchanged = std::memcmp(&previous_key, &header, sizeof(header)) == 0 &&
-        previous_casters.size() == casters.size() && (casters.empty() ||
-        std::memcmp(previous_casters.data(), casters.data(), casters.size()*sizeof(AtmosphereShadowCasterGPU)) == 0);
+    if (changes == 0 && std::memcmp(&previous_key, &header, sizeof(header)) != 0) changes |= ShadowHistorySampling;
     previous = header;
     previous_casters = std::move(casters);
     return !previous_casters.empty();
@@ -139,10 +148,24 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     auto accumulate = std::vector<rhi::DescriptorLayoutBinding>(std::begin(shadow), std::end(shadow));
     accumulate.push_back({23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     accumulate.push_back({24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
-    shadow_accumulate_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate.comp", accumulate, sizeof(uint32_t));
+    accumulate.push_back({25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_accumulate_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate.comp", accumulate, sizeof(glm::uvec2));
+    auto rotate = accumulate;
+    rotate.push_back({26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    rotate.push_back({27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    shadow_rotate_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_rotate.comp", rotate, sizeof(glm::uvec2));
+    rotate.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    rotate.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_rotate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_rotate_transparency.comp", rotate, sizeof(glm::uvec2));
+    const rhi::DescriptorLayoutBinding reproject[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
+        {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage}, {23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage},
+        {24, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage}, {26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage},
+        {27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage}};
+    shadow_reproject_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_reproject.comp", reproject, 2*sizeof(glm::mat4));
     accumulate.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     accumulate.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
-    shadow_accumulate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate_transparency.comp", accumulate, sizeof(uint32_t));
+    shadow_accumulate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate_transparency.comp", accumulate, sizeof(glm::uvec2));
     shadow_coarse_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow);
     std::vector<rhi::DescriptorLayoutBinding> shadow_vrs(std::begin(shadow), std::end(shadow));
     shadow_vrs.push_back({21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
@@ -181,6 +204,7 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     for (auto& buffer : surface_records_) buffer = ctx.create_host_buffer(1024*sizeof(glm::vec4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    for (auto& frame : shadow_diagnostics_) frame.counters = ctx.create_host_buffer(8*sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     if (ctx.dual_source_blend_enabled()) {
         rhi::GraphicsPipelineDesc desc;
         desc.vert_path = "post/fullscreen.vert";
@@ -230,23 +254,54 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_accumulate_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_accumulate_transparency_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_reproject_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_rotate_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_rotate_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_coarse_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_transparency_pipeline_);
     ctx.destroy_image(shadow_coarse_fraction_);
     ctx.destroy_image(shadow_coarse_guide_);
+    ctx.destroy_image(shadow_reproject_energy_);
+    ctx.destroy_image(shadow_reproject_loss_);
     for (auto& retired : retired_shadows_) ctx.destroy_image(retired.image);
     retired_shadows_.clear();
     ctx.destroy_image(surface_lut_);
     if (stbn_tex_) ctx.destroy_image(stbn_tex_);
     if (dummy_stbn_) ctx.destroy_image(dummy_stbn_);
     for (auto& buffer : surface_records_) ctx.destroy_buffer(buffer);
+    for (auto& frame : shadow_diagnostics_) ctx.destroy_buffer(frame.counters);
+}
+
+ShadowHistoryDiagnostics AtmosphereRenderer::shadow_history_diagnostics(rhi::VkContext& ctx) const {
+    if (!shadow_diagnostics_enabled_ || !shadow_temporal_enabled_ || stats_.shadow_updates == 0) return {};
+    auto result = shadow_last_diagnostics_;
+    const ShadowDiagnosticFrame* latest = nullptr;
+    for (const auto& frame : shadow_diagnostics_)
+        if (frame.serial > result.serial && frame.serial <= ctx.completed_serial() && (!latest || frame.serial > latest->serial))
+            latest = &frame;
+    if (!latest) return result;
+    VK_CHECK(vmaInvalidateAllocation(ctx.allocator(), latest->counters.allocation, 0, VK_WHOLE_SIZE));
+    std::array<uint32_t, 8> values;
+    std::memcpy(values.data(), latest->counters.mapped, sizeof(values));
+    result.columns = values[0];
+    result.serial = latest->serial;
+    result.depth_resets = values[1];
+    result.refining = values[2];
+    result.complete = values[3];
+    result.minimum_frames = values[0] ? values[4] : 0;
+    result.maximum_frames = values[5];
+    result.reprojected = values[6];
+    result.reprojection_rejected = values[7];
+    result.reset_reasons = latest->reset_reasons;
+    result.valid = true;
+    return result;
 }
 
 void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                                  const ephemeris::SystemSnapshot& system, const RenderSettings& settings, VkExtent2D extent,
                                  std::span<const float> minimum_heights_km, std::span<const RingHostGPU> rings,
-                                 const rhi::Image* ring_shadow_lut, uint64_t ring_shadow_revision) {
+                                 const rhi::Image* ring_shadow_lut, uint64_t ring_shadow_revision, bool shadow_diagnostics) {
     active_.clear();
     ++prepare_serial_;
     std::erase_if(retired_shadows_, [&](auto& entry) {
@@ -255,9 +310,27 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         return true;
     });
     ring_shadow_lut_ = ring_shadow_lut ? ring_shadow_lut : &surface_lut_;
+    shadow_last_diagnostics_ = shadow_diagnostics ? shadow_history_diagnostics(ctx) : ShadowHistoryDiagnostics{};
     stats_ = {};
+    shadow_diagnostics_enabled_ = shadow_diagnostics;
+    auto& diagnostics = shadow_diagnostics_[ctx.frame_index()];
+    diagnostics.serial = 0;
+    diagnostics.reset_reasons = 0;
+    if (shadow_diagnostics) {
+        const std::array<uint32_t, 8> values{0, 0, 0, 0, 64, 0, 0, 0};
+        std::memcpy(diagnostics.counters.mapped, values.data(), sizeof(values));
+        ctx.flush_buffer(diagnostics.counters);
+    }
     shadow_vrs_enabled_ = settings.atmosphere_shadow_vrs;
     shadow_temporal_enabled_ = settings.atmosphere_shadow_temporal && !settings.atmosphere_shadow_reference;
+    bool rotation_extent_changed = shadow_reproject_energy_ &&
+        (shadow_reproject_energy_.extent.width != extent.width || shadow_reproject_energy_.extent.height != extent.height);
+    if (!shadow_temporal_enabled_ || !settings.atmosphere_shadow_rotation || !settings.show_atmospheres || system.empty() || rotation_extent_changed) {
+        for (auto* image : {&shadow_reproject_energy_, &shadow_reproject_loss_}) {
+            if (*image) retired_shadows_.push_back({*image, ctx.recording_serial()});
+            *image = {};
+        }
+    }
     dual_source_ = settings.atmosphere_dual_source && bool(dual_source_pipeline_);
     auto& records = surface_records_[ctx.frame_index()];
     std::memset(records.mapped, 0, 1024*sizeof(glm::vec4));
@@ -453,25 +526,68 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             float irradiance = settings.hdr_enabled ? static_cast<float>(std::max(star.definition.lum_eq, 0.0)/(d*d)) : 1.0f;
             p.sun_irradiance[index] = {star.definition.color_rgb*(irradiance*static_cast<float>(PI)), 0.0f};
         }
-        auto view_projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au()) * camera.view_matrix_eye_relative();
-        p.inverse_view_projection = glm::inverse(view_projection);
+        auto projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au());
+        auto view = camera.view_matrix_eye_relative();
+        p.inverse_view_projection = glm::inverse(projection*view);
         p.depth_params.x = settings.hdr_enabled ? settings.exposure : 1.0f;
         p.depth_params.y = settings.aerial_perspective_enabled ? 1.0f : 0.0f;
-        bool shadows_unchanged = false;
+        uint32_t shadow_changes = 0;
         t.shadow_active = prepare_shadows(ctx, t.shadows[ctx.frame_index()], system, candidate.index, eye, radius+height,
                         float(focal), settings, ring_shadow_lut ? rings : std::span<const RingHostGPU>{},
-                        t.shadow_header, t.shadow_casters, uint32_t(prepare_serial_), shadows_unchanged);
+                        t.shadow_header, t.shadow_casters, uint32_t(prepare_serial_), shadow_changes);
         auto& uniform = t.uniforms[ctx.frame_index()];
         std::memcpy(uniform.mapped, &p, sizeof(p));
         ctx.flush_buffer(uniform);
         bool identity_dirty = t.definition != system.share_definition() || t.generation != system.generation() ||
             t.body_index != candidate.index || t.geometry_revision != b.revisions.geometry || t.lighting_revision != b.revisions.lighting;
+        t.shadow_reset_reasons = shadow_changes;
+        if (!t.shadow_history_valid) t.shadow_reset_reasons |= ShadowHistoryInitial;
+        if (identity_dirty) t.shadow_reset_reasons |= ShadowHistoryDefinition;
+        if (t.shadow_recorded_prepare+1 != prepare_serial_) t.shadow_reset_reasons |= ShadowHistoryInterrupted;
+        if (view != t.shadow_view || glm::vec3(p.camera) != glm::vec3(t.cached.camera) ||
+            p.axis_x != t.cached.axis_x || p.axis_y != t.cached.axis_y || p.axis_z != t.cached.axis_z)
+            t.shadow_reset_reasons |= ShadowHistoryCamera;
+        if (projection != t.shadow_projection) t.shadow_reset_reasons |= ShadowHistoryProjection;
+        if (p.camera.w != t.cached.camera.w || p.sun_direction != t.cached.sun_direction || p.sun_irradiance != t.cached.sun_irradiance)
+            t.shadow_reset_reasons |= ShadowHistoryLighting;
+        if (p.depth_params != t.cached.depth_params) t.shadow_reset_reasons |= ShadowHistoryTransport;
+        auto atmosphere_key = t.cached;
+        atmosphere_key.camera = p.camera;
+        atmosphere_key.axis_x = p.axis_x; atmosphere_key.axis_y = p.axis_y; atmosphere_key.axis_z = p.axis_z;
+        atmosphere_key.sun_direction = p.sun_direction;
+        atmosphere_key.sun_irradiance = p.sun_irradiance;
+        atmosphere_key.inverse_view_projection = p.inverse_view_projection;
+        atmosphere_key.depth_params = p.depth_params;
+        if (std::memcmp(&p, &atmosphere_key, sizeof(p)) != 0) t.shadow_reset_reasons |= ShadowHistoryAtmosphere;
+        if (t.shadow_ring_revision != ring_shadow_revision || t.shadow_ring_image != ring_shadow_lut_->handle)
+            t.shadow_reset_reasons |= ShadowHistoryRings;
+        if (t.shadow_reset_reasons == 0 && std::memcmp(&p, &t.cached, sizeof(p)) != 0)
+            t.shadow_reset_reasons |= ShadowHistoryTransport;
+        bool rotation_mode_unchanged = t.shadow_rotation_enabled == settings.atmosphere_shadow_rotation;
+        if (!rotation_mode_unchanged) t.shadow_reset_reasons |= ShadowHistorySampling;
+        auto relative_eye = eye-b.render.position.value;
+        if (relative_eye != t.shadow_eye_relative) t.shadow_reset_reasons |= ShadowHistoryCamera;
         t.shadow_history_reusable = shadow_temporal_enabled_ && t.shadow_history_valid && !identity_dirty &&
-            t.shadow_recorded_prepare+1 == prepare_serial_ && shadows_unchanged &&
+            t.shadow_recorded_prepare+1 == prepare_serial_ && shadow_changes == 0 &&
             std::memcmp(&p, &t.cached, sizeof(p)) == 0 &&
+            t.shadow_ring_revision == ring_shadow_revision && t.shadow_ring_image == ring_shadow_lut_->handle && rotation_mode_unchanged &&
+            relative_eye == t.shadow_eye_relative;
+        auto rotation_key = t.cached;
+        rotation_key.inverse_view_projection = p.inverse_view_projection;
+        t.shadow_history_reproject = shadow_temporal_enabled_ && settings.atmosphere_shadow_rotation &&
+            p.camera.w == 1.0f && !t.shadow_history_reusable && t.shadow_history_valid && !identity_dirty && rotation_mode_unchanged &&
+            t.shadow_recorded_prepare+1 == prepare_serial_ && shadow_changes == 0 &&
+            relative_eye == t.shadow_eye_relative && view != t.shadow_view && projection == t.shadow_projection &&
+            std::memcmp(&p, &rotation_key, sizeof(p)) == 0 &&
             t.shadow_ring_revision == ring_shadow_revision && t.shadow_ring_image == ring_shadow_lut_->handle;
+        t.shadow_reprojection = t.shadow_projection*t.shadow_view*p.inverse_view_projection;
+        t.shadow_previous_inverse = t.cached.inverse_view_projection;
+        t.shadow_eye_relative = relative_eye;
+        t.shadow_rotation_enabled = settings.atmosphere_shadow_rotation;
         t.shadow_ring_revision = ring_shadow_revision;
         t.shadow_ring_image = ring_shadow_lut_->handle;
+        t.shadow_view = view;
+        t.shadow_projection = projection;
         bool optics_dirty = !t.valid || identity_dirty || p.reference_shape != t.cached.reference_shape || p.radii_heights != t.cached.radii_heights || p.rayleigh != t.cached.rayleigh ||
             p.mie_scattering != t.cached.mie_scattering || p.mie_extinction != t.cached.mie_extinction || p.ground_albedo != t.cached.ground_albedo ||
             p.mixed_absorption != t.cached.mixed_absorption || p.ozone_absorption != t.cached.ozone_absorption ||
@@ -591,6 +707,8 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
             t->shadow_history_reusable = false;
+            t->shadow_history_reproject = false;
+            t->shadow_reset_reasons |= ShadowHistoryViewport;
         }
         const auto& header = t->shadow_header;
         bool temporal = shadow_temporal_enabled_;
@@ -604,6 +722,8 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 *image = ctx.create_image_2d(color.extent.width, color.extent.height, VK_FORMAT_R32G32B32A32_SFLOAT,
                     VK_IMAGE_USAGE_STORAGE_BIT, 1, 2);
                 t->shadow_history_reusable = false;
+                t->shadow_history_reproject = false;
+                t->shadow_reset_reasons |= ShadowHistoryInitial;
                 ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_GENERAL);
             }
         }
@@ -611,7 +731,9 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                    color.extent.width >= 64 && color.extent.height >= 64;
         ctx.transition_image(cmd, t->shadow_fraction, VK_IMAGE_LAYOUT_GENERAL);
         ctx.transition_image(cmd, t->shadow_depth, VK_IMAGE_LAYOUT_GENERAL);
-        auto& pipeline = temporal ? (transparency_writes.empty() ? shadow_accumulate_pipeline_ : shadow_accumulate_transparency_pipeline_)
+        bool reproject = temporal && t->shadow_history_reproject;
+        auto& pipeline = reproject ? (transparency_writes.empty() ? shadow_rotate_pipeline_ : shadow_rotate_transparency_pipeline_)
+                             : temporal ? (transparency_writes.empty() ? shadow_accumulate_pipeline_ : shadow_accumulate_transparency_pipeline_)
                              : vrs ? (transparency_writes.empty() ? shadow_vrs_pipeline_ : shadow_vrs_transparency_pipeline_)
                              : (transparency_writes.empty() ? shadow_pipeline_ : shadow_transparency_pipeline_);
         auto& stbn = stbn_tex_ ? stbn_tex_ : dummy_stbn_;
@@ -632,8 +754,42 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
             writes.push_back(rhi::PushDescriptorWrite::storage_image(23, t->shadow_energy));
             writes.push_back(rhi::PushDescriptorWrite::storage_image(24, t->shadow_loss));
-            ctx.push_constants(cmd, pipeline, uint32_t(t->shadow_history_reusable));
-            if (!t->shadow_history_reusable) ++stats_.shadow_history_resets;
+            writes.push_back(rhi::PushDescriptorWrite::storage_buffer(25, shadow_diagnostics_[ctx.frame_index()].counters));
+            if (reproject) {
+                for (auto* image : {&shadow_reproject_energy_, &shadow_reproject_loss_}) {
+                    if (image->extent.width != color.extent.width || image->extent.height != color.extent.height) {
+                        if (*image) retired_shadows_.push_back({*image, ctx.recording_serial()});
+                        *image = ctx.create_image_2d(color.extent.width, color.extent.height, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+                    }
+                    ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_GENERAL);
+                }
+                rhi::PushDescriptorWrite reprojection_writes[] = {
+                    rhi::PushDescriptorWrite::uniform_buffer(0, t->uniforms[ctx.frame_index()]),
+                    rhi::PushDescriptorWrite::sampled_image(3, depth, ctx.sampler_nearest_clamp()),
+                    rhi::PushDescriptorWrite::storage_buffer(11, t->shadows[ctx.frame_index()]),
+                    rhi::PushDescriptorWrite::storage_image(23, t->shadow_energy),
+                    rhi::PushDescriptorWrite::storage_image(24, t->shadow_loss),
+                    rhi::PushDescriptorWrite::storage_image(26, shadow_reproject_energy_),
+                    rhi::PushDescriptorWrite::storage_image(27, shadow_reproject_loss_)};
+                const std::array<glm::mat4, 2> transforms{t->shadow_reprojection, t->shadow_previous_inverse};
+                auto reproject_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_reproject");
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadow_reproject_pipeline_.handle);
+                ctx.push_descriptors(cmd, shadow_reproject_pipeline_, reprojection_writes);
+                ctx.push_constants(cmd, shadow_reproject_pipeline_, transforms);
+                vkCmdDispatch(cmd, (color.extent.width+7)/8, (color.extent.height+7)/8, 1);
+                ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+                ctx.end_gpu_timer(cmd, reproject_timer);
+                writes.push_back(rhi::PushDescriptorWrite::storage_image(26, shadow_reproject_energy_));
+                writes.push_back(rhi::PushDescriptorWrite::storage_image(27, shadow_reproject_loss_));
+                ++stats_.shadow_rotation_updates;
+            }
+            ctx.push_constants(cmd, pipeline, glm::uvec2(t->shadow_history_reusable, shadow_diagnostics_enabled_));
+            if (!t->shadow_history_reusable && !reproject) {
+                ++stats_.shadow_history_resets;
+                stats_.shadow_history_reset_reasons |= t->shadow_reset_reasons;
+            }
         }
         if (vrs) {
             uint32_t width = (color.extent.width+1)/2, height = (color.extent.height+1)/2;
@@ -678,6 +834,13 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         t->shadow_history_valid = temporal;
         t->shadow_recorded_prepare = prepare_serial_;
         ++stats_.shadow_updates;
+    }
+    if (shadow_diagnostics_enabled_ && shadow_temporal_enabled_ && stats_.shadow_updates != 0) {
+        ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+        auto& diagnostics = shadow_diagnostics_[ctx.frame_index()];
+        diagnostics.serial = ctx.recording_serial();
+        diagnostics.reset_reasons = stats_.shadow_history_reset_reasons;
     }
     if (dual_source_ && !transparency_writes.empty()) {
         for (auto* t : active_) {

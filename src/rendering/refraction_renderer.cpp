@@ -111,7 +111,9 @@ RefractionRenderer::Tables* RefractionRenderer::tables_for(VkCommandBuffer cmd, 
         region.imageExtent = image.extent;
         bool staged = staging_.image(cmd, ctx, image, region, bytes);
         ctx.transition_image(cmd, image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_READ_BIT);
         return staged;
     };
     t.ready = upload(t.travel, std::as_bytes(std::span(packed.travel))) &&
@@ -192,7 +194,7 @@ void RefractionRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                 source = &r;
                 if (built_source_[f] != source || !same_observer(built_[f], params)) {
                     write_ubo(ctx, ubos_[f], params);
-                    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                        VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_.handle);
                     rhi::PushDescriptorWrite writes[] = {
@@ -207,7 +209,7 @@ void RefractionRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                     vkCmdDispatch(cmd, (REFRACTION_OBSERVER_WIDTH+7)/8, (REFRACTION_OBSERVER_HEIGHT+7)/8, 1);
                     ctx.end_gpu_timer(cmd, timer);
                     ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
-                                       VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                        VK_ACCESS_2_SHADER_READ_BIT);
                     built_[f] = params;
                     built_source_[f] = source;
