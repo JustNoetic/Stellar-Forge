@@ -25,6 +25,7 @@ struct Options {
     double step_seconds = 1.0 / 60.0;
     double warp = 1.0;
     std::string simulation_mode = "inline";
+    std::string variant = "baseline";
     std::vector<std::string> scenes{"overview", "approach", "analytical", "nbody"};
     std::filesystem::path output;
 };
@@ -52,6 +53,8 @@ struct FrameSample {
     double cpu_gaia_ms = 0.0;
     double cpu_orbits_ms = 0.0;
     FrameHostTimings host;
+    std::map<std::string, double> cpu;
+    std::map<std::string, double> counters;
     std::map<std::string, double> gpu;
 };
 

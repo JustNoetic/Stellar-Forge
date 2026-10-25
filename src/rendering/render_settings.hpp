@@ -33,10 +33,14 @@ struct RenderSettings {
     bool show_atmospheres = true;
     bool aerial_perspective_enabled = true;
     bool refraction_enabled = true;
+    bool eclipse_refraction_enabled = true;
+    bool eclipse_refraction_probe = false;
     bool atmosphere_dual_source = false;
     bool atmosphere_surface_lighting = true;
     bool atmosphere_shadows_enabled = true;
     bool atmosphere_shadow_reference = false;
+    bool atmosphere_shadow_cached_weights = true;
+    bool atmosphere_shadow_fast_rings = false;
     bool atmosphere_shadow_temporal = true;
     bool atmosphere_shadow_animate_jitter = true;
     bool atmosphere_shadow_rotation = true;
@@ -47,6 +51,7 @@ struct RenderSettings {
     bool ring_shadows_enabled = true;
     bool ringshine_enabled = true;
     bool planetshine_enabled = true;
+    uint32_t ring_planetshine_mode = 0;
     uint32_t ringshine_band_count = 10;
     bool eclipse_reference_smoothstep = false;
     bool ring_shadow_reference_all_hosts = false;
@@ -85,6 +90,7 @@ public:
             !std::isfinite(candidate.star_intensity) || candidate.star_intensity < 0.0f) {
             return {false, false, "Exposure and intensity must be finite and nonnegative; star size must be 1.5 to 6 pixels."};
         }
+        if (candidate.ring_planetshine_mode > 1) return {false, false, "Ring planetshine mode must be analytical or numerical."};
         if (candidate.ringshine_band_count < 4 || candidate.ringshine_band_count > 1024) {
             return {false, false, "Ringshine bands must be 4 to 1024."};
         }

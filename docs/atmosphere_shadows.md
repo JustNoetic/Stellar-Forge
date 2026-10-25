@@ -1,5 +1,13 @@
 # Atmospheric shadow deficit
 
+The default [cached atmospheric weights path](atmosphere_shadow_cached_weights.md)
+reuses aerial-perspective lighting for eligible single-star ring-shadow samples.
+Ring visibility and filtering retain the existing calculation; unsupported columns
+use native weights. The settings checkbox can restore native weights for comparison.
+
+The separate [ring geometry experiment](atmosphere_ring_shadow_geometry.md) simplifies
+repeated visibility projection math while retaining the existing filter and samples.
+
 `RenderSettings::atmosphere_shadows_enabled` (Atmospheric shadows in rendering settings, enabled by default) adds atmospheric shadows with full-resolution endpoints from external bodies and rings. `atmosphere_shadow_samples` selects a 4/8/16 integration-sample ceiling per evaluated ray/star (default 16), shared across primary and nearest-transparent endpoints. It works with the horizon-mapped aerial LUT and both hardware blend paths. No atmosphere shadow volume or shadowed sky LUT is allocated.
 
 Atmospheric shadows use the original normalized solar loss fraction architecture:

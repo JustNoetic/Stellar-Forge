@@ -20,7 +20,7 @@ bool valid_physical(const BodyPhysicalProperties& values) {
               std::isfinite(values.radius.value) && values.radius.value > 0.0 &&
               std::isfinite(values.oblateness) && values.oblateness >= 0.0 && values.oblateness < 1.0 &&
               std::isfinite(values.j2) && std::isfinite(values.j4) &&
-              std::isfinite(values.rotation_period_hr);
+              std::isfinite(values.rotation_period_hr) && physics::valid_material(values.material);
     if (values.update_orbit) {
         ok = ok && std::isfinite(values.a_au) && values.a_au > 0.0 &&
              std::isfinite(values.e) && values.e >= 0.0 && values.e < 1.0 &&
@@ -259,6 +259,7 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     body.is_star = (values.type == "Star");
     body.rotation_period_hr = values.rotation_period_hr;
     body.tidally_locked = values.tidally_locked;
+    body.material = values.material;
     if (body.is_star) {
         body.temp_k = values.temp_k;
         body.lum_eq = values.lum_eq;
@@ -351,6 +352,7 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
         ++revisions.geometry;
         ++revisions.lighting;
     }
+    if (before.material != values.material) ++revisions.lighting;
     ++snapshot_.definition_revision_;
     if (dynamics_changed) {
         reset_jacobi(true);
@@ -479,6 +481,7 @@ CommandResult Simulation::apply(const AddBody& command) {
         return {false, false, "Adding bodies is not supported in SPICE playback mode. Switch to Keplerian or N-Body mode first."};
     }
     const auto& def = command.definition;
+    if (!physics::valid_material(def.material)) return {false, false, "Invalid surface material on the new body."};
     if (!valid_atmosphere(def.atmosphere) || !def.valid_height_range() ||
         (def.atmosphere.enabled && def.atmosphere.physical && def.mass_msun <= 0) ||
         (def.atmosphere.enabled && (def.is_star || def.is_black_hole || def.is_spacecraft)))

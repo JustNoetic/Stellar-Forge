@@ -1,6 +1,6 @@
 # Atmospheric refraction: implementation plan
 
-Status: **Phase 1 implemented and verified** (CPU physics core). **Phase 2 implemented with passing CPU and GPU contracts** (per-vertex apparent positions; §4 Phase 2 results). Observer rebuild performance remains above the original budget. Phases 3–6 not started. Source assessment: `refraction_assessment.md` (previous agent). This plan supersedes it where they differ (see §1.2).
+Status: **Phase 1 implemented and verified** (CPU physics core). **Phase 2 implemented with passing CPU and GPU contracts** (per-vertex apparent positions; §4 Phase 2 results). Observer rebuild performance remains above the original budget. Phase 3 bent atmosphere transport was reverted by user request for stability and rendering cost; sky and aerial transport remain straight. Phase 4 incident eclipse lighting now uses the approximate cached model in `eclipse_refraction.md`; its historical design below is superseded. Phases 5–6 remain planned. Source assessment: `refraction_assessment.md` (previous agent). This plan supersedes it where they differ (see §1.2).
 
 ## 1. Decisions
 
@@ -293,6 +293,20 @@ Contracts:
 Cost: the bake rebuild should be ≤ 1.5× the current `atmosphere_luts` times. Composite and per-pixel costs are unchanged.
 
 ### Phase 4: eclipse refraction
+
+Status (2026-10-23): **approximate eclipse lighting implemented** in
+[the cached analytical design](eclipse_refraction.md), covering surfaces, terrain,
+rings and reflected point sources. The detailed Phase 4 specification below is
+historical and is not the implementation contract. Direct per-pixel limb/annulus
+integration was rejected after the user measured about 1 FPS at 1440p with the
+Moon covering half the screen; that implementation has been removed. Do not
+reuse that runtime method. The replacement passed a 1440p lookup-cost gate before
+its optical bake was connected.
+
+Review note (2026-10-22): [the original implementation assessment](eclipse_refraction_assessment.md)
+identifies required corrections to the provisional design below, especially the
+outside-penumbra gate, finite-source geometry, caustic integration and shared
+source-law normalization. Resolve these before implementing this phase.
 
 **4a. Limb profile** (`limb_profile.comp`, per atmosphere revision, 512 samples over `p ∈ [p_lo, r_top]`, asinh-concentrated near `p_lo`).
 - Stores δ_rgb(p) (dispersion), and T_rgb(p) along the full bent path in → periapsis → out, using the shared medium evaluator: Rayleigh, ozone, mixed absorption, aerosols.

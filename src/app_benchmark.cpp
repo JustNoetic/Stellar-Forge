@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "benchmark/build_info.hpp"
 #include "benchmark/earth_closeup.hpp"
+#include "benchmark/audit_fixture.hpp"
 #include "core/log.hpp"
 #include "core/path_utils.hpp"
 
@@ -54,7 +55,7 @@ void App::run_benchmark() {
     };
     check_window();
     if (!star_catalog_.loaded()) throw std::runtime_error("Benchmark requires the Gaia catalog.");
-    auto settings = rendering::RenderSettings{};
+    auto settings = benchmark::audit_settings(options.variant);
     require(render_settings_.apply(settings));
     vk_.set_vsync(false);
 
@@ -111,25 +112,37 @@ void App::run_benchmark() {
             bool spice = scene == "spice";
             auto system_name = spice ? std::string_view("Ephemeris Mode") : ephemeris::SystemManager::SOLAR_SYSTEM_NAME;
             auto system_path = paths::external_path("data", "systems", system_name, "system.json");
-            require(simulation_.replace_system(sys_mgr_.load_system(system_name)));
+            auto loaded = sys_mgr_.load_system(system_name);
+            bool audit_rings = scene.find("rings") != std::string::npos;
+            if (audit_rings) {
+                auto earth = std::find_if(loaded.definition.bodies.begin(), loaded.definition.bodies.end(), [](const auto& b) { return b.name == "Earth"; });
+                if (earth == loaded.definition.bodies.end()) throw std::runtime_error("Ring audit requires Earth.");
+                auto profile = rendering::generate_procedural_ring_profile(rendering::ProceduralRingConfig{});
+                earth->rings = {benchmark::audit_earth_ring(profile)};
+                earth->ring_texture_inner = profile.inner_radius_ratio;
+                earth->ring_texture_outer = profile.outer_radius_ratio;
+                celestial_renderer_.set_custom_ring_texture(loaded.definition.name, "Earth", std::move(profile.profile));
+            }
+            require(simulation_.replace_system(std::move(loaded)));
             if (scene == "nbody") require(simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::NBody}));
             else if (!spice) require(simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Keplerian}));
             if (spice && system().definition().motion_model != ephemeris::MotionModel::Spice)
                 throw std::runtime_error("SPICE fixture did not load SPICE playback.");
-            bool earth_closeup = scene == "earth-full" || scene == "earth-eclipse";
+            bool earth_closeup = scene.starts_with("earth-") || scene == "saturn";
             if (scene == "earth-eclipse") {
                 require(simulation_.apply(ephemeris::SetPaused{false}));
                 require(simulation_.apply(ephemeris::SetTimeWarp{1.0}));
                 require(simulation_.advance(units::Seconds{benchmark::ECLIPSE_FIXTURE_YEARS * SECONDS_PER_YEAR}));
             }
-            bool paused = scene == "overview" || scene == "approach" || earth_closeup;
+            bool paused = scene == "overview" || scene == "approach" || (earth_closeup && !scene.ends_with("-live"));
             require(simulation_.apply(ephemeris::SetPaused{paused}));
             require(simulation_.apply(ephemeris::SetTimeWarp{options.warp}));
             camera_ = Camera{};
             camera_.tracking_idx = scene == "approach" ? system().find_body("Earth") : system().star_index();
             if (camera_.tracking_idx < 0) throw std::runtime_error("Benchmark target is missing.");
             camera_.horizon_align = false;
-            if (earth_closeup) camera_ = benchmark::earth_closeup_camera(system(), scene == "earth-eclipse");
+            if (earth_closeup) camera_ = benchmark::audit_camera(system(), scene);
+            double base_yaw = camera_.yaw_deg;
             ui_state_ = {};
             ui_state_.inspected_body = system().find_body("Earth");
             frame_dt_ = units::Seconds{options.step_seconds};
@@ -154,11 +167,24 @@ void App::run_benchmark() {
                     {"star_point_size", settings.star_point_size}, {"star_intensity", settings.star_intensity}, {"vsync", false}}}
             };
             if (earth_closeup) {
-                run.fixture["tracking_body"] = "Earth";
+                run.fixture["tracking_body"] = system().body(camera_.tracking_idx).definition.name;
                 run.fixture["camera_direction"] = coordinates(glm::normalize(camera_.cam_pos_rel));
-                run.fixture["earth_distance_radii"] = 1.1;
-                run.fixture["earth_view"] = scene == "earth-eclipse" ? "Moon shadow axis surface intersection" : "sunward";
+                run.fixture["distance_radii"] = glm::length(camera_.cam_pos_rel)/target_radius;
+                run.fixture["forward"] = coordinates(camera_.forward_dir());
+                run.fixture["up"] = coordinates(camera_.up);
+                run.fixture["synthetic_earth_rings"] = audit_rings;
+                if (audit_rings) run.fixture["procedural_ring"] = {{"seed", 42}, {"config", "ProceduralRingConfig defaults"},
+                    {"inner_radius_ratio", 1.2}, {"outer_radius_ratio", 2.3}};
+                run.fixture["turning"] = scene.ends_with("-turn");
+                run.fixture["altitude_km"] = (glm::length(camera_.cam_pos_rel)-ellipsoid_surface_radius(target_radius,
+                    system().body(camera_.tracking_idx).definition.oblateness, system().body(camera_.tracking_idx).render.pole, camera_.cam_pos_rel))*AU_TO_KM;
             }
+            run.fixture["variant"] = options.variant;
+            run.fixture["render_settings"]["features"] = {{"atmospheres", settings.show_atmospheres}, {"atmosphere_shadows", settings.atmosphere_shadows_enabled},
+                {"refraction", settings.refraction_enabled}, {"terrain", settings.terrain_imported_enabled}, {"normals", settings.terrain_normal_maps_enabled},
+                {"textures", settings.surface_textures_enabled}, {"rings", settings.show_rings}, {"ring_shadows", settings.ring_shadows_enabled},
+                {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
+                {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}};
             if (scene == "nbody") run.fixture["ias15_epsilon"] = simulation_.nbody_epsilon();
             log::info("{}: repetition {}/{}", scene, repetition + 1, options.repeats);
             for (uint32_t index = 0; index < options.warmup + options.frames; ++index) {
@@ -181,6 +207,7 @@ void App::run_benchmark() {
                 }
                 {
                     ScopedTimer timer(&sample.cpu_camera_ms);
+                    if (scene.ends_with("-turn")) camera_.yaw_deg = camera_.yaw_actual_deg = base_yaw+15*std::sin(index*options.step_seconds*0.7);
                     if (scene == "approach") {
                         double progress = index < options.warmup || options.frames == 1 ? 0.0
                             : static_cast<double>(sample.index) / (options.frames - 1);
@@ -190,6 +217,21 @@ void App::run_benchmark() {
                 }
                 if (!render_frame(&sample)) throw std::runtime_error("Swapchain changed during benchmark; capture rejected.");
                 sample.frame_ms = elapsed_ms(frame_start);
+                const auto& terrain = celestial_renderer_.terrain_stats();
+                const auto& textures = celestial_renderer_.texture_stats();
+                const auto& normals = celestial_renderer_.normal_stats();
+                const auto& atmosphere = celestial_renderer_.atmosphere_stats();
+                sample.counters = {{"terrain_patches", terrain.patches}, {"terrain_bakes", terrain.cache_bakes},
+                    {"terrain_selection_rebuilds", terrain.selection_rebuilds}, {"terrain_budget_limited", terrain.budget_limited},
+                    {"texture_uploads", textures.uploads}, {"texture_pending", textures.pending}, {"texture_failed", textures.failed},
+                    {"normal_uploads", normals.uploads}, {"normal_pending", normals.pending}, {"normal_failed", normals.failed},
+                    {"atmospheres_visible", atmosphere.visible}, {"optical_updates", atmosphere.optical_lut_updates},
+                    {"sky_updates", atmosphere.sky_lut_updates}, {"aerial_updates", atmosphere.aerial_lut_updates},
+                    {"shadow_updates", atmosphere.shadow_updates}, {"shadow_resets", atmosphere.shadow_history_resets},
+                    {"shadow_rotation_updates", atmosphere.shadow_rotation_updates},
+                    {"ringshine_bakes", celestial_renderer_.ringshine_frame_bake_count()},
+                    {"observer_builds", celestial_renderer_.refraction_observer_builds()},
+                    {"camera_yaw_deg", camera_.yaw_actual_deg}, {"camera_pitch_deg", camera_.pitch_actual_deg}};
                 auto extent = vk_.swapchain_extent();
                 if (extent.width != options.width || extent.height != options.height)
                     throw std::runtime_error("Swapchain extent differs from the benchmark framebuffer.");

@@ -5,6 +5,7 @@
 #include "physics/atmosphere_physics.hpp"
 #include "core/units.hpp"
 #include "physics/star_calc.hpp"
+#include "physics/surface_material.hpp"
 #include <memory>
 #include <span>
 #include <cstdint>
@@ -90,6 +91,7 @@ struct BodyDefinition {
     double lum_pole = 1.0;
     double temp_k = 5778.0;
 
+    physics::SurfaceMaterialDefinition material;
     glm::vec3 color_rgb{1.0f, 1.0f, 1.0f};
     glm::vec3 color_pole_rgb{1.0f, 1.0f, 1.0f};
 

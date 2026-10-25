@@ -43,6 +43,12 @@ void main() {
     vec3 N = surface_shading_normal(f_body_idx, f_local_pos, normalize(f_normal),
         body_surface_rotation(body_pole(b), b.spin_flags.x));
     vec3 V = normalize(-f_world_pos);
+    float emission_cosine = dot(N, V);
+#ifdef TERRAIN_SURFACE
+    vec3 geometric = cross(dFdx(f_world_pos), dFdy(f_world_pos));
+    float geometric_length = length(geometric);
+    if (geometric_length > 1e-20) emission_cosine = max(emission_cosine, 0.1*abs(dot(geometric/geometric_length, V)));
+#endif
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;
 
     if (b.spin_flags.z > 0.5) {
@@ -78,10 +84,11 @@ void main() {
         float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
 
         float ndotl = max(dot(N, L), 0.0);
-        float shadow = 1.0;
-        if (ndotl > 0.0 || any(greaterThan(diffuse, vec3(0.0)))) {
+        float brdf = surface_direct_response(N, V, L, star_r/d_au, ndotl, b.material, emission_cosine);
+        vec3 shadow = vec3(1.0);
+        if (brdf > 0.0 || any(greaterThan(diffuse, vec3(0.0)))) {
             shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s);
-            if (shadow > 1e-4 && u_scene.num_ring_hosts > 0u) {
+            if (any(greaterThan(shadow, vec3(0.0))) && u_scene.num_ring_hosts > 0u) {
                 float sun_ang_rad = star_r / d_au;
                 uint candidates = u_scene.ring_shadow_params.y != 0u
                     ? (1u << u_scene.num_ring_hosts) - 1u
@@ -93,8 +100,7 @@ void main() {
 
         total_light += albedo * star_col * irradiance * diffuse * shadow;
 
-        if (ndotl > 0.0 && shadow > 1e-4) {
-            float brdf = surface_reflectance(N, L, V);
+        if (brdf > 0.0 && any(greaterThan(shadow, vec3(0.0)))) {
             total_light += albedo * star_col * irradiance * brdf * shadow * transmission;
         }
     }
@@ -143,7 +149,7 @@ void main() {
         vec3 transmission, diffuse;
         surface_atmosphere(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord, light, N, transmission, diffuse);
         total_light += albedo*b.shine_irradiance[i].rgb
-                     *(surface_reflectance(N, light, V)*transmission+diffuse);
+                     *(surface_direct_response(N, V, light, sin(b.shine_direction[i].w), max(dot(N, light), 0.0), b.material, emission_cosine)*transmission+diffuse);
     }
 
     vec3 rgb = total_light * exposure * mesh_weight;

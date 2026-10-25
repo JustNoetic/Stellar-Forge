@@ -22,6 +22,7 @@ layout(location = 0) out vec4 out_color;
 #include "common/eclipse_shadow.glsl"
 #include "common/surface_ring_shadow.glsl"
 #include "common/ring_optics.glsl"
+#include "common/ring_planetshine_disk.glsl"
 #include "common/ring_push.glsl"
 #include "common/ring_refraction.glsl"
 
@@ -124,8 +125,8 @@ void main() {
         if (dist_star <= 1e-5) continue;
         vec3 L = to_star / dist_star;
 
-        float shadow = evaluate_eclipse_shadow(hit_pos, star_pos, star_r, u_scene.num_bodies + f_host_idx, s);
-        if (shadow <= 1e-4) continue;
+        vec3 shadow = evaluate_eclipse_shadow(hit_pos, star_pos, star_r, u_scene.num_bodies + f_host_idx, s);
+        if (!any(greaterThan(shadow, vec3(0.0)))) continue;
 
         float star_ang_rad = clamp(star_r / dist_star, 0.0, 0.999);
         float sun_side = dot(pole_n, L);
@@ -189,8 +190,6 @@ void main() {
         float same_elevation = dot(pole_n, same_light), other_elevation = dot(pole_n, other_light);
         float same_phase = clamp(-dot(same_light, V), -1.0, 1.0);
         float other_phase = clamp(-dot(other_light, V), -1.0, 1.0);
-        float same_transfer = has_same ? 0.25*ring_transfer(total_tau, max(abs(same_elevation), 1e-5), mu_v, true) : 0.0;
-        float other_transfer = has_other ? 0.25*ring_transfer(total_tau, max(abs(other_elevation), 1e-5), mu_v, false) : 0.0;
         float angular_radius = clamp(ring_hosts[f_host_idx].tangent_radius.w/max(r, 1e-12), 0.0, 1.0);
         float broaden = 1.0/(1.0+1.2*angular_radius);
         uint remaining = active_mask;
@@ -199,13 +198,31 @@ void main() {
             uint i = (u_push.packed_segments >> (slot*3u)) & 7u;
             remaining &= remaining-1u;
             RingSegmentGPU seg = ring_hosts[f_host_idx].segments[i];
-            float same_phase_response = has_same ? ring_phase_dhg(same_phase, seg.bounds_opacity_scatter.w,
-                seg.phase_row.x*broaden, seg.phase_row.y*broaden, total_tau, seg.color_flags.w > 0.5) : 0.0;
-            float other_phase_response = has_other ? ring_phase_dhg(other_phase, seg.bounds_opacity_scatter.w,
-                seg.phase_row.x*broaden, seg.phase_row.y*broaden, total_tau, seg.color_flags.w > 0.5) : 0.0;
-            vec3 response = samples[slot].xyz*(same_flux*(same_transfer*same_phase_response)
-                +other_flux*(other_transfer*other_phase_response*seg.phase_row.z));
+            vec4 props = vec4(seg.phase_row.xy*broaden, seg.bounds_opacity_scatter.w, seg.phase_row.z);
+            vec3 response = vec3(0.0);
+            if (has_same) response += same_flux*ring_radiance_rgb(total_tau, mu_v, same_elevation, same_phase,
+                props, samples[slot].xyz, seg.color_flags.w > 0.5, true);
+            if (has_other) response += other_flux*ring_radiance_rgb(total_tau, mu_v, other_elevation, other_phase,
+                props, samples[slot].xyz, seg.color_flags.w > 0.5, false);
             total_illum += (samples[slot].w/total_tau)*response;
+        }
+        if (u_scene.ringshine_params.w == 1u) {
+            for (int q = 0; q < RING_DISK_SAMPLES; ++q) {
+                vec3 incident;
+                vec4 source = ring_host_disk_sample(f_host_idx, hit_local, pole_n, q, incident);
+                if (!any(greaterThan(incident, vec3(0.0)))) continue;
+                float sun = dot(pole_n, source.xyz), phase = clamp(-dot(source.xyz, V), -1.0, 1.0);
+                uint pending = active_mask;
+                while (pending != 0u) {
+                    uint slot = uint(findLSB(pending)); pending &= pending-1u;
+                    uint i = (u_push.packed_segments >> (slot*3u)) & 7u;
+                    RingSegmentGPU seg = ring_hosts[f_host_idx].segments[i];
+                    vec4 props = vec4(seg.phase_row.xy, seg.bounds_opacity_scatter.w, seg.phase_row.z);
+                    vec3 response = ring_radiance_rgb(total_tau, mu_v, sun, phase, props,
+                        samples[slot].xyz, seg.color_flags.w > 0.5, cam_side*sun >= 0.0);
+                    total_illum += incident*(samples[slot].w/total_tau)*response;
+                }
+            }
         }
     }
 

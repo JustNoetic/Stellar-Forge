@@ -474,7 +474,7 @@ void VkContext::resolve_gpu_timers(FrameContext& frame) {
             uint64_t t1 = timestamps[i * 2 + 1];
             double ms = static_cast<double>((t1 - t0) & mask) * ns_per_tick * 1e-6;
             gpu_timings_ms_[frame.timer_names[i]] = ms;
-            if (capture_gpu_timings_) sample.timings[frame.timer_names[i]] = ms;
+            if (capture_gpu_timings_) sample.timings[frame.timer_names[i]] += ms;
         }
         if (capture_gpu_timings_) captured_gpu_timings_.push_back(std::move(sample));
     }

@@ -505,11 +505,16 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     {
         ScopedTimer timer(sample ? &celestial_prepare_ms : nullptr);
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_terrain_prepare") : UINT32_MAX;
-        celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext, ui_settings_.show_telemetry);
+        celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext, ui_settings_.show_telemetry, sample ? &sample->cpu : nullptr);
         vk_.end_gpu_timer(cmd, id);
     }
     auto refraction_writes = celestial_renderer_.refraction_writes(vk_);
-    star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
+    {
+        ScopedTimer timer(sample ? &sample->cpu["cpu_gaia_cull_ms"] : nullptr);
+        auto id = sample ? vk_.begin_gpu_timer(cmd, "gpu_gaia_cull") : UINT32_MAX;
+        star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
+        vk_.end_gpu_timer(cmd, id);
+    }
 
     auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, 0.0f, 0.0f, 0.0f, 1.0f);
     auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0.0f);
@@ -518,7 +523,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     {
         ScopedTimer timer(sample ? &sample->cpu_celestial_ms : nullptr);
         uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_celestial") : UINT32_MAX;
-        celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext);
+        celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext, sample ? &sample->cpu : nullptr);
         vk_.end_gpu_timer(cmd, id);
     }
     if (sample) sample->cpu_celestial_ms += celestial_prepare_ms;
@@ -539,7 +544,10 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     }
 
     vk_.end_rendering(cmd);
-    celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_);
+    {
+        ScopedTimer timer(sample ? &sample->cpu["cpu_atmosphere_composite_ms"] : nullptr);
+        celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_);
+    }
     vk_.end_gpu_timer(cmd, t_scene);
 
     uint32_t t_post = vk_.begin_gpu_timer(cmd, "gpu_post_composite");
@@ -984,6 +992,10 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             const char* shadow_samples[] = {"4", "8", "16"};
             ImGui::Checkbox("Adaptive shadow samples", &render_draft.atmosphere_shadow_adaptive);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses fewer samples for short or vertical atmospheric columns. Grazing rays and sharp shadows retain more samples.");
+            ImGui::Checkbox("Cached shadow weights", &render_draft.atmosphere_shadow_cached_weights);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses aerial-perspective light contributions for single-star ring shadows. Unsupported endpoints and atmosphere profiles retain native integration.");
+            ImGui::Checkbox("Fast ring shadow geometry (experimental)", &render_draft.atmosphere_shadow_fast_rings);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Simplifies projection math for single-ring atmospheric shadows while retaining the current ring filter. Grazing stellar horizons use the original calculation.");
             ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
             ImGui::Checkbox("Atmospheric shadow VRS", &render_draft.atmosphere_shadow_vrs);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses smooth shadow fractions between pixels. Depth edges, narrow shadow detail and transparent endpoints use native resolution.");
@@ -997,7 +1009,16 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds atmospheric scattered light over surfaces. Atmospheric extinction remains active when disabled.");
             ImGui::Checkbox("Atmospheric refraction", &render_draft.refraction_enabled);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bends apparent positions of stars, bodies, terrain, rings and orbits through the nearest physical atmosphere.");
+            ImGui::Checkbox("Eclipse refraction", &render_draft.eclipse_refraction_enabled);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds approximate atmospheric colouring to eclipse shadows using cached textures.");
             ImGui::Checkbox("Planetshine", &render_draft.planetshine_enabled);
+            ImGui::BeginDisabled(!render_draft.planetshine_enabled || !render_draft.show_rings);
+            ui::field("Planetshine on rings", [&](const char* id) {
+                const char* modes[] = {"Analytical", "Numerical (64 samples)"};
+                int mode = int(render_draft.ring_planetshine_mode);
+                if (ImGui::Combo(id, &mode, modes, 2)) render_draft.ring_planetshine_mode = uint32_t(mode);
+            });
+            ImGui::EndDisabled();
             ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
             ImGui::BeginDisabled(!render_draft.show_rings);
             ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
@@ -1529,6 +1550,47 @@ void App::render_body_inspector() {
                 else if (b.definition.type == "Moon" || b.definition.type == "Dwarf Planet") { ag = 0.12; ab = 0.08; q = 0.67; }
                 ui::metric_text(std::format("Geom Albedo: {:.3f}", ag));
                 ui::metric_text(std::format("Bond Albedo: {:.3f} (q = {:.2f})", ab, q));
+            }
+
+            if (!inspect_bary && !b.definition.is_star && !b.definition.is_black_hole && !b.definition.is_spacecraft) {
+                ui::section("Surface material");
+                auto& authored = draft.values.material;
+                auto material = physics::resolve_material(physical_editing ? authored : b.definition.material, b.definition.name);
+                const char* names[] = {"Automatic", "Lambert", "Lunar regolith", "Icy regolith", "Custom"};
+                const char* presets[] = {"auto", "lambert", "lunar", "icy", "custom"};
+                const auto& selected = physical_editing ? authored.preset : b.definition.material.preset;
+                int preset = 0;
+                for (int i = 0; i < 5; ++i) if (selected == presets[i]) preset = i;
+                ImGui::BeginDisabled(!physical_editing);
+                ui::field("Material preset", [&](const char* id) {
+                    if (ImGui::Combo(id, &preset, names, 5)) {
+                        authored = preset == 4 ? material : physics::material_preset(presets[preset]);
+                        authored.preset = presets[preset];
+                        material = physics::resolve_material(authored, b.definition.name);
+                        draft.dirty = true;
+                    }
+                });
+                bool hapke = material.hapke;
+                if (ImGui::Checkbox("Hapke photometry", &hapke)) {
+                    authored = material; authored.preset = "custom"; authored.hapke = hapke;
+                    material = authored; draft.dirty = true;
+                }
+                const char* labels[] = {"Grain scattering albedo", "Particle phase width", "Backscatter fraction",
+                    "Shadow opposition strength", "Shadow opposition width", "Roughness (degrees)", "Brightness",
+                    "Coherent opposition strength", "Coherent opposition width"};
+                for (size_t i = 0; i < physics::MATERIAL_FIELDS.size(); ++i) {
+                    if (!material.hapke && i != 6) continue;
+                    double value = material.*physics::MATERIAL_FIELDS[i];
+                    ui::field(labels[i], [&](const char* id) {
+                        if (ImGui::SliderScalar(id, ImGuiDataType_Double, &value,
+                            &physics::MATERIAL_MIN[i], &physics::MATERIAL_MAX[i], "%.3f")) {
+                            authored = material; authored.preset = "custom";
+                            authored.*physics::MATERIAL_FIELDS[i] = value;
+                            material = authored; draft.dirty = true;
+                        }
+                    });
+                }
+                ImGui::EndDisabled();
             }
 
             ui::section("Camera position", "Distances from camera to inspected body.");

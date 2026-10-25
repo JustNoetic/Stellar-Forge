@@ -6,12 +6,15 @@
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
 #include "rendering/refraction_renderer.hpp"
+#include "rendering/eclipse_refraction_renderer.hpp"
 #include "rendering/transparency_renderer.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "rhi/vk_context.hpp"
 #include "terrain/terrain_renderer.hpp"
 #include "terrain/surface_textures.hpp"
 #include <array>
+#include <map>
+#include <string>
 #include <span>
 #include <vector>
 #include <glm/glm.hpp>
@@ -29,6 +32,7 @@ struct alignas(16) BodyInstanceGPU {
     glm::vec4 spin_flags{0.0f};
     glm::uvec4 surface_flags{0};
     PlanetshineGPU planetshine{};
+    physics::SurfaceMaterialGPU material{};
 };
 
 struct alignas(16) SceneCelestialUBO {
@@ -54,10 +58,11 @@ public:
     void shutdown(rhi::VkContext& ctx);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                  const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
-                 bool shadow_diagnostics = false);
+                 bool shadow_diagnostics = false, std::map<std::string, double>* timings = nullptr);
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent);
+                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
+                std::map<std::string, double>* timings = nullptr);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     const terrain::TextureStats& normal_stats() const noexcept { return normals_.stats(); }
@@ -76,6 +81,8 @@ public:
     const RefractionHost& refraction_host() const noexcept { return refraction_.host(); }
     uint32_t refraction_observer_builds() const noexcept { return refraction_.observer_builds(); }
     const RefractionRenderer& refraction() const noexcept { return refraction_; }
+    uint32_t eclipse_refraction_builds() const { return eclipse_refraction_.builds(); }
+    double eclipse_refraction_bake_ms() const { return eclipse_refraction_.last_bake_ms(); }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
      std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
     uint32_t ringshine_bake_count() const noexcept { return rings_.ringshine_bake_count(); }
@@ -118,8 +125,12 @@ private:
     AtmosphereRenderer atmospheres_;
     TransparencyRenderer transparency_;
     RefractionRenderer refraction_;
+    EclipseRefractionRenderer eclipse_refraction_;
     std::vector<float> atmosphere_minima_;
     std::vector<PlanetshineGPU> planetshine_;
+    SurfaceMaterialCache materials_;
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> material_phases_{};
+    std::array<uint64_t, rhi::FRAMES_IN_FLIGHT> material_uploads_{};
 };
 
 } // namespace sf::rendering

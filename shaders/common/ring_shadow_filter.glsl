@@ -35,11 +35,7 @@ vec3 ring_shadow_coordinates(vec3 hit_rel, vec3 pole, vec3 light, float incidenc
     return vec3((radius + shift - bounds.x) / span, h, mu_coord);
 }
 
-float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec3 pole, vec3 light,
-                             float incidence, float distance, vec2 bounds, float source_angle, float pixel_size,
-                             bool single_box, float softness, bool reference_linear) {
-    vec3 uv = ring_shadow_coordinates(hit_rel, pole, light, incidence, distance, bounds,
-        source_angle, pixel_size, softness, reference_linear);
+float ring_shadow_filter(sampler2DArray lut, int ring_idx, vec3 uv, bool single_box, bool reference_linear) {
     if (uv.x + uv.y <= 0.0 || uv.x - uv.y >= 1.0) return 0.0;
     if (single_box) return clamp(ring_box_extinction(lut, ring_idx, uv.x, uv.y, uv.z), 0.0, 1.0);
     float inner = ring_box_extinction(lut, ring_idx, uv.x, 0.36 * uv.y, uv.z);
@@ -47,6 +43,14 @@ float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec
     float outer = ring_box_extinction(lut, ring_idx, uv.x, uv.y, uv.z);
     vec3 weights = reference_linear ? vec3(0.24, 0.46, 0.30) : vec3(0.08, 0.42, 0.50);
     return clamp(dot(weights, vec3(inner, middle, outer)), 0.0, 1.0);
+}
+
+float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec3 pole, vec3 light,
+                             float incidence, float distance, vec2 bounds, float source_angle, float pixel_size,
+                             bool single_box, float softness, bool reference_linear) {
+    vec3 uv = ring_shadow_coordinates(hit_rel, pole, light, incidence, distance, bounds,
+        source_angle, pixel_size, softness, reference_linear);
+    return ring_shadow_filter(lut, ring_idx, uv, single_box, reference_linear);
 }
 
 float ring_receiver_extinction(sampler2DArray lut, int ring_idx, vec3 receiver_rel, vec3 pole, vec3 light,
@@ -74,4 +78,33 @@ float ring_receiver_extinction(sampler2DArray lut, int ring_idx, vec3 receiver_r
     vec3 hit = receiver_rel + light * distance;
     return coverage * ring_shadow_extinction(lut, ring_idx, hit, pole, light, abs(denominator), distance,
         bounds, source_angle, pixel_size, single_box, softness, reference_linear);
+}
+
+float ring_receiver_extinction_fast(sampler2DArray lut, int ring_idx, vec3 receiver_rel, vec3 pole,
+                                    vec3 to_star, float star_radius, float star_distance, vec2 bounds,
+                                    float pixel_size, bool single_box, float softness, bool reference_linear) {
+    float denominator = dot(to_star, pole);
+    float absolute_denominator = abs(denominator);
+    if (reference_linear || absolute_denominator <= max(star_radius, 1e-6*star_distance))
+        return ring_receiver_extinction(lut, ring_idx, receiver_rel, pole, to_star/star_distance,
+            bounds, star_radius/star_distance, star_distance, pixel_size, single_box, softness, reference_linear);
+    float fraction = -dot(receiver_rel, pole)/denominator;
+    if (fraction <= 0.0 || fraction >= 1.0) return 0.0;
+    vec3 hit = receiver_rel+to_star*fraction;
+    float radius = length(hit);
+    if (radius <= 1e-8)
+        return ring_receiver_extinction(lut, ring_idx, receiver_rel, pole, to_star/star_distance,
+            bounds, star_radius/star_distance, star_distance, pixel_size, single_box, softness, reference_linear);
+    float radial_projection = dot(hit, to_star)/radius;
+    float radial_stretch = length(vec2(denominator, radial_projection))/absolute_denominator;
+    float tangential_stretch = length(cross(hit, to_star))/(radius*absolute_denominator);
+    float base_width = star_radius*fraction;
+    float tangential_width = base_width*tangential_stretch;
+    float curvature = tangential_width*(tangential_width/(length(vec2(radius, tangential_width))+radius+1e-20));
+    float width = softness*(base_width*radial_stretch+0.5*curvature);
+    float span = max(bounds.y-bounds.x, 1e-9);
+    float pixel_width = max(0.75*pixel_size*radial_stretch, 0.75*span/4096.0);
+    vec3 uv = vec3((radius+0.25*softness*curvature-bounds.x)/span, max(width, pixel_width)/span,
+        clamp(absolute_denominator/star_distance, 0.5/64.0, 63.5/64.0));
+    return ring_shadow_filter(lut, ring_idx, uv, single_box, false);
 }

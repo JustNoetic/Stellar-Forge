@@ -1,4 +1,5 @@
 #include "point_source.glsl"
+#include "surface_material.glsl"
 
 struct BodyInstanceGPU {
     vec4 pos_radius;
@@ -9,6 +10,7 @@ struct BodyInstanceGPU {
     uvec4 surface_flags;
     vec4 shine_direction[4];
     vec4 shine_irradiance[4];
+    SurfaceMaterial material;
 };
 
 layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
@@ -50,10 +52,4 @@ vec3 stellar_radiance(BodyInstanceGPU b, vec3 N, vec3 V) {
     float radiance = u_scene.hdr_enabled != 0u ? lum / (radius * radius) : 1.0;
     float limb = 1.0 - clamp(dot(N, V), 0.0, 1.0);
     return color * radiance * (1.0 - 0.4 * limb - 0.2 * limb * limb);
-}
-
-float surface_reflectance(vec3 N, vec3 L, vec3 V) {
-    float ndotl = max(dot(N, L), 0.0);
-    float ndotv = max(dot(N, V), 0.05);
-    return mix(ndotl, ndotl / (ndotl + ndotv), 0.35);
 }

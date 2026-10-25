@@ -1,7 +1,8 @@
 #version 460
 
 #include "common/celestial_scene.glsl"
-#include "common/eclipse_optics.glsl"
+#include "common/surface_phase.glsl"
+#include "common/eclipse_shadow.glsl"
 #include "common/refraction.glsl"
 
 layout(location = 0) out vec2 f_pixel_offset;
@@ -51,6 +52,21 @@ float point_visibility(vec3 center, uint self_idx, float stellar_radius) {
 }
 
 vec3 disc_radiance(BodyInstanceGPU b, vec3 V) {
+    if (b.color_is_star.w < 0.5) {
+        vec3 sum = vec3(0.0);
+        for (uint s = 0; s < u_scene.num_stars; ++s) {
+            vec3 delta = u_scene.stars_pos_radius[s].xyz-b.pos_radius.xyz;
+            float distance = max(length(delta), 1e-12);
+            float flux = u_scene.hdr_enabled != 0u ? u_scene.stars_color_lum[s].w/(distance*distance) : 1.0;
+            float radius = asin(clamp(u_scene.stars_pos_radius[s].w/distance, 0.0, 0.84));
+            vec3 eclipse = u_scene.eclipse_params.y == 0u ? vec3(1.0)
+                : evaluate_eclipse_shadow(b.pos_radius.xyz, u_scene.stars_pos_radius[s].xyz, u_scene.stars_pos_radius[s].w, uint(b.spin_flags.w), s);
+            sum += u_scene.stars_color_lum[s].rgb*flux*material_disk_response(b.material, dot(V, delta/distance), radius)*eclipse;
+        }
+        for (int k = 0; k < 4; ++k)
+            sum += b.shine_irradiance[k].rgb*material_disk_response(b.material, dot(V, b.shine_direction[k].xyz), b.shine_direction[k].w);
+        return b.color_is_star.rgb*sum;
+    }
     vec3 tangent = normalize(cross(V, abs(V.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
     vec3 bitangent = cross(V, tangent);
     vec3 total = vec3(0.0);
@@ -60,21 +76,7 @@ vec3 disc_radiance(BodyInstanceGPU b, vec3 V) {
         float angle = float(i) * 2.39996323;
         vec3 N = sqrt(1.0 - r2) * V
                  + sqrt(r2) * (cos(angle) * tangent + sin(angle) * bitangent);
-        if (b.color_is_star.w > 0.5) {
-            total += stellar_radiance(b, N, V);
-        } else {
-            for (uint s = 0; s < u_scene.num_stars; ++s) {
-                vec3 to_star = u_scene.stars_pos_radius[s].xyz - b.pos_radius.xyz;
-                float distance = max(length(to_star), 1e-12);
-                float irradiance = u_scene.hdr_enabled != 0u
-                                   ? u_scene.stars_color_lum[s].w / (distance * distance) : 1.0;
-                total += b.color_is_star.rgb * u_scene.stars_color_lum[s].rgb
-                         * irradiance * surface_reflectance(N, to_star / distance, V);
-            }
-            for (int k = 0; k < 4; ++k)
-                total += b.color_is_star.rgb*b.shine_irradiance[k].rgb
-                       *surface_reflectance(N, b.shine_direction[k].xyz, V);
-        }
+        total += stellar_radiance(b, N, V);
     }
     return total / float(SAMPLES);
 }

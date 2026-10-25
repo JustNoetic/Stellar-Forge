@@ -25,7 +25,9 @@ static bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephe
     const auto origin = system.body(receiver).render.position.value;
     header.eye_focal = {glm::vec3((eye-origin)*AU_TO_KM), focal};
     header.flags = {settings.atmosphere_shadows_enabled ? 1u : 0u,
-                    (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u),
+                    (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u) |
+                    (settings.atmosphere_shadow_cached_weights && settings.aerial_perspective_enabled ? 4u : 0u) |
+                    (settings.atmosphere_shadow_fast_rings ? 8u : 0u),
                     settings.eclipse_reference_smoothstep ? 1u : 0u, settings.atmosphere_shadow_reference ? 1u : 0u};
     uint32_t effective_sequence = !settings.atmosphere_shadow_reference &&
         (settings.atmosphere_shadow_temporal || settings.atmosphere_shadow_animate_jitter) ? sequence : 0u;
@@ -132,10 +134,13 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     sky_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/sky_view.comp", sky);
     std::vector<rhi::DescriptorLayoutBinding> aerial(std::begin(sky), std::end(sky));
     aerial.push_back({5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    aerial.push_back({6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    aerial.push_back({7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     aerial_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/aerial_perspective.comp", aerial);
     composite_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/composite.comp", composite);
     const rhi::DescriptorLayoutBinding shadow[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage}, {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
         {18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage}, {19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage},
@@ -632,7 +637,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                 static_cast<glm::vec4*>(records.mapped)[candidate.index] = {bottom, radius+height,
                     float(b.opaque_radius_au()*AU_TO_KM), float(surface_slot+1)};
         }
-        if (sky_dirty) {
+        if (sky_dirty && !settings.aerial_perspective_enabled) {
             uint32_t sky_timer = ctx.begin_gpu_timer(cmd, "atmosphere_sky");
             writable(t.sky);
             writable(t.throughput);
@@ -652,17 +657,24 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             writable(t.aerial_radiance);
             writable(t.aerial_optical_depth);
             writable(t.aerial_range);
+            writable(t.sky);
+            writable(t.throughput);
             rhi::PushDescriptorWrite writes[] = {ubo,
                 rhi::PushDescriptorWrite::sampled_image(1, t.transmittance, sampler),
                 rhi::PushDescriptorWrite::sampled_image(2, t.multiscatter, sampler),
                 rhi::PushDescriptorWrite::storage_image(3, t.aerial_radiance),
                 rhi::PushDescriptorWrite::storage_image(4, t.aerial_optical_depth),
-                rhi::PushDescriptorWrite::storage_image(5, t.aerial_range)};
+                rhi::PushDescriptorWrite::storage_image(5, t.aerial_range),
+                rhi::PushDescriptorWrite::storage_image(6, t.sky),
+                rhi::PushDescriptorWrite::storage_image(7, t.throughput)};
             bake(aerial_pipeline_, writes, 24, 27);
             readable(t.aerial_radiance);
             readable(t.aerial_optical_depth);
             readable(t.aerial_range);
+            readable(t.sky);
+            readable(t.throughput);
             ctx.end_gpu_timer(cmd, aerial_timer);
+            ++stats_.sky_lut_updates;
             ++stats_.aerial_lut_updates;
             t.aerial_valid = true;
         }
@@ -740,6 +752,8 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         std::vector<rhi::PushDescriptorWrite> writes{
             rhi::PushDescriptorWrite::uniform_buffer(0, t->uniforms[ctx.frame_index()]),
             rhi::PushDescriptorWrite::sampled_image(3, depth, ctx.sampler_nearest_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(5, t->aerial_radiance, ctx.sampler_linear_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(9, t->aerial_range, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(7, t->transmittance, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(8, t->multiscatter, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::storage_buffer(11, t->shadows[ctx.frame_index()]),

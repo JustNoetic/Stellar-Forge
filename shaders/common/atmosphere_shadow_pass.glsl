@@ -3,6 +3,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 3) uniform sampler2D scene_depth;
 layout(set = 0, binding = 7) uniform sampler2D transmittance_lut;
 layout(set = 0, binding = 8) uniform sampler2D multiscatter_lut;
+#define ATMOSPHERE_SHADOW_CACHED_WEIGHTS
 #include "common/atmosphere_shadow.glsl"
 #if defined(ATMOSPHERE_SHADOW_COARSE) || defined(ATMOSPHERE_SHADOW_VRS)
 #include "common/atmosphere_shadow_vrs.glsl"

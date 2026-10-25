@@ -6,6 +6,8 @@ layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
 layout(rgba16f, set = 0, binding = 3) uniform writeonly image3D radiance_lut;
 layout(rgba16f, set = 0, binding = 4) uniform writeonly image3D optical_depth_lut;
 layout(r32f, set = 0, binding = 5) uniform writeonly image2D range_lut;
+layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D sky_radiance_lut;
+layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D sky_throughput_lut;
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, AERIAL_SIZE.xy))) return;
@@ -24,4 +26,6 @@ void main() {
         imageStore(radiance_lut, ivec3(pixel, slice), vec4(min(L, vec3(65000.0)), 1.0));
         imageStore(optical_depth_lut, ivec3(pixel, slice), vec4(min(tau, vec3(65000.0)), 1.0));
     }
+    imageStore(sky_radiance_lut, pixel, vec4(min(L, vec3(65000.0)), 1.0));
+    imageStore(sky_throughput_lut, pixel, vec4(exp(-tau), 1.0));
 }

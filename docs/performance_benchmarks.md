@@ -20,7 +20,7 @@ the window cancels the capture with a nonzero exit and no complete report.
 For a quick capture:
 
 ```powershell
-.\build\StellarForge.exe --benchmark --benchmark-warmup 60 --benchmark-frames 300 --benchmark-repeats 2 --benchmark-output exports/benchmarks/baseline
+.\build\bin\StellarForge.exe --benchmark --benchmark-warmup 60 --benchmark-frames 300 --benchmark-repeats 2 --benchmark-output exports/benchmarks/baseline
 ```
 
 Use `--help` for all options. `--benchmark-hidden` hides the window but still
@@ -40,7 +40,7 @@ simulation failures and missing GPU results reject the run.
 | `nbody` | Running IAS15 | Same overview camera; integrator epsilon recorded |
 | `spice` | Running local SPICE Ephemeris Mode | Same overview camera; explicit opt-in |
 | `earth-full` | Paused analytical Solar System at time zero | Sunward Earth close-up at 1.1 Earth radii; fills the framebuffer |
-| `earth-eclipse` | Paused analytical Solar System at 1.565 years | Same distance; Moon shadow axis centered on Earth's surface |
+| `earth-eclipse` | Paused analytical Solar System at 0.297293 years | Same distance; Moon shadow axis centered on Earth's surface |
 
 All scenes use the default FOV and render settings, including Gaia stars and orbit
 lines at 2048 segments. Each repetition reloads its initial system and resets its
@@ -52,9 +52,81 @@ only its starting pose. These are deterministic workloads, not wall-time playbac
 The two Earth close-ups are opt-in. See [eclipse_shadows.md](eclipse_shadows.md)
 for their geometry, exact image checks and eclipse filtering measurements.
 
+## Comprehensive application audit
+
 ```powershell
-.\build\StellarForge.exe --benchmark --benchmark-scene nbody --benchmark-warp 3600 --benchmark-output exports/benchmarks/nbody-1h
-.\build\StellarForge.exe --benchmark --benchmark-scene spice --benchmark-output exports/benchmarks/spice
+python scripts/performance_audit.py --output exports/benchmarks/my-audit --phase baseline
+python scripts/performance_audit.py --output exports/benchmarks/my-audit --phase experiments
+python scripts/performance_audit.py --output exports/benchmarks/my-audit --phase cadence
+python scripts/performance_audit.py --output exports/benchmarks/my-audit --phase summary
+```
+
+The audit uses the normal Release application at 1600×900 with UI, visible window,
+VSync off and deterministic pipelined simulation. Defaults are 600 warmup frames,
+1500 measured frames and three repetitions. Completed captures are retained;
+incomplete directories are rejected. Run captures serially on an otherwise idle
+machine. `timings.md` contains scene mean/p95, CPU and GPU breakdowns, repetition
+variation, feature-removal deltas and streaming/cache counters. The raw JSON and
+CSV remain alongside it.
+
+`--benchmark-scene audit` includes the four original scenes plus these fixtures:
+
+| Scene | Camera / workload |
+|---|---|
+| `earth-ground` | 2 km above the oblate surface, 3° above the horizon, fixed eye in a potential ring-shadow region |
+| `earth-ground-rings` | Identical pose with the procedural ring generator's default configuration and seed 42 |
+| `earth-ground-turn`, `earth-ground-rings-turn` | Fixed eye; yaw ±15°, sinusoidal phase advanced at the fixed timestep |
+| `earth-disc` | Sunward at 2.5 equatorial radii, full disc visible |
+| `earth-full` | Sunward at 1.1 radii, surface fills the framebuffer |
+| `earth-limb` | Same distance, aimed at the tangent |
+| `earth-full-rings` | 1.1 radii above the ring-shadow region |
+| `earth-eclipse` | Moon-shadow close-up at `ECLIPSE_FIXTURE_YEARS` |
+| `saturn` | Sunward at five Saturn radii |
+| `earth-ground-live`, `earth-ground-rings-live`, `earth-full-live` | Corresponding views with analytical simulation running at 1× |
+
+Ring fixtures use the same in-memory generator/application path as the UI; source
+systems and textures are not saved. All views except `analytical`, `nbody` and
+`*-live` are paused. Paused captures expose cached steady rendering; live and
+turning captures expose update costs. They must be interpreted separately.
+
+`--benchmark-variant` disables one feature group: `no-atmosphere`, `no-shadows`
+(atmospheric shadows), `no-refraction`, `no-secondary` (planetshine and ringshine),
+`no-orbits`, `no-gaia`, `smooth` (imported/synthetic terrain and normal maps),
+`no-textures`, `no-normals`, `no-rings`, or `no-ring-shadows` (surface lighting).
+`baseline` preserves default settings. Feature removal changes the image; deltas
+are measured feature costs, not promises of equivalent-quality optimization.
+`baseline` now includes cached atmospheric shadow weights. `native-shadow-weights`
+restores the original per-sample lighting; `cached-shadow-weights` explicitly
+selects the current default. Cached weights preserve the ring filter and
+sample positions but introduce a small LUT approximation; see
+[cached weights](atmosphere_shadow_cached_weights.md) for limits and measurements.
+`fast-ring-shadows` enables the separate [ring geometry experiment](atmosphere_ring_shadow_geometry.md),
+which preserves the existing ring filter and simplifies its projection math.
+The script also measures quarter-pixel-count rendering and UI removal.
+The optional `cadence` phase cross-checks running views with fixed steps close to
+their measured uncapped frame duration, instead of the primary 1/60-second step.
+These deliberately change the camera/time trace and are reported separately.
+
+CPU child scopes split refraction, albedo streaming, normal streaming, rings,
+ringshine, terrain, planetshine, atmosphere preparation, transparency preparation,
+eclipse refraction, surface setup, draw recording, Gaia culling and atmosphere
+composition. They remain inside `cpu_record_ms` and must not be added to their
+parent. `cpu_celestial_ms` includes prepare and opaque/ring rendering; atmosphere
+composition is outside it. `gpu_terrain_prepare_ms` is the entire celestial
+preparation interval, despite its historical name. New GPU child scopes separate
+sphere, terrain, point and Gaia-cull work. Repeated timestamp names are summed
+within a captured frame, so multi-atmosphere pass totals include every instance.
+
+Raw frame `counters` retain terrain patch/bake counts, streaming pending/uploads/
+failures, atmosphere LUT updates, shadow resets/rotation reuse, ringshine bakes,
+refraction observer builds and camera orientation. Counts are separate from
+millisecond metrics. `observer_builds` is cumulative; difference adjacent frames
+within a repetition to measure rebuild frequency. Instrumentation is enabled only on benchmark paths for new
+CPU/surface-draw timers. Compare captures with matching instrumentation.
+
+```powershell
+.\build\bin\StellarForge.exe --benchmark --benchmark-scene nbody --benchmark-warp 3600 --benchmark-output exports/benchmarks/nbody-1h
+.\build\bin\StellarForge.exe --benchmark --benchmark-scene spice --benchmark-output exports/benchmarks/spice
 ```
 
 SPICE requires the local `data/ephemeris.json` runtime/kernel configuration.
@@ -80,9 +152,9 @@ This is application frame throughput, not a display scanout or input-latency met
 | `fence_wait_ms`, `acquire_wait_ms` | Separate Vulkan frame pacing waits |
 | `submit_ms`, `present_ms` | Wall time inside queue submit/present calls |
 | `gpu_frame_ms` | Timestamp interval across the frame commands, including barriers |
-| `gpu_scene_hdr_ms` | HDR scene interval, including its three renderer children |
+| `gpu_scene_hdr_ms` | HDR scene interval, including preparation, body/ring draws, Gaia, orbits, atmosphere and transparency |
 | `gpu_celestial_ms`, `gpu_gaia_ms`, `gpu_orbits_ms` | Renderer GPU intervals |
-| `gpu_terrain_prepare_ms` | Terrain cache compute prepass before dynamic rendering; included in HDR scene time; CPU preparation is included in `cpu_celestial_ms` |
+| `gpu_terrain_prepare_ms` | Entire celestial preparation interval before dynamic rendering, including terrain, atmosphere LUTs, refraction, ringshine and transparency clear; included in HDR scene time |
 | `gpu_post_composite_ms`, `gpu_ui_ms` | Composite and ImGui GPU intervals |
 
 CPU scopes measure elapsed wall time, not scheduled thread/process CPU execution.

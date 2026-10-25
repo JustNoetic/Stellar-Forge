@@ -315,6 +315,7 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
 
         std::string col_hex = j.value("color", "#ffffff");
         b.color_rgb = hex_to_rgb(col_hex);
+        b.material = physics::parse_material(j.value("material", nlohmann::json{}), b.name);
         b.color_pole_rgb = hex_to_rgb(j.value("color_pole", col_hex));
 
         if (j.contains("ring_texture_inner") && j["ring_texture_inner"].is_number()) {
@@ -547,6 +548,7 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["lum_pole"] = b.lum_pole;
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+        j["material"] = physics::serialize_material(b.material);
         serialize_body_rings(j, b);
         j["atmosphere"] = b.atmosphere;
         j["height_range_km"] = {b.height_range_km.x, b.height_range_km.y};
@@ -693,6 +695,7 @@ nlohmann::json SystemManager::serialize_snapshot_to_nbody(const SystemSnapshot& 
         j["lum_pole"] = b.lum_pole;
         j["color"] = rgb_to_hex(b.color_rgb);
         j["color_pole"] = rgb_to_hex(b.color_pole_rgb);
+        j["material"] = physics::serialize_material(b.material);
         serialize_body_rings(j, b);
         j["atmosphere"] = b.atmosphere;
         j["height_range_km"] = {b.height_range_km.x, b.height_range_km.y};

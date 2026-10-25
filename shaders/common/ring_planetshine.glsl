@@ -1,3 +1,5 @@
+#include "surface_phase.glsl"
+
 void ring_planetshine_add(vec3 light, vec3 flux, vec3 pole,
                              inout vec3 same_flux, inout vec3 other_flux,
                              inout vec3 same_direction, inout vec3 other_direction) {
@@ -30,6 +32,7 @@ void ring_planetshine_incident(uint host_index, vec3 hit_local, vec3 pole_n,
         ring_planetshine_add(bodies[host_body].shine_direction[i].xyz, flux, pole_n,
                                 same_flux, other_flux, same_direction, other_direction);
     }
+    if (u_scene.ringshine_params.w == 1u) return;
     vec3 to_host = -hit_local;
     float distance = length(to_host), radius = bodies[host_body].pos_radius.w;
     if (distance <= max(radius, 1e-12)) return;
@@ -45,10 +48,16 @@ void ring_planetshine_incident(uint host_index, vec3 hit_local, vec3 pole_n,
         float cosine = dot(to_star/star_distance, -center_direction);
         if (cosine <= cutoff) continue;
         float mu = clamp(2.0*(cosine-cutoff)/(1.0-cutoff)-1.0, -1.0, 1.0);
-        float phase = ring_planetshine_phase(mu);
+        SurfaceMaterial material = bodies[host_body].material;
+        float phase = material.grain.x < 0.5 ? (2.0/3.0)*material.surface.w*ring_planetshine_phase(mu)
+            : material_disk_response(material, mu, asin(clamp(u_scene.stars_pos_radius[s].w/star_distance, 0.0, 0.84)));
         float scale = u_scene.hdr_enabled != 0u ? u_scene.stars_color_lum[s].w/(star_distance*star_distance) : 1.0;
         vec3 flux = clamp(bodies[host_body].color_is_star.rgb, 0.0, 1.0)*u_scene.stars_color_lum[s].rgb
-                  *(scale*(2.0/3.0)*phase*ratio*ratio);
+                  *(scale*phase*ratio*ratio);
+        float flattening = clamp(bodies[host_body].pole_oblateness.w, 0.0, 0.95);
+        float pole_view = dot(pole_n, center_direction);
+        float polar = 1.0-flattening;
+        flux *= sqrt(polar*polar+(1.0-polar*polar)*pole_view*pole_view);
         if (!any(greaterThan(flux, vec3(0.0)))) continue;
         vec3 sun = to_star/star_distance;
         vec3 toward_lit = sun-center_direction*dot(sun, center_direction);

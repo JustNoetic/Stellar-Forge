@@ -63,6 +63,12 @@ LaunchOptions parse_options(int argc, char** argv) {
         if (arg == "--benchmark-hidden") o.hidden = true;
         else if (arg == "--benchmark-ui") o.ui = true;
         else if (arg == "--benchmark-detailed") o.detailed = true;
+        else if (arg == "--benchmark-variant") {
+            o.variant = value();
+            const std::set<std::string> variants{"baseline", "no-atmosphere", "no-shadows", "no-refraction", "no-secondary",
+                "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows"};
+            if (!variants.contains(o.variant)) throw std::runtime_error("Unknown benchmark variant: " + o.variant);
+        }
         else if (arg == "--benchmark-width") o.width = integer(value());
         else if (arg == "--benchmark-height") o.height = integer(value());
         else if (arg == "--benchmark-warmup") o.warmup = integer(value(), true);
@@ -79,8 +85,14 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-scene") {
             auto scene = value();
             if (scene == "all") o.scenes = {"overview", "approach", "analytical", "nbody"};
+            else if (scene == "audit") o.scenes = {"overview", "analytical", "nbody", "approach", "earth-ground",
+                "earth-ground-rings", "earth-ground-turn", "earth-ground-rings-turn", "earth-disc", "earth-full",
+                "earth-limb", "earth-full-rings", "earth-eclipse", "saturn", "earth-ground-live", "earth-ground-rings-live", "earth-full-live"};
             else if (scene == "overview" || scene == "approach" || scene == "analytical" || scene == "nbody" || scene == "spice"
-                     || scene == "earth-full" || scene == "earth-eclipse")
+                     || scene == "earth-full" || scene == "earth-eclipse" || scene == "earth-ground" || scene == "earth-ground-rings"
+                     || scene == "earth-ground-turn" || scene == "earth-ground-rings-turn" || scene == "earth-disc"
+                     || scene == "earth-limb" || scene == "earth-full-rings" || scene == "saturn" || scene == "earth-ground-live"
+                     || scene == "earth-ground-rings-live" || scene == "earth-full-live")
                 o.scenes = {std::string(scene)};
             else throw std::runtime_error("Unknown benchmark scene: " + std::string(scene));
         } else throw std::runtime_error("Unknown argument: " + std::string(arg));
@@ -101,6 +113,12 @@ std::string_view help() {
   --no-simulation-thread   Run simulation on the main thread for comparison/debugging
   --benchmark-simulation inline|worker|pipeline  Inline, wait per step, or overlap rendering (inline)
   --benchmark-scene all|overview|approach|analytical|nbody|spice|earth-full|earth-eclipse
+                    audit|earth-ground|earth-ground-rings|earth-ground-turn|earth-ground-rings-turn
+                    earth-disc|earth-limb|earth-full-rings|saturn
+                    earth-ground-live|earth-ground-rings-live|earth-full-live
+  --benchmark-variant baseline|no-atmosphere|no-shadows|no-refraction|no-secondary|no-orbits
+                      no-gaia|smooth|no-textures|no-normals|no-rings|no-ring-shadows
+                      cached-shadow-weights|native-shadow-weights|fast-ring-shadows
   --benchmark-width N       Framebuffer width (1920)
   --benchmark-height N      Framebuffer height (1080)
   --benchmark-warmup N      Unmeasured frames per run (300; zero allowed)
@@ -141,6 +159,7 @@ std::map<std::string, double> metrics(const FrameSample& s) {
         {"acquire_wait_ms", s.host.acquire_wait_ms}, {"submit_ms", s.host.submit_ms}, {"present_ms", s.host.present_ms}
     };
     for (const auto& [name, ms] : s.gpu) result[name + "_ms"] = ms;
+    result.insert(s.cpu.begin(), s.cpu.end());
     return result;
 }
 
@@ -234,7 +253,7 @@ void write_report(const Options& o, const nlohmann::json& metadata, const std::v
     nlohmann::json report{{"schema_version", 2}, {"metadata", metadata},
         {"configuration", {{"fixture_version", 1}, {"width", o.width}, {"height", o.height}, {"warmup", o.warmup},
             {"frames", o.frames}, {"repeats", o.repeats}, {"step_seconds", o.step_seconds}, {"warp", o.warp},
-            {"ui", o.ui}, {"hidden", o.hidden}, {"scenes", o.scenes}, {"simulation_mode", o.simulation_mode}}}, {"scenes", nlohmann::json::array()}};
+            {"ui", o.ui}, {"hidden", o.hidden}, {"scenes", o.scenes}, {"simulation_mode", o.simulation_mode}, {"variant", o.variant}}}, {"scenes", nlohmann::json::array()}};
     for (const auto& name : o.scenes) {
         std::map<std::string, double> totals;
         std::map<std::string, uint64_t> counts;
@@ -281,7 +300,7 @@ void write_report(const Options& o, const nlohmann::json& metadata, const std::v
         for (const auto& frame : run.frames) {
             auto times = metrics(frame);
             entry["frames"].push_back({{"index", frame.index}, {"frame_id", frame.frame_id},
-                {"simulation_years", frame.simulation_years}, {"eye_au", frame.eye_au}, {"timings", times}});
+                {"simulation_years", frame.simulation_years}, {"eye_au", frame.eye_au}, {"timings", times}, {"counters", frame.counters}});
             csv << run.scene << ',' << run.repetition << ',' << frame.index << ',' << frame.frame_id << ',' << frame.simulation_years;
             for (double coordinate : frame.eye_au) csv << ',' << coordinate;
             for (const auto& column : columns) {

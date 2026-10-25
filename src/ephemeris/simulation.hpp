@@ -54,6 +54,7 @@ struct BodyPhysicalProperties {
     std::string spectral_class;
     std::string stage;
     nlohmann::json star_props;
+    physics::SurfaceMaterialDefinition material;
 
     bool operator==(const BodyPhysicalProperties&) const = default;
 
@@ -64,7 +65,7 @@ struct BodyPhysicalProperties {
                 body.arg_peri_deg, body.mean_anom_deg, false, true,
                 body.temp_k, body.lum_eq, body.lum_pole, body.color_rgb, body.color_pole_rgb,
                 body.spectral_class, body.stage,
-                body.source_json.contains("star_props") ? body.source_json["star_props"] : nlohmann::json{}};
+                body.source_json.contains("star_props") ? body.source_json["star_props"] : nlohmann::json{}, body.material};
     }
 };
 
