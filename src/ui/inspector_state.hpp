@@ -435,6 +435,8 @@ struct RingEditState {
 
 struct WorkspaceState {
     int inspected_body = -1;
+    bool comparison_selection = false;
+    bool comparison_mode = false;
     bool edit_mode = false;
     bool inspect_barycenter = false;
     int inspector_frame = 0;
@@ -456,7 +458,7 @@ struct WorkspaceState {
     JumpTimelineDraft jump_timeline{};
     TimelineScrubState timeline_scrub{};
 
-    bool has_selection() const noexcept { return inspected_body >= 0; }
+    bool has_selection() const noexcept { return comparison_mode ? comparison_selection : inspected_body >= 0; }
     bool has_selection(const ephemeris::SystemSnapshot& snapshot) const noexcept {
         return inspected_body >= 0 && static_cast<size_t>(inspected_body) < snapshot.size();
     }

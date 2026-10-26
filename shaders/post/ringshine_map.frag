@@ -37,12 +37,26 @@ vec3 ringshine_material_radiance(float mu_v, float sun, float mu, bool lit) {
     return response;
 }
 
-vec4 host_ring_disk_sample(vec3 center, int i) {
+// Four-point cubature over a uniform-radiance stellar cap. Two Gaussian
+// polar nodes are paired antipodally; their azimuth rotates across radial
+// nodes so the ring integral also covers the disk's horizontal extent.
+vec4 ringshine_disk_sample(vec3 center, int i, uint radial_index) {
+    float sr = min(u_push.solar.y, 0.999);
+    float edge_cosine = sqrt(max(1e-6, 1.0 - sr * sr));
     vec3 vertical = vec3(0.0, 1.0, 0.0) - center * center.y;
     vertical = dot(vertical, vertical) > 1e-12 ? normalize(vertical) : vec3(1.0, 0.0, 0.0);
-    float v = min(u_push.solar.y, 0.999) * u_push.disk_offset[i];
-    float cosine = sqrt(max(1e-6, 1.0 - v * v));
-    return vec4(center * cosine + vertical * v, u_push.disk_weight[i]);
+    vec3 horizontal = cross(center, vertical);
+    int pair = i / 2;
+    float u = pair == 0 ? 0.211324865405 : 0.788675134595;
+    float angle = 6.28318530718 * fract((float(radial_index) + 0.5) * 0.569840290998 + float(pair) * 0.25);
+    // Stable for tiny apparent disks, where 1 - edge_cosine rounds to zero.
+    float one_minus_c = u * (sr * sr / (1.0 + edge_cosine));
+    float c = 1.0 - one_minus_c;
+    float s = sqrt(max(0.0, one_minus_c * (2.0 - one_minus_c)));
+    vec3 tangent = vertical * cos(angle) + horizontal * sin(angle);
+    if ((i & 1) != 0) tangent = -tangent;
+    // dOmega / (pi sin(alpha)^2): unit perpendicular incident irradiance.
+    return vec4(center * c + tangent * s, 0.5 / (1.0 + edge_cosine));
 }
 
 void main() {
@@ -84,10 +98,10 @@ void main() {
         if (material_tau <= 0.0) continue;
 
         vec3 response = vec3(0.0);
-        int sources = (u_push.solar.y > 1e-6 && abs(sun) < 2.0 * u_push.solar.y) ? 4 : 1;
+        int sources = (u_push.solar.y > 1e-6 && (u_push.solar.y >= 0.01 || abs(sun) < 2.0*u_push.solar.y)) ? 4 : 1;
         for (int q = 0; q < sources; ++q) {
-            if (sources > 1 && u_push.disk_weight[q] <= 0.0) continue;
-            vec4 source = sources == 1 ? vec4(center, 1.0) : host_ring_disk_sample(center, q);
+
+            vec4 source = sources == 1 ? vec4(center, 1.0) : ringshine_disk_sample(center, q, node);
             float sample_phi = phi + atan(-source.z, -source.x);
             response += source.w * ringshine_band(r, slat, flattening, source.y, sample_phi);
         }

@@ -92,7 +92,7 @@ private:
         GeometryBakeGPU bake;
     };
     struct SelectionEntry {
-        uint64_t generation = 0;
+        uint64_t identity = 0;
         uint64_t geometry_revision = 0;
         uint64_t bounds_revision = 0;
         uint64_t residency_revision = 0;
@@ -127,7 +127,6 @@ private:
     std::vector<std::pair<uint32_t, float>> relief_extents_;
     std::vector<StreamBinding> streams_;
     std::unordered_map<uint32_t, SelectionEntry> selections_;
-    uint64_t selection_generation_ = 0;
     GeometryCache cache_;
     TileMetadataCache metadata_;
     TerrainStats stats_{};

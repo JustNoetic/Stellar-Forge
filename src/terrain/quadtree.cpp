@@ -111,12 +111,27 @@ public:
             sine_ = occluder/distance;
             cosine_ = std::sqrt(std::max(0.0, 1.0-sine_*sine_));
             tangent_distance_ = distance*cosine_;
+            horizon_ = occluder*sine_;
+            occluder_squared_ = occluder*occluder;
+            horizon_normal_ = -axis_*scale_;
         }
         tolerance_ = 64*std::numeric_limits<double>::epsilon()*(1+glm::length(view.eye));
     }
 
     bool visible(const TileBounds& tile) const noexcept {
         if (!view_.cull) return true;
+        if (view_.orthographic_pixels > 0.0) {
+            for (int axis = 0; axis < 2; ++axis) {
+                auto local_axis = glm::transpose(view_.view_from_local)[axis];
+                double center = glm::dot(local_axis,tile.angular_radius > 0.0 ? tile.surface_center : tile.center);
+                double support = tile.support(local_axis);
+                if (center+support < view_.orthographic_bounds[axis]-tolerance_ ||
+                    center-support > view_.orthographic_bounds[axis+2]+tolerance_) return false;
+            }
+            auto front = glm::transpose(view_.view_from_local)[2];
+            auto normal_axis = front*glm::dvec3(1,1/view_.polar_ratio,1);
+            return glm::dot(normal_axis,tile.direction)+glm::length(normal_axis)*tile.angular_radius >= -tolerance_;
+        }
         for (auto plane : planes_) {
             double distance = glm::dot(plane, tile.center-view_.eye);
             if (distance+tile.radius < -tolerance_) return false;
@@ -124,6 +139,14 @@ public:
                 glm::dot(plane, tile.surface_center-view_.eye)+tile.support(plane) < -tolerance_) return false;
         }
         if (sine_ == 0.0) return true;
+        if (tile.maximum_scaled_radius > 0.0) {
+            double extent = tile.angular_radius > 0.0
+                ? glm::dot(horizon_normal_, tile.surface_center)+tile.support(horizon_normal_)
+                : glm::dot(horizon_normal_, tile.center)+tile.radius*glm::length(horizon_normal_);
+            double height = std::sqrt(std::max(0.0,
+                tile.maximum_scaled_radius*tile.maximum_scaled_radius-occluder_squared_));
+            if (extent < horizon_-cosine_*height-tolerance_) return false;
+        }
         auto to_tile = tile.center*scale_-eye_;
         double radius = tile.radius/view_.polar_ratio;
         double along = glm::dot(to_tile, axis_);
@@ -136,8 +159,8 @@ public:
 private:
     const SelectionView& view_;
     std::array<glm::dvec3, 5> planes_;
-    glm::dvec3 scale_, eye_, axis_{0};
-    double sine_ = 0, cosine_ = 0, tangent_distance_ = 0, tolerance_ = 0;
+    glm::dvec3 scale_, eye_, axis_{0}, horizon_normal_{0};
+    double sine_ = 0, cosine_ = 0, tangent_distance_ = 0, horizon_ = 0, occluder_squared_ = 0, tolerance_ = 0;
 };
 
 }
@@ -222,8 +245,8 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
         auto description = source.describe(tile, view.polar_ratio, view.height_amplitude);
         auto bound = description.bounds;
         if (!visibility.visible(bound)) return false;
-        double distance = bound.distance(view.eye);
-        double error = description.geometric_error * view.focal_pixels / distance;
+        double error = description.geometric_error * (view.orthographic_pixels > 0.0 ?
+            view.orthographic_pixels : view.focal_pixels / bound.distance(view.eye));
         candidate = {tile, error};
         return true;
     };

@@ -47,7 +47,7 @@ inline std::vector<PlanetshineGPU> prepare_planetshine(const ephemeris::SystemSn
             auto& light = lighting[j][star_slot++];
             glm::dvec3 delta = star.render.position.value-source.render.position.value;
             double distance = glm::length(delta);
-            if (distance <= 1e-12) continue;
+            if (distance <= 1e-12 || !system.illuminates(s, j)) continue;
             light.direction = delta/distance;
             light.angular_radius = std::asin(std::min(0.84, star.opaque_radius_au()/distance));
             double visibility = 1.0;
@@ -81,6 +81,7 @@ inline std::vector<PlanetshineGPU> prepare_planetshine(const ephemeris::SystemSn
             if (i == j) continue;
             auto source = system.body(j);
             if (source.definition.is_star || source.definition.is_black_hole || source.definition.is_spacecraft) continue;
+            if (!system.illuminates(j, i)) continue;
             glm::dvec3 delta = source.render.position.value-receiver.render.position.value;
             double distance2 = glm::dot(delta, delta), radius = source.opaque_radius_au();
             if (distance2 <= radius*radius*1.1025 || radius*radius < distance2*1e-8) continue;

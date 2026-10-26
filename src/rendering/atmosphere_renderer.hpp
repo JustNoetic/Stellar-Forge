@@ -5,11 +5,14 @@
 #include "rhi/vk_context.hpp"
 #include <array>
 #include <memory>
+#include <functional>
 #include <vector>
 
 namespace sf::rendering {
 
 struct RingHostGPU;
+class RingRenderer;
+struct PlanetshineGPU;
 
 struct alignas(16) AtmosphereShadowHeaderGPU {
     glm::vec4 eye_focal{};
@@ -46,6 +49,9 @@ struct alignas(16) AtmosphereParametersGPU {
     std::array<glm::vec4, ephemeris::MAX_AEROSOL_LAYERS*physics::AEROSOL_PHASE_SAMPLES> aerosol_phase{};
 };
 
+AtmosphereParametersGPU make_atmosphere_parameters(const ephemeris::BodyDefinition& body,
+    const std::shared_ptr<const physics::PreparedAtmosphere>& prepared, glm::dvec3 pole, double minimum_height = 0);
+
 enum ShadowHistoryReset : uint32_t {
     ShadowHistoryInitial = 1u << 0,
     ShadowHistoryInterrupted = 1u << 1,
@@ -75,6 +81,10 @@ struct AtmosphereStats {
     uint32_t sky_lut_updates = 0;
     uint32_t aerial_lut_updates = 0;
     uint32_t surface_lut_updates = 0;
+    uint32_t point_lut_updates = 0;
+    uint32_t stellar_lut_updates = 0;
+    uint32_t secondary_lut_updates = 0;
+    uint32_t secondary_source_lut_updates = 0;
     uint32_t shadow_updates = 0;
     uint32_t shadow_vrs_updates = 0;
     uint32_t shadow_history_resets = 0;
@@ -90,18 +100,36 @@ public:
                  const ephemeris::SystemSnapshot& system, const RenderSettings& settings, VkExtent2D extent,
                  std::span<const float> minimum_heights_km = {}, std::span<const RingHostGPU> rings = {},
                  const rhi::Image* ring_shadow_lut = nullptr, uint64_t ring_shadow_revision = 0,
-                 bool shadow_diagnostics = false);
+                 bool shadow_diagnostics = false, std::span<const PlanetshineGPU> planetshine = {},
+                 const RingRenderer* ring_lighting = nullptr);
     void composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
-                   std::span<const rhi::PushDescriptorWrite> transparency_writes = {});
+                   std::span<const rhi::PushDescriptorWrite> transparency_writes = {},
+                   const std::function<void(uint32_t)>& draw_point = {});
     const AtmosphereStats& stats() const noexcept { return stats_; }
     ShadowHistoryDiagnostics shadow_history_diagnostics(rhi::VkContext& ctx) const;
+    const rhi::Buffer& point_responses(uint32_t frame) const noexcept { return point_responses_[frame]; }
     const rhi::Image& surface_lut() const noexcept { return surface_lut_; }
     const rhi::Buffer& surface_records(uint32_t frame) const noexcept { return surface_records_[frame]; }
 
 private:
     struct Tables {
         rhi::Image transmittance, multiscatter, sky, throughput;
+        rhi::Buffer point_partials, point_response;
+        physics::SurfaceMaterialGPU point_material{};
+        glm::vec4 point_color{};
+        glm::uvec2 point_surface{};
+        bool point_valid = false;
+        rhi::Image stellar_source;
         rhi::Image aerial_radiance, aerial_optical_depth, aerial_range;
+        rhi::Image secondary_sky, secondary_aerial, secondary_range;
+        rhi::Image secondary_source;
+        glm::vec4 secondary_direction{}, secondary_irradiance{};
+        std::array<glm::vec4, 4> secondary_directions{}, secondary_weights{};
+        bool secondary_approximate = false;
+        float secondary_altitude = 0.0f;
+        float secondary_source_radius = 0.0f;
+        bool secondary_source_valid = false;
+        bool secondary_active = false, secondary_valid = false, secondary_aerial_valid = false;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> uniforms;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> shadows;
         rhi::Image shadow_fraction, shadow_depth;
@@ -118,33 +146,44 @@ private:
         glm::mat4 shadow_reprojection{1.0f}, shadow_previous_inverse{1.0f};
         glm::dvec3 shadow_eye_relative{};
         AtmosphereParametersGPU cached{};
-        std::shared_ptr<const ephemeris::SystemDefinition> definition;
-        uint64_t generation = 0, geometry_revision = 0, lighting_revision = 0;
+        uint64_t identity = 0, definition_revision = 0, geometry_revision = 0, lighting_revision = 0;
         uint64_t last_used = 0;
         uint32_t body_index = 0;
         bool valid = false;
         bool aerial_valid = false;
+        bool stellar_source_resolved = true;
     };
     std::vector<std::unique_ptr<Tables>> tables_;
     std::vector<Tables*> active_;
     std::array<Tables*, 32> surface_layers_{};
+    std::array<glm::vec2, 32> surface_keys_{};
     uint64_t prepare_serial_ = 0;
     rhi::Pipeline transmittance_pipeline_, multiscatter_pipeline_, sky_pipeline_, composite_pipeline_;
-    rhi::Pipeline aerial_pipeline_;
+    rhi::Pipeline aerial_pipeline_, point_pipeline_, point_reduce_pipeline_;
+    rhi::Pipeline small_sky_pipeline_, small_aerial_pipeline_;
+    rhi::Pipeline molecular_sky_pipeline_, molecular_aerial_pipeline_;
+    rhi::Pipeline legacy_sky_pipeline_, legacy_aerial_pipeline_;
     rhi::Pipeline dual_source_pipeline_, surface_pipeline_;
+    rhi::Pipeline stellar_source_pipeline_;
+    std::array<rhi::Pipeline, 6> secondary_bake_pipelines_;
+    std::array<rhi::Pipeline, 24> secondary_approximate_pipelines_;
+    rhi::Pipeline secondary_composite_pipeline_, secondary_dual_source_pipeline_;
+    rhi::Pipeline secondary_source_pipeline_;
+    rhi::Pipeline secondary_transparent_pipeline_, secondary_composite_transparency_pipeline_;
+    void init_secondary(rhi::VkContext& ctx);
     rhi::Pipeline transparent_pipeline_, composite_transparency_pipeline_;
     rhi::Pipeline shadow_pipeline_, shadow_transparency_pipeline_;
     rhi::Pipeline shadow_accumulate_pipeline_, shadow_accumulate_transparency_pipeline_;
     rhi::Pipeline shadow_reproject_pipeline_, shadow_rotate_pipeline_, shadow_rotate_transparency_pipeline_;
     rhi::Pipeline shadow_coarse_pipeline_, shadow_vrs_pipeline_, shadow_vrs_transparency_pipeline_;
-    struct RetiredShadow { rhi::Image image; uint64_t serial; };
-    std::vector<RetiredShadow> retired_shadows_;
+    struct RetiredImage { rhi::Image image; uint64_t serial; };
+    std::vector<RetiredImage> retired_images_;
     rhi::Image shadow_coarse_fraction_, shadow_coarse_guide_;
     rhi::Image shadow_reproject_energy_, shadow_reproject_loss_;
     rhi::Image surface_lut_;
     rhi::Image stbn_tex_;
     rhi::Image dummy_stbn_;
-    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> surface_records_;
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> surface_records_, point_responses_;
     struct ShadowDiagnosticFrame {
         rhi::Buffer counters;
         uint64_t serial = 0;

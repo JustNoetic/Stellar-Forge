@@ -45,6 +45,19 @@ float ring_shadow_filter(sampler2DArray lut, int ring_idx, vec3 uv, bool single_
     return clamp(dot(weights, vec3(inner, middle, outer)), 0.0, 1.0);
 }
 
+float ring_swept_filter(sampler2DArray lut, int ring_idx, vec3 uv, float sweep, bool single_box) {
+    float s2 = sweep*sweep, h2 = uv.y*uv.y;
+    float reach = sqrt(h2+s2);
+    if (uv.x+reach <= 0.0 || uv.x-reach >= 1.0) return 0.0;
+    if (single_box) return clamp(ring_box_extinction(lut, ring_idx, uv.x, reach, uv.z), 0.0, 1.0);
+    if (sweep > 3.0*uv.y)
+        return clamp(ring_box_extinction(lut, ring_idx, uv.x, sqrt(0.728096*h2+s2), uv.z), 0.0, 1.0);
+    float inner = ring_box_extinction(lut, ring_idx, uv.x, sqrt(0.1296*h2+s2), uv.z);
+    float middle = ring_box_extinction(lut, ring_idx, uv.x, sqrt(0.5184*h2+s2), uv.z);
+    float outer = ring_box_extinction(lut, ring_idx, uv.x, reach, uv.z);
+    return clamp(dot(vec3(0.08, 0.42, 0.50), vec3(inner, middle, outer)), 0.0, 1.0);
+}
+
 float ring_shadow_extinction(sampler2DArray lut, int ring_idx, vec3 hit_rel, vec3 pole, vec3 light,
                              float incidence, float distance, vec2 bounds, float source_angle, float pixel_size,
                              bool single_box, float softness, bool reference_linear) {

@@ -1,0 +1,85 @@
+#version 460
+#define ATMOSPHERE_SOURCE_BAKE 1
+#include "common/atmosphere.glsl"
+#include "common/surface_material.glsl"
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
+layout(set = 0, binding = 3) uniform sampler2DArray surface_lut;
+layout(std430, set = 0, binding = 4) writeonly buffer PartialResponses { vec4 responses[]; };
+layout(push_constant) uniform PointAtmosphere {
+    vec4 color;
+    SurfaceMaterial material;
+    vec4 geometry;
+    uvec4 resources;
+} push;
+shared vec3 sums[64];
+
+vec3 physical_direction(vec3 local) {
+    vec3 world = local.x*atm.axis_x.xyz+local.y*atm.axis_y.xyz+local.z*atm.axis_z.xyz;
+    return normalize(world-atm.world_pole.xyz*dot(world,atm.world_pole.xyz)*(1.0-atm.reference_shape.y));
+}
+
+vec3 ground_light(vec3 p, uint star) {
+    vec3 up = normalize(p), sun = atm.sun_direction[star].xyz;
+    vec3 world = up.x*atm.axis_x.xyz+up.y*atm.axis_y.xyz+up.z*atm.axis_z.xyz;
+    vec3 N = normalize(world_to_atmosphere(world));
+    vec3 V = physical_direction(vec3(0,0,1)), light = physical_direction(sun);
+    float mu = clamp(dot(up,sun),-1.0,1.0);
+    float x = 0.5+0.5*sign(mu)*sqrt(abs(mu));
+    float y = sqrt(clamp((length(p)-bottom_radius())/(top_radius()-bottom_radius()),0.0,1.0));
+    vec3 uv = vec3((0.5+127.0*x)/128.0,(0.5+31.0*y)/32.0,float(push.resources.x)*3.0);
+    vec3 T = vec3(1.0), diffuse = vec3(0.0);
+    if (push.resources.y != 0u) {
+        T = textureLod(surface_lut,uv,0.0).rgb;
+        diffuse = textureLod(surface_lut,uv+vec3(0,0,1),0.0).rgb;
+    }
+    float response = surface_direct_response(N,V,light,sin(atm.sun_direction[star].w),max(dot(N,light),0.0),push.material);
+    return push.color.rgb*(T*response+diffuse);
+}
+
+vec3 disk_ray(float radius, float angle, bool ground, uint star) {
+    float top = top_radius();
+    float z = sqrt(max((top-radius)*(top+radius),0.0));
+    vec3 origin = vec3(radius*cos(angle),radius*sin(angle),z);
+    float end = ground ? z-sqrt(max((push.geometry.x-radius)*(push.geometry.x+radius),0.0)) : 2.0*z;
+    vec3 d = vec3(0,0,-1), L = vec3(0), tau = vec3(0);
+    vec3 sun = atm.sun_direction[star].xyz;
+    float previous = 0.0;
+    for (int i = 1; i <= 64; ++i) {
+        float u = float(i)/64.0;
+        float t = ground ? end*(1.0-(1.0-u)*(1.0-u))
+                         : z*(u < 0.5 ? 1.0-pow(1.0-2.0*u,2.0) : 1.0+pow(2.0*u-1.0,2.0));
+        int divisions = transport_subdivisions(origin,d,previous,t-previous);
+        float ds = (t-previous)/float(divisions);
+        for (int j = 0; j < divisions; ++j) {
+            vec3 p = origin+d*(previous+(float(j)+0.5)*ds);
+            vec3 r,m,e;
+            medium(p,r,m,e);
+            vec3 source = stellar_scattering_source(transmittance_lut,p,d,sun,atm.sun_direction[star].w,r,m,star)
+                        + stellar_multiple_source(multiscatter_lut,p,sun,atm.sun_direction[star].w,r+m,star);
+            L += exp(-tau)*source*(ATM_PI*segment_integral(e,ds));
+            tau += e*ds;
+        }
+        previous = t;
+    }
+    if (ground) L += exp(-tau)*ground_light(origin+d*end,star);
+    return L;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x, radial = gl_WorkGroupID.x, star = gl_WorkGroupID.y;
+    float u = (float(radial)+0.5)/32.0, angle = 2.0*ATM_PI*(float(lane)+0.5)/64.0;
+    float ground = push.geometry.x, height = max(top_radius()-ground,0.0);
+    float r = ground*(1.0-(1.0-u)*(1.0-u));
+    vec3 value = disk_ray(r,angle,true,star)*(4.0*r*(1.0-u)/ground);
+    r = ground+height*u*u;
+    if (height > 0.0) value += disk_ray(r,angle,false,star)*(4.0*r*height*u/(ground*ground));
+    sums[lane] = value;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) sums[lane] += sums[lane+stride];
+        barrier();
+    }
+    if (lane == 0u) responses[star*32u+radial] = vec4(sums[0]/(32.0*64.0),1.0);
+}

@@ -51,6 +51,9 @@
     "lum_eq": 1.0,
     "lum_pole": 1.0,
     "m": 1.0,
+    "material": {
+      "preset": "auto"
+    },
     "motion_model": "keplerian",
     "name": "Sun",
     "oblateness": 0.0,
@@ -148,6 +151,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.6601208254589484e-07,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Mercury",
     "oblateness": 0.0,
     "omega": 29.124,
@@ -265,6 +271,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.447838287796944e-06,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Venus",
     "oblateness": 0.0,
     "omega": 54.884,
@@ -354,6 +363,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 3.0034896154649684e-06,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Earth",
     "oblateness": 0.00335,
     "omega": 114.207,
@@ -424,6 +436,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 3.694303349765111e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Moon",
     "oblateness": 0.0,
     "omega": 318.15,
@@ -482,6 +497,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 3.2271560829322774e-07,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Mars",
     "oblateness": 0.00589,
     "omega": 286.502,
@@ -552,6 +570,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 5.340494077088951e-15,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Phobos",
     "oblateness": 0.0,
     "omega": 216.3,
@@ -619,6 +640,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 7.24498773209316e-16,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Deimos",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -787,6 +811,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 0.0009545942707586034,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Jupiter",
     "oblateness": 0.06487,
     "omega": 273.867,
@@ -857,6 +884,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 4.490849537629302e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Io",
     "oblateness": 0.0,
     "omega": 49.1,
@@ -925,6 +955,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.4132922271551027e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Europa",
     "oblateness": 0.0,
     "omega": 45.0,
@@ -993,6 +1026,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 7.450570569628044e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Ganymede",
     "oblateness": 0.0,
     "omega": 198.3,
@@ -1061,6 +1097,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 5.4096579022518324e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Callisto",
     "oblateness": 0.0,
     "omega": 43.8,
@@ -1129,6 +1168,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.0398422329993303e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Amalthea",
     "oblateness": 0.0,
     "omega": 180.1,
@@ -1197,6 +1239,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.109824820578351e-13,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Thebe",
     "oblateness": 0.0,
     "omega": 26.6,
@@ -1265,6 +1310,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 9.795615238399487e-16,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Adrastea",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -1333,6 +1381,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.8084212747814436e-14,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Metis",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -1503,6 +1554,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 0.0002858150013834552,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Saturn",
     "oblateness": 0.09796,
     "omega": 339.392,
@@ -1566,7 +1620,7 @@
       },
       {
         "asymmetry": 0.9900000095367432,
-        "backscatter": 0.0,
+        "backscatter": -0.0,
         "color": "#a7aac3",
         "gradient": [
           {
@@ -1697,6 +1751,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.8857312842783506e-11,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Mimas",
     "oblateness": 0.0,
     "omega": 160.4,
@@ -1765,6 +1822,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 5.427298298278461e-11,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Enceladus",
     "oblateness": 0.0,
     "omega": 119.5,
@@ -1833,6 +1893,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 3.104961372647355e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Tethys",
     "oblateness": 0.0,
     "omega": 335.3,
@@ -1901,6 +1964,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 5.509249922380639e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Dione",
     "oblateness": 0.0,
     "omega": 116.0,
@@ -1969,6 +2035,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.1599711372298745e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Rhea",
     "oblateness": 0.0,
     "omega": 44.3,
@@ -2007,7 +2076,7 @@
           "effective_variance": 0.1,
           "material": "organic_haze",
           "optical_depth_550": 0.02,
-          "peak_km": 500.0,
+          "peak_km": 220.0,
           "width_km": 20.0
         }
       ],
@@ -2034,6 +2103,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 6.765106720336657e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Titan",
     "oblateness": 0.0,
     "omega": 78.3,
@@ -2102,6 +2174,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.8083275379626838e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Hyperion",
     "oblateness": 0.0,
     "omega": 214.0,
@@ -2170,6 +2245,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 9.08006815050034e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Iapetus",
     "oblateness": 0.0,
     "omega": 254.5,
@@ -2238,6 +2316,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 4.168411038371228e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Phoebe",
     "oblateness": 0.0,
     "omega": 240.3,
@@ -2306,6 +2387,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.280965069636856e-14,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Helene",
     "oblateness": 0.0,
     "omega": 194.3,
@@ -2374,6 +2458,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 3.6168425495628876e-15,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Telesto",
     "oblateness": 0.0,
     "omega": 66.2,
@@ -2442,6 +2529,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.8084212747814438e-15,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Calypso",
     "oblateness": 0.0,
     "omega": 221.6,
@@ -2510,6 +2600,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 7.535088644922683e-18,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Methone",
     "oblateness": 0.0,
     "omega": 315.5,
@@ -2578,6 +2671,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.2605265934768046e-18,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Polydeuces",
     "oblateness": 0.0,
     "omega": 94.1,
@@ -2747,6 +2843,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 4.365793681585408e-05,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Uranus",
     "oblateness": 0.02293,
     "omega": 96.9988,
@@ -2840,6 +2939,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.4542721084700779e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Puck",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -2908,6 +3010,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 3.309712336395839e-11,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Miranda",
     "oblateness": 0.0,
     "omega": 154.8,
@@ -2976,6 +3081,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 6.510316589213198e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Ariel",
     "oblateness": 0.0,
     "omega": 9.6,
@@ -3044,6 +3152,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 6.40482534818428e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Umbriel",
     "oblateness": 0.0,
     "omega": 183.4,
@@ -3112,6 +3223,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.7097116135329569e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Titania",
     "oblateness": 0.0,
     "omega": 184.0,
@@ -3180,6 +3294,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.546953698802627e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Oberon",
     "oblateness": 0.0,
     "omega": 132.2,
@@ -3349,6 +3466,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 5.1503084171114494e-05,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Neptune",
     "oblateness": 0.01708,
     "omega": 273.187,
@@ -3419,6 +3539,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.0763836453882357e-08,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Triton",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -3487,6 +3610,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 9.49421169260258e-14,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Naiad",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -3555,6 +3681,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.7632107429119077e-13,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Thalassa",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -3623,6 +3752,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.069982587579021e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Despina",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -3691,6 +3823,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.0624474989340982e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Galatea",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -3759,6 +3894,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.4639739868897175e-12,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Larissa",
     "oblateness": 0.0,
     "omega": 247.3,
@@ -3827,6 +3965,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.4865792528244852e-14,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Hippocamp",
     "oblateness": 0.0,
     "omega": 346.4,
@@ -3895,6 +4036,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.2077809729623462e-11,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Proteus",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -3963,6 +4107,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 6.550448471368632e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Pluto",
     "oblateness": 0.0,
     "omega": 113.76,
@@ -4032,6 +4179,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 7.994729052302724e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Charon",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -4099,6 +4249,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 4.722223619164484e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Ceres",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -4166,6 +4319,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.302508964178489e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Vesta",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -4233,6 +4389,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.0611173414735953e-10,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Pallas",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -4300,6 +4459,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 2.011596855874114e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Haumea",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -4367,6 +4529,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 1.5589875633024387e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Makemake",
     "oblateness": 0.0,
     "omega": 0.0,
@@ -4434,6 +4599,9 @@
     "lum_eq": 0.0,
     "lum_pole": 0.0,
     "m": 8.348126951877574e-09,
+    "material": {
+      "preset": "auto"
+    },
     "name": "Eris",
     "oblateness": 0.0,
     "omega": 0.0,

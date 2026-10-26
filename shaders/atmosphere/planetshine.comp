@@ -1,0 +1,36 @@
+#version 460
+#define ATMOSPHERE_SECONDARY_BAKE
+#ifdef ATMOSPHERE_SECONDARY_APPROX
+layout(push_constant) uniform SecondarySources { vec4 direction[4]; vec4 irradiance[4]; } secondary;
+#else
+layout(push_constant) uniform SecondarySource { vec4 direction; vec4 cache; } secondary;
+#endif
+#include "common/atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 4) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image3D radiance_lut;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image2D sky_lut;
+layout(r32f, set = 0, binding = 5) uniform writeonly image2D range_lut;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, SKY_SIZE))) return;
+    vec3 d = sky_direction(pixel);
+#ifdef ATMOSPHERE_SECONDARY_APPROX
+    prepare_secondary(d);
+#endif
+    vec2 segment = angular_segment(pixel, d);
+    float range = segment.y-segment.x;
+    imageStore(range_lut, pixel, vec4(range));
+    vec3 L = vec3(0.0), tau = vec3(0.0);
+    float previous = 0.0;
+    if (atm.depth_params.y > 0.5) imageStore(radiance_lut, ivec3(pixel, 0), vec4(0.0));
+    for (int slice = 1; slice < AERIAL_SIZE.z; ++slice) {
+        float end = aerial_distance(float(slice)/float(AERIAL_SIZE.z-1), range);
+        integrate_atmosphere(transmittance_lut, multiscatter_lut, d, segment.x+previous, end-previous, L, tau);
+        previous = end;
+        if (atm.depth_params.y > 0.5)
+            imageStore(radiance_lut, ivec3(pixel, slice), vec4(min(L, vec3(65000.0)), 1.0));
+    }
+    imageStore(sky_lut, pixel, vec4(min(L, vec3(65000.0)), 1.0));
+}

@@ -1,0 +1,100 @@
+#version 460
+#include "common/size_comparison.glsl"
+#include "common/atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
+layout(rgba16f, set = 0, binding = 4) uniform image2D scene_color;
+layout(std430, set = 0, binding = 8) readonly buffer Profiles { vec4 profiles[]; };
+layout(set = 0, binding = 9) uniform sampler2D scene_depth;
+#ifndef COMPARISON_REFERENCE_AIR
+layout(set = 0, binding = 12) uniform sampler2DArray radiance_lut;
+layout(set = 0, binding = 13) uniform sampler2DArray throughput_lut;
+#endif
+
+vec4 profile_level(vec4 header, float radial, uint level) {
+    uint width = 4096u >> level;
+    uint offset = level == 0u ? 0u : 8192u-(4096u >> (level-1u));
+    float x = clamp(radial*float(width)-0.5, 0.0, float(width-1u));
+    uint a = uint(floor(x)), b = min(a+1u, width-1u);
+    uint base = uint(header.z)+offset;
+    return mix(profiles[base+a], profiles[base+b], fract(x));
+}
+
+vec4 ring_profile(vec3 point, float pixel_km) {
+    float radius = length(point);
+    vec3 dx = vec3(1,0,-COMPARISON_POLE.x/COMPARISON_POLE.z);
+    vec3 dy = vec3(0,1,-COMPARISON_POLE.y/COMPARISON_POLE.z);
+    float dr = pixel_km*(abs(dot(point,dx))+abs(dot(point,dy)))/max(radius, 1e-12);
+    vec4 result = vec4(0);
+    for (int i = 0; i < int(cmp.resources.z); ++i) {
+        vec4 header = profiles[i];
+        float radial = (radius-header.x)/(header.y-header.x);
+        float footprint = max(dr/(header.y-header.x), 1e-6);
+        float coverage = clamp(radial/footprint+0.5,0.0,1.0)*clamp((1.0-radial)/footprint+0.5,0.0,1.0);
+        if (coverage <= 0.0) continue;
+        float lod = clamp(log2(footprint*4096.0), 0.0, 12.0);
+        vec4 value = mix(profile_level(header,radial,uint(floor(lod))),
+                         profile_level(header,radial,uint(ceil(lod))),fract(lod))*coverage;
+        value.rgb *= abs(dot(COMPARISON_POLE,COMPARISON_LIGHT));
+        result = value+(1.0-value.a)*result;
+    }
+    return result;
+}
+
+#include "common/size_comparison_air.glsl"
+#include "common/size_comparison_transport.glsl"
+
+void main() {
+    ivec2 pixel = ivec2(cmp.rect.xy)+ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel,ivec2(cmp.rect.zw))) || any(greaterThanEqual(pixel,imageSize(scene_color)))) return;
+    float pixel_km = cmp.display.z;
+    vec2 xy = vec2((float(pixel.x)+0.5-cmp.shape.z)*pixel_km,
+              (cmp.shape.w-float(pixel.y)-0.5)*pixel_km);
+    vec3 origin = vec3(xy, cmp.shape.x);
+    vec3 ray = vec3(0,0,-1);
+    vec2 ground = comparison_roots(origin,ray,cmp.display.x);
+    float stored_depth = texelFetch(scene_depth,pixel,0).r;
+    float scene_z = (stored_depth-0.5)*2.0*cmp.display.y;
+    float end = stored_depth > 0.0 ? origin.z-scene_z : 2.0*origin.z;
+    bool surface = ground.y >= ground.x && ground.x >= 0.0 && ground.x <= end+max(pixel_km*0.05,cmp.display.y*2e-7);
+    if (surface) end = min(end,ground.x);
+    float start = 0.0;
+    vec2 shell = cmp.resources.w > 0.0 ? comparison_roots(origin,ray,top_radius()) : vec2(0.0,end);
+    start = max(shell.x,0.0);
+    float air_end = min(shell.y,end);
+    float ring_z = -dot(COMPARISON_POLE.xy,xy)/COMPARISON_POLE.z;
+    float ring_t = origin.z-ring_z;
+    vec4 ring = cmp.resources.z > 0.0 && ring_t >= 0.0 && ring_t <= end ? ring_profile(vec3(xy,ring_z),pixel_km) : vec4(0);
+    vec3 radiance = vec3(0), throughput = vec3(1);
+#ifndef COMPARISON_REFERENCE_AIR
+    float endpoint = ground.y >= ground.x && ground.x >= 0.0 ? ground.x : shell.y;
+    bool partial = stored_depth > 0.0 && end < endpoint-max(pixel_km*0.1,cmp.display.y*4e-7);
+    if (!partial) {
+        vec3 front_radiance = vec3(0), front_throughput = vec3(1);
+        if (cmp.resources.w > 0.0 && shell.y >= shell.x) {
+            vec2 uv = comparison_transport_uv(xy);
+            radiance = textureLod(radiance_lut,vec3(uv,0),0).rgb;
+            throughput = textureLod(throughput_lut,vec3(uv,0),0).rgb;
+            if (ring.a > 0.0) {
+                front_radiance = textureLod(radiance_lut,vec3(uv,1),0).rgb;
+                front_throughput = textureLod(throughput_lut,vec3(uv,1),0).rgb;
+            }
+        }
+        radiance = ring.a*front_radiance+(1.0-ring.a)*radiance+front_throughput*ring.rgb;
+        throughput *= 1.0-ring.a;
+        imageStore(scene_color,pixel,vec4(radiance+throughput*imageLoad(scene_color,pixel).rgb,1));
+        return;
+    }
+#endif
+    if (ring.a > 0.0) {
+        integrate_air(origin,start,min(air_end,ring_t),radiance,throughput);
+        radiance += throughput*ring.rgb;
+        throughput *= 1.0-ring.a;
+        start = max(start,ring_t);
+    }
+    integrate_air(origin,start,air_end,radiance,throughput);
+    if (surface && cmp.resources.w > 0.0) throughput *= sunlight(comparison_stretch(origin+ray*ground.x));
+    vec3 background = imageLoad(scene_color,pixel).rgb;
+    imageStore(scene_color,pixel,vec4(radiance+throughput*background,1));
+}

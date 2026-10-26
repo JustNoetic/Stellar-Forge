@@ -78,6 +78,7 @@ bool write_binary_file(const std::filesystem::path& path, const void* data, size
         return false;
     }
     ofs.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    ofs.close();
     return ofs.good();
 }
 
@@ -96,6 +97,21 @@ std::optional<nlohmann::json> read_json(const std::filesystem::path& path) {
 bool write_json(const std::filesystem::path& path, const nlohmann::json& j, int indent) {
     std::string dumped = j.dump(indent);
     return write_binary_file(path, dumped.data(), dumped.size());
+}
+
+bool write_json_atomic(const std::filesystem::path& path, const nlohmann::json& j, int indent) {
+    auto temporary = path;
+    temporary += ".tmp";
+    if (!write_json(temporary, j, indent)) return false;
+    std::error_code ec;
+#ifdef _WIN32
+    if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+#else
+    std::filesystem::rename(temporary, path, ec);
+    if (!ec) return true;
+#endif
+    std::filesystem::remove(temporary, ec);
+    return false;
 }
 
 } // namespace sf::paths

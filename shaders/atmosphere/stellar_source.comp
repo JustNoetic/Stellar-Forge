@@ -1,0 +1,63 @@
+#version 460
+#define ATMOSPHERE_SOURCE_BAKE
+#ifdef ATMOSPHERE_SOURCE_RADIUS_PUSH
+layout(push_constant) uniform SourceRadius { vec4 value; } source_radius;
+#endif
+#include "common/atmosphere.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1) uniform sampler2D transmittance_lut;
+layout(set = 0, binding = 2) uniform sampler2D multiscatter_lut;
+layout(rgba16f, set = 0, binding = 3) uniform writeonly image2DArray source_lut;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, STELLAR_SOURCE_SIZE))) return;
+    vec2 uv = vec2(pixel)/vec2(STELLAR_SOURCE_SIZE-1);
+    float H2 = (top_radius()-bottom_radius())*(top_radius()+bottom_radius());
+    float rho2 = H2*uv.y*uv.y;
+    vec3 p = vec3(0.0, 0.0, bottom_radius()+rho2/(sqrt(bottom_radius()*bottom_radius()+rho2)+bottom_radius()));
+#ifdef ATMOSPHERE_SOURCE_RADIUS_PUSH
+    float radius = source_radius.value.x;
+#else
+    float radius = atm.sun_irradiance[0].w;
+#endif
+    float first = stellar_source_begin(sun_horizon(p), radius);
+    float mu = mix(first, 1.0, uv.x*uv.x), elevation = asin(clamp(mu, -1.0, 1.0));
+    vec2 range = stellar_elevation_range(elevation, radius, asin(sun_horizon(p)));
+    vec3 total = vec3(0.0), uu = vec3(0.0), tt = vec3(0.0), ut = vec3(0.0);
+    if (radius < 0.01) {
+        vec3 sun = vec3(sqrt(max(1.0-mu*mu, 0.0)), 0.0, mu);
+        if (mu > sun_horizon(p)+4.0*radius) total = sun_point_transmittance(transmittance_lut, p, mu);
+        else if (range.y > range.x) total = stellar_small_transmittance(transmittance_lut, p, sun, radius, range, elevation);
+    } else {
+        for (int i = 0; i < 8; ++i) {
+            vec3 slice = stellar_slice(range, elevation, radius, i);
+            float s = sin(slice.x), c = cos(slice.x), phi = slice.y;
+            vec3 light = range.y > range.x ? sun_point_transmittance(transmittance_lut, p, s)*slice.z : vec3(0.0);
+            total += light*2.0*phi;
+            uu += light*(2.0*phi*s*s);
+            tt += light*(c*c*(phi+0.5*sin(2.0*phi)));
+            ut += light*(2.0*s*c*sin(phi));
+        }
+    }
+    vec3 inverse = 1.0/max(total, vec3(1e-35));
+    imageStore(source_lut, ivec3(pixel, 0), vec4(sqrt(sqrt(total)), 0));
+    imageStore(source_lut, ivec3(pixel, 1), vec4(uu*inverse, 0));
+    imageStore(source_lut, ivec3(pixel, 2), vec4(tt*inverse, 0));
+    imageStore(source_lut, ivec3(pixel, 3), vec4(ut*inverse, 0));
+    vec3 multiple = vec3(0.0);
+    if (atm.depth_params.z < 0.5) {
+        elevation = asin(uv.x*2.0-1.0);
+        if (radius < 0.01) {
+            vec3 sun = vec3(cos(elevation), 0.0, sin(elevation));
+            multiple = textureLod(multiscatter_lut, multiscatter_uv(p, sun), 0.0).rgb;
+        } else {
+            range = stellar_elevation_range(elevation, radius, -0.5*ATM_PI);
+            for (int i = 0; i < 8; ++i) {
+                vec3 slice = stellar_slice(range, elevation, radius, i);
+                vec3 sun = vec3(cos(slice.x), 0.0, sin(slice.x));
+                multiple += textureLod(multiscatter_lut, multiscatter_uv(p, sun), 0.0).rgb*(2.0*slice.y*slice.z);
+            }
+        }
+    }
+    imageStore(source_lut, ivec3(pixel, 4), vec4(sqrt(sqrt(max(multiple, vec3(0.0)))), 0));
+}

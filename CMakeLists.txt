@@ -172,7 +172,10 @@ endif()
 # --- Deployment / Packaging Staging ---
 install(TARGETS StellarForge RUNTIME DESTINATION .)
 install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/bake_textures.bat" DESTINATION .)
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data" DESTINATION .)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data" DESTINATION .
+    PATTERN "settings.json" EXCLUDE
+    PATTERN "settings.json.tmp" EXCLUDE
+)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders" DESTINATION .
     PATTERN "tests" EXCLUDE
 )

@@ -42,6 +42,7 @@ public:
     const SimulationPublication& publication() const noexcept { return front_; }
 
     CommandResult replace_system(LoadedSystem loaded);
+    void swap_simulation(SimulationRunner& other);
     template<class Command> CommandResult apply(Command command) {
         return execute([command = std::move(command)](Simulation& simulation) { return simulation.apply(command); });
     }

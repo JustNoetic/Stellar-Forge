@@ -71,6 +71,7 @@ void main() {
 
     vec3 total_light = vec3(0.0);
     for (uint s = 0; s < u_scene.num_stars; ++s) {
+        if (!star_lights_body(f_body_idx, s)) continue;
         vec3 star_pos = u_scene.stars_pos_radius[s].xyz;
         float star_r = u_scene.stars_pos_radius[s].w;
         vec3 star_col = u_scene.stars_color_lum[s].rgb;
@@ -79,14 +80,13 @@ void main() {
         vec3 to_star = star_pos - f_world_pos;
         float d_au = max(length(to_star), 1e-5);
         vec3 L = to_star / d_au;
-        vec3 transmission, diffuse;
-        surface_atmosphere(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord, L, N, transmission, diffuse);
+        vec3 diffuse;
+        vec3 direct = surface_stellar_light(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord,
+            N, V, L, star_r/d_au, emission_cosine, b.material, s, diffuse);
         float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
 
-        float ndotl = max(dot(N, L), 0.0);
-        float brdf = surface_direct_response(N, V, L, star_r/d_au, ndotl, b.material, emission_cosine);
         vec3 shadow = vec3(1.0);
-        if (brdf > 0.0 || any(greaterThan(diffuse, vec3(0.0)))) {
+        if (any(greaterThan(direct+diffuse, vec3(0.0)))) {
             shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s);
             if (any(greaterThan(shadow, vec3(0.0))) && u_scene.num_ring_hosts > 0u) {
                 float sun_ang_rad = star_r / d_au;
@@ -100,8 +100,8 @@ void main() {
 
         total_light += albedo * star_col * irradiance * diffuse * shadow;
 
-        if (brdf > 0.0 && any(greaterThan(shadow, vec3(0.0)))) {
-            total_light += albedo * star_col * irradiance * brdf * shadow * transmission;
+        if (any(greaterThan(direct, vec3(0.0))) && any(greaterThan(shadow, vec3(0.0)))) {
+            total_light += albedo * star_col * irradiance * direct * shadow;
         }
     }
 
@@ -120,6 +120,7 @@ void main() {
             float len_eq = length(P_eq);
             P_eq = len_eq > 1e-5 ? P_eq / len_eq : vec3(1.0, 0.0, 0.0);
             for (uint s = 0; s < u_scene.num_stars; ++s) {
+                if (!star_lights_body(f_body_idx, s)) continue;
                 vec3 star_pos = u_scene.stars_pos_radius[s].xyz;
                 float star_r = u_scene.stars_pos_radius[s].w;
                 vec3 star_col = u_scene.stars_color_lum[s].rgb;
@@ -146,10 +147,11 @@ void main() {
     for (int i = 0; i < 4; ++i) {
         if (!any(greaterThan(b.shine_irradiance[i].rgb, vec3(0.0)))) continue;
         vec3 light = b.shine_direction[i].xyz;
-        vec3 transmission, diffuse;
-        surface_atmosphere(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord, light, N, transmission, diffuse);
+        vec3 diffuse;
+        vec3 direct = surface_stellar_light(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord,
+            N, V, light, sin(b.shine_direction[i].w), emission_cosine, b.material, 16u, diffuse);
         total_light += albedo*b.shine_irradiance[i].rgb
-                     *(surface_direct_response(N, V, light, sin(b.shine_direction[i].w), max(dot(N, light), 0.0), b.material, emission_cosine)*transmission+diffuse);
+                     *(direct+diffuse);
     }
 
     vec3 rgb = total_light * exposure * mesh_weight;

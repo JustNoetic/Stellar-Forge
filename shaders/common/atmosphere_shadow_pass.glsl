@@ -78,7 +78,7 @@ void main() {
     if (any(greaterThanEqual(pixel, size))) return;
 #ifdef ATMOSPHERE_SHADOW_COARSE
     ivec2 output_pixel = pixel;
-    pixel *= 2;
+    pixel *= shadow_vrs_scale();
     size = textureSize(scene_depth, 0);
 #endif
     vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;

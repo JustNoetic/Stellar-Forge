@@ -5,6 +5,9 @@
 #include "common/eclipse_shadow.glsl"
 #include "common/refraction.glsl"
 
+layout(std430, set = 0, binding = 27) readonly buffer AtmospherePointResponses { vec4 atmosphere_points[]; };
+layout(push_constant) uniform PointPass { uint atmosphere; } point_pass;
+
 layout(location = 0) out vec2 f_pixel_offset;
 layout(location = 1) flat out float f_point_radius;
 layout(location = 2) flat out vec3 f_flux;
@@ -55,17 +58,21 @@ vec3 disc_radiance(BodyInstanceGPU b, vec3 V) {
     if (b.color_is_star.w < 0.5) {
         vec3 sum = vec3(0.0);
         for (uint s = 0; s < u_scene.num_stars; ++s) {
+            if (!star_lights_body(uint(b.spin_flags.w), s)) continue;
             vec3 delta = u_scene.stars_pos_radius[s].xyz-b.pos_radius.xyz;
             float distance = max(length(delta), 1e-12);
             float flux = u_scene.hdr_enabled != 0u ? u_scene.stars_color_lum[s].w/(distance*distance) : 1.0;
             float radius = asin(clamp(u_scene.stars_pos_radius[s].w/distance, 0.0, 0.84));
             vec3 eclipse = u_scene.eclipse_params.y == 0u ? vec3(1.0)
                 : evaluate_eclipse_shadow(b.pos_radius.xyz, u_scene.stars_pos_radius[s].xyz, u_scene.stars_pos_radius[s].w, uint(b.spin_flags.w), s);
-            sum += u_scene.stars_color_lum[s].rgb*flux*material_disk_response(b.material, dot(V, delta/distance), radius)*eclipse;
+            vec4 air = atmosphere_points[uint(b.spin_flags.w)*16u+s];
+            vec3 response = air.w > 0.5 ? air.rgb
+                : b.color_is_star.rgb*material_disk_response(b.material, dot(V, delta/distance), radius);
+            sum += u_scene.stars_color_lum[s].rgb*flux*response*eclipse;
         }
         for (int k = 0; k < 4; ++k)
-            sum += b.shine_irradiance[k].rgb*material_disk_response(b.material, dot(V, b.shine_direction[k].xyz), b.shine_direction[k].w);
-        return b.color_is_star.rgb*sum;
+            sum += b.color_is_star.rgb*b.shine_irradiance[k].rgb*material_disk_response(b.material, dot(V, b.shine_direction[k].xyz), b.shine_direction[k].w);
+        return sum;
     }
     vec3 tangent = normalize(cross(V, abs(V.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
     vec3 bitangent = cross(V, tangent);
@@ -90,6 +97,8 @@ void main() {
     uint idx = gl_InstanceIndex;
     BodyInstanceGPU b = bodies[idx];
     if (b.surface_flags.x != 0u) return;
+    bool atmosphere = atmosphere_points[idx*16u].w > 0.5;
+    if (atmosphere != (point_pass.atmosphere != 0u)) return;
     float radius_px = apparent_radius_px(b.pos_radius);
     float weight = 1.0 - mesh_weight(radius_px);
     if (b.spin_flags.z > 0.5 || weight <= 0.0) return;
@@ -114,8 +123,8 @@ void main() {
                             + (1.0 - polar_radius * polar_radius) * pole_view * pole_view);
     vec3 flux = disc_radiance(b, V) * (POINT_PI * radius_px * radius_px * area_scale);
     if (u_scene.hdr_enabled != 0u) flux *= u_scene.screen_params.w;
-    flux *= point_signal_fade(flux, half_size) * weight * visibility * apparent.w;
-    if (max(flux.r, max(flux.g, flux.b)) <= 0.0) return;
+    flux *= weight * visibility * apparent.w;
+    if (!point_flux_visible(flux)) return;
 
     vec2 center_px = (clip.xy / clip.w * 0.5 + 0.5) * u_scene.screen_params.xy;
     flux /= point_profile_sum(center_px, half_size);

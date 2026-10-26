@@ -71,9 +71,7 @@ void main() {
     float eff_exposure = (pc.hdr_enabled != 0u) ? pc.exposure : 1.0;
     intensity *= apparent.w;
     vec3 flux = s.color.rgb * (intensity * pc.intensity_scale * eff_exposure);
-    float fade = point_signal_fade(flux, radius);
-
-    if (!on_screen || fade <= 0.0) {
+    if (!on_screen || !point_flux_visible(flux)) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
         f_color = vec3(0.0);
         f_intensity = 0.0;
@@ -89,7 +87,7 @@ void main() {
     clip.xy += q * pad_ndc * clip.w;
     gl_Position = clip;
     f_color = s.color.rgb;
-    f_intensity = intensity * pc.intensity_scale * eff_exposure * fade / normalization;
+    f_intensity = intensity * pc.intensity_scale * eff_exposure / normalization;
     f_point_radius = radius;
     f_pixel_offset = q * radius;
 }

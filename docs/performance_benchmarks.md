@@ -32,6 +32,14 @@ simulation failures and missing GPU results reject the run.
 
 ## Fixtures
 
+For a slow live camera position, open **View > Engine Telemetry**. Its scene
+breakdown records preparation, celestial bodies (including terrain and sphere /
+point children), Gaia culling/drawing, orbit lines and atmospheric composition.
+These scopes are included in Scene HDR; child timings must not be added to their
+parents. Sky/aerial update counts distinguish cached frames from rebaking.
+The additional scene timestamps are enabled only while telemetry is open or
+during a benchmark; opening telemetry does not enable CPU benchmark collection.
+
 | Scene | Simulation | Camera |
 |---|---|---|
 | `overview` | Paused Solar System | Tracks Sun, render-space offset `(0, 19.02, 40.78)` AU |

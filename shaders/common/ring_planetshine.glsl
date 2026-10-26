@@ -42,6 +42,7 @@ void ring_planetshine_incident(uint host_index, vec3 hit_local, vec3 pole_n,
     disk_pole /= max(length(disk_pole), 1e-12);
     float cutoff = -sqrt(max(0.0, 1.0-ratio*ratio));
     for (uint s = 0u; s < u_scene.num_stars; ++s) {
+        if (!star_lights_body(host_body, s)) continue;
         vec3 to_star = u_scene.stars_pos_radius[s].xyz-host_center;
         float star_distance = length(to_star);
         if (star_distance <= 1e-12) continue;

@@ -9,7 +9,7 @@ size_t GeometryKeyHash::operator()(const GeometryKey& key) const noexcept {
     auto combine = [&](uint64_t value) {
         hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
     };
-    combine(key.generation);
+    combine(key.identity);
     combine(key.geometry_revision);
     combine(key.body);
     combine(key.source.identity);

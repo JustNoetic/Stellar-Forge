@@ -30,6 +30,7 @@ struct TileBounds {
     double angular_radius = 0.0;
     double polar_ratio = 1.0;
     double padding = 0.0;
+    double maximum_scaled_radius = 0.0;
     double support(glm::dvec3 axis) const noexcept;
     double distance(glm::dvec3 eye) const noexcept;
 };
@@ -40,6 +41,8 @@ struct SelectionView {
     double tan_half_fov_x = 1.0;
     double tan_half_fov_y = 1.0;
     double focal_pixels = 800.0;
+    double orthographic_pixels = 0.0;
+    glm::dvec4 orthographic_bounds{-1, -1, 1, 1};
     double target_error_pixels = 2.0;
     double polar_ratio = 1.0;
     double height_amplitude = 0.0;

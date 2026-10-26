@@ -40,6 +40,16 @@ CommandResult SimulationRunner::replace_system(LoadedSystem loaded) {
     });
 }
 
+void SimulationRunner::swap_simulation(SimulationRunner& other) {
+    if (&other == this) return;
+    bool threaded_here = threaded(), threaded_there = other.threaded();
+    set_threaded(false);
+    other.set_threaded(false);
+    std::swap(simulation_, other.simulation_);
+    set_threaded(threaded_here);
+    other.set_threaded(threaded_there);
+}
+
 CommandResult SimulationRunner::execute(std::function<CommandResult(Simulation&)> command) {
     if (!threaded()) return command(simulation_);
     wait();

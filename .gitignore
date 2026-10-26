@@ -19,6 +19,8 @@ imgui.ini
 main_error.txt
 perf_report.txt
 data/cache/
+data/settings.json
+data/settings.json.tmp
 data/kernels/
 data/tiles/
 textures/*

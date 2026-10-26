@@ -1,5 +1,26 @@
 # Terrain precision and geometry cache performance
 
+## Surface-aware horizon culling
+
+Measured 26 October 2026, Release, 1920 × 1080, 60-degree vertical FOV, 2-pixel error and a 1024-patch cap. The existing Earth elevation pack has identity `10334824041510882139`; heights, error targets, residency budgets and shaders are unchanged. The previous horizon test used only the patch sphere expanded by the inverse polar ratio. These spheres can cross the occlusion cone or tangent-distance boundary even when the entire displaced surface is hidden. A second test uses the thin surface enclosure and a tile-local outer radial bound to reject the fully occluded cap. It applies to both geometry and shared surface-texture selection.
+
+The high-ground CPU probe finds the highest reconstructed sample in the finest tile with the largest declared maximum, approximately 8786 m in this visual elevation pack. It looks horizontally in four orthogonal tangent directions, one meter above the reconstructed ground. Both selectors have the same resident height envelopes and unlimited geometry availability. This measures desired selection rather than streaming arrival or application FPS.
+
+| Tangent direction | Selected patches before → after | Traversal visits before → after |
+| --- | ---: | ---: |
+| 0 | 785 → 632 | 1502 → 1174 |
+| 1 | 532 → 374 | 1174 → 842 |
+| 2 | 580 → 459 | 1354 → 882 |
+| 3 | 257 → 184 | 790 → 518 |
+
+All four views retain deepest LOD17 without budget pressure. At 100 m clearance, counts change from 784/532/583/262 to 634/374/462/187. Nearby ridges can still hide submitted patches: the selector has no hill-against-hill occlusion or depth-pyramid pass. The global minimum-height allowance remains conservative, so this change reduces planetary-horizon overdraw without claiming to remove all hidden mountain geometry.
+
+The existing GPU source benchmark, on the RTX 4060 Ti with the same pack and settings, reduces stationary orbital / 2 km horizon / 1 m horizon patch counts from 213/149/248 to 165/107/206. Downward views retain 6 and 8 patches. All four stationary near-ground RGBA16F images are bit-identical before and after. Orbital opaque coverage is unchanged; the maximum HDR-channel difference is 0.025635. These captures use the benchmark's original location, separately from the high-ground CPU probe. GPU clocks and host scheduling are uncontrolled; no full-frame timing claim is made.
+
+CPU regressions independently check ray-sphere visibility for signed heights, polar ratios 0.05–1, reduced refraction occluders and LOD0–24, plus radial bounds on displaced samples and morph geometry. Raw GPU reports/readbacks and high-ground CSVs are in `tests/terrain-horizon-20261026/`; probe sources are `tests/terrain_culling_probe.cpp` and `tests/terrain_high_ground_probe.cpp`.
+
+Both application and rendering-test targets build. Nine targeted CTests pass, covering terrain/import fixtures, smooth surfaces, refraction, imported geometry, terrain normals and surface textures. The separate cached/reference precision check passes. The application startup CTest exceeds its 30-second limit on two attempts; running `StellarForge --self-test` separately completes all three frames cleanly. The startup timeout remains unresolved by this terrain change.
+
 ## Independent per-pixel terrain normals
 
 Measured 19 October 2026, Release, i5-12400F / RTX 4060 Ti, 1920 × 1080, 60-degree FOV. Earth and Moon use the existing catalog albedo/elevation packs, a camera distance of two equatorial radii, 16-pixel geometric error and a 64-patch cap. Both modes draw exactly the same geometry; only `terrain_normal_maps_enabled` changes. Four repetitions alternate mode order, with 48 submissions per block and the first 16 discarded. Each submission draws the scene 128 times; GPU draw timestamps are divided by 128. Each mode has 128 retained samples per body. No geometry bakes or texture uploads occur in measured samples. CPU preparation is once per submission. Streaming warmup, readback, image export, submission waits and presentation are excluded. Clocks are uncontrolled; these offscreen pass measurements are not application FPS or a full-frame timing guarantee.

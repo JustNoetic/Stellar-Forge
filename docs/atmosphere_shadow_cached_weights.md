@@ -1,6 +1,6 @@
 # Cached atmospheric shadow weights
 
-Enabled by default for eligible columns. **Settings → Visibility → Cached shadow
+Enabled by default for eligible columns. **Settings → Atmosphere → Shadow sampling & performance → Cached shadow
 weights** can restore native integration for comparison. Toggling the option
 invalidates shadow history. Default procedural rings use seed 42.
 

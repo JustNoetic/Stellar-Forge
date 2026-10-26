@@ -3,6 +3,7 @@
 #include "core/constants.hpp"
 #include "rhi/vk_context.hpp"
 #include "ui/inspector_state.hpp"
+#include "ui/workspace_settings.hpp"
 #include <imgui.h>
 #include <string_view>
 
@@ -12,33 +13,6 @@ namespace sf::ui {
 
 inline constexpr ImVec4 ACCENT{0.38f, 0.78f, 0.86f, 1.0f};
 inline constexpr ImVec4 AMBER{0.94f, 0.70f, 0.38f, 1.0f};
-
-struct WorkspaceSettings {
-    bool ui_visible = true;
-    bool aligned_panels = true;
-    bool show_outliner = true;
-    bool show_inspector = true;
-    bool show_time_hud = true;
-    bool show_settings = false;
-    int settings_section = 0;
-    bool show_telemetry = false;
-    double ly_threshold_au = DEFAULT_LY_THRESHOLD_AU;
-    float outliner_width = 260.0f;
-    float inspector_width = 420.0f;
-    float scale = 1.0f;
-    bool confirm_delete = true;
-
-    void reset_layout() {
-        aligned_panels = true;
-        show_outliner = true;
-        show_inspector = true;
-        show_time_hud = true;
-        outliner_width = 260.0f;
-        inspector_width = 420.0f;
-        scale = 1.0f;
-        confirm_delete = true;
-    }
-};
 
 struct WorkspaceLayout {
     float width = 0.0f;
@@ -59,6 +33,7 @@ struct WorkspaceLayout {
 };
 
 enum class PanelSide { Left, Right };
+enum class SettingsSection { Display, Scene, Atmosphere, Lighting, Surfaces, Navigation, Workspace, Advanced, Count };
 
 class UiSystem {
 public:
@@ -69,7 +44,10 @@ public:
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t swapchain_idx);
 
     WorkspaceLayout compute_layout(const WorkspaceSettings& settings, const WorkspaceState& state, float fb_width, float fb_height) const;
+    glm::dvec4 comparison_bounds(const WorkspaceSettings& settings, const WorkspaceState& state) const;
     ImGuiWindowFlags prepare_side_panel(const WorkspaceSettings& settings, const WorkspaceState& state, PanelSide side, WorkspaceLayout& out_layout);
+    bool begin_settings(WorkspaceSettings& settings, const WorkspaceState& state);
+    bool end_settings(WorkspaceSettings& settings, std::string_view status, bool needs_attention);
 
     void notify_drag_active(ImGuiID id);
     void update_drag_interaction();

@@ -206,6 +206,12 @@ WorkspaceLayout UiSystem::compute_layout(const WorkspaceSettings& settings, cons
     };
 }
 
+glm::dvec4 UiSystem::comparison_bounds(const WorkspaceSettings& settings, const WorkspaceState& state) const {
+    auto layout = compute_layout(settings, state, 0, 0);
+    if (!settings.ui_visible) return {0, 0, layout.width, layout.height};
+    return {layout.left, layout.top+32*layout.scale, layout.right, layout.bottom};
+}
+
 ImGuiWindowFlags UiSystem::prepare_side_panel(const WorkspaceSettings& settings, const WorkspaceState& state, PanelSide side, WorkspaceLayout& out_layout) {
     out_layout = compute_layout(settings, state, 0.0f, 0.0f);
     float width = (side == PanelSide::Left) ? out_layout.outliner_width : out_layout.inspector_width;
@@ -220,6 +226,67 @@ ImGuiWindowFlags UiSystem::prepare_side_panel(const WorkspaceSettings& settings,
         flags |= ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize;
     }
     return flags;
+}
+
+bool UiSystem::begin_settings(WorkspaceSettings& settings, const WorkspaceState& state) {
+    if (!settings.show_settings) return false;
+    const auto layout = compute_layout(settings, state, 0.0f, 0.0f);
+    const ImVec2 size(std::min(1040.0f * layout.scale, layout.width - layout.gap * 4.0f),
+                      std::min(720.0f * layout.scale, layout.height - layout.top - layout.gap * 3.0f));
+    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(std::min(620.0f * layout.scale, size.x), std::min(400.0f * layout.scale, size.y)),
+                                        ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::SetNextWindowPos(ImVec2(layout.width * 0.5f, layout.height * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    if (!ImGui::Begin("Settings / Stellar Forge###forge_settings", &settings.show_settings, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return false;
+    }
+    const char* categories[] = {"Display", "Scene & Orbits", "Atmosphere", "Lighting & Rings", "Planet Surfaces", "Navigation", "Workspace", "Advanced"};
+    const char* descriptions[] = {
+        "Presentation, exposure and star appearance.",
+        "Background stars and orbital path overlays.",
+        "Atmospheric effects, refraction and shadow quality.",
+        "Direct sunlight, reflected light and planetary rings.",
+        "Surface maps, elevation and terrain detail.",
+        "Camera movement, viewing angle and horizon alignment.",
+        "Interface scale, panels, units and editing preferences.",
+        "Experimental options, rendering references and diagnostics."
+    };
+    settings.settings_section = std::clamp(settings.settings_section, 0, static_cast<int>(SettingsSection::Count) - 1);
+    const float footer_height = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+    ImGui::BeginChild("settings_navigation", ImVec2(185.0f * layout.scale, -footer_height), ImGuiChildFlags_Borders);
+    for (int i = 0; i < static_cast<int>(SettingsSection::Count); ++i) {
+        if (i == 0 || i == 5 || i == 7) {
+            if (i != 0) ImGui::Spacing();
+            ImGui::TextDisabled("%s", i == 0 ? "GRAPHICS" : i == 5 ? "PREFERENCES" : "DEVELOPER");
+            ImGui::Separator();
+        }
+        if (ImGui::Selectable(categories[i], settings.settings_section == i, 0, ImVec2(0.0f, 29.0f * layout.scale)))
+            settings.settings_section = i;
+    }
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::PushID(settings.settings_section);
+    ImGui::BeginChild("settings_content", ImVec2(0.0f, -footer_height), ImGuiChildFlags_Borders);
+    heading(categories[settings.settings_section], descriptions[settings.settings_section]);
+    return true;
+}
+
+bool UiSystem::end_settings(WorkspaceSettings& settings, std::string_view status, bool needs_attention) {
+    ImGui::EndChild();
+    ImGui::PopID();
+    ImGui::Separator();
+    const bool restore = ImGui::Button("Restore all defaults");
+    ImGui::SameLine();
+    if (needs_attention) ImGui::TextColored(AMBER, "Save needs attention");
+    else ImGui::TextDisabled("%.*s", static_cast<int>(status.size()), status.data());
+    if (needs_attention && ImGui::IsItemHovered()) ImGui::SetTooltip("%.*s", static_cast<int>(status.size()), status.data());
+    if (!needs_attention && ImGui::IsItemHovered()) ImGui::SetTooltip("Settings are saved to data/settings.json");
+    const float close_width = 78.0f * settings.scale;
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - close_width - ImGui::GetStyle().WindowPadding.x));
+    if (ImGui::Button("Close", ImVec2(close_width, 0.0f))) settings.show_settings = false;
+    ImGui::End();
+    return restore;
 }
 
 void UiSystem::apply_theme(float raw_scale) {

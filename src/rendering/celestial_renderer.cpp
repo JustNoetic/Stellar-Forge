@@ -87,6 +87,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     point_desc.vert_path = "celestial/point_celestial.vert";
     point_desc.frag_path = "celestial/point_celestial.frag";
     point_desc.bindings.assign(std::begin(bindings), std::end(bindings));
+    point_desc.bindings.push_back({27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1});
+    point_desc.push_constant_size = sizeof(uint32_t);
     point_desc.color_formats = {VK_FORMAT_R16G16B16A16_SFLOAT};
     point_desc.depth_format = VK_FORMAT_D32_SFLOAT;
     point_desc.depth_test = false;
@@ -96,6 +98,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     point_desc.cull_mode = VK_CULL_MODE_NONE;
 
     point_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
+    point_desc.depth_format = VK_FORMAT_UNDEFINED;
+    atmosphere_point_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
     terrain_.init(ctx, load_surface_assets);
     for (const auto& [body, source] : terrain_.height_sources()) normals_.set_height_source(body, source);
     if (load_surface_assets) {
@@ -114,6 +118,7 @@ void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     textures_.shutdown(ctx);
     normals_.shutdown(ctx);
     rhi::ShaderCache::destroy_pipeline(ctx, point_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, atmosphere_point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         ctx.destroy_buffer(instance_ssbos_[i]);
@@ -172,6 +177,7 @@ void CelestialRenderer::build_sphere_mesh(rhi::VkContext& ctx, uint32_t sectors,
 void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
                                 bool shadow_diagnostics, std::map<std::string, double>* timings) {
+    atmosphere_points_ready_ = false;
     auto measure = [&](const char* name, auto&& function) {
         ScopedTimer timer(timings ? &(*timings)[name] : nullptr);
         function();
@@ -195,9 +201,10 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     });
     measure("cpu_planetshine_prepare_ms", [&] {
     materials_.update(sys);
-    planetshine_ = prepare_planetshine(sys, settings.planetshine_enabled, settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_);
+    planetshine_ = prepare_planetshine(sys, settings.planetshine_enabled && !settings.direct_sunlight_only,
+        settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_);
     });
-    measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics); });
+    measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_); });
     measure("cpu_transparency_prepare_ms", [&] {
     transparency_.prepare(cmd, ctx, extent, !settings.transparency_reference_legacy && !sys.empty() &&
         ((settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
@@ -207,7 +214,8 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
 
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
-                               std::map<std::string, double>* timings) {
+                               std::map<std::string, double>* timings, bool gpu_diagnostics) {
+    bool profile_gpu = timings || gpu_diagnostics;
     auto setup_start = timings ? SteadyClock::now() : SteadyClock::time_point{};
     ring_eclipse_candidate_counts_.clear();
     surface_ring_candidate_masks_.clear();
@@ -237,11 +245,13 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ubo.num_bodies = count;
     ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
     ubo.num_ring_hosts = (settings.show_rings && settings.ring_shadows_enabled) ? rings_.host_count() : 0u;
-    ubo.ringshine_params = {settings.ringshine_enabled && settings.show_rings ? 1u : 0u, rings_.host_count(), settings.planetshine_enabled ? 1u : 0u, settings.ring_planetshine_mode};
+    ubo.ringshine_params = {settings.ringshine_enabled && settings.show_rings && !settings.direct_sunlight_only ? 1u : 0u,
+        rings_.host_count(), settings.planetshine_enabled && !settings.direct_sunlight_only ? 1u : 0u, settings.ring_planetshine_mode};
     body_instances_.resize(count);
     auto* inst_ptr = body_instances_.data();
     auto eclipse_records = eclipse_refraction_.records();
     auto eclipse_bounds = eclipse_refraction_.bounds();
+    std::array<uint32_t, MAX_SCENE_STARS> star_bodies{};
 
     for (uint32_t i = 0; i < count; ++i) {
         const auto& b = sys.body(i);
@@ -264,6 +274,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
 
         if (b.definition.is_star && ubo.num_stars < MAX_SCENE_STARS) {
             uint32_t s = ubo.num_stars++;
+            star_bodies[s] = i;
             ubo.stars_pos_radius[s] = glm::vec4(rel_eye, r_au);
             ubo.stars_color_lum[s] = glm::vec4(b.definition.color_rgb, static_cast<float>(std::max(b.definition.lum_eq, 1e-4)));
         }
@@ -273,6 +284,10 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         ubo.num_stars = 1;
         ubo.stars_pos_radius[0] = glm::vec4(glm::vec3(-eye_pos), static_cast<float>(SOLAR_RADII_TO_AU));
         ubo.stars_color_lum[0] = glm::vec4(1.0f, 0.95f, 0.90f, 1.0f);
+    } else {
+        for (uint32_t i = 0; i < count; ++i)
+            for (uint32_t s = 0; s < ubo.num_stars; ++s)
+                if (!sys.illuminates(star_bodies[s], i)) inst_ptr[i].surface_flags.y |= 1u << s;
     }
 
     uint32_t ring_count = settings.show_rings ? rings_.host_count() : 0u;
@@ -387,7 +402,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
 
     if (timings) (*timings)["cpu_surface_setup_ms"] = elapsed_ms(setup_start);
     auto draw_start = timings ? SteadyClock::now() : SteadyClock::time_point{};
-    auto sphere_timer = timings ? ctx.begin_gpu_timer(cmd, "gpu_spheres") : UINT32_MAX;
+    auto sphere_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_spheres") : UINT32_MAX;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipeline_.handle);
     ctx.push_descriptors(cmd, sphere_pipeline_, writes);
     VkDeviceSize offset = 0;
@@ -402,13 +417,17 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     }
 
     ctx.end_gpu_timer(cmd, sphere_timer);
-    auto terrain_timer = timings ? ctx.begin_gpu_timer(cmd, "gpu_terrain_draw") : UINT32_MAX;
+    auto terrain_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_terrain_draw") : UINT32_MAX;
     terrain_.render(cmd, ctx, writes);
     ctx.end_gpu_timer(cmd, terrain_timer);
 
-    auto points_timer = timings ? ctx.begin_gpu_timer(cmd, "gpu_points") : UINT32_MAX;
+    auto points_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_points") : UINT32_MAX;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, point_pipeline_.handle);
-    ctx.push_descriptors(cmd, point_pipeline_, writes);
+    std::vector<rhi::PushDescriptorWrite> point_writes(std::begin(writes), std::end(writes));
+    point_writes.push_back(rhi::PushDescriptorWrite::storage_buffer(27, atmospheres_.point_responses(f_idx)));
+    ctx.push_descriptors(cmd, point_pipeline_, point_writes);
+    ctx.push_constants(cmd, point_pipeline_, uint32_t(0));
+    atmosphere_points_ready_ = true;
     for (uint32_t first = 0; first < count;) {
         if (terrain_.covers(first)) { ++first; continue; }
         uint32_t end = first+1;
@@ -433,6 +452,29 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     rings_.render(cmd, ctx, settings, ring_base_writes, {ubo.stars_pos_radius, ubo.num_stars},
         transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{});
     if (timings) (*timings)["cpu_surface_draw_ms"] = elapsed_ms(draw_start);
+}
+
+void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
+    auto transparency_writes = transparency_.writes();
+    auto refraction = refraction_.writes(ctx);
+    uint32_t frame = ctx.frame_index();
+    auto draw = [&](uint32_t body) {
+        if (!atmosphere_points_ready_) return;
+        const rhi::PushDescriptorWrite writes[] = {
+            rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[frame]),
+            rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[frame]),
+            rhi::PushDescriptorWrite::storage_buffer(2, eclipse_ssbos_[frame]),
+            rhi::PushDescriptorWrite::storage_buffer(25, material_phases_[frame]),
+            rhi::PushDescriptorWrite::storage_buffer(27, atmospheres_.point_responses(frame)),
+            eclipse_refraction_.write(ctx), refraction[0], refraction[1]};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, atmosphere_point_pipeline_.handle);
+        ctx.push_descriptors(cmd, atmosphere_point_pipeline_, writes);
+        ctx.push_constants(cmd, atmosphere_point_pipeline_, uint32_t(1));
+        vkCmdDraw(cmd, 6, 1, 0, body);
+    };
+    atmospheres_.composite(cmd, ctx, color, depth,
+        transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{}, draw);
+    transparency_.resolve(cmd, ctx, color, depth);
 }
 
 } // namespace sf::rendering

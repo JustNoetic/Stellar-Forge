@@ -19,6 +19,8 @@ The combined bake increments both product update counters and is timed under `at
 
 RTX 4060 Ti, Release, 1920 × 1080. The existing `--atmosphere-benchmark` was captured before and after the merge. It uses serialized offscreen rendering with three repetitions, alternating floor order, and 8 warmup + 24 measured frames per case. Timings exclude readback and presentation; these are atmosphere preparation intervals, not whole-frame timings or application FPS. Validation was disabled for both timing captures.
 
+These captures precede the Direct sunlight only diagnostic default and include atmospheric multiple scattering and ground skylight. Disable that diagnostic when reproducing the original lighting workload.
+
 Representative medians, with the -10.984 km terrain floor:
 
 | View / change | Before, ms | Combined, ms | Reduction |

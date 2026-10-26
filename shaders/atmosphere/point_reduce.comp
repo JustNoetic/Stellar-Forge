@@ -1,0 +1,11 @@
+#version 460
+layout(local_size_x = 16) in;
+layout(std430, set = 0, binding = 0) readonly buffer PartialResponses { vec4 partials[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer PointResponses { vec4 responses[]; };
+layout(push_constant) uniform PointReduce { uint stars; } push;
+void main() {
+    uint star = gl_LocalInvocationID.x;
+    vec3 sum = vec3(0.0);
+    if (star < push.stars) for (uint i = 0u; i < 32u; ++i) sum += partials[star*32u+i].rgb;
+    responses[star] = vec4(sum,1.0);
+}

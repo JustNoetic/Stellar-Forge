@@ -14,7 +14,7 @@ struct RenderSettings {
     bool show_gaia_stars = true;
     bool show_orbits = true;
     float orbit_opacity = 1.0f;
-    uint32_t orbit_segments = 2048;
+    uint32_t orbit_segments = 1030;
     float star_point_size = DEFAULT_POINT_DIAMETER_PX;
     float star_intensity = 1.0f;
     bool vsync = false;
@@ -25,32 +25,36 @@ struct RenderSettings {
     bool terrain_debug_tiles = false;
     bool terrain_reference_fp64 = false;
     bool terrain_cached_fp64 = false;
-    float terrain_error_pixels = 2.0f;
+    float terrain_error_pixels = 16.0f;
     float terrain_height_km = 2.0f;
     uint32_t terrain_patch_limit = 1024;
     bool show_rings = true;
     bool transparency_reference_legacy = false;
     bool show_atmospheres = true;
+    bool direct_sunlight_only = false;
     bool aerial_perspective_enabled = true;
     bool refraction_enabled = true;
     bool eclipse_refraction_enabled = true;
     bool eclipse_refraction_probe = false;
-    bool atmosphere_dual_source = false;
+    bool atmosphere_dual_source = true;
     bool atmosphere_surface_lighting = true;
     bool atmosphere_shadows_enabled = true;
     bool atmosphere_shadow_reference = false;
     bool atmosphere_shadow_cached_weights = true;
-    bool atmosphere_shadow_fast_rings = false;
-    bool atmosphere_shadow_temporal = true;
+    bool atmosphere_shadow_fast_rings = true;
+    bool atmosphere_shadow_analytic = true;
+    bool atmosphere_shadow_temporal = false;
     bool atmosphere_shadow_animate_jitter = true;
-    bool atmosphere_shadow_rotation = true;
+    bool atmosphere_shadow_rotation = false;
     bool atmosphere_shadow_adaptive = true;
     bool atmosphere_shadow_vrs = true;
+    uint32_t atmosphere_shadow_vrs_scale = 4;
     uint32_t atmosphere_shadow_noise_type = 0;
-    uint32_t atmosphere_shadow_samples = 16;
+    uint32_t atmosphere_shadow_samples = 4;
     bool ring_shadows_enabled = true;
     bool ringshine_enabled = true;
     bool planetshine_enabled = true;
+    bool atmosphere_planetshine_reference = false;
     uint32_t ring_planetshine_mode = 0;
     uint32_t ringshine_band_count = 10;
     bool eclipse_reference_smoothstep = false;
@@ -74,6 +78,9 @@ public:
             return {false, false, "Ring shadow softness must be 0.25 to 4."};
         if (candidate.atmosphere_shadow_samples != 4 && candidate.atmosphere_shadow_samples != 8 && candidate.atmosphere_shadow_samples != 16)
             return {false, false, "Atmospheric shadows use 4, 8 or 16 samples."};
+        if (candidate.atmosphere_shadow_vrs_scale < 2 || candidate.atmosphere_shadow_vrs_scale > 16 ||
+            (candidate.atmosphere_shadow_vrs_scale & (candidate.atmosphere_shadow_vrs_scale-1)) != 0)
+            return {false, false, "Atmospheric shadow VRS uses a 2, 4, 8 or 16 pixel coarse grid."};
         if (candidate.atmosphere_shadow_noise_type > 1)
             return {false, false, "Atmospheric shadow noise type must be 0 (IGN) or 1 (STBN)."};
         if (!std::isfinite(candidate.terrain_error_pixels) || candidate.terrain_error_pixels < 0.5f || candidate.terrain_error_pixels > 16.0f ||

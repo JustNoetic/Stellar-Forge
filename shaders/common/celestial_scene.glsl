@@ -34,6 +34,10 @@ layout(std430, set = 0, binding = 1) readonly buffer BodyInstanceBuffer {
     BodyInstanceGPU bodies[];
 };
 
+bool star_lights_body(uint body, uint star) {
+    return (bodies[body].surface_flags.y >> star & 1u) == 0u;
+}
+
 float apparent_radius_px(vec4 pos_radius) {
     return pos_radius.w / max(length(pos_radius.xyz), 1e-12)
            * u_scene.screen_params.y * u_scene.screen_params.z;

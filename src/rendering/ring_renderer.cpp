@@ -9,6 +9,10 @@
 
 namespace sf::rendering {
 
+static bool ring_host(const ephemeris::BodyDefinition& def) {
+    return !def.rings.empty() && !def.is_star && !def.is_black_hole && !def.is_spacecraft;
+}
+
 void RingRenderer::init(rhi::VkContext& ctx) {
     mesh_ = build_annulus_mesh(ctx, RING_ANGULAR_SEGMENTS, RING_RADIAL_SUBDIVISIONS);
 
@@ -133,7 +137,7 @@ void RingRenderer::init(rhi::VkContext& ctx) {
 }
 
 void RingRenderer::shutdown(rhi::VkContext& ctx) {
-    cached_definition_.reset();
+    cached_hosts_.clear();
     staging_.shutdown(ctx);
     rhi::ShaderCache::destroy_pipeline(ctx, ringshine_pipeline_);
     for (auto& pipeline : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
@@ -198,17 +202,18 @@ void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, co
 
     for (uint32_t bi = 0; bi < body_count && host_mappings_.size() < MAX_RING_HOSTS; ++bi) {
         const auto& def = sys.body(bi).definition;
-        if (def.rings.empty() || def.is_star || def.is_black_hole || def.is_spacecraft) continue;
+        if (!ring_host(def)) continue;
 
         bool wants_texture = std::any_of(def.rings.begin(), def.rings.end(),
                                          [](const ephemeris::RingLayerDefinition& r) { return r.is_textured; });
         std::span<const glm::vec4> raw_tex{};
         if (wants_texture) {
-            std::string cache_key = std::string(sys.name()) + "/" + def.name;
+            const auto& source_system = sys.definition().body_system(bi);
+            std::string cache_key = source_system + "/" + def.name;
             auto it = cached_raw_textures_.find(cache_key);
             if (it == cached_raw_textures_.end()) {
                 std::vector<glm::vec4> loaded_tex;
-                if (auto path = ephemeris::find_ring_texture_path(sys.name(), def.name)) {
+                if (auto path = ephemeris::find_ring_texture_path(source_system, def.name)) {
                     if (auto decoded = load_ring_png_1d(*path, RING_ATLAS_WIDTH)) {
                         loaded_tex = std::move(*decoded);
                     }
@@ -251,6 +256,8 @@ void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, co
 
         mapping.draw_ranges = build_ring_draw_ranges(std::span(def.rings.data(), mapping.segment_rows.size()),
                                                     mapping.min_r_ratio, mapping.max_r_ratio, def.radius_au());
+        if (def.atmosphere.enabled)
+            mapping.atmosphere_materials = atmosphere_ring_materials(std::span(def.rings.data(),seg_profiles.size()),seg_profiles);
         auto unified = bake_unified_shadow_profile(seg_inputs, mapping.min_r_ratio, mapping.max_r_ratio, RING_ATLAS_WIDTH);
         atlas_row_indices.push_back(mapping.unified_row);
         atlas_rows.insert(atlas_rows.end(), unified.begin(), unified.end());
@@ -306,19 +313,19 @@ void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, co
     }
 
     ringshine_profile_serial_++;
-    cached_definition_ = sys.share_definition();
-    cached_generation_ = sys.generation();
-    cached_definition_revision_ = sys.definition_revision();
+    cached_hosts_ = host_keys_;
     force_rebuild_ = false;
 }
 
 void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                            const ephemeris::SystemSnapshot& sys, uint32_t body_count, int refraction_body) {
     refraction_body_ = refraction_body;
-    if (force_rebuild_ || cached_definition_.get() != &sys.definition() ||
-        cached_generation_ != sys.generation() || cached_definition_revision_ != sys.definition_revision()) {
-        rebuild_profiles(cmd, ctx, sys, body_count);
+    host_keys_.clear();
+    for (uint32_t bi = 0; bi < body_count && host_keys_.size() < MAX_RING_HOSTS; ++bi) {
+        auto body = sys.body(bi);
+        if (ring_host(body.definition)) host_keys_.push_back({bi, body.revisions.identity, body.revisions.definition});
     }
+    if (force_rebuild_ || host_keys_ != cached_hosts_) rebuild_profiles(cmd, ctx, sys, body_count);
 
     hosts_gpu_.clear();
     host_draw_ranges_.clear();
@@ -515,7 +522,7 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
                                     const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
                                     uint32_t body_count, VkExtent2D extent) {
     ringshine_frame_bakes_ = 0;
-    if (!settings.ringshine_enabled || !settings.show_rings || active_host_count_ == 0) return;
+    if (settings.direct_sunlight_only || !settings.ringshine_enabled || !settings.show_rings || active_host_count_ == 0) return;
     uint32_t f_idx = ctx.frame_index();
     auto& cache = ringshine_cache_[f_idx];
     uint32_t bands = std::clamp(settings.ringshine_band_count, 4u, 1024u);
@@ -545,6 +552,7 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
 
     std::vector<glm::dvec3> star_pos;
     std::vector<double> star_radius;
+    std::vector<uint32_t> star_body;
     bool has_real_star = false;
     for (uint32_t bi = 0; bi < body_count && star_pos.size() < 16; ++bi) {
         const auto& def = sys.body(bi).definition;
@@ -552,6 +560,7 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
         has_real_star = true;
         star_pos.push_back(sys.body(bi).render.position.value);
         star_radius.push_back(def.opaque_radius_au());
+        star_body.push_back(bi);
     }
     if (!has_real_star) return;
 
@@ -579,6 +588,7 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
             ? glm::normalize(sys.body(bi).render.pole) : glm::dvec3(0.0, 1.0, 0.0);
         const auto& mapping = host_mappings_[h];
         for (uint32_t s = 0; s < star_pos.size(); ++s) {
+            if (!sys.illuminates(star_body[s], bi)) continue;
             glm::dvec3 dir = star_pos[s] - center;
             double dist = glm::length(dir);
             if (dist <= 1e-12) continue;
@@ -606,6 +616,85 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
         bake_ringshine_tile(cmd, ctx, job);
     }
     ringshine_frame_bakes_ = static_cast<uint32_t>(jobs.size());
+}
+
+PlanetshineGPU RingRenderer::atmosphere_sources(const ephemeris::SystemSnapshot& system,
+    const RenderSettings& settings, uint32_t body_index) const {
+    PlanetshineGPU result{};
+    if (!settings.ringshine_enabled || !settings.show_rings || settings.direct_sunlight_only) return result;
+    auto found = std::find_if(host_mappings_.begin(),host_mappings_.end(),[&](const auto& h){return h.body_index == body_index;});
+    if (found == host_mappings_.end()) return result;
+    const auto& host = *found;
+    const auto body = system.body(body_index);
+    auto pole = glm::normalize(body.render.pole);
+    std::array<glm::vec4,16> stars{}, weights{};
+    glm::vec3 total(0);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < system.size() && count < 16; ++i) {
+        auto star = system.body(i);
+        if (!star.definition.is_star || !system.illuminates(i, body_index)) continue;
+        auto delta = star.render.position.value-body.render.position.value;
+        double distance = glm::length(delta);
+        if (distance <= 1e-12) continue;
+        double elevation = quantize_elevation(glm::clamp(glm::dot(delta,pole)/distance,-1.0,1.0));
+        double extent = quantize_sin_radius(std::clamp(star.opaque_radius_au()/distance,0.0,.999));
+        stars[count] = {float(elevation),float(extent),0,0};
+        float scale = settings.hdr_enabled ? float(std::max(star.definition.lum_eq,0.0)/(distance*distance)) : 1.0f;
+        weights[count] = {glm::max(star.definition.color_rgb,glm::vec3(0))*scale,0};
+        total += glm::vec3(weights[count++]);
+    }
+    if (!glm::any(glm::greaterThan(total,glm::vec3(0)))) return result;
+    for (uint32_t i = 0; i < count; ++i) for (int c = 0; c < 3; ++c)
+        weights[i][c] = total[c] > 0 ? weights[i][c]/total[c] : 0;
+    bool dirty = !host.atmosphere_valid || host.atmosphere_stars != stars;
+    for (uint32_t i = 0; i < count; ++i)
+        dirty |= glm::any(glm::greaterThan(glm::abs(weights[i]-host.atmosphere_weights[i]),glm::vec4(2e-6f)));
+    if (dirty) {
+        glm::dvec3 faces[2]{};
+        double full_area = PI*(host.max_r_ratio*host.max_r_ratio-host.min_r_ratio*host.min_r_ratio);
+        for (uint32_t s = 0; s < count; ++s) {
+            glm::vec4 offsets, fractions;
+            int samples = ringshine_source_samples(stars[s].x,stars[s].y,offsets,fractions);
+            if (samples == 1 && stars[s].y >= .01f) {
+                samples = 4; offsets = {-.75f,-.25f,.25f,.75f}; fractions = glm::vec4(.25f);
+            }
+            for (int q = 0; q < samples; ++q) {
+                double sun = std::clamp(double(stars[s].x)+double(offsets[q]*stars[s].y),-1.0,1.0);
+                if (std::abs(sun) < 1e-8) continue;
+                double horizontal = std::sqrt(std::max(1-sun*sun,0.0));
+                for (const auto& material : host.atmosphere_materials) {
+                    if (material.radius_area_tau.z <= 0) continue;
+                    double radius = material.radius_area_tau.x;
+                    double eta = 1/std::pow(std::max(1-body.definition.oblateness,.05),2);
+                    double shadow = horizontal > 1e-8 ? std::acos(std::clamp(std::sqrt((1-1/(radius*radius))*(horizontal*horizontal+sun*sun*eta))/horizontal,0.0,1.0)) : 0;
+                    double area = double(material.radius_area_tau.y)/full_area*(1-shadow/PI)*fractions[q];
+                    double mv = .5/std::sqrt(radius*radius+.25);
+                    for (int side = 0; side < 2; ++side) for (int angular = 0; angular < 4; ++angular) {
+                        double sign = side == 0 ? 1 : -1;
+                        double angle = 2*PI*(angular+.5)/4;
+                        double phase = (radius*horizontal*std::cos(angle)-.5*sign*sun)/std::sqrt(radius*radius+.25);
+                        auto response = ring_radiance_rgb(material.radius_area_tau.z,float(mv),float(sun),float(phase),
+                            material.properties,glm::vec3(material.color_textured),material.color_textured.w > .5f,sign*sun >= 0);
+                        faces[side] += glm::dvec3(response)*glm::dvec3(weights[s])*(area*.25/PI);
+                    }
+                }
+            }
+        }
+        glm::dvec3 sum = faces[0]+faces[1];
+        uint32_t packed = 0;
+        for (int c = 0; c < 3; ++c) {
+            double contrast = sum[c] > 0 ? (faces[0][c]-faces[1][c])/sum[c] : 0;
+            packed |= uint32_t(std::lround(std::clamp(contrast,-1.0,1.0)*127)+127) << (c*8);
+        }
+        host.atmosphere_sources = {};
+        host.atmosphere_sources.irradiance[0] = {glm::vec3(sum*.5),float(packed)};
+        host.atmosphere_stars = stars; host.atmosphere_weights = weights; host.atmosphere_valid = true;
+        ++atmosphere_source_bakes_;
+    }
+    result = host.atmosphere_sources;
+    result.direction[0] = {glm::vec3(pole)*float(host.max_r_ratio),-float(host.min_r_ratio)};
+    result.irradiance[0] = {glm::vec3(result.irradiance[0])*total,result.irradiance[0].w};
+    return result;
 }
 
 } // namespace sf::rendering

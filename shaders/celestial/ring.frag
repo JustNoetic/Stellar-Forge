@@ -115,6 +115,7 @@ void main() {
     vec3 total_illum = vec3(0.0);
 
     for (uint s = 0u; s < (RING_SINGLE_STAR != 0 ? 1u : u_scene.num_stars); ++s) {
+        if (!star_lights_body(ring_hosts[f_host_idx].counts_indices.x, s)) continue;
         vec3 star_pos = u_scene.stars_pos_radius[s].xyz;
         float star_r = u_scene.stars_pos_radius[s].w;
         vec3 star_col = u_scene.stars_color_lum[s].rgb;

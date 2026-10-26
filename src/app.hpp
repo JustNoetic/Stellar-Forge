@@ -1,13 +1,18 @@
 #pragma once
 
 #include "benchmark/benchmark.hpp"
+#include "comparison/system_comparison.hpp"
+#include "comparison/system_composer.hpp"
+#include "comparison/body_metrics.hpp"
 #include "core/camera.hpp"
+#include "core/user_settings.hpp"
 #include "ephemeris/system_manager.hpp"
 #include "ephemeris/simulation_runner.hpp"
 #include "rendering/render_settings.hpp"
 #include "rendering/celestial_renderer.hpp"
 #include "rendering/star_catalog.hpp"
 #include "rendering/orbit_renderer.hpp"
+#include "rendering/size_comparator.hpp"
 #include "rhi/shader_cache.hpp"
 #include "rhi/vk_context.hpp"
 #include "ui/workspace.hpp"
@@ -39,11 +44,33 @@ private:
     void render_ui();
     void render_main_menu_bar(rendering::RenderSettings& render_draft);
     void render_settings_window(rendering::RenderSettings& render_draft);
+    UserSettings capture_preferences() const;
+    void load_preferences();
+    void save_preferences(bool force = false);
+    void restore_preferences(rendering::RenderSettings& render_draft);
     void render_viewport_overlays();
     void render_outliner();
     void render_outliner_node(int body_idx);
     void render_body_inspector();
     void render_time_hud(rendering::RenderSettings& render_draft);
+    void set_size_comparison(bool active);
+    void apply_size_comparison();
+    void update_size_comparison();
+    void render_comparison_outliner();
+    void render_comparison_inspector();
+    void render_comparison_labels();
+    CommandResult add_system_comparison(std::string_view system_name);
+    void remove_system_comparison(size_t slot);
+    void advance_system_comparisons();
+    void check_system_comparison_sync();
+    void compose_scene();
+    void respace_system_comparisons();
+    CommandResult open_comparison_for_editing(size_t slot);
+    void render_system_comparator_window();
+    void render_compared_outliner();
+    void render_compared_outliner_node(size_t slot, int local);
+    void render_compared_inspector();
+    void render_comparison_table();
     void render_add_body_modal();
     void render_delete_body_modal();
     void render_create_system_modal();
@@ -69,20 +96,52 @@ private:
     ephemeris::SystemManager sys_mgr_{};
     ephemeris::SpiceKernelManager spice_mgr_{};
     ephemeris::SimulationRunner simulation_{};
+    comparison::ComparisonSet comparisons_{};
+    comparison::SystemComposer composer_{};
+    uint64_t comparison_generation_ = 0;
+    struct SceneSelection {
+        int index = -1;
+        uint64_t identity = 0;
+    };
+    SceneSelection tracked_memory_{}, centered_memory_{}, inspected_memory_{};
+    bool show_system_comparator_ = false;
+    bool show_comparison_table_ = false;
+    int comparison_metric_ = 0;
+    comparison::MatchMode comparison_match_ = comparison::MatchMode::OrbitOrder;
+    std::string comparison_table_row_;
+    int comparator_candidate_ = 0;
+    std::string comparator_error_;
     rendering::RenderSettingsStore render_settings_{};
+    UserSettings saved_preferences_{};
+    UserSettings pending_preferences_{};
+    double preferences_save_at_ = 0.0;
+    bool preferences_writable_ = true;
+    bool preferences_reset_requested_ = false;
+    std::string preferences_notice_;
+    std::string preferences_save_error_;
     ui::WorkspaceState ui_state_{};
 
     const ephemeris::SystemSnapshot& system() const noexcept { return simulation_.snapshot(); }
+    const ephemeris::SystemSnapshot& scene() const noexcept { return comparisons_.empty() ? system() : composer_.scene(); }
     std::vector<std::string> system_names_;
 
     Camera camera_{};
     rendering::StarCatalog star_catalog_{};
     rendering::CelestialRenderer celestial_renderer_{};
     rendering::OrbitRenderer orbit_renderer_{};
+    rendering::SizeComparatorRenderer size_renderer_{};
+    comparison::SizeComparison size_comparison_{};
+    comparison::SizeView size_view_{};
+    bool size_comparison_active_ = false;
+    bool size_comparison_requested_ = false;
+    bool size_comparison_initialized_ = false;
+    double comparison_refresh_at_ = 0;
+    int comparison_focus_ = -1;
 
     rhi::Image hdr_color_{};
     rhi::Image scene_depth_{};
     rhi::Pipeline composite_pipeline_{};
+    rhi::Pipeline size_composite_pipeline_{};
 
     bool self_test_ = false;
     benchmark::Options benchmark_;

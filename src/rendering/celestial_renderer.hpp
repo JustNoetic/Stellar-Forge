@@ -62,7 +62,7 @@ public:
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
-                std::map<std::string, double>* timings = nullptr);
+                std::map<std::string, double>* timings = nullptr, bool gpu_diagnostics = false);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     const terrain::TextureStats& normal_stats() const noexcept { return normals_.stats(); }
@@ -71,11 +71,7 @@ public:
     void resolve_transparency(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
         transparency_.resolve(cmd, ctx, color, depth);
     }
-    void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
-        auto writes = transparency_.writes();
-        atmospheres_.composite(cmd, ctx, color, depth, transparency_.active() ? std::span{writes} : std::span<const rhi::PushDescriptorWrite>{});
-        transparency_.resolve(cmd, ctx, color, depth);
-    }
+    void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth);
     const TransparencyRenderer& transparency() const noexcept { return transparency_; }
     std::array<rhi::PushDescriptorWrite, 2> refraction_writes(rhi::VkContext& ctx) const { return refraction_.writes(ctx); }
     const RefractionHost& refraction_host() const noexcept { return refraction_.host(); }
@@ -86,6 +82,7 @@ public:
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
      std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
     uint32_t ringshine_bake_count() const noexcept { return rings_.ringshine_bake_count(); }
+    uint64_t ring_profile_revision() const noexcept { return rings_.shadow_revision(); }
     uint32_t ringshine_frame_bake_count() const noexcept { return rings_.ringshine_frame_bake_count(); }
     std::span<const uint32_t> ringshine_sample_counts() const noexcept { return rings_.ringshine_sample_counts(); }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
@@ -117,7 +114,8 @@ private:
     std::vector<uint32_t> surface_ring_candidate_masks_;
 
     rhi::Pipeline sphere_pipeline_{};
-    rhi::Pipeline point_pipeline_{};
+    rhi::Pipeline point_pipeline_{}, atmosphere_point_pipeline_{};
+    bool atmosphere_points_ready_ = false;
     terrain::TerrainRenderer terrain_;
     terrain::SurfaceTextures textures_;
     terrain::SurfaceTextures normals_;

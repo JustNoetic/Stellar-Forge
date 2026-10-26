@@ -77,6 +77,7 @@ TileBounds surface_bounds(TileId tile, double polar_ratio, double height_amplitu
     result.angular_radius = radius;
     result.polar_ratio = polar_ratio;
     result.padding = (high-low)*.5 + maximum_height*normal_variation + 32*std::numeric_limits<double>::epsilon();
+    result.maximum_scaled_radius = 1.0 + maximum_height/polar_ratio + 32*std::numeric_limits<double>::epsilon();
     return result;
 }
 

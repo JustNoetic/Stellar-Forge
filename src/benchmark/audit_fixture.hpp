@@ -19,6 +19,8 @@ inline rendering::RenderSettings audit_settings(std::string_view variant) {
     if (variant == "cached-shadow-weights") s.atmosphere_shadow_cached_weights = true;
     if (variant == "native-shadow-weights") s.atmosphere_shadow_cached_weights = false;
     if (variant == "fast-ring-shadows") s.atmosphere_shadow_fast_rings = true;
+    if (variant == "analytic-shadows") s.atmosphere_shadow_analytic = true;
+    if (variant == "jittered-shadows") s.atmosphere_shadow_analytic = false;
     if (variant == "no-atmosphere") s.show_atmospheres = false;
     if (variant == "no-shadows") s.atmosphere_shadows_enabled = false;
     if (variant == "no-refraction") s.refraction_enabled = false;

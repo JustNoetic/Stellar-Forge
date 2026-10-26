@@ -1,8 +1,13 @@
+#include "stellar_disk.glsl"
 const float ATM_PI = 3.141592653589793;
 const ivec2 TRANSMITTANCE_SIZE = ivec2(256, 64);
 const ivec2 MULTISCATTER_SIZE = ivec2(32);
-const ivec2 SKY_SIZE = ivec2(192, 108);
-const ivec3 AERIAL_SIZE = ivec3(192, 108, 64);
+#ifndef ATMOSPHERE_GRID_WIDTH
+#define ATMOSPHERE_GRID_WIDTH 192
+#define ATMOSPHERE_GRID_HEIGHT 108
+#endif
+const ivec2 SKY_SIZE = ivec2(ATMOSPHERE_GRID_WIDTH, ATMOSPHERE_GRID_HEIGHT);
+const ivec3 AERIAL_SIZE = ivec3(SKY_SIZE, 64);
 
 layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 radii_heights;
@@ -69,13 +74,19 @@ void medium(vec3 p, out vec3 rayleigh, out vec3 mie, out vec3 extinction) {
     } else r = exp(clamp(-h / atm.radii_heights.z, -80.0, 40.0));
     float m = exp(-max(h, 0.0) / atm.radii_heights.w);
     rayleigh = atm.rayleigh.rgb * r;
+#ifdef ATMOSPHERE_RAYLEIGH_ONLY
+    mie = vec3(0.0);
+#else
     mie = atm.mie_scattering.rgb * m;
+#endif
     extinction = rayleigh + atm.mie_extinction.rgb * m;
+#ifndef ATMOSPHERE_NO_CUSTOM_AEROSOLS
     for (int i = 0; i < int(atm.aerosol_count.x); ++i) {
         float density = particle_density(i, h);
         mie += atm.aerosol_scattering[i].rgb*density;
         extinction += atm.aerosol_extinction[i].rgb*density;
     }
+#endif
     if (atm.profile_domain.w > 0.5) {
         float ozone = exp(-0.5*pow((h-atm.ozone_params.x)/max(atm.ozone_params.y, 0.001), 2.0));
         extinction += atm.mixed_absorption.rgb*r+atm.ozone_absorption.rgb*ozone;
@@ -127,14 +138,25 @@ void transmittance_ray(vec2 uv, out vec3 p, out vec3 d) {
     d = vec3(sqrt(max(1.0-mu*mu, 0.0)), 0.0, mu);
 }
 
-float sun_visibility(vec3 p, vec3 sun, float angular_radius) {
+float sun_horizon(vec3 p) {
     float r = length(p);
     float shadow_radius = min(atm.reference_shape.z > 0.0 ? atm.reference_shape.z : atm.reference_shape.x, r);
     float sin_horiz_sq = max((r-shadow_radius)*(r+shadow_radius)/(r*r), 0.0);
-    float mu_horiz = -sqrt(sin_horiz_sq);
+    return -sqrt(sin_horiz_sq);
+}
+
+float sun_visibility(vec3 p, vec3 sun, float angular_radius) {
+    float r = length(p);
+    float shadow_radius = min(atm.reference_shape.z > 0.0 ? atm.reference_shape.z : atm.reference_shape.x, r);
+    float mu_horiz = sun_horizon(p);
     float mu = dot(p, sun) / r;
     float width = max(shadow_radius/r*angular_radius, 1e-7);
     return smoothstep(-width, width, mu-mu_horiz);
+}
+
+vec3 sun_point_transmittance(sampler2D lut, vec3 p, float mu) {
+    if (mu <= sun_horizon(p)) return vec3(0.0);
+    return exp(-textureLod(lut, transmittance_uv(length(p), mu), 0.0).rgb);
 }
 
 vec3 sun_transmittance(sampler2D lut, vec3 p, vec3 sun, float angular_radius) {
@@ -166,7 +188,15 @@ float multiscatter_radius(float fraction) {
     return clamp(atm.reference_shape.x+atm.profile_domain.z*sinh(mix(start, end, fraction)), bottom_radius()+0.001, top_radius()-0.001);
 }
 
+vec3 multiple_scattering_source(sampler2D lut, vec3 p, vec3 sun, vec3 scattering) {
+    if (atm.depth_params.z > 0.5) return vec3(0.0);
+    return textureLod(lut, multiscatter_uv(p, sun), 0.0).rgb*scattering;
+}
+
 int transport_subdivisions(vec3 p, vec3 d, float start, float distance) {
+#ifdef ATMOSPHERE_NO_CUSTOM_AEROSOLS
+    return 1;
+#else
     if (atm.aerosol_count.x < 0.5) return 1;
     vec3 a = p+d*start, b = a+d*distance;
     float closest = clamp(-dot(a, d), 0.0, distance);
@@ -179,13 +209,16 @@ int transport_subdivisions(vec3 p, vec3 d, float start, float distance) {
             step = min(step, 0.5*shape.z);
     }
     return clamp(int(ceil((maximum-minimum)/max(step, 0.001))), 1, 32);
+#endif
 }
 
 float rayleigh_phase(float mu) { return 3.0*(1.0+mu*mu)/(16.0*ATM_PI); }
 float mie_phase(float mu) {
     float g = atm.mie_scattering.w;
-    return 3.0*(1.0-g*g)*(1.0+mu*mu) /
-        (8.0*ATM_PI*(2.0+g*g)*pow(max(1.0+g*g-2.0*g*mu, 1e-4), 1.5));
+    float q = max(1.0+g*g-2.0*g*mu, 1e-4);
+    float inverse = inversesqrt(q);
+    return 3.0*(1.0-g*g)*(1.0+mu*mu)*inverse*inverse*inverse /
+        (8.0*ATM_PI*(2.0+g*g));
 }
 
 vec3 particle_phase(int layer, float mu) {
@@ -198,11 +231,138 @@ vec3 particle_phase(int layer, float mu) {
 }
 
 vec3 aerosol_source(vec3 p, float mu) {
+#ifdef ATMOSPHERE_RAYLEIGH_ONLY
+    return vec3(0.0);
+#else
     float h = max(length(p), bottom_radius())-atm.reference_shape.x;
     vec3 source = atm.mie_scattering.rgb*exp(-max(h, 0.0)/atm.radii_heights.w)*mie_phase(mu);
+#ifndef ATMOSPHERE_NO_CUSTOM_AEROSOLS
     for (int i = 0; i < int(atm.aerosol_count.x); ++i)
         source += atm.aerosol_scattering[i].rgb*particle_density(i, h)*particle_phase(i, mu);
+#endif
     return source;
+#endif
+}
+
+float stellar_cache_radius() {
+#ifdef ATMOSPHERE_SECONDARY_APPROX
+    return 0.0;
+#elif defined(ATMOSPHERE_SECONDARY_BAKE)
+    return secondary.cache.x;
+#else
+    return atm.sun_irradiance[0].w;
+#endif
+}
+
+#include "stellar_source.glsl"
+
+vec3 stellar_small_transmittance(sampler2D lut, vec3 p, vec3 sun, float radius, vec2 range, float elevation) {
+    float edge = clamp((range.x-elevation)/radius, -1.0, 1.0);
+    float visible = clamp((acos(edge)-edge*sqrt(max(1.0-edge*edge, 0.0)))/ATM_PI, 0.0, 1.0);
+    vec3 light = vec3(0.0);
+    float total_weight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        float x = mix(edge, 1.0, 0.5+0.5*STELLAR_AZIMUTH[i].x);
+        float weight = STELLAR_AZIMUTH[i].y*sqrt(max(1.0-x*x, 0.0));
+        light += sun_point_transmittance(lut, p, sin(elevation+radius*x))*weight;
+        total_weight += weight;
+    }
+    light *= visible*2.0/((1.0+cos(radius))*max(total_weight, 1e-20));
+    float mu = dot(normalize(p), sun);
+    float point_weight = smoothstep(2.0*radius, 4.0*radius, mu-sun_horizon(p));
+    if (point_weight > 0.0) light = mix(light, sun_point_transmittance(lut, p, mu), point_weight);
+    return light;
+}
+
+vec3 stellar_small_source(sampler2D lut, vec3 p, vec3 view, vec3 sun, float radius, vec3 rayleigh,
+                          vec3 medium_mie, vec2 range, float elevation) {
+    vec3 light = stellar_small_transmittance(lut, p, sun, radius, range, elevation);
+    float phase = dot(view, sun);
+    vec3 particles = atm.aerosol_count.x < 0.5 ? medium_mie*mie_phase(phase) : aerosol_source(p, phase);
+    return light*(rayleigh*rayleigh_phase(phase)+particles);
+}
+
+vec3 stellar_scattering_source(sampler2D lut, vec3 p, vec3 view, vec3 sun, float radius, vec3 rayleigh, vec3 medium_mie, uint star) {
+#ifndef ATMOSPHERE_SMALL_STARS
+#ifndef ATMOSPHERE_SOURCE_BAKE
+    vec3 cached_source;
+    float cache_weight = 0.0;
+    if (star == 0u && stellar_cache_radius() > 0.0) {
+        float cached_radius = stellar_cache_radius();
+        float first = stellar_source_begin(sun_horizon(p), cached_radius);
+        if (first > -1.0 && dot(normalize(p), sun) <= first) return vec3(0.0);
+        vec2 uv = stellar_source_uv(p, sun, cached_radius);
+        cache_weight = smoothstep(2.0, 4.0, uv.x*float(STELLAR_SOURCE_SIZE.x)-0.5);
+        if (cache_weight > 0.0) cached_source = cached_stellar_source(p, view, sun, rayleigh, medium_mie, uv);
+        if (cache_weight >= 1.0) return cached_source;
+    }
+#endif
+#endif
+    vec3 up = normalize(p);
+    float mu = clamp(dot(up, sun), -1.0, 1.0);
+    float horizon = sun_horizon(p);
+    if (mu < horizon-2.0*radius) return vec3(0.0);
+    if (radius < 1e-5 || (radius < 0.01 && mu > horizon+4.0*radius)) {
+        float phase = dot(view, sun);
+        vec3 particles = atm.aerosol_count.x < 0.5 ? medium_mie*mie_phase(phase) : aerosol_source(p, phase);
+        return sun_point_transmittance(lut, p, mu)*(rayleigh*rayleigh_phase(phase)+particles);
+    }
+    float elevation = asin(mu);
+    vec2 range = stellar_elevation_range(elevation, radius, asin(horizon));
+    if (range.y <= range.x) return vec3(0.0);
+#ifdef ATMOSPHERE_SMALL_STARS
+    return stellar_small_source(lut, p, view, sun, radius, rayleigh, medium_mie, range, elevation);
+#else
+    if (radius < 0.01) return stellar_small_source(lut, p, view, sun, radius, rayleigh, medium_mie, range, elevation);
+    vec3 tangent = stellar_tangent(up, sun), bitangent = cross(up, tangent);
+    vec3 v = vec3(dot(view, up), dot(view, tangent), dot(view, bitangent));
+    vec3 source = vec3(0.0);
+    float phase = dot(view, sun);
+    vec3 particles = atm.aerosol_count.x < 0.5 ? medium_mie*mie_phase(phase) : aerosol_source(p, phase);
+    for (int i = 0; i < 8; ++i) {
+        vec3 slice = stellar_slice(range, elevation, radius, i);
+        float s = sin(slice.x), c = cos(slice.x), phi = slice.y;
+        vec3 light = sun_point_transmittance(lut, p, s)*slice.z;
+        float a = s*v.x, b = c*v.y, d = c*v.z;
+        float squared = 2.0*phi*a*a+4.0*a*b*sin(phi)
+                      +b*b*(phi+0.5*sin(2.0*phi))+d*d*(phi-0.5*sin(2.0*phi));
+        source += light*(rayleigh*(3.0/(16.0*ATM_PI))*(2.0*phi+squared)+particles*2.0*phi);
+    }
+#ifndef ATMOSPHERE_SOURCE_BAKE
+    if (cache_weight > 0.0) return mix(source, cached_source, cache_weight);
+#endif
+    return source;
+#endif
+}
+
+vec3 stellar_multiple_source(sampler2D lut, vec3 p, vec3 sun, float radius, vec3 scattering, uint star) {
+    if (atm.depth_params.z > 0.5) return vec3(0.0);
+#ifndef ATMOSPHERE_SMALL_STARS
+#ifndef ATMOSPHERE_SOURCE_BAKE
+    if (star == 0u && stellar_cache_radius() > 0.0) {
+        vec2 uv = stellar_source_uv(p, sun, stellar_cache_radius());
+        uv.x = (0.5+(dot(normalize(p), sun)*0.5+0.5)*float(STELLAR_SOURCE_SIZE.x-1))/float(STELLAR_SOURCE_SIZE.x);
+        vec3 source = textureLod(stellar_source_lut, vec3(uv, 4.0), 0.0).rgb;
+        source *= source;
+        return source*source*scattering;
+    }
+#endif
+#endif
+#ifdef ATMOSPHERE_SMALL_STARS
+    return multiple_scattering_source(lut, p, sun, scattering);
+#else
+    if (radius < 0.01) return multiple_scattering_source(lut, p, sun, scattering);
+    vec3 up = normalize(p), tangent = stellar_tangent(up, sun);
+    float elevation = asin(clamp(dot(up, sun), -1.0, 1.0));
+    vec2 range = stellar_elevation_range(elevation, radius, -0.5*ATM_PI);
+    vec3 light = vec3(0.0);
+    for (int i = 0; i < 8; ++i) {
+        vec3 slice = stellar_slice(range, elevation, radius, i);
+        vec3 direction = up*sin(slice.x)+tangent*cos(slice.x);
+        light += multiple_scattering_source(lut, p, direction, scattering)*(2.0*slice.y*slice.z);
+    }
+    return light;
+#endif
 }
 
 float sky_angle(float t, bool lower) {
@@ -225,7 +385,7 @@ vec3 sky_direction(ivec2 pixel) {
     return vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
 }
 
-vec2 sky_uv(vec3 direction) {
+vec2 sky_uv(vec3 direction, ivec2 size) {
     float theta = acos(clamp(direction.z, -1.0, 1.0));
     float r = atm.camera.z;
     bool lower;
@@ -245,9 +405,11 @@ vec2 sky_uv(vec3 direction) {
     }
     float phi = atan(direction.y, direction.x);
     float x = (phi+ATM_PI)/(2.0*ATM_PI);
-    float y = (lower ? float(SKY_SIZE.y/2)+0.5 : 0.5) + t*float(SKY_SIZE.y/2-1);
-    return vec2((0.5+x*float(SKY_SIZE.x-1))/float(SKY_SIZE.x), y/float(SKY_SIZE.y));
+    float y = (lower ? float(size.y/2)+0.5 : 0.5) + t*float(size.y/2-1);
+    return vec2((0.5+x*float(size.x-1))/float(size.x), y/float(size.y));
 }
+
+vec2 sky_uv(vec3 direction) { return sky_uv(direction, SKY_SIZE); }
 
 vec3 segment_transmittance(sampler2D lut, float rx, float mux, float rp, float mup, bool hits_ground) {
     if (hits_ground) {
@@ -273,26 +435,43 @@ vec2 angular_segment(ivec2 pixel, vec3 d) {
     return vec2(start, max(start, end));
 }
 
+#ifdef ATMOSPHERE_SECONDARY_APPROX
+#include "secondary_source.glsl"
+#endif
+
 void integrate_atmosphere(sampler2D transmittance_lut, sampler2D multiscatter_lut,
                           vec3 d, float start, float span, inout vec3 L, inout vec3 tau) {
     if (span <= 0.0) return;
-    for (int step = 0; step < 2; ++step) {
-        float offset = start+float(step)*span*0.5;
-        int subdivisions = transport_subdivisions(atm.camera.xyz, d, offset, span*0.5);
-        float dt = span*0.5/float(subdivisions);
+#ifdef ATMOSPHERE_SECONDARY_APPROX
+    const int steps = 1;
+#else
+    const int steps = 2;
+#endif
+    float cell = span/float(steps);
+    for (int step = 0; step < steps; ++step) {
+        float offset = start+float(step)*cell;
+        int subdivisions = transport_subdivisions(atm.camera.xyz, d, offset, cell);
+        float dt = cell/float(subdivisions);
         for (int j = 0; j < subdivisions; ++j) {
             vec3 q = atm.camera.xyz+d*(offset+(float(j)+0.5)*dt);
             vec3 r, m, e;
             medium(q, r, m, e);
             vec3 source = vec3(0.0);
+#ifdef ATMOSPHERE_SECONDARY_APPROX
+            source = secondary_source(transmittance_lut, multiscatter_lut, q, r, m);
+#elif defined(ATMOSPHERE_SECONDARY_BAKE)
+            vec3 sun = secondary.direction.xyz;
+            source = stellar_scattering_source(transmittance_lut, q, d, sun, secondary.direction.w, r, m, 0u)
+                   + stellar_multiple_source(multiscatter_lut, q, sun, secondary.direction.w, r+m, 0u);
+#else
             for (uint s = 0u; s < uint(atm.camera.w); ++s) {
+                if (!any(greaterThan(atm.sun_irradiance[s].rgb, vec3(0.0)))) continue;
                 vec3 sun = atm.sun_direction[s].xyz;
-                float mu = dot(d, sun);
-                vec3 direct = sun_transmittance(transmittance_lut, q, sun, atm.sun_direction[s].w)
-                            *(r*rayleigh_phase(mu)+aerosol_source(q, mu));
-                vec3 multiple = textureLod(multiscatter_lut, multiscatter_uv(q, sun), 0.0).rgb*(r+m);
+                vec3 direct = stellar_scattering_source(transmittance_lut, q, d, sun, atm.sun_direction[s].w, r, m, s);
+                vec3 multiple = stellar_multiple_source(multiscatter_lut, q, sun, atm.sun_direction[s].w, r+m, s);
                 source += atm.sun_irradiance[s].rgb*(direct+multiple);
             }
+#endif
             L += exp(-tau)*source*segment_integral(e, dt);
             tau += e*dt;
         }

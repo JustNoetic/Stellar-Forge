@@ -49,8 +49,8 @@ Lines alpha-blend into HDR, test against opaque reverse-Z scene depth and do not
 write scene depth. View > Orbit Lines and Orbit Opacity control visibility.
 `RenderSettings::orbit_segments` defaults to 2048 and accepts 128–8192 segments.
 
-Extraction caches include system generation, state revision and definition
-revision. Camera culling and GPU packing run on every draw, so moving the camera
+Extraction caches include the ordered body identities, state revision, definition
+revision and hierarchy revision. Camera culling and GPU packing run on every draw, so moving the camera
 while paused restores previously culled curves. Allocations are per frame in flight.
 
 These lines are instantaneous two-body/Jacobi approximations, including during

@@ -30,5 +30,6 @@ std::optional<std::vector<uint8_t>> read_binary_file(const std::filesystem::path
 bool write_binary_file(const std::filesystem::path& path, const void* data, size_t size);
 std::optional<nlohmann::json> read_json(const std::filesystem::path& path);
 bool write_json(const std::filesystem::path& path, const nlohmann::json& j, int indent = 2);
+bool write_json_atomic(const std::filesystem::path& path, const nlohmann::json& j, int indent = 2);
 
 } // namespace sf::paths

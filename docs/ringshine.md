@@ -17,10 +17,15 @@ pre-integrated into a lookup tile, parameterized by:
   ring plane, same $^{1.5}$ warp. Sign distinguishes the two ring faces.
 - **solar elevation** — star elevation above the host's ring plane, one baked tile per
   (host × star) pair.
-- **sin(star angular radius)** — finite stellar disk; near ring-plane equinox the disk
-  splits into 4 area-weighted polar samples via the projected-disk marginal CDF
-  ($2\sqrt{1-y^2}/\pi$), each face using two equal-area centroids. `ringshine_source_samples`
-  uses 40-iteration inverse-CDF bisection; weights sum to one on both sides of equinox.
+- **sin(star angular radius)** — uniformly bright finite stellar disk. Four
+  weighted directions cover a spherical cap, using two Gaussian polar nodes
+  and antipodal tangent offsets. Their azimuth rotates across radial nodes,
+  covering both horizontal and vertical stellar extent. The solid-angle
+  weights preserve unit irradiance perpendicular to the star-center direction.
+  Tiny disks use the central direction when sufficiently far from the ring plane;
+  finite-disk integration is used for `sin_radius >= 0.01` or within twice the
+  apparent sine radius of the ring plane. Stable cap construction avoids
+  cancellation for tiny equinox sources.
 
 The integral (`shaders/common/ringshine_integral.glsl`) uses 16-node warped azimuth
 quadrature per arc segment, with analytic oblate horizon and planetary shadow arcs.
@@ -93,8 +98,8 @@ publish pass. The rewrite bakes each tile in **one full-pass draw per frame** in
 ### Cache Keys
 
 `RingshineTileKey` per (host, star column): `profile_serial` (bumped by
-`rebuild_profiles` — covers system replacement, generation, definition revision, and
-custom-texture edits), ring geometry (inner/outer ratios), flattening, band count,
+`rebuild_profiles` — runs when any ring host's index, body identity or definition
+revision changes, and on custom-texture edits; edits to other bodies keep profiles), ring geometry (inner/outer ratios), flattening, band count,
 quantized star elevation (`round 5 decimals`) and `sin_radius` (6 significant digits).
 Keys use **world-space** positions (`render.position.value`) so camera rebasing never
 perturbs them. Star column order matches the celestial renderer's star collection order
@@ -108,7 +113,7 @@ perturbs them. Star column order matches the celestial renderer's star collectio
 | Gradient atlas | binding 8 (bake only) |
 | Radial sample SSBO | binding 10 (bake only), `(radius, dr_weight)` per node in host equatorial radii |
 | Ringshine atlas | **binding 16** (`u_ringshine_map`, sphere/terrain pipelines) |
-| Push constants (bake) | 80 B: tile (host, star, node offset, node count), host_params (inner/outer ratios, enable, flattening), solar (elevation, sin radius, segments, bands), disk_offset, disk_weight |
+| Push constants (bake) | 80 B: tile (host, star, node offset, node count), host_params (inner/outer ratios, enable, flattening), solar (elevation, sin radius, segments, bands), two reserved vec4 fields retained for layout compatibility |
 | Scene UBO | `ringshine_params` = (ringshine_enabled, host_count, planetshine_enabled, 0) |
 | Setting | `RenderSettings::ringshine_enabled` (default on), `ringshine_band_count` (default 10, clamp 4–1024, validated in `apply`) |
 
@@ -124,8 +129,11 @@ $$L_{ringshine} = \text{albedo} \cdot \frac{M(\phi, \ell)}{\pi} \cdot \text{star
 
 gated on `ringshine_params.x != 0` (independent of the ring-shadow toggle).
 
-The ringshine atlas is consumed by surface shading. Atmospheric ringshine is currently
-removed, and the scheduler uses opaque-surface/terrain receiver bounds. See
+The ringshine atlas is consumed by surface shading, and its scheduler uses
+opaque-surface/terrain receiver bounds. A separate CPU-cached diffuse field now prototypes
+atmospheric ringshine through the shared secondary bake, without extra atlas draws.
+Its approved GPU validation and performance measurements are in
+[atmospheric ringshine](atmosphere_ringshine.md). See
 `docs/secondary_lighting.md` for the remaining planetshine paths and their limits.
 
 ## Contracts (`tests/ring_gpu_tests.hpp::ringshine_contracts`)
@@ -153,3 +161,25 @@ general validation of the empirical anisotropic multiple-scattering closure.
   the full tile is baked for simplicity.
 - **Node-budget slicing** (64 nodes/frame): replaced by full single-pass bakes;
   amortization now lives entirely in the cache keys.
+
+
+## Extended stellar source validation
+
+Finite-disk radiance and shadowing are evaluated together for every sampled
+direction. Disk weights integrate solid angle relative to perpendicular incident
+irradiance; their sum can exceed one for large disks. No empirical angular-size
+brightness multiplier is applied. The four-point source cubature is distributed
+across radial integration nodes and remains approximate; increasing radial bands
+does not guarantee monotonic source-error reduction.
+
+The source rule was checked with independently ray-traced 64 by 64 surface views
+and Monte Carlo annulus/stellar sampling, plus collision-based plane-parallel slab
+transport for isotropic and two-term HG materials. The comparison distinguishes
+numerical source/integration error from the existing empirical multiple-scattering
+and opposition model. The test `ringshine_contracts` includes a 60-degree-star
+rendered pixel checked against dense full-disk quadrature; its tolerance includes
+the surface's authored albedo bands. Point-source contracts remain in place.
+
+The extended-source fix changes the ringshine bake. Visible-ring shading and its
+separate finite-source/shadow approximations are unchanged. `Direct sunlight only`
+disables secondary illumination, including ringshine.

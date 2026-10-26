@@ -10,7 +10,7 @@
 namespace sf::terrain {
 
 struct GeometryKey {
-    uint64_t generation = 0;
+    uint64_t identity = 0;
     uint64_t geometry_revision = 0;
     uint64_t tile = 0;
     uint32_t body = 0;

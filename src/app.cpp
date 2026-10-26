@@ -121,9 +121,11 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
     rhi::ShaderCache::init();
     vk_.init(window_, false);
     ui_.init(window_, vk_);
-    if (benchmark_.enabled) {
+    if (self_test_ || benchmark_.enabled) {
         ImGui::GetIO().IniFilename = nullptr;
         ImGui::GetIO().LogFilename = nullptr;
+    }
+    if (benchmark_.enabled) {
         ui_settings_.ui_visible = benchmark_.ui;
     }
 
@@ -131,7 +133,9 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
 
     system_names_ = sys_mgr_.list_systems();
     switch_system(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
+    load_preferences();
     simulation_.set_threaded(benchmark_.enabled ? benchmark_.simulation_mode != "inline" : simulation_thread);
+    comparisons_.set_threaded(simulation_.threaded());
     sf::log::info("Simulation execution: {}", simulation_.threaded() ? "worker" : "inline");
 
     star_catalog_.init(vk_, sf::paths::external_path("data", "gaia", "stars.bin"));
@@ -151,6 +155,8 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
     comp_desc.cull_mode = VK_CULL_MODE_NONE;
 
     composite_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(vk_, comp_desc);
+    comp_desc.macros = {{"SIZE_COMPARISON", "1"}};
+    size_composite_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(vk_, comp_desc);
     sf::log::info("Stellar Forge initialized (Root: {})", sf::paths::project_root().string());
 }
 
@@ -180,7 +186,7 @@ void App::switch_system(std::string_view system_name) {
     camera_.cam_pos_rel = {0.0, 19.02, 40.78};
     camera_.up = {0.0, 1.0, 0.0};
     camera_.cam_look_aim = true;
-    camera_.flight_speed_au_s = 0.2;
+    camera_.flight_speed_au_s = NavigationSettings{}.flight_speed_au_s;
     camera_.has_prev_spin = false;
     camera_.origin_render = system().body(camera_.tracking_idx).render.position.value;
 }
@@ -251,7 +257,7 @@ void App::apply_ephemeris_system() {
         camera_.cam_pos_rel = {0.0, 19.02, 40.78};
         camera_.up = {0.0, 1.0, 0.0};
         camera_.cam_look_aim = true;
-        camera_.flight_speed_au_s = 0.2;
+        camera_.flight_speed_au_s = NavigationSettings{}.flight_speed_au_s;
         camera_.has_prev_spin = false;
         camera_.origin_render = system().body(camera_.tracking_idx).render.position.value;
     }
@@ -300,6 +306,7 @@ void App::run() {
     }
     double last_time = glfwGetTime();
     uint32_t frames_rendered = 0;
+    uint64_t compared_identity = 0;
 
     while (!glfwWindowShouldClose(window_)) {
         glfwPollEvents();
@@ -313,11 +320,78 @@ void App::run() {
             simulation_.apply(ephemeris::SetPaused{true});
             sf::log::error("Simulation paused: {}", step.error);
         }
+        advance_system_comparisons();
+        compose_scene();
 
+        if (self_test_) {
+            if (!comparisons_.empty()) check_system_comparison_sync();
+            if (frames_rendered == 1) {
+                auto result = add_system_comparison(system().name());
+                if (!result) throw std::runtime_error(result.error);
+            } else if (frames_rendered == 2 && !comparisons_.empty()) {
+                int earth = composer_.map().composite(1, size_t(std::max(0, comparisons_.slot(0).snapshot().find_body("Earth"))));
+                if (earth < int(system().size())) throw std::runtime_error("Compared bodies must follow the primary bodies.");
+                camera_.focus_body(earth, scene(), true);
+                ui_state_.inspected_body = earth;
+                compared_identity = scene().body(size_t(earth)).revisions.identity;
+            } else if (frames_rendered == 3 && !comparisons_.empty()) {
+                comparisons_.slot(0).slot_lights_primary = true;
+                compose_scene();
+                size_t compared_star = size_t(composer_.map().begin(1)) + size_t(comparisons_.slot(0).snapshot().star_index());
+                if (!scene().illuminates(compared_star, 0) || scene().illuminates(size_t(system().star_index()), compared_star + 1))
+                    throw std::runtime_error("Starlight switches do not light the requested direction only.");
+            } else if (frames_rendered == 5 && !comparisons_.empty()) {
+                comparisons_.set_overlay(true);
+                compose_scene();
+                if (scene().illuminates(size_t(composer_.map().begin(1)), 0) || comparisons_.slot(0).slot_lights_primary ||
+                    !comparisons_.slot(0).primary_lights_slot)
+                    throw std::runtime_error("Overlay must isolate lighting and the swap must keep switch directions.");
+            } else if (frames_rendered == 6 && !comparisons_.empty()) {
+                show_system_comparator_ = show_comparison_table_ = true;
+                comparison_match_ = comparison::MatchMode::OrbitOrder;
+                comparison_table_row_ = "Planet 3";
+            } else if (frames_rendered == 7 && !comparisons_.empty()) {
+                comparisons_.set_overlay(false);
+                compose_scene();
+                comparison_match_ = comparison::MatchMode::Name;
+                comparison_metric_ = 5;
+                comparison_table_row_ = "Earth";
+            } else if (frames_rendered == 9) {
+                show_system_comparator_ = show_comparison_table_ = false;
+            } else if (frames_rendered == 4 && compared_identity != 0) {
+                auto result = open_comparison_for_editing(0);
+                if (!result) throw std::runtime_error(result.error);
+                if (camera_.tracking_idx < 0 || camera_.tracking_idx >= int(system().size()) ||
+                    system().body(size_t(camera_.tracking_idx)).revisions.identity != compared_identity ||
+                    ui_state_.inspected_body != camera_.tracking_idx)
+                    throw std::runtime_error("Open for Editing lost the tracked and inspected compared body.");
+            }
+            if (compared_identity != 0 && !comparisons_.empty() &&
+                scene().body(size_t(camera_.tracking_idx)).revisions.identity != compared_identity)
+                throw std::runtime_error("Camera tracking lost the compared body.");
+            uint32_t settings_frames = static_cast<uint32_t>(ui::SettingsSection::Count);
+            ui_settings_.show_settings = frames_rendered < settings_frames;
+            ui_settings_.settings_section = static_cast<int>(frames_rendered);
+            if (frames_rendered == settings_frames) {
+                set_size_comparison(true);
+                size_comparison_.selected_systems = sys_mgr_.list_systems();
+            } else if (frames_rendered == settings_frames+1) {
+                size_comparison_.select(3);
+                comparison_focus_ = size_comparison_.selection();
+            } else if (frames_rendered == settings_frames+2) {
+                size_comparison_.selected_systems.clear();
+            } else if (frames_rendered == settings_frames+3) {
+                size_comparison_.selected_systems = sys_mgr_.list_systems();
+            } else if (frames_rendered == settings_frames+4) {
+                set_size_comparison(false);
+                if (!comparisons_.empty()) remove_system_comparison(0);
+            }
+        }
         render_frame();
+        save_preferences();
 
         ++frames_rendered;
-        if (self_test_ && frames_rendered >= 3) {
+        if (self_test_ && frames_rendered >= static_cast<uint32_t>(ui::SettingsSection::Count)+5) {
             sf::log::info("Self-test completed {} frames cleanly.", frames_rendered);
             break;
         }
@@ -325,9 +399,13 @@ void App::run() {
 }
 
 void App::shutdown() {
+    save_preferences(true);
+    comparisons_.clear();
     simulation_.set_threaded(false);
     vk_.wait_idle();
+    rhi::ShaderCache::destroy_pipeline(vk_, size_composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(vk_, composite_pipeline_);
+    size_renderer_.shutdown(vk_);
     celestial_renderer_.shutdown(vk_);
     orbit_renderer_.shutdown(vk_);
     star_catalog_.shutdown(vk_);
@@ -364,6 +442,11 @@ void App::on_key(int key, int, int action, int mods) {
         return;
     }
 
+    if (size_comparison_active_) {
+        if (key == GLFW_KEY_F && action == GLFW_PRESS) { size_view_.fit = true; return; }
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) { size_comparison_.select(-1); ui_state_.comparison_selection = false; return; }
+        if (key == GLFW_KEY_W || key == GLFW_KEY_A || key == GLFW_KEY_S || key == GLFW_KEY_D || key == GLFW_KEY_Q || key == GLFW_KEY_E) return;
+    }
     bool pressed = (action != GLFW_RELEASE);
     if (key == GLFW_KEY_W) { camera_.key_w = pressed; return; }
     if (key == GLFW_KEY_A) { camera_.key_a = pressed; return; }
@@ -379,7 +462,7 @@ void App::on_key(int key, int, int action, int mods) {
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
         simulation_.apply(ephemeris::SetPaused{!simulation_.clock().paused});
     } else if (key == GLFW_KEY_F && action == GLFW_PRESS) {
-        camera_.snap_to_tracked(system());
+        camera_.snap_to_tracked(scene());
     } else if (key == GLFW_KEY_R) {
         simulation_.apply(ephemeris::SetTimeWarp{1.0});
     } else if (key == GLFW_KEY_BACKSPACE && action == GLFW_PRESS) {
@@ -404,7 +487,7 @@ void App::on_key(int key, int, int action, int mods) {
 }
 
 void App::on_mouse_button(int button, int action, int) {
-    if (benchmark_.enabled) return;
+    if (benchmark_.enabled || size_comparison_active_) return;
     double x = 0.0, y = 0.0;
     glfwGetCursorPos(window_, &x, &y);
     if (action == GLFW_RELEASE) {
@@ -418,12 +501,12 @@ void App::on_mouse_button(int button, int action, int) {
 }
 
 void App::on_cursor_pos(double xpos, double ypos) {
-    if (benchmark_.enabled || ui_.is_dragging()) return;
+    if (benchmark_.enabled || size_comparison_active_ || ui_.is_dragging()) return;
     camera_.on_cursor_pos(xpos, ypos, system());
 }
 
 void App::on_scroll(double, double yoffset) {
-    if (benchmark_.enabled) return;
+    if (benchmark_.enabled || size_comparison_active_) return;
     if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) {
         return;
     }
@@ -454,6 +537,7 @@ void App::destroy_render_targets() {
 }
 
 bool App::render_frame(benchmark::FrameSample* sample) {
+    apply_size_comparison();
     if (vk_.vsync_enabled() != render_settings_.values().vsync) {
         vk_.set_vsync(render_settings_.values().vsync);
     }
@@ -478,21 +562,25 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         }
     }
 
+    if (size_comparison_active_ && !ui_settings_.ui_visible) update_size_comparison();
+
     if (self_test_) {
         auto result = simulation_.apply(ephemeris::SetTimeWarp{simulation_.clock().warp * 1.25});
         if (!result) throw std::runtime_error(result.error);
     }
+    compose_scene();
     double camera_update_ms = 0.0;
     {
         ScopedTimer timer(sample ? &camera_update_ms : nullptr);
-        camera_.update(frame_dt_, system());
+        camera_.update(frame_dt_, scene());
     }
     if (sample) sample->cpu_camera_ms += camera_update_ms;
-    if (self_test_ && camera_.origin_render != system().body(camera_.tracking_idx).render.position.value)
+    if (self_test_ && camera_.origin_render != scene().body(camera_.tracking_idx).render.position.value)
         throw std::runtime_error("Camera tracking and rendered body use different snapshots after a time-warp change.");
 
     VkExtent2D ext = vk_.swapchain_extent();
 
+    bool profile_scene = sample || ui_settings_.show_telemetry;
     uint32_t t_scene = vk_.begin_gpu_timer(cmd, "gpu_scene_hdr");
     vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -501,52 +589,62 @@ bool App::render_frame(benchmark::FrameSample* sample) {
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
-    double celestial_prepare_ms = 0.0;
-    {
-        ScopedTimer timer(sample ? &celestial_prepare_ms : nullptr);
-        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_terrain_prepare") : UINT32_MAX;
-        celestial_renderer_.prepare(cmd, vk_, camera_, system(), render_settings_.values(), ext, ui_settings_.show_telemetry, sample ? &sample->cpu : nullptr);
-        vk_.end_gpu_timer(cmd, id);
-    }
-    auto refraction_writes = celestial_renderer_.refraction_writes(vk_);
-    {
-        ScopedTimer timer(sample ? &sample->cpu["cpu_gaia_cull_ms"] : nullptr);
-        auto id = sample ? vk_.begin_gpu_timer(cmd, "gpu_gaia_cull") : UINT32_MAX;
-        star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
-        vk_.end_gpu_timer(cmd, id);
-    }
+    if (size_comparison_active_) {
+        size_renderer_.prepare(cmd, vk_, size_comparison_, size_view_, render_settings_.values(), ext);
+        auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, .003f, .005f, .012f, 1);
+        auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0);
+        vk_.begin_rendering(cmd, ext, std::span{&color_att, 1}, &depth_att);
+        size_renderer_.render(cmd, vk_);
+        vk_.end_rendering(cmd);
+        size_renderer_.composite(cmd, vk_, hdr_color_, scene_depth_);
+    } else {
+        double celestial_prepare_ms = 0.0;
+        {
+            ScopedTimer timer(sample ? &celestial_prepare_ms : nullptr);
+            uint32_t id = profile_scene ? vk_.begin_gpu_timer(cmd, "gpu_terrain_prepare") : UINT32_MAX;
+            celestial_renderer_.prepare(cmd, vk_, camera_, scene(), render_settings_.values(), ext, ui_settings_.show_telemetry, sample ? &sample->cpu : nullptr);
+            vk_.end_gpu_timer(cmd, id);
+        }
+        auto refraction_writes = celestial_renderer_.refraction_writes(vk_);
+        {
+            ScopedTimer timer(sample ? &sample->cpu["cpu_gaia_cull_ms"] : nullptr);
+            auto id = profile_scene ? vk_.begin_gpu_timer(cmd, "gpu_gaia_cull") : UINT32_MAX;
+            star_catalog_.cull(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
+            vk_.end_gpu_timer(cmd, id);
+        }
 
-    auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, 0.0f, 0.0f, 0.0f, 1.0f);
-    auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0.0f);
-    vk_.begin_rendering(cmd, ext, std::span{&color_att, 1}, &depth_att);
+        auto color_att = rhi::RenderingAttachment::clear_color(hdr_color_, 0.0f, 0.0f, 0.0f, 1.0f);
+        auto depth_att = rhi::RenderingAttachment::clear_depth_reverse_z(scene_depth_, 0.0f);
+        vk_.begin_rendering(cmd, ext, std::span{&color_att, 1}, &depth_att);
 
-    {
-        ScopedTimer timer(sample ? &sample->cpu_celestial_ms : nullptr);
-        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_celestial") : UINT32_MAX;
-        celestial_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext, sample ? &sample->cpu : nullptr);
-        vk_.end_gpu_timer(cmd, id);
-    }
-    if (sample) sample->cpu_celestial_ms += celestial_prepare_ms;
-    {
-        ScopedTimer timer(sample ? &sample->cpu_gaia_ms : nullptr);
-        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_gaia") : UINT32_MAX;
-        star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
-        vk_.end_gpu_timer(cmd, id);
-    }
-    {
-        ScopedTimer timer(sample ? &sample->cpu_orbits_ms : nullptr);
-        uint32_t id = sample ? vk_.begin_gpu_timer(cmd, "gpu_orbits") : UINT32_MAX;
-        auto transparency_writes = celestial_renderer_.transparency().writes();
-        orbit_renderer_.render(cmd, vk_, camera_, system(), render_settings_.values(), ext,
-            celestial_renderer_.transparency().active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{},
-            refraction_writes);
-        vk_.end_gpu_timer(cmd, id);
-    }
+        {
+            ScopedTimer timer(sample ? &sample->cpu_celestial_ms : nullptr);
+            uint32_t id = profile_scene ? vk_.begin_gpu_timer(cmd, "gpu_celestial") : UINT32_MAX;
+            celestial_renderer_.render(cmd, vk_, camera_, scene(), render_settings_.values(), ext, sample ? &sample->cpu : nullptr, ui_settings_.show_telemetry);
+            vk_.end_gpu_timer(cmd, id);
+        }
+        if (sample) sample->cpu_celestial_ms += celestial_prepare_ms;
+        {
+            ScopedTimer timer(sample ? &sample->cpu_gaia_ms : nullptr);
+            uint32_t id = profile_scene ? vk_.begin_gpu_timer(cmd, "gpu_gaia") : UINT32_MAX;
+            star_catalog_.render(cmd, vk_, camera_, system().time(), render_settings_.values(), ext, refraction_writes);
+            vk_.end_gpu_timer(cmd, id);
+        }
+        {
+            ScopedTimer timer(sample ? &sample->cpu_orbits_ms : nullptr);
+            uint32_t id = profile_scene ? vk_.begin_gpu_timer(cmd, "gpu_orbits") : UINT32_MAX;
+            auto transparency_writes = celestial_renderer_.transparency().writes();
+            orbit_renderer_.render(cmd, vk_, camera_, scene(), render_settings_.values(), ext,
+                celestial_renderer_.transparency().active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{},
+                refraction_writes);
+            vk_.end_gpu_timer(cmd, id);
+        }
 
-    vk_.end_rendering(cmd);
-    {
-        ScopedTimer timer(sample ? &sample->cpu["cpu_atmosphere_composite_ms"] : nullptr);
-        celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_);
+        vk_.end_rendering(cmd);
+        {
+            ScopedTimer timer(sample ? &sample->cpu["cpu_atmosphere_composite_ms"] : nullptr);
+            celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_);
+        }
     }
     vk_.end_gpu_timer(cmd, t_scene);
 
@@ -567,12 +665,13 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     swap_att.store_op = VK_ATTACHMENT_STORE_OP_STORE;
 
     vk_.begin_rendering(cmd, ext, std::span{&swap_att, 1}, nullptr);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composite_pipeline_.handle);
+    const auto& presentation = size_comparison_active_ ? size_composite_pipeline_ : composite_pipeline_;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentation.handle);
 
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::sampled_image(0, hdr_color_, vk_.sampler_linear_clamp()),
     };
-    vk_.push_descriptors(cmd, composite_pipeline_, writes);
+    vk_.push_descriptors(cmd, presentation, writes);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vk_.end_rendering(cmd);
     vk_.end_gpu_timer(cmd, t_post);
@@ -717,10 +816,13 @@ void App::render_ui() {
 
     render_main_menu_bar(render_draft);
     render_outliner();
+    update_size_comparison();
     render_body_inspector();
     render_viewport_overlays();
     render_settings_window(render_draft);
     render_time_hud(render_draft);
+    render_system_comparator_window();
+    render_comparison_table();
     render_add_body_modal();
     render_delete_body_modal();
     render_create_system_modal();
@@ -776,7 +878,7 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         }
         ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu("Edit")) {
+    if (ImGui::BeginMenu("Edit", !size_comparison_active_)) {
         bool can_add = (system().definition().motion_model != ephemeris::MotionModel::Spice);
         if (ImGui::MenuItem("Add Orbiting Body...", nullptr, false, can_add)) {
             int p_idx = (ui_state_.inspected_body >= 0 && ui_state_.inspected_body < static_cast<int>(system().size()))
@@ -869,15 +971,20 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Snap Look to Tracked (F)")) {
-            camera_.snap_to_tracked(system());
+            camera_.snap_to_tracked(scene());
         }
         ImGui::MenuItem("Auto Horizon Level (< 200 km)", nullptr, &camera_.horizon_align);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
+        if (ImGui::MenuItem("Scene: Simulation", nullptr, !size_comparison_active_)) set_size_comparison(false);
+        if (ImGui::MenuItem("Scene: Size Comparator", nullptr, size_comparison_active_)) set_size_comparison(true);
+        ImGui::Separator();
         ImGui::MenuItem("System Outliner", nullptr, &ui_settings_.show_outliner);
         ImGui::MenuItem("Body Inspector", nullptr, &ui_settings_.show_inspector);
         ImGui::MenuItem("Time Transport HUD", nullptr, &ui_settings_.show_time_hud);
+        ImGui::MenuItem("System Comparator...", nullptr, &show_system_comparator_);
+        ImGui::MenuItem("Comparison Table...", nullptr, &show_comparison_table_);
         ImGui::Separator();
         ImGui::MenuItem("Engine Telemetry", nullptr, &ui_settings_.show_telemetry);
         ImGui::Separator();
@@ -905,231 +1012,10 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
     ImGui::EndMainMenuBar();
 }
 
-void App::render_settings_window(rendering::RenderSettings& render_draft) {
-    if (!ui_settings_.show_settings) return;
-
-    ui::WorkspaceLayout layout = ui_.compute_layout(ui_settings_, ui_state_,
-                                                   static_cast<float>(vk_.swapchain_extent().width),
-                                                   static_cast<float>(vk_.swapchain_extent().height));
-    float width = std::min(960.0f * layout.scale, layout.width - layout.gap * 4.0f);
-    float height = std::min(620.0f * layout.scale, layout.height - layout.top - layout.gap * 3.0f);
-    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2((layout.width - width) * 0.5f, (layout.height - height) * 0.5f), ImGuiCond_FirstUseEver);
-
-    if (ImGui::Begin("Settings / Stellar Forge###forge_settings", &ui_settings_.show_settings, ImGuiWindowFlags_NoCollapse)) {
-        static const char* s_categories[] = {"Optics", "Visibility", "Navigation", "Workspace"};
-        static const char* s_descriptions[] = {
-            "Exposure, star brightness, HDR rendering and post-processing.",
-            "Orbital paths, background starfield and celestial overlays.",
-            "Flight speed, field of view, horizon alignment and distance threshold.",
-            "Panel layout, interface visibility and window docking."
-        };
-
-        int section_idx = std::clamp(ui_settings_.settings_section, 0, 3);
-        float nav_w = std::min(160.0f * layout.scale, width * 0.25f);
-        float footer_h = 38.0f * layout.scale;
-
-        ImGui::BeginChild("settings_navigation", ImVec2(nav_w, -footer_h), true);
-        ImGui::TextDisabled("SETTINGS");
-        ImGui::Spacing();
-        for (int i = 0; i < 4; ++i) {
-            if (ImGui::Selectable(s_categories[i], section_idx == i, 0, ImVec2(0.0f, 26.0f * layout.scale))) {
-                section_idx = i;
-                ui_settings_.settings_section = i;
-            }
-        }
-        ImGui::EndChild();
-
-        ImGui::SameLine();
-
-        ImGui::BeginChild("settings_content", ImVec2(0.0f, -footer_h), true);
-        ui::heading(s_categories[section_idx], s_descriptions[section_idx]);
-
-        if (section_idx == 0) {
-            ui::field("Exposure##optics_exp", [&](const char* id) {
-                float speed = std::max(0.005f, render_draft.exposure * 0.02f);
-                const char* fmt = (render_draft.exposure >= 10000.0f || (render_draft.exposure > 0.0f && render_draft.exposure < 0.005f)) ? "%.4g" : "%.3f";
-                if (ui::drag_float(id, &render_draft.exposure, speed, 0.0f, 0.0f, fmt)) {
-                    render_draft.exposure = std::max(0.0f, render_draft.exposure);
-                }
-            });
-            ImGui::Checkbox("HDR Rendering", &render_draft.hdr_enabled);
-            ImGui::Checkbox("VSync", &render_draft.vsync);
-            ui::field("Point Diameter##star_pt", [&](const char* id) {
-                ImGui::SliderFloat(id, &render_draft.star_point_size, 1.5f, 6.0f, "%.1f px");
-            });
-            ui::field("Star Brightness##star_br", [&](const char* id) {
-                float star_speed = std::max(0.01f, render_draft.star_intensity * 0.02f);
-                if (ui::drag_float(id, &render_draft.star_intensity, star_speed, 0.0f, 0.0f, "%.2f")) {
-                    render_draft.star_intensity = std::max(0.0f, render_draft.star_intensity);
-                }
-            });
-        } else if (section_idx == 1) {
-            ImGui::Checkbox("Gaia DR3 Starfield", &render_draft.show_gaia_stars);
-            ImGui::Checkbox("Orbit Lines", &render_draft.show_orbits);
-            ui::field("Orbit Opacity##orb_op", [&](const char* id) {
-                ImGui::SliderFloat(id, &render_draft.orbit_opacity, 0.0f, 1.0f, "%.2f");
-            });
-            ImGui::Checkbox("Atmospheres", &render_draft.show_atmospheres);
-            ImGui::Checkbox("Atmospheric surface lighting", &render_draft.atmosphere_surface_lighting);
-            ImGui::Checkbox("Atmospheric shadows", &render_draft.atmosphere_shadows_enabled);
-            ImGui::BeginDisabled(!render_draft.atmosphere_shadows_enabled);
-            ImGui::Checkbox("Progressive atmosphere shadows", &render_draft.atmosphere_shadow_temporal);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Refines stationary views over 64 frames. Moving the eye, lighting or shadows resets immediately. Disable to see single-frame shadow sampling without history.");
-            ImGui::BeginDisabled(!render_draft.atmosphere_shadow_temporal);
-            ImGui::Checkbox("Reuse history while turning", &render_draft.atmosphere_shadow_rotation);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reprojects smooth sky shadows while rotating in place. Depth edges, narrow shadows and transparent endpoints use fresh integration while turning.");
-            ImGui::EndDisabled();
-            ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
-            ImGui::Checkbox("Animate shadow jitter", &render_draft.atmosphere_shadow_animate_jitter);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("With progressive shadows off, changes the raymarch sample positions every frame. Disable to freeze the noise pattern.");
-            ImGui::EndDisabled();
-            const char* shadow_noise_types[] = {"Interleaved Gradient Noise (IGN)", "Spatiotemporal Blue Noise (STBN)"};
-            int current_noise_type = static_cast<int>(render_draft.atmosphere_shadow_noise_type);
-            if (ImGui::Combo("Shadow noise##shadow_noise", &current_noise_type, shadow_noise_types, 2)) {
-                render_draft.atmosphere_shadow_noise_type = static_cast<uint32_t>(current_noise_type);
-            }
-            const char* shadow_samples[] = {"4", "8", "16"};
-            ImGui::Checkbox("Adaptive shadow samples", &render_draft.atmosphere_shadow_adaptive);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses fewer samples for short or vertical atmospheric columns. Grazing rays and sharp shadows retain more samples.");
-            ImGui::Checkbox("Cached shadow weights", &render_draft.atmosphere_shadow_cached_weights);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses aerial-perspective light contributions for single-star ring shadows. Unsupported endpoints and atmosphere profiles retain native integration.");
-            ImGui::Checkbox("Fast ring shadow geometry (experimental)", &render_draft.atmosphere_shadow_fast_rings);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Simplifies projection math for single-ring atmospheric shadows while retaining the current ring filter. Grazing stellar horizons use the original calculation.");
-            ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
-            ImGui::Checkbox("Atmospheric shadow VRS", &render_draft.atmosphere_shadow_vrs);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses smooth shadow fractions between pixels. Depth edges, narrow shadow detail and transparent endpoints use native resolution.");
-            ImGui::EndDisabled();
-            int shadow_quality = render_draft.atmosphere_shadow_samples == 4 ? 0 : render_draft.atmosphere_shadow_samples == 8 ? 1 : 2;
-            if (ImGui::Combo(render_draft.atmosphere_shadow_adaptive ? "Maximum shadow samples" : "Shadow samples", &shadow_quality, shadow_samples, 3))
-                render_draft.atmosphere_shadow_samples = 4u << shadow_quality;
-            ImGui::EndDisabled();
-            ImGui::Checkbox("Dual-source atmosphere blending", &render_draft.atmosphere_dual_source);
-            ImGui::Checkbox("Aerial perspective", &render_draft.aerial_perspective_enabled);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds atmospheric scattered light over surfaces. Atmospheric extinction remains active when disabled.");
-            ImGui::Checkbox("Atmospheric refraction", &render_draft.refraction_enabled);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bends apparent positions of stars, bodies, terrain, rings and orbits through the nearest physical atmosphere.");
-            ImGui::Checkbox("Eclipse refraction", &render_draft.eclipse_refraction_enabled);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds approximate atmospheric colouring to eclipse shadows using cached textures.");
-            ImGui::Checkbox("Planetshine", &render_draft.planetshine_enabled);
-            ImGui::BeginDisabled(!render_draft.planetshine_enabled || !render_draft.show_rings);
-            ui::field("Planetshine on rings", [&](const char* id) {
-                const char* modes[] = {"Analytical", "Numerical (64 samples)"};
-                int mode = int(render_draft.ring_planetshine_mode);
-                if (ImGui::Combo(id, &mode, modes, 2)) render_draft.ring_planetshine_mode = uint32_t(mode);
-            });
-            ImGui::EndDisabled();
-            ImGui::Checkbox("Planetary Rings", &render_draft.show_rings);
-            ImGui::BeginDisabled(!render_draft.show_rings);
-            ImGui::Checkbox("Ring Shadows", &render_draft.ring_shadows_enabled);
-            ImGui::BeginDisabled(!render_draft.ring_shadows_enabled);
-            ui::field("Shadow Softness##ring_shadow_softness", [&](const char* id) {
-                ImGui::SliderFloat(id, &render_draft.ring_shadow_softness, 0.25f, 4.0f, "%.2fx");
-            });
-            ImGui::EndDisabled();
-            ImGui::Checkbox("Ringshine", &render_draft.ringshine_enabled);
-            ImGui::BeginDisabled(!render_draft.ringshine_enabled);
-            ui::field("Ringshine Bands##ringshine_bands", [&](const char* id) {
-                int bands = static_cast<int>(render_draft.ringshine_band_count);
-                if (ImGui::SliderInt(id, &bands, 4, 1024, "%d", ImGuiSliderFlags_Logarithmic))
-                    render_draft.ringshine_band_count = static_cast<uint32_t>(bands);
-            });
-            ui::value_row("Requested Radial Samples", std::format("{} per host", 4 * render_draft.ringshine_band_count));
-            auto samples = celestial_renderer_.ringshine_sample_counts();
-            if (!samples.empty()) {
-                auto [minimum, maximum] = std::minmax_element(samples.begin(), samples.end());
-                ui::value_row("Active Radial Samples", *minimum == *maximum
-                    ? std::format("{} per host", *minimum)
-                    : std::format("{} to {} per host", *minimum, *maximum));
-            }
-            ImGui::EndDisabled();
-            ImGui::EndDisabled();
-            ui::section("Planet Surfaces", "Quadtree ellipsoids, imported maps and optional synthetic relief");
-            ImGui::Checkbox("Surface Textures", &render_draft.surface_textures_enabled);
-            ImGui::Checkbox("Imported Elevation", &render_draft.terrain_imported_enabled);
-            ImGui::Checkbox("Detailed Terrain Shading", &render_draft.terrain_normal_maps_enabled);
-            ImGui::Checkbox("Synthetic Terrain Preview", &render_draft.terrain_enabled);
-            ImGui::Checkbox("Terrain Tile Colors", &render_draft.terrain_debug_tiles);
-            ImGui::Checkbox("FP64 Terrain Reference", &render_draft.terrain_reference_fp64);
-            ui::field("Terrain Error##terrain_error", [&](const char* id) {
-                ImGui::SliderFloat(id, &render_draft.terrain_error_pixels, 0.5f, 16.0f, "%.1f px");
-            });
-            ImGui::BeginDisabled(!render_draft.terrain_enabled);
-            ui::field("Synthetic Relief##terrain_height", [&](const char* id) {
-                ImGui::SliderFloat(id, &render_draft.terrain_height_km, 0.0f, 20.0f, "%.2f km");
-            });
-            ImGui::EndDisabled();
-            ui::field("Patches per Body##terrain_patches", [&](const char* id) {
-                int limit = static_cast<int>(render_draft.terrain_patch_limit);
-                if (ImGui::SliderInt(id, &limit, 64, 4096)) render_draft.terrain_patch_limit = static_cast<uint32_t>(limit);
-            });
-            const auto& terrain = celestial_renderer_.terrain_stats();
-            ui::value_row("Terrain Patches", std::format("{} / {}", terrain.patches, terrain::MAX_PATCHES));
-            ui::value_row("Smooth Patches", std::to_string(terrain.smooth_patches));
-            ui::value_row("Deepest Terrain Level", std::to_string(terrain.deepest_level));
-            ui::value_row("Geometry Cache", std::format("{} cached / {} reference", terrain.cached_patches, terrain.reference_patches));
-            ui::value_row("Geometry Bakes", std::format("{} / {} per frame", terrain.cache_bakes, terrain::MAX_GEOMETRY_BAKES));
-            if (terrain.budget_limited) ImGui::TextDisabled("Patch budget reached; using coarser terrain.");
-            const auto& textures = celestial_renderer_.texture_stats();
-            ui::value_row("Surface Maps", std::format("{} bodies / {} resident tiles", textures.sources, textures.resident));
-            ui::value_row("Texture Streaming", std::format("{} uploads / {} waiting", textures.uploads, textures.pending));
-        } else if (section_idx == 2) {
-            const char* modes[] = {"Free Flight", "Simple Orbit"};
-            int cur_mode = camera_.movement_mode;
-            if (ImGui::Combo("Movement Mode", &cur_mode, modes, 2)) {
-                camera_.movement_mode = cur_mode;
-            }
-            float fov_f = static_cast<float>(camera_.fov_deg);
-            if (ImGui::SliderFloat("Field of View", &fov_f, 1.0f, 120.0f, "%.1f deg")) {
-                camera_.fov_deg = fov_f;
-            }
-            ui::field("Flight Speed", [&](const char* id) {
-                float sp_log = static_cast<float>(std::log10(std::max(1e-12, camera_.flight_speed_au_s)));
-                std::string sp_fmt = format_speed_au_s(camera_.flight_speed_au_s);
-                if (ui::drag_float(id, &sp_log, 0.02f, -12.0f, 8.0f, sp_fmt.c_str())) {
-                    camera_.flight_speed_au_s = std::pow(10.0, static_cast<double>(sp_log));
-                }
-            });
-            ImGui::Checkbox("Auto Horizon Level (< 200 km)", &camera_.horizon_align);
-            ui::field("Light-Year Display Threshold (AU)", [&](const char* id) {
-                ImGui::InputDouble(id, &ui_settings_.ly_threshold_au, 100.0, 1000.0, "%.1f");
-                ui_settings_.ly_threshold_au = std::max(1.0, ui_settings_.ly_threshold_au);
-            });
-        } else if (section_idx == 3) {
-            ImGui::Checkbox("Aligned Panels", &ui_settings_.aligned_panels);
-            ImGui::Checkbox("Show System Outliner", &ui_settings_.show_outliner);
-            ImGui::Checkbox("Show Body Inspector", &ui_settings_.show_inspector);
-            ImGui::Checkbox("Show Time Transport HUD", &ui_settings_.show_time_hud);
-            ImGui::Checkbox("Show Engine Telemetry Window", &ui_settings_.show_telemetry);
-            ImGui::Separator();
-            ImGui::Checkbox("Confirm Object Deletion", &ui_settings_.confirm_delete);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Require confirmation dialog when deleting celestial bodies. Disable to quickly delete objects.");
-            }
-            ImGui::Separator();
-            ImGui::SliderFloat("Outliner Width", &ui_settings_.outliner_width, 180.0f, 500.0f, "%.0f px");
-            ImGui::SliderFloat("Inspector Width", &ui_settings_.inspector_width, 300.0f, 700.0f, "%.0f px");
-            ImGui::Spacing();
-            if (ImGui::Button("Reset Workspace Layout")) {
-                ui_settings_.reset_layout();
-            }
-        }
-
-        ImGui::EndChild();
-
-        ImGui::Separator();
-        ImGui::TextDisabled("Changes take effect immediately");
-        ImGui::SameLine(ImGui::GetWindowWidth() - 95.0f * layout.scale);
-        if (ImGui::Button("Close", ImVec2(85.0f * layout.scale, 0.0f))) {
-            ui_settings_.show_settings = false;
-        }
-    }
-    ImGui::End();
-}
-
 void App::render_viewport_overlays() {
+    if (size_comparison_active_) render_comparison_labels();
     if (ui_settings_.show_telemetry) {
-        ImGui::SetNextWindowSize(ImVec2(460.0f, 440.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(460.0f, 620.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Engine Telemetry", &ui_settings_.show_telemetry)) {
             ui::heading("GPU Telemetry", vk_.device_name());
             ui::value_row("Frame Rate", std::format("{:.1f} FPS", ImGui::GetIO().Framerate));
@@ -1143,9 +1029,21 @@ void App::render_viewport_overlays() {
             ui::value_row("Ringshine Tiles Baked", std::format("{}", celestial_renderer_.ringshine_frame_bake_count()));
             ui::value_row("GPU Composite", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_post_composite")));
             ui::value_row("GPU Dear ImGui", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_ui")));
-            ui::section("Atmosphere shadow history", "Pixel counts use the latest completed GPU frame.");
             const auto& settings = render_settings_.values();
             const auto& stats = celestial_renderer_.atmosphere_stats();
+            ui::section("Scene breakdown", "These timings are included in GPU Scene HDR.");
+            ui::value_row("GPU Preparation", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_terrain_prepare")));
+            ui::value_row("GPU Celestial bodies", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_celestial")));
+            ui::value_row("GPU Terrain", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_terrain_draw")));
+            ui::value_row("GPU Spheres / points", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("gpu_spheres"), vk_.gpu_time_ms("gpu_points")));
+            ui::value_row("GPU Gaia cull / draw", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("gpu_gaia_cull"), vk_.gpu_time_ms("gpu_gaia")));
+            ui::value_row("GPU Orbit lines", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_orbits")));
+            ui::value_row("GPU Atmosphere composite", std::format("{:.3f} ms", stats.visible ? vk_.gpu_time_ms("atmosphere_composite") : 0.0));
+            ui::value_row("Sky / aerial LUT updates", std::format("{} / {}", stats.sky_lut_updates, stats.aerial_lut_updates));
+            ui::value_row("GPU Planetshine bake", std::format("{:.3f} ms", stats.secondary_lut_updates ? vk_.gpu_time_ms("atmosphere_secondary") : 0.0));
+            ui::value_row("GPU Planetshine source", std::format("{:.3f} ms", stats.secondary_source_lut_updates ? vk_.gpu_time_ms("atmosphere_secondary_source") : 0.0));
+            ui::value_row("Planetshine LUT updates", std::format("{}", stats.secondary_lut_updates));
+            ui::section("Atmosphere shadow history", "Pixel counts use the latest completed GPU frame.");
             ui::value_row("Auto horizon", !camera_.horizon_align || !camera_.is_near_surface ? "Inactive" :
                 camera_.key_q || camera_.key_e ? "Manual roll" : camera_.horizon_settling ?
                 std::format("Settling ({:.4f} deg)", camera_.horizon_roll_error_deg) : "Settled");
@@ -1182,16 +1080,16 @@ void App::render_viewport_overlays() {
         ImGui::End();
     }
 
-    if (!ui_settings_.show_outliner) {
+    if (!ui_settings_.show_outliner && !size_comparison_active_) {
         ImGui::SetNextWindowPos(ImVec2(10.0f, 38.0f), ImGuiCond_Always);
         ImGuiWindowFlags pill_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove;
         if (ImGui::Begin("##CameraPill", nullptr, pill_flags)) {
             std::string tracked_name = "Free Camera";
-            if (camera_.tracking_idx >= 0 && camera_.tracking_idx < static_cast<int>(system().size())) {
+            if (camera_.tracking_idx >= 0 && camera_.tracking_idx < static_cast<int>(scene().size())) {
                 tracked_name = camera_.tracking_barycenter
-                    ? std::format("{} Barycenter", system().body(camera_.tracking_idx).definition.name)
-                    : system().body(camera_.tracking_idx).definition.name;
+                    ? std::format("{} Barycenter", scene().body(camera_.tracking_idx).definition.name)
+                    : scene().body(camera_.tracking_idx).definition.name;
             }
             ImGui::TextColored(ui::ACCENT, "Track: %s", tracked_name.c_str());
             ImGui::SameLine();
@@ -1206,6 +1104,7 @@ void App::render_viewport_overlays() {
 }
 
 void App::render_outliner() {
+    if (size_comparison_active_) { render_comparison_outliner(); return; }
     if (!ui_settings_.show_outliner) return;
 
     ui::WorkspaceLayout layout{};
@@ -1233,11 +1132,14 @@ void App::render_outliner() {
         ImGui::PushID(static_cast<int>(system().generation()));
         for (int root : system().reference_hierarchy().roots) render_outliner_node(root);
         ImGui::PopID();
+        render_compared_outliner();
     }
     ImGui::End();
 }
 
 void App::render_body_inspector() {
+    if (size_comparison_active_) { render_comparison_inspector(); return; }
+    if (ui_settings_.show_inspector && ui_state_.inspected_body >= static_cast<int>(system().size())) { render_compared_inspector(); return; }
     if (!ui_settings_.show_inspector || !ui_state_.has_selection(system())) return;
     int insp_idx = ui_state_.inspected_body;
     if (insp_idx < 0 || insp_idx >= static_cast<int>(system().size())) return;
@@ -2592,6 +2494,17 @@ void App::render_time_hud(rendering::RenderSettings& render_draft) {
         if (system().definition().motion_model == ephemeris::MotionModel::Spice) hud_mode = "SPICE";
         else if (system().definition().motion_model == ephemeris::MotionModel::NBody) hud_mode = "N-Body";
         ImGui::TextDisabled("| %s", hud_mode);
+
+        if (!comparisons_.empty()) {
+            const auto& clock = simulation_.clock();
+            double skew = comparisons_.max_time_skew_years(clock.time);
+            ImGui::SameLine(0.0f, 8.0f * layout.scale);
+            if (skew > comparison::ComparisonSet::skew_tolerance_years(clock, frame_dt_)) {
+                ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.2f, 1.0f), "| Compared clocks differ by %.3g days", skew * 365.25);
+            } else {
+                ImGui::TextDisabled("| Comparing %zu system%s", comparisons_.size(), comparisons_.size() == 1 ? "" : "s");
+            }
+        }
     }
 
     float exp_val = render_draft.exposure;
@@ -2843,7 +2756,7 @@ void App::delete_body_immediate(int del_idx) {
         ui_state_.inspect_barycenter = false;
     } else if (ui_state_.inspected_body > del_idx) {
         ui_state_.inspected_body -= 1;
-        if (ui_state_.edit_mode) {
+        if (ui_state_.edit_mode && ui_state_.has_selection(system())) {
             ui_state_.body_draft.reload(system(), ui_state_.inspected_body);
         }
     }
@@ -3167,6 +3080,7 @@ void App::render_jump_timeline_modal() {
         if (can_jump) {
             if (ImGui::Button("Jump to Date (Instant)", ImVec2(240.0f, 32.0f))) {
                 auto res = simulation_.apply(ephemeris::JumpToTime{target_sim_time});
+                if (res) res = comparisons_.jump(target_sim_time);
                 if (!res) {
                     jd.error = res.error;
                 } else {
@@ -3196,6 +3110,7 @@ void App::render_jump_timeline_modal() {
         else if (jd.resolution_choice == 3) requested_steps = 50000;
         else if (jd.resolution_choice == 4) requested_steps = 200000;
 
+        ImGui::BeginDisabled(!comparisons_.empty());
         if (ImGui::Button("Render Timeline to Date", ImVec2(240.0f, 32.0f))) {
             if (std::abs(diff_years) < 1e-9) {
                 jd.error = "Target time is identical to current time.";
@@ -3205,8 +3120,9 @@ void App::render_jump_timeline_modal() {
                 ImGui::CloseCurrentPopup();
             }
         }
+        ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::TextDisabled("(Background worker integration)");
+        ImGui::TextDisabled(comparisons_.empty() ? "(Background worker integration)" : "(Unavailable while comparing systems)");
 
         if (motion_model == ephemeris::MotionModel::NBody) {
             ImGui::Spacing();

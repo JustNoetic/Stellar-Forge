@@ -67,6 +67,13 @@ struct TextureStats {
     uint32_t selection_nodes = 0;
 };
 
+struct SurfaceTextureView {
+    const ephemeris::BodyDefinition* definition = nullptr;
+    SelectionView view;
+    double radius_pixels = 0;
+    uint32_t index = 0;
+};
+
 class SurfaceTextures {
 public:
     void init(rhi::VkContext& ctx, bool normals = false);
@@ -76,6 +83,8 @@ public:
     std::vector<std::pair<std::string, std::filesystem::path>> load_catalog(const std::filesystem::path& path);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                  const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled);
+    void prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const SurfaceTextureView> views, bool enabled);
+    int source_index(const ephemeris::BodyDefinition& body) const;
     const rhi::Image& image() const noexcept { return atlas_; }
     const rhi::Buffer& pages(uint32_t frame) const noexcept { return pages_[frame]; }
     const TextureStats& stats() const noexcept { return stats_; }

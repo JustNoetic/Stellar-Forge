@@ -4,6 +4,7 @@
 #include "core/timing.hpp"
 #include <array>
 #include <functional>
+#include <initializer_list>
 #include <optional>
 #include <span>
 #include <string>
@@ -97,6 +98,10 @@ public:
 
     void push_descriptors(VkCommandBuffer cmd, const Pipeline& pipeline,
                           std::span<const PushDescriptorWrite> writes);
+    void push_descriptors(VkCommandBuffer cmd, const Pipeline& pipeline,
+                          std::initializer_list<PushDescriptorWrite> writes) {
+        push_descriptors(cmd, pipeline, std::span{writes.begin(), writes.size()});
+    }
 
     template <typename T>
     void push_constants(VkCommandBuffer cmd, const Pipeline& pipeline, const T& data) {

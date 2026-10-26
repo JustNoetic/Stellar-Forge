@@ -2,6 +2,7 @@
 
 #include "ephemeris/system_manager.hpp"
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <string_view>
@@ -78,6 +79,16 @@ struct RingSegmentProfileInput {
     float opacity = 0.7f;
     std::span<const glm::vec4> profile;
 };
+
+struct AtmosphereRingMaterial {
+    glm::vec4 radius_area_tau{};
+    glm::vec4 color_textured{};
+    glm::vec4 properties{};
+};
+
+std::array<AtmosphereRingMaterial, 2> atmosphere_ring_materials(
+    std::span<const ephemeris::RingLayerDefinition> layers,
+    std::span<const std::vector<glm::vec4>> profiles);
 
 std::vector<glm::vec4> bake_unified_shadow_profile(
     std::span<const RingSegmentProfileInput> segments,

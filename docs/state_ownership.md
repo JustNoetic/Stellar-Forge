@@ -11,6 +11,7 @@
 | Navigation pose, tracking, input and motion history | `Camera` | App and renderers | Camera methods and navigation input |
 | Panel visibility, widths and scale | App-owned `WorkspaceSettings` | `UiSystem` | UI configuration edits |
 | Inspector selection, draft values, validation messages | App-owned `WorkspaceState` | UI | Selection events, draft edits, Apply/Revert |
+| Size-comparison sources, arranged positions, selection and orthographic navigation | App-owned `comparison::SizeComparison` / `SizeView` | Comparison renderer and UI | System checkboxes, source definition refresh and viewport input; never mutates simulation snapshots; see `size_comparator.md` |
 | GPU allocations, pipelines, per-frame upload buffers | Owning renderer/RHI subsystem | Responsible rendering passes | Explicit subsystem lifecycle; independent of simulation definitions |
 | Atmospheric optical definition | `Simulation` owns `BodyDefinition::atmosphere` | Atmosphere renderer and inspector draft | Validated `ApplyBodyAtmosphere`; definition/lighting revisions, stale-edit rejection; JSON and snapshot export persistence |
 | Imported elevation identity, immutable geographic metadata, payload jobs and residency | Renderer-owned `HeightSource` / `HeightStream` / geometry cache; `data/surfaces.json` or legacy `data/terrain.json` binding | Terrain selection and drawing; worker reads immutable source requests | Explicit source binding/replacement; dataset revision keys; residency/envelope revisions invalidate renderer-owned selection/description caches; generation changes clear old tables; bounded worker publication; no mutation of simulation snapshots |
@@ -81,13 +82,22 @@ The inspector edits a `BodyEditDraft`. Changes have no effect until Apply. The c
 | J2/J4 | Increment | Increment | Unchanged | Unchanged |
 | Identical or rejected edit | Unchanged | Unchanged | Unchanged | Unchanged |
 
-`SystemSnapshot::definition_revision()` changes once per accepted definition edit. `state_revision()` changes on a load or successful nonzero simulation step. A new load increments `generation()` and resets each body's revision counters. Cache keys must include generation and body identity as well as the relevant revision. Pause, rejected steps, and unchanged settings do not invalidate prepared state.
+`SystemSnapshot::definition_revision()` changes once per accepted definition edit. `state_revision()` changes on a load or successful nonzero simulation step. A new load increments `generation()` and resets each body's revision counters. `generation()` is numbered per `Simulation` and only identifies stale commands; independent simulations reuse the same values. `BodyRevisions::identity` is a process-unique, nonzero body identity assigned on load and `AddBody`. It survives edits, steps, motion-model changes, snapshot copies and reindexing after `DeleteBody`; a reload assigns new identities. Renderer cache keys use this identity with the relevant per-body revision instead of generation, body index or definition pointer, so a cache stays valid when other bodies change or a body moves to another index. Whole-scene results (orbit curves) also compare the ordered identity list. Pause, rejected steps, and unchanged settings do not invalidate prepared state.
+
+With system comparisons, `App::system()` stays the primary snapshot that UI edits and drafts read, while `App::scene()` is the composite built by `comparison::SystemComposer` (primary bodies first, compared bodies offset after them) that the camera and renderers read. The composite carries member identities unchanged and has its own revision counters; its `generation()` changes when the ordered identity list changes. See `system_comparator_plan.md`.
 
 These domain revision keys establish contracts for future terrain, atmosphere, and illumination caches; those caches are not implemented by this change. Keys must include every dependency: an orbital result also depends on its parent's dynamics revision, while a shadow result depends on the geometry of relevant occluders. Include `state_revision()` for results that depend on moving bodies and the relevant camera identity for view-dependent results. A new editable property must define its validation, preparation, and dependent revision domains in the owning subsystem before being exposed to the UI. Add coverage for unrelated domains remaining unchanged.
 
 `RenderSettingsStore::apply` validates the complete settings candidate. On success it increments its revision only if values changed. Renderers still upload camera-dependent data per frame; a settings revision is not a substitute for camera or simulation dependencies.
 
 ## Persistence and checks
+
+Application preferences are separate from physical definitions. `UserSettings`
+serializes validated graphics, workspace and navigation preferences to
+`data/settings.json`; `App` applies the loaded values to their existing owners
+and debounces automatic saves. Camera pose, simulation state, selection and open
+dialogs remain transient. Missing fields use the current C++ defaults. See
+`settings.md` for validation, atomic writes and reset behavior.
 
 Physical edits affect the current session. The existing `SystemManager::save_system` API serializes the committed definition fields, preserving unknown JSON fields and initial state-vector data. This change does not add automatic disk writes or a Save button.
 

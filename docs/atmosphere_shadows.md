@@ -8,7 +8,14 @@ use native weights. The settings checkbox can restore native weights for compari
 The separate [ring geometry experiment](atmosphere_ring_shadow_geometry.md) simplifies
 repeated visibility projection math while retaining the existing filter and samples.
 
-`RenderSettings::atmosphere_shadows_enabled` (Atmospheric shadows in rendering settings, enabled by default) adds atmospheric shadows with full-resolution endpoints from external bodies and rings. `atmosphere_shadow_samples` selects a 4/8/16 integration-sample ceiling per evaluated ray/star (default 16), shared across primary and nearest-transparent endpoints. It works with the horizon-mapped aerial LUT and both hardware blend paths. No atmosphere shadow volume or shadowed sky LUT is allocated.
+In single-frame mode, [deterministic shadow strata](atmosphere_shadow_strata.md) replace
+jittered ring samples with exact stratum energies and swept prefix-filtered ring
+visibility. They also sample wide eclipse penumbrae at stratum midpoints.
+Progressive refinement keeps the jittered estimator described below.
+
+`RenderSettings::atmosphere_shadows_enabled` (Atmospheric shadows in rendering settings, enabled by default) adds atmospheric shadows with full-resolution endpoints from external bodies and rings. `atmosphere_shadow_samples` selects a 4/8/16 integration-sample ceiling per evaluated ray/star (default 4), shared across primary and nearest-transparent endpoints. It works with the horizon-mapped aerial LUT and both hardware blend paths. No atmosphere shadow volume or shadowed sky LUT is allocated.
+
+Opaque composition consumes the precomputed deficit for its exact sky/opaque depth and compiles out native endpoint integration. Transparent composition retains that fallback for intermediate fragment depths. An empty external-caster list disables shadow work in the per-body header. Source evaluation shares the [normalized incoming-light cache](atmosphere_finite_stars.md) with the clear sky/aerial bake when eligible.
 
 Atmospheric shadows use the original normalized solar loss fraction architecture:
 $$\text{fraction} = \text{clamp}\left(\frac{\sum_s \text{loss}_s}{\sum_s \text{energy}_s}, 0.0, 1.0\right)$$
@@ -42,9 +49,9 @@ The full `--atmosphere-shadows` suite passed before and after the cleanup with i
 
 ## Progressive refinement
 
-`atmosphere_shadow_temporal` (Progressive atmosphere shadows, enabled by default) accumulates the existing jittered integration over 64 stationary frames. It stores RGB energy and loss separately in two RGBA32F two-layer storage images, then divides accumulated loss by accumulated energy. It never averages per-frame normalized fractions. Counts and endpoint depths occupy the alpha channels. Each invocation owns its pixel's two endpoints, allowing in-place history updates without ping-pong images. Explicit compute read/write barriers order successive frames.
+`atmosphere_shadow_temporal` (Progressive atmosphere shadows, disabled by default) accumulates the existing jittered integration over 64 stationary frames. It stores RGB energy and loss separately in two RGBA32F two-layer storage images, then divides accumulated loss by accumulated energy. It never averages per-frame normalized fractions. Counts and endpoint depths occupy the alpha channels. Each invocation owns its pixel's two endpoints, allowing in-place history updates without ping-pong images. Explicit compute read/write barriers order successive frames.
 
-CPU validation compares the complete atmosphere uniforms, shadow inputs excluding the jitter sequence, retained definition identity/generation/revisions, ring profile upload revision and image identity, and consecutive preparation/composition. The atmosphere-relative eye position is also compared in double precision, without movement tolerances. A GPU comparison of both endpoint depths resets the pixel when either changes, including transparent fragments appearing or disappearing. Opaque and nearest-transparent integrals have separate storage and share a conservative pixel reset and sample sequence. Additional transparent endpoints retain their native fallback.
+CPU validation compares the complete atmosphere uniforms, shadow inputs excluding the jitter sequence, retained body identity and definition/geometry/lighting revisions, ring profile upload revision and image identity, and consecutive preparation/composition. The atmosphere-relative eye position is also compared in double precision, without movement tolerances. A GPU comparison of both endpoint depths resets the pixel when either changes, including transparent fragments appearing or disappearing. Opaque and nearest-transparent integrals have separate storage and share a conservative pixel reset and sample sequence. Additional transparent endpoints retain their native fallback.
 
 The first frame uses sequence zero and is identical to frozen native integration. Subsequent frames use the pixel's accumulated count as the jitter sequence. At 64 samples of the estimator, the pixel retains its output until invalidated. This stops residual flicker and avoids further transport evaluation for completed columns. Clear and full-umbra identities follow from the same accumulated numerator/denominator operations; a single noisy zero or one estimate does not override valid history.
 
@@ -52,7 +59,7 @@ Progressive mode uses native integration and bypasses VRS. Disabling it restores
 
 ### Rotation-only sky reuse
 
-`atmosphere_shadow_rotation` (**Reuse history while turning**, enabled by default) allows camera rotation with exactly unchanged atmosphere-relative eye coordinates, projection, atmosphere/lighting/caster/ring inputs and frame continuity. The strict stationary key remains in use when rotation reuse is disabled. Multiple-star atmospheres retain the native reset path during rotation.
+`atmosphere_shadow_rotation` (**Reuse history while turning**, disabled by default) allows camera rotation with exactly unchanged atmosphere-relative eye coordinates, projection, atmosphere/lighting/caster/ring inputs and frame continuity. The strict stationary key remains in use when rotation reuse is disabled. Multiple-star atmospheres retain the native reset path during rotation.
 
 `shadow_reproject.comp` gathers previous energy/loss integrals onto the current grid using the previous-view/current-inverse-view homography. It reads the original history and writes two separate RGBA32F scratch images before the native accumulation pass modifies any history. Explicit compute read/write barriers separate those accesses and sequential scratch reuse by different atmospheres. Scratch is shared across bodies, allocated only after qualifying rotation, and completion-retired on resize or mode disable; stationary frames need no reprojection dispatch.
 
@@ -94,6 +101,8 @@ The first dispatch evaluates shadow fractions on a grid anchored at native even/
 - Matching sky/opaque classification, log2 path difference at most 0.04 (about 2.8%), and atmospheric entry difference at most 2% of max(path, 1 km).
 - RGB fraction range at most 0.02 over the contributing taps.
 - A conservative spatial-detail check on both the native ray and coarse rays: the estimated solar penumbra must span at least three native pixel footprints throughout the visible column. Ring-plane/light-direction crossings and very small denominators reject reuse. This guards narrow features that a fraction-only test could miss between coarse samples.
+
+**Shadow VRS rate** (`atmosphere_shadow_vrs_scale`, 2/4/8/16, default 4, log2 passed in `shadow_flags.y` bits 8–11) sets the coarse grid spacing per axis: 25%, 6.25%, 1.6% or 0.39% of native pixels. Coarser grids were tried: at 32 and 64 nearly every pixel fails the agreement and penumbra guards, so the pass costs as much as native integration. The penumbra guard scales with it (1.5 grid spacings of pixel footprint: three pixels at 2, six at the default 4). With deterministic strata at 3840×2160 the four Earth ring/eclipse views measured 2.9–3.6 ms native, 1.9–2.3 ms at 2, 1.3–1.7 ms at 4 and 1.1–1.7 ms at 8 (`--vrs-scale-benchmark`). RGB RMS against native was at most 0.0009 at 4. At 8, the 1600×900 ring limb had 559 pixels above 0.02. Remaining cost is native fallback and per-pixel setup.
 
 Any failed check runs the existing native shadow integration immediately, with no temporal history. Missing border neighbors also fall back rather than extrapolate. The coarse pass skips integration where its spatial check rejects reuse, avoiding duplicate work in sharp regions. Pixels containing transparent fragments keep native primary/prefix integration, including their shared sample budget. Multiple-star atmospheres, dense-reference mode and viewports smaller than 64 pixels on either axis bypass the coarse pass entirely.
 

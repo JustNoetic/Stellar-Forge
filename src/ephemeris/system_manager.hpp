@@ -16,6 +16,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sf::comparison { class SystemComposer; }
+
 namespace sf::ephemeris {
 
 enum class MotionModel { Keplerian, Spice, NBody };
@@ -129,9 +131,22 @@ struct SystemDefinition {
     std::string custom_bsp_path;
     std::vector<BodyDefinition> bodies;
     std::unordered_map<std::string, int> name_to_idx;
+    std::vector<std::string> source_systems;
+    std::vector<uint32_t> light_groups;
+    std::vector<uint32_t> lit_by;
     int star_idx = 0;
 
     int find_body(std::string_view body_name) const;
+    const std::string& body_system(size_t index) const noexcept {
+        return index < source_systems.size() ? source_systems[index] : name;
+    }
+    uint32_t light_group(size_t index) const noexcept {
+        return index < light_groups.size() ? light_groups[index] : 0u;
+    }
+    bool illuminates(size_t source, size_t receiver) const noexcept {
+        uint32_t from = light_group(source), to = light_group(receiver);
+        return from == to || (to < lit_by.size() && from < 32u && (lit_by[to] >> from & 1u) != 0u);
+    }
 };
 
 struct BodyMotion {
@@ -152,6 +167,7 @@ struct BodyRevisions {
     uint64_t dynamics = 1;
     uint64_t geometry = 1;
     uint64_t lighting = 1;
+    uint64_t identity = 0;
 };
 
 struct BodyView {
@@ -201,6 +217,7 @@ public:
     const JacobiHierarchy& orbit_hierarchy() const noexcept { return reference_jacobi_ ? *reference_jacobi_ : *jacobi_; }
     const ReferenceHierarchy& reference_hierarchy() const noexcept { return *reference_; }
     int reference_parent(size_t index) const { return reference_->parents.at(index); }
+    bool illuminates(size_t source, size_t receiver) const noexcept { return definition_->illuminates(source, receiver); }
     uint64_t hierarchy_revision() const noexcept { return hierarchy_revision_; }
     BodyView body(size_t index) const {
         return {definition_->bodies.at(index), motions_.at(index), render_.at(index), revisions_.at(index)};
@@ -208,6 +225,7 @@ public:
 
 private:
     friend class Simulation;
+    friend class comparison::SystemComposer;
     std::shared_ptr<const SystemDefinition> definition_ = std::make_shared<const SystemDefinition>();
     std::shared_ptr<const JacobiHierarchy> jacobi_;
     std::shared_ptr<const JacobiHierarchy> reference_jacobi_;

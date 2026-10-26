@@ -255,6 +255,36 @@ void SurfaceTextures::run(std::stop_token stop) {
 
 void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                               const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled) {
+    std::vector<SurfaceTextureView> views;
+    double tan_y = std::tan(camera.fov_deg*DEG_TO_RAD*.5);
+    double focal = std::max(1u, extent.height)/(2*tan_y);
+    for (uint32_t i = 0; i < std::min<uint32_t>(system.size(), COLOR_BODIES); ++i) {
+        auto body = system.body(i);
+        auto center = camera_relative(body.render.position, camera.eye_pos_render());
+        auto rotation = body_rotation(body.render.pole, body.render.spin_angle_rad);
+        SurfaceTextureView input;
+        input.definition = &body.definition;
+        input.index = i;
+        input.radius_pixels = body.definition.radius_au()*focal/std::max(glm::length(center), 1e-15);
+        input.view.eye = glm::transpose(rotation)*(-center/body.definition.radius_au());
+        input.view.view_from_local = camera.view_rotation_double()*rotation;
+        input.view.tan_half_fov_y = tan_y;
+        input.view.tan_half_fov_x = tan_y*std::max(1u, extent.width)/std::max(1u, extent.height);
+        input.view.focal_pixels = focal;
+        views.push_back(input);
+    }
+    prepare_views(cmd, ctx, views, enabled);
+}
+
+int SurfaceTextures::source_index(const ephemeris::BodyDefinition& body) const {
+    for (uint32_t i = 0; i < sources_.size(); ++i)
+        if (sources_[i].body == body.name && sources_[i].source->compatible(
+            body.radius_au()*AU_TO_KM*1000, std::clamp(1-body.oblateness, .05, 1.0))) return int(i);
+    return -1;
+}
+
+void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
+                                    std::span<const SurfaceTextureView> views, bool enabled) {
     stats_ = {};
     stats_.sources = uint32_t(sources_.size());
     stats_.capacity = capacity_;
@@ -269,31 +299,18 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
     };
     if (enabled) {
         for (uint32_t s = 0; s < sources_.size(); ++s) for (uint32_t face = 0; face < 6; ++face) want(s, {face});
-        double tan_y = std::tan(camera.fov_deg*DEG_TO_RAD*.5);
-        double focal = std::max(1u, extent.height)/(2*tan_y);
-        std::vector<std::pair<double, uint32_t>> visible_bodies;
-        for (uint32_t i = 0; i < std::min<uint32_t>(system.size(), COLOR_BODIES); ++i) {
-            auto body = system.body(i);
-            double distance = glm::length(camera_relative(body.render.position, camera.eye_pos_render()));
-            double pixels = body.definition.radius_au()*focal/std::max(distance, 1e-15);
-            if (pixels >= 2) visible_bodies.emplace_back(-pixels, i);
-        }
+        std::vector<std::pair<double, size_t>> visible_bodies;
+        for (size_t i = 0; i < views.size(); ++i)
+            if (views[i].radius_pixels >= 2) visible_bodies.emplace_back(-views[i].radius_pixels, i);
         std::sort(visible_bodies.begin(), visible_bodies.end());
-        uint32_t remaining = capacity_-uint32_t(sources_.size())*6;
+        uint32_t remaining = capacity_-std::min(capacity_, uint32_t(sources_.size())*6);
         for (auto [priority, body_index] : visible_bodies) {
-            auto body = system.body(body_index);
+            const auto& input = views[body_index];
+            const auto& body = *input.definition;
             for (uint32_t s = 0; s < sources_.size(); ++s) {
-                if (sources_[s].body != body.definition.name ||
-                    !sources_[s].source->compatible(body.definition.radius_au()*AU_TO_KM*1000,
-                        std::clamp(1-body.definition.oblateness, .05, 1.0))) continue;
-                SelectionView view;
-                auto rotation = body_rotation(body.render.pole, body.render.spin_angle_rad);
-                auto center = camera_relative(body.render.position, camera.eye_pos_render());
-                view.eye = glm::transpose(rotation)*(-center/body.definition.radius_au());
-                view.view_from_local = camera.view_rotation_double()*rotation;
-                view.tan_half_fov_y = tan_y;
-                view.tan_half_fov_x = tan_y*std::max(1u, extent.width)/std::max(1u, extent.height);
-                view.focal_pixels = focal;
+                if (sources_[s].body != body.name || !sources_[s].source->compatible(
+                    body.radius_au()*AU_TO_KM*1000, std::clamp(1-body.oblateness, .05, 1.0))) continue;
+                SelectionView view = input.view;
                 view.target_error_pixels = 1.0;
                 view.polar_ratio = sources_[s].source->polar_ratio;
                 view.height_amplitude = .0015;
@@ -371,11 +388,13 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
     wake_.notify_one();
     stats_.resident = slots_.size();
     if (enabled) {
-        for (uint32_t i = 0; i < std::min<uint32_t>(system.size(), COLOR_BODIES); ++i) {
-            auto body = system.body(i);
+        for (const auto& input : views) {
+            uint32_t i = input.index;
+            if (i >= COLOR_BODIES) continue;
+            const auto& body = *input.definition;
             for (uint32_t s = 0; s < sources_.size(); ++s) {
-                if (sources_[s].body != body.definition.name || !sources_[s].source->compatible(
-                    body.definition.radius_au()*AU_TO_KM*1000, std::clamp(1-body.definition.oblateness, .05, 1.0))) continue;
+                if (sources_[s].body != body.name || !sources_[s].source->compatible(
+                    body.radius_au()*AU_TO_KM*1000, std::clamp(1-body.oblateness, .05, 1.0))) continue;
                 bool roots = true;
                 for (uint32_t face = 0; face < 6; ++face) roots &= words_[offsets_[s]+face] != 0;
                 if (roots) { words_[i*4] = offsets_[s]; words_[i*4+1] = sources_[s].source->level; }

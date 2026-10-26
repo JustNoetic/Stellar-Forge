@@ -38,6 +38,7 @@ vec4 ring_host_disk_sample(uint host_index, vec3 hit_local, vec3 pole, int q, ou
     vec3 normal = normalize(Q+pole*((eta-1.0)*dot(Q, pole)));
     vec3 host_center = ring_hosts[host_index].center_min_r.xyz;
     for (uint s = 0u; s < u_scene.num_stars; ++s) {
+        if (!star_lights_body(body_index, s)) continue;
         vec3 delta = (u_scene.stars_pos_radius[s].xyz-host_center)-Q;
         float star_distance = max(length(delta), 1e-12);
         vec3 L = delta/star_distance;

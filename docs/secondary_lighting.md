@@ -1,9 +1,11 @@
 # Planetshine and surface ringshine
 
 `RenderSettings::planetshine_enabled` (default on) controls reflected planetary light
-on ground, unresolved body billboards, and rings. Settings → Visibility
+on ground, unresolved body billboards, rings, and the one-source atmospheric prototype. Settings → Lighting & Rings
 exposes Planetshine beside Ringshine. The existing `ringshine_enabled` switch controls
 surface ringshine; hiding rings suppresses its illumination.
+
+Settings → Lighting & Rings → **Direct sunlight only** is available for atmospheric artifact diagnosis. It suppresses planetshine and ringshine and disables their controls while retaining the selected values. Turn it off to use the secondary-lighting paths documented below; atmospheric diffuse fill and ground skylight also return. No reflected-source selection or ringshine tile bake runs while this diagnostic is active.
 
 ## Planetshine
 
@@ -30,7 +32,7 @@ retained by complete packed material value, including reference normalization;
 body rows and phase offsets follow current snapshot order. Old unused material keys
 are discarded when inputs change. Per-frame GPU phase buffers upload only when the
 cache revision changes, at storage binding 25. Instance records are 272 bytes,
-including the 48-byte packed material. No secondary atmosphere resources are added.
+including the 48-byte packed material. Atmospheric resources are described below.
 
 Emitter eclipses use the original smooth angular penumbra and source/caster area
 bounds. Finite-distance phase remapping extinguishes the visible illuminated cap at
@@ -53,7 +55,7 @@ not emit reflected light. There is no recursive bounce. The original arbitrary
 
 ## Host planet illumination of rings
 
-Settings → Visibility → Planetshine on rings selects two modes:
+Settings → Lighting & Rings → Planetshine on rings selects two modes:
 
 - **Analytical** (default): the existing phase-aware two-lobe apparent disk, evaluated
   at ring vertices, now uses the host material phase curve and oblate projected area.
@@ -75,13 +77,41 @@ keeps this external contribution separate from its host-disk integration.
 
 ## Atmospheres
 
-Atmospheric planetshine and ringshine are currently disabled in the implementation.
-The analytical reference, shared-node approximation and secondary-radiance LUT experiment
-were removed on 2026-10-22 after their performance comparison. Atmospheres integrate stellar
-illumination through the existing sky-view and aerial perspective LUTs. Secondary light
-adds no atmospheric scattering, descriptors, images, source uploads or shader variants.
-Ground shading still uses atmospheric transmission and diffuse lookup for its own lights.
-The comparison captures remain under the ignored `tests/shine-approaches/` directory.
+Atmospheric planetshine combines up to four prepared reflected sources per receiver in
+one approximate secondary bake. It follows the existing Planetshine switch and is
+suppressed by Direct sunlight only. A diffuse atmospheric ringshine prototype now
+occupies one shared-light slot, leaving up to three reflected bodies. It follows
+Ringshine and Show rings independently of Planetshine. Approved GPU checks pass;
+measured cost and approximation limits are in [diffuse ringshine](atmosphere_ringshine.md).
+
+A separate 96 × 54 × 64 cumulative radiance volume, 96 × 54 sky texture and matching
+range texture retain 63 intervals and detached-layer subdivision, with one midpoint per
+interval. The bake reuses optical-depth and unit multiple-scattering tables. Its normalized
+combined response is multiplied by `PI * summed reflected irradiance` during composition.
+Common per-channel RGB/intensity scaling reuses it; relative source weights, altitude,
+local directions, apparent radii and optical changes refresh it. Secondary-only changes
+leave primary sky/aerial tables valid. Rotation, FOV and exposure reuse both products.
+
+Composition adds secondary radiance after the solar shadow deficit. Both opaque blend
+paths and transparent finite endpoints use the same horizon/depth reconstruction; disabling
+aerial perspective suppresses finite-endpoint inscattering. No secondary transmittance
+volume is needed. Images allocate on demand, total approximately 2.59 MiB per retained
+atmosphere for all four sources. The approximate path needs no additional incoming-light
+field. All images enter the retained-image budget. Inactive receivers keep the original
+composition shader. Engine Telemetry reports Planetshine bake time and LUT updates.
+
+Sources remain receiver-centre, uniformly bright apparent disks. Their sizes soften
+horizon visibility; one representative incoming-transmission sample and centre-direction
+Rayleigh/particle phases replace disk quadrature. Close-source parallax, illuminated
+crescent structure and weak-source merging beyond the four candidates are not resolved.
+Very large disks can visibly differ from finite-disk integration.
+The ring component instead uses a spatial diffuse annulus field with two face colours,
+approximate visible solid angle, one incoming-transmission sample and isotropic phase.
+
+The older analytical, shared-node and full-resolution combined-LUT experiments were removed
+on 2026-10-22. Their captures remain under ignored `tests/shine-approaches/`. The new prototype
+and its reference measurements are described in [the original prototype report](atmosphere_planetshine_prototype.md).
+The default shared bake is described in [the shared-light report](atmosphere_secondary_lights.md).
 
 ## Approximation limits
 
@@ -96,8 +126,10 @@ The comparison captures remain under the ignored `tests/shine-approaches/` direc
 - Analytical ring sources collapse angular structure into two face moments and use
   approximate near-field phase/centroid geometry. Numerical mode retains the original
   64-ray sampling limits for thin crescents and oblate limbs.
-- Ringshine illuminates host surfaces only; rings lighting other moons remain deferred.
-  Atmospheric secondary scattering remains disabled.
+- Ringshine illuminates host surfaces and approximately the host atmosphere;
+  rings lighting other moons remain deferred.
+  Atmospheric ringshine approximates a diffuse field for the host's own rings.
+  Planetshine uses up to four sources, or three alongside rings.
 
 ## Validation
 
@@ -108,7 +140,12 @@ material defaults, JSON roundtrips, atomic/stale edits and cache invalidation.
 `StellarRenderingTests --shine-materials` checks CPU/GPU material agreement, finite
 source horizons and numerical oblate host flux against independent dense angular
 integration. `--shine-only` covers ground, both host-ring modes, luminosity scaling,
-absence of secondary atmospheric scattering and atmosphere cache reuse.
+atmospheric planetshine, independent solar/secondary cache reuse and the
+ring visibility/toggle behavior. `--ring-atmosphere-prototype <directory>` additionally
+checks diffuse transport, both ring faces, polar occlusion, stellar intensity reuse,
+transparent endpoints and a two-star/three-moon scene.
+`--secondary-lights-prototype <directory>` additionally checks four-source additivity,
+combined-cache invalidation and a two-star/four-moon scene with transparent endpoints.
 `--shine-ring-phase` and `--shine-stability-only` retain analytical crescent and
 continuous ring-face checks. `--ringshine-only` retains surface ring radiometry.
 The app `--self-test` passes. The additional background-ring refraction check in
@@ -118,3 +155,5 @@ The app `--self-test` passes. The additional background-ring refraction check in
 The Hapke roughness equations are ported from the original engine's shared material
 implementation, which follows the public-domain USGS ISIS Hapke algorithm. See
 the original project's `docs/surface_materials.md` for its provenance and conventions.
+
+With system comparisons, planetshine, surface ringshine and ring illumination follow the composite light groups (`SystemDefinition::illuminates`): a source only reflects starlight its group may receive, and a receiver only sees sources whose group may light it. See `system_comparator_plan.md`, Phase 3.

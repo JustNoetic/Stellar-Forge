@@ -4,6 +4,7 @@
 #include "ephemeris/spice_ephemeris.hpp"
 #include "ephemeris/spk_exporter.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 
@@ -28,6 +29,13 @@ bool valid_physical(const BodyPhysicalProperties& values) {
              std::isfinite(values.arg_peri_deg) && std::isfinite(values.mean_anom_deg);
     }
     return ok;
+}
+
+BodyRevisions new_body_revisions() {
+    static std::atomic<uint64_t> next_identity{1};
+    BodyRevisions revisions;
+    revisions.identity = next_identity.fetch_add(1, std::memory_order_relaxed);
+    return revisions;
 }
 
 }
@@ -111,7 +119,8 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
     candidate.snapshot_.definition_ = std::move(owned_definition);
     candidate.snapshot_.motions_ = std::move(loaded.motions);
     candidate.snapshot_.render_.resize(candidate.snapshot_.size());
-    candidate.snapshot_.revisions_.assign(candidate.snapshot_.size(), BodyRevisions{});
+    candidate.snapshot_.revisions_.resize(candidate.snapshot_.size());
+    for (auto& revisions : candidate.snapshot_.revisions_) revisions = new_body_revisions();
     candidate.snapshot_.generation_ = snapshot_.generation_ + 1;
     candidate.snapshot_.definition_revision_ = snapshot_.definition_revision_ + 1;
     candidate.snapshot_.state_revision_ = snapshot_.state_revision_ + 1;
@@ -567,7 +576,7 @@ CommandResult Simulation::apply(const AddBody& command) {
     snapshot_.definition_ = std::move(updated);
     snapshot_.motions_.push_back(BodyMotion{EclipticPosition{new_pos}, EclipticVelocity{new_vel}});
     snapshot_.render_.resize(snapshot_.motions_.size());
-    snapshot_.revisions_.push_back(BodyRevisions{});
+    snapshot_.revisions_.push_back(new_body_revisions());
     ++snapshot_.definition_revision_;
     ++snapshot_.state_revision_;
 

@@ -1,5 +1,6 @@
 #include "rendering/ring_optics.hpp"
 #include "core/path_utils.hpp"
+#include "core/constants.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -651,6 +652,61 @@ glm::vec4 apply_hsba_pixel(glm::vec4 rgba, float hue_shift, float saturation, fl
         a_out = std::clamp(std::pow(a_out, 1.0f / std::max(0.01f, alpha_boost)), 0.0f, 1.0f);
     }
     return glm::vec4(glm::clamp(rgb_out, glm::vec3(0.0f), glm::vec3(1.0f)), a_out);
+}
+
+std::array<AtmosphereRingMaterial, 2> atmosphere_ring_materials(
+    std::span<const ephemeris::RingLayerDefinition> layers,
+    std::span<const std::vector<glm::vec4>> profiles) {
+    std::array<AtmosphereRingMaterial, 2> result{};
+    if (profiles.empty() || layers.empty()) return result;
+    layers = layers.first(std::min(layers.size(), profiles.size()));
+    double inner = layers.front().inner, outer = layers.front().outer;
+    std::vector<double> boundaries;
+    for (const auto& layer : layers) {
+        inner = std::min(inner, layer.inner); outer = std::max(outer, layer.outer);
+        boundaries.push_back(layer.inner); boundaries.push_back(layer.outer);
+    }
+    double middle = std::sqrt(.5*(inner*inner+outer*outer));
+    boundaries.push_back(middle);
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    struct Moment { double weight = 0, radius = 0, textured = 0; glm::dvec3 color{}; glm::dvec4 props{}; };
+    std::array<Moment, 2> moments{};
+    for (size_t interval = 1; interval < boundaries.size(); ++interval) {
+        double lo = boundaries[interval-1], hi = boundaries[interval];
+        for (int sample = 0; sample < 64; ++sample) {
+            double radius = std::lerp(lo, hi, (sample+.5)/64.0), total_tau = 0;
+            glm::dvec3 color(0); glm::dvec4 props(0); double textured = 0;
+            for (size_t layer = 0; layer < layers.size(); ++layer) {
+                const auto& material = layers[layer]; const auto& profile = profiles[layer];
+                if (radius < material.inner || radius > material.outer || profile.empty()) continue;
+                double index = (radius-material.inner)/(material.outer-material.inner)*double(profile.size()-1);
+                size_t first = std::min(size_t(index),profile.size()-1), next = std::min(first+1,profile.size()-1);
+                auto value = glm::mix(profile[first],profile[next],float(index-double(first)));
+                double tau = ring_tau(value.a*material.opacity);
+                total_tau += tau;
+                color += glm::dvec3(value)*tau;
+                props += glm::dvec4(material.asymmetry,material.backscatter,material.scatter,material.unlit_factor)*tau;
+                textured += material.is_textured ? tau : 0;
+            }
+            if (total_tau <= 0) continue;
+            double weight = 2*PI*radius*(hi-lo)/64.0*(-std::expm1(-total_tau));
+            auto& moment = moments[radius < middle ? 0 : 1];
+            moment.weight += weight; moment.radius += radius*weight;
+            moment.color += color*(weight/total_tau); moment.props += props*(weight/total_tau);
+            moment.textured += textured*(weight/total_tau);
+        }
+    }
+    for (int bin = 0; bin < 2; ++bin) {
+        const auto& moment = moments[bin];
+        if (moment.weight <= 0) continue;
+        double area = PI*(bin == 0 ? middle*middle-inner*inner : outer*outer-middle*middle);
+        result[bin].radius_area_tau = {float(moment.radius/moment.weight),float(area),
+            float(-std::log1p(-std::clamp(moment.weight/area,0.0,double(RING_MAX_ALPHA)))),0};
+        result[bin].color_textured = {glm::vec3(moment.color/moment.weight),float(moment.textured/moment.weight)};
+        result[bin].properties = glm::vec4(moment.props/moment.weight);
+    }
+    return result;
 }
 
 std::vector<glm::vec4> generate_ring_segment_profile(

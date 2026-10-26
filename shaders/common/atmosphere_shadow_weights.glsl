@@ -12,3 +12,10 @@ vec3 shadow_cached_weight(vec2 uv, float range, float path, float distance_weigh
     vec3 far_light = textureLod(shadow_aerial_radiance, vec3(uv, (1.5+slice)/float(AERIAL_SIZE.z)), 0.0).rgb;
     return max(far_light-near_light, vec3(0.0))*(distance_weight/max(t1-t0, 1e-8));
 }
+
+vec3 shadow_cached_light(vec2 uv, float range, float path) {
+    float fraction = clamp(path/max(range, 1e-8), 0.0, 1.0);
+    float coordinate = atm.camera.z < top_radius() ? sqrt(fraction) : fraction;
+    float z = (0.5+coordinate*float(AERIAL_SIZE.z-1))/float(AERIAL_SIZE.z);
+    return textureLod(shadow_aerial_radiance, vec3(uv, z), 0.0).rgb;
+}

@@ -145,10 +145,9 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
     covered_.assign(body_count, 0);
     relief_extents_.clear();
     stats_ = {};
-    if (selection_generation_ != system.generation()) {
-        selections_.clear();
-        selection_generation_ = system.generation();
-    }
+    std::erase_if(selections_, [&](const auto& item) {
+        return item.first >= system.size() || item.second.identity != system.body(item.first).revisions.identity;
+    });
     std::vector<GeometryKey> retained_keys;
     std::vector<std::shared_ptr<const HeightGeometry>> retained_heights;
     std::vector<HeightStream*> retained_streams;
@@ -217,16 +216,16 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
         view.height_amplitude = synthetic ? std::min(double(settings.terrain_height_km)/(radius*AU_TO_KM), 0.01) : 0.0;
         view.max_patches = std::min(remaining, settings.terrain_patch_limit);
         auto imported_key = [&](TileId tile) {
-            return GeometryKey{system.generation(), body.revisions.geometry, tile.key(), i, view.polar_ratio, 0.0, source->domain()};
+            return GeometryKey{body.revisions.identity, body.revisions.geometry, tile.key(), i, view.polar_ratio, 0.0, source->domain()};
         };
         auto& entry = selections_[i];
         bool selection_changed = false;
         if (source) {
             view.height_amplitude = std::max(std::abs(source->info().minimum_m), std::abs(source->info().maximum_m)) / source->info().equatorial_radius_m;
             uint64_t bounds_revision = source->bounds_revision();
-            bool changed = entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry ||
+            bool changed = entry.identity != body.revisions.identity || entry.geometry_revision != body.revisions.geometry ||
                 entry.bounds_revision != bounds_revision || entry.source != source->domain() || !(entry.view == view);
-            if (entry.bounds_revision != bounds_revision || entry.generation != system.generation() ||
+            if (entry.bounds_revision != bounds_revision || entry.identity != body.revisions.identity ||
                 entry.geometry_revision != body.revisions.geometry || entry.source != source->domain()) entry.descriptions.clear();
             SelectionSource selection_source(*source, entry.descriptions);
             if (changed) { entry.desired_valid = false; entry.prefetch.clear(); }
@@ -258,7 +257,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 ++stats_.selection_rebuilds;
                 selection_changed = true;
             }
-            entry.generation = system.generation();
+            entry.identity = body.revisions.identity;
             entry.geometry_revision = body.revisions.geometry;
             entry.bounds_revision = bounds_revision;
             entry.residency_revision = cache_.revision();
@@ -282,14 +281,14 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 } else active_stream->consumed(tile);
             }
             if (entry.selection.loading_limited) ++stats_.loading_bodies;
-        } else if (entry.generation != system.generation() || entry.geometry_revision != body.revisions.geometry ||
+        } else if (entry.identity != body.revisions.identity || entry.geometry_revision != body.revisions.geometry ||
                    entry.source != SourceDomain{} || !(entry.view == view)) {
             auto builds = metadata_.builds();
             entry.selection = select(view, &metadata_);
             stats_.metadata_builds += uint32_t(metadata_.builds() - builds);
             stats_.selection_nodes += entry.selection.visited;
             entry.view = view;
-            entry.generation = system.generation();
+            entry.identity = body.revisions.identity;
             entry.geometry_revision = body.revisions.geometry;
             entry.source = {};
             ++stats_.selection_rebuilds;
@@ -314,7 +313,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 placement.anchor = ellipsoid_point(patch.tile.face, -1.0+(patch.tile.x+.5)*width,
                     -1.0+(patch.tile.y+.5)*width, view.polar_ratio);
                 placement.key = source ? imported_key(patch.tile)
-                    : GeometryKey{system.generation(), body.revisions.geometry, patch.tile.key(), i, view.polar_ratio, view.height_amplitude};
+                    : GeometryKey{body.revisions.identity, body.revisions.geometry, patch.tile.key(), i, view.polar_ratio, view.height_amplitude};
                 placement.bake.anchor_polar_ratio = {glm::vec3(placement.anchor), float(view.polar_ratio)};
                 placement.bake.shape.x = float(view.height_amplitude);
                 placement.bake.address = {patch.tile.face, patch.tile.level, patch.tile.x, patch.tile.y};

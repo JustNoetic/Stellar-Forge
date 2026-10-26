@@ -4,6 +4,7 @@
 #include "ephemeris/system_manager.hpp"
 #include "rendering/render_settings.hpp"
 #include "rendering/ring_optics.hpp"
+#include "rendering/planetshine.hpp"
 #include "rhi/staging_uploads.hpp"
 #include "rhi/vk_context.hpp"
 #include <array>
@@ -77,6 +78,9 @@ public:
     uint32_t ringshine_bake_count() const noexcept { return ringshine_bakes_; }
     uint32_t ringshine_frame_bake_count() const noexcept { return ringshine_frame_bakes_; }
     std::span<const uint32_t> ringshine_sample_counts() const noexcept { return ringshine_sample_counts_; }
+    PlanetshineGPU atmosphere_sources(const ephemeris::SystemSnapshot& system,
+                                     const RenderSettings& settings, uint32_t body_index) const;
+    uint64_t atmosphere_source_bake_count() const noexcept { return atmosphere_source_bakes_; }
 
 private:
     struct CachedHostMapping {
@@ -86,6 +90,10 @@ private:
         double max_r_ratio = 2.5;
         std::vector<uint32_t> segment_rows;
         std::vector<RingDrawRange> draw_ranges;
+        std::array<AtmosphereRingMaterial, 2> atmosphere_materials{};
+        mutable PlanetshineGPU atmosphere_sources{};
+        mutable std::array<glm::vec4, 16> atmosphere_stars{}, atmosphere_weights{};
+        mutable bool atmosphere_valid = false;
     };
 
     struct RingshineTileKey {
@@ -140,11 +148,16 @@ private:
     std::vector<CachedHostMapping> host_mappings_;
     std::unordered_map<std::string, std::vector<glm::vec4>> cached_raw_textures_;
     uint32_t active_host_count_ = 0;
-    std::shared_ptr<const ephemeris::SystemDefinition> cached_definition_;
-    uint64_t cached_generation_ = 0;
-    uint64_t cached_definition_revision_ = 0;
+    struct HostKey {
+        uint32_t body_index = 0;
+        uint64_t identity = 0;
+        uint64_t definition_revision = 0;
+        bool operator==(const HostKey&) const = default;
+    };
+    std::vector<HostKey> cached_hosts_, host_keys_;
     uint64_t ringshine_profile_serial_ = 0;
     bool force_rebuild_ = true;
+    mutable uint64_t atmosphere_source_bakes_ = 0;
 };
 
 } // namespace sf::rendering

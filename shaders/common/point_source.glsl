@@ -26,7 +26,6 @@ float point_profile_sum(vec2 center_px, float radius_px) {
     return max(sum, 1e-12);
 }
 
-float point_signal_fade(vec3 flux, float radius_px) {
-    float peak = max(flux.r, max(flux.g, flux.b)) / max(0.7928351 * radius_px * radius_px, 1.0);
-    return smoothstep(1.0e-6, 2.5e-6, peak);
+bool point_flux_visible(vec3 flux) {
+    return max(flux.r, max(flux.g, flux.b)) >= 2.98023223876953125e-8;
 }

@@ -183,8 +183,9 @@ void App::run_benchmark() {
             run.fixture["render_settings"]["features"] = {{"atmospheres", settings.show_atmospheres}, {"atmosphere_shadows", settings.atmosphere_shadows_enabled},
                 {"refraction", settings.refraction_enabled}, {"terrain", settings.terrain_imported_enabled}, {"normals", settings.terrain_normal_maps_enabled},
                 {"textures", settings.surface_textures_enabled}, {"rings", settings.show_rings}, {"ring_shadows", settings.ring_shadows_enabled},
+                {"direct_sunlight_only", settings.direct_sunlight_only},
                 {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
-                {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}};
+                {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}, {"shadow_analytic", settings.atmosphere_shadow_analytic}};
             if (scene == "nbody") run.fixture["ias15_epsilon"] = simulation_.nbody_epsilon();
             log::info("{}: repetition {}/{}", scene, repetition + 1, options.repeats);
             for (uint32_t index = 0; index < options.warmup + options.frames; ++index) {
@@ -227,6 +228,8 @@ void App::run_benchmark() {
                     {"normal_uploads", normals.uploads}, {"normal_pending", normals.pending}, {"normal_failed", normals.failed},
                     {"atmospheres_visible", atmosphere.visible}, {"optical_updates", atmosphere.optical_lut_updates},
                     {"sky_updates", atmosphere.sky_lut_updates}, {"aerial_updates", atmosphere.aerial_lut_updates},
+                    {"secondary_updates", atmosphere.secondary_lut_updates},
+                    {"secondary_source_updates", atmosphere.secondary_source_lut_updates},
                     {"shadow_updates", atmosphere.shadow_updates}, {"shadow_resets", atmosphere.shadow_history_resets},
                     {"shadow_rotation_updates", atmosphere.shadow_rotation_updates},
                     {"ringshine_bakes", celestial_renderer_.ringshine_frame_bake_count()},

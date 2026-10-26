@@ -1,7 +1,7 @@
 # Atmospheric ring shadow geometry
 
-Try **Settings → Visibility → Fast ring shadow geometry (experimental)**.
-The option is off by default; cached atmospheric weights remain on by default.
+Try **Settings → Advanced → Fast ring shadow geometry (experimental)**.
+The option and cached atmospheric weights are on by default.
 Changing either option invalidates shadow history.
 
 This experiment simplifies the geometry around repeated ring-visibility queries.
@@ -87,8 +87,8 @@ in `tests/ring-shadow-geometry/validated-quality/`.
 
 The engine self-test and quality, rotation/history and shared surface-ring filter
 checks passed. The combined GPU suite ran with Vulkan validation enabled and
-reported no validation errors or warnings. The experiment remains off by default
-for comparison in the engine.
+reported no validation errors or warnings. The experiment was off by default during these comparisons; it is enabled in
+the current saved-preference baseline.
 
 ## Reproduction
 
