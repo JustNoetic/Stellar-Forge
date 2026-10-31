@@ -30,6 +30,9 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "no-shadows") s.atmosphere_shadows_enabled = false;
     if (variant == "no-refraction") s.refraction_enabled = false;
     if (variant == "no-secondary") s.planetshine_enabled = s.ringshine_enabled = false;
+    if (variant == "no-planetshine") s.planetshine_enabled = false;
+    if (variant == "no-ringshine") s.ringshine_enabled = false;
+    if (variant == "high-exposure") s.exposure = 1e4f;
     if (variant == "no-orbits") s.show_orbits = false;
     if (variant == "no-gaia") s.show_gaia_stars = false;
     if (variant == "smooth") s.terrain_imported_enabled = s.terrain_enabled = s.terrain_normal_maps_enabled = false;
@@ -100,10 +103,11 @@ inline Camera audit_camera(const ephemeris::SystemSnapshot& system, std::string_
     auto normal = scene.starts_with("earth-ground") || scene == "earth-full-rings"
         ? audit_shadow_direction(system, camera.tracking_idx) : sun;
     double radius = body.definition.radius_au();
-    if (scene == "earth-distant") {
+    if (scene.starts_with("earth-distant")) {
         auto side = glm::normalize(glm::cross(body.render.pole, sun));
-        camera.fov_deg = 0.001;
-        camera.cam_pos_rel = (sun*std::cos(75*DEG_TO_RAD)+side*std::sin(75*DEG_TO_RAD))*7.0;
+        double range = scene.size() > 14 ? std::stod(std::string(scene.substr(14))) : 7.0;
+        camera.fov_deg = std::max(0.001, 2*std::atan(body.definition.radius_au()/range)*RAD_TO_DEG/0.7);
+        camera.cam_pos_rel = (sun*std::cos(75*DEG_TO_RAD)+side*std::sin(75*DEG_TO_RAD))*range;
         return camera;
     }
     double distance = scene == "earth-disc" ? radius*2.5 : scene == "saturn" ? radius*5 : radius*1.1;

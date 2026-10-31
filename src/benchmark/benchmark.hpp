@@ -28,6 +28,7 @@ struct Options {
     std::string variant = "baseline";
     std::vector<std::string> scenes{"overview", "approach", "analytical", "nbody"};
     std::filesystem::path output;
+    std::filesystem::path capture;
 };
 
 struct LaunchOptions {

@@ -21,6 +21,7 @@ layout(location = 6) in vec2 f_tile_uv;
 #include "common/surface_textures.glsl"
 #include "common/surface_ring_shadow.glsl"
 #include "common/ringshine_lookup.glsl"
+#include "common/planetshine_lookup.glsl"
 #include "common/surface_atmosphere.glsl"
 #include "common/fluid_surface.glsl"
 
@@ -200,9 +201,18 @@ void main() {
         total_light += ringshine_light;
     }
 
-    for (int i = 0; i < 4; ++i) {
-        if (!any(greaterThan(b.shine_irradiance[i].rgb, vec3(0.0)))) continue;
+    uint shine_layer = uint(b.shine_irradiance[0].w);
+    vec3 surface_up = normalize(f_body_offset);
+    if (shine_layer > 0u) total_light += albedo*planetshine_map_sample(surface_up, shine_layer-1u);
+    // Reflected sources below both horizons only add their own twilight, and a source
+    // whose contribution at four times its unit-response bound stays under 0.1% of the
+    // light already here cannot change the pixel.
+    float shine_floor = dot(total_light, vec3(0.2126, 0.7152, 0.0722));
+    for (int i = 0; i < 4 && shine_layer == 0u; ++i) {
         vec3 light = b.shine_direction[i].xyz;
+        if (!any(greaterThan(b.shine_irradiance[i].rgb, vec3(0.0)))
+            || (dot(N, light) < 0.0 && dot(surface_up, light) < -0.05)
+            || 4000.0*dot(albedo*b.shine_irradiance[i].rgb, vec3(0.2126, 0.7152, 0.0722)) <= shine_floor) continue;
         vec3 diffuse;
         vec3 direct = surface_stellar_light(f_body_idx, f_body_offset, f_base_chord,
             N, V, light, sin(b.shine_direction[i].w), emission_cosine, b.material, 16u, diffuse);

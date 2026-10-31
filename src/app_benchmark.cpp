@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cmath>
 #include <format>
+#include <fstream>
+#include <glm/gtc/packing.hpp>
 #include <stdexcept>
 
 namespace sf {
@@ -24,6 +26,21 @@ std::array<double, 3> coordinates(const glm::dvec3& value) {
     return {value.x, value.y, value.z};
 }
 
+void write_pfm(const std::filesystem::path& path, uint32_t width, uint32_t height, const uint16_t* rgba_half) {
+    std::vector<float> rgb(size_t(width)*height*3);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint16_t* source = rgba_half+(size_t(height-1-y)*width+x)*4;
+            float* target = rgb.data()+(size_t(y)*width+x)*3;
+            for (int c = 0; c < 3; ++c) target[c] = glm::unpackHalf1x16(source[c]);
+        }
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+    std::ofstream file(path, std::ios::binary);
+    file << "PF\n" << width << ' ' << height << "\n-1.0\n";
+    file.write(reinterpret_cast<const char*>(rgb.data()), std::streamsize(rgb.size()*sizeof(float)));
+    if (!file) throw std::runtime_error("Failed to write benchmark capture: " + path.string());
+}
+
 std::string present_mode_name(VkPresentModeKHR mode) {
     switch (mode) {
         case VK_PRESENT_MODE_IMMEDIATE_KHR: return "immediate";
@@ -34,6 +51,27 @@ std::string present_mode_name(VkPresentModeKHR mode) {
     }
 }
 
+}
+
+void App::save_hdr_capture(const std::filesystem::path& path) {
+    vk_.wait_idle();
+    auto readback = vk_.create_host_buffer(VkDeviceSize(hdr_color_.extent.width)*hdr_color_.extent.height*8,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    vk_.immediate_submit([&](VkCommandBuffer cmd) {
+        VkImageLayout restore = hdr_color_.layout;
+        vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {hdr_color_.extent.width, hdr_color_.extent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, hdr_color_.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle, 1, &copy);
+        vk_.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+        vk_.transition_image(cmd, hdr_color_, restore);
+    });
+    vmaInvalidateAllocation(vk_.allocator(), readback.allocation, 0, VK_WHOLE_SIZE);
+    write_pfm(path, hdr_color_.extent.width, hdr_color_.extent.height, static_cast<const uint16_t*>(readback.mapped));
+    vk_.destroy_buffer(readback);
+    log::info("Benchmark capture: {}", path.string());
 }
 
 void App::run_benchmark() {
@@ -291,6 +329,7 @@ void App::run_benchmark() {
         }
     }
     vk_.capture_gpu_timings(false);
+    if (!options.capture.empty()) save_hdr_capture(options.capture);
     benchmark::write_report(options, metadata, runs);
     log::info("Benchmark reports: {}", options.output.string());
 }

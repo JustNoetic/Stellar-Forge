@@ -119,7 +119,24 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
         {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
+
+    planetshine_maps_ = ctx.create_image_2d(PLANETSHINE_MAP_WIDTH, PLANETSHINE_MAP_HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 1, PLANETSHINE_MAP_LAYERS, true);
+    ctx.immediate_submit([&](VkCommandBuffer cmd) {
+        ctx.transition_image(cmd, planetshine_maps_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    });
+    rhi::DescriptorLayoutBinding planetshine_bindings[] = {
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+    };
+    planetshine_map_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "celestial/planetshine_map.comp",
+        planetshine_bindings, sizeof(glm::uvec2));
+    for (auto& buffer : planetshine_bodies_)
+        buffer = ctx.create_host_buffer(MAX_CELESTIAL_BODIES*sizeof(BodyInstanceGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     rhi::GraphicsPipelineDesc sphere_desc{};
     sphere_desc.vert_path = "celestial/sphere.vert";
@@ -211,6 +228,9 @@ void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, atmosphere_point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, planetshine_map_pipeline_);
+    ctx.destroy_image(planetshine_maps_);
+    for (auto& buffer : planetshine_bodies_) ctx.destroy_buffer(buffer);
     for (uint32_t mode = 0; mode < 2; ++mode) {
         rhi::ShaderCache::destroy_pipeline(ctx, cloud_pipeline_[mode]);
         rhi::ShaderCache::destroy_pipeline(ctx, cloud_depth_pipeline_[mode]);
@@ -302,6 +322,7 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
         settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_);
     });
     measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_); });
+    measure("cpu_planetshine_maps_ms", [&] { bake_planetshine_maps(cmd, ctx, cam, sys, extent, count); });
     measure("cpu_transparency_prepare_ms", [&] {
     bool visible_clouds = false;
     if (settings.clouds_enabled) {
@@ -318,6 +339,63 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
         (visible_clouds || (settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
     });
     measure("cpu_eclipse_refraction_prepare_ms", [&] { eclipse_refraction_.prepare(cmd, ctx, sys, settings); });
+}
+
+void CelestialRenderer::bake_planetshine_maps(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                                              const ephemeris::SystemSnapshot& sys, VkExtent2D extent, uint32_t count) {
+    planetshine_layers_.assign(count, 0u);
+    uint32_t frame = ctx.frame_index();
+    const auto* records = static_cast<const glm::vec4*>(atmospheres_.surface_records(frame).mapped);
+    auto* bodies = static_cast<BodyInstanceGPU*>(planetshine_bodies_[frame].mapped);
+    bool atmosphere_changed = atmospheres_.stats().surface_lut_updates > 0;
+    double pixels = extent.height/(2.0*std::tan(cam.fov_deg*DEG_TO_RAD*0.5));
+    std::vector<glm::uvec2> dirty;
+    uint32_t layer = 0;
+    for (uint32_t i = 0; i < std::min(count, uint32_t(planetshine_.size())) && layer < PLANETSHINE_MAP_LAYERS; ++i) {
+        const auto& shine = planetshine_[i];
+        const auto& body = sys.body(i);
+        const auto& material = materials_.material(i);
+        bool lit = std::any_of(shine.irradiance.begin(), shine.irradiance.end(),
+            [](const glm::vec4& v) { return v.x > 0.0f || v.y > 0.0f || v.z > 0.0f; });
+        if (!lit || body.definition.is_star || material.grain.x > 0.5f) continue;
+        double distance = glm::length(camera_relative(body.render.position, cam.eye_pos_render()));
+        if (body.opaque_radius_au()/std::max(distance, 1e-15)*pixels <= 1.0) continue;
+        PlanetshineMapKey key{};
+        key.body = i;
+        key.radius = float(body.opaque_radius_au());
+        key.pole_oblateness = glm::vec4(glm::vec3(body.render.pole), float(body.definition.oblateness));
+        key.atmosphere = records[i];
+        key.shine = shine;
+        key.material = material;
+        BodyInstanceGPU instance{};
+        instance.pos_radius.w = key.radius;
+        instance.pole_oblateness = key.pole_oblateness;
+        instance.planetshine = shine;
+        instance.material = material;
+        bodies[i] = instance;
+        if (planetshine_keys_.size() <= layer) planetshine_keys_.resize(layer+1);
+        if (atmosphere_changed || std::memcmp(&planetshine_keys_[layer], &key, sizeof(key)) != 0) {
+            planetshine_keys_[layer] = key;
+            dirty.push_back({i, layer});
+        }
+        planetshine_layers_[i] = ++layer;
+    }
+    if (dirty.empty()) return;
+    ctx.flush_buffer(planetshine_bodies_[frame]);
+    uint32_t timer = ctx.begin_gpu_timer(cmd, "planetshine_maps");
+    ctx.transition_image(cmd, planetshine_maps_, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, planetshine_map_pipeline_.handle);
+    ctx.push_descriptors(cmd, planetshine_map_pipeline_, {
+        rhi::PushDescriptorWrite::storage_buffer(1, planetshine_bodies_[frame]),
+        rhi::PushDescriptorWrite::storage_image(3, planetshine_maps_),
+        rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
+        rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(frame))});
+    for (auto bake : dirty) {
+        ctx.push_constants(cmd, planetshine_map_pipeline_, bake);
+        vkCmdDispatch(cmd, PLANETSHINE_MAP_WIDTH/8, PLANETSHINE_MAP_HEIGHT/8, 1);
+    }
+    ctx.transition_image(cmd, planetshine_maps_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    ctx.end_gpu_timer(cmd, timer);
 }
 
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
@@ -380,6 +458,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
                                     static_cast<float>(i));
         inst.surface_flags.x = terrain_.covers(i) ? 1u : 0u;
         if (i < planetshine_.size()) inst.planetshine = planetshine_[i];
+        if (i < planetshine_layers_.size()) inst.planetshine.irradiance[0].w = float(planetshine_layers_[i]);
         inst.material = materials_.material(i);
         inst_ptr[i] = inst;
 
@@ -511,6 +590,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::storage_buffer(25, phases, 0, phase_bytes),
         rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
         rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
+        rhi::PushDescriptorWrite::sampled_image(31, planetshine_maps_, ctx.sampler_linear_repeat()),
         eclipse_refraction_.write(ctx),
         refraction[0],
         refraction[1],

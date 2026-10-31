@@ -34,6 +34,24 @@ are discarded when inputs change. Per-frame GPU phase buffers upload only when t
 cache revision changes, at storage binding 25. Instance records are 272 bytes,
 including the 48-byte packed material. Atmospheric resources are described below.
 
+Lambert receivers drawn as meshes (above one pixel) read planetshine from a baked
+irradiance map instead of evaluating the four sources per fragment. `CelestialRenderer::
+bake_planetshine_maps` assigns each such receiver one layer of a 32-layer 128×64
+RGBA32F latitude-longitude array (binding 31, `shaders/common/planetshine_lookup.glsl`)
+over the geocentric render-frame direction. `celestial/planetshine_map.comp` stores the
+summed `shine_irradiance·(direct + diffuse)` of `surface_stellar_light` at the sea-level
+ellipsoid point with its ellipsoid normal, so atmospheric transmission, skylight and
+finite-disk terminators are retained. A layer rebakes only when its receiver index,
+radius, pole, sources, material, atmosphere record or any surface atmosphere LUT
+changes; paused scenes bake once. The layer (plus one) travels in
+`shine_irradiance[0].w`. The map ignores shading normals, so moonlight shows no
+normal-map relief, like surface ringshine. RGBA16F is insufficient: unexposed moonlight
+irradiance (~1e-9) underflows half precision. Hapke receivers, receivers beyond 32 layers
+and sub-pixel bodies keep the per-fragment path, which skips sources below both the shading
+and geometric horizons and sources under 0.1% of the light already accumulated at four
+times their unit response. On the Saturn-midnight benchmark the map removes 0.6 ms
+(1440p) and matches the per-fragment result within 0.15% at exposure ×10⁴.
+
 Emitter eclipses use the original smooth angular penumbra and source/caster area
 bounds. Finite-distance phase remapping extinguishes the visible illuminated cap at
 `cos(phase) <= -sqrt(1 - (radius / distance)²)`. The original 0.7-radius sunward

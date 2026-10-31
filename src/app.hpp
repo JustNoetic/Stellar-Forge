@@ -45,6 +45,7 @@ private:
     void destroy_render_targets();
     bool render_frame(benchmark::FrameSample* sample = nullptr);
     void run_benchmark();
+    void save_hdr_capture(const std::filesystem::path& path);
     void render_ui();
     void render_main_menu_bar(rendering::RenderSettings& render_draft);
     void render_settings_window(rendering::RenderSettings& render_draft);
@@ -156,6 +157,7 @@ private:
     rhi::Image hdr_color_{};
     rhi::Image scene_depth_{};
     rhi::Pipeline composite_pipeline_{};
+    rhi::Pipeline bloom_composite_pipeline_{};
     rhi::Pipeline size_composite_pipeline_{};
     terrain::SurfaceBaker surface_baker_{};
     rhi::Image surface_preview_img_{};

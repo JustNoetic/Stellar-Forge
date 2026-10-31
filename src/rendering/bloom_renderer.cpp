@@ -8,6 +8,7 @@ namespace {
 
 struct ExtractPush { float dx, dy, highlight_limit, diffraction, threshold; uint32_t capacity; };
 struct ApplyPush { float strength, highlight_limit; };
+struct UpsamplePush { float coarse_weight; };
 struct SpikePush { float width, height, dx, dy, half_length, core_width, scale; uint32_t capacity; };
 constexpr VkDeviceSize SPIKE_BYTES = 880;
 
@@ -44,7 +45,7 @@ void BloomRenderer::init(rhi::VkContext& ctx) {
     downsample_ = rhi::ShaderCache::create_compute_pipeline(ctx, "post/bloom_downsample.comp", bindings);
     auto up_bindings = std::vector(bindings.begin(), bindings.end());
     up_bindings.push_back({2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT});
-    upsample_ = rhi::ShaderCache::create_compute_pipeline(ctx, "post/bloom_upsample.comp", up_bindings);
+    upsample_ = rhi::ShaderCache::create_compute_pipeline(ctx, "post/bloom_upsample.comp", up_bindings, sizeof(UpsamplePush));
     std::vector<rhi::DescriptorLayoutBinding> apply_bindings{
         {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT},
         {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
@@ -90,18 +91,20 @@ void BloomRenderer::prepare(rhi::VkContext& ctx, VkExtent2D extent) {
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
     };
     resize(physical_scene_, extent.width, extent.height);
-    uint32_t width = extent.width, height = extent.height;
+    uint32_t width = (extent.width+3)/4, height = (extent.height+3)/4;
     for (size_t i = 0; i < LEVELS; ++i) {
-        width = std::max(1u, (width+1)/2);
-        height = std::max(1u, (height+1)/2);
+        if (i > 0) {
+            width = std::max(1u, (width+1)/2);
+            height = std::max(1u, (height+1)/2);
+        }
         resize(down_[i], width, height);
         if (i < up_.size()) resize(up_[i], width, height);
     }
 }
 
-void BloomRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color,
-                           const RenderSettings& settings, rhi::Image* physical_scene) {
-    if (!enabled(settings)) return;
+bool BloomRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color,
+                           const RenderSettings& settings, rhi::Image* physical_scene, bool defer_resolve) {
+    if (!enabled(settings)) return false;
     prepare(ctx, {color.extent.width, color.extent.height});
     bool spikes = settings.bloom_mode == 2 && settings.bloom_diffraction > 0.0f;
     auto& spike_buffer = spikes_[ctx.frame_index()];
@@ -135,7 +138,8 @@ void BloomRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image&
                 rhi::PushDescriptorWrite::sampled_image(0, input, ctx.sampler_linear_clamp()),
                 rhi::PushDescriptorWrite::storage_image(1, output)});
         }
-        dispatch(cmd, output);
+        if (i == 0) vkCmdDispatch(cmd, (output.extent.width+3)/4, (output.extent.height+3)/4, 1);
+        else dispatch(cmd, output);
         readable(cmd, ctx, output);
     }
     ctx.end_gpu_timer(cmd, downsample_timer);
@@ -148,20 +152,22 @@ void BloomRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image&
             rhi::PushDescriptorWrite::sampled_image(0, coarse, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::storage_image(1, up_[i]),
             rhi::PushDescriptorWrite::sampled_image(2, down_[i], ctx.sampler_linear_clamp())});
+        // The quarter level also stands in for the dropped half-resolution level,
+        // which took 0.35 of the halo, so it keeps 0.35 + 0.65*0.35 of its own.
+        ctx.push_constants(cmd, upsample_, UpsamplePush{i == 0 ? 0.65f*0.65f : 0.65f});
         dispatch(cmd, up_[i]);
         readable(cmd, ctx, up_[i]);
     }
     ctx.end_gpu_timer(cmd, upsample_timer);
-    auto apply_timer = ctx.begin_gpu_timer(cmd, "bloom_apply");
-    ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, apply_.handle);
-    ctx.push_descriptors(cmd, apply_, {
-        rhi::PushDescriptorWrite::storage_image(0, color),
-        rhi::PushDescriptorWrite::sampled_image(1, source, ctx.sampler_nearest_clamp(), source.layout),
-        rhi::PushDescriptorWrite::sampled_image(2, up_[0], ctx.sampler_linear_clamp())});
-    ctx.push_constants(cmd, apply_, ApplyPush{settings.bloom_strength, settings.bloom_highlight_limit});
-    dispatch(cmd, color);
-    ctx.end_gpu_timer(cmd, apply_timer);
+    // The deferred correction reads the physical image, which the spikes leave
+    // untouched. Without one, the scene itself is the source and must be
+    // corrected before the spikes are added to it.
+    bool deferred = defer_resolve && physical_scene;
+    if (!deferred) {
+        auto apply_timer = ctx.begin_gpu_timer(cmd, "bloom_apply");
+        apply(cmd, ctx, color, source, settings);
+        ctx.end_gpu_timer(cmd, apply_timer);
+    }
     if (spikes) {
         auto spikes_timer = ctx.begin_gpu_timer(cmd, "bloom_spikes");
         float scale = float(color.extent.height)/1080.0f*settings.bloom_radius;
@@ -189,6 +195,26 @@ void BloomRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image&
     }
     ctx.memory_barrier(cmd);
     ctx.end_gpu_timer(cmd, timer);
+    return deferred;
+}
+
+void BloomRenderer::apply(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& source,
+                          const RenderSettings& settings) {
+    ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, apply_.handle);
+    ctx.push_descriptors(cmd, apply_, {
+        rhi::PushDescriptorWrite::storage_image(0, color),
+        rhi::PushDescriptorWrite::sampled_image(1, source, ctx.sampler_nearest_clamp(), source.layout),
+        rhi::PushDescriptorWrite::sampled_image(2, up_[0], ctx.sampler_linear_clamp())});
+    ctx.push_constants(cmd, apply_, ApplyPush{settings.bloom_strength, settings.bloom_highlight_limit});
+    dispatch(cmd, color);
+}
+
+void BloomRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color,
+                            const RenderSettings& settings, rhi::Image& physical_scene) {
+    readable(cmd, ctx, physical_scene);
+    apply(cmd, ctx, color, physical_scene, settings);
+    ctx.memory_barrier(cmd);
 }
 
 }

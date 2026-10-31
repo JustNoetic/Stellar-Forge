@@ -8,11 +8,8 @@ layout(push_constant) uniform Bloom { float strength; float highlight_limit; } b
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(scene);
-    if (any(greaterThanEqual(pixel, size))) return;
-    vec2 uv = (vec2(pixel)+0.5)/(2.0*vec2(textureSize(halo, 0)));
+    if (any(greaterThanEqual(pixel, imageSize(scene)))) return;
     vec4 color = imageLoad(scene, pixel);
-    vec3 physical = bloom_extract(texelFetch(physical_scene, pixel, 0).rgb, bloom.highlight_limit);
-    color.rgb = bloom_finite(bloom_finite(color.rgb)+bloom.strength*(bloom_sample(halo, uv)-physical));
+    color.rgb = bloom_resolve(color.rgb, texelFetch(physical_scene, pixel, 0).rgb, halo, pixel, bloom.strength, bloom.highlight_limit);
     imageStore(scene, pixel, color);
 }

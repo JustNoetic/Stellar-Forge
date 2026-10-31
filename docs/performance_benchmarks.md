@@ -133,6 +133,13 @@ transparency for comparison; it changes atmospheric endpoints and ordering.
 are measured feature costs, not promises of equivalent-quality optimization.
 `no-bloom` bypasses post-process bloom; `fast-bloom` selects the fast halo in
 place of the default four-spike sprites. See `bloom.md`.
+`no-planetshine` and `no-ringshine` split `no-secondary`. `high-exposure` multiplies
+exposure by 10⁴ for image checks of dark scenes, whose linear HDR values otherwise sit at
+the RGBA16F floor. `--benchmark-capture FILE` writes the last frame's linear HDR scene
+(before the halo resolve and tone mapping) as PFM.
+`tests/saturn-midnight-benchmark/run_benchmark.py` runs the Saturn-midnight feature
+matrix, reports medians, captures every case and, with `--compare <run dir>`, adds
+per-case and per-pass deltas plus image differences.
 `baseline` now includes cached atmospheric shadow weights. `native-shadow-weights`
 restores the original per-sample lighting; `cached-shadow-weights` explicitly
 selects the current default. Cached weights preserve the ring filter and

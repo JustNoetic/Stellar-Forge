@@ -9,19 +9,27 @@ Size comparison keeps its original presentation.
 
 `BloomRenderer` runs after atmosphere transport and transparency resolution,
 before ACES tone mapping and the UI. Exposure is already applied by the scene
-shaders and is not applied again. Six half-resolution-and-smaller 13-tap
-filtered levels feed a normalized tent reconstruction for the halo. Four-spike
-mode adds sparse cross sprites on top of that halo instead of convolving the
-whole image.
+shaders and is not applied again. Five levels from quarter resolution down to
+1/64 feed a normalized tent reconstruction for the halo. Four-spike mode adds
+sparse cross sprites on top of that halo instead of convolving the whole image.
 
 ## First level and spike sources
 
-`bloom_extract.comp` builds the first half-resolution level. Each 8×8 workgroup
-covers a 16×16 full-resolution tile and loads its 20×20 apron into shared
-memory once, applying highlight extraction per texel. The 13 bilinear taps of
-the original downsample all sample at texel corners, so they collapse to a fixed
-6×6 stencil read from shared memory. This keeps the original filter while
-reading each source texel about 1.6 times instead of 13 times.
+`bloom_extract.comp` builds the first, quarter-resolution level. Each 8×8
+workgroup covers a 16×16 full-resolution tile and loads its 20×20 apron into
+shared memory once, applying highlight extraction per texel. Sixteen of its
+invocations then write the tile's 4×4 quarter-resolution texels, each an 8×8
+separable tent (box 4 ⊗ box 5, weights 1 2 3 4 4 3 2 1) centred on its 4×4
+footprint. Every source pixel reaches two texels per axis with a combined
+weight of 1/4, so flux does not depend on subpixel phase. Levels 2–5 use the
+13-tap bilinear downsample.
+
+Earlier versions started at half resolution with a 13-tap level, which cost an
+extra full-size write, a downsample dispatch and the largest upsample. The
+quarter level now stands in for it: the first reconstruction step keeps
+0.35 + 0.65 × 0.35 = 0.5775 of the quarter level and mixes in 0.65² of the
+coarser levels, so the deeper scales keep their previous share of the halo. The
+innermost glow is slightly wider than before.
 
 The same pass decides spike emission. A pixel's spike fraction is
 `diffraction * smoothstep(T, 2T, peak)`, where `peak` is its largest finite HDR
@@ -79,7 +87,13 @@ The 13-tap layout is adapted from the original renderer's
 
 The final result is `scene + strength * (halo + spikes - extract(physical))`.
 It redistributes the bounded extracted light instead of adding an unnormalized
-copy. The actual solar disc and scene radiance retain their original HDR
+copy. `bloom_resolve` in `bloom.glsl` evaluates the halo term. When a
+physical-light image exists, which is the normal path with ordered
+transparency, it runs inside the tonemap pass (`composite.frag` built with
+`BLOOM`). The sprites are drawn into the scene first, and the correction reads
+the physical image, which they never touch. That removes a full-resolution read
+and write and a barrier. Without a physical image the scene itself is the
+source, so `bloom_apply.comp` corrects it in place before the sprites are drawn. The actual solar disc and scene radiance retain their original HDR
 brightness. Finite nonnegative HDR values are capped at 65000 before filtering
 and in the halo correction; NaNs become zero. Sprites add afterwards and are not
 clamped again. Screen edges use black extension. Light outside the viewport does
@@ -106,7 +120,8 @@ Images allocate lazily and retain their dimensions while disabled. Resize retire
 old images against GPU completion instead of waiting for the queue. Spike
 buffers are per frame in flight. The `bloom` GPU timer is included in
 `gpu_post_composite` and shown separately in telemetry, split into
-downsample, upsample, apply and spikes.
+downsample, upsample, apply and spikes. Apply only runs on the in-place path;
+otherwise the correction is part of `tonemap_composite`.
 
 ## Local verification
 
@@ -114,7 +129,9 @@ downsample, upsample, apply and spikes.
 bypass, interior flux, four-arm symmetry and rotation, below-threshold sources
 matching Fast exactly, HDR infinities and NaNs, no opposite-edge wrapping, tiny
 viewport resize, guide exclusion, subpixel flux and reconstruction phase at odd
-viewport dimensions, a saturated full-screen image that overflows sprite
+viewport dimensions, the deferred correction (sprites first, then
+`BloomRenderer::resolve`) matching the in-place order within half-float
+rounding, a saturated full-screen image that overflows sprite
 capacity yet stays flat within 1%, and an unsaturated crescent whose spike tails
 24 pixels from the limb must vary smoothly (ripple below 3% at 0° and 7% at 45°;
 a brute-force per-pixel reference gives 1.6% and 3.1%; the first sprite version
@@ -133,7 +150,10 @@ convolution measured 0.644 ms for `bloom` (downsample 0.340, spikes 0.188,
 apply 0.072, upsample 0.045). Sprite bloom measured 0.250 ms (downsample 0.150,
 of which the shared-memory first level is about 0.106; spikes 0.006, apply
 0.047, upsample 0.044), and Fast 0.261 ms. Slice profiles left the overview
-timing unchanged (0.232 ms, spikes 0.007). The worst case grew: in the
+timing unchanged (0.232 ms, spikes 0.007). Starting at quarter resolution and
+fusing the correction into tone mapping brought `bloom` to 0.161 ms
+(downsample 0.129, upsample 0.023, spikes 0.006) while `tonemap_composite` rose
+from 0.020 to 0.037 ms. Bloom plus tone mapping went from 0.254 to 0.201 ms. The worst case grew: in the
 standalone contracts, a full-screen saturated image at 4K adds roughly 3 ms of
 submit/wait time with all 2048 sprites drawn. The previous convolution sources are
 kept locally under `tests/bloom-sprites-20261030/previous/`. These are fixture

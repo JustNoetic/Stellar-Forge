@@ -66,7 +66,7 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-variant") {
             o.variant = value();
             const std::set<std::string_view> variants{"baseline", "no-atmosphere", "no-aerial", "no-shadows", "no-refraction", "no-secondary",
-                "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows", "analytic-shadows", "jittered-shadows", "no-clouds", "legacy-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
+                "no-planetshine", "no-ringshine", "high-exposure", "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows", "analytic-shadows", "jittered-shadows", "no-clouds", "legacy-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
             if (o.variant.empty()) throw std::runtime_error("Unknown benchmark variant: " + o.variant);
             for (size_t start = 0; start <= o.variant.size();) {
                 size_t plus = o.variant.find('+', start);
@@ -90,6 +90,7 @@ LaunchOptions parse_options(int argc, char** argv) {
                 throw std::runtime_error("Unknown simulation mode: " + o.simulation_mode);
         }
         else if (arg == "--benchmark-output") { o.output = value(); if (o.output.empty()) throw std::runtime_error("Empty output directory."); }
+        else if (arg == "--benchmark-capture") { o.capture = value(); if (o.capture.empty()) throw std::runtime_error("Empty capture path."); }
         else if (arg == "--benchmark-scene") {
             auto scene = value();
             if (scene == "all") o.scenes = {"overview", "approach", "analytical", "nbody"};
@@ -128,7 +129,7 @@ std::string_view help() {
                     earth-ground-live|earth-ground-rings-live|earth-full-live
                     terrain-navigation|earth-terrain-still|earth-terrain-walk|earth-terrain-fly|earth-terrain-turn
   --benchmark-variant baseline|no-atmosphere|no-aerial|no-shadows|no-refraction|no-secondary|no-orbits
-                      no-gaia|smooth|no-textures|no-normals|no-rings|no-ring-shadows
+                      no-planetshine|no-ringshine|high-exposure (x10^4, image checks)|no-gaia|smooth|no-textures|no-normals|no-rings|no-ring-shadows
                       cached-shadow-weights|native-shadow-weights|fast-ring-shadows|no-clouds|legacy-clouds|no-bloom|fast-bloom
                       terrain-detail (2-pixel geometry error; other defaults retained)
   --benchmark-width N       Framebuffer width (1920)
@@ -139,6 +140,7 @@ std::string_view help() {
   --benchmark-step SECONDS  Fixed simulation/camera delta (1/60)
   --benchmark-warp FACTOR   Simulation warp (1)
   --benchmark-output PATH   New report directory (default: exports/benchmarks/<UTC timestamp>)
+  --benchmark-capture FILE  Save the last frame's linear HDR scene (before halo and tone mapping) as PFM
   --benchmark-hidden        Hidden window; still requires Vulkan/window system
   --benchmark-ui            Include the fixed, disabled application workspace
   --benchmark-detailed      Also export raw frames and per-run statistics

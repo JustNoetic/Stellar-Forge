@@ -81,10 +81,37 @@ vec2 atmosphere_segment(vec3 p, vec3 d) {
     return atmosphere_segment(p, d, span);
 }
 
+float atmosphere_span(vec3 d) {
+    float span;
+    atmosphere_segment(atm.camera.xyz, d, span);
+    return span;
+}
+
 vec3 atmosphere_entry(vec3 d, float start) {
     if (start <= 0.0) return atm.camera.xyz;
     vec3 closest = atm.camera.z*vec3(-d.z*d.xy, dot(d.xy, d.xy));
     return closest-d*sqrt(max(top_radius()*top_radius()-dot(closest, closest), 0.0));
+}
+
+float sea_level_path(vec3 d, vec2 segment) {
+    float radius = atm.reference_shape.x;
+    if (segment.x <= 0.0) {
+        vec2 roots = sphere_roots(atm.camera.xyz, d, radius);
+        return roots.x >= 0.0 ? roots.x : -1.0;
+    }
+    vec3 perpendicular = cross(atm.camera.xyz, d);
+    float chord = radius*radius-dot(perpendicular, perpendicular);
+    return chord >= 0.0 ? entry_half_chord(atm.camera.xyz, d)-sqrt(chord) : -1.0;
+}
+
+float depth_endpoint_path(float distance, vec3 d, vec2 segment, float span, out bool finite_endpoint) {
+    float tolerance = segment.y*DEPTH_DISTANCE_TOLERANCE;
+    float path = distance-segment.x;
+    float sea = min(sea_level_path(d, segment), span);
+    float measured = sea >= 0.0 ? smoothstep(tolerance, 2.0*tolerance, abs(path-sea)) : 1.0;
+    finite_endpoint = measured < 1.0 || path < span-tolerance;
+    if (!finite_endpoint) return span;
+    return min(mix(sea, path, measured), span);
 }
 
 float particle_density(int layer, float height) {
@@ -397,10 +424,18 @@ vec3 stellar_multiple_source(sampler2D lut, vec3 p, vec3 sun, float radius, vec3
 #endif
 }
 
+float precise_asin(float x) {
+    return x < 0.01 ? x*(1.0+x*x/6.0) : asin(x);
+}
+
+float precise_sin(float a) {
+    return a < 0.01 ? a*(1.0-a*a/6.0) : sin(a);
+}
+
 float sky_center_angle(float t, bool lower) {
     float r = atm.camera.z;
-    float limb = asin(clamp(bottom_radius()/r, 0.0, 1.0));
-    float edge = asin(clamp(top_radius()/r, 0.0, 1.0));
+    float limb = precise_asin(clamp(bottom_radius()/r, 0.0, 1.0));
+    float edge = precise_asin(clamp(top_radius()/r, 0.0, 1.0));
     return lower ? mix(limb, edge, t*t) : limb*(1.0-(1.0-t)*(1.0-t));
 }
 
@@ -418,7 +453,8 @@ vec3 sky_direction(ivec2 pixel) {
     float phi = float(pixel.x)/float(SKY_SIZE.x-1)*2.0*ATM_PI-ATM_PI;
     if (atm.camera.z >= top_radius()) {
         float angle = sky_center_angle(t, lower);
-        return vec3(sin(angle)*cos(phi), sin(angle)*sin(phi), -cos(angle));
+        float s = precise_sin(angle);
+        return vec3(s*cos(phi), s*sin(phi), -sqrt(max(1.0-s*s, 0.0)));
     }
     float theta = sky_angle(t, lower);
     return vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
@@ -430,12 +466,13 @@ vec2 sky_uv(vec3 direction, ivec2 size) {
     bool lower;
     float t;
     if (r >= top_radius()) {
-        float angle = atan(length(direction.xy), -direction.z);
-        float limb = asin(clamp(bottom_radius()/r, 0.0, 1.0));
-        float edge = asin(clamp(top_radius()/r, 0.0, 1.0));
+        float slope = length(direction.xy)/max(-direction.z, 0.0);
+        float angle = slope < 0.01 ? slope*(1.0-slope*slope/3.0) : atan(length(direction.xy), -direction.z);
+        float limb = precise_asin(clamp(bottom_radius()/r, 0.0, 1.0));
+        float edge = precise_asin(clamp(top_radius()/r, 0.0, 1.0));
         lower = angle > limb;
-        t = lower ? sqrt(clamp((angle-limb)/max(edge-limb, 1e-8), 0.0, 1.0))
-                  : 1.0-sqrt(clamp(1.0-angle/max(limb, 1e-8), 0.0, 1.0));
+        t = lower ? sqrt(clamp((angle-limb)/max(edge-limb, 1e-30), 0.0, 1.0))
+                  : 1.0-sqrt(clamp(1.0-angle/max(limb, 1e-30), 0.0, 1.0));
     } else {
         float horizon = acos(-sqrt(max(1.0-bottom_radius()*bottom_radius()/(r*r), 0.0)));
         lower = theta > horizon;

@@ -13,15 +13,25 @@ public:
     void init(rhi::VkContext& ctx);
     void shutdown(rhi::VkContext& ctx);
     void prepare(rhi::VkContext& ctx, VkExtent2D extent);
-    void render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color,
-                const RenderSettings& settings, rhi::Image* physical_scene = nullptr);
+    // With defer_resolve and a physical-light image, the halo correction is left
+    // for the presentation pass (bloom_resolve in composite.frag) and true is
+    // returned. Otherwise it is applied to color before the spikes are drawn.
+    bool render(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color,
+                const RenderSettings& settings, rhi::Image* physical_scene = nullptr, bool defer_resolve = false);
+    // Standalone form of the deferred correction, for verification.
+    void resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color,
+                 const RenderSettings& settings, rhi::Image& physical_scene);
     rhi::Image& physical_scene() { return physical_scene_; }
+    rhi::Image& halo() { return up_[0]; }
     static bool enabled(const RenderSettings& settings) {
         return settings.hdr_enabled && settings.bloom_mode != 0 && settings.bloom_strength > 0.0f;
     }
 
 private:
-    static constexpr size_t LEVELS = 6;
+    void apply(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& source,
+               const RenderSettings& settings);
+    // Quarter resolution down to 1/64.
+    static constexpr size_t LEVELS = 5;
     rhi::Pipeline extract_, downsample_, upsample_, apply_, spike_;
     rhi::Image physical_scene_;
     std::array<rhi::Image, LEVELS> down_;

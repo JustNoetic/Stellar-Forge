@@ -106,8 +106,7 @@ bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float
     if (depth > 0.0) {
         vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
         float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
-        finite_endpoint = distance < segment.y*(1.0-DEPTH_DISTANCE_TOLERANCE);
-        path = finite_endpoint ? min(distance-segment.x, span) : span;
+        path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
         if (path <= 0.0) return false;
         if (atm.depth_params.y == 0.0) {
             vec3 x = atmosphere_entry(d, segment.x);
@@ -165,7 +164,7 @@ bool atmosphere_transport(ivec2 pixel, ivec2 size, float depth, out vec3 L, out 
     vec3 d = view_direction(ndc);
     float span;
     vec2 segment = atmosphere_segment(atm.camera.xyz, d, span);
-    if (segment.y <= segment.x) return false;
+    if (span <= 0.0) return false;
     return atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, L, T);
 }
 
@@ -181,7 +180,7 @@ void main() {
         vec3 transparent_dir = view_direction(transparent_ndc);
         float transparent_span;
         vec2 transparent_segment = atmosphere_segment(atm.camera.xyz, transparent_dir, transparent_span);
-        if (transparent_segment.y > transparent_segment.x) {
+        if (transparent_span > 0.0) {
             while (current != TRANSPARENCY_END) {
                 uvec4 fragment = fragments[current];
                 if (atmosphere_transport_ray(transparent_pixel, transparent_ndc, transparent_dir, transparent_segment, transparent_span, uintBitsToFloat(fragment.z), L, T)) {

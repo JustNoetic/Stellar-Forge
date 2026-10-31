@@ -176,6 +176,12 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
     comp_desc.cull_mode = VK_CULL_MODE_NONE;
 
     composite_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(vk_, comp_desc);
+    auto bloom_desc = comp_desc;
+    bloom_desc.bindings.push_back({1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+    bloom_desc.bindings.push_back({2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+    bloom_desc.push_constant_size = 2*sizeof(float);
+    bloom_desc.macros = {{"BLOOM", "1"}};
+    bloom_composite_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(vk_, bloom_desc);
     comp_desc.macros = {{"SIZE_COMPARISON", "1"}};
     size_composite_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(vk_, comp_desc);
     sf::log::info("Stellar Forge initialized (Root: {})", sf::paths::project_root().string());
@@ -430,6 +436,7 @@ void App::shutdown() {
     vk_.wait_idle();
     rhi::ShaderCache::destroy_pipeline(vk_, size_composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(vk_, composite_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(vk_, bloom_composite_pipeline_);
     if (surface_preview_ds_ != VK_NULL_HANDLE) {
         ImGui_ImplVulkan_RemoveTexture(surface_preview_ds_);
         surface_preview_ds_ = VK_NULL_HANDLE;
@@ -866,7 +873,8 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     vk_.end_gpu_timer(cmd, t_scene);
 
     uint32_t t_post = vk_.begin_gpu_timer(cmd, "gpu_post_composite");
-    if (bloom_enabled) bloom_renderer_.render(cmd, vk_, hdr_color_, render_settings_.values(), bloom_scene);
+    bool bloom_deferred = bloom_enabled &&
+        bloom_renderer_.render(cmd, vk_, hdr_color_, render_settings_.values(), bloom_scene, true);
     uint32_t t_tonemap = vk_.begin_gpu_timer(cmd, "tonemap_composite");
     vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -884,13 +892,23 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     swap_att.store_op = VK_ATTACHMENT_STORE_OP_STORE;
 
     vk_.begin_rendering(cmd, ext, std::span{&swap_att, 1}, nullptr);
-    const auto& presentation = size_comparison_active_ ? size_composite_pipeline_ : composite_pipeline_;
+    const auto& presentation = size_comparison_active_ ? size_composite_pipeline_ :
+        bloom_deferred ? bloom_composite_pipeline_ : composite_pipeline_;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentation.handle);
 
-    rhi::PushDescriptorWrite writes[] = {
-        rhi::PushDescriptorWrite::sampled_image(0, hdr_color_, vk_.sampler_linear_clamp()),
-    };
-    vk_.push_descriptors(cmd, presentation, writes);
+    if (bloom_deferred) {
+        vk_.push_descriptors(cmd, presentation, {
+            rhi::PushDescriptorWrite::sampled_image(0, hdr_color_, vk_.sampler_linear_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(1, *bloom_scene, vk_.sampler_nearest_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(2, bloom_renderer_.halo(), vk_.sampler_linear_clamp())});
+        const auto& values = render_settings_.values();
+        vk_.push_constants(cmd, presentation, std::array{values.bloom_strength, values.bloom_highlight_limit});
+    } else {
+        rhi::PushDescriptorWrite writes[] = {
+            rhi::PushDescriptorWrite::sampled_image(0, hdr_color_, vk_.sampler_linear_clamp()),
+        };
+        vk_.push_descriptors(cmd, presentation, writes);
+    }
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vk_.end_rendering(cmd);
     vk_.end_gpu_timer(cmd, t_tonemap);

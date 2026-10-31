@@ -36,7 +36,7 @@ bool shadow_cached_column_unlit(vec3 direction, vec2 segment, float path) {
     float half_texel = 0.5/float(AERIAL_SIZE.y);
     float middle = uv.y < 0.5 ? 0.5-half_texel : 0.5+half_texel;
     uv.y = uv.y < 0.5 ? min(uv.y, middle) : max(uv.y, middle);
-    float range = segment.y-segment.x;
+    float range = atmosphere_span(direction);
     if (abs(uv.y-0.5) < 1.0/float(AERIAL_SIZE.y))
         range = textureLod(shadow_aerial_range, uv, 0.0).r;
     return !any(greaterThan(shadow_cached_upper_light(uv, range, path), vec3(0.0)));

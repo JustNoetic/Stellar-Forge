@@ -71,8 +71,9 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
         {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
-    reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+    reference_pipeline_ =rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     desc.vert_path = "terrain/terrain.vert";
     desc.bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1});
     pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);

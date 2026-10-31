@@ -1,0 +1,27 @@
+#version 460
+#include "common/celestial_scene.glsl"
+#include "common/surface_atmosphere.glsl"
+#include "common/planetshine_lookup.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba32f, set = 0, binding = 3) uniform writeonly image2DArray destination;
+layout(push_constant) uniform Bake { uint body; uint layer; } bake;
+
+void main() {
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(texel, ivec2(PLANETSHINE_MAP_SIZE)))) return;
+    BodyInstanceGPU b = bodies[bake.body];
+    vec3 up = planetshine_map_direction((vec2(texel)+0.5)/PLANETSHINE_MAP_SIZE);
+    vec3 pole = body_pole(b);
+    float polar = max(1.0-b.pole_oblateness.w, 0.05);
+    vec3 local = up*b.pos_radius.w/length(up+pole*dot(up, pole)*(1.0/polar-1.0));
+    vec3 N = normalize(local+pole*dot(local, pole)*(1.0/(polar*polar)-1.0));
+    vec3 light = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        if (!any(greaterThan(b.shine_irradiance[i].rgb, vec3(0.0)))) continue;
+        vec3 diffuse;
+        vec3 direct = surface_stellar_light(bake.body, local, vec3(1.0, 0.0, 0.0), N, N,
+            b.shine_direction[i].xyz, sin(b.shine_direction[i].w), 1.0, b.material, 16u, diffuse);
+        light += b.shine_irradiance[i].rgb*(direct+diffuse);
+    }
+    imageStore(destination, ivec3(texel, int(bake.layer)), vec4(light, 1.0));
+}

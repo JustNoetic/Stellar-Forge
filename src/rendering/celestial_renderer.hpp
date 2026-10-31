@@ -24,6 +24,9 @@ namespace sf::rendering {
 
 inline constexpr uint32_t MAX_CELESTIAL_BODIES = 1024;
 inline constexpr uint32_t MAX_SCENE_STARS = 16;
+inline constexpr uint32_t PLANETSHINE_MAP_WIDTH = 128;
+inline constexpr uint32_t PLANETSHINE_MAP_HEIGHT = 64;
+inline constexpr uint32_t PLANETSHINE_MAP_LAYERS = 32;
 
 struct alignas(16) BodyInstanceGPU {
     glm::vec4 pos_radius{0.0f};
@@ -172,6 +175,23 @@ private:
     SurfaceMaterialCache materials_;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> material_phases_{};
     std::array<uint64_t, rhi::FRAMES_IN_FLIGHT> material_uploads_{};
+
+    struct PlanetshineMapKey {
+        uint32_t body = 0;
+        float radius = 0.0f;
+        std::array<float, 2> padding{};
+        glm::vec4 pole_oblateness{0.0f};
+        glm::vec4 atmosphere{0.0f};
+        PlanetshineGPU shine{};
+        physics::SurfaceMaterialGPU material{};
+    };
+    void bake_planetshine_maps(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                               const ephemeris::SystemSnapshot& sys, VkExtent2D extent, uint32_t count);
+    rhi::Image planetshine_maps_{};
+    rhi::Pipeline planetshine_map_pipeline_{};
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> planetshine_bodies_{};
+    std::vector<PlanetshineMapKey> planetshine_keys_;
+    std::vector<uint32_t> planetshine_layers_;
 };
 
 } // namespace sf::rendering

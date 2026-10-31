@@ -36,3 +36,10 @@ float bloom_spline(float distance) {
     distance = abs(distance);
     return distance < 0.5 ? 0.75-distance*distance : distance < 1.5 ? 0.5*(1.5-distance)*(1.5-distance) : 0.0;
 }
+
+const int BLOOM_HALO_SCALE = 4;
+
+vec3 bloom_resolve(vec3 scene, vec3 physical, sampler2D halo, ivec2 pixel, float strength, float limit) {
+    vec2 uv = (vec2(pixel)+0.5)/(float(BLOOM_HALO_SCALE)*vec2(textureSize(halo, 0)));
+    return bloom_finite(bloom_finite(scene)+strength*(bloom_sample(halo, uv)-bloom_extract(physical, limit)));
+}

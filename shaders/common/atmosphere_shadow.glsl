@@ -504,7 +504,7 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
     bool cached_weights = (shadow_flags.y & 4u) != 0u && atm.camera.w == 1.0 && (shadow_ranges[0].w > 0u || analytic) &&
         prefix_path <= 0.0 && path >= 2.0 && atm.camera.z-bottom_radius() >= 0.01;
     vec2 cached_uv = vec2(0.0);
-    float cached_range = segment.y-segment.x;
+    float cached_range = atmosphere_span(direction);
     if (cached_weights) {
         cached_weights = transport_subdivisions(entry, direction, 0.0, path) == 1;
         cached_uv = sky_uv(direction);

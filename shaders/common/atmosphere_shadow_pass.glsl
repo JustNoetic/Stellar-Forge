@@ -53,12 +53,13 @@ vec3 accumulate_shadow(ivec2 pixel, int layer, float depth, vec3 energy, vec3 lo
 }
 #endif
 
-float shadow_endpoint_path(vec2 ndc, float depth, vec2 segment, float span) {
+float shadow_endpoint_path(vec2 ndc, vec3 direction, float depth, vec2 segment, float span) {
     if (depth <= 0.0) return span;
     if (atm.depth_params.y == 0.0) return 0.0;
     vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
     float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
-    return distance < segment.y*(1.0-DEPTH_DISTANCE_TOLERANCE) ? clamp(distance-segment.x, 0.0, span) : span;
+    bool finite_endpoint;
+    return max(depth_endpoint_path(distance, direction, segment, span, finite_endpoint), 0.0);
 }
 
 #ifndef ATMOSPHERE_SHADOW_COARSE
@@ -86,7 +87,7 @@ void main() {
     float span;
     vec2 segment = atmosphere_segment(atm.camera.xyz, direction, span);
     float depth = texelFetch(scene_depth, pixel, 0).r;
-    float path = segment.y > segment.x ? shadow_endpoint_path(ndc, depth, segment, span) : 0.0;
+    float path = span > 0.0 ? shadow_endpoint_path(ndc, direction, depth, segment, span) : 0.0;
     float transparent_depth = -1.0;
 #ifdef ATMOSPHERE_SHADOW_TRANSPARENCY
     if (path > 0.0) {
@@ -107,7 +108,7 @@ void main() {
     imageStore(current_deficit, output_pixel, vec4(fraction, supported.x ? 1.0 : 0.0));
     imageStore(current_guide, output_pixel, vec4(log2(max(path, 1e-5)), segment.x, depth > 0.0 ? 1.0 : 0.0, unlit_safe ? 2.0 : valid ? 1.0 : 0.0));
 #else
-    float prefix_path = transparent_depth >= 0.0 && path > 0.0 ? shadow_endpoint_path(ndc, transparent_depth, segment, span) : 0.0;
+    float prefix_path = transparent_depth >= 0.0 && path > 0.0 ? shadow_endpoint_path(ndc, direction, transparent_depth, segment, span) : 0.0;
     vec3 prefix_fraction = vec3(0.0), fraction = vec3(0.0);
     bvec2 supported = bvec2(false);
 #ifdef ATMOSPHERE_SHADOW_ACCUMULATE
