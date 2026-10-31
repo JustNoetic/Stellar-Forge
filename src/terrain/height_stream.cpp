@@ -1,6 +1,7 @@
 #include "terrain/height_stream.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace sf::terrain {
 namespace {
@@ -19,7 +20,8 @@ public:
     explicit Baker(const HeightSource& source) : source_(source) {}
     uint64_t reads = 0;
 
-    HeightGeometry bake(TileId tile) {
+    HeightGeometry bake(TileId tile, double floor_m) {
+        floor_m_ = floor_m;
         const auto& info = source_.info();
         uint32_t level = info.cubic ? std::min(tile.level, info.data_level) : info.data_level;
         double width = std::ldexp(2.0, -int(tile.level));
@@ -51,7 +53,7 @@ private:
         double n = double(1u << level);
         double x = ((at.u+1)*.5*n-tile.x)*GRID_CELLS;
         double y = ((at.v+1)*.5*n-tile.y)*GRID_CELLS;
-        double height = (cubic ? height_sample_cubic(payload, x, y) : height_sample(payload, x, y)) / info.equatorial_radius_m;
+        double height = std::max(cubic ? height_sample_cubic(payload, x, y) : height_sample(payload, x, y), floor_m_) / info.equatorial_radius_m;
         auto scale = glm::dvec3(1, info.polar_ratio, 1);
         return direction*scale + glm::normalize(direction/scale)*height;
     }
@@ -71,6 +73,7 @@ private:
     }
 
     const HeightSource& source_;
+    double floor_m_ = -std::numeric_limits<double>::infinity();
     std::list<std::pair<TileId, HeightTile>> payloads_;
 };
 
@@ -136,7 +139,7 @@ void HeightStream::run(std::stop_token stop) {
         }
         std::shared_ptr<HeightGeometry> geometry;
         std::string error;
-        try { geometry = std::make_shared<HeightGeometry>(baker.bake(tile)); }
+        try { geometry = std::make_shared<HeightGeometry>(baker.bake(tile, floor_m_.load())); }
         catch (const std::exception& failure) { error = failure.what(); }
         {
             std::lock_guard lock(mutex_);

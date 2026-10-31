@@ -1,9 +1,9 @@
 vec2 secondary_extent[ATMOSPHERE_SECONDARY_LIGHTS];
 vec3 secondary_rayleigh[ATMOSPHERE_SECONDARY_LIGHTS];
 #ifdef ATMOSPHERE_SECONDARY_RING
-vec4 secondary_ring_shape[ATMOSPHERE_SECONDARY_LIGHTS];
-vec3 secondary_ring_pole[ATMOSPHERE_SECONDARY_LIGHTS];
-vec3 secondary_ring_contrast[ATMOSPHERE_SECONDARY_LIGHTS];
+#include "ringshine_lookup.glsl"
+vec3 secondary_ring_pole, secondary_ring_scale, secondary_ring_stars;
+int secondary_ring_host;
 #endif
 #ifndef ATMOSPHERE_RAYLEIGH_ONLY
 vec3 secondary_mie[ATMOSPHERE_SECONDARY_LIGHTS];
@@ -16,11 +16,13 @@ void prepare_secondary(vec3 view) {
     for (int s = 0; s < ATMOSPHERE_SECONDARY_LIGHTS; ++s) {
 #ifdef ATMOSPHERE_SECONDARY_RING
         if (secondary.direction[s].w < 0.0) {
-            float outer = length(secondary.direction[s].xyz), inner = -secondary.direction[s].w;
-            secondary_ring_shape[s] = vec4(inner*inner,outer*outer,sqrt(0.5*(inner*inner+outer*outer)),outer*outer-inner*inner);
-            secondary_ring_pole[s] = secondary.direction[s].xyz/outer;
-            uint packed = uint(secondary.irradiance[s].w);
-            secondary_ring_contrast[s] = vec3(packed&255u,(packed>>8u)&255u,(packed>>16u)&255u)/127.0-1.0;
+            vec3 pole = atm.world_pole.xyz;
+            secondary_ring_pole = normalize(vec3(dot(pole, atm.axis_x.xyz), dot(pole, atm.axis_y.xyz), dot(pole, atm.axis_z.xyz)));
+            secondary_ring_scale = secondary.irradiance[s].rgb*secondary.irradiance[s].w;
+            secondary_ring_host = int(-secondary.direction[s].w)-1;
+            vec3 stars = vec3(0.0);
+            for (int star = 0; star < int(atm.camera.w); ++star) stars += atm.sun_irradiance[star].rgb;
+            secondary_ring_stars = mix(vec3(0.0), 1.0/max(stars, vec3(1e-30)), greaterThan(stars, vec3(0.0)));
             continue;
         }
 #endif
@@ -39,27 +41,32 @@ void prepare_secondary(vec3 view) {
 
 #ifdef ATMOSPHERE_SECONDARY_RING
 vec3 diffuse_ring_irradiance(int s, vec3 p, out float mu) {
-    vec4 shape = secondary_ring_shape[s];
-    vec3 pole = secondary_ring_pole[s];
-    vec3 point = p/atm.reference_shape.x;
-    float height = dot(point,pole), radius2 = dot(point,point);
-    float planar = sqrt(max(radius2-height*height,0.0));
-    float floor_radius = min(atm.reference_shape.z/atm.reference_shape.x,sqrt(radius2));
-    float altitude = sqrt(max(radius2-floor_radius*floor_radius,0.0));
-    float first = max(sqrt(shape.x),floor_radius*radius2/max(floor_radius*planar+abs(height)*altitude,1e-7));
-    float inner2 = min(first*first,shape.y);
-    float ring = sqrt(0.5*(inner2+shape.y));
-    float threshold = floor_radius*floor_radius-altitude*sqrt(max(ring*ring-floor_radius*floor_radius,0.0));
-    float contact = planar > 1e-7 ? clamp(threshold/(ring*planar),-1.0,1.0) : (threshold < 0.0 ? -1.0 : 1.0);
-    float limit = acos(contact);
-    float cosine = limit > 1e-4 ? sqrt(max(1.0-contact*contact,0.0))/limit : 1.0;
-    float distance2 = max(ring*ring+radius2-2.0*ring*planar*cosine,1e-6);
-    mu = clamp((ring*planar*cosine-radius2)*inversesqrt(radius2*distance2),-1.0,1.0);
-    float physical_height = height*atm.reference_shape.y;
-    float physical_distance2 = max(distance2-height*height+physical_height*physical_height,1e-6);
-    float omega = min(2.0*ATM_PI,(shape.y-inner2)*limit*abs(physical_height)
-        /(physical_distance2*sqrt(physical_distance2)));
-    return secondary.irradiance[s].rgb*omega*max(vec3(1.0)+sign(height)*secondary_ring_contrast[s],vec3(0.0));
+    mu = 0.0;
+    vec3 pole = secondary_ring_pole;
+    vec3 physical = p-pole*dot(p, pole)*(1.0-atm.reference_shape.y);
+    float slat = dot(physical, pole)/max(length(physical), 1e-20);
+    vec3 planar = p-pole*dot(p, pole);
+    float planar_length = length(planar);
+    planar = planar_length > 1e-20 ? planar/planar_length : normalize(cross(pole, abs(pole.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0)));
+    vec3 light = vec3(0.0);
+    float cosine = 0.0, scalar = 0.0;
+    for (int star = 0; star < int(atm.camera.w); ++star) {
+        vec3 weight = atm.sun_irradiance[star].rgb*secondary_ring_stars;
+        if (!any(greaterThan(weight, vec3(0.0)))) continue;
+        vec3 anti = -atm.sun_direction[star].xyz;
+        anti -= pole*dot(anti, pole);
+        float anti_length = length(anti);
+        anti = anti_length > 1e-6 ? anti/anti_length : planar;
+        float phi = atan(dot(cross(anti, planar), pole), dot(planar, anti));
+        vec4 tile = ringshine_sample_rgba(phi, slat, secondary_ring_host, star);
+        float projected = dot(tile.rgb, vec3(0.2126, 0.7152, 0.0722)), share = dot(weight, vec3(0.2126, 0.7152, 0.0722));
+        if (projected > 0.0) light += weight*tile.rgb*(tile.a/projected);
+        cosine += share*projected;
+        scalar += share*tile.a;
+    }
+    if (!(scalar > 0.0)) return vec3(0.0);
+    mu = clamp(cosine/scalar, 0.0, 1.0);
+    return secondary_ring_scale*light;
 }
 #endif
 

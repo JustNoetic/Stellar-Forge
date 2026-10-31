@@ -228,6 +228,22 @@ ImGuiWindowFlags UiSystem::prepare_side_panel(const WorkspaceSettings& settings,
     return flags;
 }
 
+float panel_footer_height(int button_rows, std::string_view notice) {
+    const auto& style = ImGui::GetStyle();
+    float height = 1.0f + style.ItemSpacing.y + button_rows * ImGui::GetFrameHeightWithSpacing();
+    if (!notice.empty()) {
+        height += ImGui::CalcTextSize(notice.data(), notice.data() + notice.size(), false,
+                                     ImGui::GetContentRegionAvail().x).y + style.ItemSpacing.y;
+    }
+    return height;
+}
+
+void begin_panel_content(const char* id, float footer_height) {
+    float height = std::max(4.0f, ImGui::GetContentRegionAvail().y - footer_height - ImGui::GetStyle().ItemSpacing.y);
+    ImGui::BeginChild(id, ImVec2(0.0f, height), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+}
+
 bool UiSystem::begin_settings(WorkspaceSettings& settings, const WorkspaceState& state) {
     if (!settings.show_settings) return false;
     const auto layout = compute_layout(settings, state, 0.0f, 0.0f);

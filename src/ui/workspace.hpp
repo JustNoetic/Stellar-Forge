@@ -67,6 +67,8 @@ void heading(std::string_view title, std::string_view subtitle = {});
 void section(std::string_view title, std::string_view note = {});
 void value_row(std::string_view label, std::string_view value);
 void metric_text(std::string_view text);
+float panel_footer_height(int button_rows, std::string_view notice = {});
+void begin_panel_content(const char* id, float footer_height);
 
 bool render_star_creator_widgets(StarCreatorDraft& draft);
 

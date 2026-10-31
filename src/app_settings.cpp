@@ -20,6 +20,40 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
         });
         ImGui::Checkbox("HDR Rendering", &render_draft.hdr_enabled);
         ImGui::Checkbox("VSync", &render_draft.vsync);
+        ui::section("Bloom & diffraction");
+        ImGui::BeginDisabled(!render_draft.hdr_enabled);
+        ui::field("Bloom", [&](const char* id) {
+            const char* modes[] = {"Off", "Fast", "Four-spike"};
+            int mode = int(render_draft.bloom_mode);
+            if (ImGui::Combo(id, &mode, modes, 3)) render_draft.bloom_mode = uint32_t(mode);
+        });
+        ImGui::BeginDisabled(render_draft.bloom_mode == 0);
+        ui::field("Scatter strength", [&](const char* id) {
+            ImGui::SliderFloat(id, &render_draft.bloom_strength, 0.0f, 0.3f, "%.3f");
+        });
+        ui::field("Highlight limit", [&](const char* id) {
+            ImGui::SliderFloat(id, &render_draft.bloom_highlight_limit, 1.0f, 4096.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Limits glare from overexposed sources. Lower values keep halos and spike tips softer.");
+        });
+        if (render_draft.bloom_mode == 2) {
+            ui::field("Spike length", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.bloom_radius, 0.25f, 4.0f, "%.2fx");
+            });
+            ui::field("Spike strength", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.bloom_diffraction, 0.0f, 1.0f, "%.2f");
+            });
+            ui::field("Spike rotation", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.bloom_rotation_deg, 0.0f, 90.0f, "%.0f deg");
+            });
+            ui::field("Spike threshold", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.bloom_spike_threshold, 0.25f, 4096.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("HDR brightness where pixels start casting spikes; they reach full spike strength at twice this value.");
+            });
+        }
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if ((render_draft.transparency_reference_legacy || !vk_.fragment_stores_enabled()) && render_draft.show_orbits)
+            ImGui::TextDisabled("Bloom is bypassed while orbit guides use legacy blending.");
         ui::section("Star appearance");
         ui::field("Point Diameter##star_pt", [&](const char* id) {
             ImGui::SliderFloat(id, &render_draft.star_point_size, 1.5f, 6.0f, "%.1f px");
@@ -110,6 +144,18 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
         if (render_draft.direct_sunlight_only) ImGui::TextWrapped("Turn off direct sunlight only to adjust reflected lighting.");
         ImGui::Checkbox("Eclipse refraction", &render_draft.eclipse_refraction_enabled);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Adds approximate atmospheric colouring to eclipse shadows using cached textures.");
+        ImGui::Checkbox("Oceans", &render_draft.oceans_enabled);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Wind-driven ocean surfaces with filtered wave specular, sky reflection and foam on bodies with an ocean definition.");
+        ImGui::Checkbox("Clouds", &render_draft.clouds_enabled);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Texture-mapped or volumetric clouds on bodies with a cloud definition.");
+        ImGui::BeginDisabled(!render_draft.clouds_enabled);
+        ui::field("Cloud rendering", [&](const char* id) {
+            const char* modes[] = {"2D texture", "Volumetric (experimental)"};
+            int mode = int(render_draft.cloud_mode);
+            if (ImGui::Combo(id, &mode, modes, 2)) render_draft.cloud_mode = uint32_t(mode);
+        });
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("2D uses a thin cloud shell with filtered coverage. Volumetric marches through cloud columns.");
+        ImGui::EndDisabled();
         ImGui::BeginDisabled(render_draft.direct_sunlight_only);
         ImGui::Checkbox("Planetshine", &render_draft.planetshine_enabled);
         ImGui::EndDisabled();

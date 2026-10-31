@@ -654,28 +654,27 @@ glm::vec4 apply_hsba_pixel(glm::vec4 rgba, float hue_shift, float saturation, fl
     return glm::vec4(glm::clamp(rgb_out, glm::vec3(0.0f), glm::vec3(1.0f)), a_out);
 }
 
-std::array<AtmosphereRingMaterial, 2> atmosphere_ring_materials(
+std::vector<AtmosphereRingMaterial> atmosphere_ring_materials(
     std::span<const ephemeris::RingLayerDefinition> layers,
     std::span<const std::vector<glm::vec4>> profiles) {
-    std::array<AtmosphereRingMaterial, 2> result{};
+    std::vector<AtmosphereRingMaterial> result;
     if (profiles.empty() || layers.empty()) return result;
     layers = layers.first(std::min(layers.size(), profiles.size()));
-    double inner = layers.front().inner, outer = layers.front().outer;
     std::vector<double> boundaries;
-    for (const auto& layer : layers) {
-        inner = std::min(inner, layer.inner); outer = std::max(outer, layer.outer);
-        boundaries.push_back(layer.inner); boundaries.push_back(layer.outer);
-    }
-    double middle = std::sqrt(.5*(inner*inner+outer*outer));
-    boundaries.push_back(middle);
+    for (const auto& layer : layers) { boundaries.push_back(layer.inner); boundaries.push_back(layer.outer); }
     std::sort(boundaries.begin(), boundaries.end());
     boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
-    struct Moment { double weight = 0, radius = 0, textured = 0; glm::dvec3 color{}; glm::dvec4 props{}; };
-    std::array<Moment, 2> moments{};
+    if (boundaries.size() < 2) return result;
+    double span = boundaries.back()-boundaries.front();
+    struct Moment { double area = 0, weight = 0, radius = 0, textured = 0; glm::dvec3 color{}; glm::dvec4 props{}; };
+    std::vector<Moment> samples;
+    double total = 0;
     for (size_t interval = 1; interval < boundaries.size(); ++interval) {
         double lo = boundaries[interval-1], hi = boundaries[interval];
-        for (int sample = 0; sample < 64; ++sample) {
-            double radius = std::lerp(lo, hi, (sample+.5)/64.0), total_tau = 0;
+        int count = std::max(16, int(std::ceil(double(RING_ATLAS_WIDTH)*(hi-lo)/span)));
+        for (int sample = 0; sample < count; ++sample) {
+            double a = std::lerp(lo, hi, double(sample)/count), b = std::lerp(lo, hi, double(sample+1)/count);
+            double radius = .5*(a+b), total_tau = 0;
             glm::dvec3 color(0); glm::dvec4 props(0); double textured = 0;
             for (size_t layer = 0; layer < layers.size(); ++layer) {
                 const auto& material = layers[layer]; const auto& profile = profiles[layer];
@@ -689,23 +688,35 @@ std::array<AtmosphereRingMaterial, 2> atmosphere_ring_materials(
                 props += glm::dvec4(material.asymmetry,material.backscatter,material.scatter,material.unlit_factor)*tau;
                 textured += material.is_textured ? tau : 0;
             }
-            if (total_tau <= 0) continue;
-            double weight = 2*PI*radius*(hi-lo)/64.0*(-std::expm1(-total_tau));
-            auto& moment = moments[radius < middle ? 0 : 1];
-            moment.weight += weight; moment.radius += radius*weight;
-            moment.color += color*(weight/total_tau); moment.props += props*(weight/total_tau);
-            moment.textured += textured*(weight/total_tau);
+            Moment moment{PI*(b*b-a*a)};
+            if (total_tau > 0) {
+                moment.weight = moment.area*(-std::expm1(-total_tau));
+                moment.radius = radius*moment.weight;
+                moment.color = color*(moment.weight/total_tau); moment.props = props*(moment.weight/total_tau);
+                moment.textured = textured*(moment.weight/total_tau);
+                total += moment.weight;
+            }
+            samples.push_back(moment);
         }
     }
-    for (int bin = 0; bin < 2; ++bin) {
-        const auto& moment = moments[bin];
-        if (moment.weight <= 0) continue;
-        double area = PI*(bin == 0 ? middle*middle-inner*inner : outer*outer-middle*middle);
-        result[bin].radius_area_tau = {float(moment.radius/moment.weight),float(area),
-            float(-std::log1p(-std::clamp(moment.weight/area,0.0,double(RING_MAX_ALPHA)))),0};
-        result[bin].color_textured = {glm::vec3(moment.color/moment.weight),float(moment.textured/moment.weight)};
-        result[bin].properties = glm::vec4(moment.props/moment.weight);
+    if (total <= 0) return result;
+    Moment bin;
+    auto close = [&] {
+        if (bin.weight <= 0) { bin = {}; return; }
+        auto& material = result.emplace_back();
+        material.radius_area_tau = {float(bin.radius/bin.weight),float(bin.area),
+            float(-std::log1p(-std::clamp(bin.weight/bin.area,0.0,double(RING_MAX_ALPHA)))),0};
+        material.color_textured = {glm::vec3(bin.color/bin.weight),float(bin.textured/bin.weight)};
+        material.properties = glm::vec4(bin.props/bin.weight);
+        bin = {};
+    };
+    for (const auto& sample : samples) {
+        if (sample.weight <= 0) { close(); continue; }
+        bin.area += sample.area; bin.weight += sample.weight; bin.radius += sample.radius;
+        bin.color += sample.color; bin.props += sample.props; bin.textured += sample.textured;
+        if (bin.weight >= total/64) close();
     }
+    close();
     return result;
 }
 

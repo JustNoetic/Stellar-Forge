@@ -37,24 +37,22 @@ vec3 ringshine_material_radiance(float mu_v, float sun, float mu, bool lit) {
     return response;
 }
 
-// Four-point cubature over a uniform-radiance stellar cap. Two Gaussian
-// polar nodes are paired antipodally; their azimuth rotates across radial
-// nodes so the ring integral also covers the disk's horizontal extent.
 vec4 ringshine_disk_sample(vec3 center, int i, uint radial_index) {
     float sr = min(u_push.solar.y, 0.999);
     float edge_cosine = sqrt(max(1e-6, 1.0 - sr * sr));
     vec3 vertical = vec3(0.0, 1.0, 0.0) - center * center.y;
     vertical = dot(vertical, vertical) > 1e-12 ? normalize(vertical) : vec3(1.0, 0.0, 0.0);
     vec3 horizontal = cross(center, vertical);
-    int pair = i / 2;
-    float u = pair == 0 ? 0.211324865405 : 0.788675134595;
-    float angle = 6.28318530718 * fract((float(radial_index) + 0.5) * 0.569840290998 + float(pair) * 0.25);
+    float u = (radial_index & 1u) == 0u ? 0.211324865405 : 0.788675134595;
+    float angle = 6.28318530718 * fract((float(radial_index) + 0.5) * 0.569840290998);
     // Stable for tiny apparent disks, where 1 - edge_cosine rounds to zero.
     float one_minus_c = u * (sr * sr / (1.0 + edge_cosine));
     float c = 1.0 - one_minus_c;
     float s = sqrt(max(0.0, one_minus_c * (2.0 - one_minus_c)));
-    vec3 tangent = vertical * cos(angle) + horizontal * sin(angle);
-    if ((i & 1) != 0) tangent = -tangent;
+    float v = cos(angle), h = sin(angle);
+    if ((i & 1) != 0) v = -v;
+    if ((i & 2) != 0) h = -h;
+    vec3 tangent = vertical * v + horizontal * h;
     // dOmega / (pi sin(alpha)^2): unit perpendicular incident irradiance.
     return vec4(center * c + tangent * s, 0.5 / (1.0 + edge_cosine));
 }
@@ -69,12 +67,12 @@ void main() {
     int segments = int(u_push.solar.z);
     float host_radius = ring_hosts[u_push.tile.x].tangent_radius.w;
 
-    vec2 coord = (v_uv * vec2(128.0, 65.0) - 0.5) / vec2(127.0, 64.0);
-    float x = 2.0 * coord.x - 1.0, y = 2.0 * coord.y - 1.0;
-    float phi = sign(x) * pow(abs(x), 1.5) * 3.14159265358979323846;
+    vec2 coord = clamp((v_uv * vec2(65.0) - 0.5) / vec2(64.0), 0.0, 1.0);
+    float y = 2.0 * coord.y - 1.0;
+    float phi = pow(coord.x, 1.5) * 3.14159265358979323846;
     float slat = sign(y) * pow(abs(y), 1.5);
 
-    vec3 total = vec3(0.0);
+    vec4 total = vec4(0.0);
     for (uint node = 0u; node < u_push.tile.w; ++node) {
         vec2 radial = ringshine_nodes[u_push.tile.z + node];
         float r = radial.x;
@@ -97,7 +95,7 @@ void main() {
         }
         if (material_tau <= 0.0) continue;
 
-        vec3 response = vec3(0.0);
+        vec4 response = vec4(0.0);
         int sources = (u_push.solar.y > 1e-6 && (u_push.solar.y >= 0.01 || abs(sun) < 2.0*u_push.solar.y)) ? 4 : 1;
         for (int q = 0; q < sources; ++q) {
 
@@ -107,5 +105,5 @@ void main() {
         }
         total += response * radial.y;
     }
-    out_color = vec4(total, 1.0);
+    out_color = total;
 }

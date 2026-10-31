@@ -81,7 +81,7 @@ def recommended_lod(image_path):
 
 
 def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodetic",
-               backend="auto", sampler=None, rebake=False):
+               backend="auto", sampler=None, rebake=False, progress_cb=None):
     output = Path(output)
     if not 0 <= level <= 5 or not .05 <= polar <= 1 or not math.isfinite(prime):
         raise ValueError("Albedo requires data LOD 0..5 and a valid oblate reference shape")
@@ -89,11 +89,16 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
         raise ValueError("Unknown source latitude convention")
     provenance = dict(source_sha256=file_hash(source_path), polar_ratio=polar, prime_meridian_rad=prime,
                       latitude=latitude, data_level=level, core=CORE, gutter=GUTTER, version=1)
+    total_tiles = 2 * (4**(level + 1) - 1)
     if output.exists() and not rebake:
         existing = json.loads((output/"manifest.json").read_text(encoding="utf-8"))
         if existing.get("provenance") != provenance:
             raise ValueError("Existing albedo dataset differs; choose a new output directory or pass --rebake")
+        if progress_cb is not None:
+            progress_cb(total_tiles, total_tiles, f"Using cached Albedo LOD 0..{level}")
         return existing
+    if progress_cb is not None:
+        progress_cb(0, total_tiles, "Building linear-light mip pyramid...")
     with Image.open(source_path) as image:
         source = np.asarray(image.convert("RGB"))
     pyramid = [source]
@@ -133,6 +138,8 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
                         encoded = tile.tobytes()
                         payload.write(encoded)
                         checksums.append(zlib.crc32(encoded))
+                    if progress_cb is not None:
+                        progress_cb(len(checksums), total_tiles, f"Baking Albedo LOD {depth}/{level} (CUDA)")
                 else:
                     for face in range(6):
                         for ty in range(1 << depth):
@@ -143,6 +150,8 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
                                 encoded = rgba.tobytes()
                                 payload.write(encoded)
                                 checksums.append(zlib.crc32(encoded))
+                        if progress_cb is not None:
+                            progress_cb(len(checksums), total_tiles, f"Baking Albedo LOD {depth}/{level} (CPU face {face+1}/6)")
         manifest = dict(version=1, encoding="rgba8-srgb", projection="engine-oblate-cube-v1",
                         orientation="x-east-y-north-z-prime", data_level=level, core=CORE, gutter=GUTTER,
                         polar_ratio=polar, prime_meridian_rad=prime, latitude=latitude,
@@ -261,6 +270,14 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
     root, output_root = Path(root), Path(output_root)
     project = Path(__file__).resolve().parents[1]
     definitions = {body["name"]: body for body in json.loads((project/"data/system.json").read_text())}
+    user_solar = project/"data/systems/Solar System/system.json"
+    if user_solar.exists():
+        for body in json.loads(user_solar.read_text()):
+            name = body.get("name")
+            if name in definitions:
+                hr = body.get("height_range_km")
+                if isinstance(hr, list) and len(hr) == 2 and (hr[0] != 0 or hr[1] != 0):
+                    definitions[name]["height_range_km"] = hr
     constants = (project/"src/core/constants.hpp").read_text()
     solar_radius_m = float(re.search(r"SOLAR_RADIUS_KM\s*=\s*([\d.]+)", constants).group(1))*1000
 
@@ -338,6 +355,130 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
     return 0
 
 
+def inspect_image_cli(source_file, preview_out=None):
+    source_file = Path(source_file)
+    with Image.open(source_file) as img:
+        w, h = img.size
+        rec = min(5, max(0, math.ceil(math.log2(max(1, w / (CORE * 4))))))
+        if preview_out is not None:
+            pw, ph = 512, 256
+            if img.mode in ("I;16", "I", "F"):
+                raw = np.asarray(img, dtype=np.float32)
+                if raw.ndim > 2:
+                    raw = raw[:, :, 0]
+                rmin, rmax = float(np.nanmin(raw)), float(np.nanmax(raw))
+                norm = (raw - rmin) / (rmax - rmin) if rmax > rmin else np.zeros_like(raw)
+                gray = Image.fromarray(np.rint(np.clip(norm, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
+                rgba_img = gray.resize((pw, ph), Image.Resampling.BILINEAR).convert("RGBA")
+            else:
+                rgba_img = img.convert("RGBA").resize((pw, ph), Image.Resampling.BILINEAR)
+            Path(preview_out).write_bytes(np.asarray(rgba_img, dtype=np.uint8).tobytes())
+    print(f"INSPECT|{w}|{h}|{rec}", flush=True)
+    return 0
+
+
+def bake_single_body(body_name, map_type, source_file, output_root, catalog_path,
+                     level=None, polar=1.0, radius_m=6371000.0, height_min_km=-10.0, height_max_km=10.0,
+                     backend="auto", copy_to_dir=None, rebake=True):
+    from import_terrain import ImageRaster, import_tiles
+    project = Path(__file__).resolve().parents[1]
+    source_file = Path(source_file)
+    output_root = Path(output_root)
+    catalog_path = Path(catalog_path)
+    if not source_file.is_file():
+        raise FileNotFoundError(f"Source image not found: {source_file}")
+
+    sampler = None
+    cuda_name = None
+    if backend in ("auto", "cuda"):
+        try:
+            from scripts.cuda_tile_sampler import is_cuda_available, CudaTileSampler
+            ok, name = is_cuda_available()
+            if ok:
+                cuda_name = name
+                sampler = CudaTileSampler(DECODE, ENCODE)
+            elif backend == "cuda":
+                raise RuntimeError(f"CUDA required but unavailable: {name}")
+        except Exception as exc:
+            if backend == "cuda":
+                raise RuntimeError(f"CUDA initialization failed: {exc}") from exc
+            sampler = None
+
+    backend_str = f"CUDA ({cuda_name})" if sampler is not None else "CPU (NumPy)"
+    print(f"BACKEND|{backend_str}", flush=True)
+
+    if copy_to_dir is not None:
+        dest_dir = Path(copy_to_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stem = body_name if map_type == "albedo" else f"{body_name}_heightmap"
+        ext = source_file.suffix.lower() or ".png"
+        dest_path = dest_dir / f"{stem}{ext}"
+        for existing_file in dest_dir.iterdir():
+            if existing_file.is_file() and existing_file.stem.casefold() == stem.casefold() and existing_file.resolve() != dest_path.resolve():
+                try:
+                    existing_file.unlink()
+                except OSError:
+                    pass
+        if source_file.resolve() != dest_path.resolve():
+            shutil.copy2(source_file, dest_path)
+        source_file = dest_path
+
+    lod = int(level) if level is not None else recommended_lod(source_file)
+    lod = max(0, min(5, lod))
+    polar = max(0.05, min(1.0, float(polar)))
+
+    def report_progress(done, total, msg):
+        print(f"PROGRESS|{done}|{total}|{msg}", flush=True)
+
+    existing = json.loads(catalog_path.read_text(encoding="utf-8")) if catalog_path.exists() else {"version": 1, "bodies": []}
+    existing_map = {item["body"]: dict(item) for item in existing.get("bodies", [])}
+    binding = existing_map.get(body_name, {"body": body_name})
+
+    if map_type == "albedo":
+        fingerprint = hashlib.sha256(f"{file_hash(source_file)}:{polar}:{lod}:geodetic-v1".encode()).hexdigest()[:12]
+        albedo_out = output_root / body_name.lower() / fingerprint / "albedo"
+        bake_color(source_file, albedo_out, lod, polar, backend=backend, sampler=sampler,
+                   rebake=rebake, progress_cb=report_progress)
+        rel_path = albedo_out.resolve().relative_to(project).as_posix()
+        binding["albedo"] = rel_path
+        existing_map[body_name] = binding
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path.write_text(json.dumps(dict(version=1, bodies=list(existing_map.values())), indent=2) + "\n", encoding="utf-8")
+        print(f"RESULT|albedo|{rel_path}", flush=True)
+    elif map_type == "height":
+        low_m = float(height_min_km) * 1000.0
+        high_m = float(height_max_km) * 1000.0
+        radius_m = float(radius_m)
+        if low_m > high_m:
+            raise ValueError("Minimum elevation must not exceed maximum elevation")
+        if max(abs(low_m), abs(high_m)) >= radius_m * 0.01:
+            raise ValueError(f"Elevation range [{height_min_km:.2f}, {height_max_km:.2f}] km exceeds 1% of equatorial radius ({radius_m * 0.00001:.2f} km)")
+        height_tag = hashlib.sha256(f"{file_hash(source_file)}:{polar}:{radius_m}:{low_m}:{high_m}:{lod}:{CORE}:cubic-v1".encode()).hexdigest()[:12]
+        height_out = output_root / body_name.lower() / height_tag / "height"
+        if height_out.exists():
+            shutil.rmtree(height_out)
+        raster = ImageRaster(source_file, height_range_m=(low_m, high_m))
+        import_tiles(
+            height_out, lod, radius_m, polar, 0,
+            lambda lon, lat, direction: raster.sample(lon, lat),
+            dict(source_sha256=file_hash(source_file), scale=raster.scale, offset=raster.offset,
+                 interpretation="legacy-visual-range-no-geoid-correction", source_height_range_m=[low_m, high_m]),
+            f"{body_name} legacy visual elevation",
+            cells=CORE, gutter=GUTTER, reconstruction="cubic-bspline",
+            raster=raster, cuda_sampler=sampler, progress_cb=report_progress
+        )
+        rel_path = height_out.resolve().relative_to(project).as_posix()
+        binding["height"] = rel_path
+        existing_map[body_name] = binding
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path.write_text(json.dumps(dict(version=1, bodies=list(existing_map.values())), indent=2) + "\n", encoding="utf-8")
+        print(f"RESULT|height|{rel_path}", flush=True)
+    else:
+        raise ValueError(f"Unsupported map type: {map_type}")
+
+    return 0
+
+
 def main():
     project = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Bake source color maps into linear-filtered sRGB cube tile packs")
@@ -350,8 +491,40 @@ def main():
     parser.add_argument("--rebake", action="store_true", help="Force rebaking even if tile pack exists")
     parser.add_argument("--interactive", action="store_true", help="Launch interactive wizard")
     parser.add_argument("--list", action="store_true", help="List detected maps and exit")
+    parser.add_argument("--inspect-image", type=Path, default=None, help="Inspect image dimensions/LOD and optionally write 512x256 RGBA preview")
+    parser.add_argument("--preview-out", type=Path, default=None, help="Raw 512x256 RGBA output path for --inspect-image")
+    parser.add_argument("--single-body", type=str, default=None, help="Single body name for direct in-sim baking")
+    parser.add_argument("--map-type", choices=("albedo", "height"), default="albedo", help="Map layer type for --single-body")
+    parser.add_argument("--source-file", type=Path, default=None, help="Direct source image file for --single-body")
+    parser.add_argument("--polar-ratio", type=float, default=1.0, help="Oblate polar ratio (1 - oblateness) for --single-body")
+    parser.add_argument("--radius-m", type=float, default=6371000.0, help="Equatorial radius in meters for --single-body")
+    parser.add_argument("--height-min-km", type=float, default=-10.0, help="Minimum elevation in km for --single-body height")
+    parser.add_argument("--height-max-km", type=float, default=10.0, help="Maximum elevation in km for --single-body height")
+    parser.add_argument("--copy-to-dir", type=Path, default=None, help="Optional directory to copy staged source file into")
 
     args = parser.parse_args()
+
+    if args.inspect_image is not None:
+        return inspect_image_cli(args.inspect_image, args.preview_out)
+
+    if args.single_body is not None:
+        if args.source_file is None:
+            raise ValueError("--single-body requires --source-file")
+        return bake_single_body(
+            body_name=args.single_body,
+            map_type=args.map_type,
+            source_file=args.source_file,
+            output_root=args.output_root,
+            catalog_path=args.catalog,
+            level=args.level,
+            polar=args.polar_ratio,
+            radius_m=args.radius_m,
+            height_min_km=args.height_min_km,
+            height_max_km=args.height_max_km,
+            backend=args.backend,
+            copy_to_dir=args.copy_to_dir,
+            rebake=True,
+        )
 
     # Determine if we should run interactively
     no_explicit_action = (len(sys.argv) <= 1)
@@ -359,6 +532,14 @@ def main():
 
     if args.list:
         definitions = {body["name"]: body for body in json.loads((project/"data/system.json").read_text())}
+    user_solar = project/"data/systems/Solar System/system.json"
+    if user_solar.exists():
+        for body in json.loads(user_solar.read_text()):
+            name = body.get("name")
+            if name in definitions:
+                hr = body.get("height_range_km")
+                if isinstance(hr, list) and len(hr) == 2 and (hr[0] != 0 or hr[1] != 0):
+                    definitions[name]["height_range_km"] = hr
         items = discover_available_bodies(args.source_root, definitions)
         print(f"Found {len(items)} bodies in {args.source_root}:")
         for idx, item in enumerate(items, 1):

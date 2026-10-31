@@ -12,8 +12,9 @@ void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, AERIAL_SIZE.xy))) return;
     vec3 d = sky_direction(pixel);
-    vec2 segment = angular_segment(pixel, d);
-    float range = segment.y-segment.x;
+    float range;
+    vec2 segment = angular_segment(pixel, d, range);
+    vec3 origin = atmosphere_entry(d, segment.x);
     imageStore(range_lut, pixel, vec4(range));
     vec3 L = vec3(0.0), tau = vec3(0.0);
     float previous = 0.0;
@@ -21,7 +22,7 @@ void main() {
     imageStore(optical_depth_lut, ivec3(pixel, 0), vec4(0.0));
     for (int slice = 1; slice < AERIAL_SIZE.z; ++slice) {
         float end = aerial_distance(float(slice)/float(AERIAL_SIZE.z-1), range);
-        integrate_atmosphere(transmittance_lut, multiscatter_lut, d, segment.x+previous, end-previous, L, tau);
+        integrate_atmosphere(transmittance_lut, multiscatter_lut, origin, d, previous, end-previous, L, tau);
         previous = end;
         imageStore(radiance_lut, ivec3(pixel, slice), vec4(min(L, vec3(65000.0)), 1.0));
         imageStore(optical_depth_lut, ivec3(pixel, slice), vec4(min(tau, vec3(65000.0)), 1.0));

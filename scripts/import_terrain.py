@@ -87,7 +87,16 @@ class ImageRaster:
         from PIL import Image
         Image.MAX_IMAGE_PIXELS = 268435456
         with Image.open(path) as image:
-            self.values = np.asarray(image if image.mode in ("I;16", "I", "F", "L") else image.convert("L"))
+            raw = np.asarray(image if image.mode in ("I;16", "I", "F", "L") else image.convert("L"))
+        if raw.ndim > 2:
+            raw = raw[:, :, 0]
+        if raw.dtype in (np.int32, np.uint32, np.int64, np.uint64):
+            raw = np.clip(raw, 0, 65535).astype(np.uint16 if raw.max() > 255 else np.uint8)
+        elif raw.dtype in (np.float32, np.float64):
+            rmin, rmax = float(np.nanmin(raw)), float(np.nanmax(raw))
+            norm = (raw - rmin) / (rmax - rmin) if rmax > rmin else np.zeros_like(raw)
+            raw = np.rint(np.clip(norm, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        self.values = raw
         self.height, self.width = self.values.shape
         if height_range_m is not None:
             low, high = float(height_range_m[0]), float(height_range_m[1])
@@ -229,7 +238,8 @@ def _midpoint_residual_2x(g):
 
 
 def import_dense_tiles(output, level, radius, polar, prime, sampler, provenance, name,
-                       cells=128, gutter=2, reconstruction="cubic-bspline", raster=None, cuda_sampler=None):
+                       cells=128, gutter=2, reconstruction="cubic-bspline", raster=None, cuda_sampler=None,
+                       progress_cb=None):
     import numpy as np
     count = 2 * (4**(level+1)-1)
     if not 0 <= level <= 5 or count > MAX_TILES:
@@ -252,6 +262,8 @@ def import_dense_tiles(output, level, radius, polar, prime, sampler, provenance,
         except Exception:
             cuda_sampler = None
 
+    if progress_cb is not None:
+        progress_cb(0, count, "Sampling elevation cube faces...")
     if raster is not None and cuda_sampler is not None:
         face_grids, encoding_error = cuda_sampler.sample_height_faces(
             raster.values, finest, polar, prime, raster.scale, raster.offset
@@ -353,6 +365,7 @@ def import_dense_tiles(output, level, radius, polar, prime, sampler, provenance,
         step = cells // 16
 
         payload_path = temporary / "heights.bin"
+        done_tiles = 0
         with payload_path.open("w+b") as payload:
             payload.truncate(offset)
             for depth in range(level, -1, -1):
@@ -419,6 +432,9 @@ def import_dense_tiles(output, level, radius, polar, prime, sampler, provenance,
                     for i, (tx, ty, low, high, error, gradient) in enumerate(face_meta):
                         key = face, depth, tx, ty
                         records[key] = [*key, offsets[key], int(csums[i]), low, high, error, gradient]
+                    done_tiles += n * n
+                    if progress_cb is not None:
+                        progress_cb(done_tiles, count, f"Baking Elevation LOD {depth}/{level} (face {face+1}/6)")
 
         manifest = dict(version=1, encoding="float32-le", reconstruction=reconstruction, grid_cells=cells,
                         gutter=gutter, height_units="m", vertical_datum="ellipsoid", projection="engine-oblate-cube-v1",
@@ -441,11 +457,12 @@ def import_dense_tiles(output, level, radius, polar, prime, sampler, provenance,
 
 
 def import_tiles(output, level, radius, polar, prime, sampler, provenance, name,
-                 cells=CELLS, gutter=1, reconstruction="nested-triangles", raster=None, cuda_sampler=None):
+                 cells=CELLS, gutter=1, reconstruction="nested-triangles", raster=None, cuda_sampler=None,
+                 progress_cb=None):
     if cells != CELLS or gutter != 1 or reconstruction != "nested-triangles" or raster is not None:
         return import_dense_tiles(output, level, radius, polar, prime, sampler, provenance, name,
                                   cells=cells, gutter=gutter, reconstruction=reconstruction,
-                                  raster=raster, cuda_sampler=cuda_sampler)
+                                  raster=raster, cuda_sampler=cuda_sampler, progress_cb=progress_cb)
     count = 2 * (4**(level+1)-1)
     if not 0 <= level <= 5 or count > MAX_TILES:
         raise ValueError("Version 1 supports data levels 0..5 and at most 16,384 metadata records")

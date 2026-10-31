@@ -80,6 +80,7 @@ The inspector edits a `BodyEditDraft`. Changes have no effect until Apply. The c
 | Radius | Increment | Increment when zonal harmonics depend on radius | Increment | Increment |
 | Oblateness | Increment | Increment | Increment | Increment |
 | J2/J4 | Increment | Increment | Unchanged | Unchanged |
+| Rotation pole / axial tilt | Increment | Increment | Increment | Increment |
 | Identical or rejected edit | Unchanged | Unchanged | Unchanged | Unchanged |
 
 `SystemSnapshot::definition_revision()` changes once per accepted definition edit. `state_revision()` changes on a load or successful nonzero simulation step. A new load increments `generation()` and resets each body's revision counters. `generation()` is numbered per `Simulation` and only identifies stale commands; independent simulations reuse the same values. `BodyRevisions::identity` is a process-unique, nonzero body identity assigned on load and `AddBody`. It survives edits, steps, motion-model changes, snapshot copies and reindexing after `DeleteBody`; a reload assigns new identities. Renderer cache keys use this identity with the relevant per-body revision instead of generation, body index or definition pointer, so a cache stays valid when other bodies change or a body moves to another index. Whole-scene results (orbit curves) also compare the ordered identity list. Pause, rejected steps, and unchanged settings do not invalidate prepared state.
@@ -100,6 +101,10 @@ dialogs remain transient. Missing fields use the current C++ defaults. See
 `settings.md` for validation, atomic writes and reset behavior.
 
 Physical edits affect the current session. The existing `SystemManager::save_system` API serializes the committed definition fields, preserving unknown JSON fields and initial state-vector data. This change does not add automatic disk writes or a Save button.
+
+The inspector edits axial tilt through the draft's ecliptic rotation pole, relative to the current or proposed orbital normal (the ecliptic normal for a central body). Apply refreshes pole coordinates, render orientation and precession dependencies; saves and N-body exports serialize the current pole. Rotation period, tidal locking and planetary oblateness/J2/J4 have explicit controls; entering edit mode does not infer or impose tidal locking.
+
+`ApplyBodyPhysicalProperties::rotate_moon_orbits` is an opt-in draft action, reset on reload. When the pole changes, it applies the shortest pole-to-pole rotation to the positions and velocities of reference-hierarchy descendants inside the parent's Hill sphere, about the parent's current position and velocity. A half-turn uses a deterministic perpendicular axis. It preserves relative orbital sizes, shapes and phases, including nested satellites; the existing orbit-translation option can then move the group. Rotated moons receive definition/dynamics revisions and refreshed ecliptic orbital elements and existing state vectors for persistence. SPICE playback rejects this orbit edit.
 
 Build and run the CPU contract tests with:
 

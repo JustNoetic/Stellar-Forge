@@ -44,6 +44,11 @@ void main() {
     f_local_pos = local_pos;
     f_normal = ring_hosts[h].pole_max_r.xyz;
     f_host_idx = h;
-    gl_Position = u_scene.view_proj * vec4(world_pos, 1.0);
-    if (refraction_active()) gl_Position.z = gl_Position.w;
+    if (refraction_active()) {
+        gl_Position = u_scene.view_proj * vec4(world_pos, 1.0);
+        gl_Position.z = gl_Position.w;
+    } else {
+        vec3 center = bodies[ring_hosts[h].counts_indices.x].view_center.xyz;
+        gl_Position = u_scene.projection * vec4(center + mat3(u_scene.view) * local_pos, 1.0);
+    }
 }

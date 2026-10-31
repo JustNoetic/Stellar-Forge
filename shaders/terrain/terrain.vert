@@ -24,6 +24,7 @@ struct CachedPatchGPU {
     vec4 eye;
     uvec4 address;
     uvec4 metadata;
+    vec4 anchor_offset;
 };
 
 struct GeometryVertex {
@@ -48,6 +49,7 @@ layout(location = 5) flat out vec4 f_tile_color;
 layout(location = 6) out vec2 f_tile_uv;
 layout(location = 7) out vec3 f_base_chord;
 layout(location = 8) out vec3 f_apparent_pos;
+layout(location = 9) out vec3 f_body_offset;
 
 TerrainVector parent_vertex(uint first, uvec2 grid, uint stride, bool direction) {
     uvec2 origin = min(grid / stride * stride, uvec2(16u - stride));
@@ -92,6 +94,7 @@ void main() {
     TerrainMatrix rotation = TerrainMatrix(TerrainVector(tile.rotation0.xyz), TerrainVector(tile.rotation1.xyz), TerrainVector(tile.rotation2.xyz));
     TerrainVector eye = (TerrainVector(tile.anchor_high.xyz) + rotation * point * TerrainScalar(tile.anchor_high.w)) + TerrainVector(tile.anchor_low.xyz);
     f_world_pos = transpose(mat3(u_scene.view)) * vec3(eye);
+    f_body_offset = tile.anchor_offset.xyz + transpose(mat3(u_scene.view)) * vec3(rotation * point * TerrainScalar(tile.anchor_high.w));
     f_local_pos = vertex.direction.xyz;
     f_base_chord = vec3(base_chord);
     f_normal = vec3(transpose(TerrainMatrix(u_scene.view)) * rotation * TerrainVector(vertex.normal.xyz));

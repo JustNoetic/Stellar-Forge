@@ -139,7 +139,7 @@ target_compile_definitions(StellarForge PRIVATE
 set(STELLAR_PLATFORM_LIBS ${CMAKE_DL_LIBS})
 if(WIN32)
     target_compile_definitions(StellarForge PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-    list(APPEND STELLAR_PLATFORM_LIBS winhttp)
+    list(APPEND STELLAR_PLATFORM_LIBS winhttp comdlg32 ole32 windowscodecs uuid)
 endif()
 
 if(MINGW)

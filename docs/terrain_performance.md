@@ -1,5 +1,159 @@
 # Terrain precision and geometry cache performance
 
+## Full application navigation, 29 October 2026
+
+Release application on an i5-12400F / RTX 4060 Ti (NVIDIA 621.01), hidden
+1920×1080 window, UI enabled, VSync off, immediate presentation, default 45° FOV
+and rendering settings instead of saved preferences. Imported terrain, albedo,
+normals, atmospheres/shadows, refraction, clouds, secondary lighting, bloom, Gaia
+and orbit lines remain enabled. The Solar System is paused to isolate camera
+movement. Each scene has three repetitions of 600 stationary warmup frames plus
+900 measured frames, using a fixed 1/60-second scripted step.
+
+The new `terrain-navigation` suite starts at the highest daylight sample of the
+selected imported Earth tile (8795 m in this source), looking 3° above the
+horizon. Walking follows decoded triangle heights at 5 m/s with 1.7 m clearance
+and travels 74.9 m; flying uses 250 m/s with 2 km clearance and travels 3.746 km.
+Turning holds the eye and rotates 224.75°. Camera path construction and asset
+initialization are excluded; streaming during the measured path is included.
+
+| Terrain target | Scene | Mean patches | Mean FPS | Frame p95, ms | CPU work mean, ms | GPU frame mean, ms | Terrain CPU mean / p95, ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 px | Still | 215 | 257.8 | 4.228 | 0.624 | 2.376 | 0.035 / 0.049 |
+| 16 px | Walk | 254 | 209.9 | 5.214 | 0.952 | 2.928 | 0.270 / 0.456 |
+| 16 px | Fly | 137 | 232.0 | 4.694 | 0.737 | 2.694 | 0.058 / 0.091 |
+| 16 px | Turn | 200 | 245.4 | 4.488 | 0.889 | 2.314 | 0.255 / 0.401 |
+| 2 px | Still | 742 | 247.1 | 4.434 | 0.676 | 2.488 | 0.089 / 0.130 |
+| 2 px | Walk | 783 | 188.9 | 5.828 | 1.359 | 3.039 | 0.683 / 1.022 |
+| 2 px | Fly | 669 | 220.4 | 4.968 | 0.844 | 2.810 | 0.166 / 0.244 |
+| 2 px | Turn | 838 | 197.3 | 5.868 | 1.730 | 2.452 | 1.057 / 1.632 |
+
+The 2-pixel variant preserves the 1024-patch limit; turning reaches it in 15.3%
+of measured frames, so the target is not always met. All GPU timestamps are
+present and all terrain, texture and normal failure counters are zero. The
+largest baseline frame is 8.84 ms at 16 pixels and 9.55 ms at 2 pixels. The former
+is dominated by a 7.23 ms presentation call; the latter includes a 2.86 ms normal
+preparation scope. These are wall-time scopes and do not establish whether a
+rare outlier came from computation, a lock or OS scheduling. No measured baseline
+frame exceeds 16.67 ms. This is a warmed local path, not a cold-start/teleport test.
+
+At 16 pixels, walking spends about 0.906 ms on GPU terrain drawing, 0.759 ms on
+bloom, 0.340 ms on observer refraction rebuilding and 0.209 ms on atmospheric LUTs.
+Separate walking feature-removal runs, each with the same frame/repetition counts,
+reduce GPU frame time from 2.928 to 2.103 ms without bloom, and to 2.570 ms without
+refraction. Frame means change from 4.764 to 3.837 and 4.372 ms respectively.
+These change the image and are not equivalent-quality optimization results.
+Refraction removal also changes visible terrain coverage (mean 247 versus 254
+patches). GPU/CPU clocks are uncontrolled and run order is not randomized.
+
+Default terrain preparation is a small part of total frame time in these views.
+Dense turning remains the most useful terrain CPU target: desired-cut reuse can
+coincide with a resident-cut rebuild while geometry streams, and close movement
+often changes the desired cut itself. Updating changed subtrees and residency
+dependencies is the next candidate; the threshold formula remains a minor target
+according to the isolated profile below. For total frame time, terrain shading,
+bloom and moving-eye refraction/LUT work warrant investigation too. The present
+wait is substantial, so CPU/GPU scope comparisons alone do not prove hardware
+utilization or identify the source of driver/compositor overhead.
+
+The previous isolated before/after reductions must not be interpreted as
+full-application FPS improvements: this capture measures the optimized build
+only. CPU work excludes explicit fence/acquire/present waits; GPU and CPU scopes
+overlap, and inclusive parents and children must not be added. In particular,
+`gpu_terrain_prepare` covers all celestial preparation, whereas
+`cpu_terrain_prepare` isolates terrain preparation.
+
+Raw reports, CSV, pooled/per-repetition statistics, worst-frame details, analysis
+script and source/binary fingerprints are retained in
+`tests/terrain-fullapp-20261029/`. Reproduce with the documented
+[`terrain-navigation` scenes](performance_benchmarks.md#imported-terrain-navigation),
+adding `--benchmark-variant terrain-detail` for the 2-pixel target.
+
+## Retained selection and dependency plans
+
+Implemented 29 October 2026 after the CPU profile below. `SelectionPlan` validates the previous cut's visibility and refinement decisions against the current camera/projection, retaining patches, stitching, prefetch groups and cache dependencies while those decisions hold. Maximum projected error is updated on every successful validation. A changed cut, bounds/source revision, shape/limit change, live availability constraint or budget pressure uses the full selector. After repeated invalidations a 32-update backoff suppresses reuse attempts while continuing full current-view selection. This is a validated reuse path; it does not yet repair individual changed subtrees.
+
+The resident benchmark uses the same Release high-ground Earth probe, 1080p, 60-degree FOV and 4096-patch cap as the earlier reuse benchmark. Loaded moving views alternate eye positions 10 cm apart. Each process reports the median of nine batches of 256 prepare calls; the table is the median across three before and three after processes, with alternating process order. The baseline already contains the reusable traversal storage and instance-bucket optimization. CPU clocks and scheduling remain uncontrolled.
+
+| Error / selected patches | Stationary CPU prepare before → after, ms | Moving resident CPU prepare before → after, ms | Moving reduction |
+| --- | ---: | ---: | ---: |
+| 16 px / 130 | 0.0217 → 0.0106 | 0.0968 → 0.0285 | 70.5% |
+| 2 px / 632 | 0.0835 → 0.0402 | 0.4207 → 0.1055 | 74.9% |
+| 0.5 px / 1603 | 0.2252 → 0.1120 | 1.0987 → 0.2577 | 76.5% |
+
+These are isolated `TerrainRenderer::prepare` measurements with resident geometry and unchanged cuts, not application FPS. Vertex generation, source workers, GPU rendering, albedo/normal preparation, simulation, UI and presentation are excluded. Camera-dependent records still update. Geometry quality, 2:1 balancing, stitching, the 64 MiB geometry cache and admission limits are preserved.
+
+A separate paced 100 m/s source trace exercises five views and loading at a 2-pixel target / 1024-patch cap. Patch counts match the baseline and four stationary near-ground HDR captures are byte-identical. Orbital opaque coverage matches; its shading differences also occur in baseline repeats while normal maps stream, as described below. The one-meter travel cases change cuts frequently and use the full selector much more often. An initial implementation regressed in those cases; adaptive capture backoff and eliminating dependency sorting limit that extra work. Absolute source-trace times vary substantially with pacing, host scheduling and worker activity, so the loaded alternating-view table is the repeatable performance result, not a claimed speedup for arbitrary sustained travel.
+
+CPU oracle traces cover 9120 frames across face interiors/seams/corners, polar ratios 0.05–1, meter approaches, horizon/downward views, camera jumps, projection/error/occluder changes, max-level changes and imported Earth heights. Reused and fresh cuts match exact patch IDs, stitch masks, maximum-error values and required-tile sets. Retained prerequisite ordering can differ from a fresh priority traversal; the renderer's prefetch list is sorted, and committed groups retain all four children. Explicit tests cover source/bounds invalidation, budget pressure, availability callbacks and resuming reuse after churn backoff. The full selector remains the oracle and fallback.
+
+All eight targeted terrain/importer/normals/surface/refraction CTests pass with Vulkan validation requested. The separate cached/reference precision and terrain preview probes also pass, including projection changes while reusing a cut, LOD24 precision, cube seams/poles and meter-scale coverage. Application and rendering/CPU test targets build; the final diff check is clean.
+
+Sources/snapshots, before/after binaries, the standalone oracle test, local build script, raw captures and summaries are retained in `tests/terrain-incremental-20261029/`. `verified-resident-summary.json` contains the final-build table inputs; `manifest.json` records source/binary hashes. The public architecture and invalidation rules are documented in [terrain](terrain.md).
+
+## CPU preparation profile after the reuse optimization
+
+Profiled 29 October 2026 after buffer/instance reuse and before retained selection plans, on Earth pack `10334824041510882139`, at 1920 × 1080, 60-degree FOV and a 4096-patch cap. Standalone diagnostic copies instrument `TerrainRenderer::prepare` and `select`; normal application sources and binaries receive no profiling hooks. Three process repetitions each cover 16/2/0.5-pixel error, stationary resident terrain, alternating loaded eye positions 10 cm apart, and 240 paced frames traveling 100 m/s one meter above reconstructed ground. Resident cases measure 1280 calls each. The location is the same high-ground eastward view used by the resident preparation benchmark below. Clocks, scheduling and CPU power management are uncontrolled.
+
+The table uses the process with the median mean preparation time for each case, at **2-pixel error**. Coarse scopes form disjoint stages: cache/streaming includes the selection wrapper minus `select`, plus frame cache planning; selector time is therefore counted once. Transform/record preparation includes placement checks. The 632-patch resident view is deliberately more detailed than the current default 16-pixel error.
+
+| CPU preparation stage | Stationary / 632 patches | Moving resident / 632 patches | Traveling / about 641 patches |
+| --- | ---: | ---: | ---: |
+| Tree selection, including visibility/error/refinement/stitching | 0.4% | 45.0% | 47.4% |
+| Cache, prefetch, retained dependencies and streaming bookkeeping | 72.7% | 33.4% | 32.2% |
+| Instance bucketing, mapped-buffer writes and flush | 23.9% | 16.2% | 14.7% |
+| Placement checks and transform/draw-record preparation | 1.0% | 5.0% | 4.8% |
+| Other body setup/statistics | 1.9% | 0.4% | 0.9% |
+| Mean CPU preparation, ms | 0.0928 | 0.4483 | 1.1220 |
+
+The stationary case includes one possible view transition at the case boundary; its selection time is approximately zero after that transition. Across the three repeated resident captures, the selector contributes 41–53% at 2 pixels. At 0.5 pixels / 1603 patches, the median-run moving breakdown is 44.0% selection, 33.6% cache/streaming, 17.1% instance writes and 5.0% placement/records. At 16 pixels / 130 patches it is 52.6%, 40.3%, 0.8% and 5.4% respectively. Counts, raw stage times and run variability are retained in the JSON reports.
+
+Inside the selector, operations were sampled once per 17 or 31 calls, with a warmed empty-timer-pair correction. In loaded moving terrain at 2 pixels, estimated shares of the **whole preparation** are approximately 11% heap/leaf-map updates, 7% metadata retrieval, 6% visibility tests, **4–6% distance/error projection**, 3% coarser-neighbor queries and 3% output sorting. These estimates are useful for ranking, not exact cycle attribution. The projection scope includes conservative bounds distance, multiplication/division and the orthographic/perspective choice; the final threshold comparison itself remains part of traversal control. New metadata computation is a separately recorded subset of metadata retrieval, not another additive stage.
+
+The warmed distance/error projection accounts for roughly one tenth of selector time. The hypothesis that the threshold formula is the main CPU bottleneck is not supported. The largest measured area during movement is selection together with repeated prefetch/retention/cache planning, approximately 78–80% in the representative detailed views. Incremental selection is therefore a reasonable next target, particularly if it also retains refinement/dependency plans and updates them when topology or residency changes. These shares are not predicted speedups: conservative visibility/error checks, balancing and residency validity still need to be maintained.
+
+### Timing overhead and loading limits
+
+An interleaved control toggles timers off/on in the same compiled binary and alternates order for twelve pairs of 256 resident calls. At 632 patches, coarse scopes add approximately **0.5%**; detailed sampling adds **11.2%** at stride 17 and **7.0%** at stride 31. The compiled-out baseline toggle varies by −0.7%, showing host noise. Coarse overhead ranges from approximately zero at 1603 patches to 2.2% at 130 patches. Detailed resident estimates agree on projection's small share across both strides, but should be read with this instrumentation overhead in mind.
+
+Fine sampled scopes are **not used as a quantitative breakdown for paced travel**: their scaled sum exceeds inclusive selector time. A warmed fixed timer-bias correction does not adequately describe tiny operations after frame pacing. Those raw values remain in the reports with an explicit interpretation warning. Coarse scopes are the basis of the preparation table.
+
+A separate loaded-terrain control uses the same 60 Hz pacing and immediate-submission pattern as travel. At 2 pixels it measures 1.102 ms with coarse scopes, versus the median traveling capture's 1.122 ms; selection is 48.0% in that paced loaded control. Thus the apparent increase from the unpaced loaded benchmark cannot be attributed to streaming alone. This single paced control is descriptive, not a precise measurement of a 2% loading penalty. The median travel run admits/builds 60 geometry patches and spends 10/240 frames loading, with at most 21 pending jobs. It is a local geometry-cache-miss workload, not a broad test of cold elevation-file I/O or teleports across the planet.
+
+Worker CPU, camera height queries, GPU baking/upload recording, submit/fence waits, albedo/normal-map preparation, other scene systems and presentation are outside the preparation timer. Source workers still run concurrently. This profile answers the geometry-preparation question; it does not rank total application CPU consumers or measure application FPS.
+
+The instrumented selector matches 1200 saved deterministic selection digests exactly, including patch IDs, stitch masks, ordered requests/prerequisites, visits, LOD, budget/loading flags and error bits. Resident measurements reject geometry admissions/loading; travel rejects missing imported coverage and worker failures. Production source hashes are preserved and checked. Reproduction sources, build scripts, generated instrumented copies, raw captures, controls, source hashes and `summary.json` are in `tests/terrain-cpu-profile-20261029/`:
+
+```powershell
+python tests/terrain-cpu-profile-20261029/build_profile.py
+python tests/terrain-cpu-profile-20261029/build_profile.py --controls
+.\build\bin\tests\TerrainProfile-coarse.exe tests/terrain-cpu-profile-20261029/new-coarse.json
+```
+
+## Reusable CPU preparation and instance buckets
+
+Measured 29 October 2026, Release GCC `-O3`, RTX 4060 Ti, existing Earth elevation identity `10334824041510882139`, 1920 × 1080, 60-degree vertical FOV and a 4096-patch cap. The resident CPU probe finds the highest reconstructed sample in the finest tile with the largest maximum and looks east one meter above it. It waits for geometry and worker requests to settle at two eye positions 10 cm apart. Moving measurements alternate those positions, forcing current-view selection and transforms while avoiding streaming arrivals. Stationary measurements repeat one view. Each process measures nine batches of 256 calls per case; the table is the median of the three process medians. Process order is before/after, after/before, before/after. CPU clocks and scheduling are uncontrolled.
+
+| Error target / patches | Stationary CPU prepare before → after, ms | Moving CPU prepare before → after, ms | Moving reduction |
+| --- | ---: | ---: | ---: |
+| 16 px / 130 | 0.0365 → 0.0188 | 0.1074 → 0.0812 | 24.4% |
+| 2 px / 632 | 0.1922 → 0.0894 | 0.5528 → 0.4555 | 17.6% |
+| 0.5 px / 1603 | 0.6852 → 0.2521 | 1.5354 → 1.1471 | 25.3% |
+
+This measures `TerrainRenderer::prepare` only, including its normal cache/protection/record work. Geometry is resident and no bakes or loading occur in measured calls. GPU submissions, drawing, worker work, albedo/normals streaming, simulation, UI and presentation are outside the interval. These are preparation savings, not application FPS or GPU speedups. The small repeated displacement deliberately isolates CPU preparation with loaded terrain; sustained travel into new terrain has additional loading costs.
+
+Preparation now references body-owned draw records and scatters GPU instances into 64 stable mode/stitch buckets. It no longer copies and stable-sorts a second array of full draw records. Geometry-keyed placement reuse avoids recomputing anchors/bake inputs after an unchanged patch selection. Traversal vectors, heap storage, pooled leaf allocations and frame request/retention vectors retain capacity. Albedo and normal selectors also have owner-local traversal scratch. View/error/culling/residency evaluation, balancing, refinement order, geometry quality and cache/admission budgets remain the same. Height-envelope computation also runs outside its metadata mutex, with a duplicate-publication check under the lock.
+
+Two alternating before/after source-benchmark pairs additionally exercise 120 stationary and 120 paced moving frames at 100 m/s in five views, at 2-pixel error and a 1024-patch cap. The new `terrain_prepare_ms` interval separates terrain preparation from the existing whole-celestial `prepare_ms` interval. Results vary with host scheduling and loading; the moving one-meter downward case has essentially no gain in the second pair. All four stationary near-ground HDR captures are byte-identical. Orbital opaque coverage matches, but the first orbital capture has shading differences that also occur between the two original-renderer runs while normal maps stream. That capture is not treated as a deterministic image-equivalence result.
+
+An independent 1200-view comparison against the saved original selector matches exact patch IDs, stitch masks, ordered refinement prerequisites/requests, node visits, deepest levels, budget/loading flags and geometric-error bits. CPU contracts additionally compare fresh/reused scratch at face interiors, seams, corners, delayed residency and LOD24, and concurrent height reads must publish one envelope revision. Eight targeted CTests pass with Vulkan validation requested: terrain importer/CPU/imported GPU/normals, surface map/eviction, smooth surfaces and GPU refraction. The separate cached/reference precision and terrain preview probes also pass with validation requested, including moving-view placement reuse, cube seams, poles and meter-scale coverage. Application and rendering/CPU test targets build successfully.
+
+Sources, original snapshots/binaries, compile scripts, raw timing runs, hashes and image comparisons are retained in `tests/terrain-lod-optimization-20261029/`. `resident-summary.json` contains the table inputs; `resident_prepare.cpp` and `build_resident_probe.py` reproduce the resident measurement. The terrain source benchmark accepts an optional error target following its pacing argument in the local test harness:
+
+```powershell
+.\build\bin\tests\StellarRenderingTests.exe --terrain-source-benchmark data/tiles/earth/95cebe9dca5b/height tests/terrain-new/source.json --paced 2
+```
+
 ## Surface-aware horizon culling
 
 Measured 26 October 2026, Release, 1920 × 1080, 60-degree vertical FOV, 2-pixel error and a 1024-patch cap. The existing Earth elevation pack has identity `10334824041510882139`; heights, error targets, residency budgets and shaders are unchanged. The previous horizon test used only the patch sphere expanded by the inverse polar ratio. These spheres can cross the occlusion cone or tangent-distance boundary even when the entire displaced surface is hidden. A second test uses the thin surface enclosure and a tile-local outer radial bound to reject the fully occluded cap. It applies to both geometry and shared surface-texture selection.

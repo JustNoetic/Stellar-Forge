@@ -7,8 +7,10 @@
 #include "rendering/ring_generator.hpp"
 
 #include <GLFW/glfw3.h>
+#include <backends/imgui_impl_vulkan.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 #include <exception>
 #include <format>
@@ -92,6 +94,7 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     if (self_test_ || (benchmark_.enabled && benchmark_.hidden)) {
         glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     }
     if (benchmark_.enabled) glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
@@ -117,10 +120,26 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
     glfwSetScrollCallback(window_, [](GLFWwindow* w, double xoff, double yoff) {
         static_cast<App*>(glfwGetWindowUserPointer(w))->on_scroll(xoff, yoff);
     });
+    glfwSetDropCallback(window_, [](GLFWwindow* w, int count, const char** paths) {
+        static_cast<App*>(glfwGetWindowUserPointer(w))->on_drop(count, paths);
+    });
 
     rhi::ShaderCache::init();
     vk_.init(window_, false);
     ui_.init(window_, vk_);
+    {
+        auto init_preview = terrain::SurfaceBaker::build_solid_preview(0.14f, 0.16f, 0.20f);
+        surface_preview_img_ = vk_.create_image_2d(
+            terrain::SURFACE_PREVIEW_W, terrain::SURFACE_PREVIEW_H,
+            VK_FORMAT_R8G8B8A8_SRGB,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        vk_.upload_image_2d(surface_preview_img_, init_preview.data(), init_preview.size());
+        surface_preview_staging_ = vk_.create_host_buffer(
+            init_preview.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, init_preview.data());
+        surface_preview_ds_ = ImGui_ImplVulkan_AddTexture(
+            vk_.sampler_linear_clamp(), surface_preview_img_.view,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
     if (self_test_ || benchmark_.enabled) {
         ImGui::GetIO().IniFilename = nullptr;
         ImGui::GetIO().LogFilename = nullptr;
@@ -140,7 +159,9 @@ void App::init(bool self_test, benchmark::Options benchmark, bool simulation_thr
 
     star_catalog_.init(vk_, sf::paths::external_path("data", "gaia", "stars.bin"));
     celestial_renderer_.init(vk_);
+    sync_system_height_ranges();
     orbit_renderer_.init(vk_);
+    bloom_renderer_.init(vk_);
 
     rhi::GraphicsPipelineDesc comp_desc{};
     comp_desc.vert_path = "post/fullscreen.vert";
@@ -189,6 +210,7 @@ void App::switch_system(std::string_view system_name) {
     camera_.flight_speed_au_s = NavigationSettings{}.flight_speed_au_s;
     camera_.has_prev_spin = false;
     camera_.origin_render = system().body(camera_.tracking_idx).render.position.value;
+    sync_system_height_ranges();
 }
 
 void App::trigger_ephemeris_mode() {
@@ -372,6 +394,9 @@ void App::run() {
             uint32_t settings_frames = static_cast<uint32_t>(ui::SettingsSection::Count);
             ui_settings_.show_settings = frames_rendered < settings_frames;
             ui_settings_.settings_section = static_cast<int>(frames_rendered);
+            auto settings = render_settings_.values();
+            settings.bloom_mode = frames_rendered % 3;
+            render_settings_.apply(settings);
             if (frames_rendered == settings_frames) {
                 set_size_comparison(true);
                 size_comparison_.selected_systems = sys_mgr_.list_systems();
@@ -405,9 +430,16 @@ void App::shutdown() {
     vk_.wait_idle();
     rhi::ShaderCache::destroy_pipeline(vk_, size_composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(vk_, composite_pipeline_);
+    if (surface_preview_ds_ != VK_NULL_HANDLE) {
+        ImGui_ImplVulkan_RemoveTexture(surface_preview_ds_);
+        surface_preview_ds_ = VK_NULL_HANDLE;
+    }
+    vk_.destroy_buffer(surface_preview_staging_);
+    vk_.destroy_image(surface_preview_img_);
     size_renderer_.shutdown(vk_);
     celestial_renderer_.shutdown(vk_);
     orbit_renderer_.shutdown(vk_);
+    bloom_renderer_.shutdown(vk_);
     star_catalog_.shutdown(vk_);
     destroy_render_targets();
     ui_.shutdown(vk_);
@@ -425,9 +457,52 @@ void App::on_framebuffer_resize(int, int) {
     vk_.request_swapchain_resize();
 }
 
+void App::toggle_fullscreen() {
+    if (glfwGetWindowMonitor(window_)) {
+        glfwSetWindowMonitor(window_, nullptr, windowed_x_, windowed_y_,
+                             windowed_width_, windowed_height_, GLFW_DONT_CARE);
+        if (windowed_maximized_) glfwMaximizeWindow(window_);
+        return;
+    }
+
+    glfwGetWindowPos(window_, &windowed_x_, &windowed_y_);
+    glfwGetWindowSize(window_, &windowed_width_, &windowed_height_);
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    int monitor_count = 0;
+    GLFWmonitor** monitors = glfwGetMonitors(&monitor_count);
+    int64_t best_overlap = 0;
+    for (int i = 0; i < monitor_count; ++i) {
+        const GLFWvidmode* mode = glfwGetVideoMode(monitors[i]);
+        if (!mode) continue;
+        int x = 0, y = 0;
+        glfwGetMonitorPos(monitors[i], &x, &y);
+        int overlap_width = std::max(0, std::min(windowed_x_ + windowed_width_, x + mode->width) - std::max(windowed_x_, x));
+        int overlap_height = std::max(0, std::min(windowed_y_ + windowed_height_, y + mode->height) - std::max(windowed_y_, y));
+        int64_t overlap = int64_t(overlap_width) * overlap_height;
+        if (overlap > best_overlap) {
+            best_overlap = overlap;
+            monitor = monitors[i];
+        }
+    }
+    const GLFWvidmode* mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+    if (!mode) return;
+
+    windowed_maximized_ = glfwGetWindowAttrib(window_, GLFW_MAXIMIZED) == GLFW_TRUE;
+    if (windowed_maximized_) {
+        glfwRestoreWindow(window_);
+        glfwGetWindowPos(window_, &windowed_x_, &windowed_y_);
+        glfwGetWindowSize(window_, &windowed_width_, &windowed_height_);
+    }
+    glfwSetWindowMonitor(window_, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+}
+
 void App::on_key(int key, int, int action, int mods) {
     if (benchmark_.enabled) {
         if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) glfwSetWindowShouldClose(window_, GLFW_TRUE);
+        return;
+    }
+    if (key == GLFW_KEY_F11 && action == GLFW_PRESS) {
+        toggle_fullscreen();
         return;
     }
     if (key == GLFW_KEY_H && action == GLFW_PRESS &&
@@ -515,6 +590,138 @@ void App::on_scroll(double, double yoffset) {
     camera_.on_scroll(yoffset, shift);
 }
 
+void App::on_drop(int count, const char** paths) {
+    if (benchmark_.enabled || count <= 0 || !paths || !paths[0]) return;
+    if (!ui_state_.has_selection(system())) return;
+    int insp_idx = ui_state_.inspected_body;
+    const auto& b = system().body(insp_idx);
+    if (b.definition.is_star || b.definition.is_black_hole || b.definition.is_spacecraft) return;
+
+    std::filesystem::path dropped(reinterpret_cast<const char8_t*>(paths[0]));
+    std::string stem_lower = dropped.stem().string();
+    for (char& c : stem_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    int target_tab = ui_state_.surface_edit.selected_tab;
+    if (stem_lower.find("height") != std::string::npos ||
+        stem_lower.find("dem") != std::string::npos ||
+        stem_lower.find("elev") != std::string::npos ||
+        stem_lower.find("bump") != std::string::npos) {
+        target_tab = 1;
+    }
+    ui_state_.surface_edit.selected_tab = target_tab;
+    ui_state_.surface_edit.focus_surface_tab = true;
+    stage_surface_file(dropped, target_tab);
+}
+
+void App::stage_surface_file(const std::filesystem::path& path, int target_tab) {
+    auto& se = ui_state_.surface_edit;
+    int tab = (target_tab >= 0) ? target_tab : se.selected_tab;
+    auto info_opt = terrain::SurfaceBaker::inspect_and_load_image(path);
+    if (!info_opt) {
+        se.error_msg = std::format("Failed to decode image: {}", path.filename().string());
+        se.status_msg.clear();
+        return;
+    }
+    auto& stage = (tab == 1) ? se.height_stage : se.albedo_stage;
+    stage.staged_path = info_opt->path.string();
+    stage.width = info_opt->width;
+    stage.height = info_opt->height;
+    stage.recommended_lod = info_opt->recommended_lod;
+    stage.selected_lod = info_opt->recommended_lod;
+    stage.preview_rgba = std::move(info_opt->preview_rgba);
+    stage.has_staged = true;
+    se.invalidate_preview();
+    se.error_msg.clear();
+    se.status_msg = std::format("Staged {} ({}x{}, recommended LOD {}).",
+                                path.filename().string(), stage.width, stage.height, stage.recommended_lod);
+}
+
+void App::sync_system_height_ranges() {
+    for (size_t i = 0; i < system().size(); ++i) {
+        const auto& b = system().body(i);
+        if (b.definition.is_star || b.definition.is_black_hole || b.definition.is_spacecraft) continue;
+        if (b.definition.height_range_km.x == 0.0 && b.definition.height_range_km.y == 0.0) {
+            if (auto hs = celestial_renderer_.height_source(b.definition.name)) {
+                glm::dvec2 range_km{hs->info().minimum_m * 0.001, hs->info().maximum_m * 0.001};
+                if (range_km.x < range_km.y) {
+                    simulation_.apply(ephemeris::ApplyBodySurface{
+                        system().generation(), static_cast<int>(i), 0, range_km, b.definition.color_rgb
+                    });
+                }
+            }
+        }
+    }
+}
+
+bool App::save_body_surface_to_disk(const std::string& body_name, glm::dvec2 height_range_km, glm::vec3 color_rgb) {
+    std::string save_sys_name = system().name();
+    if (save_sys_name == "Ephemeris Mode") {
+        save_sys_name = std::string(ephemeris::SystemManager::SOLAR_SYSTEM_NAME);
+    }
+    if (save_sys_name.starts_with("Ephemeris: ") || !sys_mgr_.system_exists(save_sys_name)) {
+        return false;
+    }
+    try {
+        auto loaded = sys_mgr_.load_system(save_sys_name);
+        int s_idx = loaded.definition.find_body(body_name);
+        if (s_idx < 0) return false;
+        loaded.definition.bodies[s_idx].height_range_km = height_range_km;
+        loaded.definition.bodies[s_idx].color_rgb = color_rgb;
+        loaded.definition.bodies[s_idx].color_pole_rgb = color_rgb;
+        return sys_mgr_.save_system(save_sys_name, loaded.definition);
+    } catch (...) {
+        return false;
+    }
+}
+
+void App::poll_surface_baker() {
+    auto res_opt = surface_baker_.poll();
+    if (!res_opt) return;
+    const auto& res = *res_opt;
+    auto& se = ui_state_.surface_edit;
+    if (!res.success) {
+        se.error_msg = res.error;
+        se.status_msg.clear();
+        return;
+    }
+    try {
+        if (res.is_height) {
+            auto source = terrain::HeightSource::open(res.pack_path);
+            celestial_renderer_.set_height_source(res.body_name, source);
+            size_renderer_.set_height_source(res.body_name, source);
+            int b_idx = system().find_body(res.body_name);
+            if (b_idx >= 0) {
+                const auto& b = system().body(b_idx);
+                glm::dvec2 range_km{res.height_min_km, res.height_max_km};
+                simulation_.apply(ephemeris::ApplyBodySurface{
+                    system().generation(), b_idx, 0, range_km, b.definition.color_rgb
+                });
+                save_body_surface_to_disk(res.body_name, range_km, b.definition.color_rgb);
+            }
+            se.height_stage.clear();
+            se.height_stage.selected_lod = res.level;
+            se.height_range_dirty = false;
+        } else {
+            auto source = terrain::ColorSource::open(res.pack_path);
+            celestial_renderer_.set_color_source(res.body_name, source);
+            size_renderer_.set_color_source(res.body_name, source);
+            se.albedo_stage.clear();
+            se.albedo_stage.selected_lod = res.level;
+        }
+        se.invalidate_preview();
+        se.error_msg.clear();
+        se.status_msg = std::format("Baked & applied {} {} (LOD 0..{}) on {} in {:.1f}s.",
+                                    res.body_name,
+                                    res.is_height ? "Elevation" : "Albedo",
+                                    res.level,
+                                    res.backend_used.empty() ? "CPU" : res.backend_used,
+                                    res.elapsed_sec);
+    } catch (const std::exception& e) {
+        se.error_msg = std::format("Baked pack failed validation: {}", e.what());
+        se.status_msg.clear();
+    }
+}
+
 void App::recreate_render_targets() {
     VkExtent2D ext = vk_.swapchain_extent();
     if (hdr_color_.extent.width == ext.width && hdr_color_.extent.height == ext.height && hdr_color_) {
@@ -537,6 +744,7 @@ void App::destroy_render_targets() {
 }
 
 bool App::render_frame(benchmark::FrameSample* sample) {
+    poll_surface_baker();
     apply_size_comparison();
     if (vk_.vsync_enabled() != render_settings_.values().vsync) {
         vk_.set_vsync(render_settings_.values().vsync);
@@ -580,6 +788,9 @@ bool App::render_frame(benchmark::FrameSample* sample) {
 
     VkExtent2D ext = vk_.swapchain_extent();
 
+    bool bloom_enabled = !size_comparison_active_ && rendering::BloomRenderer::enabled(render_settings_.values());
+    rhi::Image* bloom_scene = nullptr;
+
     bool profile_scene = sample || ui_settings_.show_telemetry;
     uint32_t t_scene = vk_.begin_gpu_timer(cmd, "gpu_scene_hdr");
     vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -606,6 +817,12 @@ bool App::render_frame(benchmark::FrameSample* sample) {
             vk_.end_gpu_timer(cmd, id);
         }
         auto refraction_writes = celestial_renderer_.refraction_writes(vk_);
+        if (!celestial_renderer_.transparency().active() && render_settings_.values().show_orbits && scene().size() > 1)
+            bloom_enabled = false;
+        if (bloom_enabled) {
+            bloom_renderer_.prepare(vk_, ext);
+            if (celestial_renderer_.transparency().active()) bloom_scene = &bloom_renderer_.physical_scene();
+        }
         {
             ScopedTimer timer(sample ? &sample->cpu["cpu_gaia_cull_ms"] : nullptr);
             auto id = profile_scene ? vk_.begin_gpu_timer(cmd, "gpu_gaia_cull") : UINT32_MAX;
@@ -643,12 +860,14 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         vk_.end_rendering(cmd);
         {
             ScopedTimer timer(sample ? &sample->cpu["cpu_atmosphere_composite_ms"] : nullptr);
-            celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_);
+            celestial_renderer_.composite_atmospheres(cmd, vk_, hdr_color_, scene_depth_, bloom_scene);
         }
     }
     vk_.end_gpu_timer(cmd, t_scene);
 
     uint32_t t_post = vk_.begin_gpu_timer(cmd, "gpu_post_composite");
+    if (bloom_enabled) bloom_renderer_.render(cmd, vk_, hdr_color_, render_settings_.values(), bloom_scene);
+    uint32_t t_tonemap = vk_.begin_gpu_timer(cmd, "tonemap_composite");
     vk_.transition_image(cmd, hdr_color_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -674,9 +893,25 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     vk_.push_descriptors(cmd, presentation, writes);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vk_.end_rendering(cmd);
+    vk_.end_gpu_timer(cmd, t_tonemap);
     vk_.end_gpu_timer(cmd, t_post);
 
     uint32_t t_ui = vk_.begin_gpu_timer(cmd, "gpu_ui");
+    if (surface_preview_dirty_ && surface_preview_img_ && surface_preview_staging_) {
+        surface_preview_dirty_ = false;
+        vk_.transition_image(cmd, surface_preview_img_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = surface_preview_img_.extent;
+        vkCmdCopyBufferToImage(cmd, surface_preview_staging_.handle, surface_preview_img_.handle,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        vk_.transition_image(cmd, surface_preview_img_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
     ui_.render(cmd, vk_, swapchain_idx);
     vk_.end_gpu_timer(cmd, t_ui);
 
@@ -1027,18 +1262,37 @@ void App::render_viewport_overlays() {
             ui::value_row("GPU Scene HDR", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_scene_hdr")));
             ui::value_row("GPU Ringshine Bake", std::format("{:.3f} ms", vk_.gpu_time_ms("ringshine_bake")));
             ui::value_row("Ringshine Tiles Baked", std::format("{}", celestial_renderer_.ringshine_frame_bake_count()));
+            bool bloom_active = rendering::BloomRenderer::enabled(render_settings_.values()) &&
+                !size_comparison_active_ && (!render_settings_.values().show_orbits || scene().size() <= 1 || celestial_renderer_.transparency().active());
+            bool bloom_spikes_active = bloom_active && render_settings_.values().bloom_mode == 2 && render_settings_.values().bloom_diffraction > 0.0f;
             ui::value_row("GPU Composite", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_post_composite")));
+            ui::value_row("GPU Bloom", std::format("{:.3f} ms", bloom_active ? vk_.gpu_time_ms("bloom") : 0.0));
+            if (bloom_active) {
+                ui::value_row("GPU Bloom down / up", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("bloom_downsample"), vk_.gpu_time_ms("bloom_upsample")));
+                ui::value_row("GPU Bloom spikes / apply", std::format("{:.3f} / {:.3f} ms",
+                    bloom_spikes_active ? vk_.gpu_time_ms("bloom_spikes") : 0.0, vk_.gpu_time_ms("bloom_apply")));
+            }
+            ui::value_row("GPU Tonemap", std::format("{:.3f} ms", vk_.gpu_time_ms("tonemap_composite")));
             ui::value_row("GPU Dear ImGui", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_ui")));
             const auto& settings = render_settings_.values();
             const auto& stats = celestial_renderer_.atmosphere_stats();
+            bool oit_active = celestial_renderer_.transparency().active();
             ui::section("Scene breakdown", "These timings are included in GPU Scene HDR.");
             ui::value_row("GPU Preparation", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_terrain_prepare")));
             ui::value_row("GPU Celestial bodies", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_celestial")));
             ui::value_row("GPU Terrain", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_terrain_draw")));
             ui::value_row("GPU Spheres / points", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("gpu_spheres"), vk_.gpu_time_ms("gpu_points")));
+            ui::value_row("GPU Planetary rings", std::format("{:.3f} ms", settings.show_rings ? vk_.gpu_time_ms("rings") : 0.0));
             ui::value_row("GPU Gaia cull / draw", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("gpu_gaia_cull"), vk_.gpu_time_ms("gpu_gaia")));
             ui::value_row("GPU Orbit lines", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_orbits")));
             ui::value_row("GPU Atmosphere composite", std::format("{:.3f} ms", stats.visible ? vk_.gpu_time_ms("atmosphere_composite") : 0.0));
+            ui::value_row("GPU Atmo shadows / OIT / opaque", std::format("{:.3f} / {:.3f} / {:.3f} ms",
+                stats.shadow_updates ? vk_.gpu_time_ms("atmosphere_shadows") : 0.0,
+                stats.visible && oit_active ? vk_.gpu_time_ms("atmosphere_transparent") : 0.0,
+                stats.visible ? vk_.gpu_time_ms("atmosphere_opaque") : 0.0));
+            ui::value_row("GPU OIT clear / resolve", std::format("{:.3f} / {:.3f} ms",
+                oit_active ? vk_.gpu_time_ms("transparency_clear") : 0.0,
+                oit_active ? vk_.gpu_time_ms("transparency_resolve") : 0.0));
             ui::value_row("Sky / aerial LUT updates", std::format("{} / {}", stats.sky_lut_updates, stats.aerial_lut_updates));
             ui::value_row("GPU Planetshine bake", std::format("{:.3f} ms", stats.secondary_lut_updates ? vk_.gpu_time_ms("atmosphere_secondary") : 0.0));
             ui::value_row("GPU Planetshine source", std::format("{:.3f} ms", stats.secondary_source_lut_updates ? vk_.gpu_time_ms("atmosphere_secondary_source") : 0.0));
@@ -1153,6 +1407,7 @@ void App::render_body_inspector() {
         ? std::format("{} System Barycenter###inspector", b.definition.name)
         : std::format("{}###inspector", b.definition.name);
 
+    flags |= ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     if (!ImGui::Begin(win_title.c_str(), &ui_settings_.show_inspector, flags)) {
         ImGui::End();
         return;
@@ -1306,11 +1561,37 @@ void App::render_body_inspector() {
         }
     }
 
-    float footer_h = physical_editing ? (roche_violates ? 85.0f * layout.scale : 55.0f * layout.scale) : 0.0f;
+    bool can_del = (insp_idx != system().definition().star_idx && !b.definition.is_star && system().definition().motion_model != ephemeris::MotionModel::Spice);
+    std::string edit_notice = roche_violates ? "Periapsis inside Roche limit. Apply disabled." : "";
+    if (!draft.error.empty()) {
+        if (!edit_notice.empty()) edit_notice += '\n';
+        edit_notice += draft.error;
+    }
+    float footer_h = physical_editing ? ui::panel_footer_height(can_del ? 2 : 1, edit_notice) : 0.0f;
+    auto render_tilt_input = [&] {
+        double tilt = draft.axial_tilt_deg(system());
+        ui::field("Axial tilt (deg)", [&](const char* id) {
+            if (ImGui::InputDouble(id, &tilt, 1.0, 5.0, "%.2f")) draft.set_axial_tilt_deg(system(), tilt);
+        });
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(has_parent ? "Angle to the orbital normal (0 to 180 degrees)." : "Angle to the ecliptic normal (0 to 180 degrees).");
+        }
+        if (!b.definition.is_star && !system().reference_hierarchy().children[insp_idx].empty()) {
+            bool ephemeris_orbits = system().definition().motion_model == ephemeris::MotionModel::Spice;
+            ImGui::BeginDisabled(ephemeris_orbits);
+            ImGui::Checkbox("Rotate moon orbits with tilt", &draft.rotate_moon_orbits);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(ephemeris_orbits ? "Switch to Keplerian or N-body motion to edit moon orbits." :
+                    "On Apply, rotate bound moons and their satellites around this body's centre with its pole. Orbit sizes, shapes and phases are preserved.");
+            }
+        }
+    };
 
+    ui::begin_panel_content("inspector_tab_content", footer_h);
     if (ImGui::BeginTabBar("InspectorTabBar", ImGuiTabBarFlags_FittingPolicyScroll)) {
         if (ImGui::BeginTabItem("Overview")) {
-            ImGui::BeginChild("tab_overview_content", ImVec2(0.0f, -footer_h), false);
+            ImGui::BeginChild("tab_overview_content", ImVec2(0.0f, 0.0f), false);
             ui::section("Physical properties", physical_editing ? "Proposed values" : "");
 
             if (inspect_bary) {
@@ -1356,27 +1637,40 @@ void App::render_body_inspector() {
                         draft.dirty = true;
                     }
 
-                    bool tidally_locked = false;
-                    if (has_parent && draft.values.mass.value > 0.0 && draft.values.radius.value > 0.0) {
-                        double p_m = system().body(parent_idx).definition.mass_msun;
-                        double r_tid = 0.00084 * std::pow(p_m * p_m / draft.values.mass.value, 1.0 / 6.0) * std::sqrt(draft.values.radius.value);
-                        if (draft.values.a_au < r_tid) {
-                            tidally_locked = true;
-                            double tot_m = p_m + draft.values.mass.value;
-                            double p_yr = tot_m > 0.0 ? std::sqrt(std::pow(draft.values.a_au, 3.0) / tot_m) : 0.0;
-                            draft.values.rotation_period_hr = p_yr * 365.25 * 24.0;
-                            draft.values.tidally_locked = true;
-                        }
-                    }
+                }
 
-                    if (tidally_locked) {
-                        ui::metric_text(std::format("Rot Period: {:.4f} hours [Tidally Locked]", draft.values.rotation_period_hr));
-                    } else {
-                        if (ImGui::InputDouble("Rot Period (hours)", &draft.values.rotation_period_hr, 0.0, 0.0, "%.4f")) {
-                            draft.recompute_hydrostatic();
-                            draft.dirty = true;
-                        }
+                ui::section("Rotation & shape");
+                if (has_parent && ImGui::Checkbox("Tidally locked", &draft.values.tidally_locked)) {
+                    if (draft.values.tidally_locked && oe.period_days > 0.0) {
+                        draft.values.rotation_period_hr = oe.period_days * 24.0;
+                        draft.recompute_hydrostatic();
                     }
+                    draft.dirty = true;
+                }
+                ImGui::BeginDisabled(has_parent && draft.values.tidally_locked);
+                ui::field("Rotation period (hours)", [&](const char* id) {
+                    if (ImGui::InputDouble(id, &draft.values.rotation_period_hr, 0.0, 0.0, "%.4f")) {
+                        if (draft.values.type != "Star") draft.recompute_hydrostatic();
+                        draft.dirty = true;
+                    }
+                });
+                ImGui::EndDisabled();
+                if (has_parent && draft.values.tidally_locked) ImGui::TextWrapped("Rotation follows the parent. Unlock to edit the rotation period.");
+                render_tilt_input();
+                if (draft.values.type != "Star") {
+                    ui::field("Oblateness (f)", [&](const char* id) {
+                        if (ImGui::InputDouble(id, &draft.values.oblateness, 0.0, 0.0, "%.6f")) draft.dirty = true;
+                    });
+                }
+                ui::field("J2 moment", [&](const char* id) {
+                    if (ImGui::InputDouble(id, &draft.values.j2, 0.0, 0.0, "%.6e")) draft.dirty = true;
+                });
+                ui::field("J4 moment", [&](const char* id) {
+                    if (ImGui::InputDouble(id, &draft.values.j4, 0.0, 0.0, "%.6e")) draft.dirty = true;
+                });
+                if (draft.values.type != "Star" && ImGui::Button("Calculate hydrostatic shape")) {
+                    draft.recompute_hydrostatic();
+                    draft.dirty = true;
                 }
 
                 double edit_m = draft.values.mass.value;
@@ -1519,7 +1813,7 @@ void App::render_body_inspector() {
         }
 
         if (ImGui::BeginTabItem("Orbit")) {
-            ImGui::BeginChild("tab_orbit_content", ImVec2(0.0f, -footer_h), false);
+            ImGui::BeginChild("tab_orbit_content", ImVec2(0.0f, 0.0f), false);
 
             if (!has_parent) {
                 ImGui::TextWrapped("Primary central body / no parent orbit.");
@@ -1547,7 +1841,9 @@ void App::render_body_inspector() {
                 if (oe.a > 0.0 && oe.e < 1.0) ui::value_row("Apoapsis", format_distance_au(live_apo, ui_settings_.ly_threshold_au));
                 else ui::value_row("Apoapsis", "N/A / open orbit");
 
-                if (axial_tilt_deg.has_value()) {
+                if (physical_editing) {
+                    render_tilt_input();
+                } else if (axial_tilt_deg.has_value()) {
                     std::string tilt_str = std::format("{:.2f}°", *axial_tilt_deg);
                     if (*axial_tilt_deg > 90.0) tilt_str += " / retrograde";
                     ui::value_row("Axial tilt", tilt_str);
@@ -1669,8 +1965,9 @@ void App::render_body_inspector() {
         }
 
         if (!inspect_bary && !b.definition.is_star && !b.definition.is_black_hole && !b.definition.is_spacecraft) {
+            render_body_surface_tab(insp_idx);
             if (ImGui::BeginTabItem("Rings")) {
-                ImGui::BeginChild("tab_rings_content", ImVec2(0.0f, -footer_h), false);
+                ImGui::BeginChild("tab_rings_content", ImVec2(0.0f, 0.0f), false);
 
                 auto rings = b.definition.rings;
                 auto tex_in = b.definition.ring_texture_inner;
@@ -2101,7 +2398,7 @@ void App::render_body_inspector() {
         }
 
         if (!b.definition.is_star && !b.definition.is_black_hole && !b.definition.is_spacecraft && ImGui::BeginTabItem("Atmosphere")) {
-            ImGui::BeginChild("tab_atmosphere_content", ImVec2(0.0f, -footer_h), false);
+            ImGui::BeginChild("tab_atmosphere_content", ImVec2(0.0f, 0.0f), false);
             auto& edit = ui_state_.atmosphere_edit;
             edit.synchronize(system(), insp_idx);
             auto& a = edit.values;
@@ -2261,18 +2558,22 @@ void App::render_body_inspector() {
 
         ImGui::EndTabBar();
     }
+    ImGui::EndChild();
 
     if (physical_editing) {
-        ImGui::BeginChild("inspector_edit_footer", ImVec2(0.0f, 0.0f), false, ImGuiWindowFlags_NoScrollbar);
         ImGui::Separator();
+        if (!edit_notice.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+            ImGui::TextWrapped("%s", edit_notice.c_str());
+            ImGui::PopStyleColor();
+        }
         if (roche_violates) {
-            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Periapsis inside Roche limit. Apply disabled.");
             if (ImGui::Button("Cancel##edit_cancel_disabled", ImVec2(-1.0f, 0.0f))) {
                 ui_state_.edit_mode = false;
                 draft.reload(system(), insp_idx);
             }
         } else {
-            float half_w = std::max(60.0f, (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f);
+            float half_w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.43f, 1.0f));
             if (ImGui::Button("Apply Changes##apply_edits", ImVec2(half_w, 0.0f))) {
                 auto res = simulation_.apply(draft.command());
@@ -2283,15 +2584,13 @@ void App::render_body_inspector() {
                 }
             }
             ImGui::PopStyleColor();
-            ImGui::SameLine(0.0f, 10.0f);
+            ImGui::SameLine();
             if (ImGui::Button("Cancel##edit_cancel", ImVec2(half_w, 0.0f))) {
                 ui_state_.edit_mode = false;
                 draft.reload(system(), insp_idx);
             }
         }
-        bool can_del = (insp_idx != system().definition().star_idx && !b.definition.is_star && system().definition().motion_model != ephemeris::MotionModel::Spice);
         if (can_del) {
-            ImGui::Spacing();
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
@@ -2309,13 +2608,383 @@ void App::render_body_inspector() {
             }
             ImGui::PopStyleColor(3);
         }
-        if (!draft.error.empty()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", draft.error.c_str());
-        }
-        ImGui::EndChild();
     }
 
     ImGui::End();
+}
+
+void App::render_body_surface_tab(int insp_idx) {
+    const auto& b = system().body(insp_idx);
+    double r_eq_km = b.definition.radius_au() * AU_TO_KM;
+    double r_eq_m = r_eq_km * 1000.0;
+    double polar_ratio = std::clamp(1.0 - b.definition.oblateness, 0.05, 1.0);
+    double max_relief_km = std::max(0.01, r_eq_km * 0.0099);
+
+    auto active_col = celestial_renderer_.color_source(b.definition.name);
+    auto active_hgt = celestial_renderer_.height_source(b.definition.name);
+
+    auto& se = ui_state_.surface_edit;
+    if (se.body_index != insp_idx || se.system_generation != system().generation()) {
+        se.body_index = insp_idx;
+        se.system_generation = system().generation();
+        se.albedo_stage.clear();
+        se.height_stage.clear();
+        se.albedo_stage.selected_lod = active_col ? static_cast<int>(active_col->level) : 3;
+        se.height_stage.selected_lod = active_hgt ? static_cast<int>(active_hgt->info().data_level) : 3;
+        if (b.definition.height_range_km.x != 0.0 || b.definition.height_range_km.y != 0.0) {
+            se.height_min_km = b.definition.height_range_km.x;
+            se.height_max_km = b.definition.height_range_km.y;
+        } else if (active_hgt) {
+            se.height_min_km = active_hgt->info().minimum_m * 0.001;
+            se.height_max_km = active_hgt->info().maximum_m * 0.001;
+        } else {
+            double def_ext = std::min(10.0, r_eq_km * 0.005);
+            se.height_min_km = -def_ext;
+            se.height_max_km = def_ext;
+        }
+        se.height_range_dirty = false;
+        se.status_msg.clear();
+        se.error_msg.clear();
+        se.invalidate_preview();
+    }
+
+    ImGuiTabItemFlags tab_flags = 0;
+    if (se.focus_surface_tab) {
+        tab_flags |= ImGuiTabItemFlags_SetSelected;
+        se.focus_surface_tab = false;
+    }
+
+    if (!ImGui::BeginTabItem("Surface", nullptr, tab_flags)) {
+        return;
+    }
+    ImGui::BeginChild("tab_surface_content", ImVec2(0.0f, 0.0f), false);
+
+    ui::section("Surface & Elevation Maps", "Drag & drop an equirectangular image or click the preview box to stage and bake.");
+
+    float avail_w = ImGui::GetContentRegionAvail().x;
+    float sub_btn_w = std::max(80.0f, (avail_w - 6.0f) * 0.5f);
+    bool has_albedo_ind = (active_col != nullptr) || se.albedo_stage.has_staged;
+    bool has_height_ind = (active_hgt != nullptr) || se.height_stage.has_staged;
+
+    for (int t = 0; t < 2; ++t) {
+        if (t > 0) ImGui::SameLine(0.0f, 6.0f);
+        bool is_sel = (se.selected_tab == t);
+        if (is_sel) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.44f, 0.52f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.52f, 0.60f, 1.0f));
+        }
+        std::string lbl = (t == 0)
+            ? std::format("Surface (Albedo){}", has_albedo_ind ? " *" : "")
+            : std::format("Elevation (Height){}", has_height_ind ? " *" : "");
+        if (ImGui::Button(lbl.c_str(), ImVec2(sub_btn_w, 0.0f))) {
+            se.selected_tab = t;
+        }
+        if (is_sel) ImGui::PopStyleColor(2);
+    }
+
+    ImGui::Spacing();
+
+    bool is_height = (se.selected_tab == 1);
+    auto& stage = is_height ? se.height_stage : se.albedo_stage;
+    uint64_t cur_domain = is_height
+        ? (active_hgt ? active_hgt->domain().identity : 0)
+        : (active_col ? active_col->domain.identity : 0);
+
+    bool need_preview_upload = (se.preview_tab_key != se.selected_tab) ||
+                               (se.preview_is_staged != stage.has_staged) ||
+                               (stage.has_staged && se.preview_staged_key != stage.staged_path) ||
+                               (!stage.has_staged && se.preview_domain_key != cur_domain) ||
+                               (!stage.has_staged && !is_height && cur_domain == 0 && se.preview_color_key != b.definition.color_rgb);
+
+    if (need_preview_upload && surface_preview_staging_.mapped) {
+        std::vector<uint8_t> rgba;
+        if (stage.has_staged && stage.preview_rgba.size() == terrain::SURFACE_PREVIEW_W * terrain::SURFACE_PREVIEW_H * 4) {
+            rgba = stage.preview_rgba;
+        } else if (is_height && active_hgt) {
+            rgba = terrain::SurfaceBaker::build_height_pack_preview(*active_hgt);
+        } else if (!is_height && active_col) {
+            rgba = terrain::SurfaceBaker::build_color_pack_preview(*active_col);
+        } else if (!is_height) {
+            rgba = terrain::SurfaceBaker::build_solid_preview(
+                b.definition.color_rgb.r, b.definition.color_rgb.g, b.definition.color_rgb.b);
+        } else {
+            rgba = terrain::SurfaceBaker::build_solid_preview(0.13f, 0.14f, 0.17f);
+        }
+        if (rgba.size() == terrain::SURFACE_PREVIEW_W * terrain::SURFACE_PREVIEW_H * 4) {
+            std::memcpy(surface_preview_staging_.mapped, rgba.data(), rgba.size());
+            surface_preview_dirty_ = true;
+        }
+        se.preview_tab_key = se.selected_tab;
+        se.preview_is_staged = stage.has_staged;
+        se.preview_staged_key = stage.staged_path;
+        se.preview_domain_key = cur_domain;
+        se.preview_color_key = b.definition.color_rgb;
+    }
+
+    float box_w = ImGui::GetContentRegionAvail().x;
+    float box_h = std::max(90.0f, box_w * 0.5f);
+    ImVec2 p_min = ImGui::GetCursorScreenPos();
+    ImVec2 p_max(p_min.x + box_w, p_min.y + box_h);
+
+    if (surface_preview_ds_ != VK_NULL_HANDLE) {
+        ImGui::Image(reinterpret_cast<ImTextureID>(surface_preview_ds_), ImVec2(box_w, box_h));
+    } else {
+        ImGui::Dummy(ImVec2(box_w, box_h));
+    }
+
+    ImGui::SetCursorScreenPos(p_min);
+    ImGui::InvisibleButton("##surface_drop_box", ImVec2(box_w, box_h));
+    bool box_hovered = ImGui::IsItemHovered();
+    bool box_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 border_col = box_hovered
+        ? IM_COL32(95, 205, 230, 240)
+        : (stage.has_staged ? IM_COL32(240, 195, 70, 210) : IM_COL32(90, 100, 115, 180));
+    dl->AddRect(p_min, p_max, border_col, 4.0f, 0, box_hovered ? 2.0f : 1.2f);
+
+    std::string top_badge;
+    ImU32 badge_col = IM_COL32(230, 235, 245, 255);
+    if (stage.has_staged) {
+        top_badge = std::format("STAGED PREVIEW ({}x{})", stage.width, stage.height);
+        badge_col = IM_COL32(255, 215, 80, 255);
+    } else if (is_height && active_hgt) {
+        bool compat = active_hgt->compatible(r_eq_m, polar_ratio);
+        top_badge = std::format("ACTIVE PACK (LOD 0..{}, {} tiles){}",
+                                active_hgt->info().data_level,
+                                active_hgt->records().size(),
+                                compat ? "" : " [SHAPE MISMATCH]");
+        badge_col = compat ? IM_COL32(130, 235, 165, 255) : IM_COL32(255, 120, 100, 255);
+    } else if (!is_height && active_col) {
+        bool compat = active_col->compatible(r_eq_m, polar_ratio);
+        top_badge = std::format("ACTIVE PACK (LOD 0..{}, {} tiles){}",
+                                active_col->level,
+                                active_col->count(),
+                                compat ? "" : " [SHAPE MISMATCH]");
+        badge_col = compat ? IM_COL32(130, 235, 165, 255) : IM_COL32(255, 120, 100, 255);
+    }
+
+    if (!top_badge.empty()) {
+        ImVec2 ts = ImGui::CalcTextSize(top_badge.c_str());
+        dl->AddRectFilled(ImVec2(p_min.x + 6.0f, p_min.y + 6.0f),
+                          ImVec2(p_min.x + ts.x + 16.0f, p_min.y + ts.y + 12.0f),
+                          IM_COL32(10, 12, 16, 200), 3.0f);
+        dl->AddText(ImVec2(p_min.x + 11.0f, p_min.y + 9.0f), badge_col, top_badge.c_str());
+    }
+
+    const char* center_prompt = stage.has_staged
+        ? "Click or Drop Image to Replace Staged Map"
+        : ((cur_domain != 0) ? "Click or Drop Image to Stage New Map" : "Drop Equirectangular Image Here or Click to Browse");
+    if (box_hovered || (cur_domain == 0 && !stage.has_staged)) {
+        ImVec2 cs = ImGui::CalcTextSize(center_prompt);
+        ImVec2 cp(p_min.x + (box_w - cs.x) * 0.5f, p_min.y + (box_h - cs.y) * 0.5f);
+        dl->AddRectFilled(ImVec2(cp.x - 8.0f, cp.y - 4.0f),
+                          ImVec2(cp.x + cs.x + 8.0f, cp.y + cs.y + 4.0f),
+                          IM_COL32(12, 15, 20, 195), 4.0f);
+        dl->AddText(cp, IM_COL32(240, 244, 250, 255), center_prompt);
+    }
+
+    if (box_clicked && !surface_baker_.is_baking()) {
+        if (auto picked = terrain::SurfaceBaker::open_image_file_dialog()) {
+            stage_surface_file(*picked, se.selected_tab);
+        }
+    }
+
+    auto existing_disk_src = terrain::SurfaceBaker::find_existing_source_image(
+        system().name(), b.definition.name, is_height);
+
+    float action_half_w = std::max(70.0f, (avail_w - 6.0f) * 0.5f);
+    ImGui::BeginDisabled(surface_baker_.is_baking());
+    if (ImGui::Button("Browse Image...", ImVec2((stage.has_staged || cur_domain != 0) ? action_half_w : -1.0f, 0.0f))) {
+        if (auto picked = terrain::SurfaceBaker::open_image_file_dialog()) {
+            stage_surface_file(*picked, se.selected_tab);
+        }
+    }
+    if (stage.has_staged) {
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ImGui::Button("Discard Staged", ImVec2(action_half_w, 0.0f))) {
+            stage.clear();
+            se.invalidate_preview();
+            se.status_msg = "Cleared staged preview.";
+            se.error_msg.clear();
+        }
+    } else if (cur_domain != 0) {
+        ImGui::SameLine(0.0f, 6.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.16f, 0.16f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.22f, 0.22f, 1.0f));
+        if (ImGui::Button(is_height ? "Unbind Elevation" : "Unbind Albedo", ImVec2(action_half_w, 0.0f))) {
+            terrain::SurfaceBaker::remove_from_catalog(b.definition.name, is_height);
+            if (is_height) {
+                celestial_renderer_.set_height_source(b.definition.name, nullptr);
+                size_renderer_.set_height_source(b.definition.name, nullptr);
+            } else {
+                celestial_renderer_.set_color_source(b.definition.name, nullptr);
+                size_renderer_.set_color_source(b.definition.name, nullptr);
+            }
+            se.invalidate_preview();
+            se.status_msg = std::format("Removed {} pack from {}.", is_height ? "elevation" : "albedo", b.definition.name);
+            se.error_msg.clear();
+        }
+        ImGui::PopStyleColor(2);
+    }
+    ImGui::EndDisabled();
+
+    if (stage.has_staged) {
+        std::filesystem::path sp(stage.staged_path);
+        ui::metric_text(std::format("Staged: {} ({}x{}, Recommended LOD {})",
+                                    sp.filename().string(), stage.width, stage.height, stage.recommended_lod));
+    } else if (existing_disk_src) {
+        ui::metric_text(std::format("Disk source available: {}", existing_disk_src->filename().string()));
+    } else {
+        ui::metric_text("No source image staged yet.");
+    }
+
+    if (!is_height) {
+        ImGui::Spacing();
+        float base_col[3] = {b.definition.color_rgb.r, b.definition.color_rgb.g, b.definition.color_rgb.b};
+        if (ImGui::ColorEdit3("Fallback Base Color", base_col)) {
+            glm::vec3 new_col{base_col[0], base_col[1], base_col[2]};
+            simulation_.apply(ephemeris::ApplyBodySurface{
+                system().generation(), insp_idx, 0, b.definition.height_range_km, new_col
+            });
+            save_body_surface_to_disk(b.definition.name, b.definition.height_range_km, new_col);
+            se.invalidate_preview();
+        }
+    }
+
+    if (is_height) {
+        ui::section("Elevation Range", "Physical min and max elevation (km) saved to system.json and used when baking.");
+        ui::field("Minimum Elevation (km)##surf_h_min", [&](const char* id) {
+            if (ImGui::InputDouble(id, &se.height_min_km, 0.1, 1.0, "%.3f")) {
+                se.height_min_km = std::clamp(se.height_min_km, -max_relief_km, max_relief_km);
+                if (se.height_max_km < se.height_min_km) se.height_max_km = se.height_min_km;
+                se.height_range_dirty = true;
+            }
+        });
+        ui::field("Maximum Elevation (km)##surf_h_max", [&](const char* id) {
+            if (ImGui::InputDouble(id, &se.height_max_km, 0.1, 1.0, "%.3f")) {
+                se.height_max_km = std::clamp(se.height_max_km, -max_relief_km, max_relief_km);
+                if (se.height_min_km > se.height_max_km) se.height_min_km = se.height_max_km;
+                se.height_range_dirty = true;
+            }
+        });
+        ui::metric_text(std::format("Total Vertical Relief: {:.3f} km (1% Radius Envelope: ±{:.2f} km)",
+                                    se.height_max_km - se.height_min_km, max_relief_km));
+        if (active_hgt) {
+            ui::metric_text(std::format("Active Baked Pack Envelope: [{:.3f}, {:.3f}] km",
+                                        active_hgt->info().minimum_m * 0.001,
+                                        active_hgt->info().maximum_m * 0.001));
+        }
+
+        if (ImGui::Button("Apply & Save Elevation Range to JSON", ImVec2(-1.0f, 0.0f))) {
+            glm::dvec2 range_km{se.height_min_km, se.height_max_km};
+            auto res = simulation_.apply(ephemeris::ApplyBodySurface{
+                system().generation(), insp_idx, 0, range_km, b.definition.color_rgb
+            });
+            if (!res && !res.error.empty()) {
+                se.error_msg = res.error;
+                se.status_msg.clear();
+            } else {
+                bool saved = save_body_surface_to_disk(b.definition.name, range_km, b.definition.color_rgb);
+                se.height_range_dirty = false;
+                se.error_msg.clear();
+                se.status_msg = saved
+                    ? std::format("Saved height_range_km [{:.3f}, {:.3f}] km to system.json.", range_km.x, range_km.y)
+                    : std::format("Applied height_range_km [{:.3f}, {:.3f}] km in simulation.", range_km.x, range_km.y);
+            }
+        }
+    }
+
+    ui::section("Tile Pack Baker", "Select target LOD pyramid depth (0..5) and compute backend.");
+
+    static constexpr const char* lod_labels[] = {
+        "LOD 0  (6 tiles, ~0.4 MB — 0.5K)",
+        "LOD 1  (30 tiles, ~2.0 MB — 1K)",
+        "LOD 2  (126 tiles, ~8.4 MB — 2K)",
+        "LOD 3  (510 tiles, ~34 MB — 4K)",
+        "LOD 4  (2,046 tiles, ~136 MB — 8K)",
+        "LOD 5  (8,190 tiles, ~545 MB — 16K+)"
+    };
+    stage.selected_lod = std::clamp(stage.selected_lod, 0, 5);
+    ui::field("Target LOD Level##surf_lod", [&](const char* id) {
+        ImGui::Combo(id, &stage.selected_lod, lod_labels, static_cast<int>(std::size(lod_labels)));
+    });
+    if (stage.has_staged && stage.selected_lod != stage.recommended_lod) {
+        if (ImGui::SmallButton(std::format("Use Recommended (LOD {})", stage.recommended_lod).c_str())) {
+            stage.selected_lod = stage.recommended_lod;
+        }
+    }
+
+    static constexpr const char* backend_labels[] = {
+        "Auto (CUDA if available, else CPU)",
+        "CUDA (GPU CuPy RawModule)",
+        "CPU (NumPy)"
+    };
+    static constexpr const char* backend_keys[] = {"auto", "cuda", "cpu"};
+    se.backend_choice = std::clamp(se.backend_choice, 0, 2);
+    ui::field("Compute Backend##surf_backend", [&](const char* id) {
+        ImGui::Combo(id, &se.backend_choice, backend_labels, static_cast<int>(std::size(backend_labels)));
+    });
+
+    ImGui::Spacing();
+
+    if (surface_baker_.is_baking()) {
+        float prog = surface_baker_.progress();
+        std::string overlay = std::format("{:.0f}% ({:.1f}s)", prog * 100.0f, surface_baker_.elapsed_seconds());
+        ImGui::ProgressBar(prog, ImVec2(-1.0f, 0.0f), overlay.c_str());
+        std::string bname = surface_baker_.backend_name();
+        if (!bname.empty()) {
+            ui::metric_text(std::format("Backend: {}", bname));
+        }
+        ImGui::TextWrapped("%s", surface_baker_.status_text().c_str());
+    } else {
+        std::filesystem::path source_to_bake;
+        if (stage.has_staged) {
+            source_to_bake = std::filesystem::path(stage.staged_path);
+        } else if (existing_disk_src) {
+            source_to_bake = *existing_disk_src;
+        }
+        bool can_bake = !source_to_bake.empty();
+
+        ImGui::BeginDisabled(!can_bake);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.45f, 0.30f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.56f, 0.38f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.26f, 0.64f, 0.44f, 1.0f));
+        std::string bake_btn_lbl = stage.has_staged
+            ? std::format("Bake & Apply {} (LOD 0..{})", is_height ? "Elevation" : "Albedo", stage.selected_lod)
+            : std::format("Re-Bake & Apply {} (LOD 0..{})", is_height ? "Elevation" : "Albedo", stage.selected_lod);
+        if (ImGui::Button(bake_btn_lbl.c_str(), ImVec2(-1.0f, 32.0f))) {
+            terrain::SurfaceBakeRequest req{};
+            req.system_name = system().name();
+            req.body_name = b.definition.name;
+            req.is_height = is_height;
+            req.source_file = source_to_bake;
+            req.level = stage.selected_lod;
+            req.polar_ratio = polar_ratio;
+            req.radius_m = r_eq_m;
+            req.height_min_km = se.height_min_km;
+            req.height_max_km = se.height_max_km;
+            req.backend = backend_keys[se.backend_choice];
+            req.copy_to_system_textures = true;
+            se.status_msg.clear();
+            se.error_msg.clear();
+            surface_baker_.start_bake(std::move(req));
+        }
+        ImGui::PopStyleColor(3);
+        ImGui::EndDisabled();
+    }
+
+    if (!se.status_msg.empty()) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "%s", se.status_msg.c_str());
+    }
+    if (!se.error_msg.empty()) {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", se.error_msg.c_str());
+    }
+
+    ImGui::EndChild();
+    ImGui::EndTabItem();
 }
 
 void App::render_time_hud(rendering::RenderSettings& render_draft) {

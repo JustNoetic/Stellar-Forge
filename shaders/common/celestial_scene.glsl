@@ -11,6 +11,7 @@ struct BodyInstanceGPU {
     vec4 shine_direction[4];
     vec4 shine_irradiance[4];
     SurfaceMaterial material;
+    vec4 view_center;
 };
 
 layout(std140, set = 0, binding = 0) uniform SceneCelestialUBO {
@@ -41,6 +42,11 @@ bool star_lights_body(uint body, uint star) {
 float apparent_radius_px(vec4 pos_radius) {
     return pos_radius.w / max(length(pos_radius.xyz), 1e-12)
            * u_scene.screen_params.y * u_scene.screen_params.z;
+}
+
+float body_offset_depth(BodyInstanceGPU b, vec3 offset) {
+    vec4 clip = u_scene.projection * vec4(b.view_center.xyz + mat3(u_scene.view) * offset, 1.0);
+    return clamp(clip.z / clip.w, 0.0, 1.0);
 }
 
 vec3 body_pole(BodyInstanceGPU b) {

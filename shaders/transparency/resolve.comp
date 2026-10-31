@@ -3,21 +3,26 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
 layout(set = 0, binding = 3) uniform sampler2D opaque_depth;
+#ifdef BLOOM_OUTPUT
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D physical_color;
+#endif
 
 bool fragment_before(uint a, uint b) {
     uvec4 x = fragments[a], y = fragments[b];
     if (x.z != y.z) return x.z < y.z;
     if (x.x != y.x) return x.x < y.x;
-    return x.y <= y.y;
+    return (x.y & 0x7fffffffu) <= (y.y & 0x7fffffffu);
 }
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, imageSize(transparency_heads)))) return;
     uint current = imageLoad(transparency_heads, pixel).x;
+#ifndef BLOOM_OUTPUT
     if (current == TRANSPARENCY_END) return;
+#endif
     uint sorted = current;
-    if (fragments[current].w != TRANSPARENCY_END) {
+    if (current != TRANSPARENCY_END && fragments[current].w != TRANSPARENCY_END) {
         for (uint width = 1u; ; width *= 2u) {
             uint p = sorted;
             sorted = TRANSPARENCY_END;
@@ -54,12 +59,23 @@ void main() {
         }
     }
     vec4 background = imageLoad(hdr_color, pixel);
+#ifdef BLOOM_OUTPUT
+    vec3 physical = background.rgb;
+#endif
     uint depth = floatBitsToUint(texelFetch(opaque_depth, pixel, 0).r);
     while (sorted != TRANSPARENCY_END) {
         uvec4 fragment = fragments[sorted];
         vec4 color = transparent_color(fragment);
-        if (fragment.z >= depth) background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+        if (fragment.z >= depth) {
+            background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+#ifdef BLOOM_OUTPUT
+            if (!transparent_excludes_bloom(fragment)) physical = color.rgb+(1.0-color.a)*physical;
+#endif
+        }
         sorted = fragment.w;
     }
     imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+#ifdef BLOOM_OUTPUT
+    imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
+#endif
 }

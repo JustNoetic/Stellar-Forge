@@ -2,6 +2,7 @@
 #include "benchmark/build_info.hpp"
 #include "benchmark/earth_closeup.hpp"
 #include "benchmark/audit_fixture.hpp"
+#include "benchmark/terrain_navigation.hpp"
 #include "core/log.hpp"
 #include "core/path_utils.hpp"
 
@@ -61,6 +62,7 @@ void App::run_benchmark() {
 
     nlohmann::json assets = nlohmann::json::object();
     assets["data/gaia/stars.bin"] = benchmark::fingerprint(paths::external_path("data", "gaia", "stars.bin"));
+    assets["data/surfaces.json"] = benchmark::fingerprint(paths::external_path("data", "surfaces.json"));
     for (const auto& entry : std::filesystem::recursive_directory_iterator(paths::bundled_path("shaders"))) {
         if (!entry.is_regular_file()) continue;
         auto key = std::filesystem::relative(entry.path(), paths::project_root()).generic_string();
@@ -128,7 +130,7 @@ void App::run_benchmark() {
             else if (!spice) require(simulation_.apply(ephemeris::SetMotionModel{ephemeris::MotionModel::Keplerian}));
             if (spice && system().definition().motion_model != ephemeris::MotionModel::Spice)
                 throw std::runtime_error("SPICE fixture did not load SPICE playback.");
-            bool earth_closeup = scene.starts_with("earth-") || scene == "saturn";
+            bool earth_closeup = scene.starts_with("earth-") || scene.starts_with("saturn");
             if (scene == "earth-eclipse") {
                 require(simulation_.apply(ephemeris::SetPaused{false}));
                 require(simulation_.apply(ephemeris::SetTimeWarp{1.0}));
@@ -141,10 +143,19 @@ void App::run_benchmark() {
             camera_.tracking_idx = scene == "approach" ? system().find_body("Earth") : system().star_index();
             if (camera_.tracking_idx < 0) throw std::runtime_error("Benchmark target is missing.");
             camera_.horizon_align = false;
-            if (earth_closeup) camera_ = benchmark::audit_camera(system(), scene);
+            bool navigation = benchmark::terrain_navigation_scene(scene);
+            benchmark::TerrainNavigation navigation_path;
+            if (navigation) {
+                auto source = celestial_renderer_.height_source("Earth");
+                if (!source) throw std::runtime_error("Terrain navigation benchmark requires Earth elevation data.");
+                navigation_path = benchmark::terrain_navigation(system(), *source, settings, scene, options.frames, options.step_seconds);
+                camera_.tracking_idx = system().find_body("Earth");
+                camera_.horizon_align = true;
+                navigation_path.poses.front().apply(camera_);
+            } else if (earth_closeup) camera_ = benchmark::audit_camera(system(), scene);
             double base_yaw = camera_.yaw_deg;
             ui_state_ = {};
-            ui_state_.inspected_body = system().find_body("Earth");
+            ui_state_.inspected_body = system().find_body(scene.starts_with("saturn") ? "Saturn" : "Earth");
             frame_dt_ = units::Seconds{options.step_seconds};
             benchmark::Run run;
             run.scene = scene;
@@ -180,10 +191,19 @@ void App::run_benchmark() {
                     system().body(camera_.tracking_idx).definition.oblateness, system().body(camera_.tracking_idx).render.pole, camera_.cam_pos_rel))*AU_TO_KM;
             }
             run.fixture["variant"] = options.variant;
-            run.fixture["render_settings"]["features"] = {{"atmospheres", settings.show_atmospheres}, {"atmosphere_shadows", settings.atmosphere_shadows_enabled},
+            if (navigation) run.fixture["navigation"] = navigation_path.fixture;
+            run.fixture["render_settings"]["terrain_error_pixels"] = settings.terrain_error_pixels;
+            run.fixture["render_settings"]["terrain_patch_limit"] = settings.terrain_patch_limit;
+            run.fixture["render_settings"]["bloom"] = {{"mode", settings.bloom_mode}, {"strength", settings.bloom_strength},
+                {"highlight_limit", settings.bloom_highlight_limit},
+                {"radius", settings.bloom_radius}, {"diffraction", settings.bloom_diffraction}, {"rotation_deg", settings.bloom_rotation_deg},
+                {"spike_threshold", settings.bloom_spike_threshold}};
+            run.fixture["render_settings"]["features"] = {{"atmospheres", settings.show_atmospheres}, {"aerial_perspective", settings.aerial_perspective_enabled},
+                {"atmosphere_shadows", settings.atmosphere_shadows_enabled},
                 {"refraction", settings.refraction_enabled}, {"terrain", settings.terrain_imported_enabled}, {"normals", settings.terrain_normal_maps_enabled},
                 {"textures", settings.surface_textures_enabled}, {"rings", settings.show_rings}, {"ring_shadows", settings.ring_shadows_enabled},
                 {"direct_sunlight_only", settings.direct_sunlight_only},
+                {"clouds", settings.clouds_enabled}, {"cloud_mode", settings.cloud_mode}, {"legacy_transparency", settings.transparency_reference_legacy},
                 {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
                 {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}, {"shadow_analytic", settings.atmosphere_shadow_analytic}};
             if (scene == "nbody") run.fixture["ias15_epsilon"] = simulation_.nbody_epsilon();
@@ -208,7 +228,8 @@ void App::run_benchmark() {
                 }
                 {
                     ScopedTimer timer(&sample.cpu_camera_ms);
-                    if (scene.ends_with("-turn")) camera_.yaw_deg = camera_.yaw_actual_deg = base_yaw+15*std::sin(index*options.step_seconds*0.7);
+                    if (navigation) navigation_path.poses[index < options.warmup ? 0 : sample.index].apply(camera_);
+                    else if (scene.ends_with("-turn")) camera_.yaw_deg = camera_.yaw_actual_deg = base_yaw+15*std::sin(index*options.step_seconds*0.7);
                     if (scene == "approach") {
                         double progress = index < options.warmup || options.frames == 1 ? 0.0
                             : static_cast<double>(sample.index) / (options.frames - 1);
@@ -224,14 +245,22 @@ void App::run_benchmark() {
                 const auto& atmosphere = celestial_renderer_.atmosphere_stats();
                 sample.counters = {{"terrain_patches", terrain.patches}, {"terrain_bakes", terrain.cache_bakes},
                     {"terrain_selection_rebuilds", terrain.selection_rebuilds}, {"terrain_budget_limited", terrain.budget_limited},
+                    {"terrain_selection_reuses", terrain.selection_reuses}, {"terrain_selection_checks", terrain.selection_checks},
+                    {"terrain_dependency_rebuilds", terrain.dependency_rebuilds}, {"terrain_patch_updates", terrain.patch_updates},
+                    {"terrain_loading_bodies", terrain.loading_bodies}, {"terrain_deepest_level", terrain.deepest_level},
+                    {"terrain_imported_patches", terrain.imported_patches}, {"terrain_reference_patches", terrain.reference_patches},
+                    {"terrain_stream_pending", terrain.stream.pending}, {"terrain_stream_failed", terrain.stream.failed},
                     {"texture_uploads", textures.uploads}, {"texture_pending", textures.pending}, {"texture_failed", textures.failed},
                     {"normal_uploads", normals.uploads}, {"normal_pending", normals.pending}, {"normal_failed", normals.failed},
                     {"atmospheres_visible", atmosphere.visible}, {"optical_updates", atmosphere.optical_lut_updates},
                     {"sky_updates", atmosphere.sky_lut_updates}, {"aerial_updates", atmosphere.aerial_lut_updates},
                     {"secondary_updates", atmosphere.secondary_lut_updates},
                     {"secondary_source_updates", atmosphere.secondary_source_lut_updates},
-                    {"shadow_updates", atmosphere.shadow_updates}, {"shadow_resets", atmosphere.shadow_history_resets},
+                    {"shadow_updates", atmosphere.shadow_updates}, {"shadow_vrs_updates", atmosphere.shadow_vrs_updates},
+                    {"shadow_resets", atmosphere.shadow_history_resets},
                     {"shadow_rotation_updates", atmosphere.shadow_rotation_updates},
+                    {"transparency_fragments", static_cast<double>(celestial_renderer_.transparency().last_stats().fragments)},
+                    {"transparency_overflow", static_cast<double>(celestial_renderer_.transparency().last_stats().overflow)},
                     {"ringshine_bakes", celestial_renderer_.ringshine_frame_bake_count()},
                     {"observer_builds", celestial_renderer_.refraction_observer_builds()},
                     {"camera_yaw_deg", camera_.yaw_actual_deg}, {"camera_pitch_deg", camera_.pitch_actual_deg}};

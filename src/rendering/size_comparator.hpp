@@ -20,6 +20,12 @@ public:
     uint64_t transport_bakes() const noexcept { return transport_bakes_; }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
+    void set_color_source(std::string body, std::shared_ptr<const terrain::SurfaceSource> source) {
+        if (initialized_) textures_.set_color_source(std::move(body), std::move(source));
+    }
+    void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
+        if (initialized_) normals_.set_height_source(std::move(body), std::move(source));
+    }
 
 private:
     struct Resources {

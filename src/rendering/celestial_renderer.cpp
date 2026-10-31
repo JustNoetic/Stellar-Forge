@@ -8,15 +8,69 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace sf::rendering {
 
-static_assert(sizeof(BodyInstanceGPU) == 272);
+static_assert(sizeof(BodyInstanceGPU) == 288);
+static_assert(sizeof(SurfaceFluidGPU) == 128);
+static_assert(sizeof(SurfaceFluidHeaderGPU) == 32+OCEAN_WAVE_COUNT*32);
 static_assert(terrain::MAX_PATCHES >= MAX_CELESTIAL_BODIES*6);
 
 namespace {
+
+glm::dmat3 fluid_rotation(glm::dvec3 pole, double spin) {
+    glm::dvec3 reference = std::abs(pole.x) < 0.9 ? glm::dvec3(1.0, 0.0, 0.0) : glm::dvec3(0.0, 0.0, 1.0);
+    glm::dvec3 x = glm::normalize(reference - pole * glm::dot(reference, pole));
+    glm::dvec3 z = glm::cross(x, pole);
+    double c = std::cos(spin), s = std::sin(spin);
+    return glm::dmat3(x * c - z * s, pole, x * s + z * c);
+}
+
+double cox_munk_variance(double wind_ms) {
+    return 0.003 + 0.00512 * std::max(wind_ms, 0.0);
+}
+
+double surface_gravity(const ephemeris::BodyDefinition& d) {
+    double radius_m = d.radius_au() * AU_TO_KM * 1000.0;
+    double g = 6.6743e-11 * d.mass_msun * 1.98847e30 / std::max(radius_m * radius_m, 1.0);
+    return std::isfinite(g) && g > 0.05 ? g : 9.81;
+}
+
+void build_ocean_waves(SurfaceFluidHeaderGPU& header, glm::dvec3 camera_fixed_m, double wind_ms, double wind_direction_deg,
+                       double gravity, double seconds) {
+    glm::dvec3 up = glm::length(camera_fixed_m) > 1.0 ? glm::normalize(camera_fixed_m) : glm::dvec3(1.0, 0.0, 0.0);
+    glm::dvec3 east = glm::cross(glm::dvec3(0.0, 1.0, 0.0), up);
+    east = glm::length(east) > 1e-6 ? glm::normalize(east) : glm::dvec3(0.0, 0.0, 1.0);
+    glm::dvec3 north = glm::cross(up, east);
+    double wind = std::max(wind_ms, 0.5);
+    double peak_omega = 0.877 * gravity / wind;
+    double peak_wavelength = TWO_PI * gravity / (peak_omega * peak_omega);
+    double wavelength = std::clamp(1.5 * peak_wavelength, 1.0, 2000.0);
+    double variance = cox_munk_variance(wind_ms);
+    double steepness = std::sqrt(2.0 * variance / OCEAN_WAVE_COUNT);
+    double wind_angle = wind_direction_deg * DEG_TO_RAD;
+    for (uint32_t i = 0; i < OCEAN_WAVE_COUNT; ++i) {
+        double spread = (std::fmod(i * 0.6180339887498949, 1.0) * 2.0 - 1.0) * PI * (0.25 + 0.5 * i / double(OCEAN_WAVE_COUNT - 1));
+        double angle = wind_angle + spread;
+        glm::dvec3 direction = east * std::cos(angle) + north * std::sin(angle);
+        double k = TWO_PI / wavelength;
+        double omega = std::sqrt(gravity * k);
+        double offset = std::fmod(i * 2.399963229728653, TWO_PI);
+        double time_phase = std::fmod(offset - omega * seconds, TWO_PI);
+        double focus_phase = std::fmod(k * glm::dot(direction, camera_fixed_m) + time_phase, TWO_PI);
+        header.waves[i].direction_k = glm::vec4(glm::vec3(direction), static_cast<float>(k));
+        header.waves[i].phases = glm::vec4(static_cast<float>(focus_phase), static_cast<float>(time_phase),
+                                           static_cast<float>(steepness), static_cast<float>(wavelength));
+        wavelength *= 0.68;
+    }
+    header.header.x = static_cast<float>(variance);
+    header.header.y = static_cast<float>(std::fmod(seconds, 1000.0));
+}
 
 struct SphereVertex {
     glm::vec3 pos;
@@ -27,6 +81,7 @@ struct SphereVertex {
 
 void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     build_sphere_mesh(ctx, 64, 32);
+    cloud_maps_.init(ctx);
     textures_.init(ctx);
     normals_.init(ctx, true);
     rings_.init(ctx);
@@ -41,6 +96,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
             MAX_CELESTIAL_BODIES * sizeof(BodyInstanceGPU),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         eclipse_ssbos_[i] = ctx.create_host_buffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        fluid_ssbos_[i] = ctx.create_host_buffer(
+            sizeof(SurfaceFluidHeaderGPU)+MAX_CELESTIAL_BODIES*sizeof(SurfaceFluidGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
 
     rhi::DescriptorLayoutBinding bindings[] = {
@@ -60,6 +117,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
         {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     rhi::GraphicsPipelineDesc sphere_desc{};
@@ -82,6 +141,37 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     sphere_desc.front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
     sphere_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, sphere_desc);
+
+    for (uint32_t mode = 0; mode < 2; ++mode) {
+        rhi::GraphicsPipelineDesc cloud_desc = sphere_desc;
+        cloud_desc.vert_path = "celestial/cloud.vert";
+        cloud_desc.frag_path = mode == 0 ? "celestial/cloud_sheet.frag" : "celestial/cloud.frag";
+        cloud_desc.capture_statistics = std::getenv("STELLAR_SHADER_STATS") != nullptr;
+        cloud_desc.bindings = {
+            {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        };
+        cloud_desc.depth_write = false;
+        cloud_desc.premultiplied_blend = true;
+        cloud_desc.cull_mode = VK_CULL_MODE_FRONT_BIT;
+        cloud_pipeline_[mode] = rhi::ShaderCache::create_graphics_pipeline(ctx, cloud_desc);
+        if (ctx.fragment_stores_enabled()) {
+            auto capture = cloud_desc;
+            capture.macros = {{"TRANSPARENCY_CAPTURE", "1"}};
+            capture.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+            capture.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+            cloud_transparency_pipeline_[mode] = rhi::ShaderCache::create_graphics_pipeline(ctx, capture);
+        }
+        cloud_desc.macros = {{"CLOUD_DEPTH_ONLY", "1"}};
+        cloud_desc.depth_write = true;
+        cloud_desc.premultiplied_blend = false;
+        cloud_desc.additive_blend = true;
+        cloud_depth_pipeline_[mode] = rhi::ShaderCache::create_graphics_pipeline(ctx, cloud_desc);
+    }
 
     rhi::GraphicsPipelineDesc point_desc{};
     point_desc.vert_path = "celestial/point_celestial.vert";
@@ -109,6 +199,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
 }
 
 void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
+    cloud_maps_.shutdown(ctx);
     eclipse_refraction_.shutdown(ctx);
     refraction_.shutdown(ctx);
     transparency_.shutdown(ctx);
@@ -120,7 +211,13 @@ void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, atmosphere_point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
+    for (uint32_t mode = 0; mode < 2; ++mode) {
+        rhi::ShaderCache::destroy_pipeline(ctx, cloud_pipeline_[mode]);
+        rhi::ShaderCache::destroy_pipeline(ctx, cloud_depth_pipeline_[mode]);
+        rhi::ShaderCache::destroy_pipeline(ctx, cloud_transparency_pipeline_[mode]);
+    }
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
+        ctx.destroy_buffer(fluid_ssbos_[i]);
         ctx.destroy_buffer(instance_ssbos_[i]);
         ctx.destroy_buffer(material_phases_[i]);
         ctx.destroy_buffer(eclipse_ssbos_[i]);
@@ -206,8 +303,19 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     });
     measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_); });
     measure("cpu_transparency_prepare_ms", [&] {
+    bool visible_clouds = false;
+    if (settings.clouds_enabled) {
+        double pixels = extent.height/(2.0*std::tan(cam.fov_deg*DEG_TO_RAD*0.5));
+        for (uint32_t i = 0; i < count && !visible_clouds; ++i) {
+            const auto& body = sys.body(i);
+            const auto& cloud = body.definition.clouds;
+            double distance = glm::length(camera_relative(body.render.position, cam.eye_pos_render()));
+            visible_clouds = cloud.enabled && cloud.coverage > 0 && cloud.density > 0 && cloud.extinction_per_km > 0 &&
+                body.definition.radius_au()/std::max(distance, 1e-15)*pixels > 2;
+        }
+    }
     transparency_.prepare(cmd, ctx, extent, !settings.transparency_reference_legacy && !sys.empty() &&
-        ((settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
+        (visible_clouds || (settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
     });
     measure("cpu_eclipse_refraction_prepare_ms", [&] { eclipse_refraction_.prepare(cmd, ctx, sys, settings); });
 }
@@ -235,6 +343,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     glm::dvec3 eye_pos = cam.eye_pos_render().value;
     glm::mat4 view = cam.view_matrix_eye_relative();
     glm::mat4 proj = cam.proj_matrix(aspect, z_near);
+    glm::dmat3 view_rotation = glm::dmat3(glm::mat3(view));
 
     SceneCelestialUBO ubo{};
     ubo.view = view;
@@ -255,11 +364,13 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
 
     for (uint32_t i = 0; i < count; ++i) {
         const auto& b = sys.body(i);
-        glm::vec3 rel_eye = glm::vec3(camera_relative(b.render.position, cam.eye_pos_render()));
+        glm::dvec3 rel_eye_d = camera_relative(b.render.position, cam.eye_pos_render());
+        glm::vec3 rel_eye = glm::vec3(rel_eye_d);
         float r_au = static_cast<float>(b.opaque_radius_au());
 
         BodyInstanceGPU inst{};
         inst.pos_radius = glm::vec4(rel_eye, r_au);
+        inst.view_center = glm::vec4(glm::vec3(view_rotation * rel_eye_d), 0.0f);
         inst.color_is_star = glm::vec4(b.definition.color_rgb, b.definition.is_star ? 1.0f : 0.0f);
         inst.pole_oblateness = glm::vec4(glm::vec3(b.render.pole), static_cast<float>(b.definition.oblateness));
         inst.pole_color_lum = glm::vec4(b.definition.color_pole_rgb, static_cast<float>(b.definition.lum_eq));
@@ -380,6 +491,9 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         ctx.flush_buffer(phases, 0, phase_bytes);
         material_uploads_[f_idx] = materials_.revision();
     }
+    prepare_fluids(f_idx, cam, sys, settings, count, fb_h * fov_factor);
+    VkDeviceSize fluid_bytes = sizeof(SurfaceFluidHeaderGPU)+count*sizeof(SurfaceFluidGPU);
+    ctx.flush_buffer(fluid_ssbos_[f_idx], 0, fluid_bytes);
     auto refraction = refraction_.writes(ctx);
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
@@ -395,6 +509,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(f_idx)),
         rhi::PushDescriptorWrite::sampled_image(16, rings_.ringshine_atlas(f_idx), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(25, phases, 0, phase_bytes),
+        rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
+        rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
         eclipse_refraction_.write(ctx),
         refraction[0],
         refraction[1],
@@ -420,6 +536,36 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     auto terrain_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_terrain_draw") : UINT32_MAX;
     terrain_.render(cmd, ctx, writes);
     ctx.end_gpu_timer(cmd, terrain_timer);
+
+    if (!cloud_bodies_.empty()) {
+        auto cloud_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_clouds") : UINT32_MAX;
+        std::vector<rhi::PushDescriptorWrite> cloud_writes = {
+            rhi::PushDescriptorWrite::uniform_buffer(0, scene_ubos_[f_idx]),
+            rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU)),
+            rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
+            rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(f_idx)),
+            rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
+            rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
+        };
+        uint32_t mode = std::min(settings.cloud_mode, 1u);
+        bool capture = transparency_.active() && cloud_transparency_pipeline_[mode].handle;
+        const auto& pipeline = capture ? cloud_transparency_pipeline_[mode] : cloud_pipeline_[mode];
+        if (capture) {
+            auto capture_writes = transparency_.writes();
+            cloud_writes.insert(cloud_writes.end(), capture_writes.begin(), capture_writes.end());
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
+        ctx.push_descriptors(cmd, pipeline, cloud_writes);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &sphere_vbo_.handle, &offset);
+        vkCmdBindIndexBuffer(cmd, sphere_ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
+        for (uint32_t body : cloud_bodies_) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
+        if (!capture) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloud_depth_pipeline_[mode].handle);
+            ctx.push_descriptors(cmd, cloud_depth_pipeline_[mode], cloud_writes);
+            for (uint32_t body : cloud_bodies_) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
+        }
+        ctx.end_gpu_timer(cmd, cloud_timer);
+    }
 
     auto points_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_points") : UINT32_MAX;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, point_pipeline_.handle);
@@ -454,7 +600,79 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     if (timings) (*timings)["cpu_surface_draw_ms"] = elapsed_ms(draw_start);
 }
 
-void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
+void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const ephemeris::SystemSnapshot& sys,
+                                       const RenderSettings& settings, uint32_t count, float pixel_scale) {
+    auto* bytes = static_cast<std::byte*>(fluid_ssbos_[frame].mapped);
+    auto* fluids = reinterpret_cast<SurfaceFluidGPU*>(bytes + sizeof(SurfaceFluidHeaderGPU));
+    SurfaceFluidHeaderGPU header{};
+    header.flags = {settings.oceans_enabled ? 1u : 0u, settings.clouds_enabled ? 1u : 0u, settings.cloud_mode, UINT32_MAX};
+    double seconds = sys.time().value * SECONDS_PER_YEAR;
+    double best_altitude = std::numeric_limits<double>::infinity();
+    int focus = -1;
+    glm::dvec3 focus_camera_fixed{0.0};
+    std::vector<std::pair<double, uint32_t>> clouds;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& b = sys.body(i);
+        const auto& d = b.definition;
+        SurfaceFluidGPU f{};
+        if (!d.is_star && !d.is_black_hole && (d.ocean.enabled || d.clouds.enabled)) {
+            double radius_km = d.radius_au() * AU_TO_KM;
+            glm::dvec3 camera_offset = -camera_relative(b.render.position, cam.eye_pos_render());
+            double distance = glm::length(camera_offset);
+            if (d.ocean.enabled) {
+                float mode = d.ocean.mask == "global" ? 3.0f : d.ocean.mask == "height" ? 2.0f : 1.0f;
+                f.ocean_deep = glm::vec4(d.ocean.deep_color, mode);
+                f.ocean_shallow = glm::vec4(d.ocean.shallow_color, static_cast<float>(d.ocean.foam));
+                f.ocean_params = glm::vec4(static_cast<float>(d.ocean.wind_speed_ms),
+                    static_cast<float>(cox_munk_variance(d.ocean.wind_speed_ms)),
+                    static_cast<float>(radius_km + d.ocean.sea_level_km), static_cast<float>(radius_km));
+                double altitude = distance / std::max(d.radius_au(), 1e-15) - 1.0;
+                if (settings.oceans_enabled && altitude < best_altitude) {
+                    best_altitude = altitude;
+                    focus = static_cast<int>(i);
+                    glm::dvec3 pole = glm::length(b.render.pole) > 1e-4 ? glm::normalize(b.render.pole) : glm::dvec3(0.0, 1.0, 0.0);
+                    focus_camera_fixed = glm::transpose(fluid_rotation(pole, b.render.spin_angle_rad))
+                                       * camera_offset * (AU_TO_KM * 1000.0);
+                }
+            }
+            if (d.clouds.enabled) {
+                f.cloud_color = glm::vec4(d.clouds.color, 1.0f);
+                f.cloud_shape = glm::vec4(static_cast<float>(d.clouds.coverage), static_cast<float>(b.render.cloud_base_altitude_km),
+                    static_cast<float>(d.clouds.thickness_km), static_cast<float>(d.clouds.density * d.clouds.extinction_per_km));
+                f.cloud_style = glm::vec4(2.0f, static_cast<float>(d.clouds.detail_size_km),
+                    static_cast<float>(d.clouds.erosion), static_cast<float>(cloud_maps_.layer(d.clouds.coverage_map)));
+                f.cloud_noise.x = static_cast<float>(d.clouds.shape_size_km);
+                double drift = std::fmod(d.clouds.wind_speed_ms * seconds / (radius_km * 1000.0), TWO_PI);
+                double evolution = std::fmod(d.clouds.evolution * seconds / 3600.0, 1000.0);
+                f.cloud_motion = glm::vec4(static_cast<float>(d.clouds.feature_size_km), static_cast<float>(drift),
+                    static_cast<float>(evolution), static_cast<float>(radius_km));
+                double apparent_px = d.radius_au() / std::max(distance, 1e-15) * pixel_scale;
+                if (settings.clouds_enabled && d.clouds.coverage > 0 && d.clouds.density > 0 &&
+                    d.clouds.extinction_per_km > 0 && apparent_px > 2.0) clouds.emplace_back(distance, i);
+            }
+        }
+        fluids[i] = f;
+    }
+
+    double wind = 7.0, direction = 30.0, gravity = 9.81;
+    if (focus >= 0) {
+        const auto& d = sys.body(static_cast<uint32_t>(focus)).definition;
+        wind = d.ocean.wind_speed_ms;
+        direction = d.ocean.wind_direction_deg;
+        gravity = surface_gravity(d);
+        header.flags.w = static_cast<uint32_t>(focus);
+    }
+    build_ocean_waves(header, focus_camera_fixed, wind, direction, gravity, seconds);
+    std::memcpy(bytes, &header, sizeof(header));
+
+    std::sort(clouds.begin(), clouds.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    cloud_bodies_.clear();
+    for (const auto& entry : clouds) cloud_bodies_.push_back(entry.second);
+}
+
+void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
+                                              rhi::Image* physical_color) {
     auto transparency_writes = transparency_.writes();
     auto refraction = refraction_.writes(ctx);
     uint32_t frame = ctx.frame_index();
@@ -474,7 +692,7 @@ void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContex
     };
     atmospheres_.composite(cmd, ctx, color, depth,
         transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{}, draw);
-    transparency_.resolve(cmd, ctx, color, depth);
+    transparency_.resolve(cmd, ctx, color, depth, physical_color);
 }
 
 } // namespace sf::rendering

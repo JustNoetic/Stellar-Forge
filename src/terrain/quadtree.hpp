@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace sf::terrain {
@@ -56,6 +57,7 @@ struct SelectionView {
 struct Patch {
     TileId tile;
     uint32_t coarse_edges = 0;
+    bool operator==(const Patch&) const = default;
 };
 
 struct Selection {
@@ -81,8 +83,39 @@ struct TileAvailability {
     std::function<bool(TileId)> ready;
     std::function<void(TileId)> request;
 };
-Selection select(const SelectionView& view, TileMetadataCache* metadata = nullptr);
-Selection select(const SelectionView& view, const TerrainSource& source, const TileAvailability& availability = {});
+class SelectionPlan {
+public:
+    SelectionPlan();
+    ~SelectionPlan();
+    SelectionPlan(SelectionPlan&&) noexcept;
+    SelectionPlan& operator=(SelectionPlan&&) noexcept;
+    void invalidate() noexcept;
+    uint32_t checks() const noexcept;
+
+private:
+    struct Storage;
+    std::unique_ptr<Storage> storage_;
+    friend Selection select(const SelectionView&, const TerrainSource&, const TileAvailability&, class SelectionScratch*, SelectionPlan*);
+    friend bool update_selection(Selection&, SelectionPlan&, const SelectionView&, const TerrainSource&, const TileAvailability&, class SelectionScratch*);
+};
+
+class SelectionScratch {
+public:
+    SelectionScratch();
+    ~SelectionScratch();
+    SelectionScratch(SelectionScratch&&) noexcept;
+    SelectionScratch& operator=(SelectionScratch&&) noexcept;
+
+private:
+    struct Storage;
+    std::unique_ptr<Storage> storage_;
+    friend Selection select(const SelectionView&, const TerrainSource&, const TileAvailability&, SelectionScratch*, SelectionPlan*);
+};
+
+Selection select(const SelectionView& view, TileMetadataCache* metadata = nullptr, SelectionScratch* scratch = nullptr);
+Selection select(const SelectionView& view, const TerrainSource& source, const TileAvailability& availability = {}, SelectionScratch* scratch = nullptr, SelectionPlan* plan = nullptr);
+bool update_selection(Selection& selection, SelectionPlan& plan, const SelectionView& view, const TerrainSource& source,
+                      const TileAvailability& availability = {}, SelectionScratch* scratch = nullptr);
 std::vector<uint32_t> grid_indices(uint32_t coarse_edges);
 
 }

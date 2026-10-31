@@ -35,7 +35,10 @@ layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 aerosol_scattering[4];
     vec4 aerosol_extinction[4];
     vec4 aerosol_phase[512];
+    vec4 view_ray[3];
 } atm;
+
+const float DEPTH_DISTANCE_TOLERANCE = 1e-6;
 
 float bottom_radius() { return atm.radii_heights.x; }
 float top_radius() { return atm.radii_heights.y; }
@@ -49,14 +52,39 @@ vec2 sphere_roots(vec3 p, vec3 d, float radius) {
     return vec2(-b - root, -b + root);
 }
 
-vec2 atmosphere_segment(vec3 p, vec3 d) {
+float entry_half_chord(vec3 p, vec3 d) {
+    vec3 perpendicular = cross(p, d);
+    return sqrt(max(top_radius()*top_radius()-dot(perpendicular, perpendicular), 0.0));
+}
+
+float ground_half_chord(vec3 p, vec3 d) {
+    vec3 perpendicular = cross(p, d);
+    return sqrt(max(bottom_radius()*bottom_radius()-dot(perpendicular, perpendicular), 0.0));
+}
+
+vec2 atmosphere_segment(vec3 p, vec3 d, out float span) {
     vec2 outer = sphere_roots(p, d, top_radius());
+    span = 0.0;
     if (outer.y <= 0.0) return vec2(0.0);
     float start = max(outer.x, 0.0);
     float end = outer.y;
     vec2 ground = sphere_roots(p, d, bottom_radius());
-    if (ground.x >= 0.0) end = min(end, ground.x);
+    bool hit = ground.x >= 0.0;
+    if (hit) end = min(end, ground.x);
+    span = max(end-start, 0.0);
+    if (outer.x > 0.0) span = hit ? max(entry_half_chord(p, d)-ground_half_chord(p, d), 0.0) : 2.0*entry_half_chord(p, d);
     return vec2(start, max(start, end));
+}
+
+vec2 atmosphere_segment(vec3 p, vec3 d) {
+    float span;
+    return atmosphere_segment(p, d, span);
+}
+
+vec3 atmosphere_entry(vec3 d, float start) {
+    if (start <= 0.0) return atm.camera.xyz;
+    vec3 closest = atm.camera.z*vec3(-d.z*d.xy, dot(d.xy, d.xy));
+    return closest-d*sqrt(max(top_radius()*top_radius()-dot(closest, closest), 0.0));
 }
 
 float particle_density(int layer, float height) {
@@ -103,6 +131,10 @@ vec3 atmosphere_direction(vec3 world) {
 }
 
 vec3 view_direction(vec2 ndc) {
+    if (atm.view_ray[2].w > 0.5) {
+        vec3 n = vec3(ndc, 1.0);
+        return normalize(vec3(dot(atm.view_ray[0].xyz, n), dot(atm.view_ray[1].xyz, n), dot(atm.view_ray[2].xyz, n)));
+    }
     vec4 world = atm.inverse_view_projection*vec4(ndc, 1.0, 1.0);
     return atmosphere_direction(world.xyz/world.w);
 }
@@ -365,13 +397,16 @@ vec3 stellar_multiple_source(sampler2D lut, vec3 p, vec3 sun, float radius, vec3
 #endif
 }
 
+float sky_center_angle(float t, bool lower) {
+    float r = atm.camera.z;
+    float limb = asin(clamp(bottom_radius()/r, 0.0, 1.0));
+    float edge = asin(clamp(top_radius()/r, 0.0, 1.0));
+    return lower ? mix(limb, edge, t*t) : limb*(1.0-(1.0-t)*(1.0-t));
+}
+
 float sky_angle(float t, bool lower) {
     float r = atm.camera.z;
-    if (r >= top_radius()) {
-        float limb = asin(clamp(bottom_radius()/r, 0.0, 1.0));
-        float edge = asin(clamp(top_radius()/r, 0.0, 1.0));
-        return ATM_PI - (lower ? mix(limb, edge, t*t) : limb*(1.0-(1.0-t)*(1.0-t)));
-    }
+    if (r >= top_radius()) return ATM_PI-sky_center_angle(t, lower);
     float horizon = acos(-sqrt(max(1.0-bottom_radius()*bottom_radius()/(r*r), 0.0)));
     return lower ? horizon+(ATM_PI-horizon)*t*t : horizon*(1.0-(1.0-t)*(1.0-t));
 }
@@ -380,8 +415,12 @@ vec3 sky_direction(ivec2 pixel) {
     int half_height = SKY_SIZE.y/2;
     bool lower = pixel.y >= half_height;
     float t = float(lower ? pixel.y-half_height : pixel.y)/float(half_height-1);
-    float theta = sky_angle(t, lower);
     float phi = float(pixel.x)/float(SKY_SIZE.x-1)*2.0*ATM_PI-ATM_PI;
+    if (atm.camera.z >= top_radius()) {
+        float angle = sky_center_angle(t, lower);
+        return vec3(sin(angle)*cos(phi), sin(angle)*sin(phi), -cos(angle));
+    }
+    float theta = sky_angle(t, lower);
     return vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
 }
 
@@ -423,14 +462,22 @@ vec3 segment_transmittance(sampler2D lut, float rx, float mux, float rp, float m
     }
 }
 
-vec2 angular_segment(ivec2 pixel, vec3 d) {
+vec2 angular_segment(ivec2 pixel, vec3 d, out float span) {
     vec2 outer = sphere_roots(atm.camera.xyz, d, top_radius());
+    span = 0.0;
     if (outer.y <= 0.0) return vec2(0.0);
     float start = max(outer.x, 0.0), end = outer.y;
     bool ground = atm.camera.z >= top_radius() ? pixel.y < SKY_SIZE.y/2 : pixel.y >= SKY_SIZE.y/2;
+    bool hit = false;
     if (ground) {
         vec2 roots = sphere_roots(atm.camera.xyz, d, bottom_radius());
-        end = min(end, roots.x >= 0.0 ? roots.x : -dot(atm.camera.xyz, d));
+        hit = roots.x >= 0.0;
+        end = min(end, hit ? roots.x : -dot(atm.camera.xyz, d));
+    }
+    span = max(end-start, 0.0);
+    if (outer.x > 0.0) {
+        float entry = entry_half_chord(atm.camera.xyz, d);
+        span = !ground ? 2.0*entry : hit ? max(entry-ground_half_chord(atm.camera.xyz, d), 0.0) : entry;
     }
     return vec2(start, max(start, end));
 }
@@ -440,7 +487,7 @@ vec2 angular_segment(ivec2 pixel, vec3 d) {
 #endif
 
 void integrate_atmosphere(sampler2D transmittance_lut, sampler2D multiscatter_lut,
-                          vec3 d, float start, float span, inout vec3 L, inout vec3 tau) {
+                          vec3 origin, vec3 d, float start, float span, inout vec3 L, inout vec3 tau) {
     if (span <= 0.0) return;
 #ifdef ATMOSPHERE_SECONDARY_APPROX
     const int steps = 1;
@@ -450,10 +497,10 @@ void integrate_atmosphere(sampler2D transmittance_lut, sampler2D multiscatter_lu
     float cell = span/float(steps);
     for (int step = 0; step < steps; ++step) {
         float offset = start+float(step)*cell;
-        int subdivisions = transport_subdivisions(atm.camera.xyz, d, offset, cell);
+        int subdivisions = transport_subdivisions(origin, d, offset, cell);
         float dt = cell/float(subdivisions);
         for (int j = 0; j < subdivisions; ++j) {
-            vec3 q = atm.camera.xyz+d*(offset+(float(j)+0.5)*dt);
+            vec3 q = origin+d*(offset+(float(j)+0.5)*dt);
             vec3 r, m, e;
             medium(q, r, m, e);
             vec3 source = vec3(0.0);

@@ -79,7 +79,9 @@ public:
     void init(rhi::VkContext& ctx, bool normals = false);
     void shutdown(rhi::VkContext& ctx);
     void set_sources(std::vector<ColorBinding> bindings);
+    void set_color_source(std::string body, std::shared_ptr<const SurfaceSource> source);
     void set_height_source(std::string body, std::shared_ptr<const HeightSource> source);
+    std::shared_ptr<const SurfaceSource> color_source(std::string_view body) const noexcept;
     std::vector<std::pair<std::string, std::filesystem::path>> load_catalog(const std::filesystem::path& path);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                  const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled);
@@ -103,6 +105,7 @@ private:
     std::array<std::optional<GeometryKey>, COLOR_SLOTS> owners_;
     std::vector<ColorBinding> sources_;
     std::vector<SelectionEntry> selections_;
+    SelectionScratch selection_scratch_;
     std::vector<uint32_t> offsets_;
     std::vector<uint32_t> words_;
     TextureStats stats_;

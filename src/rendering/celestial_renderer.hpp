@@ -3,6 +3,7 @@
 #include "core/camera.hpp"
 #include "rendering/render_settings.hpp"
 #include "rendering/planetshine.hpp"
+#include "rendering/cloud_maps.hpp"
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
 #include "rendering/refraction_renderer.hpp"
@@ -33,6 +34,31 @@ struct alignas(16) BodyInstanceGPU {
     glm::uvec4 surface_flags{0};
     PlanetshineGPU planetshine{};
     physics::SurfaceMaterialGPU material{};
+    glm::vec4 view_center{0.0f};
+};
+
+inline constexpr uint32_t OCEAN_WAVE_COUNT = 16;
+
+struct alignas(16) OceanWaveGPU {
+    glm::vec4 direction_k{0.0f};
+    glm::vec4 phases{0.0f};
+};
+
+struct alignas(16) SurfaceFluidGPU {
+    glm::vec4 ocean_deep{0.0f};
+    glm::vec4 ocean_shallow{0.0f};
+    glm::vec4 ocean_params{0.0f};
+    glm::vec4 cloud_color{0.0f};
+    glm::vec4 cloud_shape{0.0f};
+    glm::vec4 cloud_motion{0.0f};
+    glm::vec4 cloud_style{0.0f};
+    glm::vec4 cloud_noise{0.0f};
+};
+
+struct alignas(16) SurfaceFluidHeaderGPU {
+    glm::uvec4 flags{0u, 0u, 0u, UINT32_MAX};
+    glm::vec4 header{0.0f};
+    OceanWaveGPU waves[OCEAN_WAVE_COUNT]{};
 };
 
 struct alignas(16) SceneCelestialUBO {
@@ -71,7 +97,8 @@ public:
     void resolve_transparency(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
         transparency_.resolve(cmd, ctx, color, depth);
     }
-    void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth);
+    void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
+                              rhi::Image* physical_color = nullptr);
     const TransparencyRenderer& transparency() const noexcept { return transparency_; }
     std::array<rhi::PushDescriptorWrite, 2> refraction_writes(rhi::VkContext& ctx) const { return refraction_.writes(ctx); }
     const RefractionHost& refraction_host() const noexcept { return refraction_.host(); }
@@ -86,9 +113,18 @@ public:
     uint32_t ringshine_frame_bake_count() const noexcept { return rings_.ringshine_frame_bake_count(); }
     std::span<const uint32_t> ringshine_sample_counts() const noexcept { return rings_.ringshine_sample_counts(); }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
+    void set_color_source(std::string body, std::shared_ptr<const terrain::SurfaceSource> source) {
+        textures_.set_color_source(std::move(body), std::move(source));
+    }
     void set_height_source(std::string body, std::shared_ptr<const terrain::HeightSource> source) {
         normals_.set_height_source(body, source);
         terrain_.set_height_source(std::move(body), std::move(source));
+    }
+    std::shared_ptr<const terrain::SurfaceSource> color_source(std::string_view body) const noexcept {
+        return textures_.color_source(body);
+    }
+    std::shared_ptr<const terrain::HeightSource> height_source(std::string_view body) const noexcept {
+        return terrain_.height_source(body);
     }
     void invalidate_ring_textures() noexcept { rings_.invalidate_texture_cache(); }
     void set_custom_ring_texture(std::string_view system_name, std::string_view body_name, std::vector<glm::vec4> texture_samples) {
@@ -113,7 +149,14 @@ private:
     std::vector<uint32_t> ring_eclipse_candidate_counts_;
     std::vector<uint32_t> surface_ring_candidate_masks_;
 
+    void prepare_fluids(uint32_t frame, const Camera& cam, const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
+                        uint32_t count, float pixel_scale);
+
     rhi::Pipeline sphere_pipeline_{};
+    std::array<rhi::Pipeline, 2> cloud_pipeline_{}, cloud_depth_pipeline_{}, cloud_transparency_pipeline_{};
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> fluid_ssbos_{};
+    std::vector<uint32_t> cloud_bodies_;
+    CloudMaps cloud_maps_;
     rhi::Pipeline point_pipeline_{}, atmosphere_point_pipeline_{};
     bool atmosphere_points_ready_ = false;
     terrain::TerrainRenderer terrain_;

@@ -11,17 +11,20 @@ For each host planet, the irradiance reaching a surface point from its ring is
 pre-integrated into a lookup tile, parameterized by:
 
 - **φ** — azimuth between the anti-solar direction and the surface point's meridian,
-  measured in the ring plane. Range $[-\pi, \pi]$, warped by
-  $\text{sgn}(x) \cdot |x|^{1.5}$ so texel density concentrates at the ansae.
+  measured in the ring plane. Lookup accepts $[-\pi, \pi]$ and folds to
+  $[0, \pi]$ by left/right reflection about the star/ring-normal plane.
+  The bake uses the $x^{1.5}$ warp so texel density concentrates at the ansae.
 - **sin(latitude)** — sine of the surface point's geocentric latitude relative to the
   ring plane, same $^{1.5}$ warp. Sign distinguishes the two ring faces.
 - **solar elevation** — star elevation above the host's ring plane, one baked tile per
   (host × star) pair.
 - **sin(star angular radius)** — uniformly bright finite stellar disk. Four
-  weighted directions cover a spherical cap, using two Gaussian polar nodes
-  and antipodal tangent offsets. Their azimuth rotates across radial nodes,
-  covering both horizontal and vertical stellar extent. The solid-angle
-  weights preserve unit irradiance perpendicular to the star-center direction.
+  weighted directions form a reflection-symmetric quartet about the star-center
+  direction, covering both horizontal and vertical stellar extent. Two Gaussian
+  polar nodes alternate across radial integration nodes; tangent orientation also
+  varies across nodes. Reflected horizontal offsets share the same elevation,
+  preserving left/right symmetry at every radial node. Solid-angle weights use
+  the normalization for unit irradiance perpendicular to the star-center direction.
   Tiny disks use the central direction when sufficiently far from the ring plane;
   finite-disk integration is used for `sin_radius >= 0.01` or within twice the
   apparent sine radius of the ring plane. Stable cap construction avoids
@@ -60,16 +63,23 @@ Fine-profile filtering averages material inputs rather than solving subpixel tra
 
 ## Tile Layout & Atlas
 
-Tiles are **128×65** texels (the half-texel overhang encodes ±1 endpoints exactly),
+Tiles are **65×65** texels (half-texel insets encode φ = 0/π and latitude ±1 exactly),
 **16 star columns × 16 host rows**, one RGBA32F atlas per frame-in-flight slot:
 
 - Baked values are **total**: the quadrature integrates $d\phi\,dr$ with the
   $1/\pi$ Lambertian factor left to the consumer.
+- RGB is the cosine-weighted (surface) integral. Alpha is the luminance of the same
+  visible integral without the receiver cosine, read by atmospheric ringshine
+  (`docs/atmosphere_ringshine.md`). Compute and fragment shaders both sample the atlas.
 - Bake (`shaders/post/ringshine_map.frag`) and lookup (`shaders/common/ringshine_lookup.glsl`)
   use the same φ/ℓ warp and half-texel clamp, so bake orientation (Vulkan top-down
   viewports) cancels out — tile row 0 maps to ℓ = −1 in both passes.
 - Lookup: `ringshine_sample(phi, slat, host_index, star_index)` inverts the warp
-  ($^{2/3}$ power) and clamps to tile bounds; consumers multiply by $1/\pi$.
+  ($^{2/3}$ power), folds φ with `abs`, and clamps to tile bounds; consumers
+  multiply by $1/\pi$. Latitude stays signed because the two ring faces differ.
+- The half-tile preserves approximately the original longitudinal sample spacing
+  and includes the mirror plane as an explicit texel column. It uses 4,225 rather
+  than 8,320 bake fragments per tile (49.2% fewer), with no copy/publish pass.
 
 ## Vulkan Design (single-pass bake, no ping-pong)
 
@@ -77,7 +87,7 @@ The original amortized bakes across frames with a two-texture GPU accumulator an
 publish pass. The rewrite bakes each tile in **one full-pass draw per frame** into
 `ringshine_atlases_[frame_index]`:
 
-- **Per-slot atlases** (`FRAMES_IN_FLIGHT` × 2048×1040 RGBA32F) keep every image's
+- **Per-slot atlases** (`FRAMES_IN_FLIGHT` × 1040×1040 RGBA32F) keep every image's
   writer chain fence-ordered — no cross-frame read-after-write hazards on a persistent
   accumulator, and per-slot tile caches mirror that discipline.
 - **No persistent GPU state**: each bake renders the complete radial node range
@@ -154,11 +164,35 @@ An isotropic white-material sweep additionally checks hemispherical scattered pl
 transmitted flux against the incident beam; this is a limiting-case regression, not a
 general validation of the empirical anisotropic multiple-scattering closure.
 
-## Dropped from the Original (documented)
+### Mirror validation
 
-- **Mirror optimization** (`u_mirror_tile`): baked the tile's symmetric half when
-  segment asymmetry was narrow. Cheap to add later via a scissor half-width trick;
-  the full tile is baked for simplicity.
+The local `StellarRenderingTests --ringshine-mirror` probe checks thirteen fixtures:
+point and finite sources, equinox and oblique/polar illumination, flattening up to 0.3,
+4/10/128 radial bands, stellar sine radii up to 0.866, and a 0.99 forward lobe.
+It compares the compact bake with direct evaluation of both longitude signs, exercises
+the real atlas lookup with poisoned neighboring tiles, and checks off-grid bilinear
+interpolation and endpoint clamps. Mirrored lookup values match exactly; the half bake
+differs from direct evaluation by at most 0.00073% of peak irradiance in these fixtures.
+
+A separate eight-polar by thirty-two-azimuth stellar rule, sharing the existing ring-arc
+integrator, gives at most 4.54% relative RMS error over the sampled grid. The symmetric
+four-source rule changes finite-star approximation error: the tiny equinox fixture
+increases from 0.71% to 2.51% RMS, while the larger-star fixtures generally improve.
+These measurements are fixture comparisons, not a universal error bound. The dense
+reference runs in bounded radial batches to avoid GPU driver timeouts.
+
+Reports and probe sources are under `tests/ringshine-mirror/` (git-ignored).
+The existing ringshine contracts also pass, including an independent full-disk surface
+pixel comparison within 3%; the application `--self-test` completes thirteen frames.
+The 49.2% reduction above describes texel work and atlas storage; frame timing has not
+been benchmarked for this change.
+
+## Differences from the Original
+
+- **Mirror optimization**: restored through a compact half-width tile and folded
+  lookup rather than the original `u_mirror_tile` publish pass. Finite-star source
+  sampling is reflection-symmetric; asymmetric phase functions still depend only
+  on scattering angle and do not invalidate the geometric reflection.
 - **Node-budget slicing** (64 nodes/frame): replaced by full single-pass bakes;
   amortization now lives entirely in the cache keys.
 

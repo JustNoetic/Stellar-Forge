@@ -1,0 +1,112 @@
+#version 460
+#include "common/bloom.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D destination;
+layout(std430, set = 0, binding = 2) buffer Spikes { uvec4 command; BloomSpike spikes[]; };
+layout(push_constant) uniform Extract { vec2 direction; float highlight_limit; float diffraction; float threshold; uint capacity; } extract;
+
+const int APRON = 20;
+shared vec4 light[APRON][APRON];
+shared vec4 energy[64];
+shared vec4 moments[64];
+shared float cross_moments[64];
+shared bool emitted;
+shared uint emitted_slot;
+shared vec2 profile_origin;
+shared vec2 spike_center;
+
+const float BOX[6] = float[](1, 1, 2, 2, 1, 1);
+const float DIAGONAL[6] = float[](0, 1, 1, 1, 1, 0);
+
+void main() {
+    ivec2 size = textureSize(source, 0);
+    ivec2 origin = ivec2(gl_WorkGroupID.xy)*16-2;
+    uint index = gl_LocalInvocationIndex;
+    vec4 tile_energy = vec4(0.0), tile_moments = vec4(0.0);
+    float tile_cross = 0.0;
+    for (uint i = index; i < uint(APRON*APRON); i += 64u) {
+        ivec2 texel = ivec2(i%uint(APRON), i/uint(APRON));
+        ivec2 p = origin+texel;
+        vec3 raw = vec3(0.0);
+        if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, size))) raw = bloom_finite(texelFetch(source, p, 0).rgb);
+        vec3 value = bloom_extract(raw, extract.highlight_limit);
+        float spike = extract.diffraction*smoothstep(extract.threshold, 2.0*extract.threshold, max(raw.r, max(raw.g, raw.b)));
+        light[texel.y][texel.x] = vec4(value, spike);
+        if (spike > 0.0 && all(greaterThanEqual(texel, ivec2(2))) && all(lessThan(texel, ivec2(18)))) {
+            vec3 spike_light = value*spike;
+            float weight = dot(spike_light, BLOOM_LUMINANCE);
+            vec2 position = vec2(texel-2)+0.5;
+            tile_energy += vec4(spike_light, weight);
+            tile_moments += weight*vec4(position, position*position);
+            tile_cross += weight*position.x*position.y;
+        }
+    }
+    energy[index] = tile_energy;
+    moments[index] = tile_moments;
+    cross_moments[index] = tile_cross;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            energy[index] += energy[index+stride];
+            moments[index] += moments[index+stride];
+            cross_moments[index] += cross_moments[index+stride];
+        }
+        barrier();
+    }
+    if (index == 0u) {
+        emitted = false;
+        vec4 total = energy[0];
+        if (total.w > 0.0) {
+            uint slot = atomicAdd(command.y, 1u);
+            if (slot < extract.capacity) {
+                vec4 m = moments[0]/total.w;
+                vec2 variance = max(m.zw-m.xy*m.xy, vec2(0.0))+1.0/12.0;
+                spike_center = vec2(origin+2)+m.xy;
+                spikes[slot].center_variance = vec4(spike_center, variance);
+                spikes[slot].energy_covariance = vec4(total.rgb, cross_moments[0]/total.w-m.x*m.y);
+                vec2 first = vec2(origin+2)+0.5, last = first+15.0;
+                for (uint arm = 0u; arm < 2u; ++arm) {
+                    vec2 normal = bloom_spike_normal(extract.direction, arm);
+                    profile_origin[arm] = floor(min(min(dot(first, normal), dot(last, normal)),
+                        min(dot(vec2(first.x, last.y), normal), dot(vec2(last.x, first.y), normal))))-1.0;
+                }
+                spikes[slot].profile_origin = vec4(profile_origin, 0.0, 0.0);
+                emitted_slot = slot;
+                emitted = true;
+            }
+        }
+    }
+    barrier();
+    if (emitted && index < uint(2*BLOOM_SPIKE_BINS)) {
+        uint arm = index/uint(BLOOM_SPIKE_BINS);
+        vec2 normal = bloom_spike_normal(extract.direction, arm);
+        vec2 axis = vec2(normal.y, -normal.x);
+        float bin = profile_origin[arm]+float(index%uint(BLOOM_SPIKE_BINS));
+        vec3 sum = vec3(0.0);
+        for (int y = 2; y < 18; ++y) for (int x = 2; x < 18; ++x) {
+            vec4 value = light[y][x];
+            if (value.a <= 0.0) continue;
+            vec2 position = vec2(origin+ivec2(x, y))+0.5;
+            float weight = bloom_spline(dot(position, normal)-bin)*dot(value.rgb, BLOOM_LUMINANCE)*value.a;
+            float along = dot(position-spike_center, axis);
+            sum += weight*vec3(1.0, along, along*along);
+        }
+        spikes[emitted_slot].profile[index] = vec4(sum.x/energy[0].w, sum.x > 0.0 ? sum.yz/sum.x : vec2(0.0), 0.0);
+    }
+    barrier();
+    for (uint i = index; i < uint(APRON*APRON); i += 64u) {
+        ivec2 texel = ivec2(i%uint(APRON), i/uint(APRON));
+        bool core = all(greaterThanEqual(texel, ivec2(2))) && all(lessThan(texel, ivec2(18)));
+        vec4 value = light[texel.y][texel.x];
+        light[texel.y][texel.x].rgb = value.rgb*(1.0-(core && !emitted ? 0.0 : value.a));
+    }
+    barrier();
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(destination)))) return;
+    ivec2 base = ivec2(gl_LocalInvocationID.xy)*2;
+    vec3 value = vec3(0.0);
+    for (int y = 0; y < 6; ++y) for (int x = 0; x < 6; ++x)
+        value += light[base.y+y][base.x+x].rgb*(BOX[x]*BOX[y]/128.0+DIAGONAL[x]*DIAGONAL[y]/32.0);
+    imageStore(destination, pixel, vec4(min(value, vec3(65000.0)), 1.0));
+}

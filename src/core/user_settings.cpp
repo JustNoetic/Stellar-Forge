@@ -12,6 +12,13 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
 #define SF_SETTING(name) visit(#name, settings.name)
     SF_SETTING(exposure);
     SF_SETTING(hdr_enabled);
+    SF_SETTING(bloom_mode);
+    SF_SETTING(bloom_strength);
+    SF_SETTING(bloom_highlight_limit);
+    SF_SETTING(bloom_radius);
+    SF_SETTING(bloom_diffraction);
+    SF_SETTING(bloom_rotation_deg);
+    SF_SETTING(bloom_spike_threshold);
     SF_SETTING(show_gaia_stars);
     SF_SETTING(show_orbits);
     SF_SETTING(orbit_opacity);
@@ -55,6 +62,10 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(ring_shadows_enabled);
     SF_SETTING(ringshine_enabled);
     SF_SETTING(planetshine_enabled);
+    SF_SETTING(oceans_enabled);
+    SF_SETTING(clouds_enabled);
+    SF_SETTING(cloud_mode);
+    SF_SETTING(cloud_shadows_enabled);
     SF_SETTING(ring_planetshine_mode);
     SF_SETTING(ringshine_band_count);
     SF_SETTING(eclipse_reference_smoothstep);

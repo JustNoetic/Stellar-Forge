@@ -65,9 +65,17 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-detailed") o.detailed = true;
         else if (arg == "--benchmark-variant") {
             o.variant = value();
-            const std::set<std::string> variants{"baseline", "no-atmosphere", "no-shadows", "no-refraction", "no-secondary",
-                "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows"};
-            if (!variants.contains(o.variant)) throw std::runtime_error("Unknown benchmark variant: " + o.variant);
+            const std::set<std::string_view> variants{"baseline", "no-atmosphere", "no-aerial", "no-shadows", "no-refraction", "no-secondary",
+                "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows", "analytic-shadows", "jittered-shadows", "no-clouds", "legacy-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
+            if (o.variant.empty()) throw std::runtime_error("Unknown benchmark variant: " + o.variant);
+            for (size_t start = 0; start <= o.variant.size();) {
+                size_t plus = o.variant.find('+', start);
+                std::string_view token = std::string_view(o.variant).substr(start, plus == std::string::npos ? std::string_view::npos : plus - start);
+                if (token.empty() || !variants.contains(token))
+                    throw std::runtime_error("Unknown benchmark variant: " + o.variant);
+                if (plus == std::string::npos) break;
+                start = plus + 1;
+            }
         }
         else if (arg == "--benchmark-width") o.width = integer(value());
         else if (arg == "--benchmark-height") o.height = integer(value());
@@ -85,14 +93,16 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-scene") {
             auto scene = value();
             if (scene == "all") o.scenes = {"overview", "approach", "analytical", "nbody"};
+            else if (scene == "terrain-navigation") o.scenes = {"earth-terrain-still", "earth-terrain-walk", "earth-terrain-fly", "earth-terrain-turn"};
             else if (scene == "audit") o.scenes = {"overview", "analytical", "nbody", "approach", "earth-ground",
                 "earth-ground-rings", "earth-ground-turn", "earth-ground-rings-turn", "earth-disc", "earth-full",
                 "earth-limb", "earth-full-rings", "earth-eclipse", "saturn", "earth-ground-live", "earth-ground-rings-live", "earth-full-live"};
             else if (scene == "overview" || scene == "approach" || scene == "analytical" || scene == "nbody" || scene == "spice"
                      || scene == "earth-full" || scene == "earth-eclipse" || scene == "earth-ground" || scene == "earth-ground-rings"
                      || scene == "earth-ground-turn" || scene == "earth-ground-rings-turn" || scene == "earth-disc"
-                     || scene == "earth-limb" || scene == "earth-full-rings" || scene == "saturn" || scene == "earth-ground-live"
-                     || scene == "earth-ground-rings-live" || scene == "earth-full-live")
+                     || scene == "earth-limb" || scene == "earth-full-rings" || scene == "saturn" || scene == "saturn-midnight" || scene == "earth-ground-live"
+                     || scene == "earth-ground-rings-live" || scene == "earth-full-live" || scene == "earth-terrain-still"
+                     || scene == "earth-terrain-walk" || scene == "earth-terrain-fly" || scene == "earth-terrain-turn")
                 o.scenes = {std::string(scene)};
             else throw std::runtime_error("Unknown benchmark scene: " + std::string(scene));
         } else throw std::runtime_error("Unknown argument: " + std::string(arg));
@@ -114,11 +124,13 @@ std::string_view help() {
   --benchmark-simulation inline|worker|pipeline  Inline, wait per step, or overlap rendering (inline)
   --benchmark-scene all|overview|approach|analytical|nbody|spice|earth-full|earth-eclipse
                     audit|earth-ground|earth-ground-rings|earth-ground-turn|earth-ground-rings-turn
-                    earth-disc|earth-limb|earth-full-rings|saturn
+                    earth-disc|earth-limb|earth-full-rings|saturn|saturn-midnight
                     earth-ground-live|earth-ground-rings-live|earth-full-live
-  --benchmark-variant baseline|no-atmosphere|no-shadows|no-refraction|no-secondary|no-orbits
+                    terrain-navigation|earth-terrain-still|earth-terrain-walk|earth-terrain-fly|earth-terrain-turn
+  --benchmark-variant baseline|no-atmosphere|no-aerial|no-shadows|no-refraction|no-secondary|no-orbits
                       no-gaia|smooth|no-textures|no-normals|no-rings|no-ring-shadows
-                      cached-shadow-weights|native-shadow-weights|fast-ring-shadows
+                      cached-shadow-weights|native-shadow-weights|fast-ring-shadows|no-clouds|legacy-clouds|no-bloom|fast-bloom
+                      terrain-detail (2-pixel geometry error; other defaults retained)
   --benchmark-width N       Framebuffer width (1920)
   --benchmark-height N      Framebuffer height (1080)
   --benchmark-warmup N      Unmeasured frames per run (300; zero allowed)

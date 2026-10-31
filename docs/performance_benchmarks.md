@@ -51,7 +51,7 @@ during a benchmark; opening telemetry does not enable CPU benchmark collection.
 | `earth-eclipse` | Paused analytical Solar System at 0.297293 years | Same distance; Moon shadow axis centered on Earth's surface |
 
 All scenes use the default FOV and render settings, including Gaia stars and orbit
-lines at 2048 segments. Each repetition reloads its initial system and resets its
+lines at 1030 segments. Each repetition reloads its initial system and resets its
 camera. The time step is fixed at 1/60 second, independent of render speed;
 `--benchmark-step` and `--benchmark-warp` set the workload explicitly. Running
 scenes advance during warmup and continue from that epoch during measurement.
@@ -61,6 +61,32 @@ The two Earth close-ups are opt-in. See [eclipse_shadows.md](eclipse_shadows.md)
 for their geometry, exact image checks and eclipse filtering measurements.
 
 ## Comprehensive application audit
+
+### Imported terrain navigation
+
+`--benchmark-scene terrain-navigation` runs `earth-terrain-still`,
+`earth-terrain-walk`, `earth-terrain-fly`, and `earth-terrain-turn`. Individual
+scene names are also accepted. These use the normal renderer and default settings
+with paused simulation. They require the compatible imported Earth height source.
+The fixture selects its highest daylight sample, looks 3° above the horizon, and
+precomputes the camera path outside measured frames. Warmup holds the first pose.
+Walking follows decoded triangle heights at 5 m/s with 1.7 m clearance; flying
+uses 250 m/s with 2 km clearance. Turning holds the eye and rotates 15°/s.
+The fixture records the source identity/revision, starting direction/height,
+clearance, speed, distance and camera path version.
+
+`--benchmark-variant terrain-detail` lowers the geometry error target from the
+default 16 pixels to 2 pixels, preserving the default patch limit and other
+settings. Use `--benchmark-detailed` for frame percentiles, streaming counters,
+selection reuse/rebuild counts and CPU terrain preparation timing. The
+`gpu_terrain_prepare` scope includes all celestial preparation; its name does
+not isolate terrain work.
+
+```powershell
+.\build\bin\StellarForge.exe --benchmark --benchmark-scene terrain-navigation --benchmark-hidden --benchmark-ui --benchmark-warmup 600 --benchmark-frames 900 --benchmark-repeats 3 --benchmark-detailed --benchmark-output exports/benchmarks/terrain-navigation
+```
+
+### Audit suite
 
 ```powershell
 python scripts/performance_audit.py --output exports/benchmarks/my-audit --phase baseline
@@ -100,9 +126,13 @@ turning captures expose update costs. They must be interpreted separately.
 `--benchmark-variant` disables one feature group: `no-atmosphere`, `no-shadows`
 (atmospheric shadows), `no-refraction`, `no-secondary` (planetshine and ringshine),
 `no-orbits`, `no-gaia`, `smooth` (imported/synthetic terrain and normal maps),
-`no-textures`, `no-normals`, `no-rings`, or `no-ring-shadows` (surface lighting).
+`no-textures`, `no-normals`, `no-rings`, `no-ring-shadows` (surface lighting),
+or `no-clouds`. `legacy-clouds` keeps clouds enabled and selects diagnostic legacy
+transparency for comparison; it changes atmospheric endpoints and ordering.
 `baseline` preserves default settings. Feature removal changes the image; deltas
 are measured feature costs, not promises of equivalent-quality optimization.
+`no-bloom` bypasses post-process bloom; `fast-bloom` selects the fast halo in
+place of the default four-spike sprites. See `bloom.md`.
 `baseline` now includes cached atmospheric shadow weights. `native-shadow-weights`
 restores the original per-sample lighting; `cached-shadow-weights` explicitly
 selects the current default. Cached weights preserve the ring filter and

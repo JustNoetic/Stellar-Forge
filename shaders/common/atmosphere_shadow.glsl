@@ -71,6 +71,22 @@ vec2 atmosphere_shadow_interval(uint index, bool ring, vec3 origin, vec3 directi
     if (caster.support.x < 0.0) return domain;
     vec3 pole = caster.pole_inner.xyz;
     vec3 rel = origin-center, to_star = star.xyz-origin;
+    float star_plane = dot(star.xyz-center, pole);
+    float star_side = star_plane >= 0.0 ? 1.0 : -1.0;
+    if (abs(star_plane) > star.w &&
+        dot(to_star-direction*domain.x, pole)*star_side > star.w &&
+        dot(to_star-direction*domain.y, pole)*star_side > star.w) {
+        float h0 = dot(rel, pole)*star_side;
+        float h1 = dot(direction, pole)*star_side;
+        if (abs(h1) < 1e-12) {
+            if (h0 >= 0.0) return vec2(0.0);
+        } else {
+            float crossing = -h0/h1;
+            if (h1 > 0.0) domain.y = min(domain.y, crossing);
+            else domain.x = max(domain.x, crossing);
+            if (domain.y <= domain.x) return vec2(0.0);
+        }
+    }
     float a0 = dot(to_star, pole)/distance, a1 = -dot(direction, pole)/distance;
     vec3 n0 = rel*a0-to_star*(dot(rel, pole)/distance);
     vec3 n1 = direction*(dot(star.xyz-center, pole)/distance)
@@ -80,13 +96,12 @@ vec2 atmosphere_shadow_interval(uint index, bool ring, vec3 origin, vec3 directi
         dot(n0, n1)-radius*radius*a0*a1, dot(n0, n0)-radius*radius*a0*a0, domain);
 }
 
-float atmosphere_shadow_visibility(vec3 p, uint star_index) {
+float atmosphere_shadow_visibility(vec3 p, uint star_index, uvec4 range) {
     vec4 star = shadow_stars[star_index];
     vec3 to_star = star.xyz-p;
     float distance = length(to_star);
     if (distance <= 1e-6) return 1.0;
     vec3 light = to_star/distance;
-    uvec4 range = shadow_ranges[star_index];
     if ((shadow_flags.y & 8u) != 0u && shadow_flags.w == 0u && atm.camera.w == 1.0 && range.y == 0u && range.w == 1u) {
         AtmosphereShadowCaster caster = shadow_casters[range.z];
         float footprint = length(p-shadow_eye_focal.xyz)/shadow_eye_focal.w;
@@ -120,6 +135,10 @@ float atmosphere_shadow_visibility(vec3 p, uint star_index) {
         if (visibility <= 1e-4) return 0.0;
     }
     return visibility;
+}
+
+float atmosphere_shadow_visibility(vec3 p, uint star_index) {
+    return atmosphere_shadow_visibility(p, star_index, shadow_ranges[star_index]);
 }
 
 float atmosphere_shadow_transition(vec3 p, vec3 direction, vec4 star, uvec4 range) {
@@ -173,7 +192,7 @@ float atmosphere_shadow_step(vec3 p, vec3 direction, vec4 star, uvec4 range, flo
 
 vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
     if (shadow_flags.x == 0u) return vec3(0.0);
-    vec3 entry = atm.camera.xyz+direction*segment.x;
+    vec3 entry = atmosphere_entry(direction, segment.x);
     vec3 origin = atmosphere_to_physical(entry);
     vec3 physical_direction = atmosphere_to_physical(direction);
     vec2 domain = vec2(0.0, path);
@@ -472,7 +491,7 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
         if (prefix_path > 0.0) prefix_deficit = atmosphere_shadow_reference(direction, segment, prefix_path);
         return atmosphere_shadow_reference(direction, segment, path);
     }
-    vec3 entry = atm.camera.xyz+direction*segment.x;
+    vec3 entry = atmosphere_entry(direction, segment.x);
     vec3 origin = atmosphere_to_physical(entry), physical_direction = atmosphere_to_physical(direction);
     float entry_radius = clamp(length(entry), bottom_radius(), top_radius());
     float entry_mu = clamp(dot(entry, direction)/entry_radius, -1.0, 1.0);
@@ -505,9 +524,20 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
     for (uint s = 0u; s < uint(atm.camera.w); ++s) {
         if (max(max(atm.sun_irradiance[s].r, atm.sun_irradiance[s].g), atm.sun_irradiance[s].b) <= 0.0) continue;
         uvec4 range = shadow_ranges[s];
-        uint count = range.y+range.w;
         vec4 star = shadow_stars[s];
         vec3 sun = atm.sun_direction[s].xyz;
+        if (range.y > 0u) {
+            bool moon_shadow = false;
+            for (uint j = 0u; j < range.y; ++j) {
+                vec2 candidate = atmosphere_shadow_interval(range.x+j, false, origin, physical_direction, star, vec2(0.0, path));
+                if (candidate.y > candidate.x) {
+                    moon_shadow = true;
+                    break;
+                }
+            }
+            if (!moon_shadow) range.y = 0u;
+        }
+        uint count = range.y+range.w;
         vec2 interval = count > 0u ? atmosphere_shadow_next(range, origin, physical_direction, star, vec2(0.0, path)) : vec2(0.0);
         bool has_shadow = count > 0u && interval.y > interval.x;
         if (!has_shadow) {
@@ -516,6 +546,10 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
             supported.x = true;
             if (prefix_path > 0.0) supported.y = true;
         }
+#ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
+        if (cached_weights && !any(greaterThan(shadow_cached_upper_light(cached_uv, cached_range, path), vec3(0.0))))
+            continue;
+#endif
 
         if (base_budget < 0.0) {
             base_budget = prefix_path > 0.0 ? float(maximum)
@@ -568,12 +602,14 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
                     next_energy = max(light2-light1, vec3(0.0));
                     light1 = light2;
                 }
-                float center_density = max(dot(energy, luminance), 1e-20);
-                float spread = (i > 0u ? 1.0 : 0.0)+(i+1u < samples ? 1.0 : 0.0);
-                float slope = spread > 0.0 ? clamp((dot(next_energy-previous_energy, luminance))/(2.0*spread*center_density), -1.0, 1.0) : 0.0;
                 total_energy += energy;
-                total_loss += energy*(1.0-atmosphere_ring_stratum_visibility(caster, star, origin, physical_direction,
-                    proposal, vec2(t0, t1), vec2(float(i), float(i+1u))/float(samples), slope));
+                if (any(greaterThan(energy, vec3(0.0)))) {
+                    float center_density = max(dot(energy, luminance), 1e-20);
+                    float spread = (i > 0u ? 1.0 : 0.0)+(i+1u < samples ? 1.0 : 0.0);
+                    float slope = spread > 0.0 ? clamp((dot(next_energy-previous_energy, luminance))/(2.0*spread*center_density), -1.0, 1.0) : 0.0;
+                    total_loss += energy*(1.0-atmosphere_ring_stratum_visibility(caster, star, origin, physical_direction,
+                        proposal, vec2(t0, t1), vec2(float(i), float(i+1u))/float(samples), slope));
+                }
                 previous_energy = energy;
                 energy = next_energy;
                 t0 = t1;
@@ -620,22 +656,26 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
                 vec3 q_pos = entry + direction * t;
                 vec3 r, m, e;
                 medium(q_pos, r, m, e);
-                float radius = clamp(length(q_pos), bottom_radius(), top_radius());
-                float mu = clamp(dot(q_pos, direction) / radius, -1.0, 1.0);
-                vec3 view_transmittance = segment_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
-                if (t < 2.0) {
-                    vec3 sr, sm, se;
-                    medium((entry + q_pos) * 0.5, sr, sm, se);
-                    view_transmittance = mix(exp(-se * t), view_transmittance, smoothstep(0.5, 2.0, t));
-                }
-
                 vec3 direct = stellar_scattering_source(transmittance_lut, q_pos, direction, sun, atm.sun_direction[s].w, r, m, s);
                 vec3 multiple = stellar_multiple_source(multiscatter_lut, q_pos, sun, atm.sun_direction[s].w, r+m, s);
-                weight = view_transmittance * atm.sun_irradiance[s].rgb * (direct + multiple) * ds;
+                vec3 source = direct + multiple;
+                if (any(greaterThan(source, vec3(0.0)))) {
+                    float radius = clamp(length(q_pos), bottom_radius(), top_radius());
+                    float mu = clamp(dot(q_pos, direction) / radius, -1.0, 1.0);
+                    vec3 view_transmittance = segment_transmittance(transmittance_lut, entry_radius, entry_mu, radius, mu, hits_ground);
+                    if (t < 2.0) {
+                        vec3 sr, sm, se;
+                        medium((entry + q_pos) * 0.5, sr, sm, se);
+                        view_transmittance = mix(exp(-se * t), view_transmittance, smoothstep(0.5, 2.0, t));
+                    }
+                    weight = view_transmittance * atm.sun_irradiance[s].rgb * source * ds;
+                } else {
+                    weight = vec3(0.0);
+                }
             }
 
-            bool shadowed = has_shadow && (!analytic || count > 1u || (t >= interval.x && t <= interval.y));
-            float vis = shadowed ? atmosphere_shadow_visibility(origin + physical_direction * t, s) : 1.0;
+            bool shadowed = has_shadow && any(greaterThan(weight, vec3(0.0))) && (!analytic || count > 1u || (t >= interval.x && t <= interval.y));
+            float vis = shadowed ? atmosphere_shadow_visibility(origin + physical_direction * t, s, range) : 1.0;
 
             total_energy += weight;
             total_loss += weight * (1.0 - vis);

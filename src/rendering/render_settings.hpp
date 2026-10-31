@@ -11,6 +11,13 @@ inline constexpr float DEFAULT_POINT_DIAMETER_PX = 3.0f;
 struct RenderSettings {
     float exposure = 1.0f;
     bool hdr_enabled = true;
+    uint32_t bloom_mode = 2;
+    float bloom_strength = 0.08f;
+    float bloom_highlight_limit = 64.0f;
+    float bloom_radius = 1.0f;
+    float bloom_diffraction = 0.65f;
+    float bloom_rotation_deg = 45.0f;
+    float bloom_spike_threshold = 4.0f;
     bool show_gaia_stars = true;
     bool show_orbits = true;
     float orbit_opacity = 1.0f;
@@ -54,6 +61,10 @@ struct RenderSettings {
     bool ring_shadows_enabled = true;
     bool ringshine_enabled = true;
     bool planetshine_enabled = true;
+    bool oceans_enabled = true;
+    bool clouds_enabled = true;
+    uint32_t cloud_mode = 0;
+    bool cloud_shadows_enabled = false;
     bool atmosphere_planetshine_reference = false;
     uint32_t ring_planetshine_mode = 0;
     uint32_t ringshine_band_count = 10;
@@ -74,6 +85,15 @@ public:
     uint64_t revision() const noexcept { return revision_; }
 
     CommandResult apply(const RenderSettings& candidate) {
+        if (candidate.bloom_mode > 2 ||
+            !std::isfinite(candidate.bloom_strength) || candidate.bloom_strength < 0.0f || candidate.bloom_strength > 1.0f ||
+            !std::isfinite(candidate.bloom_highlight_limit) || candidate.bloom_highlight_limit < 1.0f || candidate.bloom_highlight_limit > 4096.0f ||
+            !std::isfinite(candidate.bloom_radius) || candidate.bloom_radius < 0.25f || candidate.bloom_radius > 4.0f ||
+            !std::isfinite(candidate.bloom_diffraction) || candidate.bloom_diffraction < 0.0f || candidate.bloom_diffraction > 1.0f ||
+            !std::isfinite(candidate.bloom_rotation_deg) || candidate.bloom_rotation_deg < 0.0f || candidate.bloom_rotation_deg > 90.0f ||
+            !std::isfinite(candidate.bloom_spike_threshold) || candidate.bloom_spike_threshold < 0.25f || candidate.bloom_spike_threshold > 4096.0f)
+            return {false, false, "Bloom requires a valid mode, strength and diffraction from 0 to 1, highlight limit from 1 to 4096, radius from 0.25 to 4, rotation from 0 to 90 degrees, and spike threshold from 0.25 to 4096."};
+        if (candidate.cloud_mode > 1) return {false, false, "Cloud mode must be 2D texture or volumetric."};
         if (!std::isfinite(candidate.ring_shadow_softness) || candidate.ring_shadow_softness < 0.25f || candidate.ring_shadow_softness > 4.0f)
             return {false, false, "Ring shadow softness must be 0.25 to 4."};
         if (candidate.atmosphere_shadow_samples != 4 && candidate.atmosphere_shadow_samples != 8 && candidate.atmosphere_shadow_samples != 16)

@@ -14,7 +14,7 @@
 
 namespace sf::rendering {
 
-static_assert(sizeof(AtmosphereParametersGPU) == 13328);
+static_assert(sizeof(AtmosphereParametersGPU) == 13376);
 static_assert(sizeof(AtmosphereParametersGPU) <= 16384);
 static_assert(sizeof(AtmosphereShadowHeaderGPU) == 560);
 static_assert(sizeof(AtmosphereShadowCasterGPU) == 48);
@@ -258,9 +258,14 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     transparent_bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
     composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/composite_transparency.comp", transparent_bindings);
+    const std::pair<std::string, std::string> unshadowed[] = {{"ATMOSPHERE_UNSHADOWED", "1"}};
+    unshadowed_composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/composite_transparency.comp", transparent_bindings, 0, unshadowed);
     std::erase_if(transparent_bindings, [](auto binding) { return binding.binding == 4; });
     transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/transparent.comp", transparent_bindings);
+    unshadowed_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/transparent.comp", transparent_bindings, 0, unshadowed);
     surface_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/surface_irradiance.comp", source_bindings, sizeof(glm::uvec2));
     surface_lut_ = ctx.create_image_2d(128, 32, VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, 1, 96);
@@ -306,14 +311,19 @@ void AtmosphereRenderer::init_secondary(rhi::VkContext& ctx) {
     auto composite = std::vector<rhi::DescriptorLayoutBinding>(std::begin(composite_bindings), std::end(composite_bindings));
     for (uint32_t binding : {28u, 29u, 30u}) composite.push_back({binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
     const std::pair<std::string, std::string> macros[] = {{"ATMOSPHERE_SECONDARY", "1"}};
+    const std::pair<std::string, std::string> unshadowed[] = {{"ATMOSPHERE_SECONDARY", "1"}, {"ATMOSPHERE_UNSHADOWED", "1"}};
     secondary_composite_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/composite.comp", composite, sizeof(glm::vec4), macros);
     composite.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     composite.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
     secondary_composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/composite_transparency.comp", composite, sizeof(glm::vec4), macros);
+    secondary_unshadowed_composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/composite_transparency.comp", composite, sizeof(glm::vec4), unshadowed);
     std::erase_if(composite, [](auto binding) { return binding.binding == 4; });
     secondary_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/transparent.comp", composite, sizeof(glm::vec4), macros);
+    secondary_unshadowed_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/transparent.comp", composite, sizeof(glm::vec4), unshadowed);
     if (ctx.dual_source_blend_enabled()) {
         rhi::GraphicsPipelineDesc desc;
         desc.vert_path = "post/fullscreen.vert";
@@ -369,6 +379,8 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, transparent_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, composite_transparency_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, unshadowed_transparent_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, unshadowed_composite_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, dual_source_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, surface_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, stellar_source_pipeline_);
@@ -378,6 +390,8 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, secondary_composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, secondary_composite_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, secondary_transparent_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, secondary_unshadowed_transparent_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, secondary_unshadowed_composite_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, secondary_dual_source_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, small_sky_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, small_aerial_pipeline_);
@@ -639,6 +653,14 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         auto projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au());
         auto view = camera.view_matrix_eye_relative();
         p.inverse_view_projection = glm::inverse(projection*view);
+        glm::dmat3 view_to_world = glm::inverse(glm::dmat3(glm::mat3(view)));
+        glm::dvec3 ray_scale{1.0/projection[0][0], 1.0/projection[1][1], -1.0};
+        for (int k = 0; k < 3; ++k) {
+            glm::dvec3 axis = k == 0 ? x : k == 1 ? y : z;
+            glm::dvec3 row;
+            for (int j = 0; j < 3; ++j) row[j] = glm::dot(axis, atmosphere_space(view_to_world[j]))*ray_scale[j];
+            p.view_ray[k] = {glm::vec3(row), 1.0f};
+        }
         p.depth_params.x = settings.hdr_enabled ? settings.exposure : 1.0f;
         p.depth_params.y = settings.aerial_perspective_enabled ? 1.0f : 0.0f;
         p.depth_params.z = settings.direct_sunlight_only ? 1.0f : 0.0f;
@@ -967,38 +989,59 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                     glm::vec3 total(0.0f);
                     uint32_t count = 0;
                     bool diffuse_ring = false;
+                    uint32_t ring_slot = 0;
+                    glm::vec3 ring_response(0.0f);
                     for (size_t source = 0; source < PLANETSHINE_LIGHTS; ++source) {
                         glm::vec3 flux = glm::max(glm::vec3(lights.irradiance[source]), glm::vec3(0.0f));
                         if (!glm::any(glm::greaterThan(flux, glm::vec3(0.0f)))) continue;
                         bool ring = lights.direction[source].w < 0;
-                        diffuse_ring |= ring;
-                        glm::dvec3 direction = ring ? glm::dvec3(lights.direction[source]) :
-                            glm::normalize(atmosphere_space(glm::dvec3(lights.direction[source])));
-                        sources.direction[count] = {glm::vec3(glm::dot(direction, x), glm::dot(direction, y), glm::dot(direction, z)), lights.direction[source].w};
+                        if (ring && !ring_lighting) continue;
+                        if (ring) {
+                            diffuse_ring = true;
+                            ring_slot = count;
+                            ring_response = glm::max(glm::vec3(lights.direction[source]), glm::vec3(1e-30f));
+                            sources.direction[count] = {0.0f, 0.0f, 0.0f, lights.direction[source].w};
+                        } else {
+                            glm::dvec3 direction = glm::normalize(atmosphere_space(glm::dvec3(lights.direction[source])));
+                            sources.direction[count] = {glm::dot(direction, x), glm::dot(direction, y), glm::dot(direction, z), lights.direction[source].w};
+                        }
                         sources.irradiance[count++] = {flux, lights.irradiance[source].w};
                         total += flux;
                     }
                     for (uint32_t source = 0; source < count; ++source) for (int channel = 0; channel < 3; ++channel)
                         sources.irradiance[source][channel] = count == 1 ? 1.0f :
                             (total[channel] > 0.0f ? sources.irradiance[source][channel]/total[channel] : 0.0f);
+                    std::array<glm::vec4, 17> ring_key{};
+                    uint64_t ring_revision = 0;
+                    if (diffuse_ring) {
+                        float luminance = glm::dot(ring_response, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+                        sources.irradiance[ring_slot] = {glm::vec3(sources.irradiance[ring_slot])*(luminance/ring_response), 1.0f/(float(PI)*luminance)};
+                        ring_key[0] = {glm::vec3(glm::dot(pole, x), glm::dot(pole, y), glm::dot(pole, z)), float(settings.ringshine_band_count)};
+                        for (size_t star = 0; star < p.sun_direction.size(); ++star) ring_key[star+1] = {glm::vec3(p.sun_direction[star]), 0.0f};
+                        ring_revision = ring_lighting->shadow_revision();
+                    }
                     t.secondary_irradiance = {total*float(PI), 0.0f};
                     t.secondary_active = true;
                     bool weights_changed = false;
                     for (uint32_t source = 0; source < PLANETSHINE_LIGHTS; ++source)
                         weights_changed |= glm::any(glm::greaterThan(glm::abs(sources.irradiance[source]-t.secondary_weights[source]), glm::vec4(2e-6f)));
                     if (!t.secondary_valid || !t.secondary_approximate || t.secondary_directions != sources.direction ||
+                        t.secondary_ring_key != ring_key || t.secondary_ring_revision != ring_revision ||
                         weights_changed || t.secondary_altitude != p.camera.z || (settings.aerial_perspective_enabled && !t.secondary_aerial_valid)) {
                         bool simple = p.aerosol_count.x < 0.5f, molecular = p.aerosol_count.y < 0.5f;
                         auto& pipeline = secondary_approximate_pipelines_[(diffuse_ring ? 12 : 0)+(count-1)*3+(simple ? (molecular ? 1 : 2) : 0)];
                         if (!pipeline) {
                             constexpr auto stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                            const rhi::DescriptorLayoutBinding bindings[] = {
+                            std::vector<rhi::DescriptorLayoutBinding> bindings{
                                 {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage}, {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
                                 {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage},
                                 {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage}, {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage}};
                             std::vector<std::pair<std::string, std::string>> macros{{"ATMOSPHERE_GRID_WIDTH", "96"}, {"ATMOSPHERE_GRID_HEIGHT", "54"},
                                 {"ATMOSPHERE_SECONDARY_APPROX", "1"}, {"ATMOSPHERE_SECONDARY_LIGHTS", std::to_string(count)}};
-                            if (diffuse_ring) macros.emplace_back("ATMOSPHERE_SECONDARY_RING", "1");
+                            if (diffuse_ring) {
+                                macros.emplace_back("ATMOSPHERE_SECONDARY_RING", "1");
+                                bindings.push_back({16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
+                            }
                             if (simple) {
                                 macros.emplace_back("ATMOSPHERE_NO_CUSTOM_AEROSOLS", "1");
                                 if (molecular) macros.emplace_back("ATMOSPHERE_RAYLEIGH_ONLY", "1");
@@ -1009,12 +1052,14 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                         writable(t.secondary_sky);
                         writable(t.secondary_range);
                         writable(t.secondary_aerial);
-                        const rhi::PushDescriptorWrite writes[] = {ubo,
+                        std::vector<rhi::PushDescriptorWrite> writes{ubo,
                             rhi::PushDescriptorWrite::sampled_image(1, t.transmittance, sampler),
                             rhi::PushDescriptorWrite::sampled_image(2, t.multiscatter, sampler),
                             rhi::PushDescriptorWrite::storage_image(3, t.secondary_aerial),
                             rhi::PushDescriptorWrite::storage_image(4, t.secondary_sky),
                             rhi::PushDescriptorWrite::storage_image(5, t.secondary_range)};
+                        if (diffuse_ring)
+                            writes.push_back(rhi::PushDescriptorWrite::sampled_image(16, ring_lighting->ringshine_atlas(ctx.frame_index()), ctx.sampler_linear_clamp()));
                         ctx.push_constants(cmd, pipeline, sources);
                         bake(pipeline, writes, 12, 14);
                         readable(t.secondary_sky);
@@ -1023,6 +1068,8 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                         ctx.end_gpu_timer(cmd, secondary_timer);
                         ++stats_.secondary_lut_updates;
                         t.secondary_directions = sources.direction;
+                        t.secondary_ring_key = ring_key;
+                        t.secondary_ring_revision = ring_revision;
                         t.secondary_weights = sources.irradiance;
                         t.secondary_altitude = p.camera.z;
                         t.secondary_valid = t.secondary_approximate = true;
@@ -1288,6 +1335,7 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         diagnostics.reset_reasons = stats_.shadow_history_reset_reasons;
     }
     if (dual_source_ && !transparency_writes.empty()) {
+        uint32_t transparent_timer = ctx.begin_gpu_timer(cmd, "atmosphere_transparent");
         for (auto* t : active_) {
             if (t->cached.depth_params.w <= 0.0f) continue;
             auto& stbn = stbn_tex_ ? stbn_tex_ : dummy_stbn_;
@@ -1308,7 +1356,10 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 rhi::PushDescriptorWrite::sampled_image(17, t->shadow_active ? t->shadow_depth : surface_lut_, ctx.sampler_nearest_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
             writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
-            auto& pipeline = t->secondary_active ? secondary_transparent_pipeline_ : transparent_pipeline_;
+            bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
+            auto& pipeline = t->secondary_active
+                ? (shadow_shader ? secondary_transparent_pipeline_ : secondary_unshadowed_transparent_pipeline_)
+                : (shadow_shader ? transparent_pipeline_ : unshadowed_transparent_pipeline_);
             if (t->secondary_active) {
                 writes.push_back(rhi::PushDescriptorWrite::sampled_image(28, t->secondary_sky, ctx.sampler_linear_clamp()));
                 writes.push_back(rhi::PushDescriptorWrite::sampled_image(29, t->secondary_aerial, ctx.sampler_linear_clamp()));
@@ -1321,7 +1372,9 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
+        ctx.end_gpu_timer(cmd, transparent_timer);
     }
+    uint32_t opaque_timer = ctx.begin_gpu_timer(cmd, "atmosphere_opaque");
     if (dual_source_) {
         auto attachment = rhi::RenderingAttachment::load_color(color);
         ctx.begin_rendering(cmd, {color.extent.width, color.extent.height}, {&attachment, 1});
@@ -1375,9 +1428,12 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             ctx.push_descriptors(cmd, pipeline, graphics);
             vkCmdDraw(cmd, 3, 1, 0, 0);
         } else {
+            bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
             auto& pipeline = t->secondary_active
-                ? (transparency_writes.empty() ? secondary_composite_pipeline_ : secondary_composite_transparency_pipeline_)
-                : (transparency_writes.empty() ? composite_pipeline_ : composite_transparency_pipeline_);
+                ? (transparency_writes.empty() ? secondary_composite_pipeline_ :
+                    shadow_shader ? secondary_composite_transparency_pipeline_ : secondary_unshadowed_composite_transparency_pipeline_)
+                : (transparency_writes.empty() ? composite_pipeline_ :
+                    shadow_shader ? composite_transparency_pipeline_ : unshadowed_composite_transparency_pipeline_);
             std::vector<rhi::PushDescriptorWrite> compute(std::begin(writes), std::end(writes));
             compute.insert(compute.end(), transparency_writes.begin(), transparency_writes.end());
             if (t->secondary_active) {
@@ -1395,6 +1451,7 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         point();
     }
     if (dual_source_) ctx.end_rendering(cmd);
+    ctx.end_gpu_timer(cmd, opaque_timer);
     ctx.end_gpu_timer(cmd, timer);
 }
 

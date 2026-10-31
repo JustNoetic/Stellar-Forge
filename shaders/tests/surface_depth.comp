@@ -11,8 +11,9 @@ void main() {
     BodyInstanceGPU b;
     b.pos_radius = vec4(0.0, 0.0, -2.0, 1.0);
     b.pole_oblateness = vec4(0.0, 1.0, 0.0, float(index / 2u) * 0.2);
+    b.view_center = vec4(mat3(u_scene.view) * b.pos_radius.xyz, 0.0);
     vec3 position = vec3(0.0, 0.0, local_z - 2.0);
     vec4 projected = u_scene.view_proj * vec4(position, 1.0);
     float original = projected.z / projected.w;
-    depths[index] = vec4(curved_surface_depth(b, position, position, vec3(0.0, 0.0, local_z), original), original, 0.0, 0.0);
+    depths[index] = vec4(curved_surface_depth(b, position, position-b.pos_radius.xyz, position, vec3(0.0, 0.0, local_z), original), original, 0.0, 0.0);
 }

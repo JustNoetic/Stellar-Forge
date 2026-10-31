@@ -78,6 +78,81 @@ std::string rgb_to_hex(const glm::vec3& rgb) {
     return std::format("#{:02x}{:02x}{:02x}", r, g, b);
 }
 
+glm::vec3 json_rgb(const nlohmann::json& j, const char* key, glm::vec3 fallback) {
+    if (!j.contains(key)) return fallback;
+    const auto& v = j.at(key);
+    if (v.is_string()) return hex_to_rgb(v.get<std::string>());
+    if (!v.is_array() || v.size() != 3) throw std::invalid_argument(std::format("{} must be an RGB triple.", key));
+    glm::vec3 rgb{v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()};
+    if (!std::isfinite(rgb.r+rgb.g+rgb.b)) throw std::invalid_argument(std::format("{} must be finite.", key));
+    return glm::clamp(rgb, glm::vec3(0.0f), glm::vec3(1.0f));
+}
+
+double json_bounded(const nlohmann::json& j, const char* key, double fallback, double lo, double hi) {
+    double value = j.value(key, fallback);
+    if (!std::isfinite(value)) throw std::invalid_argument(std::format("{} must be finite.", key));
+    return std::clamp(value, lo, hi);
+}
+
+OceanDefinition parse_ocean(const nlohmann::json& j) {
+    OceanDefinition o;
+    if (!j.is_object()) throw std::invalid_argument("ocean must be an object.");
+    o.enabled = j.value("enabled", true);
+    o.mask = j.value("mask", o.mask);
+    if (o.mask != "albedo" && o.mask != "height" && o.mask != "global")
+        throw std::invalid_argument("ocean.mask must be albedo, height or global.");
+    o.sea_level_km = json_bounded(j, "sea_level_km", o.sea_level_km, -100.0, 100.0);
+    o.deep_color = json_rgb(j, "deep_color", o.deep_color);
+    o.shallow_color = json_rgb(j, "shallow_color", o.shallow_color);
+    o.wind_speed_ms = json_bounded(j, "wind_speed_ms", o.wind_speed_ms, 0.0, 60.0);
+    o.wind_direction_deg = json_bounded(j, "wind_direction_deg", o.wind_direction_deg, -360.0, 360.0);
+    o.foam = json_bounded(j, "foam", o.foam, 0.0, 4.0);
+    return o;
+}
+
+nlohmann::json serialize_ocean(const OceanDefinition& o) {
+    return {{"enabled", o.enabled}, {"mask", o.mask}, {"sea_level_km", o.sea_level_km},
+        {"deep_color", {o.deep_color.r, o.deep_color.g, o.deep_color.b}},
+        {"shallow_color", {o.shallow_color.r, o.shallow_color.g, o.shallow_color.b}},
+        {"wind_speed_ms", o.wind_speed_ms}, {"wind_direction_deg", o.wind_direction_deg}, {"foam", o.foam}};
+}
+
+CloudDefinition parse_clouds(const nlohmann::json& j) {
+    CloudDefinition c;
+    if (!j.is_object()) throw std::invalid_argument("clouds must be an object.");
+    c.enabled = j.value("enabled", true);
+    c.coverage_map = j.value("coverage_map", c.coverage_map);
+    c.type = j.value("type", c.type);
+    if (c.type != "mixed" && c.type != "stratus" && c.type != "cumulus" && c.type != "cirrus")
+        throw std::invalid_argument("Cloud type must be mixed, stratus, cumulus or cirrus.");
+    c.coverage = json_bounded(j, "coverage", c.coverage, 0.0, 1.0);
+    c.base_altitude_km = json_bounded(j, "base_altitude_km", c.base_altitude_km, 0.0, 500.0);
+    c.automatic_altitude = j.value("automatic_altitude", !j.contains("base_altitude_km"));
+    c.base_pressure_pa = json_bounded(j, "base_pressure_pa", c.base_pressure_pa, 0.0, 1e10);
+    c.relative_humidity = json_bounded(j, "relative_humidity", c.relative_humidity, 0.0, 1.0);
+    c.thickness_km = json_bounded(j, "thickness_km", c.thickness_km, 0.05, 200.0);
+    c.density = json_bounded(j, "density", c.density, 0.0, 50.0);
+    c.extinction_per_km = json_bounded(j, "extinction_per_km", c.extinction_per_km, 0.0, 100.0);
+    c.shape_size_km = json_bounded(j, "shape_size_km", c.shape_size_km, 0.2, 1000.0);
+    c.detail_size_km = json_bounded(j, "detail_size_km", c.detail_size_km, 0.05, 1000.0);
+    c.erosion = json_bounded(j, "erosion", c.erosion, 0.0, 1.0);
+    c.feature_size_km = json_bounded(j, "feature_size_km", c.feature_size_km, 1.0, 1e5);
+    c.wind_speed_ms = json_bounded(j, "wind_speed_ms", c.wind_speed_ms, -500.0, 500.0);
+    c.evolution = json_bounded(j, "evolution", c.evolution, 0.0, 10.0);
+    c.color = json_rgb(j, "color", c.color);
+    return c;
+}
+
+nlohmann::json serialize_clouds(const CloudDefinition& c) {
+    return {{"enabled", c.enabled}, {"coverage_map", c.coverage_map}, {"type", c.type},
+        {"coverage", c.coverage}, {"base_altitude_km", c.base_altitude_km},
+        {"automatic_altitude", c.automatic_altitude}, {"base_pressure_pa", c.base_pressure_pa}, {"relative_humidity", c.relative_humidity},
+        {"thickness_km", c.thickness_km}, {"density", c.density}, {"feature_size_km", c.feature_size_km},
+        {"extinction_per_km", c.extinction_per_km}, {"shape_size_km", c.shape_size_km},
+        {"detail_size_km", c.detail_size_km}, {"erosion", c.erosion},
+        {"wind_speed_ms", c.wind_speed_ms}, {"evolution", c.evolution}, {"color", {c.color.r, c.color.g, c.color.b}}};
+}
+
 glm::vec3 temperature_to_rgb(double temp_k) noexcept {
     double temp = std::clamp(temp_k, 1000.0, 40000.0) / 100.0;
     double r = (temp <= 66.0)
@@ -214,16 +289,32 @@ LoadedSystem SystemManager::load_system(std::string_view name) const {
         loaded.definition.name = std::string(name);
         return loaded;
     }
+    std::filesystem::path base_path = sf::paths::external_path("data", "system.json");
     std::filesystem::path path = sf::paths::external_path("data", "systems", name, "system.json");
     if (!std::filesystem::exists(path)) {
-        path = sf::paths::external_path("data", "system.json");
+        path = base_path;
     }
 
     auto raw_opt = sf::paths::read_json(path);
     if (!raw_opt || !raw_opt->is_array()) {
         sf::log::fatal("Failed to load system JSON at {}", path.string());
     }
-    return parse_system(*raw_opt, name);
+    auto loaded = parse_system(*raw_opt, name);
+    if (name == SOLAR_SYSTEM_NAME && path != base_path && std::filesystem::exists(base_path)) {
+        if (auto base_raw = sf::paths::read_json(base_path); base_raw && base_raw->is_array()) {
+            for (const auto& jb : *base_raw) {
+                if (!jb.is_object() || !jb.contains("name") || !jb.contains("height_range_km")) continue;
+                int idx = loaded.definition.find_body(jb["name"].get<std::string>());
+                if (idx >= 0 && loaded.definition.bodies[idx].height_range_km == glm::dvec2{0.0}) {
+                    const auto& hr = jb["height_range_km"];
+                    if (hr.is_array() && hr.size() == 2) {
+                        loaded.definition.bodies[idx].height_range_km = {hr[0].get<double>(), hr[1].get<double>()};
+                    }
+                }
+            }
+        }
+    }
+    return loaded;
 }
 
 LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::string_view name) {
@@ -298,6 +389,8 @@ LoadedSystem SystemManager::parse_system(const nlohmann::json& raw_arr, std::str
             b.height_range_km = {range.at(0).get<double>(), range.at(1).get<double>()};
         }
         if (j.contains("atmosphere")) b.atmosphere = j.at("atmosphere").get<AtmosphereDefinition>();
+        if (j.contains("ocean")) b.ocean = parse_ocean(j.at("ocean"));
+        if (j.contains("clouds")) b.clouds = parse_clouds(j.at("clouds"));
         b.j2 = j.value("J2", 0.0);
         b.j4 = j.value("j4", 0.0);
 
@@ -543,6 +636,9 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["M"] = b.mean_anom_deg;
         j["rotation_period"] = b.rotation_period_hr;
         j["W0"] = b.w0_deg;
+        auto [pole_ra, pole_dec] = math::ecliptic_to_pole(b.pole_ecl);
+        j["pole_ra"] = pole_ra;
+        j["pole_dec"] = pole_dec;
         j["tidally_locked"] = b.tidally_locked;
         j["lum_eq"] = b.lum_eq;
         j["lum_pole"] = b.lum_pole;
@@ -551,6 +647,8 @@ nlohmann::json SystemManager::serialize_definition(const SystemDefinition& defin
         j["material"] = physics::serialize_material(b.material);
         serialize_body_rings(j, b);
         j["atmosphere"] = b.atmosphere;
+        if (b.ocean.enabled || j.contains("ocean")) j["ocean"] = serialize_ocean(b.ocean);
+        if (b.clouds.enabled || j.contains("clouds")) j["clouds"] = serialize_clouds(b.clouds);
         j["height_range_km"] = {b.height_range_km.x, b.height_range_km.y};
         if (b.is_star) {
             if (!j.contains("star_props") || !j["star_props"].is_object()) {
@@ -592,7 +690,26 @@ bool SystemManager::save_system(std::string_view name, const SystemDefinition& d
         }
         return save_system(SOLAR_SYSTEM_NAME, solar.definition);
     }
-    return sf::paths::write_json(sf::paths::external_path("data", "systems", name, "system.json"), serialize_definition(definition), 2);
+    bool ok = sf::paths::write_json(sf::paths::external_path("data", "systems", name, "system.json"), serialize_definition(definition), 2);
+    if (ok && name == SOLAR_SYSTEM_NAME) {
+        auto base_path = sf::paths::external_path("data", "system.json");
+        if (auto base_raw = sf::paths::read_json(base_path); base_raw && base_raw->is_array()) {
+            bool changed = false;
+            for (auto& jb : *base_raw) {
+                if (!jb.is_object() || !jb.contains("name")) continue;
+                int idx = definition.find_body(jb["name"].get<std::string>());
+                if (idx >= 0) {
+                    const auto& hr = definition.bodies[idx].height_range_km;
+                    if (hr.x != 0.0 || hr.y != 0.0) {
+                        jb["height_range_km"] = {hr.x, hr.y};
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) sf::paths::write_json(base_path, *base_raw, 2);
+        }
+    }
+    return ok;
 }
 
 bool SystemManager::system_exists(std::string_view name) const {
@@ -690,6 +807,9 @@ nlohmann::json SystemManager::serialize_snapshot_to_nbody(const SystemSnapshot& 
         j["j4"] = b.j4;
         j["rotation_period"] = b.rotation_period_hr;
         j["W0"] = b.w0_deg;
+        auto [pole_ra, pole_dec] = math::ecliptic_to_pole(b.pole_ecl);
+        j["pole_ra"] = pole_ra;
+        j["pole_dec"] = pole_dec;
         j["tidally_locked"] = b.tidally_locked;
         j["lum_eq"] = b.lum_eq;
         j["lum_pole"] = b.lum_pole;
@@ -698,6 +818,8 @@ nlohmann::json SystemManager::serialize_snapshot_to_nbody(const SystemSnapshot& 
         j["material"] = physics::serialize_material(b.material);
         serialize_body_rings(j, b);
         j["atmosphere"] = b.atmosphere;
+        if (b.ocean.enabled || j.contains("ocean")) j["ocean"] = serialize_ocean(b.ocean);
+        if (b.clouds.enabled || j.contains("clouds")) j["clouds"] = serialize_clouds(b.clouds);
         j["height_range_km"] = {b.height_range_km.x, b.height_range_km.y};
 
         if (b.parent_idx < 0) {

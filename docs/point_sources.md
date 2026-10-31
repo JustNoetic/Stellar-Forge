@@ -26,6 +26,11 @@ Local bodies and Gaia share a compact radial Gaussian profile with a smooth tape
 
 At each source center, the profile is normalized over the pixel centers covered by its billboard. Their weights sum to one, so total point flux remains stable as a source moves between pixels or its configured diameter changes. This is a sampled optical approximation, not an Airy diffraction calculation. At a three-pixel diameter, the visible source occupies at most three columns and three rows.
 
+These footprint contracts apply before post processing. The application can
+redistribute light beyond the sprite through Fast bloom or four-spike
+sprites, after atmosphere/transparency composition and before tone mapping.
+The point diameter and mesh transition remain unchanged. See [bloom](bloom.md).
+
 The tone mapper bounds HDR inputs to the largest finite half-float value before its rational curve. Saturated half-float infinities therefore map to white without an infinity-over-infinity result.
 
 The final composite fetches the corresponding HDR texel directly. Bilinear filtering would spread saturated point pixels beyond their configured footprint and can blend half-float infinities into neighboring pixels.
@@ -33,6 +38,14 @@ The final composite fetches the corresponding HDR texel directly. Bilinear filte
 Both Gaia and local points use instanced billboards with interpolated pixel offsets, avoiding native point-sprite size rounding and keeping the shared profile's width and flux consistent.
 
 The common `point_flux_visible` predicate culls only when every component of the integrated exposed source flux is below `2^-25`, half the smallest positive half-float subnormal. Such a source cannot change an RGBA16F pixel even if all its light falls into that pixel. There is no additional brightness fade or PSF-size-dependent attenuation. Local visibility, mesh weight and observer refraction are applied before the predicate; Gaia compute culling and drawing both include observer refraction gain. Exposure is applied once. Gaia intensity remains a separate artistic control.
+
+Observer refraction returns the original position/direction and unit flux gain
+for analytically unaffected rays. Its angular-area ratio uses
+`cos(bend) - cos(theta) * sin(bend) / sin(theta)`, with sine obtained from the
+direction/up cross product. Reconstructing theta with `acos` and then dividing
+two sines lost precision near 180 degrees: a distant Sun could receive zero
+gain and disappear as the eye moved. The GPU identity contracts cover both
+angular poles and 4050/4095/4096/4097/4101/4150 AU, plus wider distance bounds.
 
 Gaia's magnitude normalization is anchored to a solar absolute G magnitude of 4.67 and the spherical mesh's mean limb factor of 5/6. A solar analogue and a local one-solar-luminosity star consequently agree in integrated brightness at the same distance, exposure and default intensity. This replaces the earlier unrelated catalog coefficient and sprite-size multiplier, so the starfield's brightness changes. G-band catalog flux and bolometric system luminosity still require spectral modeling for exact agreement for other stellar temperatures.
 
@@ -53,6 +66,12 @@ Enable the optional GPU contracts with `cmake -S . -B build -DSTELLAR_BUILD_REND
 - Agreement between a synthetic Gaia solar analogue and the local Sun.
 - Compact pixel footprints at multiple subpixel offsets, changes in point diameter at 1080p, and a millionfold overexposure through the composite shader.
 - Mesh-sized sprites through the 5-to-3 px handoff and a three-pixel unresolved minimum, at 256p, 1080p and 2160p.
+
+`StellarPointRefractionTests` / `point_refraction_identity_contracts` additionally
+dispatches the production local-point and Gaia refraction helpers on 256
+unaffected near-axis rays. Every ray must retain exactly unit gain and the
+local source position must remain unchanged. The original shader returned zero
+gain for 13 of 16 near-antipodal rays in the initial 4101-AU reproduction.
 
 Small mesh rasterization errors remain at a few pixels because the mesh pass has no multisample antialiasing. Their reflected-light sweep uses resolved radii of 12–30 pixels and checks area scaling separately from stellar point normalization. `smooth_surface_contracts` additionally verifies resolved quadtree selection down to 2.5 pixels, CPU terrain preparation culling for subpixel bodies and point light transitions, and attachment underflow for imperceptible bodies.
 

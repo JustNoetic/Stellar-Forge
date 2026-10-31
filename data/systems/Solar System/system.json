@@ -59,7 +59,7 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "",
-    "pole_dec": 63.87,
+    "pole_dec": 63.87000000000006,
     "pole_ra": 286.13,
     "r": 1.0,
     "rotation_period": 609.12,
@@ -158,7 +158,7 @@
     "oblateness": 0.0,
     "omega": 29.124,
     "parentId": "Sun",
-    "pole_dec": 61.45,
+    "pole_dec": 61.45000000000006,
     "pole_ra": 281.01,
     "r": 0.0035,
     "rotation_period": 1407.6,
@@ -278,7 +278,7 @@
     "oblateness": 0.0,
     "omega": 54.884,
     "parentId": "Sun",
-    "pole_dec": 67.16,
+    "pole_dec": 67.16000000000007,
     "pole_ra": 272.76,
     "r": 0.0086,
     "rotation_period": -5832.5,
@@ -351,12 +351,36 @@
         ]
       ]
     },
+    "clouds": {
+      "automatic_altitude": true,
+      "base_altitude_km": 2.0,
+      "base_pressure_pa": 0.0,
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "coverage": 0.5,
+      "coverage_map": "earth",
+      "density": 1.0,
+      "detail_size_km": 0.8,
+      "enabled": true,
+      "erosion": 0.3,
+      "evolution": 0.05,
+      "extinction_per_km": 4.0,
+      "feature_size_km": 900.0,
+      "relative_humidity": 0.7,
+      "shape_size_km": 12.0,
+      "thickness_km": 4.0,
+      "type": "cumulus",
+      "wind_speed_ms": 12.0
+    },
     "color": "#2c6cff",
     "color_pole": "#2c6cff",
     "e": 0.016708,
     "height_range_km": [
-      -10.984,
-      8.848
+      -8.0,
+      6.4
     ],
     "inc": 5e-05,
     "j4": -1.6e-06,
@@ -368,6 +392,24 @@
     },
     "name": "Earth",
     "oblateness": 0.00335,
+    "ocean": {
+      "deep_color": [
+        0.004000000189989805,
+        0.01600000075995922,
+        0.03500000014901161
+      ],
+      "enabled": true,
+      "foam": 0.5,
+      "mask": "albedo",
+      "sea_level_km": 0.0,
+      "shallow_color": [
+        0.019999999552965164,
+        0.09000000357627869,
+        0.10000000149011612
+      ],
+      "wind_direction_deg": 30.0,
+      "wind_speed_ms": 7.0
+    },
     "omega": 114.207,
     "parentId": "Sun",
     "pole_dec": 90.0,
@@ -428,8 +470,8 @@
     "color_pole": "#1e1e1e",
     "e": 0.0554,
     "height_range_km": [
-      0.0,
-      0.0
+      -9.12,
+      10.76
     ],
     "inc": 5.16,
     "j4": 0.0,
@@ -443,7 +485,7 @@
     "oblateness": 0.0,
     "omega": 318.15,
     "parentId": "Earth",
-    "pole_dec": 65.64,
+    "pole_dec": 65.63999999999999,
     "pole_ra": 266.86,
     "r": 0.002497,
     "rotation_period": 0.0,
@@ -504,7 +546,7 @@
     "oblateness": 0.00589,
     "omega": 286.502,
     "parentId": "Sun",
-    "pole_dec": 52.88,
+    "pole_dec": 52.88000000000001,
     "pole_ra": 317.68,
     "r": 0.00487207,
     "req_km": 3396.19,
@@ -577,6 +619,8 @@
     "oblateness": 0.0,
     "omega": 216.3,
     "parentId": "Mars",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 1.6e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -647,6 +691,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Mars",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 9e-06,
     "rotation_period": 0.0,
     "sv": {
@@ -892,6 +938,8 @@
     "omega": 49.1,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00262,
     "rotation_period": 0.0,
     "sv": {
@@ -963,6 +1011,8 @@
     "omega": 45.0,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00224,
     "rotation_period": 0.0,
     "sv": {
@@ -1034,6 +1084,8 @@
     "omega": 198.3,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00379,
     "rotation_period": 0.0,
     "sv": {
@@ -1105,6 +1157,8 @@
     "omega": 43.8,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00346,
     "rotation_period": 0.0,
     "sv": {
@@ -1176,6 +1230,8 @@
     "omega": 180.1,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00012,
     "rotation_period": 0.0,
     "sv": {
@@ -1247,6 +1303,8 @@
     "omega": 26.6,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 7e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -1318,6 +1376,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 1.2e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -1389,6 +1449,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Jupiter",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 3.1e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -1561,8 +1623,8 @@
     "oblateness": 0.09796,
     "omega": 339.392,
     "parentId": "Sun",
-    "pole_dec": 83.537,
-    "pole_ra": 40.589,
+    "pole_dec": 83.53700000000015,
+    "pole_ra": 40.58899999999994,
     "r": 0.0837,
     "req_km": 60330.0,
     "ring_texture_inner": 1.14489,
@@ -1759,6 +1821,8 @@
     "omega": 160.4,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000285,
     "rotation_period": 0.0,
     "sv": {
@@ -1830,6 +1894,8 @@
     "omega": 119.5,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000362,
     "rotation_period": 0.0,
     "sv": {
@@ -1901,6 +1967,8 @@
     "omega": 335.3,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000766,
     "rotation_period": 0.0,
     "sv": {
@@ -1972,6 +2040,8 @@
     "omega": 116.0,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000807,
     "rotation_period": 0.0,
     "sv": {
@@ -2043,6 +2113,8 @@
     "omega": 44.3,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.001097,
     "rotation_period": 0.0,
     "sv": {
@@ -2111,6 +2183,8 @@
     "omega": 78.3,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.0037,
     "rotation_period": 0.0,
     "sv": {
@@ -2182,6 +2256,8 @@
     "omega": 214.0,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000194,
     "rotation_period": 0.0,
     "sv": {
@@ -2253,6 +2329,8 @@
     "omega": 254.5,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.001056,
     "rotation_period": 0.0,
     "sv": {
@@ -2324,6 +2402,8 @@
     "omega": 240.3,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000153,
     "rotation_period": 0.0,
     "sv": {
@@ -2395,6 +2475,8 @@
     "omega": 194.3,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 2.5e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -2466,6 +2548,8 @@
     "omega": 66.2,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 1.7e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -2537,6 +2621,8 @@
     "omega": 221.6,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 1.5e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -2608,6 +2694,8 @@
     "omega": 315.5,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 2e-06,
     "rotation_period": 0.0,
     "sv": {
@@ -2679,6 +2767,8 @@
     "omega": 94.1,
     "orbitRef": "equatorial",
     "parentId": "Saturn",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 1e-06,
     "rotation_period": 0.0,
     "sv": {
@@ -2850,7 +2940,7 @@
     "oblateness": 0.02293,
     "omega": 96.9988,
     "parentId": "Sun",
-    "pole_dec": 15.17,
+    "pole_dec": 15.170000000000002,
     "pole_ra": 77.31,
     "r": 0.0364,
     "req_km": 26200.0,
@@ -2947,6 +3037,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Uranus",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000116,
     "rotation_period": 0.0,
     "sv": {
@@ -3018,6 +3110,8 @@
     "omega": 154.8,
     "orbitRef": "equatorial",
     "parentId": "Uranus",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000339,
     "rotation_period": 0.0,
     "sv": {
@@ -3089,6 +3183,8 @@
     "omega": 9.6,
     "orbitRef": "equatorial",
     "parentId": "Uranus",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000832,
     "rotation_period": 0.0,
     "sv": {
@@ -3160,6 +3256,8 @@
     "omega": 183.4,
     "orbitRef": "equatorial",
     "parentId": "Uranus",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00084,
     "rotation_period": 0.0,
     "sv": {
@@ -3231,6 +3329,8 @@
     "omega": 184.0,
     "orbitRef": "equatorial",
     "parentId": "Uranus",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.001133,
     "rotation_period": 0.0,
     "sv": {
@@ -3302,6 +3402,8 @@
     "omega": 132.2,
     "orbitRef": "equatorial",
     "parentId": "Uranus",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.001094,
     "rotation_period": 0.0,
     "sv": {
@@ -3473,7 +3575,7 @@
     "oblateness": 0.01708,
     "omega": 273.187,
     "parentId": "Sun",
-    "pole_dec": 42.95,
+    "pole_dec": 42.95000000000002,
     "pole_ra": 299.3,
     "r": 0.0353,
     "req_km": 25225.0,
@@ -3547,6 +3649,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00194,
     "rotation_period": 0.0,
     "sv": {
@@ -3618,6 +3722,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 4.3e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -3689,6 +3795,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 5.7e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -3760,6 +3868,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000106,
     "rotation_period": 0.0,
     "sv": {
@@ -3831,6 +3941,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000114,
     "rotation_period": 0.0,
     "sv": {
@@ -3902,6 +4014,8 @@
     "omega": 247.3,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000139,
     "rotation_period": 0.0,
     "sv": {
@@ -3973,6 +4087,8 @@
     "omega": 346.4,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 2.5e-05,
     "rotation_period": 0.0,
     "sv": {
@@ -4044,6 +4160,8 @@
     "omega": 0.0,
     "orbitRef": "equatorial",
     "parentId": "Neptune",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000288,
     "rotation_period": 0.0,
     "sv": {
@@ -4186,6 +4304,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Pluto",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.000871,
     "rotation_period": 0.0,
     "sv": {
@@ -4256,6 +4376,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Sun",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.0006792658758652383,
     "rotation_period": 0.0,
     "sv": {
@@ -4326,6 +4448,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Sun",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.00037625297986615733,
     "rotation_period": 0.0,
     "sv": {
@@ -4396,6 +4520,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Sun",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.0003676364994112072,
     "rotation_period": 0.0,
     "sv": {
@@ -4466,6 +4592,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Sun",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.001171841341873223,
     "rotation_period": 0.0,
     "sv": {
@@ -4536,6 +4664,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Sun",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.001026797254214895,
     "rotation_period": 0.0,
     "sv": {
@@ -4606,6 +4736,8 @@
     "oblateness": 0.0,
     "omega": 0.0,
     "parentId": "Sun",
+    "pole_dec": 66.561,
+    "pole_ra": 270.0,
     "r": 0.0016701611281845076,
     "rotation_period": 0.0,
     "sv": {

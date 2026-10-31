@@ -108,6 +108,7 @@ struct BodyEditDraft {
     ephemeris::BodyPhysicalProperties values{};
     StarCreatorDraft star{};
     bool dirty = false;
+    bool rotate_moon_orbits = false;
     std::string error;
 
     void reload(const ephemeris::SystemSnapshot& snapshot, int index) {
@@ -116,6 +117,7 @@ struct BodyEditDraft {
         body_revision = snapshot.body(index).revisions.definition;
         reference_parent = snapshot.reference_parent(index);
         values = ephemeris::BodyPhysicalProperties::from(snapshot.body(index).definition);
+        rotate_moon_orbits = false;
         if (values.type == "Star" || snapshot.body(index).definition.is_star) {
             star.init_from_body(snapshot.body(index).definition);
         }
@@ -131,17 +133,55 @@ struct BodyEditDraft {
     }
 
     void recompute_hydrostatic() {
-        if (values.rotation_period_hr > 0.0 && values.mass.value > 0.0 && values.radius.value > 0.0) {
+        if (std::abs(values.rotation_period_hr) > 0.0 && values.mass.value > 0.0 && values.radius.value > 0.0) {
             auto shape = math::compute_hydrostatic_shape(values.mass.value, values.radius.value,
-                                                         values.rotation_period_hr, values.type);
+                                                         std::abs(values.rotation_period_hr), values.type);
             values.oblateness = shape.oblateness;
             values.j2 = shape.j2;
             values.j4 = shape.j4;
         }
     }
 
+    glm::dvec3 tilt_reference_normal(const ephemeris::SystemSnapshot& snapshot) const {
+        int parent = snapshot.reference_parent(body_index);
+        if (parent < 0) return {0.0, 0.0, 1.0};
+        glm::dvec3 normal;
+        if (values.update_orbit) {
+            double inc = values.inc_deg * DEG_TO_RAD;
+            double node = values.omega_node_deg * DEG_TO_RAD;
+            normal = {std::sin(inc) * std::sin(node), -std::sin(inc) * std::cos(node), std::cos(inc)};
+            if (values.equatorial_frame) {
+                normal = math::rotate_equatorial_to_ecliptic(normal, glm::dvec3{0.0}, snapshot.body(parent).definition.pole_ecl).first;
+            }
+        } else {
+            const auto& motion = snapshot.body(body_index).motion;
+            const auto& parent_motion = snapshot.body(parent).motion;
+            normal = glm::cross(motion.position.value - parent_motion.position.value,
+                                motion.velocity.value - parent_motion.velocity.value);
+        }
+        double length = glm::length(normal);
+        return length > 1e-12 ? normal / length : glm::dvec3{0.0, 0.0, 1.0};
+    }
+
+    double axial_tilt_deg(const ephemeris::SystemSnapshot& snapshot) const {
+        return std::acos(std::clamp(glm::dot(glm::normalize(values.pole_ecl), tilt_reference_normal(snapshot)), -1.0, 1.0)) * RAD_TO_DEG;
+    }
+
+    void set_axial_tilt_deg(const ephemeris::SystemSnapshot& snapshot, double tilt) {
+        if (!std::isfinite(tilt)) return;
+        auto normal = tilt_reference_normal(snapshot);
+        auto direction = values.pole_ecl - normal * glm::dot(values.pole_ecl, normal);
+        if (glm::length(direction) < 1e-12) {
+            glm::dvec3 reference = std::abs(normal.z) < 0.99 ? glm::dvec3{0.0, 0.0, 1.0} : glm::dvec3{1.0, 0.0, 0.0};
+            direction = glm::cross(normal, reference);
+        }
+        double angle = std::clamp(tilt, 0.0, 180.0) * DEG_TO_RAD;
+        values.pole_ecl = glm::normalize(normal * std::cos(angle) + glm::normalize(direction) * std::sin(angle));
+        dirty = true;
+    }
+
     ephemeris::ApplyBodyPhysicalProperties command() const {
-        return {system_generation, body_index, body_revision, values, reference_parent};
+        return {system_generation, body_index, body_revision, values, reference_parent, rotate_moon_orbits};
     }
 };
 
@@ -433,6 +473,53 @@ struct RingEditState {
     }
 };
 
+struct SurfaceLayerStage {
+    std::string staged_path;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int recommended_lod = 3;
+    int selected_lod = 3;
+    std::vector<uint8_t> preview_rgba;
+    bool has_staged = false;
+
+    void clear() {
+        staged_path.clear();
+        width = 0;
+        height = 0;
+        recommended_lod = 3;
+        preview_rgba.clear();
+        has_staged = false;
+    }
+};
+
+struct SurfaceEditState {
+    int body_index = -1;
+    uint64_t system_generation = 0;
+    int selected_tab = 0;
+    int backend_choice = 0;
+    SurfaceLayerStage albedo_stage{};
+    SurfaceLayerStage height_stage{};
+    double height_min_km = -10.0;
+    double height_max_km = 10.0;
+    bool height_range_dirty = false;
+    bool focus_surface_tab = false;
+    uint64_t preview_domain_key = UINT64_MAX;
+    int preview_tab_key = -1;
+    bool preview_is_staged = false;
+    std::string preview_staged_key;
+    glm::vec3 preview_color_key{-1.0f};
+    std::string status_msg;
+    std::string error_msg;
+
+    void invalidate_preview() noexcept {
+        preview_domain_key = UINT64_MAX;
+        preview_tab_key = -1;
+        preview_is_staged = false;
+        preview_staged_key.clear();
+        preview_color_key = glm::vec3{-1.0f};
+    }
+};
+
 struct WorkspaceState {
     int inspected_body = -1;
     bool comparison_selection = false;
@@ -442,6 +529,7 @@ struct WorkspaceState {
     int inspector_frame = 0;
     BodyEditDraft body_draft{};
     RingEditState ring_edit{};
+    SurfaceEditState surface_edit{};
     AtmosphereEditDraft atmosphere_edit{};
     AddBodyDraft add_body{};
     DeleteBodyPrompt delete_prompt{};

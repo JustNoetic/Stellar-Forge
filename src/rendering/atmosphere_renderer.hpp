@@ -47,6 +47,7 @@ struct alignas(16) AtmosphereParametersGPU {
     glm::vec4 aerosol_count{};
     std::array<glm::vec4, ephemeris::MAX_AEROSOL_LAYERS> aerosol_shape{}, aerosol_scattering{}, aerosol_extinction{};
     std::array<glm::vec4, ephemeris::MAX_AEROSOL_LAYERS*physics::AEROSOL_PHASE_SAMPLES> aerosol_phase{};
+    std::array<glm::vec4, 3> view_ray{};
 };
 
 AtmosphereParametersGPU make_atmosphere_parameters(const ephemeris::BodyDefinition& body,
@@ -125,6 +126,8 @@ private:
         rhi::Image secondary_source;
         glm::vec4 secondary_direction{}, secondary_irradiance{};
         std::array<glm::vec4, 4> secondary_directions{}, secondary_weights{};
+        std::array<glm::vec4, 17> secondary_ring_key{};
+        uint64_t secondary_ring_revision = 0;
         bool secondary_approximate = false;
         float secondary_altitude = 0.0f;
         float secondary_source_radius = 0.0f;
@@ -170,8 +173,10 @@ private:
     rhi::Pipeline secondary_composite_pipeline_, secondary_dual_source_pipeline_;
     rhi::Pipeline secondary_source_pipeline_;
     rhi::Pipeline secondary_transparent_pipeline_, secondary_composite_transparency_pipeline_;
+    rhi::Pipeline secondary_unshadowed_transparent_pipeline_, secondary_unshadowed_composite_transparency_pipeline_;
     void init_secondary(rhi::VkContext& ctx);
     rhi::Pipeline transparent_pipeline_, composite_transparency_pipeline_;
+    rhi::Pipeline unshadowed_transparent_pipeline_, unshadowed_composite_transparency_pipeline_;
     rhi::Pipeline shadow_pipeline_, shadow_transparency_pipeline_;
     rhi::Pipeline shadow_accumulate_pipeline_, shadow_accumulate_transparency_pipeline_;
     rhi::Pipeline shadow_reproject_pipeline_, shadow_rotate_pipeline_, shadow_rotate_transparency_pipeline_;

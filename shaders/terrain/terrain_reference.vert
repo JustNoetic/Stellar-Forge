@@ -32,6 +32,7 @@ layout(location = 5) flat out vec4 f_tile_color;
 layout(location = 6) out vec2 f_tile_uv;
 layout(location = 7) out vec3 f_base_chord;
 layout(location = 8) out vec3 f_apparent_pos;
+layout(location = 9) out vec3 f_body_offset;
 
 dvec3 cube_vector(uint face, dvec2 uv) {
     return terrain_cube_vector(face, uv);
@@ -84,6 +85,7 @@ void main() {
     dmat3 rotation = dmat3(tile.rotation_height.xyz, tile.rotation_error.xyz, tile.rotation_reserved.xyz);
     dvec3 relative = tile.anchor_radius.xyz + rotation * ((point - tile.anchor_polar_ratio.xyz) * tile.anchor_radius.w);
     f_world_pos = vec3(relative);
+    f_body_offset = vec3(rotation * (point * tile.anchor_radius.w));
     f_local_pos = vec3(normalize(cube_vector(tile.address.x, uv)));
     f_base_chord = vec3(base_chord);
     double e = 0.0001;

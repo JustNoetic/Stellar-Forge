@@ -55,6 +55,7 @@ struct BodyPhysicalProperties {
     std::string stage;
     nlohmann::json star_props;
     physics::SurfaceMaterialDefinition material;
+    glm::dvec3 pole_ecl{0.0, 0.0, 1.0};
 
     bool operator==(const BodyPhysicalProperties&) const = default;
 
@@ -65,7 +66,7 @@ struct BodyPhysicalProperties {
                 body.arg_peri_deg, body.mean_anom_deg, false, true,
                 body.temp_k, body.lum_eq, body.lum_pole, body.color_rgb, body.color_pole_rgb,
                 body.spectral_class, body.stage,
-                body.source_json.contains("star_props") ? body.source_json["star_props"] : nlohmann::json{}, body.material};
+                body.source_json.contains("star_props") ? body.source_json["star_props"] : nlohmann::json{}, body.material, body.pole_ecl};
     }
 };
 
@@ -75,6 +76,7 @@ struct ApplyBodyPhysicalProperties {
     uint64_t expected_body_revision;
     BodyPhysicalProperties values;
     int expected_reference_parent = -2;
+    bool rotate_moon_orbits = false;
 };
 
 struct ApplyBodyRings {
@@ -98,6 +100,14 @@ struct ApplyBodyAtmosphere {
     int body_index = -1;
     uint64_t expected_body_revision = 0;
     AtmosphereDefinition values;
+};
+
+struct ApplyBodySurface {
+    uint64_t system_generation = 0;
+    int body_index = -1;
+    uint64_t expected_body_revision = 0;
+    glm::dvec2 height_range_km{0.0};
+    glm::vec3 color_rgb{1.0f};
 };
 
 struct DeleteBody {
@@ -133,6 +143,7 @@ public:
     CommandResult apply(const ApplyBodyPhysicalProperties& command);
     CommandResult apply(const ApplyBodyRings& command);
     CommandResult apply(const ApplyBodyAtmosphere& command);
+    CommandResult apply(const ApplyBodySurface& command);
     CommandResult apply(const AddBody& command);
     CommandResult apply(const DeleteBody& command);
     CommandResult apply(JumpToTime command);

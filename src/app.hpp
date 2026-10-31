@@ -9,12 +9,14 @@
 #include "ephemeris/system_manager.hpp"
 #include "ephemeris/simulation_runner.hpp"
 #include "rendering/render_settings.hpp"
+#include "rendering/bloom_renderer.hpp"
 #include "rendering/celestial_renderer.hpp"
 #include "rendering/star_catalog.hpp"
 #include "rendering/orbit_renderer.hpp"
 #include "rendering/size_comparator.hpp"
 #include "rhi/shader_cache.hpp"
 #include "rhi/vk_context.hpp"
+#include "terrain/surface_baker.hpp"
 #include "ui/workspace.hpp"
 #include <string>
 #include <vector>
@@ -34,8 +36,10 @@ public:
     void on_mouse_button(int button, int action, int mods);
     void on_cursor_pos(double xpos, double ypos);
     void on_scroll(double xoffset, double yoffset);
+    void on_drop(int count, const char** paths);
 
 private:
+    void toggle_fullscreen();
     void switch_system(std::string_view system_name);
     void recreate_render_targets();
     void destroy_render_targets();
@@ -52,6 +56,11 @@ private:
     void render_outliner();
     void render_outliner_node(int body_idx);
     void render_body_inspector();
+    void render_body_surface_tab(int insp_idx);
+    void stage_surface_file(const std::filesystem::path& path, int target_tab = -1);
+    void poll_surface_baker();
+    void sync_system_height_ranges();
+    bool save_body_surface_to_disk(const std::string& body_name, glm::dvec2 height_range_km, glm::vec3 color_rgb);
     void render_time_hud(rendering::RenderSettings& render_draft);
     void set_size_comparison(bool active);
     void apply_size_comparison();
@@ -89,6 +98,11 @@ private:
     void delete_body_immediate(int body_idx);
 
     GLFWwindow* window_ = nullptr;
+    int windowed_x_ = 0;
+    int windowed_y_ = 0;
+    int windowed_width_ = 1600;
+    int windowed_height_ = 900;
+    bool windowed_maximized_ = false;
     rhi::VkContext vk_;
     ui::UiSystem ui_;
     ui::WorkspaceSettings ui_settings_{};
@@ -129,6 +143,7 @@ private:
     rendering::StarCatalog star_catalog_{};
     rendering::CelestialRenderer celestial_renderer_{};
     rendering::OrbitRenderer orbit_renderer_{};
+    rendering::BloomRenderer bloom_renderer_{};
     rendering::SizeComparatorRenderer size_renderer_{};
     comparison::SizeComparison size_comparison_{};
     comparison::SizeView size_view_{};
@@ -142,6 +157,11 @@ private:
     rhi::Image scene_depth_{};
     rhi::Pipeline composite_pipeline_{};
     rhi::Pipeline size_composite_pipeline_{};
+    terrain::SurfaceBaker surface_baker_{};
+    rhi::Image surface_preview_img_{};
+    rhi::Buffer surface_preview_staging_{};
+    VkDescriptorSet surface_preview_ds_ = VK_NULL_HANDLE;
+    bool surface_preview_dirty_ = false;
 
     bool self_test_ = false;
     benchmark::Options benchmark_;

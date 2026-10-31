@@ -14,6 +14,6 @@ void main() {
     if (color.a < 0.01) discard;
     out_color = vec4(pow(color.rgb, vec3(2.2)) * 4.0, color.a);
 #ifdef TRANSPARENCY_CAPTURE
-    if (capture_transparency(vec4(out_color.rgb*out_color.a, out_color.a))) out_color = vec4(0.0);
+    if (capture_transparency(vec4(out_color.rgb*out_color.a, out_color.a), gl_FragCoord.z, true)) out_color = vec4(0.0);
 #endif
 }

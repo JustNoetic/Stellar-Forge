@@ -644,7 +644,7 @@ void VkContext::copy_buffer(VkCommandBuffer cmd, const Buffer& source, const Buf
 }
 
 Image VkContext::create_image_2d(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
-                                 uint32_t mip_levels, uint32_t array_layers) {
+                                 uint32_t mip_levels, uint32_t array_layers, bool array_view) {
     Image img{};
     img.format = format;
     img.extent = {width, height, 1};
@@ -669,7 +669,7 @@ Image VkContext::create_image_2d(uint32_t width, uint32_t height, VkFormat forma
 
     VkImageViewCreateInfo iv_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     iv_ci.image = img.handle;
-    iv_ci.viewType = array_layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    iv_ci.viewType = array_layers > 1 || array_view ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     iv_ci.format = format;
     iv_ci.subresourceRange.aspectMask = img.aspect;
     iv_ci.subresourceRange.baseMipLevel = 0;
@@ -718,19 +718,23 @@ Image VkContext::create_image_3d(uint32_t width, uint32_t height, uint32_t depth
 }
 
 void VkContext::upload_image_2d(Image& image, const void* pixels, VkDeviceSize byte_size, VkImageLayout final_layout) {
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = image.aspect;
+    region.imageSubresource.layerCount = image.layers;
+    region.imageExtent = image.extent;
+    upload_image_2d(image, pixels, byte_size, std::span{&region, 1}, final_layout);
+}
+
+void VkContext::upload_image_2d(Image& image, const void* pixels, VkDeviceSize byte_size,
+                                std::span<const VkBufferImageCopy> regions, VkImageLayout final_layout) {
     Buffer staging = create_host_buffer(byte_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels);
     immediate_submit([&](VkCommandBuffer cmd) {
         transition_image(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
-        VkBufferImageCopy region{};
-        region.imageSubresource.aspectMask = image.aspect;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = image.layers;
-        region.imageExtent = image.extent;
-        vkCmdCopyBufferToImage(cmd, staging.handle, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        vkCmdCopyBufferToImage(cmd, staging.handle, image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            static_cast<uint32_t>(regions.size()), regions.data());
 
         transition_image(cmd, image, final_layout,
                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,

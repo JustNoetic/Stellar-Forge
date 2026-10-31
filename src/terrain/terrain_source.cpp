@@ -156,11 +156,13 @@ HeightTile HeightSource::read(TileId tile) const {
 }
 
 void HeightSource::retain_envelope(TileId tile, const HeightTile& payload) const {
-    std::lock_guard lock(envelope_mutex_);
-    for (auto i = envelopes_.begin(); i != envelopes_.end(); ++i) {
-        if (i->first == tile.key()) {
-            envelopes_.splice(envelopes_.begin(), envelopes_, i);
-            return;
+    {
+        std::lock_guard lock(envelope_mutex_);
+        for (auto i = envelopes_.begin(); i != envelopes_.end(); ++i) {
+            if (i->first == tile.key()) {
+                envelopes_.splice(envelopes_.begin(), envelopes_, i);
+                return;
+            }
         }
     }
     Envelope env;
@@ -225,6 +227,13 @@ void HeightSource::retain_envelope(TileId tile, const HeightTile& payload) const
                 env.mip_err4[idx] = e4;
                 env.mip_err8[idx] = e8;
             }
+        }
+    }
+    std::lock_guard lock(envelope_mutex_);
+    for (auto i = envelopes_.begin(); i != envelopes_.end(); ++i) {
+        if (i->first == tile.key()) {
+            envelopes_.splice(envelopes_.begin(), envelopes_, i);
+            return;
         }
     }
     if (envelopes_.size() == 512) envelopes_.pop_back();

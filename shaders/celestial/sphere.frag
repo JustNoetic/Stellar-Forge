@@ -7,6 +7,7 @@ layout(location = 3) in float f_subpixel_factor;
 layout(location = 4) flat in uint f_body_idx;
 layout(location = 7) in vec3 f_base_chord;
 layout(location = 8) in vec3 f_apparent_pos;
+layout(location = 9) in vec3 f_body_offset;
 
 #ifdef TERRAIN_SURFACE
 layout(location = 5) flat in vec4 f_tile_color;
@@ -21,13 +22,14 @@ layout(location = 6) in vec2 f_tile_uv;
 #include "common/surface_ring_shadow.glsl"
 #include "common/ringshine_lookup.glsl"
 #include "common/surface_atmosphere.glsl"
+#include "common/fluid_surface.glsl"
 
 layout(location = 0) out vec4 out_color;
 layout(depth_greater) out float gl_FragDepth;
 
 void main() {
     BodyInstanceGPU b = bodies[f_body_idx];
-    gl_FragDepth = curved_surface_depth(b, f_world_pos, f_apparent_pos, f_base_chord, gl_FragCoord.z);
+    gl_FragDepth = curved_surface_depth(b, f_world_pos, f_body_offset, f_apparent_pos, f_base_chord, gl_FragCoord.z);
 #ifdef TERRAIN_SURFACE
     if (f_tile_color.w > 0.5) {
         vec2 edge = min(f_tile_uv, 1.0 - f_tile_uv);
@@ -50,6 +52,7 @@ void main() {
     if (geometric_length > 1e-20) emission_cosine = max(emission_cosine, 0.1*abs(dot(geometric/geometric_length, V)));
 #endif
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;
+    float footprint_m = max(length(dFdx(f_world_pos)), length(dFdy(f_world_pos)))*FLUID_AU_KM*1000.0;
 
     if (b.spin_flags.z > 0.5) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
@@ -69,6 +72,46 @@ void main() {
     vec3 albedo = clamp(base_albedo * (1.0 + lat_band), 0.0, 1.0);
     albedo = surface_albedo(f_body_idx, f_local_pos, albedo);
 
+    float ocean = 0.0;
+    OceanSurface water;
+    float water_fresnel = 0.0;
+    vec3 ocean_up = normalize(f_normal);
+    if (fluid_ocean_active(f_body_idx)) {
+        SurfaceFluidGPU fluid = fluids[f_body_idx];
+        vec3 pole = body_pole(b);
+        float mode = fluid.ocean_deep.w;
+        float height_km = length(fluid_spherical(f_body_offset, pole, fluid_flattening(b)))*FLUID_AU_KM
+                        -fluid.ocean_params.z;
+        float luminance = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
+        float blue = (albedo.b-max(albedo.r, albedo.g*0.85))/max(albedo.b, 1e-4);
+        float albedo_mask = smoothstep(0.05, 0.25, blue)*(1.0-smoothstep(0.12, 0.3, luminance));
+        vec3 water_albedo = fluid.ocean_deep.rgb;
+        if (mode > 2.5) ocean = 1.0;
+#ifdef TERRAIN_SURFACE
+        else if (mode > 1.5) {
+            float tolerance_km = max(0.002, length(f_world_pos)*FLUID_AU_KM*2e-7);
+            ocean = 1.0-smoothstep(tolerance_km, 2.0*tolerance_km, height_km);
+            water_albedo = mix(fluid.ocean_deep.rgb, fluid.ocean_shallow.rgb, albedo_mask*0.5);
+        }
+#endif
+        else {
+            ocean = albedo_mask;
+            water_albedo = mix(fluid.ocean_deep.rgb, albedo, 0.5);
+        }
+        if (ocean > 0.0) {
+            float q = max(1.0-b.pole_oblateness.w, 0.05);
+            vec3 local = normalize(f_local_pos);
+            vec3 fixed_normal = normalize(vec3(local.x, local.y/(q*q), local.z));
+            mat3 rotation = body_surface_rotation(pole, b.spin_flags.x);
+            ocean_up = normalize(rotation*fixed_normal);
+            vec3 fixed_from_camera_m = transpose(rotation)*f_world_pos*(FLUID_AU_KM*1000.0);
+            water = ocean_surface(f_body_idx, fixed_normal, fixed_from_camera_m, footprint_m, rotation);
+            water_fresnel = ocean_fresnel(max(dot(water.normal, V), 0.0), sqrt(water.roughness_squared*0.5));
+            water_albedo = mix(water_albedo*(1.0-water_fresnel), vec3(0.55), water.foam);
+            albedo = mix(albedo, water_albedo, ocean);
+        }
+    }
+
     vec3 total_light = vec3(0.0);
     for (uint s = 0; s < u_scene.num_stars; ++s) {
         if (!star_lights_body(f_body_idx, s)) continue;
@@ -81,7 +124,7 @@ void main() {
         float d_au = max(length(to_star), 1e-5);
         vec3 L = to_star / d_au;
         vec3 diffuse;
-        vec3 direct = surface_stellar_light(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord,
+        vec3 direct = surface_stellar_light(f_body_idx, f_body_offset, f_base_chord,
             N, V, L, star_r/d_au, emission_cosine, b.material, s, diffuse);
         float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
 
@@ -103,16 +146,29 @@ void main() {
         if (any(greaterThan(direct, vec3(0.0))) && any(greaterThan(shadow, vec3(0.0)))) {
             total_light += albedo * star_col * irradiance * direct * shadow;
         }
+
+        if (ocean > 0.0) {
+            vec3 transmission = vec3(smoothstep(-0.01, 0.02, dot(ocean_up, L)));
+            if (surface_atmospheres[f_body_idx].w > 0.5) {
+                SurfaceAtmosphereSample lookup = surface_atmosphere_sample(f_body_idx, f_body_offset,
+                    f_base_chord, ocean_up);
+                transmission = textureLod(surface_atmosphere_lut, surface_atmosphere_coordinates(lookup, L), 0.0).rgb;
+            }
+            float sun_radius = star_r/d_au;
+            float specular = 3.141592653589793*ocean_specular(water.normal, V, L,
+                water.roughness_squared+0.5*sun_radius*sun_radius)*(1.0-water.foam);
+            vec3 reflected = transmission*specular+water_fresnel*diffuse*(1.0-water.foam);
+            total_light += ocean*star_col*irradiance*shadow*reflected;
+        }
     }
 
     if (u_scene.ringshine_params.x != 0u) {
         vec3 ringshine_light = vec3(0.0);
         for (uint r = 0; r < u_scene.ringshine_params.y; ++r) {
             if (ring_hosts[r].counts_indices.x != f_body_idx) continue;
-            vec3 host_center = ring_hosts[r].center_min_r.xyz;
             vec3 pole = ring_hosts[r].pole_max_r.xyz;
             float host_r = ring_hosts[r].tangent_radius.w;
-            vec3 rel = f_world_pos - host_center;
+            vec3 rel = f_body_offset;
             float dist2 = dot(rel, rel);
             if (dist2 > 2.25 * host_r * host_r || dist2 < 1e-12) continue;
 
@@ -148,7 +204,7 @@ void main() {
         if (!any(greaterThan(b.shine_irradiance[i].rgb, vec3(0.0)))) continue;
         vec3 light = b.shine_direction[i].xyz;
         vec3 diffuse;
-        vec3 direct = surface_stellar_light(f_body_idx, f_world_pos-b.pos_radius.xyz, f_base_chord,
+        vec3 direct = surface_stellar_light(f_body_idx, f_body_offset, f_base_chord,
             N, V, light, sin(b.shine_direction[i].w), emission_cosine, b.material, 16u, diffuse);
         total_light += albedo*b.shine_irradiance[i].rgb
                      *(direct+diffuse);

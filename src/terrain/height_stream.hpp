@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <limits>
 
 #include "terrain/terrain_source.hpp"
 #include <condition_variable>
@@ -39,6 +41,8 @@ public:
     void consumed(TileId tile);
     StreamStats stats() const;
     const HeightSource& source() const noexcept { return *source_; }
+    void set_floor_m(double floor) noexcept { floor_m_.store(floor); }
+    double floor_m() const noexcept { return floor_m_.load(); }
     std::shared_ptr<const HeightSource> share_source() const noexcept { return source_; }
 
 private:
@@ -48,6 +52,7 @@ private:
     };
     void run(std::stop_token stop);
     std::shared_ptr<const HeightSource> source_;
+    std::atomic<double> floor_m_{-std::numeric_limits<double>::infinity()};
     uint32_t capacity_;
     uint32_t queue_limit_;
     mutable std::mutex mutex_;

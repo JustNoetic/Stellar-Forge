@@ -322,6 +322,22 @@ inline glm::mat4 reverse_z_perspective(float fov_rad, float aspect, float z_near
     return m;
 }
 
+inline glm::dmat3 rotation_between_axes(glm::dvec3 from, glm::dvec3 to) noexcept {
+    from = glm::normalize(from);
+    to = glm::normalize(to);
+    auto axis = glm::cross(from, to);
+    double sine = glm::length(axis);
+    double cosine = std::clamp(glm::dot(from, to), -1.0, 1.0);
+    if (sine < 1e-12) {
+        if (cosine > 0.0) return glm::dmat3{1.0};
+        glm::dvec3 reference = std::abs(from.z) < 0.99 ? glm::dvec3{0.0, 0.0, 1.0} : glm::dvec3{1.0, 0.0, 0.0};
+        axis = glm::normalize(glm::cross(from, reference));
+    } else {
+        axis /= sine;
+    }
+    return glm::dmat3{glm::rotate(glm::dmat4{1.0}, std::atan2(sine, cosine), axis)};
+}
+
 struct KeplerianElements {
     double a = 0.0;
     double e = 0.0;

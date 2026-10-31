@@ -39,6 +39,40 @@ struct RingGradientStop {
     bool operator==(const RingGradientStop&) const = default;
 };
 
+struct OceanDefinition {
+    bool enabled = false;
+    std::string mask = "albedo";
+    double sea_level_km = 0.0;
+    glm::vec3 deep_color{0.004f, 0.016f, 0.035f};
+    glm::vec3 shallow_color{0.02f, 0.09f, 0.10f};
+    double wind_speed_ms = 7.0;
+    double wind_direction_deg = 30.0;
+    double foam = 0.5;
+    bool operator==(const OceanDefinition&) const = default;
+};
+
+struct CloudDefinition {
+    bool enabled = false;
+    std::string coverage_map;
+    std::string type = "cumulus";
+    double coverage = 0.5;
+    double base_altitude_km = 2.0;
+    bool automatic_altitude = false;
+    double base_pressure_pa = 0.0;
+    double relative_humidity = 0.7;
+    double thickness_km = 6.0;
+    double density = 1.0;
+    double extinction_per_km = 4.0;
+    double shape_size_km = 12.0;
+    double detail_size_km = 0.8;
+    double erosion = 0.3;
+    double feature_size_km = 900.0;
+    double wind_speed_ms = 12.0;
+    double evolution = 0.15;
+    glm::vec3 color{1.0f, 1.0f, 1.0f};
+    bool operator==(const CloudDefinition&) const = default;
+};
+
 struct RingLayerDefinition {
     double inner = 1.5;
     double outer = 2.5;
@@ -101,6 +135,8 @@ struct BodyDefinition {
     std::optional<double> ring_texture_outer;
     std::vector<RingLayerDefinition> rings;
     AtmosphereDefinition atmosphere;
+    OceanDefinition ocean;
+    CloudDefinition clouds;
     glm::dvec2 height_range_km{0.0};
 
     glm::dvec3 pole_ecl{0.0, 0.0, 1.0};
@@ -160,6 +196,7 @@ struct BodyRenderState {
     glm::dvec3 pole{0.0, 1.0, 0.0};
     double spin_angle_rad = 0.0;
     std::shared_ptr<const physics::PreparedAtmosphere> atmosphere;
+    double cloud_base_altitude_km = 2.0;
 };
 
 struct BodyRevisions {

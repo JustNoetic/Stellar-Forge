@@ -15,6 +15,9 @@ void TransparencyRenderer::init(rhi::VkContext& ctx) {
     bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT});
     bindings.push_back({3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT});
     resolve_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/resolve.comp", bindings);
+    bindings.push_back({5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT});
+    const std::array macros{std::pair<std::string, std::string>{"BLOOM_OUTPUT", "1"}};
+    bloom_resolve_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/resolve.comp", bindings, 0, macros);
     for (auto& buffer : counters_) buffer = ctx.create_host_buffer(16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
 
@@ -29,6 +32,7 @@ void TransparencyRenderer::shutdown(rhi::VkContext& ctx) {
     for (auto& buffer : counters_) ctx.destroy_buffer(buffer);
     rhi::ShaderCache::destroy_pipeline(ctx, clear_);
     rhi::ShaderCache::destroy_pipeline(ctx, resolve_);
+    rhi::ShaderCache::destroy_pipeline(ctx, bloom_resolve_);
 }
 
 void TransparencyRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, VkExtent2D extent, bool enabled) {
@@ -43,6 +47,7 @@ void TransparencyRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, VkE
         sf::log::warn("Transparency fragment budget exceeded by {} fragments; excess fragments use draw-order blending.", previous.overflow);
     last_overflow_ = previous.overflow;
     active_ = enabled && ctx.fragment_stores_enabled();
+    last_stats_ = active_ ? previous : TransparencyStats{};
     if (!active_) return;
     auto timer = ctx.begin_gpu_timer(cmd, "transparency_clear");
     if (heads_.extent.width != extent.width || heads_.extent.height != extent.height) {
@@ -73,17 +78,21 @@ std::array<rhi::PushDescriptorWrite, 2> TransparencyRenderer::writes() const {
             rhi::PushDescriptorWrite::storage_buffer(15, fragments_)};
 }
 
-void TransparencyRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
+void TransparencyRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
+                                   rhi::Image* physical_color) {
     if (!active_) return;
     auto timer = ctx.begin_gpu_timer(cmd, "transparency_resolve");
     ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL);
     ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     ctx.memory_barrier(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_.handle);
+    auto& pipeline = physical_color ? bloom_resolve_ : resolve_;
+    if (physical_color) ctx.transition_image(cmd, *physical_color, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
     auto resources = writes();
-    rhi::PushDescriptorWrite descriptors[] = {resources[0], resources[1], rhi::PushDescriptorWrite::storage_image(4, color),
+    std::vector<rhi::PushDescriptorWrite> descriptors = {resources[0], resources[1], rhi::PushDescriptorWrite::storage_image(4, color),
         rhi::PushDescriptorWrite::sampled_image(3, depth, ctx.sampler_nearest_clamp())};
-    ctx.push_descriptors(cmd, resolve_, descriptors);
+    if (physical_color) descriptors.push_back(rhi::PushDescriptorWrite::storage_image(5, *physical_color));
+    ctx.push_descriptors(cmd, pipeline, descriptors);
     vkCmdDispatch(cmd, (color.extent.width+7)/8, (color.extent.height+7)/8, 1);
     ctx.memory_barrier(cmd);
     auto frame = ctx.frame_index();

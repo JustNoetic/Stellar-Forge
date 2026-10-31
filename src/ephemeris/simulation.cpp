@@ -1,6 +1,7 @@
 #include "ephemeris/simulation.hpp"
 #include "core/math_utils.hpp"
 #include "core/log.hpp"
+#include "physics/cloud_physics.hpp"
 #include "ephemeris/spice_ephemeris.hpp"
 #include "ephemeris/spk_exporter.hpp"
 #include <algorithm>
@@ -21,7 +22,9 @@ bool valid_physical(const BodyPhysicalProperties& values) {
               std::isfinite(values.radius.value) && values.radius.value > 0.0 &&
               std::isfinite(values.oblateness) && values.oblateness >= 0.0 && values.oblateness < 1.0 &&
               std::isfinite(values.j2) && std::isfinite(values.j4) &&
-              std::isfinite(values.rotation_period_hr) && physics::valid_material(values.material);
+              std::isfinite(values.rotation_period_hr) && physics::valid_material(values.material) &&
+              finite_vector(values.pole_ecl) && std::isfinite(glm::length(values.pole_ecl)) &&
+              glm::length(values.pole_ecl) > 1e-12;
     if (values.update_orbit) {
         ok = ok && std::isfinite(values.a_au) && values.a_au > 0.0 &&
              std::isfinite(values.e) && values.e >= 0.0 && values.e < 1.0 &&
@@ -230,14 +233,17 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
         return {false, false, "The body changed after this draft was opened. Revert to reload its current values."};
     }
     if (!valid_physical(command.values)) {
-        return {false, false, "Mass must be nonnegative, radius positive, oblateness in [0, 1), and all values finite."};
+        return {false, false, "Mass must be nonnegative, radius positive, oblateness in [0, 1), the rotation pole nonzero, and all values finite."};
     }
-    if (command.values.update_orbit && command.expected_reference_parent != -2 &&
+    bool pole_changed = command.values.pole_ecl != snapshot_.definition_->bodies[index].pole_ecl;
+    if ((command.values.update_orbit || pole_changed) && command.expected_reference_parent != -2 &&
         command.expected_reference_parent != snapshot_.reference_parent(index)) {
-        return {false, false, "The reference parent changed after this orbit draft was opened. Revert to reload the current orbit."};
+        return {false, false, "The reference parent changed after this draft was opened. Revert to reload the current orbit and tilt."};
     }
     const auto& old = snapshot_.definition_->bodies[index];
     auto values = command.values;
+    if (pole_changed && command.rotate_moon_orbits && snapshot_.definition_->motion_model == MotionModel::Spice)
+        return {false, false, "Switch to Keplerian or N-body motion before rotating moon orbits."};
     if (old.atmosphere.enabled && old.atmosphere.physical && values.mass.value <= 0)
         return {false, false, "A hydrostatic atmosphere requires positive body mass."};
     if (old.is_black_hole) {
@@ -269,6 +275,12 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     body.rotation_period_hr = values.rotation_period_hr;
     body.tidally_locked = values.tidally_locked;
     body.material = values.material;
+    if (pole_changed) {
+        body.pole_ecl = glm::normalize(values.pole_ecl);
+        auto [ra, dec] = math::ecliptic_to_pole(body.pole_ecl);
+        body.pole_ra_deg = ra;
+        body.pole_dec_deg = dec;
+    }
     if (body.is_star) {
         body.temp_k = values.temp_k;
         body.lum_eq = values.lum_eq;
@@ -283,10 +295,38 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     }
 
     bool dynamics_changed = (before.mass != values.mass || before.oblateness != values.oblateness ||
-                             before.j2 != values.j2 || before.j4 != values.j4 ||
+                             before.j2 != values.j2 || before.j4 != values.j4 || pole_changed ||
                              (before.radius != values.radius && (before.j2 != 0.0 || before.j4 != 0.0)));
 
     int orbit_parent = snapshot_.reference_parent(index);
+    std::vector<int> rotated_moons;
+    if (pole_changed && command.rotate_moon_orbits && !old.is_star) {
+        const auto centre = snapshot_.motions_[index];
+        double hill_radius = std::numeric_limits<double>::infinity();
+        if (orbit_parent >= 0) {
+            double parent_mass = snapshot_.definition_->bodies[orbit_parent].mass_msun;
+            double distance = glm::length(centre.position.value - snapshot_.motions_[orbit_parent].position.value);
+            if (parent_mass > 0.0 && old.mass_msun > 0.0)
+                hill_radius = distance * std::cbrt(old.mass_msun / (3.0 * parent_mass));
+        }
+        auto rotation = math::rotation_between_axes(old.pole_ecl, body.pole_ecl);
+        std::vector<int> descendants{static_cast<int>(index)};
+        for (size_t k = 0; k < descendants.size(); ++k) {
+            for (int child : snapshot_.reference_hierarchy().children[descendants[k]]) {
+                if (updated->bodies[child].is_star ||
+                    glm::length(snapshot_.motions_[child].position.value - centre.position.value) > hill_radius) continue;
+                descendants.push_back(child);
+                rotated_moons.push_back(child);
+            }
+        }
+        for (int moon : rotated_moons) {
+            auto& motion = snapshot_.motions_[moon];
+            motion.position.value = centre.position.value + rotation * (motion.position.value - centre.position.value);
+            motion.velocity.value = centre.velocity.value + rotation * (motion.velocity.value - centre.velocity.value);
+            ++snapshot_.revisions_[moon].dynamics;
+            ++snapshot_.revisions_[moon].definition;
+        }
+    }
     if (values.update_orbit && orbit_parent >= 0) {
         int parent_idx = orbit_parent;
         double parent_m = snapshot_.definition_->bodies[parent_idx].mass_msun;
@@ -345,9 +385,43 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
                 if (is_moon) {
                     snapshot_.motions_[k].position.value += delta_pos;
                     snapshot_.motions_[k].velocity.value += delta_vel;
-                    ++snapshot_.revisions_[k].dynamics;
+                    if (std::find(rotated_moons.begin(), rotated_moons.end(), static_cast<int>(k)) == rotated_moons.end())
+                        ++snapshot_.revisions_[k].dynamics;
                 }
             }
+        }
+    }
+
+    auto refreshed_orbits = rotated_moons;
+    if (pole_changed) {
+        for (size_t k = 0; k < snapshot_.size(); ++k) {
+            const auto& child = updated->bodies[k];
+            if (child.parent_idx == static_cast<int>(index) && child.source_json.is_object() &&
+                child.source_json.value("orbitRef", "") == "equatorial" &&
+                std::find(refreshed_orbits.begin(), refreshed_orbits.end(), static_cast<int>(k)) == refreshed_orbits.end()) {
+                refreshed_orbits.push_back(static_cast<int>(k));
+                ++snapshot_.revisions_[k].definition;
+            }
+        }
+    }
+    for (int moon : refreshed_orbits) {
+        auto& definition = updated->bodies[moon];
+        int parent = definition.parent_idx;
+        if (parent < 0) continue;
+        auto rel_pos = snapshot_.motions_[moon].position.value - snapshot_.motions_[parent].position.value;
+        auto rel_vel = snapshot_.motions_[moon].velocity.value - snapshot_.motions_[parent].velocity.value;
+        auto elements = math::compute_keplerian_elements(rel_pos, rel_vel,
+            G_CONST * (updated->bodies[parent].mass_msun + definition.mass_msun));
+        definition.semi_major_au = elements.a;
+        definition.eccentricity = elements.e;
+        definition.inc_deg = elements.inc_deg;
+        definition.omega_node_deg = elements.omega_node_deg;
+        definition.arg_peri_deg = elements.arg_peri_deg;
+        definition.mean_anom_deg = elements.mean_anomaly_deg;
+        if (definition.source_json.is_object()) definition.source_json.erase("orbitRef");
+        if (definition.source_json.contains("sv")) {
+            definition.source_json["sv"] = {{"x", rel_pos.x}, {"y", rel_pos.y}, {"z", rel_pos.z},
+                {"vx", rel_vel.x}, {"vy", rel_vel.y}, {"vz", rel_vel.z}};
         }
     }
 
@@ -357,7 +431,7 @@ CommandResult Simulation::apply(const ApplyBodyPhysicalProperties& command) {
     ++revisions.definition;
     if (dynamics_changed) ++revisions.dynamics;
     if (before.radius != values.radius || before.oblateness != values.oblateness || before.type != values.type ||
-        before.color_rgb != values.color_rgb || before.lum_eq != values.lum_eq || before.temp_k != values.temp_k) {
+        before.color_rgb != values.color_rgb || before.lum_eq != values.lum_eq || before.temp_k != values.temp_k || pole_changed) {
         ++revisions.geometry;
         ++revisions.lighting;
     }
@@ -477,6 +551,41 @@ CommandResult Simulation::apply(const ApplyBodyAtmosphere& command) {
     ++snapshot_.revisions_[index].definition;
     ++snapshot_.revisions_[index].lighting;
     if (geometry_changed) ++snapshot_.revisions_[index].geometry;
+    ++snapshot_.definition_revision_;
+    prepare_render_state(true);
+    return {true, true, {}};
+}
+
+CommandResult Simulation::apply(const ApplyBodySurface& command) {
+    if (command.system_generation != snapshot_.generation_ || command.body_index < 0 ||
+        static_cast<size_t>(command.body_index) >= snapshot_.size())
+        return {false, false, "The edited body belongs to a different system or no longer exists."};
+    size_t index = static_cast<size_t>(command.body_index);
+    if (command.expected_body_revision != 0 && command.expected_body_revision != snapshot_.revisions_[index].definition)
+        return {false, false, "The body changed after this draft was opened. Revert to reload its current values."};
+    const auto& old = snapshot_.definition_->bodies[index];
+    if (old.is_star || old.is_black_hole || old.is_spacecraft)
+        return {false, false, "Surface maps are available on planetary bodies only."};
+    if (!finite_vector(glm::dvec3(command.color_rgb)))
+        return {false, false, "Surface color must be finite."};
+    BodyDefinition candidate = old;
+    candidate.height_range_km = command.height_range_km;
+    candidate.color_rgb = glm::clamp(command.color_rgb, glm::vec3(0.0f), glm::vec3(1.0f));
+    candidate.color_pole_rgb = candidate.color_rgb;
+    double max_relief_km = old.radius_au() * AU_TO_KM * 0.01;
+    if (!candidate.valid_height_range() || std::max(std::abs(candidate.height_range_km.x), std::abs(candidate.height_range_km.y)) >= max_relief_km)
+        return {false, false, "Elevation range must have min <= max and stay within 1% of the equatorial radius."};
+    if (old.height_range_km == candidate.height_range_km && old.color_rgb == candidate.color_rgb)
+        return {};
+    bool geom_changed = (old.height_range_km != candidate.height_range_km);
+    auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
+    updated->bodies[index].height_range_km = candidate.height_range_km;
+    updated->bodies[index].color_rgb = candidate.color_rgb;
+    updated->bodies[index].color_pole_rgb = candidate.color_pole_rgb;
+    snapshot_.definition_ = std::move(updated);
+    ++snapshot_.revisions_[index].definition;
+    ++snapshot_.revisions_[index].lighting;
+    if (geom_changed) ++snapshot_.revisions_[index].geometry;
     ++snapshot_.definition_revision_;
     prepare_render_state(true);
     return {true, true, {}};
@@ -905,6 +1014,13 @@ void Simulation::prepare_render_state(bool definitions_changed) {
                     render.atmosphere->mass_solar != body.mass_msun || render.atmosphere->radius_km != radius)
                     render.atmosphere = physics::prepare_atmosphere(body.atmosphere, body.mass_msun, radius);
             } else render.atmosphere.reset();
+            render.cloud_base_altitude_km = body.clouds.base_altitude_km;
+            if (body.clouds.enabled && body.clouds.automatic_altitude && render.atmosphere) {
+                double pressure = body.clouds.base_pressure_pa;
+                if (pressure == 0) pressure = body.atmosphere.cloud_deck_pressure_pa;
+                if (auto altitude = physics::cloud_base_altitude(*render.atmosphere, body.clouds.relative_humidity, pressure))
+                    render.cloud_base_altitude_km = *altitude;
+            }
         }
         render.position = ecliptic_to_render(snapshot_.motions_[i].position);
         render.velocity = ecliptic_to_render(snapshot_.motions_[i].velocity);

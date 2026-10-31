@@ -5,6 +5,27 @@ Atmosphere, Lighting & Rings, Planet Surfaces), Navigation and Workspace
 preferences, and an Advanced page for experiments and diagnostics. Dependent
 controls retain their values while disabled. Changes apply immediately.
 
+Display includes Bloom & diffraction: Off, Fast, or Four-spike (default), with
+scatter strength, highlight limit, spike length, strength, rotation and threshold controls.
+Only pixels brighter than the spike threshold (default 4 HDR units) cast spikes.
+The highlight limit softly caps only the light extracted for glare, preserving
+the scene's HDR solar disc. The default is 64; lower values soften overexposed
+halos and spike tips. Spike tails also taper smoothly to zero.
+Bloom requires HDR and preserves orbit guide exclusion in ordered transparency.
+The legacy orbit reference path bypasses bloom. See `bloom.md` for the filter,
+HDR saturation limits and local verification.
+
+Press **F11** to toggle fullscreen on the display containing most of the window.
+Fullscreen uses that display's current resolution and refresh rate. Pressing F11
+again restores the previous window position, size and maximized state. The
+shortcut also works while UI controls have keyboard focus. Fullscreen is session
+state and is not saved to preferences.
+
+Lighting & Rings includes Cloud rendering: 2D texture (default) or Volumetric
+(experimental). `cloud_mode` persists as 0 or 1 alongside `clouds_enabled`.
+The 2D mode reuses existing coverage mips and atmosphere transport; see
+`oceans_clouds.md` for per-body altitude and moisture controls.
+
 Interactive sessions load `data/settings.json` through `paths::external_path`.
 Graphics settings, panel visibility and sizes, interface scale, distance units,
 deletion confirmation, and navigation preferences persist. Camera pose, tracked

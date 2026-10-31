@@ -26,6 +26,7 @@ class TerrainSource {
 public:
     virtual ~TerrainSource() = default;
     virtual SourceDomain domain() const noexcept = 0;
+    virtual uint64_t bounds_revision() const noexcept { return 0; }
     virtual SurfaceTile describe(TileId tile, double polar_ratio, double amplitude) const = 0;
 };
 
@@ -92,7 +93,7 @@ public:
     void retain_envelope(TileId tile, const HeightTile& payload) const;
     double morph_error(uint32_t level) const noexcept;
     double approximation_error(TileId tile, uint32_t stride = 1) const;
-    uint64_t bounds_revision() const noexcept { return bounds_revision_.load(std::memory_order_relaxed); }
+    uint64_t bounds_revision() const noexcept override { return bounds_revision_.load(std::memory_order_relaxed); }
     bool compatible(double radius_m, double polar_ratio) const noexcept;
     std::span<const HeightRecord> records() const noexcept { return records_; }
 

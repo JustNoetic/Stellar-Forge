@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <queue>
+#include <memory_resource>
 #include <limits>
 #include <unordered_map>
 
@@ -175,7 +175,7 @@ double error_coefficient(double polar_ratio, double height_amplitude) noexcept {
 
 namespace {
 
-using LeafMap = std::unordered_map<uint64_t, size_t>;
+using LeafMap = std::pmr::unordered_map<uint64_t, size_t>;
 
 int coarser_neighbor(const LeafMap& leaves, TileId tile, uint32_t edge) {
     if (tile.level == 0) return -1;
@@ -207,20 +207,9 @@ int coarser_neighbor(const LeafMap& leaves, TileId tile, uint32_t edge) {
 
 }
 
-Selection select(const SelectionView& input, TileMetadataCache* metadata) {
-    return select(input, ProceduralSource{metadata});
-}
-
-Selection select(const SelectionView& input, const TerrainSource& source, const TileAvailability& availability) {
-    SelectionView view = input;
-    view.max_level = std::min(view.max_level, MAX_LEVEL);
-    view.max_patches = std::clamp(view.max_patches, 6u, MAX_PATCHES);
-    view.polar_ratio = std::clamp(view.polar_ratio, 0.05, 1.0);
-    view.height_amplitude = std::clamp(view.height_amplitude, 0.0, 0.01);
-    view.target_error_pixels = std::max(view.target_error_pixels, 0.1);
-    Visibility visibility(view);
+struct SelectionScratch::Storage {
     struct Candidate { TileId tile; double error; };
-    struct Node { Candidate candidate; bool active = true; bool scheduled = false; };
+    struct Node { Candidate candidate; bool active = true; bool scheduled = false; uint32_t decision = UINT32_MAX; };
     struct Request {
         double error;
         size_t index;
@@ -228,32 +217,169 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
             return error != other.error ? error < other.error : index > other.index;
         }
     };
-    Selection result;
+    std::pmr::unsynchronized_pool_resource pool;
     std::vector<Node> nodes;
-    nodes.reserve(view.max_patches * 4);
-    LeafMap leaves;
-    leaves.reserve(view.max_patches * 2);
-    std::priority_queue<Request> queue;
+    LeafMap leaves{&pool};
+    std::vector<Request> queue;
     std::vector<size_t> splits;
     std::vector<Candidate> children;
+    std::vector<uint32_t> child_decisions;
     std::vector<TileId> prerequisites;
+    uint32_t capacity = 0;
+};
+
+SelectionScratch::SelectionScratch() = default;
+SelectionScratch::~SelectionScratch() = default;
+SelectionScratch::SelectionScratch(SelectionScratch&&) noexcept = default;
+SelectionScratch& SelectionScratch::operator=(SelectionScratch&&) noexcept = default;
+
+struct SelectionPlan::Storage {
+    struct Decision {
+        SurfaceTile surface;
+        bool visible = false;
+        bool refine = false;
+        bool selected = false;
+        uint8_t children = 0;
+    };
+    SelectionView view;
+    SourceDomain source;
+    uint64_t bounds_revision = 0;
+    std::vector<Decision> decisions;
+    uint32_t checks = 0;
+    uint32_t budget_bound = 0;
+    bool valid = false;
+    bool limited = false;
+    uint32_t misses = 0;
+    uint32_t cooldown = 0;
+    void missed() noexcept {
+        if (++misses == 2) { cooldown = 32; misses = 0; }
+    }
+};
+
+SelectionPlan::SelectionPlan() = default;
+SelectionPlan::~SelectionPlan() = default;
+SelectionPlan::SelectionPlan(SelectionPlan&&) noexcept = default;
+SelectionPlan& SelectionPlan::operator=(SelectionPlan&&) noexcept = default;
+void SelectionPlan::invalidate() noexcept {
+    if (storage_) {
+        if (storage_->valid) storage_->missed();
+        storage_->valid = false;
+        storage_->limited = false;
+    }
+}
+uint32_t SelectionPlan::checks() const noexcept { return storage_ ? storage_->checks : 0; }
+
+static SelectionView normalized_view(SelectionView view) {
+    view.max_level = std::min(view.max_level, MAX_LEVEL);
+    view.max_patches = std::clamp(view.max_patches, 6u, MAX_PATCHES);
+    view.polar_ratio = std::clamp(view.polar_ratio, 0.05, 1.0);
+    view.height_amplitude = std::clamp(view.height_amplitude, 0.0, 0.01);
+    view.target_error_pixels = std::max(view.target_error_pixels, 0.1);
+    return view;
+}
+
+bool update_selection(Selection& selection, SelectionPlan& plan, const SelectionView& input, const TerrainSource& source,
+                      const TileAvailability& availability, SelectionScratch* scratch) {
+    auto view = normalized_view(input);
+    if (plan.storage_) {
+        auto& previous = *plan.storage_;
+        previous.checks = 0;
+        auto comparable = previous.view;
+        comparable.eye = view.eye;
+        comparable.view_from_local = view.view_from_local;
+        comparable.tan_half_fov_x = view.tan_half_fov_x;
+        comparable.tan_half_fov_y = view.tan_half_fov_y;
+        comparable.focal_pixels = view.focal_pixels;
+        comparable.orthographic_pixels = view.orthographic_pixels;
+        comparable.orthographic_bounds = view.orthographic_bounds;
+        comparable.target_error_pixels = view.target_error_pixels;
+        comparable.occluder_scale = view.occluder_scale;
+        if (previous.valid && !availability.ready && comparable == view && previous.source == source.domain() &&
+            previous.bounds_revision == source.bounds_revision()) {
+            Visibility visibility(view);
+            double maximum_error = 0;
+            bool valid = true;
+            for (const auto& decision : previous.decisions) {
+                ++previous.checks;
+                bool seen = visibility.visible(decision.surface.bounds);
+                if (seen != decision.visible) { valid = false; break; }
+                if (!seen) continue;
+                double error = decision.surface.geometric_error * (view.orthographic_pixels > 0 ?
+                    view.orthographic_pixels : view.focal_pixels/decision.surface.bounds.distance(view.eye));
+                if ((error > view.target_error_pixels) != decision.refine) { valid = false; break; }
+                if (decision.selected) maximum_error = std::max(maximum_error, error);
+            }
+            if (valid) {
+                previous.misses = 0;
+                selection.max_error_pixels = maximum_error;
+                return false;
+            }
+        }
+        if (previous.valid) previous.missed();
+    }
+    selection = select(view, source, availability, scratch, &plan);
+    return true;
+}
+
+Selection select(const SelectionView& input, TileMetadataCache* metadata, SelectionScratch* scratch) {
+    return select(input, ProceduralSource{metadata}, {}, scratch);
+}
+
+Selection select(const SelectionView& input, const TerrainSource& source, const TileAvailability& availability, SelectionScratch* scratch, SelectionPlan* plan) {
+    SelectionView view = normalized_view(input);
+    SelectionPlan::Storage* retained = nullptr;
+    if (plan) {
+        if (!plan->storage_) plan->storage_ = std::make_unique<SelectionPlan::Storage>();
+        retained = plan->storage_.get();
+        retained->valid = false;
+        retained->decisions.clear();
+        retained->budget_bound = 0;
+        retained->view = view;
+        retained->source = source.domain();
+        retained->bounds_revision = source.bounds_revision();
+    }
+    bool capture = retained && !retained->limited && !retained->cooldown && !availability.ready;
+    if (retained && retained->cooldown) --retained->cooldown;
+    uint32_t decision_limit = std::min(MAX_PATCHES*4, view.max_patches*4+MAX_LEVEL*4+6);
+    Visibility visibility(view);
+    SelectionScratch local;
+    auto& storage = scratch ? scratch->storage_ : local.storage_;
+    if (!storage) storage = std::make_unique<SelectionScratch::Storage>();
+    auto& [pool, nodes, leaves, queue, splits, children, child_decisions, prerequisites, capacity] = *storage;
+    using Candidate = SelectionScratch::Storage::Candidate;
+    nodes.clear();
+    leaves.clear();
+    queue.clear();
+    if (capacity < view.max_patches) {
+        nodes.reserve(view.max_patches * 4);
+        leaves.reserve(view.max_patches * 2);
+        queue.reserve(view.max_patches * 4);
+        capacity = view.max_patches;
+    }
     splits.reserve(64);
     children.reserve(256);
     prerequisites.reserve(256);
+    Selection result;
     auto evaluate = [&](TileId tile, Candidate& candidate) {
         ++result.visited;
         auto description = source.describe(tile, view.polar_ratio, view.height_amplitude);
         auto bound = description.bounds;
-        if (!visibility.visible(bound)) return false;
-        double error = description.geometric_error * (view.orthographic_pixels > 0.0 ?
-            view.orthographic_pixels : view.focal_pixels / bound.distance(view.eye));
+        bool seen = visibility.visible(bound);
+        double error = seen ? description.geometric_error * (view.orthographic_pixels > 0.0 ?
+            view.orthographic_pixels : view.focal_pixels / bound.distance(view.eye)) : 0;
+        if (capture) {
+            if (retained->decisions.size() == decision_limit) capture = false;
+            else retained->decisions.push_back({description, seen, error > view.target_error_pixels});
+        }
+        if (!seen) return false;
         candidate = {tile, error};
         return true;
     };
-    auto add = [&](Candidate candidate) {
+    auto add = [&](Candidate candidate, uint32_t decision) {
         leaves.emplace(candidate.tile.key(), nodes.size());
-        queue.push({candidate.error, nodes.size()});
-        nodes.push_back({candidate});
+        queue.push_back({candidate.error, nodes.size()});
+        std::push_heap(queue.begin(), queue.end());
+        nodes.push_back({candidate, true, false, decision});
     };
     for (uint32_t face = 0; face < 6; ++face) {
         Candidate candidate;
@@ -262,7 +388,8 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
                 if (availability.request) availability.request({face});
                 result.loading_limited = true;
             }
-            add(candidate);
+            add(candidate, capture ? uint32_t(retained->decisions.size()-1) : UINT32_MAX);
+            if (capture) ++retained->budget_bound;
             if (availability.ready || availability.request) result.required_tiles.push_back({face});
         }
     }
@@ -276,23 +403,31 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
             if (other >= 0) self(self, size_t(other));
         }
         splits.push_back(index);
+        uint8_t visible_children = 0;
         for (uint32_t y = 0; y < 2; ++y) {
             for (uint32_t x = 0; x < 2; ++x) {
                 Candidate candidate;
                 TileId child{tile.face, tile.level + 1, tile.x * 2 + x, tile.y * 2 + y};
                 if (availability.ready || availability.request) prerequisites.push_back(child);
-                if (evaluate(child, candidate)) children.push_back(candidate);
+                if (evaluate(child, candidate)) {
+                    ++visible_children;
+                    children.push_back(candidate);
+                    child_decisions.push_back(capture ? uint32_t(retained->decisions.size()-1) : UINT32_MAX);
+                }
             }
         }
+        if (capture) retained->decisions[nodes[index].decision].children = visible_children;
     };
     while (!queue.empty()) {
-        auto request = queue.top();
-        queue.pop();
+        std::pop_heap(queue.begin(), queue.end());
+        auto request = queue.back();
+        queue.pop_back();
         if (!nodes[request.index].active) continue;
         auto tile = nodes[request.index].candidate.tile;
         if (request.error <= view.target_error_pixels || tile.level >= view.max_level) continue;
         splits.clear();
         children.clear();
+        child_decisions.clear();
         prerequisites.clear();
         schedule(schedule, request.index);
         if (leaves.size() - splits.size() + children.size() > view.max_patches) {
@@ -316,14 +451,16 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
         if (!availability.ready && availability.request) for (auto child : prerequisites) availability.request(child);
         result.required_tiles.insert(result.required_tiles.end(), prerequisites.begin(), prerequisites.end());
         for (size_t index : splits) {
+            if (capture) retained->budget_bound += std::max(1u, uint32_t(retained->decisions[nodes[index].decision].children))-1;
             nodes[index].active = false;
             leaves.erase(nodes[index].candidate.tile.key());
         }
-        for (auto candidate : children) add(candidate);
+        for (size_t index = 0; index < children.size(); ++index) add(children[index], child_decisions[index]);
     }
     result.patches.reserve(leaves.size());
     for (const auto& node : nodes) {
         if (!node.active) continue;
+        if (capture) retained->decisions[node.decision].selected = true;
         result.max_error_pixels = std::max(result.max_error_pixels, node.candidate.error);
         Patch patch{node.candidate.tile};
         for (uint32_t edge = 0; edge < 4; ++edge) {
@@ -335,6 +472,10 @@ Selection select(const SelectionView& input, const TerrainSource& source, const 
         return a.tile.key() < b.tile.key();
     });
     for (const auto& patch : result.patches) result.deepest_level = std::max(result.deepest_level, patch.tile.level);
+    if (retained) {
+        retained->valid = capture && !result.budget_limited && !result.loading_limited && retained->budget_bound <= view.max_patches;
+        retained->limited = result.budget_limited || result.visited > decision_limit;
+    }
     return result;
 }
 

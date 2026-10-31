@@ -6,6 +6,12 @@ Rings and orbit lines use a shared per-pixel linked-list A-buffer. Opaque sphere
 
 ## Atmospheric transport
 
+When bloom is enabled, an optional resolve output excludes orbit guides from
+the physical-light image while retaining normal presentation and transport.
+Guide records use the sign bit of packed alpha as a marker; decoded opacity
+remains positive, transport preserves the marker, and sorting ignores it.
+See `bloom.md`.
+
 Atmospheric extinction remains RGB, including on GPUs using hardware dual-source blending. For a surface at distance d, let P be premultiplied surface radiance, alpha its opacity, T(d) the RGB transmission from the camera to the surface, and S(d) the atmospheric scattered radiance over that same interval. Before surface blending, transform its stored color to:
 
 `P_camera = T(d) * P + alpha * S(d)`
@@ -20,11 +26,21 @@ The compute atmosphere path transforms stored fragments in the same dispatch as 
 
 ## Bounds and lifetime
 
-Fragment allocation targets two fragments per viewport pixel, capped at 128 MiB of records and the device storage-buffer range. The separate head image uses four bytes per pixel. Steady allocation is approximately 71.2 MiB at 1920x1080 and 159.6 MiB at 3840x2160. Allocation is lazy, retained at its high-water mark, and skipped when neither rings nor a multi-body orbit pass is enabled. Resized images and grown buffers retire after GPU completion; normal frames introduce no queue wait.
+Fragment allocation targets two fragments per viewport pixel, capped at 128 MiB of records and the device storage-buffer range. The separate head image uses four bytes per pixel. Steady allocation is approximately 71.2 MiB at 1920x1080 and 159.6 MiB at 3840x2160. Allocation is lazy, retained at its high-water mark, and skipped when no visible clouds, rings or multi-body orbit pass require it. Resized images and grown buffers retire after GPU completion; normal frames introduce no queue wait.
+
+Visible cumulus also enables capture when rings and orbit lines are disabled.
+Clouds append their integrated premultiplied radiance, opacity and
+opacity-weighted mean ray distance during their single colour march. Their
+enclosing mesh is only a ray proxy, so clouds use analytically reconstructed
+entry depth instead of early testing that mesh's far-side depth. The existing
+opaque-depth checks in atmospheric composition and resolve filter the captured
+layer. Ordinary cloud rendering no longer needs a second density march or
+opaque cloud depth writes. Hardware without fragment atomics and the legacy
+reference mode retain a cheap map-only depth estimate.
 
 When the global record budget is exhausted, excess fragments use ordinary draw-order blending into the background. They remain visible, but ordering and their atmospheric endpoint are approximate in this overload condition. A GPU overflow counter, asynchronously copied to frame-owned host buffers, exposes this condition through `TransparencyRenderer::stats`; the renderer logs when overflow begins. Hardware without fragment storage atomics uses the legacy renderer and logs that fallback. `RenderSettings::transparency_reference_legacy` exists for controlled comparisons. Existing batched terrain/ring raster microbenchmarks explicitly use this legacy raster path; their timings omit the new resolve. The transparency benchmark measures the complete new path.
 
-The current transport still treats overlapping atmospheres as independently composed columns. Physically overlapping participating media require combined extinction/source evaluation. Future volumetric clouds must use that combined-medium model; a single cloud surface or shell would not represent embedded rings/lines correctly. This change addresses camera visibility, not new atmosphere/ring/cloud sunlight shadowing.
+The current transport still treats overlapping atmospheres as independently composed columns. Physically overlapping participating media require combined extinction/source evaluation. Cumulus currently approximates an integrated column as one weighted transparent layer: this improves atmospheric endpoints without a duplicate march, but does not exactly represent rings/lines embedded within the cloud volume or overlapping media. Those cases still require combined-medium transport. Cloud ground shadows remain disabled.
 
 ## Verification
 

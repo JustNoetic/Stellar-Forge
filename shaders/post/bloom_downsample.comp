@@ -1,0 +1,20 @@
+#version 460
+#include "common/bloom.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D destination;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(destination)))) return;
+    vec2 texel = 1.0/vec2(textureSize(source, 0));
+    vec2 center = (vec2(pixel)*2.0+1.0)*texel;
+    vec3 value = vec3(0.0);
+    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        float weight = float((x == 0 ? 2 : 1)*(y == 0 ? 2 : 1))/32.0;
+        value += bloom_sample(source, center+2.0*vec2(x, y)*texel)*weight;
+    }
+    for (int y = -1; y <= 1; y += 2) for (int x = -1; x <= 1; x += 2)
+        value += bloom_sample(source, center+vec2(x, y)*texel)*0.125;
+    imageStore(destination, pixel, vec4(min(value, vec3(65000.0)), 1.0));
+}

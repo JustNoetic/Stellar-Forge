@@ -148,6 +148,17 @@ void SurfaceTextures::init(rhi::VkContext& ctx, bool normals) {
     words_.resize(COLOR_BODIES*4);
 }
 
+void SurfaceTextures::set_color_source(std::string body, std::shared_ptr<const SurfaceSource> source) {
+    if (body.empty() && !source) { set_sources({}); return; }
+    auto bindings = sources_;
+    auto found = std::find_if(bindings.begin(), bindings.end(), [&](const auto& binding) { return binding.body == body; });
+    if (found != bindings.end() && source && found->source->domain == source->domain) return;
+    if (found == bindings.end() && !source) return;
+    std::erase_if(bindings, [&](const auto& binding) { return binding.body == body; });
+    if (source) bindings.push_back({std::move(body), std::move(source)});
+    set_sources(std::move(bindings));
+}
+
 void SurfaceTextures::set_height_source(std::string body, std::shared_ptr<const HeightSource> source) {
     if (body.empty() && !source) { set_sources({}); return; }
     auto bindings = sources_;
@@ -157,6 +168,13 @@ void SurfaceTextures::set_height_source(std::string body, std::shared_ptr<const 
     std::erase_if(bindings, [&](const auto& binding) { return binding.body == body; });
     if (source) bindings.push_back({std::move(body), std::make_shared<NormalSource>(std::move(source))});
     set_sources(std::move(bindings));
+}
+
+std::shared_ptr<const SurfaceSource> SurfaceTextures::color_source(std::string_view body) const noexcept {
+    for (const auto& binding : sources_) {
+        if (binding.body == body) return binding.source;
+    }
+    return nullptr;
 }
 
 void SurfaceTextures::shutdown(rhi::VkContext& ctx) {
@@ -200,9 +218,11 @@ std::vector<std::pair<std::string, std::filesystem::path>> SurfaceTextures::load
     uint32_t missing = 0;
     for (const auto& entry : j->at("bodies")) {
         std::string body = entry.at("body");
-        auto albedo = paths::external_path(entry.at("albedo").get<std::string>());
-        if (std::filesystem::exists(albedo/"manifest.json")) bindings.push_back({body, ColorSource::open(albedo)});
-        else ++missing;
+        if (entry.contains("albedo")) {
+            auto albedo = paths::external_path(entry.at("albedo").get<std::string>());
+            if (std::filesystem::exists(albedo/"manifest.json")) bindings.push_back({body, ColorSource::open(albedo)});
+            else ++missing;
+        }
         if (entry.contains("height")) {
             auto height = paths::external_path(entry.at("height").get<std::string>());
             if (std::filesystem::exists(height/"manifest.json")) heights.emplace_back(body, height);
@@ -318,7 +338,7 @@ void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                 view.max_patches = std::max(6u, std::min(normals_ ? remaining/2 : remaining, 256u));
                 auto& entry = selections_[s];
                 if (!entry.valid || !(entry.view == view)) {
-                    entry.selection = select(view, TextureError{});
+                    entry.selection = select(view, TextureError{}, {}, &selection_scratch_);
                     entry.view = view;
                     entry.valid = true;
                     ++stats_.selection_rebuilds;

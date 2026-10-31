@@ -14,6 +14,7 @@ layout(location = 3) out float f_subpixel_factor;
 layout(location = 4) flat out uint f_body_idx;
 layout(location = 7) out vec3 f_base_chord;
 layout(location = 8) out vec3 f_apparent_pos;
+layout(location = 9) out vec3 f_body_offset;
 
 void main() {
     uint idx = gl_InstanceIndex;
@@ -36,6 +37,7 @@ void main() {
         f_local_pos = vec3(0.0);
         f_normal = vec3(0.0, 1.0, 0.0);
         f_apparent_pos = vec3(0.0);
+        f_body_offset = vec3(0.0);
         return;
     }
 
@@ -46,10 +48,12 @@ void main() {
     vec3 scaled_pos = rotation*(in_position*scale);
     vec3 adj_norm = rotation*normalize(in_normal/scale);
 
-    vec3 world_pos = center + scaled_pos * radius;
+    vec3 offset = scaled_pos * radius;
+    vec3 world_pos = center + offset;
     f_world_pos = world_pos;
+    f_body_offset = offset;
     f_normal = adj_norm;
     vec3 apparent = refract_position(world_pos);
     f_apparent_pos = apparent;
-    gl_Position = u_scene.view_proj * vec4(apparent, 1.0);
+    gl_Position = u_scene.projection * vec4(b.view_center.xyz + mat3(u_scene.view) * (offset + apparent - world_pos), 1.0);
 }

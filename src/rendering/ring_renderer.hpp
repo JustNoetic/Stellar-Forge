@@ -90,7 +90,7 @@ private:
         double max_r_ratio = 2.5;
         std::vector<uint32_t> segment_rows;
         std::vector<RingDrawRange> draw_ranges;
-        std::array<AtmosphereRingMaterial, 2> atmosphere_materials{};
+        std::vector<AtmosphereRingMaterial> atmosphere_materials;
         mutable PlanetshineGPU atmosphere_sources{};
         mutable std::array<glm::vec4, 16> atmosphere_stars{}, atmosphere_weights{};
         mutable bool atmosphere_valid = false;

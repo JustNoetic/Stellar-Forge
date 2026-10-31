@@ -487,7 +487,7 @@ void RingRenderer::bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx,
     uint32_t f_idx = ctx.frame_index();
     auto& atlas = ringshine_atlases_[f_idx];
     ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     rhi::RenderingAttachment att = rhi::RenderingAttachment::load_color(atlas);
     ctx.begin_rendering(cmd, VkExtent2D{RINGSHINE_TILE_WIDTH * 16, RINGSHINE_TILE_HEIGHT * MAX_RING_HOSTS}, {&att, 1}, nullptr);
@@ -513,7 +513,7 @@ void RingRenderer::bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx,
 
     ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     ringshine_cache_[f_idx][{job.host_idx, job.star_col}] = job.key;
     ringshine_bakes_++;
 }
@@ -580,10 +580,13 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
             std::max(0.0, body.height_range_km.y)*KM_TO_AU;
         glm::dvec3 to_body = center-eye;
         double depth = glm::dot(to_body, cam.forward_dir());
-        if (depth+radius <= 0.0 ||
+        double air = body.atmosphere.enabled
+            ? (body_view.render.atmosphere ? body_view.render.atmosphere->height_km : body.atmosphere.height_km)*KM_TO_AU : 0.0;
+        bool inside_air = air > 0.0 && glm::length(to_body) < body.radius_au()+air;
+        if (!inside_air && (depth+radius <= 0.0 ||
             std::abs(glm::dot(to_body, cam.right_dir())) > depth*tan_x+radius*std::sqrt(1.0+tan_x*tan_x) ||
-            std::abs(glm::dot(to_body, cam.up_dir())) > depth*tan_y+radius*std::sqrt(1.0+tan_y*tan_y)) continue;
-        if (depth > radius && radius/(depth-radius)*focal <= 1.5) continue;
+            std::abs(glm::dot(to_body, cam.up_dir())) > depth*tan_y+radius*std::sqrt(1.0+tan_y*tan_y))) continue;
+        if (!inside_air && depth > radius && radius/(depth-radius)*focal <= 1.5) continue;
         glm::dvec3 pole = glm::length(sys.body(bi).render.pole) > 1e-9
             ? glm::normalize(sys.body(bi).render.pole) : glm::dvec3(0.0, 1.0, 0.0);
         const auto& mapping = host_mappings_[h];
@@ -650,8 +653,9 @@ PlanetshineGPU RingRenderer::atmosphere_sources(const ephemeris::SystemSnapshot&
     for (uint32_t i = 0; i < count; ++i)
         dirty |= glm::any(glm::greaterThan(glm::abs(weights[i]-host.atmosphere_weights[i]),glm::vec4(2e-6f)));
     if (dirty) {
-        glm::dvec3 faces[2]{};
-        double full_area = PI*(host.max_r_ratio*host.max_r_ratio-host.min_r_ratio*host.min_r_ratio);
+        const auto& bins = host.atmosphere_materials;
+        std::vector<glm::dvec3> flux(bins.size()*2);
+        double eta = 1/std::pow(std::max(1-body.definition.oblateness,.05),2);
         for (uint32_t s = 0; s < count; ++s) {
             glm::vec4 offsets, fractions;
             int samples = ringshine_source_samples(stars[s].x,stars[s].y,offsets,fractions);
@@ -662,12 +666,12 @@ PlanetshineGPU RingRenderer::atmosphere_sources(const ephemeris::SystemSnapshot&
                 double sun = std::clamp(double(stars[s].x)+double(offsets[q]*stars[s].y),-1.0,1.0);
                 if (std::abs(sun) < 1e-8) continue;
                 double horizontal = std::sqrt(std::max(1-sun*sun,0.0));
-                for (const auto& material : host.atmosphere_materials) {
+                for (size_t bin = 0; bin < bins.size(); ++bin) {
+                    const auto& material = bins[bin];
                     if (material.radius_area_tau.z <= 0) continue;
                     double radius = material.radius_area_tau.x;
-                    double eta = 1/std::pow(std::max(1-body.definition.oblateness,.05),2);
                     double shadow = horizontal > 1e-8 ? std::acos(std::clamp(std::sqrt((1-1/(radius*radius))*(horizontal*horizontal+sun*sun*eta))/horizontal,0.0,1.0)) : 0;
-                    double area = double(material.radius_area_tau.y)/full_area*(1-shadow/PI)*fractions[q];
+                    double area = double(material.radius_area_tau.y)*(1-shadow/PI)*fractions[q];
                     double mv = .5/std::sqrt(radius*radius+.25);
                     for (int side = 0; side < 2; ++side) for (int angular = 0; angular < 4; ++angular) {
                         double sign = side == 0 ? 1 : -1;
@@ -675,24 +679,24 @@ PlanetshineGPU RingRenderer::atmosphere_sources(const ephemeris::SystemSnapshot&
                         double phase = (radius*horizontal*std::cos(angle)-.5*sign*sun)/std::sqrt(radius*radius+.25);
                         auto response = ring_radiance_rgb(material.radius_area_tau.z,float(mv),float(sun),float(phase),
                             material.properties,glm::vec3(material.color_textured),material.color_textured.w > .5f,sign*sun >= 0);
-                        faces[side] += glm::dvec3(response)*glm::dvec3(weights[s])*(area*.25/PI);
+                        flux[2*bin+side] += glm::dvec3(response)*glm::dvec3(weights[s])*(area*.25/PI);
                     }
                 }
             }
         }
-        glm::dvec3 sum = faces[0]+faces[1];
-        uint32_t packed = 0;
-        for (int c = 0; c < 3; ++c) {
-            double contrast = sum[c] > 0 ? (faces[0][c]-faces[1][c])/sum[c] : 0;
-            packed |= uint32_t(std::lround(std::clamp(contrast,-1.0,1.0)*127)+127) << (c*8);
-        }
+        glm::dvec3 sum(0);
+        double area = 0;
+        for (size_t bin = 0; bin < bins.size(); ++bin) { sum += flux[2*bin]+flux[2*bin+1]; area += 2*bins[bin].radius_area_tau.y; }
         host.atmosphere_sources = {};
-        host.atmosphere_sources.irradiance[0] = {glm::vec3(sum*.5),float(packed)};
+        if (glm::any(glm::greaterThan(sum,glm::dvec3(0)))) {
+            auto response = glm::max(glm::vec3(sum/area),glm::vec3(1e-30f));
+            host.atmosphere_sources.direction[0] = {response,-1.0f-float(found-host_mappings_.begin())};
+            host.atmosphere_sources.irradiance[0] = {response,0.0f};
+        }
         host.atmosphere_stars = stars; host.atmosphere_weights = weights; host.atmosphere_valid = true;
         ++atmosphere_source_bakes_;
     }
     result = host.atmosphere_sources;
-    result.direction[0] = {glm::vec3(pole)*float(host.max_r_ratio),-float(host.min_r_ratio)};
     result.irradiance[0] = {glm::vec3(result.irradiance[0])*total,result.irradiance[0].w};
     return result;
 }

@@ -19,7 +19,7 @@ inline constexpr uint32_t MAX_RING_HOSTS = 16;
 inline constexpr uint32_t MAX_RING_SEGMENTS = 8;
 inline constexpr uint32_t RING_ANGULAR_SEGMENTS = 128;
 inline constexpr uint32_t RING_RADIAL_SUBDIVISIONS = 32;
-inline constexpr uint32_t RINGSHINE_TILE_WIDTH = 128;
+inline constexpr uint32_t RINGSHINE_TILE_WIDTH = 65;
 inline constexpr uint32_t RINGSHINE_TILE_HEIGHT = 65;
 inline constexpr float RING_MAX_ALPHA = 0.99999994f;
 
@@ -86,7 +86,7 @@ struct AtmosphereRingMaterial {
     glm::vec4 properties{};
 };
 
-std::array<AtmosphereRingMaterial, 2> atmosphere_ring_materials(
+std::vector<AtmosphereRingMaterial> atmosphere_ring_materials(
     std::span<const ephemeris::RingLayerDefinition> layers,
     std::span<const std::vector<glm::vec4>> profiles);
 
