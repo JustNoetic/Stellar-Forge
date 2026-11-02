@@ -141,17 +141,23 @@ Shaded in `celestial/sphere.frag` (spheres and terrain).
   fragment intersects the exact oblate shell at `base + thickness/2`; no terrain
   tessellation, displaced vertices, volume noise or ray marching is needed.
   Manual and automatically prepared bases work in both modes.
-- One filtered coverage lookup per visible shell crossing uses the existing R8
+- One filtered coverage lookup per fragment uses the existing R8
   atlas, longitude wrap, polar clamping, wind and projected-footprint mip LOD.
   Coverage supplies opacity; `density × extinction_per_km × thickness_km`
   controls optical thickness. Slant paths increase opacity toward the limb.
-- Front and back crossings are captured separately when visible, with the
-  opaque planet rejecting the hidden back side. Lighting uses attenuated starlight
+- One side only: from above the shell the ray's entry crossing (the top
+  surface), from inside/below it the exit crossing (the underside); the choice
+  switches as the camera passes through the shell altitude. The far side seen
+  past the limb from above is not drawn (it lies behind long, dense atmospheric
+  paths and is normally invisible). Shading a single crossing cut the fragment
+  shader from 80 to 56 registers, removed a local-memory spill and reduced the
+  cloud draw by about 30% (0.22 → 0.15 ms full-disc 1080p, RTX 4060 Ti);
+  captures are unchanged except at the limb. Lighting uses attenuated starlight
   and sky irradiance from the existing surface-atmosphere lookup at cloud height;
   cloud undersides have reduced direct illumination. The sky contribution is
   `0.5 × sky_irradiance` on both sides. It requires atmospheric surface lighting;
   Direct sunlight only suppresses it with the other indirect-light terms.
-- Each crossing enters the existing transparency list at its exact depth. The
+- The crossing enters the existing transparency list at its exact depth. The
   atmosphere compositor applies `T * premultiplied_color + alpha * scattering`
   using the same aerial LUT as the surface, then resolves depth-sorted layers.
   There is no additional aerial LUT or atmospheric integration pass.

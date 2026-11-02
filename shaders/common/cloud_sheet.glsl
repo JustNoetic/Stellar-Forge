@@ -64,33 +64,21 @@ void render_cloud_sheet() {
         if (anchor_distance+ground.x > 0.0) ground_offset = ground.x;
         else if (anchor_distance+ground.y > 0.0 && dot(camera, camera) < pow(f.cloud_motion.w/FLUID_AU_KM, 2.0)) discard;
     }
-    mat3 rotation = body_surface_rotation(pole, b.spin_flags.x);
-    vec4 combined = vec4(0.0);
-    float nearest_depth = 0.0;
-    for (int i = 1; i >= 0; --i) {
-        float distance = anchor_distance+roots[i];
-        if (distance <= 1e-12 || roots[i] >= ground_offset || (i == 0 && roots.y-roots.x < 1e-12)) continue;
-        vec3 local = f_body_offset+ray*roots[i];
-        vec4 color = cloud_sheet_color(f_body_idx, ray, local, distance, pole, flattening, rotation);
-        if (color.a < 1e-3) continue;
-        float depth = cloud_sheet_depth(b, local);
+    float hit = anchor_distance+roots.x > 1e-12 ? roots.x : roots.y;
+    float distance = anchor_distance+hit;
+    if (distance <= 1e-12 || hit >= ground_offset) discard;
+    vec3 local = f_body_offset+ray*hit;
+    vec4 color = cloud_sheet_color(f_body_idx, ray, local, distance, pole, flattening, body_surface_rotation(pole, b.spin_flags.x));
+    if (color.a < 1e-3) discard;
+    float depth = cloud_sheet_depth(b, local);
+    gl_FragDepth = depth;
 #ifdef TRANSPARENCY_CAPTURE
-        if (capture_transparency(color, depth)) color = vec4(0.0);
-#endif
-        combined = color+(1.0-color.a)*combined;
-        nearest_depth = depth;
-    }
-#ifdef TRANSPARENCY_CAPTURE
-    gl_FragDepth = nearest_depth;
-    out_color = combined;
-#else
-    if (combined.a < 1e-3) discard;
-    gl_FragDepth = nearest_depth;
-#ifdef CLOUD_DEPTH_ONLY
-    if (combined.a < 0.999) discard;
+    if (capture_transparency(color, depth)) color = vec4(0.0);
+    out_color = color;
+#elif defined(CLOUD_DEPTH_ONLY)
+    if (color.a < 0.999) discard;
     out_color = vec4(0.0);
 #else
-    out_color = combined;
-#endif
+    out_color = color;
 #endif
 }
