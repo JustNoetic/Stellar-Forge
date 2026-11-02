@@ -4,6 +4,7 @@
 #include "rendering/render_settings.hpp"
 #include "rendering/planetshine.hpp"
 #include "rendering/cloud_maps.hpp"
+#include "rendering/ocean_waves.hpp"
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
 #include "rendering/refraction_renderer.hpp"
@@ -40,13 +41,6 @@ struct alignas(16) BodyInstanceGPU {
     glm::vec4 view_center{0.0f};
 };
 
-inline constexpr uint32_t OCEAN_WAVE_COUNT = 16;
-
-struct alignas(16) OceanWaveGPU {
-    glm::vec4 direction_k{0.0f};
-    glm::vec4 phases{0.0f};
-};
-
 struct alignas(16) SurfaceFluidGPU {
     glm::vec4 ocean_deep{0.0f};
     glm::vec4 ocean_shallow{0.0f};
@@ -61,7 +55,7 @@ struct alignas(16) SurfaceFluidGPU {
 struct alignas(16) SurfaceFluidHeaderGPU {
     glm::uvec4 flags{0u, 0u, 0u, UINT32_MAX};
     glm::vec4 header{0.0f};
-    OceanWaveGPU waves[OCEAN_WAVE_COUNT]{};
+    OceanCascadesGPU ocean{};
 };
 
 struct alignas(16) SceneCelestialUBO {
@@ -160,6 +154,8 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> fluid_ssbos_{};
     std::vector<uint32_t> cloud_bodies_;
     CloudMaps cloud_maps_;
+    OceanWaves ocean_;
+    int ocean_focus_ = -1;
     rhi::Pipeline point_pipeline_{}, atmosphere_point_pipeline_{};
     bool atmosphere_points_ready_ = false;
     terrain::TerrainRenderer terrain_;

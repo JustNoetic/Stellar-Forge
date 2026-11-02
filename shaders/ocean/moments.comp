@@ -1,0 +1,14 @@
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba32f, set = 0, binding = 1) uniform readonly image2DArray field;
+layout(rgba16f, set = 0, binding = 2) uniform writeonly image2DArray moments;
+layout(push_constant) uniform Moments { float choppiness; } m;
+
+void main() {
+    ivec3 texel = ivec3(gl_GlobalInvocationID);
+    vec4 v = imageLoad(field, texel);
+    vec2 slope = v.xy/max(vec2(1.0)-m.choppiness*v.zw, vec2(0.25));
+    float jacobian = -m.choppiness*(v.z+v.w);
+    imageStore(moments, ivec3(texel.xy, 2*texel.z), vec4(slope, slope*slope));
+    imageStore(moments, ivec3(texel.xy, 2*texel.z+1), vec4(jacobian, jacobian*jacobian, slope.x*slope.y, 0.0));
+}

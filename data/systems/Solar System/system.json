@@ -158,7 +158,7 @@
     "oblateness": 0.0,
     "omega": 29.124,
     "parentId": "Sun",
-    "pole_dec": 61.45000000000006,
+    "pole_dec": 61.45000000000011,
     "pole_ra": 281.01,
     "r": 0.0035,
     "rotation_period": 1407.6,
@@ -379,8 +379,8 @@
     "color_pole": "#2c6cff",
     "e": 0.016708,
     "height_range_km": [
-      -8.0,
-      6.4
+      -10.0,
+      8.0
     ],
     "inc": 5e-05,
     "j4": -1.6e-06,

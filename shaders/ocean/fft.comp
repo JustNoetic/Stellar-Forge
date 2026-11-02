@@ -1,0 +1,37 @@
+#version 460
+layout(local_size_x = 128) in;
+layout(rgba32f, set = 0, binding = 1) uniform image2DArray field;
+layout(push_constant) uniform Fft { uint vertical; } fft;
+
+const uint N = 256u;
+const uint LOG_N = 8u;
+const float PI = 3.141592653589793;
+shared vec4 values[N];
+
+vec2 complex_multiply(vec2 a, vec2 b) {
+    return vec2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x);
+}
+
+ivec3 location(uint i) {
+    return fft.vertical != 0u ? ivec3(gl_WorkGroupID.x, i, gl_WorkGroupID.z) : ivec3(i, gl_WorkGroupID.x, gl_WorkGroupID.z);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    for (uint i = t; i < N; i += gl_WorkGroupSize.x)
+        values[bitfieldReverse(i) >> (32u-LOG_N)] = imageLoad(field, location(i));
+    barrier();
+    for (uint span = 1u; span < N; span <<= 1u) {
+        uint j = t%span;
+        uint i0 = (t/span)*2u*span+j, i1 = i0+span;
+        float angle = PI*float(j)/float(span);
+        vec2 w = vec2(cos(angle), sin(angle));
+        vec4 a = values[i0], b = values[i1];
+        b = vec4(complex_multiply(b.xy, w), complex_multiply(b.zw, w));
+        values[i0] = a+b;
+        values[i1] = a-b;
+        barrier();
+    }
+    for (uint i = t; i < N; i += gl_WorkGroupSize.x)
+        imageStore(field, location(i), values[i]);
+}

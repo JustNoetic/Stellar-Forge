@@ -1,4 +1,5 @@
 #version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #include "common/bloom.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D source;
@@ -8,6 +9,7 @@ layout(push_constant) uniform Extract { vec2 direction; float highlight_limit; f
 
 const int APRON = 20;
 shared vec4 light[APRON][APRON];
+shared vec3 rows[APRON][4];
 shared vec4 energy[64];
 shared vec4 moments[64];
 shared float cross_moments[64];
@@ -43,19 +45,21 @@ void main() {
             tile_cross += weight*position.x*position.y;
         }
     }
-    energy[index] = tile_energy;
-    moments[index] = tile_moments;
-    cross_moments[index] = tile_cross;
-    barrier();
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
-        if (index < stride) {
-            energy[index] += energy[index+stride];
-            moments[index] += moments[index+stride];
-            cross_moments[index] += cross_moments[index+stride];
-        }
-        barrier();
+    tile_energy = subgroupAdd(tile_energy);
+    tile_moments = subgroupAdd(tile_moments);
+    tile_cross = subgroupAdd(tile_cross);
+    if (subgroupElect()) {
+        energy[gl_SubgroupID] = tile_energy;
+        moments[gl_SubgroupID] = tile_moments;
+        cross_moments[gl_SubgroupID] = tile_cross;
     }
+    barrier();
     if (index == 0u) {
+        for (uint i = 1u; i < gl_NumSubgroups; ++i) {
+            energy[0] += energy[i];
+            moments[0] += moments[i];
+            cross_moments[0] += cross_moments[i];
+        }
         emitted = false;
         vec4 total = energy[0];
         if (total.w > 0.0) {
@@ -96,20 +100,24 @@ void main() {
         spikes[emitted_slot].profile[index] = vec4(sum.x/energy[0].w, sum.x > 0.0 ? sum.yz/sum.x : vec2(0.0), 0.0);
     }
     barrier();
-    for (uint i = index; i < uint(APRON*APRON); i += 64u) {
-        ivec2 texel = ivec2(i%uint(APRON), i/uint(APRON));
-        bool core = all(greaterThanEqual(texel, ivec2(2))) && all(lessThan(texel, ivec2(18)));
-        vec4 value = light[texel.y][texel.x];
-        light[texel.y][texel.x].rgb = value.rgb*(1.0-(core && !emitted ? 0.0 : value.a));
+    for (uint i = index; i < uint(APRON*4); i += 64u) {
+        int row = int(i/4u), column = int(i%4u)*4;
+        bool core_row = row >= 2 && row < 18;
+        vec3 sum = vec3(0.0);
+        for (int x = 0; x < 8; ++x) {
+            vec4 value = light[row][column+x];
+            bool core = core_row && column+x >= 2 && column+x < 18;
+            sum += value.rgb*((1.0-(core && !emitted ? 0.0 : value.a))*TENT[x]);
+        }
+        rows[row][i%4u] = sum;
     }
     barrier();
     if (index >= 16u) return;
     ivec2 local = ivec2(index%4u, index/4u);
     ivec2 pixel = ivec2(gl_WorkGroupID.xy)*4+local;
     if (any(greaterThanEqual(pixel, imageSize(destination)))) return;
-    ivec2 base = local*4;
     vec3 value = vec3(0.0);
-    for (int y = 0; y < 8; ++y) for (int x = 0; x < 8; ++x)
-        value += light[base.y+y][base.x+x].rgb*(TENT[x]*TENT[y]/400.0);
+    for (int y = 0; y < 8; ++y)
+        value += rows[local.y*4+y][local.x]*(TENT[y]/400.0);
     imageStore(destination, pixel, vec4(min(value, vec3(65000.0)), 1.0));
 }

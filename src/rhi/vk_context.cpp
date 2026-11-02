@@ -801,6 +801,41 @@ void VkContext::transition_image_range(VkCommandBuffer cmd, const Image& image, 
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
+void VkContext::build_mip_chain(VkCommandBuffer cmd, Image& source, Image& destination,
+                                VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                                VkPipelineStageFlags2 dst_stage) {
+    transition_image(cmd, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src_stage, src_access,
+                     VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkImageSubresourceRange all{destination.aspect, 0, destination.mip_levels, 0, destination.layers};
+    transition_image_range(cmd, destination, all, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    for (uint32_t level = 0; level < destination.mip_levels; ++level) {
+        const Image& from = level == 0 ? source : destination;
+        uint32_t from_level = level == 0 ? 0 : level - 1;
+        VkImageBlit2 region{VK_STRUCTURE_TYPE_IMAGE_BLIT_2};
+        region.srcSubresource = {destination.aspect, from_level, 0, destination.layers};
+        region.srcOffsets[1] = {int32_t(std::max(from.extent.width >> from_level, 1u)), int32_t(std::max(from.extent.height >> from_level, 1u)), 1};
+        region.dstSubresource = {destination.aspect, level, 0, destination.layers};
+        region.dstOffsets[1] = {int32_t(std::max(destination.extent.width >> level, 1u)), int32_t(std::max(destination.extent.height >> level, 1u)), 1};
+        VkBlitImageInfo2 blit{VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2};
+        blit.srcImage = from.handle;
+        blit.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        blit.dstImage = destination.handle;
+        blit.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        blit.regionCount = 1;
+        blit.pRegions = &region;
+        blit.filter = VK_FILTER_LINEAR;
+        vkCmdBlitImage2(cmd, &blit);
+        transition_image_range(cmd, destination, {destination.aspect, level, 1, 0, destination.layers},
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
+    transition_image_range(cmd, destination, all, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_BLIT_BIT, 0, dst_stage, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    destination.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
 void VkContext::transition_image(VkCommandBuffer cmd, Image& image, VkImageLayout new_layout,
                                  VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                                  VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {

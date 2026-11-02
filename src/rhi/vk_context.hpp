@@ -86,6 +86,10 @@ public:
                                 VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                                 VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access);
 
+    void build_mip_chain(VkCommandBuffer cmd, Image& source, Image& destination,
+                         VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                         VkPipelineStageFlags2 dst_stage);
+
     void memory_barrier(VkCommandBuffer cmd,
                         VkPipelineStageFlags2 src_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                         VkAccessFlags2 src_access = VK_ACCESS_2_MEMORY_WRITE_BIT,

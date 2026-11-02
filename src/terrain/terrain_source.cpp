@@ -241,7 +241,11 @@ void HeightSource::retain_envelope(TileId tile, const HeightTile& payload) const
     bounds_revision_.fetch_add(1, std::memory_order_relaxed);
 }
 
-SurfaceTile HeightSource::describe(TileId tile, double polar, double) const {
+SurfaceTile HeightSource::describe(TileId tile, double polar, double amplitude) const {
+    return describe(tile, polar, amplitude, -std::numeric_limits<double>::infinity());
+}
+
+SurfaceTile HeightSource::describe(TileId tile, double polar, double, double floor_m) const {
     const auto& r = record(tile);
     double radius = info_.equatorial_radius_m;
     TileMetadata local{r.minimum_m / radius, r.maximum_m / radius, 0, 0};
@@ -332,6 +336,13 @@ SurfaceTile HeightSource::describe(TileId tile, double polar, double) const {
             local.minimum_height = (low - info_.encoding_error_m) / radius;
             local.maximum_height = (high + info_.encoding_error_m) / radius;
         }
+    }
+    if (std::isfinite(floor_m)) {
+        local.minimum_height = std::max(local.minimum_height, floor_m / radius);
+        local.maximum_height = std::max(local.maximum_height, floor_m / radius);
+        if (high <= floor_m) height_error = 0.0;
+        low = std::max(low, floor_m);
+        high = std::max(high, floor_m);
     }
     return {surface_bounds(tile, polar, 1.0, local), approximation_error_with_height(tile, stride, low, high, grad, height_error)};
 }

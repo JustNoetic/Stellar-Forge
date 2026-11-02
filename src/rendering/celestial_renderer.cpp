@@ -18,7 +18,7 @@ namespace sf::rendering {
 
 static_assert(sizeof(BodyInstanceGPU) == 288);
 static_assert(sizeof(SurfaceFluidGPU) == 128);
-static_assert(sizeof(SurfaceFluidHeaderGPU) == 32+OCEAN_WAVE_COUNT*32);
+static_assert(sizeof(SurfaceFluidHeaderGPU) == 32+sizeof(OceanCascadesGPU));
 static_assert(terrain::MAX_PATCHES >= MAX_CELESTIAL_BODIES*6);
 
 namespace {
@@ -41,35 +41,31 @@ double surface_gravity(const ephemeris::BodyDefinition& d) {
     return std::isfinite(g) && g > 0.05 ? g : 9.81;
 }
 
-void build_ocean_waves(SurfaceFluidHeaderGPU& header, glm::dvec3 camera_fixed_m, double wind_ms, double wind_direction_deg,
-                       double gravity, double seconds) {
-    glm::dvec3 up = glm::length(camera_fixed_m) > 1.0 ? glm::normalize(camera_fixed_m) : glm::dvec3(1.0, 0.0, 0.0);
-    glm::dvec3 east = glm::cross(glm::dvec3(0.0, 1.0, 0.0), up);
-    east = glm::length(east) > 1e-6 ? glm::normalize(east) : glm::dvec3(0.0, 0.0, 1.0);
-    glm::dvec3 north = glm::cross(up, east);
-    double wind = std::max(wind_ms, 0.5);
-    double peak_omega = 0.877 * gravity / wind;
-    double peak_wavelength = TWO_PI * gravity / (peak_omega * peak_omega);
-    double wavelength = std::clamp(1.5 * peak_wavelength, 1.0, 2000.0);
-    double variance = cox_munk_variance(wind_ms);
-    double steepness = std::sqrt(2.0 * variance / OCEAN_WAVE_COUNT);
-    double wind_angle = wind_direction_deg * DEG_TO_RAD;
-    for (uint32_t i = 0; i < OCEAN_WAVE_COUNT; ++i) {
-        double spread = (std::fmod(i * 0.6180339887498949, 1.0) * 2.0 - 1.0) * PI * (0.25 + 0.5 * i / double(OCEAN_WAVE_COUNT - 1));
-        double angle = wind_angle + spread;
-        glm::dvec3 direction = east * std::cos(angle) + north * std::sin(angle);
-        double k = TWO_PI / wavelength;
-        double omega = std::sqrt(gravity * k);
-        double offset = std::fmod(i * 2.399963229728653, TWO_PI);
-        double time_phase = std::fmod(offset - omega * seconds, TWO_PI);
-        double focus_phase = std::fmod(k * glm::dot(direction, camera_fixed_m) + time_phase, TWO_PI);
-        header.waves[i].direction_k = glm::vec4(glm::vec3(direction), static_cast<float>(k));
-        header.waves[i].phases = glm::vec4(static_cast<float>(focus_phase), static_cast<float>(time_phase),
-                                           static_cast<float>(steepness), static_cast<float>(wavelength));
-        wavelength *= 0.68;
+struct OceanFocus {
+    int body = -1;
+    double altitude_m = std::numeric_limits<double>::infinity();
+    glm::dvec3 camera_fixed_m{0.0};
+};
+
+OceanFocus find_ocean_focus(const Camera& cam, const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, uint32_t count) {
+    OceanFocus focus;
+    if (!settings.oceans_enabled) return focus;
+    double best = std::numeric_limits<double>::infinity();
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& b = sys.body(i);
+        const auto& d = b.definition;
+        if (d.is_star || d.is_black_hole || !d.ocean.enabled) continue;
+        glm::dvec3 camera_offset = -camera_relative(b.render.position, cam.eye_pos_render());
+        double distance = glm::length(camera_offset);
+        double altitude = distance / std::max(d.radius_au(), 1e-15) - 1.0;
+        if (altitude >= best) continue;
+        best = altitude;
+        glm::dvec3 pole = glm::length(b.render.pole) > 1e-4 ? glm::normalize(b.render.pole) : glm::dvec3(0.0, 1.0, 0.0);
+        focus.body = static_cast<int>(i);
+        focus.altitude_m = (distance - d.radius_au()) * AU_TO_KM * 1000.0 - d.ocean.sea_level_km * 1000.0;
+        focus.camera_fixed_m = glm::transpose(fluid_rotation(pole, b.render.spin_angle_rad)) * camera_offset * (AU_TO_KM * 1000.0);
     }
-    header.header.x = static_cast<float>(variance);
-    header.header.y = static_cast<float>(std::fmod(seconds, 1000.0));
+    return focus;
 }
 
 struct SphereVertex {
@@ -82,6 +78,7 @@ struct SphereVertex {
 void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     build_sphere_mesh(ctx, 64, 32);
     cloud_maps_.init(ctx);
+    ocean_.init(ctx);
     textures_.init(ctx);
     normals_.init(ctx, true);
     rings_.init(ctx);
@@ -120,6 +117,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     planetshine_maps_ = ctx.create_image_2d(PLANETSHINE_MAP_WIDTH, PLANETSHINE_MAP_HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -217,6 +215,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
 
 void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     cloud_maps_.shutdown(ctx);
+    ocean_.shutdown(ctx);
     eclipse_refraction_.shutdown(ctx);
     refraction_.shutdown(ctx);
     transparency_.shutdown(ctx);
@@ -339,6 +338,22 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
         (visible_clouds || (settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
     });
     measure("cpu_eclipse_refraction_prepare_ms", [&] { eclipse_refraction_.prepare(cmd, ctx, sys, settings); });
+    measure("cpu_ocean_prepare_ms", [&] {
+    auto focus = find_ocean_focus(cam, sys, settings, count);
+    ocean_focus_ = -1;
+    if (focus.body < 0 || focus.altitude_m > OCEAN_ACTIVE_ALTITUDE_M) {
+        ocean_.reset();
+        return;
+    }
+    const auto& body = sys.body(static_cast<uint32_t>(focus.body));
+    const auto& d = body.definition;
+    ocean_.track(body.revisions.identity, focus.camera_fixed_m);
+    uint32_t timer = ctx.begin_gpu_timer(cmd, "gpu_ocean_waves");
+    ocean_.update(cmd, ctx, {d.ocean.wind_speed_ms, d.ocean.wind_direction_deg * DEG_TO_RAD, surface_gravity(d)},
+                  sys.time().value * SECONDS_PER_YEAR);
+    ctx.end_gpu_timer(cmd, timer);
+    ocean_focus_ = focus.body;
+    });
 }
 
 void CelestialRenderer::bake_planetshine_maps(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
@@ -591,6 +606,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
         rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
         rhi::PushDescriptorWrite::sampled_image(31, planetshine_maps_, ctx.sampler_linear_repeat()),
+        rhi::PushDescriptorWrite::sampled_image(32, ocean_.moments(), ctx.sampler_linear_repeat()),
         eclipse_refraction_.write(ctx),
         refraction[0],
         refraction[1],
@@ -687,9 +703,6 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
     SurfaceFluidHeaderGPU header{};
     header.flags = {settings.oceans_enabled ? 1u : 0u, settings.clouds_enabled ? 1u : 0u, settings.cloud_mode, UINT32_MAX};
     double seconds = sys.time().value * SECONDS_PER_YEAR;
-    double best_altitude = std::numeric_limits<double>::infinity();
-    int focus = -1;
-    glm::dvec3 focus_camera_fixed{0.0};
     std::vector<std::pair<double, uint32_t>> clouds;
 
     for (uint32_t i = 0; i < count; ++i) {
@@ -707,14 +720,6 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
                 f.ocean_params = glm::vec4(static_cast<float>(d.ocean.wind_speed_ms),
                     static_cast<float>(cox_munk_variance(d.ocean.wind_speed_ms)),
                     static_cast<float>(radius_km + d.ocean.sea_level_km), static_cast<float>(radius_km));
-                double altitude = distance / std::max(d.radius_au(), 1e-15) - 1.0;
-                if (settings.oceans_enabled && altitude < best_altitude) {
-                    best_altitude = altitude;
-                    focus = static_cast<int>(i);
-                    glm::dvec3 pole = glm::length(b.render.pole) > 1e-4 ? glm::normalize(b.render.pole) : glm::dvec3(0.0, 1.0, 0.0);
-                    focus_camera_fixed = glm::transpose(fluid_rotation(pole, b.render.spin_angle_rad))
-                                       * camera_offset * (AU_TO_KM * 1000.0);
-                }
             }
             if (d.clouds.enabled) {
                 f.cloud_color = glm::vec4(d.clouds.color, 1.0f);
@@ -735,15 +740,13 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
         fluids[i] = f;
     }
 
-    double wind = 7.0, direction = 30.0, gravity = 9.81;
-    if (focus >= 0) {
-        const auto& d = sys.body(static_cast<uint32_t>(focus)).definition;
-        wind = d.ocean.wind_speed_ms;
-        direction = d.ocean.wind_direction_deg;
-        gravity = surface_gravity(d);
-        header.flags.w = static_cast<uint32_t>(focus);
+    if (ocean_focus_ >= 0 && static_cast<uint32_t>(ocean_focus_) < count) {
+        const auto& d = sys.body(static_cast<uint32_t>(ocean_focus_)).definition;
+        header.flags.w = static_cast<uint32_t>(ocean_focus_);
+        header.ocean = ocean_.cascades();
+        header.header.z = static_cast<float>(ocean_.residual_mean_square_slope(cox_munk_variance(d.ocean.wind_speed_ms)));
+        header.header.w = static_cast<float>(OCEAN_CHOPPINESS * OCEAN_CHOPPINESS * ocean_.mean_square_slope());
     }
-    build_ocean_waves(header, focus_camera_fixed, wind, direction, gravity, seconds);
     std::memcpy(bytes, &header, sizeof(header));
 
     std::sort(clouds.begin(), clouds.end(), [](const auto& a, const auto& b) { return a.first > b.first; });

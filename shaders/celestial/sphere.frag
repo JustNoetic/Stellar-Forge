@@ -53,7 +53,7 @@ void main() {
     if (geometric_length > 1e-20) emission_cosine = max(emission_cosine, 0.1*abs(dot(geometric/geometric_length, V)));
 #endif
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;
-    float footprint_m = max(length(dFdx(f_world_pos)), length(dFdy(f_world_pos)))*FLUID_AU_KM*1000.0;
+    vec3 world_dx = dFdx(f_world_pos), world_dy = dFdy(f_world_pos);
 
     if (b.spin_flags.z > 0.5) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
@@ -105,8 +105,9 @@ void main() {
             vec3 fixed_normal = normalize(vec3(local.x, local.y/(q*q), local.z));
             mat3 rotation = body_surface_rotation(pole, b.spin_flags.x);
             ocean_up = normalize(rotation*fixed_normal);
-            vec3 fixed_from_camera_m = transpose(rotation)*f_world_pos*(FLUID_AU_KM*1000.0);
-            water = ocean_surface(f_body_idx, fixed_normal, fixed_from_camera_m, footprint_m, rotation);
+            mat3 fixed_from_world = transpose(rotation)*(FLUID_AU_KM*1000.0);
+            water = ocean_surface(f_body_idx, fixed_normal, fixed_from_world*f_world_pos,
+                fixed_from_world*world_dx, fixed_from_world*world_dy, rotation);
             water_fresnel = ocean_fresnel(max(dot(water.normal, V), 0.0), sqrt(water.roughness_squared*0.5));
             water_albedo = mix(water_albedo*(1.0-water_fresnel), vec3(0.55), water.foam);
             albedo = mix(albedo, water_albedo, ocean);

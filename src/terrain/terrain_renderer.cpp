@@ -14,12 +14,13 @@ namespace {
 
 class SelectionSource final : public TerrainSource {
 public:
-    SelectionSource(const HeightSource& source, std::unordered_map<uint64_t, SurfaceTile>& cache) : source_(source), cache_(cache) {}
+    SelectionSource(const HeightSource& source, std::unordered_map<uint64_t, SurfaceTile>& cache, double floor_m)
+        : source_(source), cache_(cache), floor_m_(floor_m) {}
     SourceDomain domain() const noexcept override { return source_.domain(); }
     uint64_t bounds_revision() const noexcept override { return source_.bounds_revision(); }
     SurfaceTile describe(TileId tile, double polar, double amplitude) const override {
         if (auto entry = cache_.find(tile.key()); entry != cache_.end()) return entry->second;
-        auto value = source_.describe(tile, polar, amplitude);
+        auto value = source_.describe(tile, polar, amplitude, floor_m_);
         if (cache_.size() == MAX_SOURCE_RECORDS) cache_.clear();
         cache_.emplace(tile.key(), value);
         return value;
@@ -28,6 +29,7 @@ public:
 private:
     const HeightSource& source_;
     std::unordered_map<uint64_t, SurfaceTile>& cache_;
+    double floor_m_;
 };
 
 }
@@ -72,6 +74,7 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     reference_pipeline_ =rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     desc.vert_path = "terrain/terrain.vert";
@@ -253,7 +256,7 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 entry.bounds_revision != bounds_revision || entry.source != source->domain();
             bool changed = invalidated || view_changed;
             if (invalidated) { entry.descriptions.clear(); entry.plan.invalidate(); }
-            SelectionSource selection_source(*source, entry.descriptions);
+            SelectionSource selection_source(*source, entry.descriptions, ocean_floor_m);
             if (changed) entry.desired_valid = false;
             std::unordered_set<uint64_t> wanted;
             auto request = [&](TileId tile) {

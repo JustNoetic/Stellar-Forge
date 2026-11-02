@@ -4,12 +4,7 @@
 
 const float FLUID_AU_KM = 149597870.7;
 const float FLUID_PI = 3.141592653589793;
-const uint OCEAN_WAVE_COUNT = 16u;
-
-struct OceanWaveGPU {
-    vec4 direction_k;
-    vec4 phases;
-};
+const uint OCEAN_CASCADE_COUNT = 5u;
 
 struct SurfaceFluidGPU {
     vec4 ocean_deep;
@@ -23,11 +18,14 @@ struct SurfaceFluidGPU {
 };
 
 layout(set = 0, binding = 29) uniform sampler2DArray cloud_coverage_maps;
+layout(set = 0, binding = 32) uniform sampler2DArray ocean_moments;
 
 layout(std430, set = 0, binding = 28) readonly buffer SurfaceFluidBuffer {
     uvec4 fluid_flags;
     vec4 fluid_header;
-    OceanWaveGPU ocean_waves[OCEAN_WAVE_COUNT];
+    vec4 ocean_tangent;
+    vec4 ocean_bitangent;
+    vec4 ocean_cascades[OCEAN_CASCADE_COUNT];
     SurfaceFluidGPU fluids[];
 };
 
@@ -207,39 +205,48 @@ struct OceanSurface {
     float foam;
 };
 
-OceanSurface ocean_surface(uint body, vec3 fixed_normal, vec3 fixed_from_camera_m, float footprint_m, mat3 rotation) {
+float ocean_below(float x) {
+    return 1.0/(1.0+exp(-1.702*x));
+}
+
+OceanSurface ocean_surface(uint body, vec3 fixed_normal, vec3 fixed_from_camera_m, vec3 fixed_dx_m, vec3 fixed_dy_m, mat3 rotation) {
     SurfaceFluidGPU f = fluids[body];
-    bool focus = fluid_flags.w == body;
-    vec3 fixed_position_m = fixed_normal*(f.ocean_params.w*1000.0);
     float wind = 0.55+0.9*fbm_noise(fixed_normal*7.0+vec3(3.1, 1.7, 5.3), 3, 2.1, 0.5);
-    float steepness_scale = sqrt(max(f.ocean_params.y, 1e-6)/max(fluid_header.x, 1e-6)*wind);
-    vec3 gradient = vec3(0.0);
-    float unresolved = 0.0, crest = 0.0, total = 0.0;
-    for (uint i = 0u; i < OCEAN_WAVE_COUNT; ++i) {
-        OceanWaveGPU w = ocean_waves[i];
-        float k = w.direction_k.w;
-        if (k <= 0.0) continue;
-        float s = w.phases.z*steepness_scale;
-        float fade = 1.0-clamp((footprint_m*4.0/w.phases.w-1.0)*0.5, 0.0, 1.0);
-        float variance = 0.5*s*s;
-        total += variance;
-        unresolved += (1.0-fade*fade)*variance;
-        if (fade <= 0.0) continue;
-        float phase = focus ? k*dot(w.direction_k.xyz, fixed_from_camera_m)+w.phases.x
-                            : k*dot(w.direction_k.xyz, fixed_position_m)+w.phases.y;
-        gradient += w.direction_k.xyz*(s*fade*cos(phase));
-        crest += fade*s*sin(phase);
-    }
-    gradient -= fixed_normal*dot(gradient, fixed_normal);
-    OceanSurface o;
-    o.normal = normalize(rotation*normalize(fixed_normal-gradient));
-    o.roughness_squared = max(unresolved, 0.0)+0.0015;
     float u = f.ocean_params.x*sqrt(wind);
-    float whitecaps = 3.84e-6*pow(max(u, 0.0), 3.41)*f.ocean_shallow.w;
-    float crest_bias = total > 0.0 ? crest/sqrt(2.0*total) : 0.0;
-    float breakup = mix(value_noise(fixed_normal*(f.ocean_params.w*1000.0/30.0)+vec3(fluid_header.y*0.05)), 0.5,
-        clamp(footprint_m/30.0-0.5, 0.0, 1.0));
-    o.foam = clamp(whitecaps*(1.0+3.0*max(crest_bias, 0.0))*(0.5+breakup)*4.0, 0.0, 0.8);
+    float whitecaps = clamp(3.84e-6*pow(max(u, 0.0), 3.41)*f.ocean_shallow.w*2.0, 1e-5, 0.5);
+    OceanSurface o;
+    if (fluid_flags.w != body) {
+        o.normal = normalize(rotation*fixed_normal);
+        o.roughness_squared = f.ocean_params.y*wind+0.001;
+        o.foam = min(whitecaps, 0.8);
+        return o;
+    }
+    vec3 tangent = ocean_tangent.xyz, bitangent = ocean_bitangent.xyz;
+    vec2 p = vec2(dot(fixed_from_camera_m, tangent), dot(fixed_from_camera_m, bitangent));
+    vec2 px = vec2(dot(fixed_dx_m, tangent), dot(fixed_dx_m, bitangent));
+    vec2 py = vec2(dot(fixed_dy_m, tangent), dot(fixed_dy_m, bitangent));
+    vec2 slope = vec2(0.0);
+    float variance = 0.0, jacobian = 0.0, jacobian_variance = 0.0;
+    for (uint i = 0u; i < OCEAN_CASCADE_COUNT; ++i) {
+        vec4 c = ocean_cascades[i];
+        vec2 uv = p*c.z+c.xy;
+        vec4 s = textureGrad(ocean_moments, vec3(uv, float(2u*i)), px*c.z, py*c.z);
+        vec4 j = textureGrad(ocean_moments, vec3(uv, float(2u*i+1u)), px*c.z, py*c.z);
+        slope += s.xy;
+        variance += max(s.z-s.x*s.x, 0.0)+max(s.w-s.y*s.y, 0.0);
+        jacobian += j.x;
+        jacobian_variance += max(j.y-j.x*j.x, 0.0);
+    }
+    float scale = sqrt(wind);
+    slope *= scale;
+    vec3 gradient = slope.x*tangent+slope.y*bitangent;
+    gradient -= fixed_normal*dot(gradient, fixed_normal);
+    o.normal = normalize(rotation*normalize(fixed_normal-gradient));
+    o.roughness_squared = (variance+fluid_header.z)*wind+0.001;
+    float spread = sqrt(fluid_header.w*wind);
+    float threshold = 1.0-log((1.0-whitecaps)/whitecaps)/1.702*spread;
+    float local = max(sqrt(jacobian_variance)*scale, 0.02*spread+1e-4);
+    o.foam = min(ocean_below((threshold-1.0-jacobian*scale)/local), 0.8);
     return o;
 }
 

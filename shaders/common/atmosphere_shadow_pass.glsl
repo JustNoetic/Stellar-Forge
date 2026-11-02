@@ -167,7 +167,7 @@ void main() {
         if (prefix_path <= 0.0)
             reconstructed = reconstruct_shadow_vrs(pixel, depth, direction, segment, path, fraction, supported.x);
 #endif
-        if (!reconstructed)
+        if (!reconstructed && !shadow_cached_column_unlit(direction, segment, path))
             fraction = atmosphere_shadow_deficit(direction, segment, path, pixel, shadow_temporal.x,
                 prefix_path, prefix_fraction, supported);
         store_shadow(pixel, 0, depth, fraction, supported.x);

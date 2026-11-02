@@ -87,6 +87,7 @@ public:
     static std::shared_ptr<HeightSource> open(const std::filesystem::path& directory);
     SourceDomain domain() const noexcept override { return info_.domain; }
     SurfaceTile describe(TileId tile, double polar_ratio, double amplitude) const override;
+    SurfaceTile describe(TileId tile, double polar_ratio, double amplitude, double floor_m) const;
     const HeightSourceInfo& info() const noexcept { return info_; }
     const HeightRecord& record(TileId tile) const;
     HeightTile read(TileId tile) const;

@@ -1,0 +1,39 @@
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, set = 0, binding = 0) readonly buffer Amplitudes { vec4 amplitudes[]; };
+layout(rgba32f, set = 0, binding = 1) uniform writeonly image2DArray field;
+layout(push_constant) uniform Evolve {
+    double seconds;
+    float gravity;
+    float choppiness;
+    vec4 lengths;
+    float last_length;
+} evolve;
+
+const float PI = 3.141592653589793;
+const double TWO_PI_D = 6.283185307179586LF;
+
+vec2 complex_multiply(vec2 a, vec2 b) {
+    return vec2(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x);
+}
+
+vec2 times_i(vec2 a) {
+    return vec2(-a.y, a.x);
+}
+
+void main() {
+    int n = imageSize(field).x;
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    int cascade = int(gl_GlobalInvocationID.z);
+    float length_m = cascade < 4 ? evolve.lengths[cascade] : evolve.last_length;
+    vec2 k = 2.0*PI*vec2(texel-n/2)/length_m;
+    float magnitude = length(k);
+    vec4 h0 = amplitudes[(cascade*n+texel.y)*n+texel.x];
+    float phase = float(mod(double(sqrt(evolve.gravity*magnitude))*evolve.seconds, TWO_PI_D));
+    vec2 rotation = vec2(cos(phase), sin(phase));
+    vec2 h = complex_multiply(h0.xy, rotation)+complex_multiply(h0.zw, vec2(rotation.x, -rotation.y));
+    float inverse = magnitude > 0.0 ? 1.0/magnitude : 0.0;
+    vec2 slopes = times_i(h*k.x)-h*k.y;
+    vec2 stretch = h*(k.x*k.x*inverse)+times_i(h*(k.y*k.y*inverse));
+    imageStore(field, ivec3((texel+n/2)%n, cascade), vec4(slopes, stretch));
+}

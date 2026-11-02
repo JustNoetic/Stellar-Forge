@@ -5,8 +5,9 @@ Space Agency water/cloud shaders as a reference (moment-filtered Beckmann ocean
 BRDF, Bruneton Fresnel fit, whitecap coverage, Henyey-Greenstein cloud
 phase, Wrenninge-style multiple-scattering attenuation, erosion of a coverage
 field by detail noise). Cloud weather comes from optional grayscale coverage
-maps; volume detail and ocean waves use analytic/hash noise. Both render in the
-existing scene passes, without temporal reconstruction or FFT cascades.
+maps; volume detail uses analytic/hash noise. Ocean waves come from FFT cascades
+of a JONSWAP spectrum (shading only, no geometric displacement). Both render in the
+existing scene passes, without temporal reconstruction.
 
 ## Body definition
 
@@ -73,7 +74,9 @@ it enabled, serialize it back. Earth in the Solar System preset enables both.
 frame by `CelestialRenderer::prepare_fluids`:
 
 - header: `fluid_flags` (oceans, clouds, cloud mode, focus body),
-  `fluid_header` (table Cox-Munk variance, wrapped time), 16 `OceanWaveGPU`.
+  `fluid_header` (z: residual mean-square slope, w: Jacobian variance),
+  `OceanCascadesGPU` (tangent frame, per-cascade UV offset and 1/size).
+  Binding 32 is the ocean moment array (`OceanWaves::moments`).
 - per body `SurfaceFluidGPU`: ocean colours/mask/foam, wind and Cox-Munk
   variance, sea-level and surface radii (km), cloud colour/shape/motion.
 - cloud style: cumulus marker, detail size, erosion and one-based coverage-map
@@ -90,22 +93,40 @@ is ignored by rendering.
 
 Shaded in `celestial/sphere.frag` (spheres and terrain).
 
-- Waves: 16 directional deep-water waves, wavelengths from 1.5× the
-  Pierson-Moskowitz peak (`ω_p = 0.877 g/U`) down by 0.68 per wave, equal
-  steepness so the slope variance sums to Cox-Munk `0.003 + 0.00512 U`.
-  Dispersion `ω = sqrt(g k)` with the body's surface gravity.
-- Precision: the body nearest the camera (relative altitude) is the focus body.
-  Its wave directions lie in the tangent frame under the camera and the CPU
-  folds `k·(d·camera_fixed) − ωt` into a per-wave phase in double precision; the
-  shader only adds `k·d·(Rᵀ·camera-relative position)`. Other bodies use the
-  body-fixed position directly (their short waves are filtered anyway).
-- Filtering: waves shorter than ~4 pixel footprints fade out of the normal and
-  their slope variance moves into the Beckmann roughness (LEADR-style moments).
-  A low-frequency wind field modulates the variance (orbital glint variation).
+- Waves (`src/rendering/ocean_waves.hpp/.cpp`, `shaders/ocean/*.comp`): five 256²
+  cascades of 2, 28, 392, 5488 and 76832 m (KSA layout). Each keeps only the
+  wavenumbers above the next larger cascade's Nyquist limit. The initial spectrum
+  is built on the CPU (fixed seed) on wind/gravity changes: JONSWAP with fetch
+  1000 km, clamped to Pierson-Moskowitz (`ω_p ≥ 0.855 g/U`, `α ≥ 0.0081`),
+  γ = 3.3, Donelan-Banner spreading blended 10% toward isotropic, small-wave
+  suppression `exp(−k²·10⁻⁴)`. It is stored per frame in flight in host-mapped
+  storage buffers (5.2 MiB each), refreshed lazily. Deep-water dispersion uses the
+  body's surface gravity; the phase `ω t` is reduced in FP64 on the GPU.
+- Per frame (focus body below 1000 km altitude only, ~0.11 ms on an RTX 4060 Ti):
+  evolve → row/column inverse FFT (shared-memory radix 2) → moments. Each cascade
+  writes (sx, sy, sx², sy²) and (J − 1, (J − 1)², sx·sy) with choppiness 1, where
+  slopes are divided by the horizontal stretch `1 − λ D_xx`. `VkContext::build_mip_chain`
+  blits them into a mipmapped RGBA16F array.
+- Mapping: the CPU parallel-transports a tangent frame under the camera (body-fixed)
+  and accumulates the camera's planar motion in FP64, wrapped at 76832 m (all
+  cascade sizes divide it). The shader projects the camera-relative body-fixed
+  position onto that frame and adds per-cascade UV offsets, so the near field
+  never subtracts large coordinates.
+- Filtering: `textureGrad` with the projected pixel derivatives. Mean slopes
+  shade the normal; the mip variance `E[s²] − E[s]²` plus the residual
+  `max(Cox-Munk − spectrum, 0)` becomes Beckmann roughness, so the far field and
+  the roughness-only path (non-focus bodies, or above 1000 km) both match Cox-Munk
+  `0.003 + 0.00512 U`. A low-frequency wind field modulates slope and variance.
 - BRDF: Beckmann D, Smith-Beckmann G, Bruneton/Neyret Fresnel fit; sun disk
   radius widens the lobe. Sky reflection = Fresnel × the existing ground
   skylight term. Water-leaving light uses the water albedo × (1 − F).
-- Foam: Monahan whitecap fraction `3.84e-6 U^3.41`, biased toward crests.
+- Foam: Monahan whitecap fraction `W = 3.84e-6 U^3.41` (× 2 × `foam`) sets a
+  Jacobian threshold at the `1 − W` quantile of the spectrum's Jacobian spread. The
+  filtered coverage is the probability that the local Jacobian lies below it, so
+  the far field averages to W (Dupuy-Bruneton style).
+- Culling: imported tiles below sea level describe their bounds with the same
+  floor (`HeightSource::describe(..., floor_m)`), so clamped water surfaces are not
+  frustum-culled against seabed bounds.
 - Imported terrain heights are clamped to sea level (`HeightStream::set_floor_m`,
   part of the geometry cache key) so the ocean is a flat surface over bathymetry;
   atmosphere minima use the same floor.

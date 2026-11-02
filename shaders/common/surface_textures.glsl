@@ -42,7 +42,7 @@ vec3 surface_albedo(uint body, vec3 local_direction, vec3 fallback) {
     uint coarse = uint(floor(level)), fine = uint(ceil(level));
     vec3 face_uv = surface_face_uv(direction);
     vec3 a = surface_level(base, face_uv, coarse, fallback);
-    vec3 b = surface_level(base, face_uv, fine, fallback);
+    vec3 b = fine == coarse ? a : surface_level(base, face_uv, fine, fallback);
     return mix(a, b, fract(level));
 }
 
