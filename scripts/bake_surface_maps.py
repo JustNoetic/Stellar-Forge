@@ -349,6 +349,17 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
         existing_map[item["body"]] = binding
         print(f"  [OK] {item['body']}: albedo LOD 0..{lod}" + (f" + elevation LOD 0..{height_lod} ({CORE}x{CORE})" if "height" in binding else ""), flush=True)
 
+        cloud_stem = f"{item['body']}_clouds".casefold()
+        cloud_source = next((path for path in sorted(item["folder"].iterdir())
+                             if path.is_file() and path.stem.casefold() == cloud_stem
+                             and path.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")), None)
+        if cloud_source is not None:
+            cloud_out = item["folder"] / "clouds"
+            if not (cloud_out / "coverage.r8").exists() or rebake:
+                from bake_cloud_maps import bake as bake_clouds
+                cloud_manifest = bake_clouds(cloud_source, cloud_out)
+                print(f"  [OK] {item['body']}: cloud coverage ({len(cloud_manifest['levels'])} mips)", flush=True)
+
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     catalog_path.write_text(json.dumps(dict(version=1, bodies=list(existing_map.values())), indent=2)+"\n", encoding="utf-8")
     print(f"\nCatalog updated: {catalog_path}")

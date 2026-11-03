@@ -29,5 +29,15 @@ rem Run texture baker with auto-selected CUDA support
 "%PY_EXE%" scripts\bake_surface_maps.py %*
 set "BAKE_RESULT=%errorlevel%"
 
+if "%BAKE_RESULT%"=="0" (
+    if exist "textures\Solar System\Earth\Earth_clouds.jpg" (
+        if not exist "textures\Solar System\Earth\clouds\coverage.r8" (
+            echo.
+            echo Baking Earth cloud coverage mip pyramid...
+            "%PY_EXE%" scripts\bake_cloud_maps.py "textures\Solar System\Earth\Earth_clouds.jpg" "textures\Solar System\Earth\clouds"
+        )
+    )
+)
+
 if "%~1"=="" pause
 exit /b %BAKE_RESULT%

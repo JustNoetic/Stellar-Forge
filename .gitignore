@@ -21,8 +21,22 @@ perf_report.txt
 data/cache/
 data/settings.json
 data/settings.json.tmp
-data/kernels/
+data/kernels/*
+!data/kernels/cspice.dll
+!data/kernels/SpiceyPy-LICENSE.txt
+!data/kernels/additional/
+data/kernels/additional/*
+!data/kernels/additional/artemis2.bsp
 data/tiles/
 textures/*
 !textures/.gitkeep
+!textures/noise/
+textures/noise/*
+!textures/noise/stbn_scalar.bin
+!textures/Solar System/
+textures/Solar System/*
+!textures/Solar System/source_manifest.json
+!textures/Solar System/Saturn/
+textures/Solar System/Saturn/*
+!textures/Solar System/Saturn/Rings.png
 __pycache__/

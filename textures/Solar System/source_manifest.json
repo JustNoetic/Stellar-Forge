@@ -1,0 +1,194 @@
+{
+  "files": [
+    {
+      "path": "Callisto/Callisto.png",
+      "bytes": 35452174,
+      "sha256": "987f2049de40257ff0920eaf4355467a5220417a714d03cae5f42d482e8241e2",
+      "size": [
+        8192,
+        4096
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Earth/Earth.jpg",
+      "bytes": 23716627,
+      "sha256": "c2f2c80a352518cfea23d462dad6f6e778375ddd74bbec5786bcfc85cc49c61d",
+      "size": [
+        21600,
+        10800
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Earth/Earth_clouds.jpg",
+      "bytes": 62214565,
+      "sha256": "ac4fefceeb31b17f43e4c60c3631dde934ba6bb3fcdb1fe7c5cd221529f4daeb",
+      "size": [
+        16000,
+        8000
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Earth/Earth_heightmap.png",
+      "bytes": 75282262,
+      "sha256": "f91a66e40335d9d4315abee2c0ed0b155481f71c340fadca2486f3f761a06a23",
+      "size": [
+        21600,
+        10800
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "path": "Earth/Earth_specular.png",
+      "bytes": 4959292,
+      "sha256": "282dfa21a24c3a648a46ac7671cad527c1602110a197796c832d8435266fe325",
+      "size": [
+        16200,
+        8100
+      ],
+      "mode": "L"
+    },
+    {
+      "path": "Enceladus/Enceladus.png",
+      "bytes": 27830562,
+      "sha256": "ba680a02ce27781fe5d7d44746826284d66c45f5a984c7e81ae975477e792751",
+      "size": [
+        8192,
+        4096
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Europa/Europa.jpg",
+      "bytes": 63798658,
+      "sha256": "21fdbe57b370d3bca1c8f828b2c20a101ffdd9fc3b7d826faf4d107f483a6d47",
+      "size": [
+        20000,
+        10000
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Ganymede/Ganymede.png",
+      "bytes": 62142593,
+      "sha256": "9695fc69d044dc1ca08054fad840ea4ea4c0e28aee1bfb6bd6f709eb46857258",
+      "size": [
+        11520,
+        5760
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Io/Io.webp",
+      "bytes": 277938,
+      "sha256": "a231a39417323d00a2dd3f59a8771b3fe469f8393d1d66153c6e17c144f3e03e",
+      "size": [
+        2048,
+        1024
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Jupiter/Jupiter.png",
+      "bytes": 10446397,
+      "sha256": "21e0442fc6a222963c81493115ddd969f0458224cb2336e1dbc31433e1d26af3",
+      "size": [
+        4400,
+        2200
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "path": "Mars/Mars.png",
+      "bytes": 81374555,
+      "sha256": "515517ed87a77e955aea1c83c667f7e9052ec5517ddd394ede5815657cda3022",
+      "size": [
+        16384,
+        8192
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Mercury/Mercury.jpg",
+      "bytes": 17673863,
+      "sha256": "fe8b56d2dcf056360ff1a947549e7398305b2165034a8af70925eaff4bf22187",
+      "size": [
+        8192,
+        4096
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Mimas/Mimas.jpg",
+      "bytes": 1605648,
+      "sha256": "f2d62eaa50c7864e303a13434738a7bc6db0e133f1f4b163c2506979800c1116",
+      "size": [
+        5760,
+        2880
+      ],
+      "mode": "L"
+    },
+    {
+      "path": "Moon/Moon.jpg",
+      "bytes": 23572282,
+      "sha256": "90e036f3dd37af8c473e21af536f709b01bc2e7e6df9ee8609aeae68a4a365ed",
+      "size": [
+        16384,
+        8192
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Moon/Moon_heightmap.tif",
+      "bytes": 33201026,
+      "sha256": "45a2b32d56e81ed30db07fead8abc842b249b6511219d9ca2c53f81bc2dc5d62",
+      "size": [
+        5760,
+        2880
+      ],
+      "mode": "I;16"
+    },
+    {
+      "path": "Saturn/Rings.png",
+      "bytes": 9368,
+      "sha256": "a728f4a154cebc65762f19f7f533a1f7942842c7cd98676a901bfc8e6d4719ac",
+      "size": [
+        4521,
+        1
+      ],
+      "mode": "RGBA"
+    },
+    {
+      "path": "Saturn/Saturn.jpg",
+      "bytes": 885832,
+      "sha256": "542048758c751d88f45b4d1c32d9b51851be2ee36905b265bf58bbad2c161a2a",
+      "size": [
+        4096,
+        2048
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Titan/Titan.png",
+      "bytes": 25518089,
+      "sha256": "dffd537628725251bd7b5c60790af07b230e026343e501e93def9af2be070da1",
+      "size": [
+        8192,
+        4096
+      ],
+      "mode": "RGB"
+    },
+    {
+      "path": "Venus/Venus.jpg",
+      "bytes": 15345031,
+      "sha256": "52902ed28d8edc79ae38ad8797174dc4f85459a13030fceaac805c1dce672624",
+      "size": [
+        8192,
+        4096
+      ],
+      "mode": "RGB"
+    }
+  ]
+}
