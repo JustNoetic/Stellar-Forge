@@ -2,6 +2,7 @@
 
 #include "physics/atmosphere_refraction.hpp"
 #include <glm/glm.hpp>
+#include <algorithm>
 #include <cmath>
 #include <numbers>
 #include <vector>
@@ -18,7 +19,44 @@ struct RefractionHost {
     double ground_radius_km = 0.0;
     double max_displacement = 0.0;
     double lowest_visible_chord_km = 0.0;
+    glm::dvec3 center{0.0};
+    glm::dvec3 pole{0.0, 1.0, 0.0};
+    double stretch = 0.0;
+    const physics::PreparedRefraction* refraction = nullptr;
 };
+
+inline glm::dmat3 apparent_rotation(const RefractionHost& host, glm::dvec3 position_au) {
+    glm::dmat3 identity(1.0);
+    if (host.body < 0 || !host.refraction) return identity;
+    const auto& r = *host.refraction;
+    auto stretched = [&](glm::dvec3 v) { return v+host.pole*(glm::dot(v, host.pole)*host.stretch); };
+    glm::dvec3 a = stretched(position_au)*149597870.7;
+    double distance = glm::length(a);
+    if (!(distance > 0.0)) return identity;
+    glm::dvec3 v = a/distance;
+    glm::dvec3 up = glm::normalize(stretched(-host.center));
+    double mu = std::clamp(glm::dot(v, up), -1.0, 1.0);
+    glm::dvec3 side = up-v*mu;
+    double sine = glm::length(side);
+    double camera = host.camera_radius_km;
+    if (sine < 1e-12 || (camera > r.top_radius_km && (mu >= 0.0 || camera*sine >= r.top_radius_km))) return identity;
+    double b = camera*sine, along = -camera*mu;
+    double target = std::sqrt(b*b+(distance-along)*(distance-along));
+    double polar = std::atan2(along, b)+std::atan2(distance-along, b);
+    auto solution = r.solve(camera, target, polar, 1, distance > .05*r.ground_radius_km);
+    double rotation = std::atan2(sine, mu)-solution.apparent_zenith;
+    if (!std::isfinite(rotation)) return identity;
+    rotation = std::clamp(rotation, -host.max_displacement, host.max_displacement);
+    glm::dvec3 lifted = v*std::cos(rotation)+side/sine*std::sin(rotation);
+    glm::dvec3 apparent = glm::normalize(lifted-host.pole*(glm::dot(lifted, host.pole)*host.stretch/(1.0+host.stretch)));
+    glm::dvec3 original = glm::normalize(position_au);
+    glm::dvec3 axis = glm::cross(original, apparent);
+    double s = glm::length(axis), c = glm::dot(original, apparent);
+    if (s < 1e-15) return identity;
+    axis /= s;
+    glm::dmat3 k(0.0, axis.z, -axis.y, -axis.z, 0.0, axis.x, axis.y, -axis.x, 0.0);
+    return identity+s*k+(1.0-c)*k*k;
+}
 
 struct alignas(16) RefractionGPU {
     glm::vec4 host{0.0f};

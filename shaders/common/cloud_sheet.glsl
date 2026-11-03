@@ -43,7 +43,7 @@ vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pol
 }
 
 float cloud_sheet_depth(BodyInstanceGPU b, vec3 local) {
-    return min(body_offset_depth(b, local)*CLOUD_DEPTH_BIAS, 1.0);
+    return min(body_offset_depth(b, local+f_refraction_shift)*CLOUD_DEPTH_BIAS, 1.0);
 }
 
 void render_cloud_sheet() {

@@ -6,10 +6,12 @@ layout(location = 1) in vec3 in_normal;
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
 #include "common/fluid_surface.glsl"
+#include "common/refraction.glsl"
 
 layout(location = 0) out vec3 f_world_pos;
 layout(location = 1) flat out uint f_body_idx;
 layout(location = 2) out vec3 f_body_offset;
+layout(location = 3) out vec3 f_refraction_shift;
 
 void main() {
     uint idx = gl_InstanceIndex;
@@ -22,5 +24,7 @@ void main() {
     vec3 offset = rotation*(in_position*scale)*radius;
     f_world_pos = b.pos_radius.xyz+offset;
     f_body_offset = offset;
-    gl_Position = u_scene.projection*vec4(b.view_center.xyz+mat3(u_scene.view)*offset, 1.0);
+    bool host = all(equal(b.pos_radius.xyz, u_refraction.host.xyz));
+    f_refraction_shift = host ? vec3(0.0) : refract_position(f_world_pos)-f_world_pos;
+    gl_Position = u_scene.projection*vec4(b.view_center.xyz+mat3(u_scene.view)*(offset+f_refraction_shift), 1.0);
 }

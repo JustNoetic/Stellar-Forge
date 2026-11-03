@@ -39,18 +39,18 @@ bool shadow_vrs_spatial_safe(vec3 direction, vec2 segment, float path) {
 }
 
 #ifdef ATMOSPHERE_SHADOW_VRS
-layout(set = 0, binding = 21) uniform sampler2D coarse_shadow_fraction;
-layout(set = 0, binding = 22) uniform sampler2D coarse_shadow_guide;
+layout(set = 0, binding = 21) uniform sampler2DArray coarse_shadow_fraction;
+layout(set = 0, binding = 22) uniform sampler2DArray coarse_shadow_guide;
 
-bool reconstruct_shadow_vrs(ivec2 pixel, float depth, vec3 direction, vec2 segment, float path,
+bool reconstruct_shadow_vrs(ivec2 pixel, int layer, bool finite, vec3 direction, vec2 segment, float path,
                             out vec3 fraction, out bool supported) {
     int scale = shadow_vrs_scale();
     ivec2 base = pixel/scale;
     vec2 f = vec2(pixel%scale)/float(scale);
     if (all(equal(pixel%scale, ivec2(0)))) {
-        vec4 guide = texelFetch(coarse_shadow_guide, base, 0);
-        if (guide.w < 0.5) return false;
-        vec4 value = texelFetch(coarse_shadow_fraction, base, 0);
+        vec4 guide = texelFetch(coarse_shadow_guide, ivec3(base, layer), 0);
+        if (guide.w < 0.5 || (guide.z > 0.5) != finite || abs(guide.x-log2(max(path, 1e-5))) > 0.04) return false;
+        vec4 value = texelFetch(coarse_shadow_fraction, ivec3(base, layer), 0);
         fraction = value.rgb;
         supported = value.a > 0.5;
         return true;
@@ -59,18 +59,18 @@ bool reconstruct_shadow_vrs(ivec2 pixel, float depth, vec3 direction, vec2 segme
     vec3 sum = vec3(0.0);
     float log_path = log2(max(path, 1e-5));
     float segment_tolerance = max(0.02*max(path, 1.0), 4.0*float(scale)*segment.x/max(shadow_eye_focal.w, 1.0));
-    ivec2 size = textureSize(coarse_shadow_fraction, 0);
+    ivec2 size = textureSize(coarse_shadow_fraction, 0).xy;
     bool any_supported = false, all_supported = true, all_unlit = true;
     for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
         float weight = (x == 0 ? 1.0-f.x : f.x)*(y == 0 ? 1.0-f.y : f.y);
         if (weight <= 0.0) continue;
         ivec2 tap = base+ivec2(x, y);
         if (any(greaterThanEqual(tap, size))) return false;
-        vec4 guide = texelFetch(coarse_shadow_guide, tap, 0);
-        if (guide.w < 0.5 || (guide.z > 0.5) != (depth > 0.0) || abs(guide.x-log_path) > 0.04 ||
+        vec4 guide = texelFetch(coarse_shadow_guide, ivec3(tap, layer), 0);
+        if (guide.w < 0.5 || (guide.z > 0.5) != finite || abs(guide.x-log_path) > 0.04 ||
             abs(guide.y-segment.x) > segment_tolerance) return false;
         all_unlit = all_unlit && guide.w > 1.5;
-        vec4 value = texelFetch(coarse_shadow_fraction, tap, 0);
+        vec4 value = texelFetch(coarse_shadow_fraction, ivec3(tap, layer), 0);
         bool tap_supported = value.a >= 0.5;
         any_supported = any_supported || tap_supported;
         all_supported = all_supported && tap_supported;

@@ -185,6 +185,9 @@ void RefractionRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         host_.ground_radius_km = r.ground_radius_km;
         host_.max_displacement = r.max_deflection()/polar_ratio;
         host_.lowest_visible_chord_km = r.lowest_visible_chord(host_.camera_radius_km);
+        host_.center = center;
+        host_.pole = pole;
+        host_.stretch = 1.0/polar_ratio-1.0;
         if (host_.camera_radius_km > r.bottom_radius_km) {
             Tables* tables = tables_for(cmd, ctx, body.render.atmosphere);
             if (tables) {
@@ -222,6 +225,7 @@ void RefractionRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         params = {};
         host_.body = -1;
     }
+    host_.refraction = source;
     write_ubo(ctx, ubos_[f], params);
     retire_tables(ctx, source && host_.body >= 0 ? system.body(size_t(host_.body)).render.atmosphere.get() : nullptr);
 }

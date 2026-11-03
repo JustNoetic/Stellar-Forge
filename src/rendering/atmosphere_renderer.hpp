@@ -13,6 +13,7 @@ namespace sf::rendering {
 struct RingHostGPU;
 class RingRenderer;
 struct PlanetshineGPU;
+struct RefractionHost;
 
 struct alignas(16) AtmosphereShadowHeaderGPU {
     glm::vec4 eye_focal{};
@@ -102,7 +103,7 @@ public:
                  std::span<const float> minimum_heights_km = {}, std::span<const RingHostGPU> rings = {},
                  const rhi::Image* ring_shadow_lut = nullptr, uint64_t ring_shadow_revision = 0,
                  bool shadow_diagnostics = false, std::span<const PlanetshineGPU> planetshine = {},
-                 const RingRenderer* ring_lighting = nullptr);
+                 const RingRenderer* ring_lighting = nullptr, const RefractionHost* refraction = nullptr);
     void composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                    std::span<const rhi::PushDescriptorWrite> transparency_writes = {},
                    const std::function<void(uint32_t)>& draw_point = {});
@@ -180,7 +181,7 @@ private:
     rhi::Pipeline shadow_pipeline_, shadow_transparency_pipeline_;
     rhi::Pipeline shadow_accumulate_pipeline_, shadow_accumulate_transparency_pipeline_;
     rhi::Pipeline shadow_reproject_pipeline_, shadow_rotate_pipeline_, shadow_rotate_transparency_pipeline_;
-    rhi::Pipeline shadow_coarse_pipeline_, shadow_vrs_pipeline_, shadow_vrs_transparency_pipeline_;
+    rhi::Pipeline shadow_coarse_pipeline_, shadow_coarse_transparency_pipeline_, shadow_vrs_pipeline_, shadow_vrs_transparency_pipeline_;
     struct RetiredImage { rhi::Image image; uint64_t serial; };
     std::vector<RetiredImage> retired_images_;
     rhi::Image shadow_coarse_fraction_, shadow_coarse_guide_;

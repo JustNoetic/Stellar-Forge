@@ -3,6 +3,7 @@
 #include "rendering/eclipse_candidates.hpp"
 #include "rendering/ring_renderer.hpp"
 #include "rendering/planetshine.hpp"
+#include "rendering/refraction_tables.hpp"
 #include "rhi/shader_cache.hpp"
 #include <algorithm>
 #include <bit>
@@ -246,6 +247,11 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     accumulate.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
     shadow_accumulate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate_transparency.comp", accumulate, sizeof(glm::uvec2));
     shadow_coarse_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow);
+    std::vector<rhi::DescriptorLayoutBinding> coarse_transparency(std::begin(shadow), std::end(shadow));
+    coarse_transparency.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    coarse_transparency.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_coarse_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/shadow_coarse_transparency.comp", coarse_transparency);
     std::vector<rhi::DescriptorLayoutBinding> shadow_vrs(std::begin(shadow), std::end(shadow));
     shadow_vrs.push_back({21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
     shadow_vrs.push_back({22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
@@ -407,6 +413,7 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_rotate_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_rotate_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_coarse_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, shadow_coarse_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_transparency_pipeline_);
     ctx.destroy_image(shadow_coarse_fraction_);
@@ -452,7 +459,8 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                                  const ephemeris::SystemSnapshot& system, const RenderSettings& settings, VkExtent2D extent,
                                  std::span<const float> minimum_heights_km, std::span<const RingHostGPU> rings,
                                  const rhi::Image* ring_shadow_lut, uint64_t ring_shadow_revision, bool shadow_diagnostics,
-                                 std::span<const PlanetshineGPU> planetshine, const RingRenderer* ring_lighting) {
+                                 std::span<const PlanetshineGPU> planetshine, const RingRenderer* ring_lighting,
+                                 const RefractionHost* refraction) {
     active_.clear();
     ++prepare_serial_;
     std::erase_if(retired_images_, [&](auto& entry) {
@@ -499,12 +507,20 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         }
         return;
     }
-    struct Candidate { uint32_t index; double distance; };
+    struct Candidate { uint32_t index; double distance; glm::dmat3 apparent; };
     std::vector<Candidate> candidates;
     double tan_y = std::tan(camera.fov_deg*DEG_TO_RAD*0.5);
     double tan_x = tan_y*double(extent.width)/std::max(1u, extent.height);
     double focal = double(extent.height)/(2.0*tan_y);
     glm::dvec3 eye = camera.eye_pos_render().value;
+    auto outside = [&](glm::dvec3 to_body, double outer, double tx, double ty) {
+        double depth = glm::dot(to_body, camera.forward_dir());
+        return depth+outer <= 0.0 ||
+            std::abs(glm::dot(to_body, camera.right_dir())) > depth*tx+outer*std::sqrt(1.0+tx*tx) ||
+            std::abs(glm::dot(to_body, camera.up_dir())) > depth*ty+outer*std::sqrt(1.0+ty*ty);
+    };
+    double pad = refraction && refraction->refraction ? refraction->max_displacement : 0.0;
+    auto padded = [&](double tangent) { return std::tan(std::min(std::atan(tangent)+pad, 1.5)); };
     for (uint32_t i = 0; i < system.size(); ++i) {
         const auto b = system.body(i);
         const auto& a = b.definition.atmosphere;
@@ -514,14 +530,17 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         double distance = glm::length(to_body);
         double height = b.render.atmosphere ? b.render.atmosphere->height_km : a.height_km;
         double outer = radius+height;
+        glm::dmat3 apparent(1.0);
         if (distance > outer) {
-            double depth = glm::dot(to_body, camera.forward_dir());
-            if (depth+outer <= 0.0 ||
-                std::abs(glm::dot(to_body, camera.right_dir())) > depth*tan_x+outer*std::sqrt(1.0+tan_x*tan_x) ||
-                std::abs(glm::dot(to_body, camera.up_dir())) > depth*tan_y+outer*std::sqrt(1.0+tan_y*tan_y)) continue;
+            bool refracted = pad > 0.0 && int(i) != refraction->body;
+            if (outside(to_body, outer, refracted ? padded(tan_x) : tan_x, refracted ? padded(tan_y) : tan_y)) continue;
+            if (refracted) {
+                apparent = apparent_rotation(*refraction, b.render.position.value-eye);
+                if (outside(apparent*to_body, outer, tan_x, tan_y)) continue;
+            }
         }
         if (i >= 1024) continue;
-        candidates.push_back({i, distance});
+        candidates.push_back({i, distance, apparent});
     }
     std::sort(candidates.begin(), candidates.end(), [](auto a, auto b) { return a.distance > b.distance; });
     constexpr size_t retained_budget = 256 * 1024 * 1024;
@@ -652,8 +671,9 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         }
         auto projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au());
         auto view = camera.view_matrix_eye_relative();
-        p.inverse_view_projection = glm::inverse(projection*view);
-        glm::dmat3 view_to_world = glm::inverse(glm::dmat3(glm::mat3(view)));
+        glm::dmat3 apparent_to_true = glm::transpose(candidate.apparent);
+        p.inverse_view_projection = glm::mat4(glm::dmat4(apparent_to_true)*glm::dmat4(glm::inverse(projection*view)));
+        glm::dmat3 view_to_world = apparent_to_true*glm::inverse(glm::dmat3(glm::mat3(view)));
         glm::dvec3 ray_scale{1.0/projection[0][0], 1.0/projection[1][1], -1.0};
         for (int k = 0; k < 3; ++k) {
             glm::dvec3 axis = k == 0 ? x : k == 1 ? y : z;
@@ -1290,7 +1310,7 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                     if (*image) retired_images_.push_back({*image, ctx.recording_serial()});
                     *image = ctx.create_image_2d(width, height,
                         image == &shadow_coarse_fraction_ ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT,
-                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 1, 2);
                 }
             }
             ctx.transition_image(cmd, shadow_coarse_fraction_, VK_IMAGE_LAYOUT_GENERAL);
@@ -1299,9 +1319,11 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             std::erase_if(coarse_writes, [](auto write) { return write.binding == 18 || write.binding == 19; });
             coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(18, shadow_coarse_fraction_));
             coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(19, shadow_coarse_guide_));
+            coarse_writes.insert(coarse_writes.end(), transparency_writes.begin(), transparency_writes.end());
+            auto& coarse = transparency_writes.empty() ? shadow_coarse_pipeline_ : shadow_coarse_transparency_pipeline_;
             uint32_t coarse_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_coarse");
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadow_coarse_pipeline_.handle);
-            ctx.push_descriptors(cmd, shadow_coarse_pipeline_, coarse_writes);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, coarse.handle);
+            ctx.push_descriptors(cmd, coarse, coarse_writes);
             vkCmdDispatch(cmd, (width+7)/8, (height+7)/8, 1);
             ctx.end_gpu_timer(cmd, coarse_timer);
             for (auto* image : {&shadow_coarse_fraction_, &shadow_coarse_guide_})

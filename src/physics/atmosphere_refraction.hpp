@@ -212,8 +212,14 @@ public:
 
     double max_deflection() const noexcept {
         double best = 0;
-        for (size_t i = 0; i < REFRACTION_IMPACT_SAMPLES; ++i)
-            if (turn_radius[i] >= ground_radius_km) best = std::max(best, deflection[i].y);
+        for (size_t i = 0; i < REFRACTION_IMPACT_SAMPLES; ++i) {
+            if (turn_radius[i] < ground_radius_km) continue;
+            best = std::max(best, deflection[i].y);
+            if (i > 0 && turn_radius[i-1] < ground_radius_km) {
+                double f = (ground_radius_km-turn_radius[i-1])/(turn_radius[i]-turn_radius[i-1]);
+                best = std::max(best, deflection[i-1].y+(deflection[i].y-deflection[i-1].y)*f);
+            }
+        }
         return best;
     }
 

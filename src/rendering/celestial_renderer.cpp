@@ -167,6 +167,8 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
             {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
             {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+            {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
             {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
             {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         };
@@ -320,7 +322,7 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     planetshine_ = prepare_planetshine(sys, settings.planetshine_enabled && !settings.direct_sunlight_only,
         settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_);
     });
-    measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_); });
+    measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_, &refraction_.host()); });
     measure("cpu_planetshine_maps_ms", [&] { bake_planetshine_maps(cmd, ctx, cam, sys, extent, count); });
     measure("cpu_transparency_prepare_ms", [&] {
     bool visible_clouds = false;
@@ -640,6 +642,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             rhi::PushDescriptorWrite::storage_buffer(1, instance_ssbos_[f_idx], 0, count * sizeof(BodyInstanceGPU)),
             rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(f_idx)),
+            refraction[0],
+            refraction[1],
             rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
             rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
         };

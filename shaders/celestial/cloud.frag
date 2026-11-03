@@ -3,6 +3,7 @@
 layout(location = 0) in vec3 f_world_pos;
 layout(location = 1) flat in uint f_body_idx;
 layout(location = 2) in vec3 f_body_offset;
+layout(location = 3) in vec3 f_refraction_shift;
 
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
@@ -91,11 +92,11 @@ void main() {
         if (view_transmittance < 0.001) break;
     }
     if (view_transmittance >= 0.001) discard;
-    gl_FragDepth = min(body_offset_depth(b, f_body_offset+ray*(depth_weighted_t/max(depth_total_weight, 1e-6)))*CLOUD_DEPTH_BIAS, 1.0);
+    gl_FragDepth = min(body_offset_depth(b, f_refraction_shift+f_body_offset+ray*(depth_weighted_t/max(depth_total_weight, 1e-6)))*CLOUD_DEPTH_BIAS, 1.0);
     out_color = vec4(0.0);
     return;
 #endif
-    gl_FragDepth = min(body_offset_depth(b, f_body_offset+ray*t0)*CLOUD_DEPTH_BIAS, 1.0);
+    gl_FragDepth = min(body_offset_depth(b, f_refraction_shift+f_body_offset+ray*t0)*CLOUD_DEPTH_BIAS, 1.0);
 
     bool atmosphere = surface_atmospheres[f_body_idx].w > 0.5;
     SurfaceAtmosphereSample lookup;
@@ -176,7 +177,7 @@ void main() {
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;
     out_color = vec4(radiance*exposure, alpha);
 #ifdef TRANSPARENCY_CAPTURE
-    float cloud_depth = min(body_offset_depth(b, f_body_offset+ray*(weighted_t/max(total_weight, 1e-6)))*CLOUD_DEPTH_BIAS, 1.0);
+    float cloud_depth = min(body_offset_depth(b, f_refraction_shift+f_body_offset+ray*(weighted_t/max(total_weight, 1e-6)))*CLOUD_DEPTH_BIAS, 1.0);
     if (capture_transparency(out_color, cloud_depth)) out_color = vec4(0.0);
 #endif
 }

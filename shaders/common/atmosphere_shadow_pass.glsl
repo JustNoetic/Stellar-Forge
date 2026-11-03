@@ -9,8 +9,8 @@ layout(set = 0, binding = 8) uniform sampler2D multiscatter_lut;
 #include "common/atmosphere_shadow_vrs.glsl"
 #endif
 #ifdef ATMOSPHERE_SHADOW_COARSE
-layout(rgba16f, set = 0, binding = 18) uniform writeonly image2D current_deficit;
-layout(rgba32f, set = 0, binding = 19) uniform writeonly image2D current_guide;
+layout(rgba16f, set = 0, binding = 18) uniform writeonly image2DArray current_deficit;
+layout(rgba32f, set = 0, binding = 19) uniform writeonly image2DArray current_guide;
 #else
 layout(rgba16f, set = 0, binding = 18) uniform writeonly image2DArray current_deficit;
 layout(r32f, set = 0, binding = 19) uniform writeonly image2DArray current_depth;
@@ -98,17 +98,23 @@ void main() {
         }
     }
 #endif
+    float prefix_path = transparent_depth >= 0.0 && path > 0.0 ? shadow_endpoint_path(ndc, direction, transparent_depth, segment, span) : 0.0;
 #ifdef ATMOSPHERE_SHADOW_COARSE
-    vec3 unused, fraction = vec3(0.0);
+    vec3 prefix_fraction = vec3(0.0), fraction = vec3(0.0);
     bvec2 supported = bvec2(false);
     bool spatial_safe = path > 0.0 && shadow_vrs_spatial_safe(direction, segment, path);
     bool unlit_safe = !spatial_safe && path > 0.0 && shadow_cached_column_unlit(direction, segment, path);
-    bool valid = spatial_safe || unlit_safe;
-    if (spatial_safe) fraction = atmosphere_shadow_deficit(direction, segment, path, pixel, shadow_temporal.x, 0.0, unused, supported);
-    imageStore(current_deficit, output_pixel, vec4(fraction, supported.x ? 1.0 : 0.0));
-    imageStore(current_guide, output_pixel, vec4(log2(max(path, 1e-5)), segment.x, depth > 0.0 ? 1.0 : 0.0, unlit_safe ? 2.0 : valid ? 1.0 : 0.0));
+    bool prefix_safe = prefix_path > 0.0 && shadow_vrs_spatial_safe(direction, segment, prefix_path);
+    bool prefix_unlit = prefix_path > 0.0 && !prefix_safe && shadow_cached_column_unlit(direction, segment, prefix_path);
+    if (spatial_safe || prefix_safe)
+        fraction = atmosphere_shadow_deficit(direction, segment, path, pixel, shadow_temporal.x, prefix_path, prefix_fraction, supported);
+    imageStore(current_deficit, ivec3(output_pixel, 0), vec4(spatial_safe ? fraction : vec3(0.0), spatial_safe && supported.x ? 1.0 : 0.0));
+    imageStore(current_guide, ivec3(output_pixel, 0), vec4(log2(max(path, 1e-5)), segment.x, depth > 0.0 ? 1.0 : 0.0,
+        unlit_safe ? 2.0 : spatial_safe ? 1.0 : 0.0));
+    imageStore(current_deficit, ivec3(output_pixel, 1), vec4(prefix_safe ? prefix_fraction : vec3(0.0), prefix_safe && supported.y ? 1.0 : 0.0));
+    imageStore(current_guide, ivec3(output_pixel, 1), vec4(log2(max(prefix_path, 1e-5)), segment.x, prefix_path > 0.0 ? 1.0 : 0.0,
+        prefix_unlit ? 2.0 : prefix_safe ? 1.0 : 0.0));
 #else
-    float prefix_path = transparent_depth >= 0.0 && path > 0.0 ? shadow_endpoint_path(ndc, direction, transparent_depth, segment, span) : 0.0;
     vec3 prefix_fraction = vec3(0.0), fraction = vec3(0.0);
     bvec2 supported = bvec2(false);
 #ifdef ATMOSPHERE_SHADOW_ACCUMULATE
@@ -164,8 +170,8 @@ void main() {
     if (path > 0.0) {
         bool reconstructed = false;
 #ifdef ATMOSPHERE_SHADOW_VRS
-        if (prefix_path <= 0.0)
-            reconstructed = reconstruct_shadow_vrs(pixel, depth, direction, segment, path, fraction, supported.x);
+        reconstructed = reconstruct_shadow_vrs(pixel, 0, depth > 0.0, direction, segment, path, fraction, supported.x) &&
+            (prefix_path <= 0.0 || reconstruct_shadow_vrs(pixel, 1, true, direction, segment, prefix_path, prefix_fraction, supported.y));
 #endif
         if (!reconstructed && !shadow_cached_column_unlit(direction, segment, path))
             fraction = atmosphere_shadow_deficit(direction, segment, path, pixel, shadow_temporal.x,
