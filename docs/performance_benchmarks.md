@@ -131,6 +131,7 @@ or `no-clouds`. `legacy-clouds` keeps clouds enabled and selects diagnostic lega
 transparency for comparison; it changes atmospheric endpoints and ordering.
 `baseline` preserves default settings. Feature removal changes the image; deltas
 are measured feature costs, not promises of equivalent-quality optimization.
+`earth-backlit` and `earth-backlit-zoom` place the Sun behind Earth from 60 radii (29 and about 280 pixels of radius at 1080p) for the limb path in `atmosphere_limb_images.md`.
 `no-bloom` bypasses post-process bloom; `fast-bloom` selects the fast halo in
 place of the default four-spike sprites. See `bloom.md`.
 `no-planetshine` and `no-ringshine` split `no-secondary`. `high-exposure` multiplies

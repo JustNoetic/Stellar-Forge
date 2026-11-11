@@ -19,7 +19,7 @@ float point_visibility(vec3 center, uint self_idx, float stellar_radius) {
     for (uint i = 0; i < u_scene.num_bodies; ++i) {
         if (i == self_idx) continue;
         BodyInstanceGPU caster = bodies[i];
-        if (refraction_active() && all(equal(caster.pos_radius.xyz, u_refraction.host.xyz))) continue;
+        if (refraction_active() && !(stellar_radius > 0.0 && refraction_exterior()) && all(equal(caster.pos_radius.xyz, u_refraction.host.xyz))) continue;
         if (stellar_radius > 0.0) {
             float along = dot(caster.pos_radius.xyz, ray);
             if (along <= 0.0 || along >= distance) continue;
@@ -104,7 +104,7 @@ void main() {
     if (b.spin_flags.z > 0.5 || weight <= 0.0) return;
 
     vec3 center = b.pos_radius.xyz;
-    vec4 apparent = refract_point(center);
+    vec4 apparent = b.color_is_star.w > 0.5 && refraction_exterior() ? vec4(center, 1.0) : refract_point(center);
     if (apparent.w <= 0.0) return;
     vec4 clip = u_scene.view_proj * vec4(apparent.xyz, 1.0);
     if (clip.w <= 0.0) return;

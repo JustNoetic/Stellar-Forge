@@ -21,6 +21,7 @@ RefractionGPU refraction_parameters() {
 }
 
 bool refraction_active() { return u_refraction.host.w > 0.5; }
+bool refraction_exterior() { return refraction_active() && u_refraction.frame.w > 0.5; }
 
 vec3 refraction_to_atmosphere(vec3 v) {
     return v+u_refraction.pole.xyz*(dot(v, u_refraction.pole.xyz)*u_refraction.pole.w);
@@ -57,17 +58,27 @@ float refraction_angular_spread(vec3 direction, vec3 up, float rotation) {
     return max(0.0, cos(rotation)-cosine*sin(rotation)/max(sine, 1e-6));
 }
 
-vec3 refract_position(vec3 position) {
-    if (!refraction_active()) return position;
+vec3 refraction_offset(vec3 position) {
+    if (!refraction_active()) return vec3(0.0);
     vec3 a = refraction_to_atmosphere(position);
     float d = length(a);
-    if (d <= 0.0) return position;
+    if (d <= 0.0) return vec3(0.0);
     vec3 up, tangent;
     vec3 v = a/d;
     vec2 sample_value = refraction_lookup(v, d*u_refraction.escape.z, up, tangent);
-    if (sample_value.x == 0.0) return position;
-    vec3 apparent = v*cos(sample_value.x)+tangent*sin(sample_value.x);
-    return refraction_preserve_range(position, apparent, u_refraction.pole);
+    if (sample_value.x == 0.0) return vec3(0.0);
+    float range = length(position);
+    float half_sine = sin(0.5*sample_value.x);
+    vec3 delta = tangent*sin(sample_value.x)-v*(2.0*half_sine*half_sine);
+    vec3 e = refraction_from_atmosphere(delta)*(d/range);
+    vec3 n = position/range;
+    float k = dot(e, 2.0*n+e);
+    float m = sqrt(1.0+k);
+    return range*(e-n*(k/(1.0+m)))/m;
+}
+
+vec3 refract_position(vec3 position) {
+    return position+refraction_offset(position);
 }
 
 vec4 refract_direction(vec3 direction) {

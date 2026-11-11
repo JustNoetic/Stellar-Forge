@@ -36,6 +36,10 @@ layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 aerosol_extinction[4];
     vec4 aerosol_phase[512];
     vec4 view_ray[3];
+    vec4 limb_bend[64];
+    vec4 star_radiance[16];
+    vec4 star_disc[16];
+    vec4 limb_image;
 } atm;
 
 const float DEPTH_DISTANCE_TOLERANCE = 1e-6;
@@ -460,14 +464,23 @@ vec3 sky_direction(ivec2 pixel) {
     return vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
 }
 
+float exterior_sky_angle(vec3 direction) {
+    float slope = length(direction.xy)/max(-direction.z, 0.0);
+    return slope < 0.01 ? slope*(1.0-slope*slope/3.0) : atan(length(direction.xy), -direction.z);
+}
+
+vec2 sky_grid_uv(float x, float t, bool lower, ivec2 size) {
+    float y = (lower ? float(size.y/2)+0.5 : 0.5) + t*float(size.y/2-1);
+    return vec2((0.5+x*float(size.x-1))/float(size.x), y/float(size.y));
+}
+
 vec2 sky_uv(vec3 direction, ivec2 size) {
     float theta = acos(clamp(direction.z, -1.0, 1.0));
     float r = atm.camera.z;
     bool lower;
     float t;
     if (r >= top_radius()) {
-        float slope = length(direction.xy)/max(-direction.z, 0.0);
-        float angle = slope < 0.01 ? slope*(1.0-slope*slope/3.0) : atan(length(direction.xy), -direction.z);
+        float angle = exterior_sky_angle(direction);
         float limb = precise_asin(clamp(bottom_radius()/r, 0.0, 1.0));
         float edge = precise_asin(clamp(top_radius()/r, 0.0, 1.0));
         lower = angle > limb;
@@ -480,9 +493,7 @@ vec2 sky_uv(vec3 direction, ivec2 size) {
                   : 1.0-sqrt(clamp(1.0-theta/horizon, 0.0, 1.0));
     }
     float phi = atan(direction.y, direction.x);
-    float x = (phi+ATM_PI)/(2.0*ATM_PI);
-    float y = (lower ? float(size.y/2)+0.5 : 0.5) + t*float(size.y/2-1);
-    return vec2((0.5+x*float(size.x-1))/float(size.x), y/float(size.y));
+    return sky_grid_uv((phi+ATM_PI)/(2.0*ATM_PI), t, lower, size);
 }
 
 vec2 sky_uv(vec3 direction) { return sky_uv(direction, SKY_SIZE); }

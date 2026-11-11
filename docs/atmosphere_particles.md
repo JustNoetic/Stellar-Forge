@@ -28,7 +28,7 @@ Up to four populations have independent materials, sizes, columns, profiles and 
 
 For a lognormal number distribution, `sigma² = ln(1 + effective_variance)` and `ln(r_m) = ln(effective_radius_um) - 2.5 sigma²`. Preparation integrates 48 log-radius bins over ±4.5 sigma. Homogeneous-sphere Mie coefficients use downward logarithmic-derivative and Riccati–Bessel recurrences. Cross sections determine extinction/scattering; angular amplitudes determine the unpolarized phase function. Cross sections use the sphere approximation. Ice and condensate angular tables use a smooth phase fitted to the Mie first moment; see [giant atmospheres](giant_atmospheres.md).
 
-Representative refractive indices at 680/550/440 nm:
+Representative refractive indices for the red/green/blue channels (the red samples were chosen near 680 nm; Mie size parameters now use 625/550/440 nm):
 
 | Material | Real part | Absorptive part, red/green/blue |
 | --- | --- | --- |

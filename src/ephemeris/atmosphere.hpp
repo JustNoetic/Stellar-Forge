@@ -11,6 +11,7 @@
 namespace sf::ephemeris {
 
 inline constexpr size_t MAX_AEROSOL_LAYERS = 4;
+inline constexpr double RGB_WAVELENGTHS_NM[] = {625.0, 550.0, 440.0};
 
 struct AerosolLayer {
     std::string material = "mineral_dust";
@@ -215,14 +216,13 @@ inline void from_json(const nlohmann::json& j, AtmosphereDefinition& a) {
     if (j.contains("beta_mie") && !j.contains("mie_extinction")) {
         double beta = j.at("beta_mie").get<double>()*1000.0;
         double alpha = j.contains("mie_angstrom") && !j.at("mie_angstrom").is_null() ? j.at("mie_angstrom").get<double>() : 1.2;
-        constexpr double wavelengths[] = {680.0, 550.0, 440.0};
         glm::vec3 albedo(1.0f);
         if (j.contains("mie_albedo")) {
             const auto& value = j.at("mie_albedo");
             if (value.is_number()) albedo = glm::vec3(value.get<float>());
             else albedo = {value.at(0).get<float>(), value.at(1).get<float>(), value.at(2).get<float>()};
         }
-        for (int c = 0; c < 3; ++c) a.mie_extinction[c] = float(beta*std::pow(wavelengths[c]/550.0, -alpha));
+        for (int c = 0; c < 3; ++c) a.mie_extinction[c] = float(beta*std::pow(RGB_WAVELENGTHS_NM[c]/550.0, -alpha));
         a.mie_scattering = a.mie_extinction*albedo;
     }
     if (version == 1 && a.physical && a.automatic_aerosols && !j.contains("aerosols")) {

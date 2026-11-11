@@ -101,7 +101,7 @@ LaunchOptions parse_options(int argc, char** argv) {
             else if (scene == "overview" || scene == "approach" || scene == "analytical" || scene == "nbody" || scene == "spice"
                      || scene == "earth-full" || scene == "earth-eclipse" || scene == "earth-ground" || scene == "earth-ground-rings"
                      || scene == "earth-ground-turn" || scene == "earth-ground-rings-turn" || scene == "earth-disc"
-                     || scene == "earth-limb" || scene == "earth-full-rings" || scene == "saturn" || scene == "saturn-midnight" || scene == "earth-ground-live"
+                     || scene == "earth-limb" || scene == "earth-backlit" || scene == "earth-backlit-zoom" || scene == "earth-full-rings" || scene == "saturn" || scene == "saturn-midnight" || scene == "earth-ground-live"
                      || scene == "earth-ground-rings-live" || scene == "earth-full-live" || scene == "earth-terrain-still"
                      || scene == "earth-terrain-walk" || scene == "earth-terrain-fly" || scene == "earth-terrain-turn")
                 o.scenes = {std::string(scene)};
@@ -125,7 +125,7 @@ std::string_view help() {
   --benchmark-simulation inline|worker|pipeline  Inline, wait per step, or overlap rendering (inline)
   --benchmark-scene all|overview|approach|analytical|nbody|spice|earth-full|earth-eclipse
                     audit|earth-ground|earth-ground-rings|earth-ground-turn|earth-ground-rings-turn
-                    earth-disc|earth-limb|earth-full-rings|saturn|saturn-midnight
+                    earth-disc|earth-limb|earth-backlit|earth-backlit-zoom|earth-full-rings|saturn|saturn-midnight
                     earth-ground-live|earth-ground-rings-live|earth-full-live
                     terrain-navigation|earth-terrain-still|earth-terrain-walk|earth-terrain-fly|earth-terrain-turn
   --benchmark-variant baseline|no-atmosphere|no-aerial|no-shadows|no-refraction|no-secondary|no-orbits

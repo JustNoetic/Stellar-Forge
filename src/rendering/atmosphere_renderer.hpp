@@ -49,6 +49,10 @@ struct alignas(16) AtmosphereParametersGPU {
     std::array<glm::vec4, ephemeris::MAX_AEROSOL_LAYERS> aerosol_shape{}, aerosol_scattering{}, aerosol_extinction{};
     std::array<glm::vec4, ephemeris::MAX_AEROSOL_LAYERS*physics::AEROSOL_PHASE_SAMPLES> aerosol_phase{};
     std::array<glm::vec4, 3> view_ray{};
+    std::array<glm::vec4, 64> limb_bend{};
+    std::array<glm::vec4, 16> star_radiance{};
+    std::array<glm::vec4, 16> star_disc{};
+    glm::vec4 limb_image{};
 };
 
 AtmosphereParametersGPU make_atmosphere_parameters(const ephemeris::BodyDefinition& body,
@@ -141,6 +145,7 @@ private:
         AtmosphereShadowHeaderGPU shadow_header{};
         std::vector<AtmosphereShadowCasterGPU> shadow_casters;
         bool shadow_active = false;
+        bool limb_active = false;
         bool shadow_history_valid = false, shadow_history_reusable = false;
         bool shadow_history_reproject = false, shadow_rotation_enabled = false;
         uint64_t shadow_recorded_prepare = 0, shadow_ring_revision = 0;
@@ -168,6 +173,8 @@ private:
     rhi::Pipeline molecular_sky_pipeline_, molecular_aerial_pipeline_;
     rhi::Pipeline legacy_sky_pipeline_, legacy_aerial_pipeline_;
     rhi::Pipeline dual_source_pipeline_, surface_pipeline_;
+    rhi::Pipeline limb_dual_source_pipeline_, limb_transparent_pipeline_, limb_unshadowed_transparent_pipeline_;
+    rhi::Pipeline limb_secondary_dual_source_pipeline_, limb_secondary_transparent_pipeline_, limb_secondary_unshadowed_transparent_pipeline_;
     rhi::Pipeline stellar_source_pipeline_;
     std::array<rhi::Pipeline, 6> secondary_bake_pipelines_;
     std::array<rhi::Pipeline, 24> secondary_approximate_pipelines_;

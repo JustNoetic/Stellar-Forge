@@ -39,7 +39,17 @@ float bloom_spline(float distance) {
 
 const int BLOOM_HALO_SCALE = 4;
 
+vec3 bloom_halo(sampler2D halo, ivec2 pixel) {
+    vec2 size = vec2(textureSize(halo, 0));
+    vec2 grid = (vec2(pixel)+0.5)/float(BLOOM_HALO_SCALE)-0.5;
+    vec2 base = floor(grid), f = grid-base, g = 1.0-f;
+    vec2 near = (g*g*g+3.0*f*f*f-6.0*f*f+4.0)/6.0, far = 1.0-near;
+    vec2 low = (base-0.5+(3.0*f*f*f-6.0*f*f+4.0)/(6.0*near))/size;
+    vec2 high = (base+1.5+f*f*f/(6.0*far))/size;
+    return near.x*near.y*bloom_sample(halo, low)+far.x*near.y*bloom_sample(halo, vec2(high.x, low.y))
+         + near.x*far.y*bloom_sample(halo, vec2(low.x, high.y))+far.x*far.y*bloom_sample(halo, high);
+}
+
 vec3 bloom_resolve(vec3 scene, vec3 physical, sampler2D halo, ivec2 pixel, float strength, float limit) {
-    vec2 uv = (vec2(pixel)+0.5)/(float(BLOOM_HALO_SCALE)*vec2(textureSize(halo, 0)));
-    return bloom_finite(bloom_finite(scene)+strength*(bloom_sample(halo, uv)-bloom_extract(physical, limit)));
+    return bloom_finite(bloom_finite(scene)+strength*(bloom_halo(halo, pixel)-bloom_extract(physical, limit)));
 }

@@ -53,7 +53,7 @@ void main() {
     f_world_pos = world_pos;
     f_body_offset = offset;
     f_normal = adj_norm;
-    vec3 apparent = refract_position(world_pos);
+    vec3 apparent = b.color_is_star.w > 0.5 && refraction_exterior() ? world_pos : refract_position(world_pos);
     f_apparent_pos = apparent;
     gl_Position = u_scene.projection * vec4(b.view_center.xyz + mat3(u_scene.view) * (offset + apparent - world_pos), 1.0);
 }

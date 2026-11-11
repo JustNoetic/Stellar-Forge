@@ -105,9 +105,9 @@ void main() {
     vec3 color = 0.25 + 0.65 * vec3(hash & 255u, (hash >> 8u) & 255u, (hash >> 16u) & 255u) / 255.0;
     f_tile_color = vec4(color, float(tile.metadata.w));
     f_tile_uv = vec2(grid) / 16.0;
-    vec3 apparent = refract_position(f_world_pos);
-    f_apparent_pos = apparent;
-    vec3 shift = mat3(u_scene.view) * (apparent - f_world_pos);
+    vec3 refraction = refraction_offset(f_world_pos);
+    f_apparent_pos = f_world_pos + refraction;
+    vec3 shift = mat3(u_scene.view) * refraction;
     gl_Position = u_scene.projection * vec4(vec3(eye) + shift, 1.0);
 #if defined(TERRAIN_PRECISE_PROJECTION) || defined(TERRAIN_CACHED_FP64)
     dvec3 precise_eye = dvec3(tile.anchor_high.xyz) + dvec3(tile.anchor_low.xyz)

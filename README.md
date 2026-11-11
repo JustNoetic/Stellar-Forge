@@ -105,10 +105,12 @@ cmake --build build --parallel
 | `STELLAR_BUILD_RENDER_TESTS` | `OFF` | Build GPU rendering contract and visual regression suites |
 | `STELLAR_TEST_EPHEMERIS` | `OFF` | Enable SPICE ephemeris tests against locally installed NAIF kernels |
 
-### Creating a Self-Contained Distribution (`dist/`)
-```powershell
-cmake --install build --prefix dist
+### Creating a Self-Contained Release Archive (`dist/`)
+Run the release packager to build `StellarForge.exe` (Release), stage only the essential runtime files (`shaders/`, `scripts/`, `data/gaia/stars.bin`, `data/systems/`, `cspice.dll`, `artemis2.bsp`, `stbn_scalar.bin`, `Saturn/Rings.png`), and compress them into `dist/StellarForge-v2.0.0-win64.zip` (~20 MB)—automatically omitting the multi-gigabyte NAIF kernels, tile caches, and raw planetary source textures:
+```bat
+.\package_release.bat
 ```
+*(Pass `--skip-build` to package an existing build, or `--include-textures-zip` to also generate a separate `StellarForge-v2.0.0-SolarSystem-SourceTextures.zip` archive for GitHub Releases.)*
 
 ---
 

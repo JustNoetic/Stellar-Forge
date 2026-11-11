@@ -100,31 +100,7 @@ vec3 finite_transmittance(vec3 x, vec3 p, vec3 direction, vec3 extinction, float
     return mix(exp(-extinction * path), T_lut, smoothstep(0.5, 2.0, path));
 }
 
-bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float span, float depth, out vec3 L, out vec3 T) {
-    float path = span;
-    bool finite_endpoint = false;
-    if (depth > 0.0) {
-        vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
-        float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
-        path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
-        if (path <= 0.0) return false;
-        if (atm.depth_params.y == 0.0) {
-            vec3 x = atmosphere_entry(d, segment.x);
-            vec3 p = x+d*path;
-            vec3 r, m, e;
-            medium((x+p)*0.5, r, m, e);
-            T = finite_transmittance(x, p, d, e, path);
-            L = vec3(0.0);
-            return true;
-        }
-    }
-    if (finite_endpoint) {
-        aerial_transport(d, span, path, L, T);
-    } else {
-        vec2 uv = sky_uv(d);
-        L = textureLod(radiance_lut, uv, 0.0).rgb;
-        T = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
-    }
+void atmosphere_shadow_loss(ivec2 pixel, vec3 d, vec2 segment, float path, float depth, inout vec3 L) {
 #ifndef ATMOSPHERE_UNSHADOWED
     if (shadow_flags.x != 0u) {
         if (any(greaterThan(L, vec3(0.0)))) {
@@ -151,6 +127,34 @@ bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float
         }
     }
 #endif
+}
+
+bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float span, float depth, out vec3 L, out vec3 T) {
+    float path = span;
+    bool finite_endpoint = false;
+    if (depth > 0.0) {
+        vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
+        float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
+        path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
+        if (path <= 0.0) return false;
+        if (atm.depth_params.y == 0.0) {
+            vec3 x = atmosphere_entry(d, segment.x);
+            vec3 p = x+d*path;
+            vec3 r, m, e;
+            medium((x+p)*0.5, r, m, e);
+            T = finite_transmittance(x, p, d, e, path);
+            L = vec3(0.0);
+            return true;
+        }
+    }
+    if (finite_endpoint) {
+        aerial_transport(d, span, path, L, T);
+    } else {
+        vec2 uv = sky_uv(d);
+        L = textureLod(radiance_lut, uv, 0.0).rgb;
+        T = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
+    }
+    atmosphere_shadow_loss(pixel, d, segment, path, depth, L);
 #ifdef ATMOSPHERE_SECONDARY
     L += secondary.irradiance.rgb*secondary_radiance(d, span, path, finite_endpoint);
 #endif
@@ -158,12 +162,196 @@ bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float
     return true;
 }
 
+#ifdef ATMOSPHERE_LIMB
+const float LIMB_RESOLVED_PIXELS = 32.0;
+const int LIMB_MAX_TAPS = 16;
+const int LIMB_BEND_ROWS = 64;
+
+struct LimbFootprint { vec2 across; float center, wide, narrow, limb, edge, azimuth; bool resolved; };
+
+bool limb_footprint(vec2 ndc, vec3 d, ivec2 size, out LimbFootprint f) {
+    float sine = length(d.xy);
+    if (sine < atm.limb_image.z || sine > atm.limb_image.w || d.z >= 0.0) return false;
+    float r = atm.camera.z;
+    f.limb = precise_asin(clamp(bottom_radius()/r, 0.0, 1.0));
+    f.edge = precise_asin(clamp(top_radius()/r, 0.0, 1.0));
+    f.center = exterior_sky_angle(d);
+    vec3 row_x = vec3(atm.view_ray[0].x, atm.view_ray[1].x, atm.view_ray[2].x);
+    vec3 row_y = vec3(atm.view_ray[0].y, atm.view_ray[1].y, atm.view_ray[2].y);
+    vec3 row_z = vec3(atm.view_ray[0].z, atm.view_ray[1].z, atm.view_ray[2].z);
+    f.across = d.xy/max(sine, 1e-30);
+    vec3 radial = vec3(f.across*-d.z, sine);
+    vec2 steps = abs(vec2(dot(radial, row_x), dot(radial, row_y)))*2.0/(vec2(size)*length(row_x*ndc.x+row_y*ndc.y+row_z));
+    f.wide = max(steps.x, steps.y);
+    f.narrow = max(min(steps.x, steps.y), 1e-3*f.wide);
+    float reach = 0.5*(f.wide+f.narrow);
+    if (f.center+reach <= f.limb || f.center-reach >= f.edge) return false;
+    f.resolved = f.edge-f.limb > LIMB_RESOLVED_PIXELS*f.wide;
+    if (f.resolved && atm.limb_image.x < 0.5) return false;
+    f.azimuth = (atan(d.y, d.x)+ATM_PI)/(2.0*ATM_PI);
+    return true;
+}
+
+float limb_coverage(LimbFootprint f, float angle) {
+    float offset = angle-f.center, x = abs(offset);
+    float outside = max(0.5*(f.wide+f.narrow)-x, 0.0);
+    float area = x <= 0.5*(f.wide-f.narrow) ? x/f.wide : 0.5-0.5*outside*outside/(f.wide*f.narrow);
+    return 0.5+sign(offset)*area;
+}
+
+float limb_row(LimbFootprint f, bool lower, float angle) {
+    return lower ? sqrt(clamp((angle-f.limb)/(f.edge-f.limb), 0.0, 1.0)) : 1.0-sqrt(clamp(1.0-angle/f.limb, 0.0, 1.0));
+}
+
+float limb_row_angle(LimbFootprint f, bool lower, float t) {
+    return lower ? f.limb+(f.edge-f.limb)*t*t : f.limb*t*(2.0-t);
+}
+
+void limb_integrate(LimbFootprint f, bool lower, inout vec3 L, out vec3 T, out float weight) {
+    float reach = 0.5*(f.wide+f.narrow);
+    float first = limb_row(f, lower, lower ? max(f.center-reach, f.limb) : f.center-reach);
+    float last = limb_row(f, lower, lower ? f.center+reach : min(f.center+reach, f.limb));
+    T = vec3(0.0);
+    weight = 0.0;
+    if (last <= first) return;
+    int taps = clamp(int(ceil((last-first)*float(SKY_SIZE.y/2-1))), 1, LIMB_MAX_TAPS);
+    float below = limb_coverage(f, limb_row_angle(f, lower, first));
+    for (int i = 0; i < taps; ++i) {
+        float above = limb_coverage(f, limb_row_angle(f, lower, mix(first, last, float(i+1)/float(taps))));
+        float t = mix(first, last, (float(i)+0.5)/float(taps));
+        float share = above-below;
+        vec2 uv = sky_grid_uv(f.azimuth, t, lower, SKY_SIZE);
+        L += share*textureLod(radiance_lut, uv, 0.0).rgb;
+        T += share*clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
+#ifdef ATMOSPHERE_SECONDARY
+        L += share*secondary.irradiance.rgb*textureLod(secondary_sky_lut, sky_grid_uv(f.azimuth, t, lower, textureSize(secondary_sky_lut, 0)), 0.0).rgb;
+#endif
+        weight += share;
+        below = above;
+    }
+}
+
+vec3 limb_pole() {
+    return vec3(dot(atm.world_pole.xyz, atm.axis_x.xyz), dot(atm.world_pole.xyz, atm.axis_y.xyz), dot(atm.world_pole.xyz, atm.axis_z.xyz));
+}
+
+vec3 limb_bend_at(float t) {
+    float row = t*float(LIMB_BEND_ROWS-1);
+    int index = min(int(row), LIMB_BEND_ROWS-2);
+    return mix(atm.limb_bend[index].rgb, atm.limb_bend[index+1].rgb, row-float(index));
+}
+
+vec3 limb_star_image(LimbFootprint f) {
+    if (atm.limb_image.x < 0.5) return vec3(0.0);
+    float reach = 0.5*(f.wide+f.narrow);
+    float first = limb_row(f, true, f.center-reach), last = limb_row(f, true, f.center+reach);
+    if (last <= first) return vec3(0.0);
+    float rows = float(LIMB_BEND_ROWS-1);
+    int begin = int(first*rows), end = min(int(ceil(last*rows)), LIMB_BEND_ROWS-1);
+    float lowest = limb_row_angle(f, true, first), highest = limb_row_angle(f, true, last);
+    vec3 high_bend = limb_bend_at(last);
+    float exit_low = lowest-atm.limb_image.y;
+    float exit_high = highest-min(high_bend.r, min(high_bend.g, high_bend.b));
+    vec3 image = vec3(0.0);
+    vec3 pole = limb_pole();
+    vec3 plane = vec3(-f.across.y, f.across.x, 0.0);
+    plane = normalize(plane+pole*(dot(plane, pole)*atm.world_pole.w));
+    for (uint star = 0u; star < uint(atm.camera.w); ++star) {
+        vec3 radiance = atm.star_radiance[star].rgb;
+        vec4 sun = atm.star_disc[star];
+        float side = dot(plane, sun.xyz);
+        if (!any(greaterThan(radiance, vec3(0.0))) || abs(side) >= sun.w) continue;
+        float true_chord = sqrt(sun.w*sun.w-side*side);
+        vec3 nearest = normalize(sun.xyz-plane*side), along = cross(plane, nearest);
+        vec3 near_end = nearest*cos(true_chord)-along*sin(true_chord), far_end = nearest*cos(true_chord)+along*sin(true_chord);
+        near_end += pole*(dot(near_end, pole)*atm.world_pole.w);
+        far_end += pole*(dot(far_end, pole)*atm.world_pole.w);
+        float s0 = atan(dot(f.across, near_end.xy), -near_end.z), s1 = atan(dot(f.across, far_end.xy), -far_end.z);
+        float center = 0.5*(s0+s1), chord = 0.5*abs(s1-s0);
+        float to_true = true_chord/max(chord, 1e-30);
+        if (center+chord < exit_low || center-chord > exit_high) continue;
+        for (int row = begin; row < end; ++row) {
+            if (atm.limb_bend[row].w < 0.5 || atm.limb_bend[row+1].w < 0.5) continue;
+            float t0 = max(float(row)/rows, first), t1 = min(float(row+1)/rows, last);
+            if (t1 <= t0) continue;
+            float a0 = limb_row_angle(f, true, t0), a1 = limb_row_angle(f, true, t1);
+            vec3 start = a0-limb_bend_at(t0), slope = max(a1-limb_bend_at(t1)-start, vec3(1e-12));
+            vec3 enter = clamp((center-chord-start)/slope, 0.0, 1.0), leave = clamp((center+chord-start)/slope, 0.0, 1.0);
+            if (all(lessThanEqual(leave, enter))) continue;
+            for (int channel = 0; channel < 3; ++channel) {
+                if (leave[channel] <= enter[channel]) continue;
+                float share = limb_coverage(f, mix(a0, a1, leave[channel]))-limb_coverage(f, mix(a0, a1, enter[channel]));
+                float middle = 0.5*(enter[channel]+leave[channel]);
+                float offset = (start[channel]+slope[channel]*middle-center)*to_true;
+                float rim = 1.0-sqrt(max(1.0-(side*side+offset*offset)/(sun.w*sun.w), 0.0));
+                vec2 uv = sky_grid_uv(f.azimuth, mix(t0, t1, middle), true, SKY_SIZE);
+                float transmitted = clamp(textureLod(throughput_lut, uv, 0.0)[channel], 0.0, 1.0);
+                image[channel] += share*transmitted*radiance[channel]*(1.0-0.4*rim-0.2*rim*rim);
+            }
+        }
+    }
+    return image;
+}
+
+bool limb_star_behind(vec3 d) {
+    if (atm.limb_image.x < 0.5) return false;
+    vec3 pole = limb_pole();
+    vec3 seen = normalize(d-pole*(dot(d, pole)*atm.world_pole.w/(1.0+atm.world_pole.w)));
+    for (uint star = 0u; star < uint(atm.camera.w); ++star) {
+        vec4 sun = atm.star_disc[star];
+        if (dot(seen, sun.xyz) > 0.0 && length(cross(seen, sun.xyz)) < sun.w) return true;
+    }
+    return false;
+}
+
+float limb_depth_distance(vec2 ndc, float depth) {
+    vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
+    return length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
+}
+
+bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment, float span, float depth, out vec3 L, out vec3 T) {
+    float path = span;
+    bool surface_seen = false;
+    if (depth > 0.0) {
+        float distance = limb_depth_distance(ndc, depth);
+        float closest = -dot(atm.camera.xyz, d);
+        if (distance < closest-top_radius()) return false;
+        surface_seen = distance < closest+top_radius();
+        bool finite_endpoint;
+        if (span > 0.0) path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
+    }
+    if (f.resolved) {
+        L = vec3(0.0);
+        T = vec3(1.0);
+        if (span > 0.0 && !atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, L, T)) return false;
+    } else {
+        L = vec3(0.0);
+        vec3 ground, sky;
+        float ground_weight, sky_weight;
+        limb_integrate(f, false, L, ground, ground_weight);
+        limb_integrate(f, true, L, sky, sky_weight);
+        float space = max(1.0-ground_weight-sky_weight, 0.0);
+        T = surface_seen && ground_weight > 0.0 ? ground/ground_weight
+          : sky_weight+space > 0.0 ? (sky+space)/(sky_weight+space) : ground/max(ground_weight, 1e-20);
+        if (span > 0.0) atmosphere_shadow_loss(pixel, d, segment, path, depth, L);
+        L *= atm.depth_params.w;
+    }
+    if (!surface_seen || !f.resolved) L += limb_star_image(f)*atm.depth_params.w;
+    if (!surface_seen && limb_star_behind(d)) T = vec3(1.0-limb_coverage(f, f.edge));
+    return true;
+}
+#endif
+
 bool atmosphere_transport(ivec2 pixel, ivec2 size, float depth, out vec3 L, out vec3 T) {
     if (any(greaterThanEqual(pixel, size))) return false;
     vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
     vec3 d = view_direction(ndc);
     float span;
     vec2 segment = atmosphere_segment(atm.camera.xyz, d, span);
+#ifdef ATMOSPHERE_LIMB
+    LimbFootprint limb;
+    if (limb_footprint(ndc, d, size, limb)) return limb_transport(pixel, limb, ndc, d, segment, span, depth, L, T);
+#endif
     if (span <= 0.0) return false;
     return atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, L, T);
 }
@@ -180,12 +368,24 @@ void main() {
         vec3 transparent_dir = view_direction(transparent_ndc);
         float transparent_span;
         vec2 transparent_segment = atmosphere_segment(atm.camera.xyz, transparent_dir, transparent_span);
+#ifdef ATMOSPHERE_LIMB
+        LimbFootprint transparent_limb;
+        bool thin_limb = limb_footprint(transparent_ndc, transparent_dir, transparent_size, transparent_limb) && !transparent_limb.resolved;
+        float limb_cover = thin_limb ? limb_coverage(transparent_limb, transparent_limb.limb) : 1.0;
+        vec3 limb_light = thin_limb ? limb_star_image(transparent_limb)*atm.depth_params.w*atm.depth_params.x : vec3(0.0);
+#endif
         if (transparent_span > 0.0) {
             while (current != TRANSPARENCY_END) {
                 uvec4 fragment = fragments[current];
                 if (atmosphere_transport_ray(transparent_pixel, transparent_ndc, transparent_dir, transparent_segment, transparent_span, uintBitsToFloat(fragment.z), L, T)) {
                     vec4 color = transparent_color(fragment);
                     color.rgb = color.rgb*T+color.a*L*atm.depth_params.x;
+#ifdef ATMOSPHERE_LIMB
+                    if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, uintBitsToFloat(fragment.z))) < top_radius()) {
+                        color *= limb_cover;
+                        color.rgb += color.a*limb_light;
+                    }
+#endif
                     fragments[current].xy = pack_transparent_color(color, transparent_excludes_bloom(fragment));
                 }
                 current = fragment.w;

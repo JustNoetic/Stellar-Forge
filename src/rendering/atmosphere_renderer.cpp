@@ -15,7 +15,8 @@
 
 namespace sf::rendering {
 
-static_assert(sizeof(AtmosphereParametersGPU) == 13376);
+static_assert(sizeof(AtmosphereParametersGPU) == 14928);
+constexpr double LIMB_RESOLVED_PIXELS = 32.0;
 static_assert(sizeof(AtmosphereParametersGPU) <= 16384);
 static_assert(sizeof(AtmosphereShadowHeaderGPU) == 560);
 static_assert(sizeof(AtmosphereShadowCasterGPU) == 48);
@@ -272,6 +273,12 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
         "atmosphere/transparent.comp", transparent_bindings);
     unshadowed_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/transparent.comp", transparent_bindings, 0, unshadowed);
+    const std::pair<std::string, std::string> limb[] = {{"ATMOSPHERE_LIMB", "1"}};
+    const std::pair<std::string, std::string> unshadowed_limb[] = {{"ATMOSPHERE_UNSHADOWED", "1"}, {"ATMOSPHERE_LIMB", "1"}};
+    limb_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/transparent.comp", transparent_bindings, 0, limb);
+    limb_unshadowed_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/transparent.comp", transparent_bindings, 0, unshadowed_limb);
     surface_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/surface_irradiance.comp", source_bindings, sizeof(glm::uvec2));
     surface_lut_ = ctx.create_image_2d(128, 32, VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, 1, 96);
@@ -298,6 +305,7 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
         rhi::GraphicsPipelineDesc desc;
         desc.vert_path = "post/fullscreen.vert";
         desc.frag_path = "atmosphere/composite.frag";
+        desc.capture_statistics = ctx.pipeline_statistics_enabled();
         for (auto binding : composite_bindings) {
             if (binding.binding == 4) continue;
             binding.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -308,6 +316,8 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
         desc.cull_mode = VK_CULL_MODE_NONE;
         desc.dual_source_blend = true;
         dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+        desc.macros = {{"ATMOSPHERE_LIMB", "1"}};
+        limb_dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     }
 }
 
@@ -330,10 +340,17 @@ void AtmosphereRenderer::init_secondary(rhi::VkContext& ctx) {
         "atmosphere/transparent.comp", composite, sizeof(glm::vec4), macros);
     secondary_unshadowed_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/transparent.comp", composite, sizeof(glm::vec4), unshadowed);
+    const std::pair<std::string, std::string> limb[] = {{"ATMOSPHERE_SECONDARY", "1"}, {"ATMOSPHERE_LIMB", "1"}};
+    const std::pair<std::string, std::string> unshadowed_limb[] = {{"ATMOSPHERE_SECONDARY", "1"}, {"ATMOSPHERE_UNSHADOWED", "1"}, {"ATMOSPHERE_LIMB", "1"}};
+    limb_secondary_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/transparent.comp", composite, sizeof(glm::vec4), limb);
+    limb_secondary_unshadowed_transparent_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
+        "atmosphere/transparent.comp", composite, sizeof(glm::vec4), unshadowed_limb);
     if (ctx.dual_source_blend_enabled()) {
         rhi::GraphicsPipelineDesc desc;
         desc.vert_path = "post/fullscreen.vert";
         desc.frag_path = "atmosphere/composite.frag";
+        desc.capture_statistics = ctx.pipeline_statistics_enabled();
         desc.macros.assign(std::begin(macros), std::end(macros));
         desc.push_constant_size = sizeof(glm::vec4);
         for (auto binding : composite) {
@@ -346,6 +363,8 @@ void AtmosphereRenderer::init_secondary(rhi::VkContext& ctx) {
         desc.cull_mode = VK_CULL_MODE_NONE;
         desc.dual_source_blend = true;
         secondary_dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+        desc.macros.assign(std::begin(limb), std::end(limb));
+        limb_secondary_dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     }
 }
 
@@ -388,6 +407,9 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, unshadowed_transparent_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, unshadowed_composite_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, dual_source_pipeline_);
+    for (auto* pipeline : {&limb_dual_source_pipeline_, &limb_transparent_pipeline_, &limb_unshadowed_transparent_pipeline_,
+                           &limb_secondary_dual_source_pipeline_, &limb_secondary_transparent_pipeline_, &limb_secondary_unshadowed_transparent_pipeline_})
+        rhi::ShaderCache::destroy_pipeline(ctx, *pipeline);
     rhi::ShaderCache::destroy_pipeline(ctx, surface_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, stellar_source_pipeline_);
     for (auto& pipeline : secondary_bake_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
@@ -668,6 +690,15 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
             float irradiance = settings.hdr_enabled ? static_cast<float>(std::max(star.definition.lum_eq, 0.0)/(d*d)) : 1.0f;
             if (!system.illuminates(s, candidate.index)) irradiance = 0.0f;
             p.sun_irradiance[index] = {star.definition.color_rgb*(irradiance*static_cast<float>(PI)), 0.0f};
+            double star_radius = std::max(star.definition.radius_au(), 1e-12);
+            float radiance = !system.illuminates(s, candidate.index) ? 0.0f :
+                settings.hdr_enabled ? static_cast<float>(std::max(star.definition.lum_eq, 0.0)/(star_radius*star_radius)) : 1.0f;
+            p.star_radiance[index] = {star.definition.color_rgb*radiance, 0.0f};
+            glm::dvec3 sight = star.render.position.value-eye;
+            double range = glm::length(sight);
+            glm::dvec3 seen = range > 1e-12 ? sight/range : glm::normalize(delta);
+            p.star_disc[index] = {glm::vec3(glm::dot(seen, x), glm::dot(seen, y), glm::dot(seen, z)),
+                float(std::asin(std::clamp(star.opaque_radius_au()/std::max(range, 1e-12), 1e-7, 1.0)))};
         }
         auto projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au());
         auto view = camera.view_matrix_eye_relative();
@@ -687,6 +718,41 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         double point_radius = b.opaque_radius_au()*AU_TO_KM/std::max(candidate.distance, 1e-12)*focal;
         float blend = float(std::clamp(point_radius-1.5, 0.0, 1.0));
         p.depth_params.w = blend*blend*(3.0f-2.0f*blend);
+        t.limb_active = false;
+        p.limb_image.z = 2.0f;
+        if (distance > p.radii_heights.y && settings.aerial_perspective_enabled) {
+            double limb = std::asin(std::clamp(double(p.radii_heights.x)/distance, 0.0, 1.0));
+            double edge = std::asin(std::clamp(double(p.radii_heights.y)/distance, 0.0, 1.0));
+            bool star_image = false;
+            if (settings.refraction_enabled && b.render.atmosphere && b.render.atmosphere->refraction)
+                for (uint32_t star = 0; star < uint32_t(p.camera.w); ++star) {
+                    glm::dvec3 seen{p.star_disc[star]};
+                    glm::dvec3 sun = atmosphere_space(seen.x*x+seen.y*y+seen.z*z);
+                    double separation = std::atan2(std::hypot(glm::dot(sun, x), glm::dot(sun, y)), -glm::dot(sun, z));
+                    star_image = star_image || (glm::any(glm::greaterThan(glm::vec3(p.star_radiance[star]), glm::vec3(0.0f))) &&
+                                                separation-p.star_disc[star].w/polar_ratio <= edge);
+                }
+            if (star_image) {
+                const auto& refraction = *b.render.atmosphere->refraction;
+                double horizon = refraction.horizon_impact(distance);
+                for (size_t row = 0; row < p.limb_bend.size(); ++row) {
+                    double t_row = double(row)/double(p.limb_bend.size()-1);
+                    double impact = distance*std::sin(limb+(edge-limb)*t_row*t_row);
+                    glm::dvec3 bend = refraction.total_deflection(impact);
+                    for (int channel = 0; channel < 3; ++channel) if (!std::isfinite(bend[channel])) bend[channel] = bend.y;
+                    bool visible = impact >= horizon && std::isfinite(bend.y);
+                    p.limb_bend[row] = {glm::vec3(bend), visible ? 1.0f : 0.0f};
+                    if (visible) p.limb_image.y = std::max(p.limb_image.y, float(std::max({bend.x, bend.y, bend.z})));
+                }
+                p.limb_image.x = 1.0f;
+            }
+            t.limb_active = star_image || (edge-limb)*focal < LIMB_RESOLVED_PIXELS;
+            if (t.limb_active) {
+                double margin = 1.5/std::max(focal, 1e-9);
+                p.limb_image.z = float(std::sin(std::max(limb-margin, 0.0)));
+                p.limb_image.w = float(std::sin(std::min(edge+margin, PI/2)));
+            }
+        }
         if (point_radius >= 2.5) t.point_valid = false;
         if (p.depth_params.w > 0.0f && !t.aerial_radiance) {
             t.aerial_radiance = ctx.create_image_3d(192, 108, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -745,6 +811,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         atmosphere_key.camera = p.camera;
         atmosphere_key.axis_x = p.axis_x; atmosphere_key.axis_y = p.axis_y; atmosphere_key.axis_z = p.axis_z;
         atmosphere_key.sun_direction = p.sun_direction;
+        atmosphere_key.star_disc = p.star_disc;
         atmosphere_key.sun_irradiance = p.sun_irradiance;
         atmosphere_key.inverse_view_projection = p.inverse_view_projection;
         atmosphere_key.depth_params = p.depth_params;
@@ -1379,7 +1446,11 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
             writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
             bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
-            auto& pipeline = t->secondary_active
+            auto& pipeline = t->limb_active
+                ? (t->secondary_active
+                    ? (shadow_shader ? limb_secondary_transparent_pipeline_ : limb_secondary_unshadowed_transparent_pipeline_)
+                    : (shadow_shader ? limb_transparent_pipeline_ : limb_unshadowed_transparent_pipeline_))
+                : t->secondary_active
                 ? (shadow_shader ? secondary_transparent_pipeline_ : secondary_unshadowed_transparent_pipeline_)
                 : (shadow_shader ? transparent_pipeline_ : unshadowed_transparent_pipeline_);
             if (t->secondary_active) {
@@ -1437,7 +1508,9 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             rhi::PushDescriptorWrite::sampled_image(17, t->shadow_active ? t->shadow_depth : surface_lut_, ctx.sampler_nearest_clamp()),
             rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
         if (dual_source_) {
-            auto& pipeline = t->secondary_active ? secondary_dual_source_pipeline_ : dual_source_pipeline_;
+            auto& pipeline = t->limb_active
+                ? (t->secondary_active ? limb_secondary_dual_source_pipeline_ : limb_dual_source_pipeline_)
+                : (t->secondary_active ? secondary_dual_source_pipeline_ : dual_source_pipeline_);
             std::vector<rhi::PushDescriptorWrite> graphics;
             for (const auto& write : writes) if (write.binding != 4) graphics.push_back(write);
             if (t->secondary_active) {

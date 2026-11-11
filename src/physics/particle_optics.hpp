@@ -100,7 +100,6 @@ inline PreparedAerosol prepare_aerosol(const ephemeris::AerosolLayer& layer, dou
     if (!ephemeris::valid_aerosol(layer)) throw std::invalid_argument("Invalid aerosol layer");
     PreparedAerosol result;
     result.shape = {layer.scale_height_km, layer.peak_km, layer.width_km, 0};
-    constexpr double wavelengths[] = {.680, .550, .440};
     glm::dvec3 extinction(0), scattering(0);
     std::array<glm::dvec3, AEROSOL_PHASE_SAMPLES> intensity{};
     double variance = std::log1p(layer.effective_variance), sigma = std::sqrt(variance);
@@ -110,7 +109,7 @@ inline PreparedAerosol prepare_aerosol(const ephemeris::AerosolLayer& layer, dou
         double radius = std::exp(center+z*sigma);
         double weight = std::exp(-.5*z*z)*radius*radius;
         for (int c = 0; c < 3; ++c) {
-            auto sphere = mie_sphere(particle_refractive_index(layer.material, c), 2*std::numbers::pi*radius/wavelengths[c]);
+            auto sphere = mie_sphere(particle_refractive_index(layer.material, c), 2*std::numbers::pi*radius/(ephemeris::RGB_WAVELENGTHS_NM[c]*1e-3));
             extinction[c] += weight*sphere.extinction;
             scattering[c] += weight*sphere.scattering;
             for (size_t i = 0; i < AEROSOL_PHASE_SAMPLES; ++i) {

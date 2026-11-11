@@ -7,7 +7,9 @@ layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D destination;
 layout(std430, set = 0, binding = 2) buffer Spikes { uvec4 command; BloomSpike spikes[]; };
 layout(push_constant) uniform Extract { vec2 direction; float highlight_limit; float diffraction; float threshold; uint capacity; } extract;
 
-const int APRON = 20;
+const int APRON = 22;
+const int BORDER = 3;
+const int TAPS = 10;
 shared vec4 light[APRON][APRON];
 shared vec3 rows[APRON][4];
 shared vec4 energy[64];
@@ -18,13 +20,13 @@ shared uint emitted_slot;
 shared vec2 profile_origin;
 shared vec2 spike_center;
 
-// Box 4 convolved with box 5: every full-resolution pixel lands on two quarter
-// texels per axis with a combined weight of 1/4, so flux is phase independent.
-const float TENT[8] = float[](1, 2, 3, 4, 4, 3, 2, 1);
+// Box 4 cubed: every full-resolution pixel lands on two or three quarter texels
+// per axis with a combined weight of 1/4, so flux is phase independent.
+const float KERNEL[TAPS] = float[](1, 3, 6, 10, 12, 12, 10, 6, 3, 1);
 
 void main() {
     ivec2 size = textureSize(source, 0);
-    ivec2 origin = ivec2(gl_WorkGroupID.xy)*16-2;
+    ivec2 origin = ivec2(gl_WorkGroupID.xy)*16-BORDER;
     uint index = gl_LocalInvocationIndex;
     vec4 tile_energy = vec4(0.0), tile_moments = vec4(0.0);
     float tile_cross = 0.0;
@@ -36,10 +38,10 @@ void main() {
         vec3 value = bloom_extract(raw, extract.highlight_limit);
         float spike = extract.diffraction*smoothstep(extract.threshold, 2.0*extract.threshold, max(raw.r, max(raw.g, raw.b)));
         light[texel.y][texel.x] = vec4(value, spike);
-        if (spike > 0.0 && all(greaterThanEqual(texel, ivec2(2))) && all(lessThan(texel, ivec2(18)))) {
+        if (spike > 0.0 && all(greaterThanEqual(texel, ivec2(BORDER))) && all(lessThan(texel, ivec2(BORDER+16)))) {
             vec3 spike_light = value*spike;
             float weight = dot(spike_light, BLOOM_LUMINANCE);
-            vec2 position = vec2(texel-2)+0.5;
+            vec2 position = vec2(texel-BORDER)+0.5;
             tile_energy += vec4(spike_light, weight);
             tile_moments += weight*vec4(position, position*position);
             tile_cross += weight*position.x*position.y;
@@ -67,10 +69,10 @@ void main() {
             if (slot < extract.capacity) {
                 vec4 m = moments[0]/total.w;
                 vec2 variance = max(m.zw-m.xy*m.xy, vec2(0.0))+1.0/12.0;
-                spike_center = vec2(origin+2)+m.xy;
+                spike_center = vec2(origin+BORDER)+m.xy;
                 spikes[slot].center_variance = vec4(spike_center, variance);
                 spikes[slot].energy_covariance = vec4(total.rgb, cross_moments[0]/total.w-m.x*m.y);
-                vec2 first = vec2(origin+2)+0.5, last = first+15.0;
+                vec2 first = vec2(origin+BORDER)+0.5, last = first+15.0;
                 for (uint arm = 0u; arm < 2u; ++arm) {
                     vec2 normal = bloom_spike_normal(extract.direction, arm);
                     profile_origin[arm] = floor(min(min(dot(first, normal), dot(last, normal)),
@@ -89,7 +91,7 @@ void main() {
         vec2 axis = vec2(normal.y, -normal.x);
         float bin = profile_origin[arm]+float(index%uint(BLOOM_SPIKE_BINS));
         vec3 sum = vec3(0.0);
-        for (int y = 2; y < 18; ++y) for (int x = 2; x < 18; ++x) {
+        for (int y = BORDER; y < BORDER+16; ++y) for (int x = BORDER; x < BORDER+16; ++x) {
             vec4 value = light[y][x];
             if (value.a <= 0.0) continue;
             vec2 position = vec2(origin+ivec2(x, y))+0.5;
@@ -102,12 +104,12 @@ void main() {
     barrier();
     for (uint i = index; i < uint(APRON*4); i += 64u) {
         int row = int(i/4u), column = int(i%4u)*4;
-        bool core_row = row >= 2 && row < 18;
+        bool core_row = row >= BORDER && row < BORDER+16;
         vec3 sum = vec3(0.0);
-        for (int x = 0; x < 8; ++x) {
+        for (int x = 0; x < TAPS; ++x) {
             vec4 value = light[row][column+x];
-            bool core = core_row && column+x >= 2 && column+x < 18;
-            sum += value.rgb*((1.0-(core && !emitted ? 0.0 : value.a))*TENT[x]);
+            bool core = core_row && column+x >= BORDER && column+x < BORDER+16;
+            sum += value.rgb*((1.0-(core && !emitted ? 0.0 : value.a))*KERNEL[x]);
         }
         rows[row][i%4u] = sum;
     }
@@ -117,7 +119,7 @@ void main() {
     ivec2 pixel = ivec2(gl_WorkGroupID.xy)*4+local;
     if (any(greaterThanEqual(pixel, imageSize(destination)))) return;
     vec3 value = vec3(0.0);
-    for (int y = 0; y < 8; ++y)
-        value += rows[local.y*4+y][local.x]*(TENT[y]/400.0);
+    for (int y = 0; y < TAPS; ++y)
+        value += rows[local.y*4+y][local.x]*(KERNEL[y]/4096.0);
     imageStore(destination, pixel, vec4(min(value, vec3(65000.0)), 1.0));
 }

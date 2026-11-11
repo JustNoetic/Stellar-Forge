@@ -21,14 +21,16 @@ struct GasOptics {
     glm::dvec3 absorption;
 };
 
+inline constexpr glm::dvec3 OZONE_CROSS_SECTION{3.74e-25, 3.5e-25, 1.582e-26};
+
 inline const std::array<GasOptics, 11> ATMOSPHERIC_GASES{{
     {"N2", .0280134, 1.000298, 1.034, {}}, {"O2", .0319988, 1.000271, 1.096, {}},
     {"Ar", .039948, 1.000281, 1.0, {}}, {"CO2", .0440095, 1.000450, 1.15, {}},
     {"CH4", .0160425, 1.000444, 1.0, {3.50986e-30, 6.70107e-31, 8.25387234042553e-32}},
     {"H2", .00201588, 1.000132, 1.02, {}}, {"He", .004002602, 1.000036, 1.0, {}},
     {"H2O", .01801528, 1.000252, 1.001, {}}, {"NH3", .01703052, 1.000376, 1.0, {}},
-    {"O3", .0479982, 1.000520, 1.03, {1.209e-25, 3.5e-25, 1.582e-26}},
-    {"SO2", .0640638, 1.000686, 1.075, {1e-29, 5e-29, 3e-28}}
+    {"O3", .0479982, 1.000520, 1.03, OZONE_CROSS_SECTION},
+    {"SO2", .0640638, 1.000686, 1.075, {2e-29, 5e-29, 3e-28}}
 }};
 
 struct GasState {
@@ -218,7 +220,6 @@ inline std::shared_ptr<const PreparedAtmosphere> prepare_atmosphere(const epheme
         if (a.pressure_pa > 0) for (const auto& layer : a.aerosols)
             result->aerosols.push_back(prepare_aerosol(layer, a.bottom_altitude_km));
     }
-    constexpr double wavelengths[] = {680e-9, 550e-9, 440e-9};
     double reference_density = 101325.0/(BOLTZMANN*273.15);
     glm::dvec3 rayleigh(0), absorption(0);
     for (const auto& gas : ATMOSPHERIC_GASES) {
@@ -228,7 +229,7 @@ inline std::shared_ptr<const PreparedAtmosphere> prepare_atmosphere(const epheme
         double ll = (gas.refractive_index*gas.refractive_index-1)/(gas.refractive_index*gas.refractive_index+2);
         for (int c = 0; c < 3; ++c)
             rayleigh[c] += fraction*24*std::pow(std::numbers::pi, 3)*ll*ll*gas.king_factor/
-                (std::pow(wavelengths[c], 4)*reference_density*reference_density);
+                (std::pow(ephemeris::RGB_WAVELENGTHS_NM[c]*1e-9, 4)*reference_density*reference_density);
         absorption += fraction*gas.absorption;
     }
     result->rayleigh = rayleigh*result->surface.number_density_m3*1000.0;
@@ -236,7 +237,7 @@ inline std::shared_ptr<const PreparedAtmosphere> prepare_atmosphere(const epheme
     double integral_m = a.ozone_width_km*1000*std::sqrt(std::numbers::pi/2)*
         std::erfc(-a.ozone_peak_km/(std::sqrt(2.0)*a.ozone_width_km));
     double ozone_peak_density = a.pressure_pa > 0 ? a.ozone_column_du*2.687e20/integral_m : 0;
-    result->ozone_absorption = glm::dvec3(1.209e-25, 3.5e-25, 1.582e-26)*ozone_peak_density*1000.0;
+    result->ozone_absorption = OZONE_CROSS_SECTION*ozone_peak_density*1000.0;
     double top = a.height_km;
     if (a.automatic_height) {
         top = std::max(1.0, a.ozone_column_du > 0 ? a.ozone_peak_km+6*a.ozone_width_km : 1.0);

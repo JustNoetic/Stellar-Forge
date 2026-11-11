@@ -143,7 +143,7 @@ if(WIN32)
 endif()
 
 if(MINGW)
-    target_link_options(StellarForge PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic)
+    target_link_options(StellarForge PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
 target_link_libraries(StellarForge PRIVATE
@@ -172,9 +172,13 @@ endif()
 # --- Deployment / Packaging Staging ---
 install(TARGETS StellarForge RUNTIME DESTINATION .)
 install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/bake_textures.bat" DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md" DESTINATION . OPTIONAL)
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data" DESTINATION .
     PATTERN "settings.json" EXCLUDE
     PATTERN "settings.json.tmp" EXCLUDE
+    PATTERN "cache" EXCLUDE
+    PATTERN "tiles" EXCLUDE
+    PATTERN "kernels/default" EXCLUDE
 )
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders" DESTINATION .
     PATTERN "tests" EXCLUDE
@@ -183,4 +187,6 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/scripts" DESTINATION .
     PATTERN "__pycache__" EXCLUDE
     PATTERN "*.pyc" EXCLUDE
 )
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/textures" DESTINATION .)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/textures/noise/stbn_scalar.bin" DESTINATION "textures/noise" OPTIONAL)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/textures/Solar System/source_manifest.json" DESTINATION "textures/Solar System" OPTIONAL)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/textures/Solar System/Saturn/Rings.png" DESTINATION "textures/Solar System/Saturn" OPTIONAL)

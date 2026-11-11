@@ -100,6 +100,15 @@ inline Camera audit_camera(const ephemeris::SystemSnapshot& system, std::string_
         camera.cam_look_aim = true;
         return camera;
     }
+    if (scene.starts_with("earth-backlit")) {
+        double radius = body.definition.radius_au(), angular = std::asin(1.0/60.0);
+        auto side = glm::normalize(glm::cross(body.render.pole, sun));
+        auto forward = glm::normalize(sun*std::cos(0.2*angular)+side*std::sin(0.2*angular));
+        camera.cam_pos_rel = -forward*(60.0*radius);
+        camera.fov_deg = scene == "earth-backlit-zoom" ? 3.6 : 34.5;
+        audit_look(camera, forward, glm::normalize(body.render.pole-forward*glm::dot(body.render.pole, forward)));
+        return camera;
+    }
     auto normal = scene.starts_with("earth-ground") || scene == "earth-full-rings"
         ? audit_shadow_direction(system, camera.tracking_idx) : sun;
     double radius = body.definition.radius_au();

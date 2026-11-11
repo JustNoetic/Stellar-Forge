@@ -16,20 +16,34 @@ sparse cross sprites on top of that halo instead of convolving the whole image.
 ## First level and spike sources
 
 `bloom_extract.comp` builds the first, quarter-resolution level. Each 8×8
-workgroup covers a 16×16 full-resolution tile and loads its 20×20 apron into
+workgroup covers a 16×16 full-resolution tile and loads its 22×22 apron into
 shared memory once, applying highlight extraction per texel. Sixteen of its
-invocations then write the tile's 4×4 quarter-resolution texels, each an 8×8
-separable tent (box 4 ⊗ box 5, weights 1 2 3 4 4 3 2 1) centred on its 4×4
-footprint. Every source pixel reaches two texels per axis with a combined
-weight of 1/4, so flux does not depend on subpixel phase. Levels 2–5 use the
-13-tap bilinear downsample.
+invocations then write the tile's 4×4 quarter-resolution texels, each a 10×10
+separable quadratic B-spline (box 4 cubed, weights 1 3 6 10 12 12 10 6 3 1)
+centred on its 4×4 footprint. Every source pixel reaches two or three texels per
+axis with a combined weight of 1/4, so flux does not depend on subpixel phase.
+Levels 2–5 use the 13-tap bilinear downsample.
+
+Half of the halo's energy lands within about 5 pixels of its source, close to the
+4-pixel quarter texel, so this level is undersampled and its reconstruction shows.
+The previous 8-tap tent with a bilinear resolve left a visible grid: fitting the
+pipeline to a screenshot of a backlit Earth found one clear best alignment with
+the quarter grid (1.45 8-bit levels of error against a 3.05 median). `bloom_halo`
+therefore reconstructs with a cubic B-spline in four bilinear taps, and the wider
+first kernel reduces the remaining dependence on subpixel phase. In a numerical
+model of the pipeline these together cut grid error from 2.59 to 0.63 levels RMS
+(72.9 to 10.8 maximum) and the spread of a point source's peak from 57% to 18%.
+Splatting each bright pixel at full resolution was rejected: the halo's 99% radius
+is about 172 pixels, so a 298-pixel ring would need about 36 million blended
+fragments.
 
 Earlier versions started at half resolution with a 13-tap level, which cost an
 extra full-size write, a downsample dispatch and the largest upsample. The
 quarter level now stands in for it: the first reconstruction step keeps
 0.35 + 0.65 × 0.35 = 0.5775 of the quarter level and mixes in 0.65² of the
 coarser levels, so the deeper scales keep their previous share of the halo. The
-innermost glow is slightly wider than before.
+innermost glow is slightly wider than before. The cubic resolve then moved the 50%
+energy radius from about 4.5 to 5.4 pixels.
 
 The same pass decides spike emission. A pixel's spike fraction is
 `diffraction * smoothstep(T, 2T, peak)`, where `peak` is its largest finite HDR
@@ -155,6 +169,9 @@ fusing the correction into tone mapping brought `bloom` to 0.161 ms
 (downsample 0.129, upsample 0.023, spikes 0.006) while `tonemap_composite` rose
 from 0.020 to 0.037 ms. Bloom plus tone mapping went from 0.254 to 0.201 ms. The worst case grew: in the
 standalone contracts, a full-screen saturated image at 4K adds roughly 3 ms of
-submit/wait time with all 2048 sprites drawn. The previous convolution sources are
+submit/wait time with all 2048 sprites drawn. The wider first kernel and cubic
+resolve add about 0.012-0.02 ms to `bloom_downsample` and 0.015 ms to
+`tonemap_composite` at 1080p (0.08 and 0.003 ms in the saturated 4K fixture). The
+previous convolution sources are
 kept locally under `tests/bloom-sprites-20261030/previous/`. These are fixture
 timings, not hardware-independent guarantees.

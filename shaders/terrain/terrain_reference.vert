@@ -102,13 +102,13 @@ void main() {
     vec3 color = 0.25 + 0.65 * vec3(hash & 255u, (hash >> 8u) & 255u, (hash >> 16u) & 255u) / 255.0;
     f_tile_color = vec4(color, float(tile.metadata.z));
     f_tile_uv = vec2(grid) / 16.0;
-    vec3 apparent = refract_position(f_world_pos);
-    f_apparent_pos = apparent;
-    gl_Position = u_scene.view_proj * vec4(apparent, 1.0);
+    vec3 refraction = refraction_offset(f_world_pos);
+    f_apparent_pos = f_world_pos + refraction;
+    gl_Position = u_scene.view_proj * vec4(f_apparent_pos, 1.0);
     if (tile.eye_anchor.w > 0.5) {
         dmat3 eye_rotation = dmat3(tile.eye_rotation0.xyz, tile.eye_rotation1.xyz, tile.eye_rotation2.xyz);
         dvec3 eye = tile.eye_anchor.xyz + eye_rotation * ((point - tile.anchor_polar_ratio.xyz) * tile.anchor_radius.w)
-                  + dvec3(mat3(u_scene.view) * (apparent - f_world_pos));
+                  + dvec3(mat3(u_scene.view) * refraction);
         gl_Position = vec4(dmat4(u_scene.projection) * dvec4(eye, 1.0));
     }
 }
