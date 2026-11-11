@@ -14,6 +14,9 @@ struct RingHostGPU;
 class RingRenderer;
 struct PlanetshineGPU;
 struct RefractionHost;
+struct AtmosphereFrame;
+struct AtmosphereChanges;
+struct LutRecorder;
 
 struct alignas(16) AtmosphereShadowHeaderGPU {
     glm::vec4 eye_focal{};
@@ -162,6 +165,23 @@ private:
         bool aerial_valid = false;
         bool stellar_source_resolved = true;
     };
+    struct Candidate { uint32_t index; double distance; glm::dmat3 apparent; };
+    bool begin_prepare(rhi::VkContext& ctx, const ephemeris::SystemSnapshot& system, const RenderSettings& settings,
+                       VkExtent2D extent, const rhi::Image* ring_shadow_lut, bool shadow_diagnostics);
+    std::vector<Candidate> select_candidates(const Camera& camera, const ephemeris::SystemSnapshot& system, VkExtent2D extent,
+                                             const RefractionHost* refraction) const;
+    void assign_tables(std::span<const Candidate> candidates, const ephemeris::SystemSnapshot& system,
+                       std::vector<size_t>& slots, std::vector<size_t>& surface_slots) const;
+    void update_shadow_history(Tables& t, const AtmosphereFrame& frame, glm::dvec3 relative_eye, bool identity_dirty,
+                               uint32_t shadow_changes, uint64_t ring_shadow_revision, const RenderSettings& settings);
+    void bake_luts(const LutRecorder& lut, Tables& t, const AtmosphereFrame& frame, const AtmosphereChanges& changes,
+                   const ephemeris::SystemSnapshot& system, uint32_t index, size_t surface_slot, const RenderSettings& settings);
+    void bake_secondary(const LutRecorder& lut, Tables& t, const AtmosphereFrame& frame, const AtmosphereChanges& changes,
+                        const ephemeris::SystemSnapshot& system, uint32_t index, const RenderSettings& settings,
+                        std::span<const PlanetshineGPU> planetshine, const RingRenderer* ring_lighting);
+    void resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ctx, Tables& table, rhi::Image& color, rhi::Image& depth,
+                         std::span<const rhi::PushDescriptorWrite> transparency_writes);
+    void retire_shadow_history(rhi::VkContext& ctx, Tables& table);
     std::vector<std::unique_ptr<Tables>> tables_;
     std::vector<Tables*> active_;
     std::array<Tables*, 32> surface_layers_{};

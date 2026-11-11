@@ -58,6 +58,8 @@ private:
     void render_outliner_node(int body_idx);
     void render_body_inspector();
     void render_body_surface_tab(int insp_idx);
+    void render_body_rings_tab(int insp_idx);
+    void render_body_atmosphere_tab(int insp_idx);
     void stage_surface_file(const std::filesystem::path& path, int target_tab = -1);
     void poll_surface_baker();
     void sync_system_height_ranges();
