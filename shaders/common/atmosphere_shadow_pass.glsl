@@ -172,6 +172,10 @@ void main() {
 #ifdef ATMOSPHERE_SHADOW_VRS
         reconstructed = reconstruct_shadow_vrs(pixel, 0, depth > 0.0, direction, segment, path, fraction, supported.x) &&
             (prefix_path <= 0.0 || reconstruct_shadow_vrs(pixel, 1, true, direction, segment, prefix_path, prefix_fraction, supported.y));
+        if (!reconstructed) {
+            fraction = prefix_fraction = vec3(0.0);
+            supported = bvec2(false);
+        }
 #endif
         if (!reconstructed && !shadow_cached_column_unlit(direction, segment, path))
             fraction = atmosphere_shadow_deficit(direction, segment, path, pixel, shadow_temporal.x,

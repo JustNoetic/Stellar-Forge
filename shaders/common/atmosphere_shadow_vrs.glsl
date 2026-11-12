@@ -44,6 +44,8 @@ layout(set = 0, binding = 22) uniform sampler2DArray coarse_shadow_guide;
 
 bool reconstruct_shadow_vrs(ivec2 pixel, int layer, bool finite, vec3 direction, vec2 segment, float path,
                             out vec3 fraction, out bool supported) {
+    fraction = vec3(0.0);
+    supported = false;
     int scale = shadow_vrs_scale();
     ivec2 base = pixel/scale;
     vec2 f = vec2(pixel%scale)/float(scale);
