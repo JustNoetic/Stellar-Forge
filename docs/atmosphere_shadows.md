@@ -1,5 +1,10 @@
 # Atmospheric shadow deficit
 
+Single-frame ring and eclipse shadows default to the [closed-form path](atmosphere_shadow_closed_form.md),
+which evaluates casters at light-weighted points of the cached in-scatter instead of
+raymarching. Ineligible atmospheres, progressive mode and the reference use the
+sampled estimator described below.
+
 The default [cached atmospheric weights path](atmosphere_shadow_cached_weights.md)
 reuses aerial-perspective lighting for eligible single-star ring-shadow samples.
 Ring visibility and filtering retain the existing calculation; unsupported columns

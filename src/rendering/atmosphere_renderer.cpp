@@ -80,6 +80,16 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     shadow_vrs.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_vrs.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
     shadow_vrs_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs);
+    {
+        const std::pair<std::string, std::string> closed[] = {{"ATMOSPHERE_SHADOW_CLOSED_FORM", "1"}};
+        std::vector<rhi::DescriptorLayoutBinding> vrs_plain(shadow_vrs.begin(), shadow_vrs.end()-2);
+        shadow_closed_pipelines_[0] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow.comp", shadow, 0, closed);
+        shadow_closed_pipelines_[1] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_transparency.comp", shadow_transparency, 0, closed);
+        shadow_closed_pipelines_[2] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", vrs_plain, 0, closed);
+        shadow_closed_pipelines_[3] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs, 0, closed);
+        shadow_closed_pipelines_[4] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow, 0, closed);
+        shadow_closed_pipelines_[5] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse_transparency.comp", coarse_transparency, 0, closed);
+    }
     std::vector<rhi::DescriptorLayoutBinding> transparent_bindings(std::begin(composite_bindings), std::end(composite_bindings));
     transparent_bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     transparent_bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
@@ -258,6 +268,7 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_coarse_transparency_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_transparency_pipeline_);
+    for (auto& pipeline : shadow_closed_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     ctx.destroy_image(shadow_coarse_fraction_);
     ctx.destroy_image(shadow_coarse_guide_);
     ctx.destroy_image(shadow_reproject_energy_);

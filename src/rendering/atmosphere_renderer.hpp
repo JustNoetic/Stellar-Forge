@@ -127,6 +127,11 @@ private:
         physics::SurfaceMaterialGPU point_material{};
         glm::vec4 point_color{};
         glm::uvec2 point_surface{};
+        // Geometry the point response was last baked for: world-space view and pole directions,
+        // and per star its world-space direction (xyz) and angular radius (w).
+        glm::dvec3 point_view{}, point_pole{};
+        std::array<glm::dvec4, 16> point_suns{};
+        float point_stars = 0.0f;
         bool point_valid = false;
         rhi::Image stellar_source;
         rhi::Image aerial_radiance, aerial_optical_depth, aerial_range;
@@ -209,6 +214,9 @@ private:
     rhi::Pipeline shadow_accumulate_pipeline_, shadow_accumulate_transparency_pipeline_;
     rhi::Pipeline shadow_reproject_pipeline_, shadow_rotate_pipeline_, shadow_rotate_transparency_pipeline_;
     rhi::Pipeline shadow_coarse_pipeline_, shadow_coarse_transparency_pipeline_, shadow_vrs_pipeline_, shadow_vrs_transparency_pipeline_;
+    // Closed-form shadow variants with the sampled paths compiled out: plain, +transparency, VRS, VRS+transparency,
+    // coarse, coarse+transparency.
+    std::array<rhi::Pipeline, 6> shadow_closed_pipelines_;
     struct RetiredImage { rhi::Image image; uint64_t serial; };
     std::vector<RetiredImage> retired_images_;
     rhi::Image shadow_coarse_fraction_, shadow_coarse_guide_;

@@ -169,7 +169,7 @@ void App::run_benchmark() {
             if (spice && system().definition().motion_model != ephemeris::MotionModel::Spice)
                 throw std::runtime_error("SPICE fixture did not load SPICE playback.");
             bool earth_closeup = scene.starts_with("earth-") || scene.starts_with("saturn");
-            if (scene == "earth-eclipse") {
+            if (scene.starts_with("earth-eclipse")) {
                 require(simulation_.apply(ephemeris::SetPaused{false}));
                 require(simulation_.apply(ephemeris::SetTimeWarp{1.0}));
                 require(simulation_.advance(units::Seconds{benchmark::ECLIPSE_FIXTURE_YEARS * SECONDS_PER_YEAR}));
@@ -243,7 +243,8 @@ void App::run_benchmark() {
                 {"direct_sunlight_only", settings.direct_sunlight_only},
                 {"clouds", settings.clouds_enabled}, {"cloud_mode", settings.cloud_mode}, {"legacy_transparency", settings.transparency_reference_legacy},
                 {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
-                {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}, {"shadow_analytic", settings.atmosphere_shadow_analytic}};
+                {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}, {"shadow_analytic", settings.atmosphere_shadow_analytic},
+                {"shadow_closed_form", settings.atmosphere_shadow_closed_form}};
             if (scene == "nbody") run.fixture["ias15_epsilon"] = simulation_.nbody_epsilon();
             log::info("{}: repetition {}/{}", scene, repetition + 1, options.repeats);
             for (uint32_t index = 0; index < options.warmup + options.frames; ++index) {

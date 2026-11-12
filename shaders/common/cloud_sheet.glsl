@@ -39,7 +39,8 @@ vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pol
         float sun_cosine = max(dot(normal, light), 0.0);
         float diffuse = CLOUD_RELIEF_LIGHT*smoothstep(0.0, CLOUD_RELIEF_FADE_COSINE, sun_cosine)+(1.0-CLOUD_RELIEF_LIGHT)*sun_cosine;
         if (underside) diffuse *= 0.25;
-        radiance += u_scene.stars_color_lum[s].rgb*irradiance*(transmission*diffuse+sky*0.5);
+        vec3 shadow = cloud_star_shadow(body, ray*distance, s);
+        radiance += u_scene.stars_color_lum[s].rgb*irradiance*(transmission*diffuse+sky*0.5)*shadow;
     }
     float exposure = u_scene.hdr_enabled != 0u ? u_scene.screen_params.w : 1.0;
     return vec4(radiance*f.cloud_color.rgb*(opacity*exposure), opacity);

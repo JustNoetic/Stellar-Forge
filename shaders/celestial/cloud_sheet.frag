@@ -7,6 +7,7 @@ layout(location = 3) in vec3 f_refraction_shift;
 
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
+#include "common/cloud_shadow.glsl"
 #include "common/surface_atmosphere.glsl"
 #include "common/fluid_surface.glsl"
 #ifdef TRANSPARENCY_CAPTURE

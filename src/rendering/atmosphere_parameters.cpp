@@ -44,6 +44,7 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                     (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u) |
                     (settings.atmosphere_shadow_cached_weights && settings.aerial_perspective_enabled ? 4u : 0u) |
                     (settings.atmosphere_shadow_fast_rings ? 8u : 0u) | (settings.atmosphere_shadow_analytic && !settings.atmosphere_shadow_temporal ? 16u : 0u) |
+                    (settings.atmosphere_shadow_closed_form && !settings.atmosphere_shadow_temporal ? 32u : 0u) |
                     (uint32_t(std::bit_width(std::clamp(settings.atmosphere_shadow_vrs_scale, 2u, 16u))-1) << 8u),
                     settings.eclipse_reference_smoothstep ? 1u : 0u, settings.atmosphere_shadow_reference ? 1u : 0u};
     uint32_t effective_sequence = !settings.atmosphere_shadow_reference &&
@@ -52,6 +53,7 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                        settings.atmosphere_shadow_samples, settings.atmosphere_shadow_adaptive ? 1u : 0u};
     std::vector<AtmosphereShadowCasterGPU> casters;
     uint32_t star_index = 0;
+    bool closed_form_safe = true;
     for (uint32_t s = 0; s < system.size() && star_index < header.stars.size(); ++s) {
         const auto star = system.body(s);
         if (!star.definition.is_star || glm::length(star.render.position.value-origin) < 1e-12) continue;
@@ -94,11 +96,14 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                     double profile_blur = 0.75*(radius-inner)/4096.0;
                     support = float(radius+std::max({stellar_blur, pixel_blur, profile_blur})+0.01);
                 }
+                // The closed form needs every ray to stay on one side of the ring plane as seen from the star.
+                if (std::abs(glm::dot(glm::dvec3(light), glm::dvec3(pole))) <= double(light.w)+3.0*outer) closed_form_safe = false;
                 casters.push_back({{center, radius}, {pole, inner}, {support, float(ring.counts_indices.y), settings.ring_shadow_softness, 0}});
             }
         }
         range.w = uint32_t(casters.size())-range.z;
     }
+    if (!closed_form_safe) header.flags.y &= ~32u;
     if (casters.empty()) header.flags.x = 0;
     VkDeviceSize bytes = sizeof(header)+casters.size()*sizeof(AtmosphereShadowCasterGPU);
     if (buffer.size < bytes) {

@@ -28,7 +28,7 @@ vec3 shadow_cached_upper_light(vec2 uv, float range, float path) {
 }
 
 bool shadow_cached_column_unlit(vec3 direction, vec2 segment, float path) {
-    if ((shadow_flags.y & 4u) == 0u || atm.camera.w != 1.0 || path < 2.0 || atm.camera.z-bottom_radius() < 0.01)
+    if ((shadow_flags.y & 4u) == 0u || shadow_flags.w != 0u || atm.camera.w != 1.0 || path < 2.0 || atm.camera.z-bottom_radius() < 0.01)
         return false;
     vec3 entry = atmosphere_entry(direction, segment.x);
     if (transport_subdivisions(entry, direction, 0.0, path) != 1) return false;

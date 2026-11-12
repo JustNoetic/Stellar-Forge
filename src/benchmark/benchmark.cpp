@@ -66,7 +66,7 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-variant") {
             o.variant = value();
             const std::set<std::string_view> variants{"baseline", "no-atmosphere", "no-aerial", "no-shadows", "no-refraction", "no-secondary",
-                "no-planetshine", "no-ringshine", "high-exposure", "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows", "analytic-shadows", "jittered-shadows", "no-clouds", "legacy-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
+                "no-planetshine", "no-ringshine", "high-exposure", "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows", "analytic-shadows", "jittered-shadows", "reference-shadows", "closed-form-shadows", "sampled-shadows", "progressive-shadows", "no-shadow-vrs", "no-clouds", "legacy-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
             if (o.variant.empty()) throw std::runtime_error("Unknown benchmark variant: " + o.variant);
             for (size_t start = 0; start <= o.variant.size();) {
                 size_t plus = o.variant.find('+', start);
@@ -99,9 +99,9 @@ LaunchOptions parse_options(int argc, char** argv) {
                 "earth-ground-rings", "earth-ground-turn", "earth-ground-rings-turn", "earth-disc", "earth-full",
                 "earth-limb", "earth-full-rings", "earth-eclipse", "saturn", "earth-ground-live", "earth-ground-rings-live", "earth-full-live"};
             else if (scene == "overview" || scene == "approach" || scene == "analytical" || scene == "nbody" || scene == "spice"
-                     || scene == "earth-full" || scene == "earth-eclipse" || scene == "earth-ground" || scene == "earth-ground-rings"
+                     || scene == "earth-full" || scene == "earth-eclipse" || scene == "earth-eclipse-oblique" || scene == "earth-ground" || scene == "earth-ground-rings"
                      || scene == "earth-ground-turn" || scene == "earth-ground-rings-turn" || scene == "earth-disc"
-                     || scene == "earth-limb" || scene == "earth-backlit" || scene == "earth-backlit-zoom" || scene == "earth-full-rings" || scene == "saturn" || scene == "saturn-midnight" || scene == "earth-ground-live"
+                     || scene == "earth-limb" || scene == "earth-backlit" || scene == "earth-backlit-zoom" || scene == "earth-full-rings" || scene == "saturn" || scene == "saturn-limb" || scene == "saturn-midnight" || scene == "earth-ground-live"
                      || scene == "earth-ground-rings-live" || scene == "earth-full-live" || scene == "earth-terrain-still"
                      || scene == "earth-terrain-walk" || scene == "earth-terrain-fly" || scene == "earth-terrain-turn")
                 o.scenes = {std::string(scene)};
@@ -124,13 +124,13 @@ std::string_view help() {
   --no-simulation-thread   Run simulation on the main thread for comparison/debugging
   --benchmark-simulation inline|worker|pipeline  Inline, wait per step, or overlap rendering (inline)
   --benchmark-scene all|overview|approach|analytical|nbody|spice|earth-full|earth-eclipse
-                    audit|earth-ground|earth-ground-rings|earth-ground-turn|earth-ground-rings-turn
-                    earth-disc|earth-limb|earth-backlit|earth-backlit-zoom|earth-full-rings|saturn|saturn-midnight
+                    audit|earth-eclipse-oblique|earth-ground|earth-ground-rings|earth-ground-turn|earth-ground-rings-turn
+                    earth-disc|earth-limb|earth-backlit|earth-backlit-zoom|earth-full-rings|saturn|saturn-limb|saturn-midnight
                     earth-ground-live|earth-ground-rings-live|earth-full-live
                     terrain-navigation|earth-terrain-still|earth-terrain-walk|earth-terrain-fly|earth-terrain-turn
   --benchmark-variant baseline|no-atmosphere|no-aerial|no-shadows|no-refraction|no-secondary|no-orbits
                       no-planetshine|no-ringshine|high-exposure (x10^4, image checks)|no-gaia|smooth|no-textures|no-normals|no-rings|no-ring-shadows
-                      cached-shadow-weights|native-shadow-weights|fast-ring-shadows|no-clouds|legacy-clouds|no-bloom|fast-bloom
+                      cached-shadow-weights|native-shadow-weights|fast-ring-shadows|reference-shadows|closed-form-shadows|sampled-shadows|progressive-shadows|no-shadow-vrs|no-clouds|legacy-clouds|no-bloom|fast-bloom
                       terrain-detail (2-pixel geometry error; other defaults retained)
   --benchmark-width N       Framebuffer width (1920)
   --benchmark-height N      Framebuffer height (1080)

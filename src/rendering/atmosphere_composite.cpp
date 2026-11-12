@@ -185,7 +185,13 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
     ctx.transition_image(cmd, t->shadow_fraction, VK_IMAGE_LAYOUT_GENERAL);
     ctx.transition_image(cmd, t->shadow_depth, VK_IMAGE_LAYOUT_GENERAL);
     bool reproject = temporal && t->shadow_history_reproject;
-    auto& pipeline = reproject ? (transparency_writes.empty() ? shadow_rotate_pipeline_ : shadow_rotate_transparency_pipeline_)
+    // The closed-form variants need the single-star cumulative in-scatter cache, which layered aerosols (transport
+    // subdivisions) invalidate; prepare_shadows clears flag 32 when a ring is too close to edge-on.
+    bool layered_aerosols = false;
+    for (int i = 0; i < int(t->cached.aerosol_count.x); ++i) layered_aerosols = layered_aerosols || t->cached.aerosol_shape[i].z > 0.0f;
+    bool closed = !temporal && header.flags.w == 0u && (header.flags.y & 36u) == 36u && t->cached.camera.w == 1.0f && !layered_aerosols;
+    size_t closed_index = (vrs ? 2u : 0u)+(transparency_writes.empty() ? 0u : 1u);
+    auto& pipeline = closed ? shadow_closed_pipelines_[closed_index] : reproject ? (transparency_writes.empty() ? shadow_rotate_pipeline_ : shadow_rotate_transparency_pipeline_)
                          : temporal ? (transparency_writes.empty() ? shadow_accumulate_pipeline_ : shadow_accumulate_transparency_pipeline_)
                          : vrs ? (transparency_writes.empty() ? shadow_vrs_pipeline_ : shadow_vrs_transparency_pipeline_)
                          : (transparency_writes.empty() ? shadow_pipeline_ : shadow_transparency_pipeline_);
@@ -265,7 +271,8 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
         coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(18, shadow_coarse_fraction_));
         coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(19, shadow_coarse_guide_));
         coarse_writes.insert(coarse_writes.end(), transparency_writes.begin(), transparency_writes.end());
-        auto& coarse = transparency_writes.empty() ? shadow_coarse_pipeline_ : shadow_coarse_transparency_pipeline_;
+        auto& coarse = closed ? shadow_closed_pipelines_[transparency_writes.empty() ? 4 : 5]
+            : transparency_writes.empty() ? shadow_coarse_pipeline_ : shadow_coarse_transparency_pipeline_;
         uint32_t coarse_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_coarse");
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, coarse.handle);
         ctx.push_descriptors(cmd, coarse, coarse_writes);

@@ -133,10 +133,20 @@ void AtmosphereRenderer::bake_luts(const LutRecorder& lut, Tables& t, const Atmo
             t.point_partials = ctx.create_device_buffer(16*32*sizeof(glm::vec4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             t.point_response = ctx.create_device_buffer(16*sizeof(glm::vec4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         }
-        bool point_dirty = !t.point_valid || identity_dirty || lighting_mode_dirty ||
-            p.sun_direction != t.cached.sun_direction || p.camera.w != t.cached.camera.w ||
-            p.axis_x != t.cached.axis_x || p.axis_y != t.cached.axis_y || p.axis_z != t.cached.axis_z ||
-            p.world_pole != t.cached.world_pole || point.color != t.point_color ||
+        // The response is a disc integral, so it depends only on the world-space view, pole and star
+        // directions and the stars' angular radii, not on the local x/y basis. Orbital motion moves
+        // these by float-noise amounts every frame; rebake only once they drift past the tolerance.
+        constexpr double POINT_ANGLE_TOLERANCE = 1e-4;  // radians (chord length of unit vectors)
+        auto moved = [](glm::dvec3 a, glm::dvec3 b) { return glm::length(a-b) > POINT_ANGLE_TOLERANCE; };
+        std::array<glm::dvec4, 16> suns{};
+        bool geometry_moved = p.camera.w != t.point_stars || moved(frame.z, t.point_view) || moved(frame.pole, t.point_pole);
+        for (uint32_t star = 0; star < uint32_t(p.camera.w); ++star) {
+            const glm::vec4& sun = p.sun_direction[star];
+            suns[star] = {frame.x*double(sun.x)+frame.y*double(sun.y)+frame.z*double(sun.z), sun.w};
+            geometry_moved = geometry_moved || moved(glm::dvec3(suns[star]), glm::dvec3(t.point_suns[star])) ||
+                std::abs(suns[star].w-t.point_suns[star].w) > POINT_ANGLE_TOLERANCE*t.point_suns[star].w;
+        }
+        bool point_dirty = !t.point_valid || identity_dirty || lighting_mode_dirty || geometry_moved || point.color != t.point_color ||
             glm::uvec2(point.resources) != t.point_surface ||
             std::memcmp(&point.material, &t.point_material, sizeof(point.material)) != 0;
         if (point_dirty) {
@@ -159,6 +169,10 @@ void AtmosphereRenderer::bake_luts(const LutRecorder& lut, Tables& t, const Atmo
             t.point_material = point.material;
             t.point_color = point.color;
             t.point_surface = glm::uvec2(point.resources);
+            t.point_view = frame.z;
+            t.point_pole = frame.pole;
+            t.point_suns = suns;
+            t.point_stars = p.camera.w;
             t.point_valid = true;
             ++stats_.point_lut_updates;
         }

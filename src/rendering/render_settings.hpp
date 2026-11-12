@@ -50,6 +50,7 @@ struct RenderSettings {
     bool atmosphere_shadow_cached_weights = true;
     bool atmosphere_shadow_fast_rings = true;
     bool atmosphere_shadow_analytic = true;
+    bool atmosphere_shadow_closed_form = true;
     bool atmosphere_shadow_temporal = false;
     bool atmosphere_shadow_animate_jitter = true;
     bool atmosphere_shadow_rotation = false;

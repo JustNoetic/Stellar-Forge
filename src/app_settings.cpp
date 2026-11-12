@@ -121,6 +121,8 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
             ImGui::Checkbox("Deterministic shadow strata", &render_draft.atmosphere_shadow_analytic);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Integrates single-ring shadows over each stratum without jitter and samples smooth eclipse penumbrae at stratum midpoints. Progressive shadows keep jittered accumulation.");
+            ImGui::Checkbox("Closed-form shadows", &render_draft.atmosphere_shadow_closed_form);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Evaluates ring and eclipse shadows at light-weighted points of four cached in-scatter slices, without raymarching. Applies to single-star atmospheres without layered aerosols; grazing ring geometry and other cases use sampled integration.");
             ImGui::EndDisabled();
             ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
             ImGui::Checkbox("Atmospheric shadow VRS", &render_draft.atmosphere_shadow_vrs);

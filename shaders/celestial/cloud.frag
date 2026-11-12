@@ -7,6 +7,7 @@ layout(location = 3) in vec3 f_refraction_shift;
 
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
+#include "common/cloud_shadow.glsl"
 #include "common/surface_atmosphere.glsl"
 #include "common/fluid_surface.glsl"
 #ifdef TRANSPARENCY_CAPTURE
@@ -114,7 +115,7 @@ void main() {
         float d_au = max(length(to_star), 1e-5);
         vec3 L = to_star/d_au;
         float irradiance = (u_scene.hdr_enabled != 0u) ? u_scene.stars_color_lum[s].w/(d_au*d_au) : 1.0;
-        vec3 light = u_scene.stars_color_lum[s].rgb*irradiance;
+        vec3 light = u_scene.stars_color_lum[s].rgb*irradiance*cloud_star_shadow(f_body_idx, ray*(anchor_distance+0.5*(t0+t1)), s);
         vec3 transmission, sky = vec3(0.0);
         if (atmosphere) {
             vec3 uv = surface_atmosphere_coordinates(lookup, L);

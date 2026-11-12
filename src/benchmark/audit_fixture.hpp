@@ -25,6 +25,15 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "fast-ring-shadows") s.atmosphere_shadow_fast_rings = true;
     if (variant == "analytic-shadows") s.atmosphere_shadow_analytic = true;
     if (variant == "jittered-shadows") s.atmosphere_shadow_analytic = false;
+    if (variant == "reference-shadows") s.atmosphere_shadow_reference = true;
+    if (variant == "closed-form-shadows") s.atmosphere_shadow_closed_form = true;
+    if (variant == "sampled-shadows") s.atmosphere_shadow_closed_form = false;
+    if (variant == "progressive-shadows") {
+        s.atmosphere_shadow_temporal = true;
+        s.atmosphere_shadow_samples = 16;
+        s.atmosphere_shadow_adaptive = false;
+    }
+    if (variant == "no-shadow-vrs") s.atmosphere_shadow_vrs = false;
     if (variant == "no-atmosphere") s.show_atmospheres = false;
     if (variant == "no-aerial") s.aerial_perspective_enabled = false;
     if (variant == "no-shadows") s.atmosphere_shadows_enabled = false;
@@ -61,7 +70,30 @@ inline void audit_look(Camera& camera, glm::dvec3 forward, glm::dvec3 up) {
     camera.pitch_deg = camera.pitch_actual_deg = std::asin(std::clamp(forward.y, -1.0, 1.0))*RAD_TO_DEG;
 }
 
-inline glm::dvec3 audit_shadow_direction(const ephemeris::SystemSnapshot& system, int earth) {
+// Oblique view of the Moon's shadow: the camera sits 3000 km (along the ground) to the side of where the shadow
+// axis meets Earth, about 1000 km up, looking at that point near the limb. Long grazing rays cross the penumbral
+// gradient, so shadow integration errors cover a large part of the frame.
+inline Camera eclipse_oblique_camera(const ephemeris::SystemSnapshot& system) {
+    Camera camera = earth_closeup_camera(system, true);
+    const auto& body = system.body(camera.tracking_idx);
+    auto hit = glm::normalize(camera.cam_pos_rel);
+    auto sun = glm::normalize(system.body(system.star_index()).render.position.value-body.render.position.value);
+    auto sunward = sun-hit*glm::dot(sun, hit);
+    if (glm::length(sunward) < 1e-6) sunward = glm::cross(body.render.pole, hit);
+    auto side = glm::normalize(glm::cross(hit, glm::normalize(sunward)));
+    double radius = body.definition.radius_au();
+    auto target = hit*ellipsoid_surface_radius(radius, body.definition.oblateness, body.render.pole, hit);
+    double range = 3000.0*KM_TO_AU, elevation = 10.0*DEG_TO_RAD;
+    auto position = target+(side*std::cos(elevation)+hit*std::sin(elevation))*range;
+    auto aim = target+hit*(30.0*KM_TO_AU);
+    camera.fov_deg = 30.0;
+    auto up = glm::normalize(position);
+    audit_look(camera, aim-position, glm::normalize(up-glm::normalize(aim-position)*glm::dot(up, glm::normalize(aim-position))));
+    camera.cam_pos_rel = position;
+    return camera;
+}
+
+inline glm::dvec3 audit_shadow_direction(const ephemeris::SystemSnapshot& system, int earth, double target_ratio = 1.7) {
     const auto& body = system.body(earth);
     auto sun = glm::normalize(system.body(system.star_index()).render.position.value-body.render.position.value);
     auto pole = body.render.pole;
@@ -75,17 +107,46 @@ inline glm::dvec3 audit_shadow_direction(const ephemeris::SystemSnapshot& system
         double distance = -glm::dot(direction, pole)/elevation;
         double ring_radius = glm::length(direction+sun*distance);
         if (distance <= 0 || glm::dot(direction, sun) <= 0) continue;
-        if (std::abs(ring_radius-1.7) < error) {
+        if (std::abs(ring_radius-target_ratio) < error) {
             best = direction;
-            error = std::abs(ring_radius-1.7);
+            error = std::abs(ring_radius-target_ratio);
         }
     }
-    if (error > 0.1) throw std::runtime_error("Earth audit ring shadow geometry is unavailable at this epoch.");
+    if (error > 0.1) throw std::runtime_error("Audit ring shadow geometry is unavailable at this epoch.");
     return best;
+}
+
+// Grazing view along a latitude circle of Saturn's dayside, 15000 km from a point under the Cassini division's
+// shadow and 2 degrees above its horizon. The equator lies to the right, so the ring shadow bands run left to right
+// and converge toward the hazy limb; long sight lines cross several bands, which stresses shadow integration.
+inline Camera saturn_limb_camera(const ephemeris::SystemSnapshot& system) {
+    Camera camera;
+    camera.horizon_align = false;
+    camera.tracking_idx = system.find_body("Saturn");
+    if (camera.tracking_idx < 0) throw std::runtime_error("Audit camera target missing.");
+    const auto& body = system.body(camera.tracking_idx);
+    auto pole = body.render.pole;
+    auto normal = audit_shadow_direction(system, camera.tracking_idx, 1.98);
+    double radius = body.definition.radius_au();
+    auto target = normal*ellipsoid_surface_radius(radius, body.definition.oblateness, pole, normal);
+    auto up = oblate_surface_normal(normal, body.definition.oblateness, pole);
+    auto north = glm::normalize(pole-up*glm::dot(pole, up));
+    auto equatorward = glm::dot(normal, pole) > 0 ? -north : north;
+    auto forward = glm::normalize(glm::cross(up, equatorward));
+    double range = 15000.0*KM_TO_AU, elevation = 2.0*DEG_TO_RAD;
+    auto position = target-forward*(range*std::cos(elevation))+up*(range*std::sin(elevation));
+    camera.fov_deg = 7.6;
+    auto look = glm::normalize(target-position);
+    auto camera_up = glm::normalize(position);
+    audit_look(camera, look, glm::normalize(camera_up-look*glm::dot(camera_up, look)));
+    camera.cam_pos_rel = position;
+    return camera;
 }
 
 inline Camera audit_camera(const ephemeris::SystemSnapshot& system, std::string_view scene) {
     if (scene == "earth-full" || scene == "earth-full-live" || scene == "earth-eclipse") return earth_closeup_camera(system, scene == "earth-eclipse");
+    if (scene == "earth-eclipse-oblique") return eclipse_oblique_camera(system);
+    if (scene == "saturn-limb") return saturn_limb_camera(system);
     Camera camera;
     camera.horizon_align = false;
     camera.tracking_idx = system.find_body(scene.starts_with("saturn") ? "Saturn" : "Earth");

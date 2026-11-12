@@ -208,7 +208,7 @@ vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
         if (count == 0u) {
             if (atm.camera.w <= 1.0) continue;
             float t = domain.x;
-            float base_step = max((domain.y-domain.x)/(shadow_flags.w != 0u ? 1024.0 : 48.0), 0.001);
+            float base_step = max((domain.y-domain.x)/(shadow_flags.w != 0u ? 256.0 : 48.0), 0.001);
             vec3 sun = atm.sun_direction[s].xyz;
             for (uint sample_index = 0u; sample_index < 8192u && t < domain.y; ++sample_index) {
                 float step = min(base_step, domain.y-t);
@@ -261,7 +261,7 @@ vec3 atmosphere_shadow_reference(vec3 direction, vec2 segment, float path) {
                 if (interval.y == end) break;
             }
             float t = interval.x;
-            float base_step = max((interval.y-interval.x)/(shadow_flags.w != 0u ? 1024.0 : 48.0), 0.001);
+            float base_step = max((interval.y-interval.x)/(shadow_flags.w != 0u ? 256.0 : 48.0), 0.001);
             for (uint sample_index = 0u; sample_index < 8192u && t < interval.y; ++sample_index) {
                 float step = min(base_step, interval.y-t);
                 vec3 start = entry+direction*t;
@@ -419,6 +419,172 @@ float atmosphere_ring_stratum_visibility(AtmosphereShadowCaster caster, vec4 sta
     return visibility <= 1e-4 ? 0.0 : visibility;
 }
 
+#ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
+// Closed-form shadow (prototype, shadow_flags.y & 32). The deficit is the Stieltjes integral of the blocked fraction
+// against the cached cumulative in-scatter W(t): each shadow interval is cut into a few strata on the cache's own
+// spacing, and each stratum contributes its exact energy W(t1)-W(t0) times its light-weighted mean blocked fraction.
+// That mean comes from the stratum's light centroid and spread (one extra W fetch, exponential density fit) and two
+// nodes at centroid +- spread: for parallel light the ring-plane hit point moves linearly with t, so the nodes give the
+// swept radius box that the ring's prefix-integral LUT filters exactly; sphere casters, whose penumbra is smooth,
+// are evaluated at the same nodes. No jitter, so the result is deterministic.
+const uint CLOSED_FORM_STRATA = 4u;
+
+float closed_form_luminance(vec3 value) {
+    return dot(value, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 closed_form_ring_coordinates(AtmosphereShadowCaster caster, vec4 star, vec3 m, float mean) {
+    vec3 center = caster.position_radius.xyz, pole = caster.pole_inner.xyz;
+    vec3 rel = m-center, to_star = star.xyz-m;
+    float distance = length(to_star);
+    float denominator = dot(to_star, pole), absolute_denominator = abs(denominator);
+    float fraction = max(-dot(rel, pole)/denominator, 0.0);
+    vec3 hit = rel+to_star*fraction;
+    float radius = max(length(hit), 1e-8);
+    float radial_stretch = length(vec2(denominator, dot(hit, to_star)/radius))/absolute_denominator;
+    float base_width = star.w*fraction;
+    float tangential_width = base_width*length(cross(hit, to_star))/(radius*absolute_denominator);
+    float curvature = tangential_width*(tangential_width/(length(vec2(radius, tangential_width))+radius+1e-20));
+    float softness = caster.support.z;
+    float span = max(caster.position_radius.w-caster.pole_inner.w, 1e-9);
+    float footprint = length(m-shadow_eye_focal.xyz)/shadow_eye_focal.w;
+    float width = max(softness*(base_width*radial_stretch+0.5*curvature),
+                      max(0.75*footprint*radial_stretch, 0.75*span/4096.0));
+    return vec3((mean+0.25*softness*curvature-caster.pole_inner.w)/span, width/span,
+                clamp(absolute_denominator/distance, 0.5/64.0, 63.5/64.0));
+}
+
+// Light-weighted mean offset from the stratum start, standard deviation, and the fitted decay rate x (per stratum
+// length), for a stratum of length d that holds a fraction "a" of its light in its first half. The density is
+// fitted as exp(-x u) on u in [0, 1], which is what the air density along a ray looks like at stratum scale.
+vec3 closed_form_moments(float a, float d) {
+    float x = 2.0*log(clamp(a, 1e-3, 1.0-1e-3)/(1.0-clamp(a, 1e-3, 1.0-1e-3)));
+    float mean, variance;
+    if (abs(x) < 0.5) {
+        float x2 = x*x;
+        mean = 0.5-x/12.0+x*x2/720.0;
+        variance = 1.0/12.0-x2/720.0+x2*x2/30240.0;
+    } else {
+        float e = exp(x);
+        mean = 1.0/x-1.0/(e-1.0);
+        variance = 1.0/(x*x)-e/((e-1.0)*(e-1.0));
+    }
+    return vec3(d*vec2(mean, sqrt(max(variance, 0.0))), x);
+}
+
+// Share of the fitted stratum light in u in [0, u].
+float closed_form_light_share(float x, float u) {
+    return abs(x) < 1e-3 ? u : (1.0-exp(-x*u))/(1.0-exp(-x));
+}
+
+#ifndef CLOSED_FORM_RING_PIECES
+#define CLOSED_FORM_RING_PIECES 3
+#endif
+
+// Light-weighted mean ring extinction over the stratum [t0, t1]. For parallel light the ring-plane hit moves
+// linearly with t, so each of a few equal pieces of the (plane-side clipped) stratum sweeps an exact radius range,
+// which the ring LUT's prefix integral filters as a box. Each piece is weighted by its exact share of the fitted
+// light, so light concentrated at one end of a long grazing stratum is not smeared across every band it crosses.
+// Penumbra width, incidence and curvature shift vary slowly and come from the light centroid.
+float closed_form_ring_extinction(AtmosphereShadowCaster caster, vec4 star, vec3 origin, vec3 direction,
+                                  float t0, float t1, vec3 moments) {
+    vec3 center = caster.position_radius.xyz, pole = caster.pole_inner.xyz;
+    float side = dot(star.xyz-center, pole);
+    float sa = dot(center-origin-direction*t0, pole)*side, sb = dot(center-origin-direction*t1, pole)*side;
+    if (sa <= 0.0 && sb <= 0.0) return 0.0;
+    float d = max(t1-t0, 1e-9);
+    vec2 clip = vec2(0.0, 1.0);
+    if (sa <= 0.0 || sb <= 0.0) {
+        float crossing = sa/(sa-sb);
+        if (sa <= 0.0) clip.x = crossing; else clip.y = crossing;
+    }
+    if (clip.y <= clip.x) return 0.0;
+    float span = max(caster.position_radius.w-caster.pole_inner.w, 1e-9);
+    float middle = clamp(t0+moments.x, t0+clip.x*d, t0+clip.y*d);
+    float centroid_radius = length(atmosphere_ring_plane_hit(origin+direction*middle, center, pole, star.xyz));
+    vec3 uv = closed_form_ring_coordinates(caster, star, origin+direction*middle, centroid_radius);
+    float shift = uv.x-(centroid_radius-caster.pole_inner.w)/span;
+    bool single_box = (shadow_flags.y & 1u) != 0u;
+    float extinction = 0.0, share = closed_form_light_share(moments.z, clip.x);
+    float radius = length(atmosphere_ring_plane_hit(origin+direction*(t0+clip.x*d), center, pole, star.xyz));
+    for (int k = 1; k <= CLOSED_FORM_RING_PIECES; ++k) {
+        float u = mix(clip.x, clip.y, float(k)/float(CLOSED_FORM_RING_PIECES));
+        float next_share = closed_form_light_share(moments.z, u);
+        float next_radius = length(atmosphere_ring_plane_hit(origin+direction*(t0+u*d), center, pole, star.xyz));
+        vec3 piece = vec3((0.5*(radius+next_radius)-caster.pole_inner.w)/span+shift, uv.yz);
+        extinction += (next_share-share)*ring_swept_filter(atmosphere_ring_shadow_lut, int(caster.support.y), piece,
+                                                           0.5*abs(next_radius-radius)/span, single_box);
+        share = next_share;
+        radius = next_radius;
+    }
+    return extinction;
+}
+
+// Light-weighted mean visibility of the sphere casters over the stratum. The penumbra is smooth, so the two moment
+// nodes suffice unless the transition is short compared with the stratum; then uniform Gauss panels are used.
+float closed_form_sphere_visibility(uint star_index, uvec4 spheres, vec4 star, vec3 origin, vec3 direction,
+                                    float t0, float t1, vec3 moments) {
+    float transition = atmosphere_shadow_transition(origin+direction*(t0+moments.x), direction, star, spheres);
+    int panels = clamp(int(ceil(2.0*(t1-t0)/max(transition, 1e-6))), 1, 4);
+    if (panels == 1)
+        return 0.5*(atmosphere_shadow_visibility(origin+direction*(t0+moments.x-moments.y), star_index, spheres)
+                   +atmosphere_shadow_visibility(origin+direction*(t0+moments.x+moments.y), star_index, spheres));
+    float width = (t1-t0)/float(panels), visibility = 0.0;
+    for (int i = 0; i < panels; ++i) {
+        float middle = t0+(float(i)+0.5)*width;
+        visibility += atmosphere_shadow_visibility(origin+direction*(middle-0.2886751346*width), star_index, spheres)
+                    + atmosphere_shadow_visibility(origin+direction*(middle+0.2886751346*width), star_index, spheres);
+    }
+    return visibility/float(2*panels);
+}
+
+vec3 closed_form_shadow_loss(uint star_index, uvec4 range, vec4 star, vec3 origin, vec3 direction,
+                             vec2 uv, float cached_range, float path) {
+    vec3 loss = vec3(0.0);
+    uvec4 spheres = uvec4(range.x, range.y, range.z, 0u);
+    float cursor = 0.0;
+    for (uint component = 0u; component < range.y+range.w && cursor < path; ++component) {
+        vec2 interval = atmosphere_shadow_next(range, origin, direction, star, vec2(cursor, path));
+        if (interval.y <= interval.x) break;
+        // The cache's first slice already holds the first step's light, so W(0) is 0 rather than that slice.
+        vec3 low = interval.x > 1e-3 ? shadow_cached_light(uv, cached_range, interval.x) : vec3(0.0);
+        vec3 high = shadow_cached_light(uv, cached_range, interval.y);
+        float low_value = closed_form_luminance(low), high_value = closed_form_luminance(high);
+        float t0 = interval.x;
+        vec3 w0 = low;
+        for (uint i = 1u; high_value > low_value && i <= CLOSED_FORM_STRATA; ++i) {
+            float t1 = interval.y;
+            vec3 w1 = high;
+            if (i < CLOSED_FORM_STRATA) {
+                // Strata follow the cache's own spacing (square-root in distance from inside the atmosphere,
+                // linear from outside); the light-weighted moments absorb the density variation within each.
+                float q = float(i)/float(CLOSED_FORM_STRATA);
+                if (atm.camera.z < top_radius()) {
+                    vec2 root = sqrt(interval/max(cached_range, 1e-6));
+                    float coordinate = mix(root.x, root.y, q);
+                    t1 = clamp(coordinate*coordinate*cached_range, interval.x, interval.y);
+                } else t1 = mix(interval.x, interval.y, q);
+                w1 = shadow_cached_light(uv, cached_range, t1);
+            }
+            vec3 energy = max(w1-w0, vec3(0.0));
+            if (t1 > t0 && any(greaterThan(energy, vec3(0.0)))) {
+                float start = closed_form_luminance(w0), total = max(closed_form_luminance(w1)-start, 1e-30);
+                float half_light = closed_form_luminance(shadow_cached_light(uv, cached_range, 0.5*(t0+t1)))-start;
+                vec3 moments = closed_form_moments(clamp(half_light/total, 0.0, 1.0), t1-t0);
+                float visibility = range.y > 0u ? closed_form_sphere_visibility(star_index, spheres, star, origin, direction, t0, t1, moments) : 1.0;
+                for (uint j = 0u; j < range.w; ++j)
+                    visibility *= 1.0-closed_form_ring_extinction(shadow_casters[range.z+j], star, origin, direction, t0, t1, moments);
+                loss += energy*(1.0-clamp(visibility, 0.0, 1.0));
+            }
+            t0 = t1;
+            w0 = w1;
+        }
+        cursor = interval.y;
+    }
+    return loss;
+}
+#endif
+
 float get_ign(vec2 p) {
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
@@ -486,11 +652,56 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
     supported = bvec2(false);
     prefix_deficit = vec3(0.0);
     if (shadow_flags.x == 0u) return vec3(0.0);
+#ifndef ATMOSPHERE_SHADOW_CLOSED_FORM
     if (shadow_flags.w != 0u) {
         supported = bvec2(true, prefix_path > 0.0);
         if (prefix_path > 0.0) prefix_deficit = atmosphere_shadow_reference(direction, segment, prefix_path);
         return atmosphere_shadow_reference(direction, segment, path);
     }
+#endif
+#ifdef ATMOSPHERE_SHADOW_CLOSED_FORM
+    {
+        // Closed-form-only variant: the host selects it for one star, cached weights and no layered aerosols, so the
+        // sampled paths below are unreachable and compiled out, which keeps register pressure low.
+        vec3 origin = atmosphere_to_physical(atmosphere_entry(direction, segment.x));
+        vec3 physical_direction = atmosphere_to_physical(direction);
+        vec2 uv = sky_uv(direction);
+        float half_texel = 0.5/float(AERIAL_SIZE.y);
+        float middle = uv.y < 0.5 ? 0.5-half_texel : 0.5+half_texel;
+        uv.y = uv.y < 0.5 ? min(uv.y, middle) : max(uv.y, middle);
+        float cached_range = atmosphere_span(direction);
+        if (abs(uv.y-0.5) < 1.0/float(AERIAL_SIZE.y)) cached_range = textureLod(shadow_aerial_range, uv, 0.0).r;
+        vec3 energy = vec3(0.0), loss = vec3(0.0), prefix_energy = vec3(0.0), prefix_loss = vec3(0.0);
+        uvec4 range = shadow_ranges[0];
+        vec4 star = shadow_stars[0];
+        bool lit = max(max(atm.sun_irradiance[0].r, atm.sun_irradiance[0].g), atm.sun_irradiance[0].b) > 0.0;
+        for (int layer = 0; layer < 2 && lit && range.y+range.w > 0u; ++layer) {
+            float span = layer == 0 ? path : prefix_path;
+            if (span <= 0.0) continue;
+            vec2 first = atmosphere_shadow_next(range, origin, physical_direction, star, vec2(0.0, span));
+            if (first.y <= first.x) continue;
+            supported[layer] = true;
+            vec3 e = vec3(1.0), l;
+            if (span >= 2.0) {
+                e = max(shadow_cached_light(uv, cached_range, span), vec3(0.0));
+                l = closed_form_shadow_loss(0u, range, star, origin, physical_direction, uv, cached_range, span);
+            } else {
+                // Too short for the cache's resolution: weight the ray uniformly.
+                vec3 moments = closed_form_moments(0.5, span);
+                float visibility = range.y > 0u ? closed_form_sphere_visibility(0u, uvec4(range.xyz, 0u), star, origin,
+                    physical_direction, 0.0, span, moments) : 1.0;
+                for (uint j = 0u; j < range.w; ++j)
+                    visibility *= 1.0-closed_form_ring_extinction(shadow_casters[range.z+j], star, origin, physical_direction,
+                        0.0, span, moments);
+                l = vec3(1.0-clamp(visibility, 0.0, 1.0));
+            }
+            if (layer == 0) { energy = e; loss = l; } else { prefix_energy = e; prefix_loss = l; }
+        }
+        estimate = AtmosphereShadowEstimate(energy, loss, prefix_energy, prefix_loss);
+        if (any(greaterThan(prefix_energy, vec3(1e-20)))) prefix_deficit = normalized_shadow_loss(prefix_loss, prefix_energy);
+        return any(greaterThan(energy, vec3(1e-20))) ? normalized_shadow_loss(loss, energy) : vec3(0.0);
+    }
+#endif
     vec3 entry = atmosphere_entry(direction, segment.x);
     vec3 origin = atmosphere_to_physical(entry), physical_direction = atmosphere_to_physical(direction);
     float entry_radius = clamp(length(entry), bottom_radius(), top_radius());
@@ -551,6 +762,19 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
             continue;
 #endif
 
+#ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
+        bool closed_form = (shadow_flags.y & 32u) != 0u && cached_weights && (shadow_flags.y & 2u) == 0u;
+        for (uint j = 0u; closed_form && j < range.w; ++j) {
+            vec3 to_star = star.xyz-origin;
+            closed_form = abs(dot(to_star, shadow_casters[range.z+j].pole_inner.xyz)) > max(star.w, 1e-6*length(to_star))+path;
+        }
+        if (closed_form) {
+            total_energy += max(shadow_cached_light(cached_uv, cached_range, path), vec3(0.0));
+            if (has_shadow)
+                total_loss += closed_form_shadow_loss(s, range, star, origin, physical_direction, cached_uv, cached_range, path);
+            continue;
+        }
+#endif
         if (base_budget < 0.0) {
             base_budget = prefix_path > 0.0 ? float(maximum)
                         : shadow_sample_budget(entry, direction, path, maximum, contributing_span);
