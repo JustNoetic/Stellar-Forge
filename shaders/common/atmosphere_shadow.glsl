@@ -667,15 +667,12 @@ struct AtmosphereShadowEstimate {
 };
 
 vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 pixel, uint sequence,
-                               float prefix_path, out vec3 prefix_deficit, out bvec2 supported,
-                               out AtmosphereShadowEstimate estimate) {
+                               float prefix_path, out vec3 prefix_deficit, out AtmosphereShadowEstimate estimate) {
     estimate = AtmosphereShadowEstimate(vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
-    supported = bvec2(false);
     prefix_deficit = vec3(0.0);
     if (shadow_flags.x == 0u) return vec3(0.0);
 #ifndef ATMOSPHERE_SHADOW_CLOSED_FORM
     if (shadow_flags.w != 0u) {
-        supported = bvec2(true, prefix_path > 0.0);
         vec3 result = vec3(0.0);
         for (int i = 0; i < (prefix_path > 0.0 ? 2 : 1); ++i) {
             vec3 r = atmosphere_shadow_reference(direction, segment, i == 0 ? path : prefix_path);
@@ -705,7 +702,6 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
             if (span <= 0.0) continue;
             vec2 first = atmosphere_shadow_next(range, origin, physical_direction, star, vec2(0.0, span));
             if (first.y <= first.x) continue;
-            supported[layer] = true;
             vec3 e = vec3(1.0), l;
             if (span >= 2.0) {
                 e = max(shadow_cached_light(uv, cached_range, span), vec3(0.0));
@@ -778,12 +774,7 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
         uint count = range.y+range.w;
         vec2 interval = count > 0u ? atmosphere_shadow_next(range, origin, physical_direction, star, vec2(0.0, path)) : vec2(0.0);
         bool has_shadow = count > 0u && interval.y > interval.x;
-        if (!has_shadow) {
-            if (atm.camera.w <= 1.0) continue;
-        } else {
-            supported.x = true;
-            if (prefix_path > 0.0) supported.y = true;
-        }
+        if (!has_shadow && atm.camera.w <= 1.0) continue;
 #ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
         if (cached_weights && !any(greaterThan(shadow_cached_upper_light(cached_uv, cached_range, path), vec3(0.0))))
             continue;
@@ -945,10 +936,10 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
 }
 
 vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 pixel, uint sequence,
-                              float prefix_path, out vec3 prefix_deficit, out bvec2 supported) {
+                              float prefix_path, out vec3 prefix_deficit) {
     AtmosphereShadowEstimate unused;
     return atmosphere_shadow_estimate(direction, segment, path, pixel, sequence,
-        prefix_path, prefix_deficit, supported, unused);
+        prefix_path, prefix_deficit, unused);
 }
 
 #ifdef ATMOSPHERE_SHADOW_CLOSED_FORM
@@ -961,9 +952,8 @@ vec3 atmosphere_shadow_deficit(vec3 direction, vec2 segment, float path, ivec2 p
 const float CLOSED_FORM_CLOUD_SPLIT_SHARE = 0.9; // of the opaque endpoint's path
 
 void closed_form_shadow_endpoints(vec3 direction, vec2 segment, float path, float prefix_path, float cloud_path,
-                                  out vec3 fraction, out vec3 prefix_fraction, out vec3 cloud_fraction, out bvec3 supported) {
+                                  out vec3 fraction, out vec3 prefix_fraction, out vec3 cloud_fraction) {
     fraction = prefix_fraction = cloud_fraction = vec3(0.0);
-    supported = bvec3(false);
     uvec4 range = shadow_ranges[0];
     bool lit = max(max(atm.sun_irradiance[0].r, atm.sun_irradiance[0].g), atm.sun_irradiance[0].b) > 0.0;
     if (shadow_flags.x == 0u || !lit || range.y+range.w == 0u) return;
@@ -1010,20 +1000,12 @@ void closed_form_shadow_endpoints(vec3 direction, vec2 segment, float path, floa
         }
         if (layer == 0) {
             fraction = value;
-            supported.x = true;
-            if (split > 0.0 && cloud_slot) {
-                prefix_fraction = split_value;
-                supported.y = true;
-            } else if (split > 0.0) {
-                cloud_fraction = split_value;
-                supported.z = true;
-            }
+            if (split > 0.0 && cloud_slot) prefix_fraction = split_value;
+            else if (split > 0.0) cloud_fraction = split_value;
         } else if (cloud_slot) {
             cloud_fraction = value;
-            supported.z = true;
         } else {
             prefix_fraction = value;
-            supported.y = true;
         }
     }
 }

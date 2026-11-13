@@ -155,7 +155,7 @@ private:
         bool secondary_active = false, secondary_valid = false, secondary_aerial_valid = false;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> uniforms;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> shadows;
-        std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> shadow_tiles, transparent_tiles;
+        std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> transparent_tiles;
         rhi::Image shadow_fraction, shadow_depth;
         rhi::Image shadow_energy, shadow_loss;
         AtmosphereShadowHeaderGPU shadow_header{};
@@ -230,12 +230,9 @@ private:
     rhi::Pipeline shadow_accumulate_pipeline_, shadow_accumulate_transparency_pipeline_;
     rhi::Pipeline shadow_reproject_pipeline_, shadow_rotate_pipeline_, shadow_rotate_transparency_pipeline_;
     rhi::Pipeline shadow_coarse_pipeline_, shadow_coarse_transparency_pipeline_, shadow_vrs_pipeline_, shadow_vrs_transparency_pipeline_;
-    // Closed-form shadow variants with the sampled paths compiled out: plain, +transparency, VRS, VRS+transparency,
-    // coarse, coarse+transparency.
-    std::array<rhi::Pipeline, 6> shadow_closed_pipelines_;
-    // Lean VRS resolve (reconstruction only): plain, +transparency. The VRS resolve pipelines run as deferred passes
-    // over the tiles it lists.
-    std::array<rhi::Pipeline, 2> shadow_vrs_lean_pipelines_;
+    // Closed-form shadow variants with the sampled paths compiled out: plain, +transparency, coarse,
+    // coarse+transparency. The VRS resolve only upsamples the coarse pass, so it has no closed-form variant.
+    std::array<rhi::Pipeline, 4> shadow_closed_pipelines_;
     // Ring penumbra table owned by RingRenderer; a 1x1 zero layer when there is none.
     const rhi::Image* ring_penumbra_ = nullptr;
     rhi::Image ring_penumbra_dummy_;

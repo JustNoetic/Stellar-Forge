@@ -455,8 +455,7 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
 #ifndef ATMOSPHERE_SHADOW_DATA_ONLY
                         if (shadow_cache_missed && any(greaterThan(endpoint_L, vec3(0.0)))) {
                             vec3 unused;
-                            bvec2 supported;
-                            vec3 fraction = atmosphere_shadow_deficit(transparent_dir, transparent_segment, path, transparent_pixel, 0u, 0.0, unused, supported);
+                            vec3 fraction = atmosphere_shadow_deficit(transparent_dir, transparent_segment, path, transparent_pixel, 0u, 0.0, unused);
                             endpoint_L = max(endpoint_L - endpoint_L * fraction, vec3(0.0));
                         }
 #endif

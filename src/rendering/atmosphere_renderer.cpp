@@ -80,23 +80,16 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     std::vector<rhi::DescriptorLayoutBinding> shadow_vrs(std::begin(shadow), std::end(shadow));
     shadow_vrs.push_back({21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
     shadow_vrs.push_back({22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage});
-    shadow_vrs.push_back({37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
-    const auto vrs_plain = shadow_vrs;
-    shadow_vrs_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", shadow_vrs, 0, tile_deferred);
-    shadow_vrs_lean_pipelines_[0] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", shadow_vrs, 0, tile_lean);
+    shadow_vrs_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", shadow_vrs);
     shadow_vrs.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_vrs.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
-    shadow_vrs_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs, 0, tile_deferred);
-    shadow_vrs_lean_pipelines_[1] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs, 0, tile_lean);
+    shadow_vrs_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs);
     {
         const std::pair<std::string, std::string> closed[] = {{"ATMOSPHERE_SHADOW_CLOSED_FORM", "1"}};
-        const std::pair<std::string, std::string> closed_deferred[] = {{"ATMOSPHERE_SHADOW_CLOSED_FORM", "1"}, {"ATMOSPHERE_TILE_DEFERRED", "1"}};
         shadow_closed_pipelines_[0] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow.comp", shadow, 0, closed);
         shadow_closed_pipelines_[1] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_transparency.comp", shadow_transparency, 0, closed);
-        shadow_closed_pipelines_[2] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", vrs_plain, 0, closed_deferred);
-        shadow_closed_pipelines_[3] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs, 0, closed_deferred);
-        shadow_closed_pipelines_[4] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow, 0, closed);
-        shadow_closed_pipelines_[5] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse_transparency.comp", coarse_transparency, 0, closed);
+        shadow_closed_pipelines_[2] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow, 0, closed);
+        shadow_closed_pipelines_[3] = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse_transparency.comp", coarse_transparency, 0, closed);
     }
     std::vector<rhi::DescriptorLayoutBinding> transparent_bindings(std::begin(composite_bindings), std::end(composite_bindings));
     transparent_bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
@@ -256,7 +249,6 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
         ctx.destroy_image(t->secondary_source);
         for (auto& u : t->uniforms) ctx.destroy_buffer(u);
         for (auto& shadow : t->shadows) ctx.destroy_buffer(shadow);
-        for (auto& tiles : t->shadow_tiles) ctx.destroy_buffer(tiles);
         for (auto& tiles : t->transparent_tiles) ctx.destroy_buffer(tiles);
         ctx.destroy_image(t->shadow_fraction);
         ctx.destroy_image(t->shadow_depth);
@@ -311,7 +303,6 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, shadow_vrs_transparency_pipeline_);
     for (auto& pipeline : shadow_closed_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
-    for (auto& pipeline : shadow_vrs_lean_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     for (auto& pipeline : transparent_lean_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     ctx.destroy_image(ring_penumbra_dummy_);
     ring_penumbra_ = nullptr;

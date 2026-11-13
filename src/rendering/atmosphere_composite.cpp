@@ -242,11 +242,13 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
     bool layered_aerosols = false;
     for (int i = 0; i < int(t->cached.aerosol_count.x); ++i) layered_aerosols = layered_aerosols || t->cached.aerosol_shape[i].z > 0.0f;
     bool closed = !temporal && header.flags.w == 0u && (header.flags.y & 36u) == 36u && t->cached.camera.w == 1.0f && !layered_aerosols;
-    size_t closed_index = (vrs ? 2u : 0u)+(transparency_writes.empty() ? 0u : 1u);
-    auto& pipeline = closed ? shadow_closed_pipelines_[closed_index] : reproject ? (transparency_writes.empty() ? shadow_rotate_pipeline_ : shadow_rotate_transparency_pipeline_)
-                         : temporal ? (transparency_writes.empty() ? shadow_accumulate_pipeline_ : shadow_accumulate_transparency_pipeline_)
-                         : vrs ? (transparency_writes.empty() ? shadow_vrs_pipeline_ : shadow_vrs_transparency_pipeline_)
-                         : (transparency_writes.empty() ? shadow_pipeline_ : shadow_transparency_pipeline_);
+    bool transparent = !transparency_writes.empty();
+    // The VRS resolve only upsamples the coarse pass, which is where the closed form applies.
+    auto& pipeline = vrs ? (transparent ? shadow_vrs_transparency_pipeline_ : shadow_vrs_pipeline_)
+                   : closed ? shadow_closed_pipelines_[transparent ? 1 : 0]
+                   : reproject ? (transparent ? shadow_rotate_transparency_pipeline_ : shadow_rotate_pipeline_)
+                   : temporal ? (transparent ? shadow_accumulate_transparency_pipeline_ : shadow_accumulate_pipeline_)
+                   : (transparent ? shadow_transparency_pipeline_ : shadow_pipeline_);
     auto& stbn = stbn_tex_ ? stbn_tex_ : dummy_stbn_;
     std::vector<rhi::PushDescriptorWrite> writes{
         rhi::PushDescriptorWrite::uniform_buffer(0, t->uniforms[ctx.frame_index()]),
@@ -325,8 +327,8 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
         coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(18, shadow_coarse_fraction_));
         coarse_writes.push_back(rhi::PushDescriptorWrite::storage_image(19, shadow_coarse_guide_));
         coarse_writes.insert(coarse_writes.end(), transparency_writes.begin(), transparency_writes.end());
-        auto& coarse = closed ? shadow_closed_pipelines_[transparency_writes.empty() ? 4 : 5]
-            : transparency_writes.empty() ? shadow_coarse_pipeline_ : shadow_coarse_transparency_pipeline_;
+        auto& coarse = closed ? shadow_closed_pipelines_[transparent ? 3 : 2]
+            : transparent ? shadow_coarse_transparency_pipeline_ : shadow_coarse_pipeline_;
         uint32_t cw = uint32_t(std::max(0, header.shadow_coarse_bounds.z-header.shadow_coarse_bounds.x));
         uint32_t ch = uint32_t(std::max(0, header.shadow_coarse_bounds.w-header.shadow_coarse_bounds.y));
         uint32_t coarse_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_coarse");
@@ -346,25 +348,9 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
     uint32_t sw = uint32_t(std::max(0, header.shadow_bounds.z-header.shadow_bounds.x));
     uint32_t sh = uint32_t(std::max(0, header.shadow_bounds.w-header.shadow_bounds.y));
     uint32_t resolve_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_resolve");
-    if (vrs) {
-        // Reconstruction only, without the full integration compiled in; the full shader reruns the tiles it lists.
-        auto& tiles = t->shadow_tiles[ctx.frame_index()];
-        begin_tiles(cmd, ctx, tiles, {sw, sh});
-        writes.push_back(rhi::PushDescriptorWrite::storage_buffer(37, tiles));
-        auto& lean = shadow_vrs_lean_pipelines_[transparency_writes.empty() ? 0 : 1];
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lean.handle);
-        ctx.push_descriptors(cmd, lean, writes);
-        vkCmdDispatch(cmd, (sw+7)/8, (sh+7)/8, 1);
-        uint32_t deferred_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_deferred");
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-        ctx.push_descriptors(cmd, pipeline, writes);
-        dispatch_tiles(cmd, ctx, tiles);
-        ctx.end_gpu_timer(cmd, deferred_timer);
-    } else {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-        ctx.push_descriptors(cmd, pipeline, writes);
-        vkCmdDispatch(cmd, (sw+7)/8, (sh+7)/8, 1);
-    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+    ctx.push_descriptors(cmd, pipeline, writes);
+    vkCmdDispatch(cmd, (sw+7)/8, (sh+7)/8, 1);
     ctx.end_gpu_timer(cmd, resolve_timer);
     for (auto* image : {&t->shadow_fraction, &t->shadow_depth})
         ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

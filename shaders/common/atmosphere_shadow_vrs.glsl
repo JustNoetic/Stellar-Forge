@@ -42,49 +42,33 @@ bool shadow_vrs_spatial_safe(vec3 direction, vec2 segment, float path) {
 layout(set = 0, binding = 21) uniform sampler2DArray coarse_shadow_fraction;
 layout(set = 0, binding = 22) uniform sampler2DArray coarse_shadow_guide;
 
-bool reconstruct_shadow_vrs(ivec2 pixel, int layer, bool finite, vec3 direction, vec2 segment, float path,
-                            out vec3 fraction, out bool supported) {
-    fraction = vec3(0.0);
-    supported = false;
+// Fixed-rate guided upsample: every pixel blends its 2x2 coarse neighbourhood with bilinear weights scaled by how
+// well each tap's visible segment (path length, entry distance, finite/infinite endpoint) matches its own. There is
+// no fallback, so the cost is the same for every pixel whatever the shadow geometry.
+vec3 reconstruct_shadow_vrs(ivec2 pixel, int layer, bool finite, vec2 segment, float path) {
     int scale = shadow_vrs_scale();
     ivec2 base = pixel/scale;
     vec2 f = vec2(pixel%scale)/float(scale);
-    if (all(equal(pixel%scale, ivec2(0)))) {
-        vec4 guide = texelFetch(coarse_shadow_guide, ivec3(base, layer), 0);
-        if (guide.w < 0.5 || (guide.z > 0.5) != finite || abs(guide.x-log2(max(path, 1e-5))) > 0.04) return false;
-        vec4 value = texelFetch(coarse_shadow_fraction, ivec3(base, layer), 0);
-        fraction = value.rgb;
-        supported = value.a > 0.5;
-        return true;
-    }
-    vec3 minimum = vec3(1.0), maximum = vec3(0.0);
-    vec3 sum = vec3(0.0);
     float log_path = log2(max(path, 1e-5));
     float segment_tolerance = max(0.02*max(path, 1.0), 4.0*float(scale)*segment.x/max(shadow_eye_focal.w, 1.0));
-    ivec2 size = textureSize(coarse_shadow_fraction, 0).xy;
-    bool any_supported = false, all_supported = true, all_unlit = true;
+    ivec2 lo = max(shadow_coarse_bounds.xy, ivec2(0));
+    ivec2 hi = min(shadow_coarse_bounds.zw, textureSize(coarse_shadow_fraction, 0).xy)-1;
+    vec3 sum = vec3(0.0);
+    float total = 0.0;
+    // A thin cloud or transparent fragment the coarse anchors all missed borrows the opaque layer's rays.
+    for (int source = layer; source >= 0 && total <= 0.0; source = source == 0 ? -1 : 0)
     for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
-        float weight = (x == 0 ? 1.0-f.x : f.x)*(y == 0 ? 1.0-f.y : f.y);
-        if (weight <= 0.0) continue;
-        ivec2 tap = base+ivec2(x, y);
-        if (any(greaterThanEqual(tap, size))) return false;
-        vec4 guide = texelFetch(coarse_shadow_guide, ivec3(tap, layer), 0);
-        if (guide.w < 0.5 || (guide.z > 0.5) != finite || abs(guide.x-log_path) > 0.04 ||
-            abs(guide.y-segment.x) > segment_tolerance) return false;
-        all_unlit = all_unlit && guide.w > 1.5;
-        vec4 value = texelFetch(coarse_shadow_fraction, ivec3(tap, layer), 0);
-        bool tap_supported = value.a >= 0.5;
-        any_supported = any_supported || tap_supported;
-        all_supported = all_supported && tap_supported;
-        minimum = min(minimum, value.rgb);
-        maximum = max(maximum, value.rgb);
-        sum += weight*value.rgb;
+        ivec2 tap = clamp(base+ivec2(x, y), lo, hi);
+        vec4 guide = texelFetch(coarse_shadow_guide, ivec3(tap, source), 0);
+        if (guide.w < 0.5) continue;
+        // A small floor keeps the off-centre taps available when the nearest one belongs to another surface.
+        float weight = (x == 0 ? 1.0-f.x : f.x)*(y == 0 ? 1.0-f.y : f.y)+1e-3;
+        float mismatch = max(abs(guide.x-log_path)/0.04, abs(guide.y-segment.x)/segment_tolerance);
+        weight /= 1.0+mismatch*mismatch*mismatch*mismatch;
+        if ((guide.z > 0.5) != finite) weight *= 1e-4;
+        sum += weight*texelFetch(coarse_shadow_fraction, ivec3(tap, source), 0).rgb;
+        total += weight;
     }
-    if (any_supported != all_supported) return false;
-    if (any(greaterThan(maximum-minimum, vec3(0.02)))) return false;
-    if (!all_unlit && !shadow_vrs_spatial_safe(direction, segment, path)) return false;
-    fraction = sum;
-    supported = all_supported;
-    return true;
+    return total > 0.0 ? sum/total : vec3(0.0);
 }
 #endif

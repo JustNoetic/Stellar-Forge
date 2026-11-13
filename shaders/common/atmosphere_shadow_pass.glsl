@@ -18,7 +18,6 @@ layout(r32f, set = 0, binding = 19) uniform writeonly image2DArray current_depth
 #ifdef ATMOSPHERE_SHADOW_TRANSPARENCY
 #include "common/transparency.glsl"
 #endif
-#include "common/atmosphere_tiles.glsl"
 layout(set = 0, binding = 34) uniform sampler2D cloud_layer_depth;
 
 // Reverse-Z depth of the 2D cloud sheet composited inline by the atmosphere pass, when it lies in front of the
@@ -73,22 +72,36 @@ float shadow_endpoint_path(vec2 ndc, vec3 direction, float depth, vec2 segment, 
 }
 
 #ifndef ATMOSPHERE_SHADOW_COARSE
-void store_shadow(ivec2 pixel, int layer, float depth, vec3 fraction, bool supported) {
-    imageStore(current_deficit, ivec3(pixel, layer), vec4(fraction, supported ? 1.0 : 0.0));
+void store_shadow(ivec2 pixel, int layer, float depth, vec3 fraction) {
+    imageStore(current_deficit, ivec3(pixel, layer), vec4(fraction, 0.0));
     imageStore(current_depth, ivec3(pixel, layer), vec4(depth));
 }
 #endif
 
-// Returns true when a lean VRS resolve leaves this pixel to the deferred full pass.
-bool evaluate_shadow_pixel(ivec2 pixel) {
+#ifndef ATMOSPHERE_SHADOW_ACCUMULATE
+// Single-frame deficits at the opaque endpoint, the nearest transparent fragment and the cloud sheet.
+void shadow_integrate(ivec2 pixel, vec3 direction, vec2 segment, float path, float prefix_path, float cloud_path,
+                      out vec3 fraction, out vec3 prefix_fraction, out vec3 cloud_fraction) {
+#ifdef ATMOSPHERE_SHADOW_CLOSED_FORM
+    closed_form_shadow_endpoints(direction, segment, path, prefix_path, cloud_path, fraction, prefix_fraction, cloud_fraction);
+#else
+    fraction = atmosphere_shadow_deficit(direction, segment, path, pixel, shadow_temporal.x, prefix_path, prefix_fraction);
+    vec3 unused;
+    cloud_fraction = cloud_path > 0.0
+        ? atmosphere_shadow_deficit(direction, segment, cloud_path, pixel, shadow_temporal.x, 0.0, unused) : vec3(0.0);
+#endif
+}
+#endif
+
+void evaluate_shadow_pixel(ivec2 pixel) {
     ivec2 size = imageSize(current_deficit).xy;
 #ifdef ATMOSPHERE_SHADOW_COARSE
-    if (any(lessThan(pixel, shadow_coarse_bounds.xy)) || any(greaterThanEqual(pixel, min(size, shadow_coarse_bounds.zw)))) return false;
+    if (any(lessThan(pixel, shadow_coarse_bounds.xy)) || any(greaterThanEqual(pixel, min(size, shadow_coarse_bounds.zw)))) return;
     ivec2 output_pixel = pixel;
     pixel *= shadow_vrs_scale();
     size = textureSize(scene_depth, 0);
 #else
-    if (any(lessThan(pixel, shadow_bounds.xy)) || any(greaterThanEqual(pixel, min(size, shadow_bounds.zw)))) return false;
+    if (any(lessThan(pixel, shadow_bounds.xy)) || any(greaterThanEqual(pixel, min(size, shadow_bounds.zw)))) return;
 #endif
     vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
     vec3 direction = view_direction(ndc);
@@ -109,54 +122,21 @@ bool evaluate_shadow_pixel(ivec2 pixel) {
     float prefix_path = transparent_depth >= 0.0 && path > 0.0 ? shadow_endpoint_path(ndc, direction, transparent_depth, segment, span) : 0.0;
     float cloud_depth = path > 0.0 ? shadow_cloud_depth(pixel, depth) : -1.0;
     float cloud_path = cloud_depth >= 0.0 ? shadow_endpoint_path(ndc, direction, cloud_depth, segment, span) : 0.0;
+    vec3 fraction = vec3(0.0), prefix_fraction = vec3(0.0), cloud_fraction = vec3(0.0);
 #ifdef ATMOSPHERE_SHADOW_COARSE
-    vec3 prefix_fraction = vec3(0.0), fraction = vec3(0.0);
-    bvec2 supported = bvec2(false);
-    bool spatial_safe = path > 0.0 && shadow_vrs_spatial_safe(direction, segment, path);
-    bool unlit_safe = !spatial_safe && path > 0.0 && shadow_cached_column_unlit(direction, segment, path);
-    bool prefix_safe = prefix_path > 0.0 && shadow_vrs_spatial_safe(direction, segment, prefix_path);
-    bool prefix_unlit = prefix_path > 0.0 && !prefix_safe && shadow_cached_column_unlit(direction, segment, prefix_path);
-    bool cloud_safe = cloud_path > 0.0 && shadow_vrs_spatial_safe(direction, segment, cloud_path);
-    bool cloud_unlit = cloud_path > 0.0 && !cloud_safe && shadow_cached_column_unlit(direction, segment, cloud_path);
-    vec3 cloud_fraction = vec3(0.0);
-    bool cloud_supported = false;
-#ifdef ATMOSPHERE_SHADOW_CLOSED_FORM
-    if (spatial_safe || prefix_safe || cloud_safe) {
-        bvec3 endpoint_supported;
-        closed_form_shadow_endpoints(direction, segment, path, prefix_path, cloud_safe ? cloud_path : 0.0,
-            fraction, prefix_fraction, cloud_fraction, endpoint_supported);
-        supported = endpoint_supported.xy;
-        cloud_supported = endpoint_supported.z;
+    // Every covered texel is integrated; the full-resolution VRS pass only upsamples.
+    if (path > 0.0) shadow_integrate(pixel, direction, segment, path, prefix_path, cloud_path, fraction, prefix_fraction, cloud_fraction);
+    float paths[3] = float[3](path, prefix_path, cloud_path);
+    vec3 fractions[3] = vec3[3](fraction, prefix_fraction, cloud_fraction);
+    for (int layer = 0; layer < 3; ++layer) {
+        float layer_path = paths[layer];
+        bool finite = layer == 0 ? depth > 0.0 : layer_path > 0.0;
+        imageStore(current_deficit, ivec3(output_pixel, layer), vec4(fractions[layer], 0.0));
+        // Guide: log path length, atmosphere entry distance, finite endpoint, coverage.
+        imageStore(current_guide, ivec3(output_pixel, layer), vec4(log2(max(layer_path, 1e-5)), segment.x,
+            finite ? 1.0 : 0.0, layer_path > 0.0 ? 1.0 : 0.0));
     }
 #else
-    for (int pass = 0; pass < 2; ++pass) {
-        if (pass == 0 ? !(spatial_safe || prefix_safe) : !cloud_safe) continue;
-        vec3 second;
-        bvec2 flags;
-        vec3 first = atmosphere_shadow_deficit(direction, segment, pass == 0 ? path : cloud_path,
-            pixel, shadow_temporal.x, pass == 0 ? prefix_path : 0.0, second, flags);
-        if (pass == 0) {
-            fraction = first;
-            prefix_fraction = second;
-            supported = flags;
-        } else {
-            cloud_fraction = first;
-            cloud_supported = flags.x;
-        }
-    }
-#endif
-    imageStore(current_deficit, ivec3(output_pixel, 0), vec4(spatial_safe ? fraction : vec3(0.0), spatial_safe && supported.x ? 1.0 : 0.0));
-    imageStore(current_guide, ivec3(output_pixel, 0), vec4(log2(max(path, 1e-5)), segment.x, depth > 0.0 ? 1.0 : 0.0,
-        unlit_safe ? 2.0 : spatial_safe ? 1.0 : 0.0));
-    imageStore(current_deficit, ivec3(output_pixel, 1), vec4(prefix_safe ? prefix_fraction : vec3(0.0), prefix_safe && supported.y ? 1.0 : 0.0));
-    imageStore(current_guide, ivec3(output_pixel, 1), vec4(log2(max(prefix_path, 1e-5)), segment.x, prefix_path > 0.0 ? 1.0 : 0.0,
-        prefix_unlit ? 2.0 : prefix_safe ? 1.0 : 0.0));
-    imageStore(current_deficit, ivec3(output_pixel, 2), vec4(cloud_safe ? cloud_fraction : vec3(0.0), cloud_safe && cloud_supported ? 1.0 : 0.0));
-    imageStore(current_guide, ivec3(output_pixel, 2), vec4(log2(max(cloud_path, 1e-5)), segment.x, cloud_path > 0.0 ? 1.0 : 0.0,
-        cloud_unlit ? 2.0 : cloud_safe ? 1.0 : 0.0));
-#else
-    vec3 prefix_fraction = vec3(0.0), fraction = vec3(0.0);
-    bvec2 supported = bvec2(false);
 #ifdef ATMOSPHERE_SHADOW_ACCUMULATE
     float count = 0.0;
     bool endpoints_changed = false;
@@ -175,7 +155,7 @@ bool evaluate_shadow_pixel(ivec2 pixel) {
             history_pixel_age = 64u;
             history_pixel_counts = uvec4(1u, 0u, 0u, 1u);
         }
-        return false;
+        return;
     }
     AtmosphereShadowEstimate estimate = AtmosphereShadowEstimate(vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
     uint sequence = uint(count);
@@ -184,7 +164,7 @@ bool evaluate_shadow_pixel(ivec2 pixel) {
 #endif
     if (path > 0.0)
         fraction = atmosphere_shadow_estimate(direction, segment, path, pixel, sequence,
-            prefix_path, prefix_fraction, supported, estimate);
+            prefix_path, prefix_fraction, estimate);
 #ifdef ATMOSPHERE_SHADOW_ROTATION
     if (count > 0.0) {
         vec3 previous_energy = imageLoad(reprojected_energy, pixel).rgb;
@@ -204,77 +184,38 @@ bool evaluate_shadow_pixel(ivec2 pixel) {
     }
     fraction = accumulate_shadow(pixel, 0, depth, estimate.energy, estimate.loss, count);
     prefix_fraction = accumulate_shadow(pixel, 1, transparent_depth, estimate.prefix_energy, estimate.prefix_loss, count);
-    store_shadow(pixel, 0, depth, fraction, supported.x);
-    store_shadow(pixel, 1, transparent_depth, prefix_fraction, supported.y);
+    store_shadow(pixel, 0, depth, fraction);
+    store_shadow(pixel, 1, transparent_depth, prefix_fraction);
     imageStore(current_depth, ivec3(pixel, 2), vec4(-1.0));
 #else
     if (path > 0.0) {
-        bool reconstructed = false;
-        vec3 cloud_fraction = vec3(0.0);
-        bool cloud_supported = false;
 #ifdef ATMOSPHERE_SHADOW_VRS
-        reconstructed = reconstruct_shadow_vrs(pixel, 0, depth > 0.0, direction, segment, path, fraction, supported.x) &&
-            (prefix_path <= 0.0 || reconstruct_shadow_vrs(pixel, 1, true, direction, segment, prefix_path, prefix_fraction, supported.y)) &&
-            (cloud_path <= 0.0 || reconstruct_shadow_vrs(pixel, 2, true, direction, segment, cloud_path, cloud_fraction, cloud_supported));
-        if (!reconstructed) {
-            fraction = prefix_fraction = cloud_fraction = vec3(0.0);
-            supported = bvec2(false);
-            cloud_supported = false;
-        }
-#endif
-#ifdef ATMOSPHERE_TILE_LEAN
-        if (!reconstructed && !shadow_cached_column_unlit(direction, segment, path)) return true;
+        fraction = reconstruct_shadow_vrs(pixel, 0, depth > 0.0, segment, path);
+        if (prefix_path > 0.0) prefix_fraction = reconstruct_shadow_vrs(pixel, 1, true, segment, prefix_path);
+        if (cloud_path > 0.0) cloud_fraction = reconstruct_shadow_vrs(pixel, 2, true, segment, cloud_path);
 #else
-        if (!reconstructed && !shadow_cached_column_unlit(direction, segment, path)) {
-#ifdef ATMOSPHERE_SHADOW_CLOSED_FORM
-            bvec3 endpoint_supported;
-            closed_form_shadow_endpoints(direction, segment, path, prefix_path, cloud_path,
-                fraction, prefix_fraction, cloud_fraction, endpoint_supported);
-            supported = endpoint_supported.xy;
-            cloud_supported = endpoint_supported.z;
-#else
-            for (int pass = 0; pass < (cloud_path > 0.0 ? 2 : 1); ++pass) {
-                vec3 second;
-                bvec2 flags;
-                vec3 first = atmosphere_shadow_deficit(direction, segment, pass == 0 ? path : cloud_path,
-                    pixel, shadow_temporal.x, pass == 0 ? prefix_path : 0.0, second, flags);
-                if (pass == 0) {
-                    fraction = first;
-                    prefix_fraction = second;
-                    supported = flags;
-                } else {
-                    cloud_fraction = first;
-                    cloud_supported = flags.x;
-                }
-            }
+        if (!shadow_cached_column_unlit(direction, segment, path))
+            shadow_integrate(pixel, direction, segment, path, prefix_path, cloud_path, fraction, prefix_fraction, cloud_fraction);
 #endif
-        }
-#endif
-        store_shadow(pixel, 0, depth, fraction, supported.x);
+        store_shadow(pixel, 0, depth, fraction);
         if (cloud_path > 0.0)
-            store_shadow(pixel, 2, cloud_depth, cloud_fraction, cloud_supported);
+            store_shadow(pixel, 2, cloud_depth, cloud_fraction);
         else
             imageStore(current_depth, ivec3(pixel, 2), vec4(-1.0));
 #ifdef ATMOSPHERE_SHADOW_TRANSPARENCY
         if (prefix_path > 0.0)
-            store_shadow(pixel, 1, transparent_depth, prefix_fraction, supported.y);
+            store_shadow(pixel, 1, transparent_depth, prefix_fraction);
         else
             imageStore(current_depth, ivec3(pixel, 1), vec4(-1.0));
 #endif
     }
 #endif
 #endif
-    return false;
 }
 
 #ifndef ATMOSPHERE_SHADOW_ACCUMULATE
 void main() {
-#if defined(ATMOSPHERE_TILE_DEFERRED)
-    evaluate_shadow_pixel(shadow_bounds.xy+atmosphere_tile_pixel());
-#elif defined(ATMOSPHERE_TILE_LEAN)
-    atmosphere_tile_begin();
-    atmosphere_tile_end(evaluate_shadow_pixel(shadow_bounds.xy+ivec2(gl_GlobalInvocationID.xy)));
-#elif defined(ATMOSPHERE_SHADOW_COARSE)
+#ifdef ATMOSPHERE_SHADOW_COARSE
     evaluate_shadow_pixel(shadow_coarse_bounds.xy+ivec2(gl_GlobalInvocationID.xy));
 #else
     evaluate_shadow_pixel(shadow_bounds.xy+ivec2(gl_GlobalInvocationID.xy));
