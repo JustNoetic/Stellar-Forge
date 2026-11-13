@@ -12,6 +12,7 @@ namespace sf::rendering {
 inline constexpr uint32_t REFRACTION_PROFILE_TEXELS_X = 1024;
 inline constexpr uint32_t REFRACTION_OBSERVER_WIDTH = 512;
 inline constexpr uint32_t REFRACTION_OBSERVER_HEIGHT = 128;
+inline constexpr uint32_t REFRACTION_EXIT_CELLS = 4096;
 
 struct RefractionHost {
     int body = -1;

@@ -80,6 +80,27 @@ layout(set = 0, binding = 22) uniform sampler2D u_refraction_travel;
 layout(set = 0, binding = 23) uniform sampler2D u_refraction_rows;
 layout(set = 0, binding = 24) uniform sampler2D u_refraction_profile;
 
+#ifdef RING_REFRACTION_TABLE
+// Per-view exit table (refraction/exit_table.comp): row 0 Catmull-Rom polar nodes, row 1 (error bound, state).
+layout(set = 0, binding = 27) uniform sampler2D u_refraction_exit;
+
+// Below this tolerance the theta -> cell mapping's own float rounding is no longer negligible.
+const float RING_EXIT_TOLERANCE_FLOOR = 1e-6;
+
+// 1: polar interpolated within tolerance; 0: ray blocked; -1: use the exact path.
+int ring_refraction_exit_table(RefractionGPU g, float theta, float tolerance, out float polar) {
+    polar = 0.0;
+    if (tolerance < RING_EXIT_TOLERANCE_FLOOR) return -1;
+    float cell = refraction_column(g, theta, 0.0)*float(REFRACTION_EXIT_CELLS-1);
+    int i = clamp(int(cell), 0, REFRACTION_EXIT_CELLS-2);
+    vec2 bound = texelFetch(u_refraction_exit, ivec2(i, 1), 0).xy;
+    if (bound.y < -0.5 || bound.x > tolerance) return -1;
+    if (bound.y < 0.5) return 0;
+    polar = refraction_exit_catmull(texelFetch(u_refraction_exit, ivec2(i, 0), 0), cell-float(i));
+    return 1;
+}
+#endif
+
 bool ring_refracted_hit(vec3 anchor, vec3 center, vec3 pole, float pixel_angle,
                         out vec3 hit, out vec3 direction, out vec3 apparent) {
     vec3 world = center+anchor;
@@ -100,20 +121,25 @@ bool ring_refracted_hit(vec3 anchor, vec3 center, vec3 pole, float pixel_angle,
     if (sine < 1e-7) return mu >= 0.0 || range*g.escape.z <= g.frame.x;
     float radius = g.frame.y, camera_radius = radius+g.frame.x;
     float b = camera_radius*sine;
-    float q = g.frame.w > 0.5 ? b-radius : refraction_invariant(g, atan(sine, mu));
+    float theta = atan(sine, mu);
+    float q = g.frame.w > 0.5 ? b-radius : refraction_invariant(g, theta);
     if (g.frame.w > 0.5) {
         if (mu >= 0.0 || q >= g.frame.z) return true;
         float entry = -camera_radius*mu-sqrt(max((g.frame.z-q)*(2.0*radius+g.frame.z+q), 0.0));
         float target = range*length(refraction_to_atmosphere(view_ray))*g.escape.z;
         if (target <= entry) return true;
     }
-    bool inward = mu < 0.0;
-    bool covered = q >= g.model.x;
-    if (q > g.escape.x || (inward && (!covered || refraction_turn(u_refraction_rows, u_refraction_profile, g, q) < 0.0))) return false;
-    float top_travel = refraction_table_travel(u_refraction_travel, u_refraction_rows, u_refraction_profile, g, q, g.frame.z);
-    float camera_travel = refraction_table_travel(u_refraction_travel, u_refraction_rows, u_refraction_profile, g, q, g.frame.x);
-    float polar = covered ? (inward ? top_travel+camera_travel : top_travel-camera_travel)
-                          : refraction_direct(u_refraction_profile, g, q, g.frame.x, g.frame.z);
+    float polar;
+#ifdef RING_REFRACTION_TABLE
+    int tabulated = g.frame.w > 0.5 ? -1 : ring_refraction_exit_table(g, theta, 0.02*pixel_angle, polar);
+    if (tabulated == 0) return false;
+    if (tabulated < 0)
+#endif
+    {
+        vec2 exit = refraction_exit_polar(u_refraction_travel, u_refraction_rows, u_refraction_profile, g, theta, q);
+        if (exit.y < 0.5) return false;
+        polar = exit.x;
+    }
     vec3 azimuth = normalize(v-up*mu);
     vec3 normal_exit = up*cos(polar)+azimuth*sin(polar);
     vec3 tangent_exit = -up*sin(polar)+azimuth*cos(polar);

@@ -7,6 +7,7 @@ const int REFRACTION_PROFILE_WIDTH = 1024;
 const int REFRACTION_OBSERVER_WIDTH = 512;
 const int REFRACTION_OBSERVER_HEIGHT = 128;
 const int REFRACTION_SURFACE_ROW = REFRACTION_OBSERVER_HEIGHT/2;
+const int REFRACTION_EXIT_CELLS = 4096;
 const float REFRACTION_PI = 3.14159265358979f;
 const float REFRACTION_FAR = 1e20f;
 
@@ -100,11 +101,10 @@ float refraction_travel_row(sampler2D travel, int row, int column, float f) {
     return a+(b-a)*f;
 }
 
-float refraction_table_travel(sampler2D travel, sampler2D rows, sampler2D profile, RefractionGPU g, float q, float h) {
+// Travel to height h for an impact q below the top, given q's turning height and table row (shared by both ends of a chord).
+float refraction_table_travel_at(sampler2D travel, RefractionGPU g, float q, float h, float turn, float row) {
     float top = g.frame.z;
-    if (q >= top) return refraction_vacuum(g, q, h);
     float tail = h > top ? refraction_vacuum(g, q, h)-refraction_vacuum(g, q, top) : 0.0f;
-    float turn = refraction_turn(rows, profile, g, q);
     float inside = min(h, top);
     if (inside <= turn) return tail;
     float span = sqrt(max(top-turn, 0.0f));
@@ -112,12 +112,23 @@ float refraction_table_travel(sampler2D travel, sampler2D rows, sampler2D profil
     float column = clamp(x, 0.0f, 1.0f)*float(REFRACTION_COLUMNS-1);
     int j = min(int(column), REFRACTION_COLUMNS-2);
     float f = column-float(j);
-    float row = refraction_row_position(g, q);
     int i = min(int(row), REFRACTION_ROWS-2);
     float w = row-float(i);
     float value = refraction_catmull(refraction_travel_row(travel, i-1, j, f), refraction_travel_row(travel, i, j, f),
                                      refraction_travel_row(travel, i+1, j, f), refraction_travel_row(travel, i+2, j, f), w);
     return span*value+tail;
+}
+
+float refraction_table_travel(sampler2D travel, sampler2D rows, sampler2D profile, RefractionGPU g, float q, float h) {
+    if (q >= g.frame.z) return refraction_vacuum(g, q, h);
+    return refraction_table_travel_at(travel, g, q, h, refraction_turn(rows, profile, g, q), refraction_row_position(g, q));
+}
+
+// Travel to two heights along one impact; the turning point and row are looked up once.
+vec2 refraction_table_travel_pair(sampler2D travel, sampler2D rows, sampler2D profile, RefractionGPU g, float q, float a, float b) {
+    if (q >= g.frame.z) return vec2(refraction_vacuum(g, q, a), refraction_vacuum(g, q, b));
+    float turn = refraction_turn(rows, profile, g, q), row = refraction_row_position(g, q);
+    return vec2(refraction_table_travel_at(travel, g, q, a, turn, row), refraction_table_travel_at(travel, g, q, b, turn, row));
 }
 
 float refraction_direct(sampler2D profile, RefractionGPU g, float q, float a, float b) {
@@ -157,20 +168,32 @@ vec2 refraction_reach_impact(sampler2D travel, sampler2D rows, sampler2D profile
     bool blocked = q > g.escape.x && target > g.escape.y;
     if (!inward) {
         if (target < camera || blocked) return vec2(0.0f, 0.0f);
-        float t = covered ? refraction_table_travel(travel, rows, profile, g, q, target)-refraction_table_travel(travel, rows, profile, g, q, camera)
-                          : refraction_direct(profile, g, q, camera, target);
-        return vec2(t, 1.0f);
+        if (!covered) return vec2(refraction_direct(profile, g, q, camera, target), 1.0f);
+        vec2 travels = refraction_table_travel_pair(travel, rows, profile, g, q, target, camera);
+        return vec2(travels.x-travels.y, 1.0f);
     }
     float turn = covered ? refraction_turn(rows, profile, g, q) : -REFRACTION_FAR;
     bool grounded = !covered || turn < floor_height;
     if (target < camera && !outbound) {
         if (target < (grounded ? floor_height : turn)) return vec2(0.0f, 0.0f);
-        float t = covered ? refraction_table_travel(travel, rows, profile, g, q, camera)-refraction_table_travel(travel, rows, profile, g, q, target)
-                          : refraction_direct(profile, g, q, target, camera);
-        return vec2(t, 1.0f);
+        if (!covered) return vec2(refraction_direct(profile, g, q, target, camera), 1.0f);
+        vec2 travels = refraction_table_travel_pair(travel, rows, profile, g, q, camera, target);
+        return vec2(travels.x-travels.y, 1.0f);
     }
     if (grounded || blocked || target < turn) return vec2(0.0f, 0.0f);
-    return vec2(refraction_table_travel(travel, rows, profile, g, q, camera)+refraction_table_travel(travel, rows, profile, g, q, target), 1.0f);
+    vec2 travels = refraction_table_travel_pair(travel, rows, profile, g, q, camera, target);
+    return vec2(travels.x+travels.y, 1.0f);
+}
+
+// (central angle, 1) swept by an observer's ray at zenith theta (invariant q) between the eye and the atmosphere top,
+// or (0, 0) when the ray turns below the ground or never escapes.
+vec2 refraction_exit_polar(sampler2D travel, sampler2D rows, sampler2D profile, RefractionGPU g, float theta, float q) {
+    bool inward = theta > 0.5f*REFRACTION_PI;
+    bool covered = q >= g.model.x;
+    if (q > g.escape.x || (inward && (!covered || refraction_turn(rows, profile, g, q) < 0.0f))) return vec2(0.0f, 0.0f);
+    if (!covered) return vec2(refraction_direct(profile, g, q, g.frame.x, g.frame.z), 1.0f);
+    vec2 travels = refraction_table_travel_pair(travel, rows, profile, g, q, g.frame.z, g.frame.x);
+    return vec2(inward ? travels.x+travels.y : travels.x-travels.y, 1.0f);
 }
 
 vec2 refraction_reach(sampler2D travel, sampler2D rows, sampler2D profile, RefractionGPU g, float zenith, float target, float floor_height, bool outbound) {
@@ -415,6 +438,15 @@ vec2 refraction_solve(sampler2D travel, sampler2D rows, sampler2D profile, Refra
         rotation = mix(refraction_born(profile, g, chord, distance), rotation, weight);
     }
     return vec2(clamp(rotation, -g.profile.w, g.profile.w), 2.0f*visible-1.0f);
+}
+
+// Interior observer zenith at exit-table node i, on the observer table's horizon-dense column mapping.
+float refraction_exit_theta(RefractionGPU g, float node) {
+    return refraction_chord(g, clamp(node/float(REFRACTION_EXIT_CELLS-1), 0.0f, 1.0f)).x;
+}
+
+float refraction_exit_catmull(vec4 nodes, float t) {
+    return refraction_catmull(nodes.x, nodes.y, nodes.z, nodes.w, t);
 }
 
 vec2 refraction_observer_cell(sampler2D travel, sampler2D rows, sampler2D profile, RefractionGPU g, int column, int row) {

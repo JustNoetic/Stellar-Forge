@@ -139,7 +139,7 @@ void main() {
                     ? (1u << u_scene.num_ring_hosts) - 1u
                     : eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars + s];
                 if (candidates != 0u)
-                    shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad, d_au, candidates);
+                    shadow *= compute_surface_ring_shadow(f_world_pos, L, sun_ang_rad, d_au, candidates, uint(s));
             }
         }
 

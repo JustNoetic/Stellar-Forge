@@ -174,6 +174,19 @@ void App::run_benchmark() {
                 require(simulation_.apply(ephemeris::SetTimeWarp{1.0}));
                 require(simulation_.advance(units::Seconds{benchmark::ECLIPSE_FIXTURE_YEARS * SECONDS_PER_YEAR}));
             }
+            if (scene.starts_with("earth-equinox")) {
+                // Advance from the epoch toward the next equinox until the Sun is within the fixture's elevation.
+                require(simulation_.apply(ephemeris::SetPaused{false}));
+                require(simulation_.apply(ephemeris::SetTimeWarp{1.0}));
+                double target = benchmark::equinox_fixture_elevation(scene);
+                require(simulation_.advance(units::Seconds{120.0*86400.0}));
+                int steps = 0;
+                for (double e = std::abs(benchmark::sun_equator_elevation(system())); e > target; e = std::abs(benchmark::sun_equator_elevation(system()))) {
+                    if (++steps > 200000) throw std::runtime_error("Equinox fixture did not reach its Sun elevation.");
+                    require(simulation_.advance(units::Seconds{e > target+0.1 ? 3600.0 : 60.0}));
+                }
+                log::info("Equinox fixture: Sun {:.4f} deg from the equator after {} steps.", benchmark::sun_equator_elevation(system()), steps);
+            }
             bool paused = scene == "overview" || scene == "approach" || (earth_closeup && !scene.ends_with("-live"));
             require(simulation_.apply(ephemeris::SetPaused{paused}));
             require(simulation_.apply(ephemeris::SetTimeWarp{options.warp}));
@@ -241,7 +254,7 @@ void App::run_benchmark() {
                 {"refraction", settings.refraction_enabled}, {"terrain", settings.terrain_imported_enabled}, {"normals", settings.terrain_normal_maps_enabled},
                 {"textures", settings.surface_textures_enabled}, {"rings", settings.show_rings}, {"ring_shadows", settings.ring_shadows_enabled},
                 {"direct_sunlight_only", settings.direct_sunlight_only},
-                {"clouds", settings.clouds_enabled}, {"cloud_mode", settings.cloud_mode}, {"legacy_transparency", settings.transparency_reference_legacy},
+                {"clouds", settings.clouds_enabled}, {"cloud_mode", settings.cloud_mode}, {"cloud_sheet_inline", settings.cloud_sheet_inline}, {"legacy_transparency", settings.transparency_reference_legacy},
                 {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
                 {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}, {"shadow_analytic", settings.atmosphere_shadow_analytic},
                 {"shadow_closed_form", settings.atmosphere_shadow_closed_form}};

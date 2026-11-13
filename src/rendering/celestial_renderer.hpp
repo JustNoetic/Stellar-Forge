@@ -151,6 +151,13 @@ private:
 
     rhi::Pipeline sphere_pipeline_{};
     std::array<rhi::Pipeline, 2> cloud_pipeline_{}, cloud_depth_pipeline_{}, cloud_transparency_pipeline_{};
+    // Inline 2D clouds: the sheet pass stores each pixel's front cloud crossing in a cloud layer (colour with
+    // 2*body+opacity in alpha, and reverse-Z depth), which the atmosphere composite blends with its own transport.
+    rhi::Pipeline cloud_inline_pipeline_{};
+    rhi::Image cloud_layer_color_, cloud_layer_depth_;
+    std::vector<std::pair<rhi::Image, uint64_t>> retired_cloud_layers_;
+    bool cloud_layer_active_ = false;
+    void prepare_cloud_layer(VkCommandBuffer cmd, rhi::VkContext& ctx, VkExtent2D extent);
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> fluid_ssbos_{};
     std::vector<uint32_t> cloud_bodies_;
     CloudMaps cloud_maps_;

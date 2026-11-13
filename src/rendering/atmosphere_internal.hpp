@@ -7,6 +7,7 @@
 namespace sf::rendering {
 
 struct RingHostGPU;
+struct RingPenumbraSlots;
 
 inline constexpr double LIMB_RESOLVED_PIXELS = 32.0;
 
@@ -25,7 +26,10 @@ inline constexpr rhi::DescriptorLayoutBinding composite_bindings[] = {
         {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
         {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
         {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}, {17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
-        {20, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}, {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}};
+        {20, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}, {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
+        {33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}, {34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
+        {38, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}};
+
 
 struct AtmosphereFrame {
     AtmosphereParametersGPU p{};
@@ -67,10 +71,11 @@ struct LutRecorder {
 
 bool stellar_source_resolved(const AtmosphereParametersGPU& p);
 bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::SystemSnapshot& system,
-                     uint32_t receiver, glm::dvec3 eye, float outer, float focal,
+                     uint32_t receiver, glm::dvec3 eye, float outer, float ground, float focal,
+                     const Camera& camera, const glm::dmat3& apparent, VkExtent2D extent, double refraction_pad,
                      const RenderSettings& settings, std::span<const RingHostGPU> rings,
                      AtmosphereShadowHeaderGPU& previous, std::vector<AtmosphereShadowCasterGPU>& previous_casters,
-                     uint32_t sequence, uint32_t& changes);
+                     uint32_t sequence, uint32_t& changes, const RingPenumbraSlots* penumbra_slots = nullptr);
 AtmosphereFrame make_atmosphere_frame(const ephemeris::SystemSnapshot& system, uint32_t index, const Camera& camera,
                                       const RenderSettings& settings, VkExtent2D extent, const glm::dmat3& apparent,
                                       double candidate_distance, double focal, glm::dvec3 eye, std::span<const float> minimum_heights_km);

@@ -157,7 +157,10 @@ Shaded in `celestial/sphere.frag` (spheres and terrain).
   cloud undersides have reduced direct illumination. The sky contribution is
   `0.5 × sky_irradiance` on both sides. It requires atmospheric surface lighting;
   Direct sunlight only suppresses it with the other indirect-light terms.
-- The crossing enters the existing transparency list at its exact depth. The
+- Inline composition (default, `cloud_sheet_inline`, Settings → "Composite 2D
+  clouds with the atmosphere"; see below) blends the crossing inside the
+  atmosphere pass. With it off, or with progressive atmosphere shadows, the
+  crossing enters the existing transparency list at its exact depth instead. The
   atmosphere compositor applies `T * premultiplied_color + alpha * scattering`
   using the same aerial LUT as the surface, then resolves depth-sorted layers.
   There is no additional aerial LUT or atmospheric integration pass.
@@ -173,6 +176,98 @@ Shaded in `celestial/sphere.frag` (spheres and terrain).
   Earth's native 16000×8000 R8 map with mips costs about 162.8 MiB. Mesh vertex
   count is independent of texture resolution. Close views reveal the flat shell;
   this mode does not produce cloud volume or billowing silhouettes.
+
+### Inline 2D cloud composition
+
+Measured with the transparency-list path, the cloud draw was only about 30% of
+what 2D clouds cost (2560×1440, RTX 4060 Ti; Earth full disc with ring shadows
++2.72 ms in total, of which 0.78 ms was the draw). The rest came from treating
+every cloud pixel as a general transparent fragment:
+- an A-buffer record and per-pixel sort;
+- a separate atmospheric transport pass for the fragment endpoint;
+- a second full shadowed in-scatter integration up to the cloud.
+
+The inline path keeps the sheet shader but changes where its result goes:
+
+- **Cloud layer.** `CLOUD_SHEET_INLINE` (`cloud_inline_pipeline_`) stores each
+  pixel's front crossing in two full-resolution storage images instead of the
+  transparency list (no depth test; occlusion is resolved later):
+  - an RGBA32F colour: premultiplied, exposure applied; alpha holds
+    `2·body + opacity`;
+  - an R32F reverse-Z depth.
+
+  Only the depth image is cleared each frame.
+- **Composite.** The atmosphere composite (compute and dual-source fragment
+  paths) reads the layer for its own body when the cloud lies in front of the
+  scene depth. It transports the cloud with one extra `atmosphere_transport`
+  call at the cloud depth, then blends with
+  `scattered = (1−α)·scattered + C`, `transmitted *= (1−α)`.
+- **Shadows.** The shadow pass reads the cloud depth (binding 34) and stores the
+  cloud's shadowed prefix as a third layer of the shadow deficit/endpoint
+  images; the coarse VRS images also have three layers. The closed-form path
+  (`closed_form_shadow_endpoints`) keeps the plain two-integration loop:
+  - **Split.** When the cloud lies in the last tenth of the opaque ray (seen from
+    above, a few km before the ground), its loss is a partial sum of the opaque
+    integration's own strata. Strata before the cloud count fully, and the
+    stratum containing it counts with its visibility over the light
+    `W(cloud) − W(t0)`. This costs one light-cache lookup, with no visibility
+    evaluations.
+  - **Own slot.** Otherwise (seen from below, the cloud is near the camera,
+    inside a first stratum reaching far past it), the cloud takes the second
+    integration slot. A transparent fragment, then usually an orbit line or ring
+    behind the cloud, becomes the split.
+
+  Tried and rejected:
+  - One shared sweep through all endpoints, with strata in proportion to each
+    segment's light share: it cost as much as a separate integration.
+  - Splitting from above and below alike: up to 149% error near the deck seen
+    from below.
+  - A runtime strata count, or more call sites of the strata loop: these slow
+    every pixel through register pressure.
+
+  The sampled and reference shadow paths evaluate the cloud endpoint with a
+  separate call.
+- **Ordering with rings and orbit lines.** These still use the transparency
+  list, which resolves after the composite, over a background that already
+  contains the cloud. The atmosphere's fragment-transport pass therefore
+  rewrites any fragment behind the cloud (premultiplied F, alpha f) as
+  `(1−α)F + f·C`. Blending it over the clouded background then gives
+  `C + (1−α)(F + (1−f)X)`, the same as sorting it with the cloud.
+- **Fallbacks.** Bodies whose atmosphere is not composited this frame keep the
+  transparency-list path, as do progressive (temporal) atmosphere shadows,
+  whose history has no cloud layer. The same applies on hardware without
+  fragment stores. The `layered-clouds` benchmark variant selects the old path.
+- **Limitation.** If two clouded bodies overlap on screen, their storage writes
+  race; the old path sorted them.
+
+Measured 2026-11-12 (RTX 4060 Ti, 2560×1440 hidden window, 900 frames after 300
+warm-up, all defaults), GPU ms added by clouds over the `no-clouds` variant:
+
+| View | Transparency list (`layered-clouds`) | Inline |
+|---|---:|---:|
+| earth-ground | +0.70 | +0.40 |
+| earth-ground-rings | +2.28 | +1.19 |
+| earth-full | +0.94 | +0.54 |
+| earth-full-rings | +3.19 | +1.11 |
+| earth-eclipse | +3.10 | +1.11 |
+
+What changed in earth-full-rings:
+- `atmosphere_transparent` dropped from 2.05 to 0.08 ms;
+- `transparency_resolve` from 0.48 to 0.16 ms;
+- the shadow pass from 1.65 to 1.48 ms (1.20 without clouds);
+- the cloud draw from 0.76 to 0.62 ms;
+- the composite's opaque pass gained about 0.4 ms for the cloud transport.
+
+Accuracy was checked with 90-frame 1600×900 high-exposure captures against
+256-step `reference-shadows`. Error is the same as the transparency-list path:
+- earth-ground-rings: mean 1.82% vs 1.79%; max 8.9% vs 74.7%. The old path's
+  maximum came from orbit lines drawn through the cloud.
+- earth-full-rings: mean 0.32% in both.
+- earth-eclipse: mean 0.05% vs 0.03%.
+
+Image differences from the old path concentrate on transparent fragments behind
+overcast cloud. Those fragments are now hidden; the old path drew them through
+the cloud.
 
 ### Experimental volumetric mode
 

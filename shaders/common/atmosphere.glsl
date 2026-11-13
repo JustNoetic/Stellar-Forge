@@ -40,6 +40,7 @@ layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 star_radiance[16];
     vec4 star_disc[16];
     vec4 limb_image;
+    vec4 cloud_layer; // x: body index, y: 1 when the 2D cloud sheet is composited inline from the cloud layer
 } atm;
 
 const float DEPTH_DISTANCE_TOLERANCE = 1e-6;

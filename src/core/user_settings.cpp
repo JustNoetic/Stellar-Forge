@@ -66,6 +66,7 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(oceans_enabled);
     SF_SETTING(clouds_enabled);
     SF_SETTING(cloud_mode);
+    SF_SETTING(cloud_sheet_inline);
     SF_SETTING(cloud_shadows_enabled);
     SF_SETTING(ring_planetshine_mode);
     SF_SETTING(ringshine_band_count);

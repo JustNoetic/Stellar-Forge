@@ -16,6 +16,19 @@ static bool ring_host(const ephemeris::BodyDefinition& def) {
 void RingRenderer::init(rhi::VkContext& ctx) {
     mesh_ = build_annulus_mesh(ctx, RING_ANGULAR_SEGMENTS, RING_RADIAL_SUBDIVISIONS);
 
+    {
+        const rhi::DescriptorLayoutBinding penumbra[] = {
+            {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1}};
+        penumbra_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "celestial/ring_penumbra.comp", penumbra,
+                                                                       sizeof(glm::ivec4)+sizeof(glm::vec4));
+        penumbra_table_ = ctx.create_image_2d(RING_PENUMBRA_WIDTH, RING_PENUMBRA_ROWS+1, VK_FORMAT_R32_SFLOAT,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, 1, RING_PENUMBRA_SLOTS, true);
+        ctx.immediate_submit([&](VkCommandBuffer cmd) {
+            ctx.transition_image(cmd, penumbra_table_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        });
+    }
+
     std::vector<RingHostGPU> empty_hosts(MAX_RING_HOSTS);
     for (auto& buf : host_ssbos_) {
         buf = ctx.create_host_buffer(MAX_RING_HOSTS * sizeof(RingHostGPU),
@@ -63,6 +76,7 @@ void RingRenderer::init(rhi::VkContext& ctx) {
         {24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     desc.push_constant_size = sizeof(uint32_t) * 4;
     desc.depth_test = true;
@@ -143,6 +157,9 @@ void RingRenderer::shutdown(rhi::VkContext& ctx) {
     for (auto& pipeline : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     for (auto& pipeline : transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     ctx.destroy_image(shadow_lut_);
+    rhi::ShaderCache::destroy_pipeline(ctx, penumbra_pipeline_);
+    ctx.destroy_image(penumbra_table_);
+    penumbra_slots_ = {};
     ctx.destroy_image(gradient_atlas_);
     for (auto& atlas : ringshine_atlases_) ctx.destroy_image(atlas);
     for (auto& buffer : ringshine_radial_buffers_) ctx.destroy_buffer(buffer);
@@ -381,11 +398,68 @@ void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camer
     }
 
     active_host_count_ = static_cast<uint32_t>(hosts_gpu_.size());
+    update_penumbra(cmd, ctx, sys, body_count);
     uint32_t f_idx = ctx.frame_index();
     if (!hosts_gpu_.empty()) {
         std::memcpy(host_ssbos_[f_idx].mapped, hosts_gpu_.data(), hosts_gpu_.size() * sizeof(RingHostGPU));
         ctx.flush_buffer(host_ssbos_[f_idx], 0, hosts_gpu_.size() * sizeof(RingHostGPU));
     }
+}
+
+// Assigns a penumbra table layer to every (ring host, scene star) pair, packs the slots into
+// counts_indices.w, and rebuilds the layers that are new or whose ring LUT changed. Earlier frames'
+// passes may still read the table; the barrier orders the rebuild after them, and layers not rebuilt
+// keep their contents (the transition is from a defined layout).
+void RingRenderer::update_penumbra(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys,
+                                   uint32_t body_count) {
+    ++penumbra_slots_.serial;
+    std::vector<glm::dvec3> stars;
+    for (uint32_t i = 0; i < body_count && stars.size() < RING_PENUMBRA_STARS; ++i) {
+        auto body = sys.body(i);
+        if (body.definition.is_star) stars.push_back(body.render.position.value);
+    }
+    for (auto& host : hosts_gpu_) {
+        host.counts_indices.w = 0u;
+        glm::dvec3 center = sys.body(host.counts_indices.x).render.position.value;
+        glm::dvec3 pole(glm::vec3(host.pole_max_r));
+        for (size_t s = 0; s < stars.size(); ++s) {
+            glm::dvec3 to_star = stars[s]-center;
+            double distance = glm::length(to_star);
+            if (distance <= 0.0) continue;
+            float mu = RingPenumbraSlots::key_mu(std::abs(glm::dot(to_star, pole))/distance);
+            int slot = penumbra_slots_.acquire(float(host.counts_indices.y), mu);
+            if (slot >= 0) host.counts_indices.w |= uint32_t(slot+1) << (4u*uint32_t(s));
+        }
+    }
+    auto& slots = penumbra_slots_.slots;
+    auto stale = [&](const RingPenumbraSlots::Slot& slot) {
+        return slot.used == penumbra_slots_.serial && (!slot.built || slot.built_revision != ringshine_profile_serial_);
+    };
+    if (!std::any_of(slots.begin(), slots.end(), stale)) return;
+    uint32_t timer = ctx.begin_gpu_timer(cmd, "ring_penumbra");
+    ctx.transition_image(cmd, penumbra_table_, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, penumbra_pipeline_.handle);
+    const rhi::PushDescriptorWrite writes[] = {
+        rhi::PushDescriptorWrite::sampled_image(0, shadow_lut_, ctx.sampler_nearest_clamp()),
+        rhi::PushDescriptorWrite::storage_image(1, penumbra_table_)};
+    ctx.push_descriptors(cmd, penumbra_pipeline_, writes);
+    struct { glm::ivec4 slot_layer; glm::vec4 incidence; } push{};
+    for (size_t i = 0; i < slots.size(); ++i) {
+        auto& slot = slots[i];
+        if (!stale(slot)) continue;
+        push.slot_layer = {int(i), int(slot.key.x), 0, 0};
+        push.incidence = {slot.key.y, 0.0f, 0.0f, 0.0f};
+        ctx.push_constants(cmd, penumbra_pipeline_, push);
+        vkCmdDispatch(cmd, 1, RING_PENUMBRA_ROWS+1, 1);
+        slot.built = true;
+        slot.built_revision = ringshine_profile_serial_;
+    }
+    ctx.transition_image(cmd, penumbra_table_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    ctx.end_gpu_timer(cmd, timer);
 }
 
 void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
@@ -437,7 +511,8 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
         if (refracted || settings.ring_reference_full_annulus || !classification.radial_ranges) {
             uint32_t packed = 0;
             for (uint32_t s = 0; s < host.counts_indices.z; ++s) packed |= s << (s * 3u);
-            draw(0, mesh.index_count, packed, host.counts_indices.z, pipeline_base + 3u);
+            // Capacity only needs to cover the host's segments; a larger sample array just costs registers.
+            draw(0, mesh.index_count, packed, host.counts_indices.z, pipeline_base + std::bit_width(std::max(host.counts_indices.z, 1u) - 1u));
         } else {
             for (const auto& range : host_draw_ranges_[host_idx])
                 draw(range.first_index, range.index_count, range.packed_segments, range.segment_count,

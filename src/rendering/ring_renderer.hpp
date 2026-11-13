@@ -7,7 +7,9 @@
 #include "rendering/planetshine.hpp"
 #include "rhi/staging_uploads.hpp"
 #include "rhi/vk_context.hpp"
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <map>
 #include <span>
 #include <string>
@@ -34,6 +36,47 @@ struct alignas(16) RingHostGPU {
 
 static_assert(sizeof(RingSegmentGPU) == 48);
 static_assert(sizeof(RingHostGPU) == 464);
+
+// Ring penumbra table (shaders/common/ring_penumbra.glsl): layers of star-disk-filtered ring
+// extinction, one per (ring LUT layer, star incidence). RingHostGPU::counts_indices.w packs, per
+// scene star s < RING_PENUMBRA_STARS, the slot + 1 in bits [4s, 4s+4) (0 = none). Layers persist
+// across frames and are rebuilt only when re-keyed or when the ring LUT changes.
+inline constexpr uint32_t RING_PENUMBRA_WIDTH = 6144;
+inline constexpr uint32_t RING_PENUMBRA_ROWS = 56;
+inline constexpr uint32_t RING_PENUMBRA_SLOTS = 8;
+inline constexpr uint32_t RING_PENUMBRA_STARS = 8;
+struct RingPenumbraSlots {
+    struct Slot {
+        glm::vec2 key{-1.0f, 0.0f};  // x = ring LUT layer, y = mu coordinate built at
+        uint64_t used = 0;
+        uint64_t built_revision = 0;
+        bool built = false;
+    };
+    std::array<Slot, RING_PENUMBRA_SLOTS> slots{};
+    uint64_t serial = 0;
+
+    // Incidence snapped to a fixed grid (steps of ~1.7e-4 relative) and clamped to the prefix
+    // LUT's rows, so a slot depends only on the current frame, never on which incidence an
+    // earlier frame built; the shaders accept 2e-3.
+    static float key_mu(double mu) {
+        float snapped = std::exp2(std::round(std::log2(float(std::max(mu, 1e-6)))*4096.0f)/4096.0f);
+        return std::clamp(snapped, float(0.5/64.0), float(63.5/64.0));
+    }
+
+    // Slot for (layer, key mu); -1 when all are taken this frame.
+    int acquire(float layer, float mu) {
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (slots[i].key.x == layer && slots[i].key.y == mu) {
+                slots[i].used = serial;
+                return int(i);
+            }
+        int victim = -1;
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (slots[i].used != serial && (victim < 0 || slots[i].used < slots[size_t(victim)].used)) victim = int(i);
+        if (victim >= 0) slots[size_t(victim)] = {{layer, mu}, serial, 0, false};
+        return victim;
+    }
+};
 
 class RingRenderer {
 public:
@@ -74,6 +117,8 @@ public:
     const rhi::Image& gradient_atlas() const noexcept { return gradient_atlas_; }
     const rhi::Image& shadow_lut() const noexcept { return shadow_lut_; }
     uint64_t shadow_revision() const noexcept { return ringshine_profile_serial_; }
+    const rhi::Image& penumbra_table() const noexcept { return penumbra_table_; }
+    const RingPenumbraSlots& penumbra_slots() const noexcept { return penumbra_slots_; }
     const rhi::Image& ringshine_atlas(uint32_t frame) const noexcept { return ringshine_atlases_[frame]; }
     uint32_t ringshine_bake_count() const noexcept { return ringshine_bakes_; }
     uint32_t ringshine_frame_bake_count() const noexcept { return ringshine_frame_bakes_; }
@@ -117,6 +162,7 @@ private:
         uint32_t index_count = 0;
     };
     AnnulusMesh build_annulus_mesh(rhi::VkContext& ctx, uint32_t angular_segments, uint32_t radial_subdivisions);
+    void update_penumbra(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count);
     void rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count);
     void bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingshineJob& job);
 
@@ -127,6 +173,9 @@ private:
     std::array<rhi::Pipeline, 16> transparency_pipelines_{};
     rhi::Image gradient_atlas_{};
     rhi::Image shadow_lut_{};
+    rhi::Pipeline penumbra_pipeline_{};
+    rhi::Image penumbra_table_{};
+    RingPenumbraSlots penumbra_slots_;
     std::array<rhi::Image, rhi::FRAMES_IN_FLIGHT> ringshine_atlases_{};
     rhi::Pipeline ringshine_pipeline_{};
     std::array<std::map<std::pair<uint32_t, uint32_t>, RingshineTileKey>, rhi::FRAMES_IN_FLIGHT> ringshine_cache_;

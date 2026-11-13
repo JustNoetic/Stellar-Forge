@@ -8,6 +8,7 @@ layout(location = 3) in vec3 f_refraction_shift;
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
 #include "common/cloud_shadow.glsl"
+#include "common/cloud_ringshine.glsl"
 #include "common/surface_atmosphere.glsl"
 #include "common/fluid_surface.glsl"
 #ifdef TRANSPARENCY_CAPTURE
@@ -130,6 +131,7 @@ void main() {
         star_direct[s] = light*transmission*phase;
         ambient += light*(sky+0.015*transmission);
     }
+    ambient += cloud_ringshine(f_body_idx, mid, ray*(anchor_distance+0.5*(t0+t1)), true);
 
     vec3 radiance = vec3(0.0);
     float transmittance = 1.0;

@@ -49,8 +49,13 @@ void RefractionRenderer::init(rhi::VkContext& ctx) {
         ubos_[i] = ctx.create_host_buffer(sizeof(RefractionGPU), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &disabled);
         observers_[i] = ctx.create_image_2d(REFRACTION_OBSERVER_WIDTH, REFRACTION_OBSERVER_HEIGHT, VK_FORMAT_R32G32_SFLOAT,
                                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        exits_[i] = ctx.create_image_2d(REFRACTION_EXIT_CELLS, 2, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     }
     ctx.immediate_submit([&](VkCommandBuffer cmd) {
+        for (auto& image : exits_)
+            ctx.transition_image(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
         for (auto& image : observers_)
             ctx.transition_image(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
@@ -63,10 +68,12 @@ void RefractionRenderer::init(rhi::VkContext& ctx) {
         {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1},
     };
     pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "refraction/observer_table.comp", bindings);
+    exit_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "refraction/exit_table.comp", bindings);
 }
 
 void RefractionRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, exit_pipeline_);
     for (auto& t : tables_) {
         ctx.destroy_image(t.travel);
         ctx.destroy_image(t.rows);
@@ -75,6 +82,7 @@ void RefractionRenderer::shutdown(rhi::VkContext& ctx) {
     tables_.clear();
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         ctx.destroy_image(observers_[i]);
+        ctx.destroy_image(exits_[i]);
         ctx.destroy_buffer(ubos_[i]);
     }
     staging_.shutdown(ctx);
@@ -211,6 +219,12 @@ void RefractionRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                     uint32_t timer = ctx.begin_gpu_timer(cmd, "refraction_observer");
                     vkCmdDispatch(cmd, (REFRACTION_OBSERVER_WIDTH+7)/8, (REFRACTION_OBSERVER_HEIGHT+7)/8, 1);
                     ctx.end_gpu_timer(cmd, timer);
+                    writes[4] = rhi::PushDescriptorWrite::storage_image(4, exits_[f]);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, exit_pipeline_.handle);
+                    ctx.push_descriptors(cmd, exit_pipeline_, writes);
+                    uint32_t exit_timer = ctx.begin_gpu_timer(cmd, "refraction_exit");
+                    vkCmdDispatch(cmd, REFRACTION_EXIT_CELLS/64, 1, 1);
+                    ctx.end_gpu_timer(cmd, exit_timer);
                     ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                                        VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                                        VK_ACCESS_2_SHADER_READ_BIT);
@@ -234,6 +248,10 @@ std::array<rhi::PushDescriptorWrite, 2> RefractionRenderer::writes(rhi::VkContex
     uint32_t f = ctx.frame_index();
     return {rhi::PushDescriptorWrite::uniform_buffer(20, ubos_[f], 0, sizeof(RefractionGPU)),
             rhi::PushDescriptorWrite::sampled_image(21, observers_[f], ctx.sampler_nearest_clamp(), VK_IMAGE_LAYOUT_GENERAL)};
+}
+
+rhi::PushDescriptorWrite RefractionRenderer::exit_write(rhi::VkContext& ctx) const {
+    return rhi::PushDescriptorWrite::sampled_image(27, exits_[ctx.frame_index()], ctx.sampler_nearest_clamp(), VK_IMAGE_LAYOUT_GENERAL);
 }
 
 std::array<rhi::PushDescriptorWrite, 3> RefractionRenderer::ray_writes(rhi::VkContext& ctx) const {

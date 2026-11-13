@@ -42,6 +42,7 @@ vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pol
         vec3 shadow = cloud_star_shadow(body, ray*distance, s);
         radiance += u_scene.stars_color_lum[s].rgb*irradiance*(transmission*diffuse+sky*0.5)*shadow;
     }
+    radiance += cloud_ringshine(body, local, ray*distance, false)*(underside ? 0.25 : 1.0);
     float exposure = u_scene.hdr_enabled != 0u ? u_scene.screen_params.w : 1.0;
     return vec4(radiance*f.cloud_color.rgb*(opacity*exposure), opacity);
 }
@@ -75,8 +76,17 @@ void render_cloud_sheet() {
     vec4 color = cloud_sheet_color(f_body_idx, ray, local, distance, pole, flattening, body_surface_rotation(pole, b.spin_flags.x));
     if (color.a < 1e-3) discard;
     float depth = cloud_sheet_depth(b, local);
+#ifdef CLOUD_SHEET_INLINE
+    // The atmosphere composite blends this layer with its own transport and occlusion test against scene depth.
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    imageStore(cloud_layer_color, pixel, vec4(color.rgb, 2.0*float(f_body_idx)+min(color.a, 1.0)));
+    imageStore(cloud_layer_depth, pixel, vec4(depth));
+    out_color = vec4(0.0);
+#else
     gl_FragDepth = depth;
-#ifdef TRANSPARENCY_CAPTURE
+#endif
+#if defined(CLOUD_SHEET_INLINE)
+#elif defined(TRANSPARENCY_CAPTURE)
     if (capture_transparency(color, depth)) color = vec4(0.0);
     out_color = color;
 #elif defined(CLOUD_DEPTH_ONLY)

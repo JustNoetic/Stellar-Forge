@@ -14,7 +14,7 @@ vec3 cloud_star_shadow(uint body, vec3 world_pos, uint s) {
             ? (1u << u_scene.num_ring_hosts)-1u
             : eclipse_words[u_scene.ring_shadow_params.x+body*u_scene.num_stars+s];
         if (candidates != 0u)
-            shadow *= compute_surface_ring_shadow(world_pos, to_star/distance, star_radius/distance, distance, candidates);
+            shadow *= compute_surface_ring_shadow(world_pos, to_star/distance, star_radius/distance, distance, candidates, s);
     }
     return shadow;
 }

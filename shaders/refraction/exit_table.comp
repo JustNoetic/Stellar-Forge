@@ -1,0 +1,67 @@
+#version 460
+layout(local_size_x = 256) in;
+
+#include "common/refraction_solve.glsl"
+
+layout(std140, set = 0, binding = 0) uniform RefractionParameters {
+    vec4 host;
+    vec4 pole;
+    vec4 frame;
+    vec4 mapping;
+    vec4 model;
+    vec4 profile;
+    vec4 escape;
+} u_refraction;
+layout(set = 0, binding = 1) uniform sampler2D travel_table;
+layout(set = 0, binding = 2) uniform sampler2D row_table;
+layout(set = 0, binding = 3) uniform sampler2D profile_table;
+layout(rgba32f, set = 0, binding = 4) uniform writeonly image2D exit_table;
+
+const int EXIT_GROUP_CELLS = 64;
+const int EXIT_NODES = EXIT_GROUP_CELLS+3;
+const int EXIT_TASKS = EXIT_NODES+3*EXIT_GROUP_CELLS;
+shared vec2 exit_nodes[EXIT_NODES];
+shared vec2 exit_inner[3*EXIT_GROUP_CELLS];
+
+// Interior observers only: polar exit angle by zenith for the ring's forward refraction (see ring_refraction.glsl).
+// Each workgroup covers 64 cells. Its threads first evaluate, one exact solve each, the 67 nodes the cells' Catmull-Rom
+// spans need and three interior points per cell; each cell then stores nodes i-1..i+2 and (error bound, state).
+// State 1 interpolates, 0 means every ray in the cell is blocked, -1 that it straddles a validity edge and needs the
+// exact path. The bound is twice the largest interpolation error at the three interior points.
+void main() {
+    RefractionGPU g = RefractionGPU(u_refraction.host, u_refraction.pole, u_refraction.frame, u_refraction.mapping,
+                                    u_refraction.model, u_refraction.profile, u_refraction.escape);
+    int base = int(gl_WorkGroupID.x)*EXIT_GROUP_CELLS;
+    bool interior = g.frame.w < 0.5;
+    for (int task = int(gl_LocalInvocationIndex); task < EXIT_TASKS; task += int(gl_WorkGroupSize.x)) {
+        float node = task < EXIT_NODES ? float(clamp(base-1+task, 0, REFRACTION_EXIT_CELLS-1))
+                                       : float(base+(task-EXIT_NODES)/3)+0.25*float((task-EXIT_NODES)%3+1);
+        vec2 exit = vec2(0.0);
+        if (interior) {
+            float theta = refraction_exit_theta(g, node);
+            exit = refraction_exit_polar(travel_table, row_table, profile_table, g, theta, refraction_invariant(g, theta));
+        }
+        if (task < EXIT_NODES) exit_nodes[task] = exit;
+        else exit_inner[task-EXIT_NODES] = exit;
+    }
+    barrier();
+    int local = int(gl_LocalInvocationIndex);
+    int cell = base+local;
+    if (local >= EXIT_GROUP_CELLS || cell >= REFRACTION_EXIT_CELLS) return;
+    vec4 nodes = vec4(exit_nodes[local].x, exit_nodes[local+1].x, exit_nodes[local+2].x, exit_nodes[local+3].x);
+    int valid = int(exit_nodes[local].y+exit_nodes[local+1].y+exit_nodes[local+2].y+exit_nodes[local+3].y);
+    float error = 0.0;
+    int inner = 0;
+    for (int k = 0; k < 3; ++k) {
+        vec2 exit = exit_inner[3*local+k];
+        inner += int(exit.y);
+        error = max(error, abs(refraction_exit_catmull(nodes, 0.25*float(k+1))-exit.x));
+    }
+    vec2 bound = vec2(REFRACTION_FAR, -1.0);
+    if (interior && cell < REFRACTION_EXIT_CELLS-1) {
+        if (valid == 4 && inner == 3) bound = vec2(2.0*error, 1.0);
+        else if (valid == 0 && inner == 0) bound = vec2(0.0, 0.0);
+    }
+    imageStore(exit_table, ivec2(cell, 0), nodes);
+    imageStore(exit_table, ivec2(cell, 1), vec4(bound, 0.0, 0.0));
+}

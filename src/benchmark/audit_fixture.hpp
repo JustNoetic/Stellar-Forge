@@ -20,6 +20,7 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "fast-bloom") s.bloom_mode = 1;
     if (variant == "no-clouds") s.clouds_enabled = false;
     if (variant == "legacy-clouds") s.transparency_reference_legacy = true;
+    if (variant == "layered-clouds") s.cloud_sheet_inline = false;
     if (variant == "cached-shadow-weights") s.atmosphere_shadow_cached_weights = true;
     if (variant == "native-shadow-weights") s.atmosphere_shadow_cached_weights = false;
     if (variant == "fast-ring-shadows") s.atmosphere_shadow_fast_rings = true;
@@ -143,7 +144,59 @@ inline Camera saturn_limb_camera(const ephemeris::SystemSnapshot& system) {
     return camera;
 }
 
+// Near-equinox ring shadow fixtures: the simulation advances until the Sun is this many degrees from Earth's
+// equator. 0.15 degrees is inside the Sun's own angular radius, so its disk straddles the ring plane.
+inline double equinox_fixture_elevation(std::string_view scene) {
+    return scene.ends_with("-1deg") ? 1.0 : 0.15;
+}
+
+inline double sun_equator_elevation(const ephemeris::SystemSnapshot& system) {
+    const auto& body = system.body(system.find_body("Earth"));
+    auto sun = glm::normalize(system.body(system.star_index()).render.position.value-body.render.position.value);
+    return std::asin(std::clamp(glm::dot(sun, body.render.pole), -1.0, 1.0))*RAD_TO_DEG;
+}
+
+// 40 km above the point 35 degrees of longitude before local noon where the ring shadow falls at 1.7 radii, looking
+// along the equator toward noon and 8 degrees down, so the thin equinox shadow band runs to the horizon and the
+// edge-on ring rises from it.
+inline Camera equinox_camera(const ephemeris::SystemSnapshot& system) {
+    Camera camera;
+    camera.horizon_align = false;
+    camera.tracking_idx = system.find_body("Earth");
+    const auto& body = system.body(camera.tracking_idx);
+    auto pole = body.render.pole;
+    auto sun = glm::normalize(system.body(system.star_index()).render.position.value-body.render.position.value);
+    double elevation = glm::dot(sun, pole);
+    auto equatorial = glm::normalize(sun-pole*elevation);
+    auto east = glm::normalize(glm::cross(pole, equatorial));
+    double longitude = -35.0*DEG_TO_RAD, side = elevation < 0.0 ? 1.0 : -1.0;
+    auto meridian = equatorial*std::cos(longitude)+east*std::sin(longitude);
+    double radius = body.definition.radius_au(), error = 1e9;
+    glm::dvec3 best = meridian;
+    for (int i = 1; i <= 40000; ++i) {
+        double latitude = i*0.00025*DEG_TO_RAD;
+        auto normal = meridian*std::cos(latitude)+pole*(side*std::sin(latitude));
+        auto p = normal*(ellipsoid_surface_radius(radius, body.definition.oblateness, pole, normal)/radius);
+        double distance = -glm::dot(p, pole)/elevation;
+        if (distance <= 0.0) continue;
+        double ring = glm::length(p+sun*distance);
+        if (std::abs(ring-1.7) < error) {
+            error = std::abs(ring-1.7);
+            best = normal;
+        }
+    }
+    if (error > 0.05) throw std::runtime_error("Equinox ring shadow geometry is unavailable.");
+    auto up = oblate_surface_normal(best, body.definition.oblateness, pole);
+    auto along = glm::normalize(-equatorial*std::sin(longitude)+east*std::cos(longitude));
+    along = glm::normalize(along-up*glm::dot(along, up));
+    camera.cam_pos_rel = best*(ellipsoid_surface_radius(radius, body.definition.oblateness, pole, best)+40.0*KM_TO_AU);
+    camera.fov_deg = 60.0;
+    audit_look(camera, along*std::cos(8*DEG_TO_RAD)-up*std::sin(8*DEG_TO_RAD), up);
+    return camera;
+}
+
 inline Camera audit_camera(const ephemeris::SystemSnapshot& system, std::string_view scene) {
+    if (scene.starts_with("earth-equinox")) return equinox_camera(system);
     if (scene == "earth-full" || scene == "earth-full-live" || scene == "earth-eclipse") return earth_closeup_camera(system, scene == "earth-eclipse");
     if (scene == "earth-eclipse-oblique") return eclipse_oblique_camera(system);
     if (scene == "saturn-limb") return saturn_limb_camera(system);
@@ -168,6 +221,37 @@ inline Camera audit_camera(const ephemeris::SystemSnapshot& system, std::string_
         camera.cam_pos_rel = -forward*(60.0*radius);
         camera.fov_deg = scene == "earth-backlit-zoom" ? 3.6 : 34.5;
         audit_look(camera, forward, glm::normalize(body.render.pole-forward*glm::dot(body.render.pole, forward)));
+        return camera;
+    }
+    if (scene == "earth-sky-rings-south") {
+        // Noon at 34 degrees latitude in the Sun's hemisphere, thousands of km from the ring shadow on the other one.
+        // Looks equatorward 25 degrees up, so the lit rings fill the sky; no shadowed haze is anywhere in view.
+        auto pole = body.render.pole;
+        double side = glm::dot(sun, pole) >= 0 ? 1.0 : -1.0;
+        auto equatorial = glm::normalize(sun-pole*glm::dot(sun, pole));
+        auto normal = glm::normalize(equatorial*std::cos(34*DEG_TO_RAD)+pole*(side*std::sin(34*DEG_TO_RAD)));
+        double radius = body.definition.radius_au();
+        auto up = oblate_surface_normal(normal, body.definition.oblateness, pole);
+        camera.cam_pos_rel = normal*(ellipsoid_surface_radius(radius, body.definition.oblateness, pole, normal)+2*KM_TO_AU);
+        camera.fov_deg = 45.0;
+        auto equatorward = glm::normalize(-pole*side-up*glm::dot(-pole*side, up));
+        audit_look(camera, equatorward*std::cos(25*DEG_TO_RAD)+up*std::sin(25*DEG_TO_RAD), up);
+        return camera;
+    }
+    if (scene.starts_with("earth-sky-rings")) {
+        auto normal = audit_shadow_direction(system, camera.tracking_idx, 2.45);
+        double radius = body.definition.radius_au();
+        auto up = oblate_surface_normal(normal, body.definition.oblateness, body.render.pole);
+        camera.cam_pos_rel = normal*(ellipsoid_surface_radius(radius, body.definition.oblateness, body.render.pole, normal)+2*KM_TO_AU);
+        camera.fov_deg = 70.0;
+        if (scene == "earth-sky-rings-away") {
+            auto poleward = glm::normalize(-body.render.pole-up*glm::dot(-body.render.pole, up));
+            if (glm::dot(normal, body.render.pole) > 0) poleward = glm::normalize(body.render.pole-up*glm::dot(body.render.pole, up));
+            audit_look(camera, poleward*std::cos(35*DEG_TO_RAD)+up*std::sin(35*DEG_TO_RAD), up);
+        } else {
+            auto look = glm::normalize(sun);
+            audit_look(camera, look, glm::normalize(up-look*glm::dot(up, look)));
+        }
         return camera;
     }
     auto normal = scene.starts_with("earth-ground") || scene == "earth-full-rings"

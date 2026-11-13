@@ -118,6 +118,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     planetshine_maps_ = ctx.create_image_2d(PLANETSHINE_MAP_WIDTH, PLANETSHINE_MAP_HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -174,7 +175,9 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
             {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
             {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
             {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
             {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+            {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         };
         cloud_desc.depth_write = false;
         cloud_desc.premultiplied_blend = true;
@@ -186,6 +189,14 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
             capture.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
             capture.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
             cloud_transparency_pipeline_[mode] = rhi::ShaderCache::create_graphics_pipeline(ctx, capture);
+        }
+        if (mode == 0 && ctx.fragment_stores_enabled()) {
+            auto inline_desc = cloud_desc;
+            inline_desc.macros = {{"CLOUD_SHEET_INLINE", "1"}};
+            inline_desc.bindings.push_back({35, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+            inline_desc.bindings.push_back({36, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+            inline_desc.depth_test = false;
+            cloud_inline_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, inline_desc);
         }
         cloud_desc.macros = {{"CLOUD_DEPTH_ONLY", "1"}};
         cloud_desc.depth_write = true;
@@ -241,6 +252,11 @@ void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
         rhi::ShaderCache::destroy_pipeline(ctx, cloud_depth_pipeline_[mode]);
         rhi::ShaderCache::destroy_pipeline(ctx, cloud_transparency_pipeline_[mode]);
     }
+    rhi::ShaderCache::destroy_pipeline(ctx, cloud_inline_pipeline_);
+    ctx.destroy_image(cloud_layer_color_);
+    ctx.destroy_image(cloud_layer_depth_);
+    for (auto& [image, serial] : retired_cloud_layers_) ctx.destroy_image(image);
+    retired_cloud_layers_.clear();
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
         ctx.destroy_buffer(fluid_ssbos_[i]);
         ctx.destroy_buffer(instance_ssbos_[i]);
@@ -330,16 +346,24 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     measure("cpu_planetshine_maps_ms", [&] { bake_planetshine_maps(cmd, ctx, cam, sys, extent, count); });
     measure("cpu_transparency_prepare_ms", [&] {
     bool visible_clouds = false;
+    cloud_layer_active_ = false;
+    bool inline_clouds = settings.clouds_enabled && settings.cloud_mode == 0 && settings.cloud_sheet_inline &&
+        cloud_inline_pipeline_.handle != VK_NULL_HANDLE;
     if (settings.clouds_enabled) {
         double pixels = extent.height/(2.0*std::tan(cam.fov_deg*DEG_TO_RAD*0.5));
-        for (uint32_t i = 0; i < count && !visible_clouds; ++i) {
+        for (uint32_t i = 0; i < count; ++i) {
             const auto& body = sys.body(i);
             const auto& cloud = body.definition.clouds;
+            // Inline clouds blend in the atmosphere composite, so they need no transparent fragments.
+            bool composited = inline_clouds && atmospheres_.composites_clouds(i);
+            cloud_layer_active_ = cloud_layer_active_ || composited;
+            if (visible_clouds || composited) continue;
             double distance = glm::length(camera_relative(body.render.position, cam.eye_pos_render()));
             visible_clouds = cloud.enabled && cloud.coverage > 0 && cloud.density > 0 && cloud.extinction_per_km > 0 &&
                 body.definition.radius_au()/std::max(distance, 1e-15)*pixels > 2;
         }
     }
+    prepare_cloud_layer(cmd, ctx, extent);
     transparency_.prepare(cmd, ctx, extent, !settings.transparency_reference_legacy && !sys.empty() &&
         (visible_clouds || (settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
     });
@@ -603,6 +627,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::storage_buffer(6, textures_.pages(f_idx)),
         rhi::PushDescriptorWrite::storage_buffer(7, rings_.host_buffer(f_idx), 0, MAX_RING_HOSTS * sizeof(RingHostGPU)),
         rhi::PushDescriptorWrite::sampled_image(9, rings_.shadow_lut(), ctx.sampler_linear_clamp()),
+        rhi::PushDescriptorWrite::sampled_image(39, rings_.penumbra_table(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::sampled_image(10, normals_.image(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(11, normals_.pages(f_idx)),
         rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
@@ -653,24 +678,39 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             rhi::PushDescriptorWrite::storage_buffer(2, eclipse_buffer, 0, eclipse_bytes),
             rhi::PushDescriptorWrite::storage_buffer(7, rings_.host_buffer(f_idx), 0, MAX_RING_HOSTS * sizeof(RingHostGPU)),
             rhi::PushDescriptorWrite::sampled_image(9, rings_.shadow_lut(), ctx.sampler_linear_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(39, rings_.penumbra_table(), ctx.sampler_linear_clamp()),
+            rhi::PushDescriptorWrite::sampled_image(16, rings_.ringshine_atlas(f_idx), ctx.sampler_linear_clamp()),
             eclipse_refraction_.write(ctx),
         };
         uint32_t mode = std::min(settings.cloud_mode, 1u);
+        std::vector<uint32_t> inline_bodies, layered_bodies;
+        for (uint32_t body : cloud_bodies_)
+            (mode == 0 && cloud_layer_active_ && atmospheres_.composites_clouds(body) ? inline_bodies : layered_bodies).push_back(body);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &sphere_vbo_.handle, &offset);
+        vkCmdBindIndexBuffer(cmd, sphere_ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
+        if (!inline_bodies.empty()) {
+            auto inline_writes = cloud_writes;
+            inline_writes.push_back(rhi::PushDescriptorWrite::storage_image(35, cloud_layer_color_));
+            inline_writes.push_back(rhi::PushDescriptorWrite::storage_image(36, cloud_layer_depth_));
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloud_inline_pipeline_.handle);
+            ctx.push_descriptors(cmd, cloud_inline_pipeline_, inline_writes);
+            for (uint32_t body : inline_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
+        }
         bool capture = transparency_.active() && cloud_transparency_pipeline_[mode].handle;
         const auto& pipeline = capture ? cloud_transparency_pipeline_[mode] : cloud_pipeline_[mode];
         if (capture) {
             auto capture_writes = transparency_.writes();
             cloud_writes.insert(cloud_writes.end(), capture_writes.begin(), capture_writes.end());
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-        ctx.push_descriptors(cmd, pipeline, cloud_writes);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &sphere_vbo_.handle, &offset);
-        vkCmdBindIndexBuffer(cmd, sphere_ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
-        for (uint32_t body : cloud_bodies_) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
-        if (!capture) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloud_depth_pipeline_[mode].handle);
-            ctx.push_descriptors(cmd, cloud_depth_pipeline_[mode], cloud_writes);
-            for (uint32_t body : cloud_bodies_) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
+        if (!layered_bodies.empty()) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
+            ctx.push_descriptors(cmd, pipeline, cloud_writes);
+            for (uint32_t body : layered_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
+            if (!capture) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloud_depth_pipeline_[mode].handle);
+                ctx.push_descriptors(cmd, cloud_depth_pipeline_[mode], cloud_writes);
+                for (uint32_t body : layered_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
+            }
         }
         ctx.end_gpu_timer(cmd, cloud_timer);
     }
@@ -699,6 +739,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         refraction[0],
         refraction[1],
         refraction_rays[0], refraction_rays[1], refraction_rays[2],
+        refraction_.exit_write(ctx),
         eclipse_refraction_.write(ctx),
         rhi::PushDescriptorWrite::storage_buffer(25, phases, 0, phase_bytes),
     };
@@ -766,6 +807,35 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
     for (const auto& entry : clouds) cloud_bodies_.push_back(entry.second);
 }
 
+void CelestialRenderer::prepare_cloud_layer(VkCommandBuffer cmd, rhi::VkContext& ctx, VkExtent2D extent) {
+    std::erase_if(retired_cloud_layers_, [&](auto& entry) {
+        if (entry.second > ctx.completed_serial()) return false;
+        ctx.destroy_image(entry.first);
+        return true;
+    });
+    if (!cloud_layer_active_) return;
+    if (cloud_layer_depth_.extent.width != extent.width || cloud_layer_depth_.extent.height != extent.height) {
+        for (auto* image : {&cloud_layer_color_, &cloud_layer_depth_})
+            if (*image) retired_cloud_layers_.emplace_back(*image, ctx.recording_serial());
+        cloud_layer_color_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R32G32B32A32_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        cloud_layer_depth_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R32_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    }
+    // Only depth is cleared: colour is read only where the stored depth lies in front of the scene.
+    ctx.transition_image(cmd, cloud_layer_color_, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    ctx.transition_image(cmd, cloud_layer_depth_, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkClearColorValue zero{};
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, cloud_layer_depth_.handle, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+}
+
 void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                                               rhi::Image* physical_color) {
     auto transparency_writes = transparency_.writes();
@@ -785,8 +855,18 @@ void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContex
         ctx.push_constants(cmd, atmosphere_point_pipeline_, uint32_t(1));
         vkCmdDraw(cmd, 6, 1, 0, body);
     };
+    std::array<rhi::PushDescriptorWrite, 2> cloud_layer{};
+    if (cloud_layer_active_) {
+        for (auto* image : {&cloud_layer_color_, &cloud_layer_depth_})
+            ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        cloud_layer = {rhi::PushDescriptorWrite::sampled_image(33, cloud_layer_color_, ctx.sampler_nearest_clamp()),
+                       rhi::PushDescriptorWrite::sampled_image(34, cloud_layer_depth_, ctx.sampler_nearest_clamp())};
+    }
     atmospheres_.composite(cmd, ctx, color, depth,
-        transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{}, draw);
+        transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{}, draw,
+        cloud_layer_active_ ? std::span<const rhi::PushDescriptorWrite>{cloud_layer} : std::span<const rhi::PushDescriptorWrite>{});
     transparency_.resolve(cmd, ctx, color, depth, physical_color);
 }
 

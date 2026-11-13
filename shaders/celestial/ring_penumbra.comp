@@ -1,0 +1,89 @@
+#version 460
+layout(local_size_x = 1024) in;
+
+#define RING_PENUMBRA_BUILD 1
+#include "common/ring_penumbra.glsl"
+
+// Builds one layer of the ring penumbra table (common/ring_penumbra.glsl) from the prefix-integral
+// ring shadow LUT (4097 columns, 64 incidence rows), using exact texel reads so no 8-bit filter
+// weights enter. One workgroup per texture row: row 0 copies the prefix at this incidence; each
+// kernel row filters RING_PENUMBRA_WIDTH/1024 consecutive columns per thread, then scans the row's
+// trapezoid integral across the workgroup.
+layout(set = 0, binding = 0) uniform sampler2DArray prefix_lut;
+layout(r32f, set = 0, binding = 1) uniform writeonly image2DArray table;
+layout(push_constant) uniform Push {
+    ivec4 slot_layer;  // x = table layer, y = prefix LUT layer
+    vec4 incidence;    // x = mu coordinate (prefix LUT row position)
+} pc;
+
+const int PER_THREAD = RING_PENUMBRA_WIDTH/1024;
+shared double partial[1024];
+// The prefix LUT row at this incidence (interpolated between its two mu rows), read once per row.
+shared float prefix_row[4097];
+
+float prefix(float i) {
+    return prefix_row[int(clamp(i, 0.0, 4096.0))];
+}
+
+// Mean extinction over [u-h, u+h], zero outside the ring (matches ring_box_extinction).
+float box(float u, float h) {
+    float u0 = clamp(u-h, 0.0, 1.0);
+    float u1 = clamp(u+h, 0.0, 1.0);
+    if (u1 <= u0 || h <= 0.0) return 0.0;
+    float x0 = u0*4096.0, x1 = u1*4096.0;
+    float i0 = floor(x0), i1 = floor(x1);
+    float f0 = x0-i0, f1 = x1-i1;
+    float s0 = prefix(i0), s0_next = prefix(i0+1.0);
+    float s1 = prefix(i1), s1_next = prefix(i1+1.0);
+    float d0 = max(0.0, s0_next-s0), d1 = max(0.0, s1_next-s1);
+    float sum = i1 > i0 ? (1.0-f0)*d0+f1*d1+max(0.0, s1-s0_next) : (x1-x0)*d0;
+    return sum/(2.0*h);
+}
+
+void main() {
+    int texture_row = int(gl_WorkGroupID.y);
+    int row = texture_row-1;  // kernel row; texture row 0 is the raw prefix
+    int lane = int(gl_LocalInvocationID.x);
+    float fy = clamp(pc.incidence.x*64.0-0.5, 0.0, 63.0);
+    int row0 = int(floor(fy)), row1 = min(row0+1, 63);
+    float row_mix = fy-float(row0);
+    for (int x = lane; x <= 4096; x += 1024) {
+        float a = texelFetch(prefix_lut, ivec3(x, row0, pc.slot_layer.y), 0).r;
+        float b = texelFetch(prefix_lut, ivec3(x, row1, pc.slot_layer.y), 0).r;
+        prefix_row[x] = mix(a, b, row_mix);
+    }
+    barrier();
+    if (texture_row == 0) {
+        for (int x = lane; x < RING_PENUMBRA_WIDTH; x += 1024)
+            imageStore(table, ivec3(x, 0, pc.slot_layer.x), vec4(prefix_row[min(x, 4096)]));
+        return;
+    }
+    float h = ring_penumbra_row_width(float(row));
+    float spacing = ring_penumbra_column_spacing(float(row));
+
+    float values[PER_THREAD];
+    double local_sum = 0.0;
+    for (int k = 0; k < PER_THREAD; ++k) {
+        float u = ring_penumbra_column_u(float(row), float(lane*PER_THREAD+k));
+        values[k] = clamp(0.08*box(u, 0.36*h)+0.42*box(u, 0.72*h)+0.50*box(u, h), 0.0, 1.0);
+        local_sum += values[k];
+    }
+    partial[lane] = local_sum;
+    barrier();
+    for (int offset = 1; offset < 1024; offset <<= 1) {
+        double add = lane >= offset ? partial[lane-offset] : 0.0;
+        barrier();
+        partial[lane] += add;
+        barrier();
+    }
+    // Trapezoid integral up to each column, in ring-span units. Only differences are used, so the
+    // constant half of column 0 (zero anyway, it lies past the kernel's reach) is left in.
+    // The scan runs in double: deep ring shadow leaves little light, so the box difference of this
+    // integral needs absolute accuracy well below the 1/4096 texel increments it is built from.
+    double running = partial[lane]-local_sum;
+    for (int k = 0; k < PER_THREAD; ++k) {
+        int x = lane*PER_THREAD+k;
+        imageStore(table, ivec3(x, texture_row, pc.slot_layer.x), vec4(float((running+0.5*double(values[k]))*double(spacing))));
+        running += values[k];
+    }
+}

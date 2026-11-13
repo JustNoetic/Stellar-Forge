@@ -8,10 +8,15 @@ layout(location = 3) in vec3 f_refraction_shift;
 #include "common/celestial_scene.glsl"
 #include "common/body_surface.glsl"
 #include "common/cloud_shadow.glsl"
+#include "common/cloud_ringshine.glsl"
 #include "common/surface_atmosphere.glsl"
 #include "common/fluid_surface.glsl"
 #ifdef TRANSPARENCY_CAPTURE
 #include "common/transparency.glsl"
+#endif
+#ifdef CLOUD_SHEET_INLINE
+layout(rgba32f, set = 0, binding = 35) uniform writeonly image2D cloud_layer_color;
+layout(r32f, set = 0, binding = 36) uniform writeonly image2D cloud_layer_depth;
 #endif
 
 layout(location = 0) out vec4 out_color;

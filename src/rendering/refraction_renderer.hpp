@@ -32,6 +32,8 @@ public:
     std::array<rhi::PushDescriptorWrite, 2> writes(rhi::VkContext& ctx) const;
     const RefractionHost& host() const noexcept { return host_; }
     std::array<rhi::PushDescriptorWrite, 3> ray_writes(rhi::VkContext& ctx) const;
+    // Binding 27: per-view exit polar table for the ring's forward refraction (interior observers).
+    rhi::PushDescriptorWrite exit_write(rhi::VkContext& ctx) const;
     uint32_t observer_builds() const noexcept { return observer_builds_; }
     const rhi::Image& observer(uint32_t frame) const noexcept { return observers_[frame]; }
     const RefractionGPU& parameters(uint32_t frame) const noexcept { return built_[frame]; }
@@ -51,9 +53,11 @@ private:
     std::vector<Tables> tables_;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> ubos_{};
     std::array<rhi::Image, rhi::FRAMES_IN_FLIGHT> observers_{};
+    std::array<rhi::Image, rhi::FRAMES_IN_FLIGHT> exits_{};
     std::array<RefractionGPU, rhi::FRAMES_IN_FLIGHT> built_{};
     std::array<const physics::PreparedRefraction*, rhi::FRAMES_IN_FLIGHT> built_source_{};
     rhi::Pipeline pipeline_{};
+    rhi::Pipeline exit_pipeline_{};
     RefractionHost host_{};
     uint32_t observer_builds_ = 0;
 };

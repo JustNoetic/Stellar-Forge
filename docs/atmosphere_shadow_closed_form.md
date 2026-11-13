@@ -18,13 +18,22 @@ inside the atmosphere, linear outside):
    for `|x| < 0.5`).
 3. Eclipses are evaluated at `mean ± σ` with the exact disc-overlap visibility; short
    eclipse transitions use up to four Gauss panels.
-4. Rings split the stratum (clipped to the star side of the ring plane) into 3 equal
+4. Rings split the stratum's part on one side of the ring plane into 3 equal
    pieces (`CLOSED_FORM_RING_PIECES`). For parallel light the ring-plane hit moves
    linearly with t, so each piece sweeps an exact radius range, which the ring LUT's
    prefix integral filters as one box. Each piece is weighted by its exact share of the
    fitted light, `F(u) = (1 - e^(-xu)) / (1 - e^(-x))`. Penumbra width, incidence and
    curvature shift come from the light centroid.
 5. Loss is `energy × (1 - visibility)`, the product of sphere and ring visibilities.
+
+Each side of the ring plane sees only the part of the star's disc beyond the plane, as
+`ring_receiver_coordinates` models it for surfaces: that part's coverage, through light
+tilted to its mean elevation. Away from equinox this is the whole, untilted disc on the
+far side and nothing on the star's side. While the disc straddles the plane (within about
+16 hours of Earth's equinox) both sides are shadowed. A stratum crossing the plane then
+takes the side with more covered light and drops the other: evaluating both sides cost
+0.13–0.18 ms in every view through register pressure, even with the second side as a
+single box.
 
 Uniform-in-t averaging inside a stratum converges only as O(1/N) and was worse than the
 sampled path; the light-weighted moments are what make 4 strata sufficient. The first
@@ -34,9 +43,11 @@ smeared band edges (3.1% p99 on `saturn-limb`); 3 pieces halve it.
 
 ## Eligibility
 
-The CPU sets header flag `y & 32` when the setting is on and progressive mode is off. It
-clears it when any ring is within `star radius + 3 × outer radius` of edge-on to the
-star. The composite selects the dedicated `ATMOSPHERE_SHADOW_CLOSED_FORM` pipelines
+The CPU sets header flag `y & 32` when the setting is on and progressive mode is off.
+Ring geometry no longer clears it. It used to be cleared whenever a ring was within
+`star radius + 3 × outer radius` of edge-on to the star, which sent every shadowed pixel
+to the sampled march near equinox: `earth-equinox-rings` (Sun 0.15° from the equator,
+1600×900) took 2.87 ms in atmosphere shadows, now 1.06 ms. The composite selects the dedicated `ATMOSPHERE_SHADOW_CLOSED_FORM` pipelines
 (plain, transparency, VRS, VRS + transparency, coarse, coarse + transparency) only when
 cached weights are also active, there is one star, no aerosol layer is shaped, and
 reference mode is off. Anything else falls back to the sampled path, which also uses the

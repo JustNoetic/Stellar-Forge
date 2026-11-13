@@ -157,6 +157,10 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             if (ImGui::Combo(id, &mode, modes, 2)) render_draft.cloud_mode = uint32_t(mode);
         });
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("2D uses a thin cloud shell with filtered coverage. Volumetric marches through cloud columns.");
+        ImGui::BeginDisabled(render_draft.cloud_mode != 0);
+        ImGui::Checkbox("Composite 2D clouds with the atmosphere", &render_draft.cloud_sheet_inline);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blends the 2D cloud sheet inside the atmosphere pass from a per-pixel cloud layer, instead of as a transparent fragment with its own atmospheric transport and sorting.");
+        ImGui::EndDisabled();
         ImGui::EndDisabled();
         ImGui::BeginDisabled(render_draft.direct_sunlight_only);
         ImGui::Checkbox("Planetshine", &render_draft.planetshine_enabled);

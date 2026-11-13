@@ -20,6 +20,8 @@ Keep alpha unchanged. Blend transformed surfaces far to near over the atmosphere
 
 Transport reuses the same finite-endpoint reconstruction and horizon-mapped cumulative LUT functions as opaque aerial perspective. Foreground fragments before atmospheric entry remain unchanged; fragments within an atmosphere receive a partial column; fragments beyond it receive the full bounded column. Camera-relative positions, inverse projection, exposure, colored extinction and optical cache invalidation remain shared. No new per-pixel atmospheric ray integration or LUT rebaking is introduced. Atmospheric shadow VRS reconstructs both the primary and the nearest-transparent prefix endpoint from a two-layer coarse grid (see `atmosphere_shadows.md`), falling back to native integration of both when either fails its guards; farther transparent endpoints keep the existing fallback.
 
+With atmospheric shadows active, transparent transport runs in two dispatches. The lean pass (`ATMOSPHERE_TILE_LEAN`) reads shadow deficits only from the shadow pass's endpoint cache: primary, nearest-transparent prefix and cloud layers. It marks fragments whose depth misses that cache by setting the sign bit of the record's reverse-Z depth; fragments behind a 2D cloud whose own endpoint misses are marked too. It leaves those fragments untouched and lists their 8×8 tile. The full shader (`ATMOSPHERE_TILE_DEFERRED`) then runs on the listed tiles by indirect dispatch. It transports only marked fragments and clears the bit before the transparency resolve sorts by depth. The inline fallback integration had cost occupancy even when it never ran: in `earth-sky-rings` (2560×1440, `no-orbits`) the pass went from 1.25 to 0.44 ms with identical images. Orbit lines crossing rings are the usual misses (about 0.16 ms of deferred work in that view with orbits shown). The non-dual-source `composite_transparency` path is unchanged.
+
 Complete columns reuse the sky radiance and RGB transmission instead of reevaluating finite-distance scattering. A surface beyond atmosphere exit therefore cannot introduce a brightness seam against empty sky with the same background radiance. Disabling aerial perspective suppresses the surface inscattering term while retaining finite RGB extinction for rings, orbit lines and opaque surfaces; no aerial scattering volume needs to be baked for this mode.
 
 The compute atmosphere path transforms stored fragments in the same dispatch as opaque/background composition. With dual-source blending selected and supported, a compute pass transforms only pixels containing stored fragments; the existing hardware dual-source pass still composites the opaque/background image. Both paths then use the same surface resolver. Atmospheric passes preserve their existing far-to-near ordering.
@@ -28,7 +30,10 @@ The compute atmosphere path transforms stored fragments in the same dispatch as 
 
 Fragment allocation targets two fragments per viewport pixel, capped at 128 MiB of records and the device storage-buffer range. The separate head image uses four bytes per pixel. Steady allocation is approximately 71.2 MiB at 1920x1080 and 159.6 MiB at 3840x2160. Allocation is lazy, retained at its high-water mark, and skipped when no visible clouds, rings or multi-body orbit pass require it. Resized images and grown buffers retire after GPU completion; normal frames introduce no queue wait.
 
-Visible cumulus also enables capture when rings and orbit lines are disabled.
+2D cloud sheets composited inline by the atmosphere pass (the default; see
+`oceans_clouds.md`) do not use the fragment list, and do not enable capture. Fragments behind such a
+cloud are rewritten during atmospheric transport so they resolve beneath it. Volumetric cumulus, and 2D
+sheets on the fallback path, still enable capture when rings and orbit lines are disabled.
 Clouds append their integrated premultiplied radiance, opacity and
 opacity-weighted mean ray distance during their single colour march. Their
 enclosing mesh is only a ray proxy, so clouds use analytically reconstructed

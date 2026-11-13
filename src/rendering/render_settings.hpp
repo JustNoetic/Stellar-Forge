@@ -65,6 +65,7 @@ struct RenderSettings {
     bool oceans_enabled = true;
     bool clouds_enabled = true;
     uint32_t cloud_mode = 0;
+    bool cloud_sheet_inline = true;
     bool cloud_shadows_enabled = false;
     bool atmosphere_planetshine_reference = false;
     uint32_t ring_planetshine_mode = 0;

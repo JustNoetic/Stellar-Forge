@@ -1,4 +1,5 @@
 #version 460
+#define RING_REFRACTION_TABLE
 
 #ifdef TRANSPARENCY_CAPTURE
 layout(early_fragment_tests) in;
