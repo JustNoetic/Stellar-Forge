@@ -164,7 +164,7 @@ const std::vector<DefaultKernelInfo>& SpiceEphemeris::default_kernels() {
         {"sat456.bsp", "Saturn Moons", "Irregular Saturn Moons (115MB)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat456.bsp", false},
         {"sat457.bsp", "Saturn Moons", "Irregular Saturn Moons (190MB)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat457.bsp", false},
         {"sat459.bsp", "Saturn Moons", "Irregular Saturn Moons (80MB)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat459.bsp", false},
-        {"ura111.bsp", "Uranus Moons", "Major Uranus Moons (Miranda, Ariel, etc.)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/a_old_versions/ura111.bsp", false},
+        {"ura111.bsp", "Uranus Moons", "Major Uranus Moons (Miranda, Ariel, etc.)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/a_old_versions/ura111.bsp", true},
         {"nep095.bsp", "Neptune Moons", "Major & Inner Neptune Moons (Triton, Proteus, etc.)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep095.bsp", true},
         {"nep105.bsp", "Neptune Moons", "Nereid Ephemeris (201MB)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep105.bsp", false},
         {"nep104.bsp", "Neptune Moons", "Irregular Neptune Moons (318MB)", "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep104.bsp", false},
@@ -234,6 +234,11 @@ std::shared_ptr<SpiceEphemeris> SpiceEphemeris::reload(std::string& error) {
     return source;
 }
 
+std::shared_ptr<SpiceEphemeris> SpiceEphemeris::active() {
+    std::lock_guard lock(g_spice_instance_mutex);
+    return g_active_spice.lock();
+}
+
 CommandResult SpiceEphemeris::initialize() {
     std::lock_guard lock(mutex_);
     auto config = paths::read_json(paths::external_path("data", "ephemeris.json"));
@@ -280,6 +285,8 @@ CommandResult SpiceEphemeris::initialize() {
         reset_();
         clear_();
         loaded_kernels_.clear();
+        body_centers_.clear();
+        body_coverage_.clear();
         char action[] = "RETURN", printing[] = "NONE";
         error_action_("SET", 0, action);
         error_print_("SET", 0, printing);
@@ -295,6 +302,9 @@ CommandResult SpiceEphemeris::initialize() {
             status = result();
             if (!status) return status;
             loaded_kernels_.push_back(path);
+            if (to_lower(path.extension().string()) == ".bsp") {
+                scan_bsp_segments(path);
+            }
         }
     } catch (const std::exception& error) {
         return {false, false, error.what()};
@@ -321,6 +331,85 @@ CommandResult SpiceEphemeris::result() const {
     return {false, false, message};
 }
 
+void SpiceEphemeris::scan_bsp_segments(const std::filesystem::path& path) {
+    if (!dafopr_ || !dafbfs_ || !daffna_ || !dafgs_ || !spkuds_ || !dafcls_) return;
+    std::error_code ec;
+    auto abs_path = std::filesystem::absolute(path, ec);
+    int handle = 0;
+    bool close_handle = false;
+    int spk_count = 0;
+    if (ktotal_ && kdata_) {
+        ktotal_("SPK", &spk_count);
+        if (failed_()) reset_();
+        for (int i = 0; i < spk_count; ++i) {
+            char kfile[512]{}, ftype[64]{}, src[256]{};
+            int khandle = 0, found = 0;
+            kdata_(i, "SPK", sizeof(kfile), sizeof(ftype), sizeof(src), kfile, ftype, src, &khandle, &found);
+            if (failed_()) {
+                reset_();
+                continue;
+            }
+            if (found && std::filesystem::equivalent(abs_path, std::filesystem::path(kfile), ec)) {
+                handle = khandle;
+                close_handle = false;
+                break;
+            }
+        }
+    }
+    if (handle == 0) {
+        dafopr_(abs_path.string().c_str(), &handle);
+        if (failed_()) {
+            reset_();
+            return;
+        }
+        close_handle = true;
+    }
+
+    dafbfs_(handle);
+    if (failed_()) {
+        reset_();
+        if (close_handle) dafcls_(handle);
+        return;
+    }
+
+    while (true) {
+        int found = 0;
+        daffna_(&found);
+        if (failed_()) {
+            reset_();
+            break;
+        }
+        if (!found) break;
+
+        double sum[128]{};
+        dafgs_(sum);
+        if (failed_()) {
+            reset_();
+            break;
+        }
+        int body = 0, center = 0, frame = 0, type_id = 0, baddr = 0, eaddr = 0;
+        double b_epoch = 0.0, e_epoch = 0.0;
+        spkuds_(sum, &body, &center, &frame, &type_id, &b_epoch, &e_epoch, &baddr, &eaddr);
+        if (failed_()) {
+            reset_();
+            continue;
+        }
+        body_centers_[body] = center;
+        auto it = body_coverage_.find(body);
+        if (it == body_coverage_.end()) {
+            body_coverage_[body] = {b_epoch, e_epoch};
+        } else {
+            it->second.first = std::min(it->second.first, b_epoch);
+            it->second.second = std::max(it->second.second, e_epoch);
+        }
+    }
+
+    if (close_handle) {
+        dafcls_(handle);
+        if (failed_()) reset_();
+    }
+}
+
 CommandResult SpiceEphemeris::furnish_file(const std::filesystem::path& path) {
     std::lock_guard lock(mutex_);
     std::error_code ec;
@@ -329,12 +418,20 @@ CommandResult SpiceEphemeris::furnish_file(const std::filesystem::path& path) {
     }
     for (const auto& existing : loaded_kernels_) {
         if (std::filesystem::equivalent(existing, path, ec)) {
+            if (to_lower(path.extension().string()) == ".bsp") {
+                scan_bsp_segments(path);
+            }
             return {};
         }
     }
     furnish_(path.string().c_str());
     auto status = result();
-    if (status) loaded_kernels_.push_back(path);
+    if (status) {
+        loaded_kernels_.push_back(path);
+        if (to_lower(path.extension().string()) == ".bsp") {
+            scan_bsp_segments(path);
+        }
+    }
     return status;
 }
 
@@ -353,6 +450,61 @@ bool SpiceEphemeris::query_raw_state(int target, int observer, double et, double
     return false;
 }
 
+bool SpiceEphemeris::query_state_vec(int target, int observer, double et, double state_out[6], int depth) const {
+    if (target == observer) {
+        for (int i = 0; i < 6; ++i) state_out[i] = 0.0;
+        return true;
+    }
+    if (query_raw_state(target, observer, et, state_out)) return true;
+
+    auto alt_id = [](int id) -> int {
+        if (id > 100 && id < 1000 && id % 100 == 99) return id / 100;
+        if (id > 0 && id < 10) return id * 100 + 99;
+        return id;
+    };
+
+    const int alt_t = alt_id(target);
+    const int alt_o = alt_id(observer);
+    if (alt_t == observer || target == alt_o || (alt_t == alt_o && alt_t != target)) {
+        for (int i = 0; i < 6; ++i) state_out[i] = 0.0;
+        return true;
+    }
+    if (alt_t != target && query_raw_state(alt_t, observer, et, state_out)) return true;
+    if (alt_o != observer && query_raw_state(target, alt_o, et, state_out)) return true;
+    if (alt_t != target && alt_o != observer && query_raw_state(alt_t, alt_o, et, state_out)) return true;
+
+    if (depth < 8) {
+        auto it = body_centers_.find(target);
+        if (it == body_centers_.end() && alt_t != target) {
+            it = body_centers_.find(alt_t);
+        }
+        if (it != body_centers_.end() && it->second != target && it->second != alt_t) {
+            const int cid = it->second;
+            const int alt_c = alt_id(cid);
+            double rel[6]{};
+            bool have_rel = query_raw_state(target, cid, et, rel);
+            if (!have_rel && alt_c != cid) have_rel = query_raw_state(target, alt_c, et, rel);
+            if (!have_rel && alt_t != target) have_rel = query_raw_state(alt_t, cid, et, rel);
+            if (have_rel) {
+                if (cid == observer || alt_c == observer || cid == alt_o) {
+                    for (int i = 0; i < 6; ++i) state_out[i] = rel[i];
+                    return true;
+                }
+                double c_state[6]{};
+                if (query_state_vec(cid, observer, et, c_state, depth + 1)) {
+                    for (int i = 0; i < 6; ++i) state_out[i] = rel[i] + c_state[i];
+                    return true;
+                }
+                if (observer == 0 && !body_centers_.contains(cid) && !body_centers_.contains(alt_c)) {
+                    for (int i = 0; i < 6; ++i) state_out[i] = rel[i];
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 CommandResult SpiceEphemeris::state(int target, double et, BodyMotion& motion) const {
     return state_relative(target, 0, et, motion);
 }
@@ -367,11 +519,7 @@ CommandResult SpiceEphemeris::state_relative(int target, int observer, double et
         char primary_msg[2048]{};
         message_("LONG", sizeof(primary_msg), primary_msg);
         reset_();
-        bool recovered = false;
-        if (target > 100 && target < 1000 && target % 100 == 99) {
-            recovered = query_raw_state(target / 100, observer, et, state);
-        }
-        if (!recovered) {
+        if (!query_state_vec(target, observer, et, state, 0)) {
             return {false, false, primary_msg};
         }
     }
@@ -381,6 +529,47 @@ CommandResult SpiceEphemeris::state_relative(int target, int observer, double et
     motion.position = EclipticPosition{glm::dvec3(state[0], state[1], state[2]) * KM_TO_AU};
     motion.velocity = EclipticVelocity{glm::dvec3(state[3], state[4], state[5]) * (KM_TO_AU * SECONDS_PER_YEAR)};
     return {};
+}
+
+CommandResult SpiceEphemeris::state_clamped(const BodyDefinition& body, double et, BodyMotion& motion, bool* in_coverage) const {
+    std::lock_guard lock(mutex_);
+    constexpr double kMaxFiniteSpanSec = 50.0 * 365.25 * 86400.0;
+    double cov_start = body.spice_start_et;
+    double cov_end = body.spice_end_et;
+    bool has_bounds = body.has_finite_spice_coverage();
+    if (!has_bounds) {
+        auto it = body_coverage_.find(body.spice_id);
+        if (it == body_coverage_.end() && body.spice_id > 100 && body.spice_id < 1000 && body.spice_id % 100 == 99) {
+            it = body_coverage_.find(body.spice_id / 100);
+        }
+        if (it != body_coverage_.end() && it->second.second >= it->second.first) {
+            const double span = it->second.second - it->second.first;
+            if (body.is_spacecraft || body.spice_id < 0 || span < kMaxFiniteSpanSec) {
+                cov_start = it->second.first;
+                cov_end = it->second.second;
+                has_bounds = true;
+            }
+        }
+    }
+
+    bool valid_cov = true;
+    double query_et = et;
+    if (has_bounds) {
+        if (et < cov_start || et > cov_end) {
+            valid_cov = false;
+            query_et = std::clamp(et, cov_start, cov_end);
+        }
+    }
+    if (in_coverage) *in_coverage = valid_cov;
+
+    auto res = state(body.spice_id, query_et, motion);
+    if (!res && has_bounds) {
+        const double span = std::max(0.0, cov_end - cov_start);
+        const double eps = std::min(1.0, span * 0.01);
+        const double nudged_et = std::clamp(query_et, cov_start + eps, cov_end - eps);
+        res = state(body.spice_id, nudged_et, motion);
+    }
+    return res;
 }
 
 CommandResult SpiceEphemeris::spk_open(const std::filesystem::path& path, std::string_view internal_name, int& handle) {
@@ -467,11 +656,11 @@ std::string SpiceEphemeris::body_name(int spice_id) const {
     return {};
 }
 
-std::string SpiceEphemeris::et_to_utc(double et, const char* format) const {
+std::string SpiceEphemeris::et_to_utc(double et, const char* format, int prec) const {
     std::lock_guard lock(mutex_);
     if (!et2utc_ || !std::isfinite(et)) return std::format("{:.0f}s ET", et);
     char buf[128]{};
-    et2utc_(et, format, 0, sizeof(buf), buf);
+    et2utc_(et, format, prec, sizeof(buf), buf);
     if (failed_()) {
         reset_();
         return std::format("{:.0f}s ET", et);
@@ -564,13 +753,18 @@ BspInspectResult SpiceEphemeris::inspect_bsp(const std::filesystem::path& bsp_pa
     out.filepath = abs_path.string();
     out.filename = abs_path.filename().string();
 
-    auto tls_default = paths::external_path("data", "kernels", "default", "naif0012.tls");
-    if (!std::filesystem::is_regular_file(tls_default, ec)) {
-        tls_default = paths::external_path("data", "kernels", "naif0012.tls");
-    }
-    if (std::filesystem::is_regular_file(tls_default, ec)) {
-        furnish_file(tls_default);
-    }
+    auto furnish_core = [&](const char* fname) {
+        auto p = paths::external_path("data", "kernels", "default", fname);
+        if (!std::filesystem::is_regular_file(p, ec)) {
+            p = paths::external_path("data", "kernels", fname);
+        }
+        if (std::filesystem::is_regular_file(p, ec)) {
+            furnish_file(p);
+        }
+    };
+    furnish_core("naif0012.tls");
+    furnish_core("pck00010.tpc");
+    furnish_core("de440s.bsp");
 
     int handle = 0;
     bool close_handle = false;
@@ -1374,14 +1568,62 @@ LoadedSystem SpiceKernelManager::build_ephemeris_system(const SystemDefinition* 
     result.definition.name = "Ephemeris Mode";
     result.definition.motion_model = MotionModel::Spice;
     result.definition.epoch_utc = target_epoch;
+    result.definition.spice_epoch_et = et;
+
+    std::vector<BspInspectResult> kernel_infos;
+    std::unordered_map<int, BspBodyInfo> merged_bsp_info;
+    auto record_bsp_info = [&](const BspBodyInfo& binfo) {
+        auto it = merged_bsp_info.find(binfo.id);
+        if (it == merged_bsp_info.end()) {
+            merged_bsp_info[binfo.id] = binfo;
+        } else {
+            it->second.start_et = std::min(it->second.start_et, binfo.start_et);
+            it->second.end_et = std::max(it->second.end_et, binfo.end_et);
+            if (binfo.center_id != 0 && it->second.center_id == 0) {
+                it->second.center_id = binfo.center_id;
+            }
+        }
+    };
+
+    for (const auto& kpath : spice->loaded_kernels()) {
+        if (to_lower(kpath.extension().string()) != ".bsp") continue;
+        auto info = spice->inspect_bsp(kpath);
+        if (!info.valid) continue;
+        for (const auto& binfo : info.bodies) {
+            record_bsp_info(binfo);
+            if (binfo.id > 100 && binfo.id < 1000 && binfo.id % 100 == 99) {
+                BspBodyInfo alias = binfo;
+                alias.id = binfo.id / 100;
+                record_bsp_info(alias);
+            } else if (binfo.id > 0 && binfo.id < 10) {
+                BspBodyInfo alias = binfo;
+                alias.id = binfo.id * 100 + 99;
+                record_bsp_info(alias);
+            }
+        }
+        kernel_infos.push_back(std::move(info));
+    }
+
+    if (auto it_earth = merged_bsp_info.find(399); it_earth != merged_bsp_info.end()) {
+        result.definition.spice_min_et = it_earth->second.start_et;
+        result.definition.spice_max_et = it_earth->second.end_et;
+    }
 
     std::unordered_set<int> included_ids;
     std::unordered_set<std::string> included_names;
+    std::unordered_map<int, std::string> id_to_body_name;
 
     auto mark_included = [&](int spid, const std::string& name) {
         included_ids.insert(spid);
-        if (spid > 100 && spid < 1000 && spid % 100 == 99) included_ids.insert(spid / 100);
-        if (spid > 0 && spid < 10) included_ids.insert(spid * 100 + 99);
+        id_to_body_name[spid] = name;
+        if (spid > 100 && spid < 1000 && spid % 100 == 99) {
+            included_ids.insert(spid / 100);
+            id_to_body_name[spid / 100] = name;
+        }
+        if (spid > 0 && spid < 10) {
+            included_ids.insert(spid * 100 + 99);
+            id_to_body_name[spid * 100 + 99] = name;
+        }
         included_names.insert(to_upper(name));
     };
 
@@ -1395,8 +1637,14 @@ LoadedSystem SpiceKernelManager::build_ephemeris_system(const SystemDefinition* 
             }
             if (copy.spice_id == 0) continue;
 
+            if (auto it_info = merged_bsp_info.find(copy.spice_id); it_info != merged_bsp_info.end()) {
+                copy.spice_center_id = it_info->second.center_id;
+                copy.spice_start_et = it_info->second.start_et;
+                copy.spice_end_et = it_info->second.end_et;
+            }
+
             BodyMotion st{};
-            if (!spice->state(copy.spice_id, et, st)) {
+            if (!spice->state_clamped(copy, et, st)) {
                 continue;
             }
             mark_included(copy.spice_id, copy.name);
@@ -1405,23 +1653,21 @@ LoadedSystem SpiceKernelManager::build_ephemeris_system(const SystemDefinition* 
         }
     }
 
-    for (const auto& kpath : spice->loaded_kernels()) {
-        if (to_lower(kpath.extension().string()) != ".bsp") continue;
-        auto info = spice->inspect_bsp(kpath);
-        if (!info.valid) continue;
+    constexpr double kFiniteMissionMaxSec = 50.0 * 365.25 * 86400.0;
 
+    for (const auto& info : kernel_infos) {
         for (const auto& binfo : info.bodies) {
             int spid = binfo.id;
-            if (spid == 1 || spid == 2 || spid == 3 || spid == 4) continue;
+            if (spid >= 0 && spid <= 9) continue;
             if (included_ids.contains(spid) || included_names.contains(to_upper(binfo.name))) continue;
-
-            BodyMotion st{};
-            if (!spice->state(spid, et, st)) continue;
 
             const auto* known = SpiceEphemeris::find_known_body(spid);
             BodyDefinition bdef{};
             bdef.name = binfo.name;
             bdef.spice_id = spid;
+            bdef.spice_center_id = binfo.center_id;
+            bdef.spice_start_et = binfo.start_et;
+            bdef.spice_end_et = binfo.end_et;
             bdef.is_spacecraft = (spid < 0) || (known && known->is_spacecraft);
             bdef.type = known ? known->type : (bdef.is_spacecraft ? "Spacecraft" : "Moon");
             bdef.is_star = (bdef.type == "Star");
@@ -1429,16 +1675,33 @@ LoadedSystem SpiceKernelManager::build_ephemeris_system(const SystemDefinition* 
             bdef.color_rgb = hex_to_rgb(col_hex);
             bdef.color_pole_rgb = bdef.color_rgb;
 
+            if (known && !known->mission_start_utc.empty()) {
+                bdef.mission_start_utc = known->mission_start_utc;
+                bdef.mission_end_utc = known->mission_end_utc;
+            } else if (bdef.is_spacecraft || (binfo.end_et - binfo.start_et) < kFiniteMissionMaxSec) {
+                bdef.mission_start_utc = binfo.utc_start;
+                bdef.mission_end_utc = binfo.utc_end;
+            }
+
+            BodyMotion st{};
+            if (!spice->state_clamped(bdef, et, st)) continue;
+
             double fallback_m_kg = known ? known->mass_kg : (bdef.is_spacecraft ? 26000.0 : 1e15);
             double fallback_r_km = known ? known->radius_km : (bdef.is_spacecraft ? 0.010 : 10.0);
             spice->body_gm_and_radius(spid, fallback_m_kg, fallback_r_km, bdef.mass_msun, bdef.radius_rsun);
 
             std::string parent_name = "Sun";
-            if (known && !known->parent_name.empty()) {
+            if (binfo.center_id != 0 && binfo.center_id != 10 && id_to_body_name.contains(binfo.center_id)) {
+                parent_name = id_to_body_name[binfo.center_id];
+            } else if (known && !known->parent_name.empty()) {
                 parent_name = known->parent_name;
+            } else if (binfo.center_id != 0 && binfo.center_id != 10) {
+                if (const auto* kc = SpiceEphemeris::find_known_body(binfo.center_id)) {
+                    parent_name = kc->name;
+                }
             } else if (spid < 0) {
                 BodyMotion st_start = st;
-                spice->state(spid, binfo.start_et, st_start);
+                spice->state_clamped(bdef, binfo.start_et, st_start);
                 struct CandidateParent { int id; const char* name; };
                 static constexpr CandidateParent kCandidates[] = {
                     {399, "Earth"}, {699, "Saturn"}, {599, "Jupiter"},
@@ -1569,8 +1832,14 @@ LoadedSystem SpiceKernelManager::build_generic_bsp_system(const std::filesystem:
     double epoch_et = info.min_et;
     if (info.sidecar.is_object() && info.sidecar.contains("epoch_et_seconds_past_j2000")) {
         epoch_et = info.sidecar.value("epoch_et_seconds_past_j2000", info.min_et);
+    } else {
+        double sc_min = std::numeric_limits<double>::infinity();
+        for (const auto& b : info.bodies) {
+            if (b.id < 0) sc_min = std::min(sc_min, b.start_et);
+        }
+        if (std::isfinite(sc_min)) epoch_et = sc_min;
     }
-    std::string epoch_utc = spice->et_to_utc(epoch_et, "ISOC");
+    std::string epoch_utc = spice->et_to_utc(epoch_et, "ISOC", 3);
 
     std::vector<BspBodyInfo> all_bodies = info.bodies;
     std::unordered_set<int> present_ids;
@@ -1580,30 +1849,66 @@ LoadedSystem SpiceKernelManager::build_generic_bsp_system(const std::filesystem:
         if (b.id > 0 && b.id < 10) present_ids.insert(b.id * 100 + 99);
     }
 
-    auto ensure_context_body = [&](int cid) {
-        if (cid == 0 || present_ids.contains(cid)) return;
+    auto ensure_context_body = [&](auto& self, int cid, int depth) -> void {
+        if (cid == 0 || depth > 6 || present_ids.contains(cid)) return;
         int actual_id = (cid > 0 && cid < 10) ? (cid * 100 + 99) : cid;
         if (present_ids.contains(actual_id)) return;
         BodyMotion test_st{};
         if (!spice->state(actual_id, epoch_et, test_st)) return;
         const auto* known = SpiceEphemeris::find_known_body(actual_id);
+        int parent_cid = (actual_id == 10) ? 0 : 10;
+        if (known && !known->parent_name.empty()) {
+            if (const auto* kp = SpiceEphemeris::find_known_body_by_name(known->parent_name)) {
+                parent_cid = kp->id;
+            }
+        } else if (actual_id > 100 && actual_id < 1000 && actual_id % 100 != 99) {
+            parent_cid = (actual_id / 100) * 100 + 99;
+        }
+        if (parent_cid != 0 && parent_cid != actual_id) {
+            self(self, parent_cid, depth + 1);
+        }
         BspBodyInfo cbody{};
         cbody.id = actual_id;
         cbody.name = known ? known->name : spice->body_name(actual_id);
         if (cbody.name.empty()) cbody.name = std::format("Object {}", actual_id);
-        cbody.center_id = (actual_id == 10) ? 0 : 10;
+        cbody.center_id = parent_cid;
         cbody.color_hex = known ? known->color_hex : "#a0a0a0";
-        cbody.start_et = epoch_et;
-        cbody.end_et = info.max_et;
+        cbody.start_et = -1e30;
+        cbody.end_et = 1e30;
         present_ids.insert(actual_id);
         present_ids.insert(cid);
         all_bodies.push_back(std::move(cbody));
     };
 
-    ensure_context_body(10);
+    ensure_context_body(ensure_context_body, 10, 0);
     for (size_t i = 0; i < info.bodies.size(); ++i) {
-        ensure_context_body(info.bodies[i].center_id);
+        ensure_context_body(ensure_context_body, info.bodies[i].center_id, 0);
     }
+
+    LoadedSystem solar_template;
+    bool has_solar_template = false;
+    try {
+        SystemManager sys_mgr;
+        if (sys_mgr.system_exists(SystemManager::SOLAR_SYSTEM_NAME)) {
+            solar_template = sys_mgr.load_system(SystemManager::SOLAR_SYSTEM_NAME);
+            has_solar_template = !solar_template.definition.bodies.empty();
+        }
+    } catch (...) {
+        has_solar_template = false;
+    }
+
+    auto find_template_body = [&](int spid, std::string_view bname) -> const BodyDefinition* {
+        if (!has_solar_template) return nullptr;
+        for (const auto& tb : solar_template.definition.bodies) {
+            if (tb.spice_id != 0 && tb.spice_id == spid) return &tb;
+            if (spid > 0 && spid < 10 && tb.spice_id == spid * 100 + 99) return &tb;
+        }
+        std::string uname = to_upper(bname);
+        for (const auto& tb : solar_template.definition.bodies) {
+            if (to_upper(tb.name) == uname) return &tb;
+        }
+        return nullptr;
+    };
 
     std::unordered_map<int, std::string> id_to_name;
     for (const auto& b : all_bodies) {
@@ -1618,33 +1923,49 @@ LoadedSystem SpiceKernelManager::build_generic_bsp_system(const std::filesystem:
     };
     std::vector<RawEntry> entries;
     std::unordered_set<std::string> used_names;
+    const bool has_sidecar_bodies = info.sidecar.is_object() && info.sidecar.contains("bodies") && info.sidecar["bodies"].is_array();
 
     for (const auto& b : all_bodies) {
-        BodyMotion st{};
-        if (!spice->state(b.id, epoch_et, st)) {
-            if (!spice->state(b.id, b.start_et, st)) continue;
-        }
-
         const auto* known = SpiceEphemeris::find_known_body(b.id);
         BodyDefinition bdef{};
+        if (!has_sidecar_bodies) {
+            if (const auto* tpl = find_template_body(b.id, b.name)) {
+                bdef = *tpl;
+            }
+        }
+
         bdef.name = b.name;
         if (used_names.contains(bdef.name)) {
             bdef.name = std::format("{} ({})", b.name, b.id);
         }
         used_names.insert(bdef.name);
         bdef.spice_id = b.id;
+        bdef.spice_center_id = b.center_id;
+        bdef.spice_start_et = b.start_et;
+        bdef.spice_end_et = b.end_et;
+        bdef.mission_start_utc = b.utc_start;
+        bdef.mission_end_utc = b.utc_end;
         bdef.is_spacecraft = (b.id < 0) || (known && known->is_spacecraft);
         bdef.is_star = (b.id == 10) || (known && known->type == "Star");
-        bdef.type = bdef.is_star ? "Star" : (known ? known->type : (bdef.is_spacecraft ? "Spacecraft" : "Terrestrial"));
-        bdef.color_rgb = hex_to_rgb(b.color_hex);
-        bdef.color_pole_rgb = bdef.color_rgb;
-        bdef.pole_ecl = {0.0, 0.0, 1.0};
+
+        if (bdef.source_json.empty()) {
+            bdef.type = bdef.is_star ? "Star" : (known ? known->type : (bdef.is_spacecraft ? "Spacecraft" : "Terrestrial"));
+            bdef.color_rgb = hex_to_rgb(b.color_hex);
+            bdef.color_pole_rgb = bdef.color_rgb;
+            bdef.pole_ecl = {0.0, 0.0, 1.0};
+        }
+
+        BodyMotion st{};
+        if (!spice->state_clamped(bdef, epoch_et, st)) {
+            if (!spice->state(b.id, b.start_et, st)) continue;
+        }
 
         double fallback_m_kg = known ? known->mass_kg : (bdef.is_star ? 1.98847e30 : (bdef.is_spacecraft ? 26000.0 : 1e20));
         double fallback_r_km = known ? known->radius_km : (bdef.is_star ? 696340.0 : (bdef.is_spacecraft ? 0.010 : 1000.0));
         spice->body_gm_and_radius(b.id, fallback_m_kg, fallback_r_km, bdef.mass_msun, bdef.radius_rsun);
         if (bdef.radius_rsun <= 0.0) bdef.radius_rsun = 0.001;
 
+        bdef.parent_id.clear();
         if (!bdef.is_star) {
             if (b.center_id != 0 && id_to_name.contains(b.center_id) && id_to_name[b.center_id] != bdef.name) {
                 bdef.parent_id = id_to_name[b.center_id];
@@ -1661,16 +1982,22 @@ LoadedSystem SpiceKernelManager::build_generic_bsp_system(const std::filesystem:
             }
         }
 
-        bdef.source_json = {
-            {"name", bdef.name},
-            {"type", bdef.type},
-            {"spice_id", bdef.spice_id},
-            {"parentId", bdef.parent_id},
-            {"m", bdef.mass_msun},
-            {"r", bdef.radius_rsun},
-            {"color", b.color_hex},
-            {"is_spacecraft", bdef.is_spacecraft}
-        };
+        if (bdef.source_json.empty()) {
+            bdef.source_json = {
+                {"name", bdef.name},
+                {"type", bdef.type},
+                {"spice_id", bdef.spice_id},
+                {"parentId", bdef.parent_id},
+                {"m", bdef.mass_msun},
+                {"r", bdef.radius_rsun},
+                {"color", b.color_hex},
+                {"is_spacecraft", bdef.is_spacecraft}
+            };
+        } else {
+            bdef.source_json["name"] = bdef.name;
+            bdef.source_json["spice_id"] = bdef.spice_id;
+            bdef.source_json["parentId"] = bdef.parent_id;
+        }
         entries.push_back({std::move(bdef), st});
     }
 
@@ -1727,6 +2054,9 @@ LoadedSystem SpiceKernelManager::build_generic_bsp_system(const std::filesystem:
     loaded.definition.motion_model = MotionModel::Spice;
     loaded.definition.epoch_utc = epoch_utc;
     loaded.definition.custom_bsp_path = std::filesystem::absolute(bsp_path).string();
+    loaded.definition.spice_epoch_et = epoch_et;
+    loaded.definition.spice_min_et = info.min_et;
+    loaded.definition.spice_max_et = info.max_et;
 
     for (size_t idx : order) {
         auto& e = entries[idx];

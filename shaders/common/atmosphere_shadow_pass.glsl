@@ -96,8 +96,9 @@ void shadow_integrate(ivec2 pixel, vec3 direction, vec2 segment, float path, flo
 void evaluate_shadow_pixel(ivec2 pixel) {
     ivec2 size = imageSize(current_deficit).xy;
 #ifdef ATMOSPHERE_SHADOW_COARSE
-    if (any(lessThan(pixel, shadow_coarse_bounds.xy)) || any(greaterThanEqual(pixel, min(size, shadow_coarse_bounds.zw)))) return;
-    ivec2 output_pixel = pixel;
+    if (any(lessThan(pixel, shadow_coarse_bounds.xy)) || any(greaterThanEqual(pixel, shadow_coarse_bounds.zw))) return;
+    // The coarse textures are indexed from the corner of this body's coarse rectangle.
+    ivec2 output_pixel = pixel-shadow_coarse_bounds.xy;
     pixel *= shadow_vrs_scale();
     size = textureSize(scene_depth, 0);
 #else

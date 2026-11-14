@@ -1,7 +1,7 @@
 # Planetshine and surface ringshine
 
 `RenderSettings::planetshine_enabled` (default on) controls reflected planetary light
-on ground, unresolved body billboards, rings, and the one-source atmospheric prototype. Settings → Lighting & Rings
+on ground, clouds, unresolved body billboards, rings, and atmospheres. Settings → Lighting & Rings
 exposes Planetshine beside Ringshine. The existing `ringshine_enabled` switch controls
 surface ringshine; hiding rings suppresses its illumination.
 

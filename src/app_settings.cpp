@@ -78,6 +78,55 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             if (ImGui::SliderInt(id, &segments, 128, 8192, "%d segments", ImGuiSliderFlags_Logarithmic))
                 render_draft.orbit_segments = static_cast<uint32_t>(segments);
         });
+
+        ui::section("Spacecraft & ephemeris trajectories");
+        ui::field("Trajectory Frame", [&](const char* id) {
+            const char* frames[] = {
+                "Auto (Lagrange Orbits)",
+                "Parent Inertial",
+                "Rotating Pair"
+            };
+            int fm = static_cast<int>(render_draft.ephem_frame_mode);
+            if (ImGui::Combo(id, &fm, frames, IM_ARRAYSIZE(frames))) {
+                render_draft.ephem_frame_mode = static_cast<uint32_t>(fm);
+            }
+        });
+        if (render_draft.ephem_frame_mode == 2) {
+            ui::field("Rotating Pair", [&](const char* id) {
+                const char* pairs[] = {
+                    "Sun - Earth (L1/L2)",
+                    "Earth - Moon",
+                    "Sun - Jupiter",
+                    "Sun - Saturn",
+                    "Saturn - Titan"
+                };
+                int rp = static_cast<int>(render_draft.ephem_rotating_pair);
+                if (ImGui::Combo(id, &rp, pairs, IM_ARRAYSIZE(pairs))) {
+                    render_draft.ephem_rotating_pair = static_cast<uint32_t>(rp);
+                }
+            });
+        }
+        if (render_draft.ephem_frame_mode == 0 || render_draft.ephem_frame_mode == 2) {
+            ui::field("Rotating Window", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.ephem_lagrange_days, 15.0f, 730.0f, "%.0f days");
+            });
+        }
+        ui::field("Trajectory Samples", [&](const char* id) {
+            int pts = static_cast<int>(render_draft.ephem_sample_points);
+            if (ImGui::SliderInt(id, &pts, 500, 20000, "%d pts", ImGuiSliderFlags_Logarithmic)) {
+                render_draft.ephem_sample_points = static_cast<uint32_t>(pts);
+            }
+        });
+        ImGui::Checkbox("Sliding Window Trail Fade", &render_draft.ephem_trail_fade);
+        if (render_draft.ephem_trail_fade) {
+            ui::field("Past Trail Window", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.ephem_trail_days, 0.5f, 365.0f, "%.1f days", ImGuiSliderFlags_Logarithmic);
+            });
+            ui::field("Future Lead Window", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.ephem_lead_days, 0.0f, 365.0f, "%.1f days");
+            });
+        }
+        ImGui::Checkbox("Hide Bodies Outside SPICE Coverage", &render_draft.ephem_hide_outside);
         ImGui::EndDisabled();
     } else if (page == ui::SettingsSection::Atmosphere) {
         ui::section("Atmospheric effects");
@@ -126,14 +175,18 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ImGui::EndDisabled();
             ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
             ImGui::Checkbox("Atmospheric shadow VRS", &render_draft.atmosphere_shadow_vrs);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses smooth shadow fractions between pixels. Depth edges, narrow shadow detail and transparent endpoints use native resolution.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Integrates shadows on a coarse grid and upsamples them, for atmospheres covering more of the screen than the shadow ray budget.");
             ImGui::BeginDisabled(!render_draft.atmosphere_shadow_vrs);
+            ui::field("Shadow ray budget", [&](const char* id) {
+                ImGui::SliderFloat(id, &render_draft.atmosphere_shadow_vrs_budget, 0.0f, 100.0f, "%.2f%% of screen", ImGuiSliderFlags_Logarithmic);
+            });
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shadow rays each atmosphere may integrate. Atmospheres within it integrate every pixel; larger ones use the finest coarse grid that fits, up to the VRS rate. 0 always uses the VRS rate.");
             ui::field("Shadow VRS rate", [&](const char* id) {
                 const char* rates[] = {"1/2 (25% of pixels)", "1/4 (6.25% of pixels)", "1/8 (1.6% of pixels)", "1/16 (0.39% of pixels)"};
                 int rate = std::bit_width(std::clamp(render_draft.atmosphere_shadow_vrs_scale, 2u, 16u))-2;
                 if (ImGui::Combo(id, &rate, rates, 4)) render_draft.atmosphere_shadow_vrs_scale = 2u << rate;
             });
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Coarse shadow-fraction grid spacing per axis. Pixels failing the reuse guards still integrate natively.");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Coarsest shadow grid spacing per axis, used when an atmosphere exceeds the ray budget at finer grids.");
             ImGui::EndDisabled();
             ImGui::EndDisabled();
         }
@@ -149,18 +202,10 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
         ImGui::Checkbox("Oceans", &render_draft.oceans_enabled);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Wind-driven ocean surfaces with filtered wave specular, sky reflection and foam on bodies with an ocean definition.");
         ImGui::Checkbox("Clouds", &render_draft.clouds_enabled);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Texture-mapped or volumetric clouds on bodies with a cloud definition.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Texture-mapped cloud shells on bodies with a cloud definition.");
         ImGui::BeginDisabled(!render_draft.clouds_enabled);
-        ui::field("Cloud rendering", [&](const char* id) {
-            const char* modes[] = {"2D texture", "Volumetric (experimental)"};
-            int mode = int(render_draft.cloud_mode);
-            if (ImGui::Combo(id, &mode, modes, 2)) render_draft.cloud_mode = uint32_t(mode);
-        });
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("2D uses a thin cloud shell with filtered coverage. Volumetric marches through cloud columns.");
-        ImGui::BeginDisabled(render_draft.cloud_mode != 0);
-        ImGui::Checkbox("Composite 2D clouds with the atmosphere", &render_draft.cloud_sheet_inline);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blends the 2D cloud sheet inside the atmosphere pass from a per-pixel cloud layer, instead of as a transparent fragment with its own atmospheric transport and sorting.");
-        ImGui::EndDisabled();
+        ImGui::Checkbox("Composite clouds with the atmosphere", &render_draft.cloud_sheet_inline);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blends the cloud sheet inside the atmosphere pass from a per-pixel cloud layer, instead of as a transparent fragment with its own atmospheric transport and sorting.");
         ImGui::EndDisabled();
         ImGui::BeginDisabled(render_draft.direct_sunlight_only);
         ImGui::Checkbox("Planetshine", &render_draft.planetshine_enabled);

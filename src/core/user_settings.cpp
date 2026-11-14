@@ -23,6 +23,14 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(show_orbits);
     SF_SETTING(orbit_opacity);
     SF_SETTING(orbit_segments);
+    SF_SETTING(ephem_frame_mode);
+    SF_SETTING(ephem_rotating_pair);
+    SF_SETTING(ephem_lagrange_days);
+    SF_SETTING(ephem_sample_points);
+    SF_SETTING(ephem_trail_fade);
+    SF_SETTING(ephem_trail_days);
+    SF_SETTING(ephem_lead_days);
+    SF_SETTING(ephem_hide_outside);
     SF_SETTING(star_point_size);
     SF_SETTING(star_intensity);
     SF_SETTING(vsync);
@@ -58,6 +66,7 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(atmosphere_shadow_adaptive);
     SF_SETTING(atmosphere_shadow_vrs);
     SF_SETTING(atmosphere_shadow_vrs_scale);
+    SF_SETTING(atmosphere_shadow_vrs_budget);
     SF_SETTING(atmosphere_shadow_noise_type);
     SF_SETTING(atmosphere_shadow_samples);
     SF_SETTING(ring_shadows_enabled);
@@ -65,7 +74,6 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(planetshine_enabled);
     SF_SETTING(oceans_enabled);
     SF_SETTING(clouds_enabled);
-    SF_SETTING(cloud_mode);
     SF_SETTING(cloud_sheet_inline);
     SF_SETTING(cloud_shadows_enabled);
     SF_SETTING(ring_planetshine_mode);

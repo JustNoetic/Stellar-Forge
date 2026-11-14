@@ -1,0 +1,104 @@
+#version 460
+// Tileable cloud noise (docs/volumetric_clouds_plan.md §4). Pass 0 records each channel's range, pass 1 writes the
+// channel normalized to [0, 1]. Shape (128^3): R Perlin-Worley, G/B/A inverted Worley fBm at 4, 8 and 16 cells per
+// tile. Detail (32^3): R/G/B/A inverted Worley fBm at 2, 4, 8 and 16 cells per tile.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(set = 0, binding = 0, rgba8) uniform writeonly image3D noise_image;
+layout(std430, set = 0, binding = 1) buffer NoiseRange { uint noise_range[]; };
+layout(push_constant) uniform NoisePush {
+    uint detail;
+    uint normalize_pass;
+    uint size;
+    uint range_offset;
+} pc;
+
+uvec3 noise_pcg(uvec3 v) {
+    v = v*1664525u+1013904223u;
+    v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+    v ^= v >> 16u;
+    v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+    return v;
+}
+
+vec3 noise_hash(ivec3 cell, int period, uint seed) {
+    uvec3 wrapped = uvec3(((cell % period)+period) % period);
+    return vec3(noise_pcg(wrapped+uvec3(seed*1013u, seed*7919u, seed*104729u)))*(1.0/4294967296.0);
+}
+
+// Distance to the nearest jittered feature point, periodic in `period` cells.
+float worley(vec3 p, int period, uint seed) {
+    ivec3 cell = ivec3(floor(p));
+    vec3 f = p-vec3(cell);
+    float nearest = 1e9;
+    for (int z = -1; z <= 1; ++z) for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        ivec3 offset = ivec3(x, y, z);
+        vec3 delta = vec3(offset)+noise_hash(cell+offset, period, seed)-f;
+        nearest = min(nearest, dot(delta, delta));
+    }
+    return sqrt(nearest);
+}
+
+float worley_fbm(vec3 uvw, int frequency, uint seed) {
+    float sum = 0.0;
+    const float weights[3] = float[3](0.625, 0.25, 0.125);
+    for (int octave = 0; octave < 3; ++octave) {
+        int cells = frequency << octave;
+        sum += weights[octave]*clamp(1.0-worley(uvw*float(cells), cells, seed+uint(octave)), 0.0, 1.0);
+    }
+    return sum;
+}
+
+float gradient_noise(vec3 p, int period, uint seed) {
+    ivec3 cell = ivec3(floor(p));
+    vec3 f = p-vec3(cell);
+    vec3 u = f*f*f*(f*(f*6.0-15.0)+10.0);
+    float corners[8];
+    for (int i = 0; i < 8; ++i) {
+        ivec3 corner = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        vec3 gradient = normalize(noise_hash(cell+corner, period, seed)*2.0-1.0+vec3(1e-6));
+        corners[i] = dot(gradient, f-vec3(corner));
+    }
+    return mix(mix(mix(corners[0], corners[1], u.x), mix(corners[2], corners[3], u.x), u.y),
+               mix(mix(corners[4], corners[5], u.x), mix(corners[6], corners[7], u.x), u.y), u.z);
+}
+
+float perlin_fbm(vec3 uvw, int frequency, int octaves, uint seed) {
+    float sum = 0.0, amplitude = 1.0, norm = 0.0;
+    for (int octave = 0; octave < octaves; ++octave) {
+        int cells = frequency << octave;
+        sum += amplitude*gradient_noise(uvw*float(cells), cells, seed+uint(octave));
+        norm += amplitude;
+        amplitude *= 0.5;
+    }
+    return sum/norm;
+}
+
+vec4 raw_noise(vec3 uvw) {
+    if (pc.detail != 0u)
+        return vec4(worley_fbm(uvw, 2, 101u), worley_fbm(uvw, 4, 111u), worley_fbm(uvw, 8, 121u), worley_fbm(uvw, 16, 131u));
+    float perlin = clamp(0.5+0.5*perlin_fbm(uvw, 4, 6, 11u), 0.0, 1.0);
+    float cells = worley_fbm(uvw, 4, 21u);
+    // Perlin-Worley: billowy Perlin dilated by Worley cells (Schneider 2015).
+    float perlin_worley = cells+perlin*(1.0-cells);
+    return vec4(perlin_worley, worley_fbm(uvw, 4, 31u), worley_fbm(uvw, 8, 41u), worley_fbm(uvw, 16, 51u));
+}
+
+void main() {
+    uvec3 texel = gl_GlobalInvocationID;
+    if (any(greaterThanEqual(texel, uvec3(pc.size)))) return;
+    // abs() clears a negative zero's sign bit, so the unsigned bit order matches the float order.
+    vec4 value = abs(raw_noise((vec3(texel)+0.5)/float(pc.size)));
+    if (pc.normalize_pass == 0u) {
+        for (int c = 0; c < 4; ++c) {
+            atomicMin(noise_range[pc.range_offset+uint(c)], floatBitsToUint(value[c]));
+            atomicMax(noise_range[pc.range_offset+4u+uint(c)], floatBitsToUint(value[c]));
+        }
+        return;
+    }
+    vec4 low, high;
+    for (int c = 0; c < 4; ++c) {
+        low[c] = uintBitsToFloat(noise_range[pc.range_offset+uint(c)]);
+        high[c] = uintBitsToFloat(noise_range[pc.range_offset+4u+uint(c)]);
+    }
+    imageStore(noise_image, ivec3(texel), clamp((value-low)/max(high-low, vec4(1e-6)), 0.0, 1.0));
+}

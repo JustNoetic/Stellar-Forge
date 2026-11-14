@@ -51,14 +51,14 @@ vec3 reconstruct_shadow_vrs(ivec2 pixel, int layer, bool finite, vec2 segment, f
     vec2 f = vec2(pixel%scale)/float(scale);
     float log_path = log2(max(path, 1e-5));
     float segment_tolerance = max(0.02*max(path, 1.0), 4.0*float(scale)*segment.x/max(shadow_eye_focal.w, 1.0));
-    ivec2 lo = max(shadow_coarse_bounds.xy, ivec2(0));
-    ivec2 hi = min(shadow_coarse_bounds.zw, textureSize(coarse_shadow_fraction, 0).xy)-1;
+    // The coarse textures hold only this body's coarse rectangle, indexed from its corner.
+    ivec2 lo = shadow_coarse_bounds.xy, hi = shadow_coarse_bounds.zw-1;
     vec3 sum = vec3(0.0);
     float total = 0.0;
     // A thin cloud or transparent fragment the coarse anchors all missed borrows the opaque layer's rays.
     for (int source = layer; source >= 0 && total <= 0.0; source = source == 0 ? -1 : 0)
     for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
-        ivec2 tap = clamp(base+ivec2(x, y), lo, hi);
+        ivec2 tap = clamp(base+ivec2(x, y), lo, hi)-lo;
         vec4 guide = texelFetch(coarse_shadow_guide, ivec3(tap, source), 0);
         if (guide.w < 0.5) continue;
         // A small floor keeps the off-centre taps available when the nearest one belongs to another surface.

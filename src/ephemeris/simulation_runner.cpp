@@ -293,7 +293,7 @@ void SimulationRunner::start_timeline_render(units::Years target_time, size_t re
                 }
                 double et_k = epoch_et + units::to_seconds(t_k).value;
                 for (size_t b = 0; b < num_bodies; ++b) {
-                    auto st = spice->state(def.bodies[b].spice_id, et_k, current_motions[b]);
+                    auto st = spice->state_clamped(def.bodies[b], et_k, current_motions[b]);
                     if (!st && !def.bodies[b].is_spacecraft) {
                         std::lock_guard lk(timeline_mutex_);
                         timeline_error_ = def.bodies[b].name + ": " + st.error;

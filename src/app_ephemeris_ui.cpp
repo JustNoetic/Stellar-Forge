@@ -21,12 +21,21 @@ void App::open_jump_timeline_modal() {
 void App::render_jump_timeline_modal() {
     if (!ui_state_.jump_timeline.active) return;
 
-    ImGui::SetNextWindowSize(ImVec2(520.0f, 500.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(540.0f, 540.0f), ImGuiCond_Always);
     ImGui::OpenPopup("Jump to Date / Render Timeline###jump_timeline_modal");
     if (ImGui::BeginPopupModal("Jump to Date / Render Timeline###jump_timeline_modal", &ui_state_.jump_timeline.active, ImGuiWindowFlags_NoResize)) {
         auto& jd = ui_state_.jump_timeline;
 
         ui::heading("Jump to Date / Render Timeline", "Jump instantly or render a scrubbable timeline to a target epoch.");
+
+        auto motion_model = system().definition().motion_model;
+        if (motion_model == ephemeris::MotionModel::Spice) {
+            ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "Mode: NASA SPICE Ephemeris Playback");
+        } else if (motion_model == ephemeris::MotionModel::Keplerian) {
+            ImGui::TextColored(ImVec4(0.45f, 0.90f, 0.55f, 1.0f), "Mode: Analytical Keplerian (Jacobi)");
+        } else {
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "Mode: N-Body Simulation (IAS15)");
+        }
 
         auto cur_utc = time::calculate_sim_date(system().definition().epoch_utc, system().time(), false);
         auto cur_local = time::calculate_sim_date(system().definition().epoch_utc, system().time(), true);
@@ -42,11 +51,12 @@ void App::render_jump_timeline_modal() {
         ImGui::Text("Input Time Standard:");
         ImGui::SameLine();
         bool prev_utc = jd.is_utc;
-        if (ImGui::RadioButton("Local Time", !jd.is_utc)) {
+        std::string local_radio = std::format("Local Time ({})###jd_local_tz", cur_local.tz);
+        if (ImGui::RadioButton(local_radio.c_str(), !jd.is_utc)) {
             jd.is_utc = false;
         }
         ImGui::SameLine();
-        if (ImGui::RadioButton("UTC", jd.is_utc)) {
+        if (ImGui::RadioButton("UTC###jd_utc_tz", jd.is_utc)) {
             jd.is_utc = true;
         }
         if (prev_utc != jd.is_utc) {
@@ -86,9 +96,30 @@ void App::render_jump_timeline_modal() {
         ImGui::Text("Presets:");
         ImGui::SameLine();
         if (ImGui::SmallButton("Today/Now")) {
-            auto now = time::calculate_sim_date(system().definition().epoch_utc, units::Years{0.0}, !jd.is_utc);
+            auto now = time::current_wall_clock_date(!jd.is_utc);
             jd.target_year = now.year; jd.target_month = now.month; jd.target_day = now.day;
             jd.target_hour = now.hour; jd.target_minute = now.minute; jd.target_second = now.second;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Set target date to the current real-world wall-clock time.");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Current Sim")) {
+            auto cur = time::calculate_sim_date(system().definition().epoch_utc, system().time(), !jd.is_utc);
+            jd.target_year = cur.year; jd.target_month = cur.month; jd.target_day = cur.day;
+            jd.target_hour = cur.hour; jd.target_minute = cur.minute; jd.target_second = cur.second;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Reset target date to the current simulation clock.");
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Sim Epoch")) {
+            auto ep = time::calculate_sim_date(system().definition().epoch_utc, units::Years{0.0}, !jd.is_utc);
+            jd.target_year = ep.year; jd.target_month = ep.month; jd.target_day = ep.day;
+            jd.target_hour = ep.hour; jd.target_minute = ep.minute; jd.target_second = ep.second;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Set target date to the initial epoch of the loaded system/kernel.");
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("J2000")) {
@@ -106,8 +137,6 @@ void App::render_jump_timeline_modal() {
         if (ImGui::SmallButton("-1 Year")) { jd.target_year -= 1; }
         ImGui::SameLine();
         if (ImGui::SmallButton("+10 Years")) { jd.target_year += 10; }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("+100 Years")) { jd.target_year += 100; }
 
         time::DateTimeUTC target_dt{jd.target_year, jd.target_month, jd.target_day, jd.target_hour, jd.target_minute, jd.target_second, ""};
         units::Years target_sim_time = time::sim_time_from_date(system().definition().epoch_utc, target_dt, jd.is_utc);
@@ -117,7 +146,6 @@ void App::render_jump_timeline_modal() {
         ImGui::TextDisabled("Target Sim Time: %.5f yr (%+.5f yr from current)", target_sim_time.value, diff_years);
         ImGui::Separator();
 
-        auto motion_model = system().definition().motion_model;
         bool can_jump = (motion_model == ephemeris::MotionModel::Keplerian || motion_model == ephemeris::MotionModel::Spice);
 
         if (can_jump) {

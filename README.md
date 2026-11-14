@@ -43,7 +43,7 @@ Designed from the ground up around modern GPU-driven pipelines and double-precis
 ### 5. Oblate Cube-Sphere Terrain, FFT Oceans & Clouds
 - **Oblate Quadtree Terrain LOD**: 6-face oblate cube-sphere quadtree (`Quadtree`) with continuous spatial morphing, a 64 MiB GPU patch geometry cache (`GeometryCache`), and async streaming of `128×128` (+2-texel gutter) cubic B-spline elevation DEMs, lossless sRGB albedo tiles, and `RGBA16_SNORM` normal maps.
 - **Spectral FFT Ocean Waves**: Five `256×256` JONSWAP FFT cascades (`2 m` to `77 km` wavelengths) for the focused body below `1,000 km` altitude, featuring parallel-transported tangent frames, prefiltered slope/Jacobian moment mips, Cox-Munk residual roughness, Jacobian-quantile whitecap foam, and Bruneton Fresnel reflectance.
-- **Cumulus Cloud Shells & Volumetric Layers**: Supports fast 2D oblate texture shells and ray-marched volumetric cumulus layers driven by up to `16384×8192` 14-mip `R8` coverage pyramids (`CloudMaps`), with lifting condensation level (LCL) automatic base altitude calculation.
+- **Cloud Shells**: Fast 2D oblate texture shells driven by up to `16384×8192` 14-mip `R8` coverage pyramids (`CloudMaps`), composited inline with the atmosphere, with lifting condensation level (LCL) automatic base altitude calculation. Volumetric clouds are planned as a rewrite.
 
 ### 6. Astrophysics, Gaia DR3 Starfield & Comparative Tools
 - **Gaia DR3 Star Catalog (~475k Stars)**: GPU compute frustum culling (`starfield_cull.comp`) and `vkCmdDrawIndirect` rendering with flux-normalized 3 px point-spread functions and smooth subpixel mesh-to-point transitions.

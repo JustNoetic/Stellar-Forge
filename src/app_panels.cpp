@@ -35,6 +35,10 @@ void App::render_outliner_node(int body_idx) {
     std::string label = (camera_.tracking_idx == body_idx)
         ? std::format("{} [Tracked]", b.definition.name)
         : b.definition.name;
+    const bool inactive_spice = (system().definition().motion_model == ephemeris::MotionModel::Spice && !b.render.spice_valid);
+    if (inactive_spice) {
+        label += " [Inactive]";
+    }
 
     bool can_delete = (body_idx != system().definition().star_idx && !b.definition.is_star && system().definition().motion_model != ephemeris::MotionModel::Spice);
     bool can_add = (system().definition().motion_model != ephemeris::MotionModel::Spice);
@@ -54,7 +58,13 @@ void App::render_outliner_node(int body_idx) {
         ImGui::PushClipRect(ImVec2(win_pos.x, win_pos.y), ImVec2(clip_right, win_pos.y + win_size.y), true);
     }
 
+    if (inactive_spice) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.65f, 0.85f));
+    }
     bool opened = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<intptr_t>(body_idx)), flags, "%s", label.c_str());
+    if (inactive_spice) {
+        ImGui::PopStyleColor();
+    }
 
     if (clip_row) {
         ImGui::PopClipRect();

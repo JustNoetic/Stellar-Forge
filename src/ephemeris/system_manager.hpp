@@ -100,10 +100,21 @@ struct BodyDefinition {
 
     int parent_idx = -1;
     int spice_id = 0;
+    int spice_center_id = 0;
+    double spice_start_et = -1e30;
+    double spice_end_et = 1e30;
+    std::string mission_start_utc;
+    std::string mission_end_utc;
     bool is_star = false;
     bool is_black_hole = false;
     bool is_spacecraft = false;
     bool tidally_locked = false;
+
+    bool has_finite_spice_coverage() const noexcept {
+        constexpr double kMaxFiniteSpanSec = 50.0 * 365.25 * 86400.0;
+        return spice_start_et > -1e20 && spice_end_et < 1e20 && spice_end_et >= spice_start_et &&
+               (is_spacecraft || spice_id < 0 || (spice_end_et - spice_start_et) < kMaxFiniteSpanSec);
+    }
 
     double mass_msun = 0.0;
     double radius_rsun = 1.0;
@@ -165,6 +176,9 @@ struct SystemDefinition {
     MotionModel motion_model = MotionModel::Keplerian;
     std::string epoch_utc;
     std::string custom_bsp_path;
+    std::optional<double> spice_epoch_et;
+    double spice_min_et = -1e30;
+    double spice_max_et = 1e30;
     std::vector<BodyDefinition> bodies;
     std::unordered_map<std::string, int> name_to_idx;
     std::vector<std::string> source_systems;
@@ -197,6 +211,7 @@ struct BodyRenderState {
     double spin_angle_rad = 0.0;
     std::shared_ptr<const physics::PreparedAtmosphere> atmosphere;
     double cloud_base_altitude_km = 2.0;
+    bool spice_valid = true;
 };
 
 struct BodyRevisions {

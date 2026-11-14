@@ -170,7 +170,9 @@ void App::apply_ephemeris_system() {
                       system().definition().custom_bsp_path.empty());
     std::string prev_tracked_name;
     std::string prev_inspected_name;
+    units::Years prev_time{};
     if (was_spice) {
+        prev_time = system().time();
         if (camera_.tracking_idx >= 0 && static_cast<size_t>(camera_.tracking_idx) < system().size()) {
             prev_tracked_name = system().body(camera_.tracking_idx).definition.name;
         }
@@ -201,9 +203,13 @@ void App::apply_ephemeris_system() {
         simulation_error_ = result.error;
         return;
     }
+    sync_system_height_ranges();
     simulation_error_.clear();
 
     if (was_spice) {
+        if (std::abs(prev_time.value) > 1e-12) {
+            simulation_.apply(ephemeris::JumpToTime{prev_time});
+        }
         int trk = prev_tracked_name.empty() ? -1 : system().find_body(prev_tracked_name);
         camera_.tracking_idx = (trk >= 0) ? trk : system().star_index();
         int insp = prev_inspected_name.empty() ? -1 : system().find_body(prev_inspected_name);
@@ -238,6 +244,7 @@ void App::open_generic_bsp_playback(const std::filesystem::path& bsp_path) {
         ui_state_.bsp_import.error = result.error;
         return;
     }
+    sync_system_height_ranges();
     simulation_error_.clear();
     ui_state_ = {};
 

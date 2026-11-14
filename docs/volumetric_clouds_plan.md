@@ -1,0 +1,414 @@
+# Volumetric clouds: design plan
+
+Status: **phase 1 built, previews awaiting review** (design 2026-11-13, phase 1 2026-11-14; see "Phase 1 status" under §10). The experimental ray-marched mode was
+removed the same day ([oceans_clouds.md](oceans_clouds.md), "Volumetric clouds
+(removed)"). This plan replaces it. The 2D sheet stays as the orbit and distant-body
+renderer.
+
+## 1. Decisions
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Fully closed form, like the atmosphere shadows? | **No; closed form only where the medium is smooth.** See §2. Volume shape comes from a near-field march; the orbit and mid-distance layer, empty-space bounds and the long sun path are analytic or cached. |
+| 2 | Architecture reference | **KSA-style planet shell** (global coverage map, per-type vertical profile, capped noise erosion, shadow volume, low-resolution march with temporal reconstruction, altitude hand-off to a 2D layer). **Nubis-family density model.** Selected **garden** tricks: adaptive stepping and phase/attenuation shaping. |
+| 3 | Code reuse from references | **KSA: ideas only.** No licence ships with its shaders; we implement from the published talks and papers they cite (§13). **garden: Apache-2.0**; code may be adapted with its licence header and a note in the file. |
+| 4 | Which bodies | **Focus body only**, while the camera is below the hand-off altitude. All other bodies, and the focus body from orbit, use the 2D sheet. |
+| 5 | Output path | **The existing inline cloud layer** (bindings 35/36 written, 33/34 read). The atmosphere composite, shadow strata and ring/orbit-line ordering consume it unchanged. |
+| 6 | Pass type | **Compute**, recorded between `end_rendering` and `composite_atmospheres` in `App` (scene depth is final there). It needs no fragment stores. |
+| 7 | Resolution | **One ray per 2×2 block per frame** by default, rotating through the block over 4 frames; 4×4 (16 frames) as a low-quality option. A full-resolution brute-force **reference mode** is kept for tests and look development. |
+| 8 | Budget (RTX 4060 Ti, 2560×1440) | **Target: ≤ +1.2 ms over `no-clouds` in earth-ground, ≤ +1.5 ms at aircraft altitude.** The inline 2D sheet costs +0.40 ms in earth-ground. Validated in phase 3; the targets move only with a measured reason. |
+| 9 | Default | **Off** (`cloud_volumetric = false`) until phase 5 meets the budget and the hand-off is seamless. |
+
+## 2. Why not closed form throughout
+
+The atmosphere shadow path is closed form because:
+- **Its medium is smooth.** The in-scattered light along a ray (the 64-slice weight
+  cache) is fitted well by one exponential per stratum.
+- **Its occluders are analytic.** Spheres and the ring plane give exact shadow intervals.
+
+Cumulus breaks both:
+- **The medium is the noise.** Silhouettes, cauliflower edges and wisps come from
+  eroding a 3D Worley field, and ∫σ dt through it has no antiderivative.
+- **Lighting nests a second integral.** Each point's sun transmittance is another
+  integral of the same field. Dark bases, bright tops and silver linings come from
+  that nesting, and no single fitted curve per ray reproduces it.
+
+The closed-form alternatives all remove the shape:
+- **Height-only density** gives fog or stratus.
+- **Gaussian blobs** have closed-form view optical depth, but they need sampled
+  self-shadowing and millions of instances per planet.
+- **Homogeneous slabs** have no internal structure.
+
+So closed form is used where shape does not matter:
+
+| Component | Treatment |
+|---|---|
+| Orbit / mid-distance layer | Closed-form thick slab (§8): exact oblate chord, coverage-weighted extinction, analytic sun attenuation through the slab |
+| Empty space | Closed-form bounds from a max-coverage pyramid and the per-type profile height range (§5) |
+| Sun path beyond ~1–2 km | Cached optical depth (shadow volume, §6), not marched per sample |
+| Atmosphere transport of the cloud | One evaluation at the light-weighted mean depth, as the inline layer already does |
+| Near-field shape | Raymarch, inside the bounds only |
+
+## 3. Goals and non-goals
+
+Goals:
+- Cumulus fields with volumetric silhouettes, self-shadowing, dark bases and forward
+  scattering. They must be visible from the ground, from aircraft altitude and from
+  inside the layer.
+- A seamless altitude hand-off to the sheet, with no visible change in coverage or
+  brightness.
+- Reuse of `CloudDefinition`, automatic base altitude, `CloudMaps` and `cloud_weather`.
+- Deterministic, testable components (§11), in line with the other GPU contracts.
+
+Non-goals for the first version (listed in §12 as later work):
+- several layers per body;
+- volumetric cirrus;
+- a per-texel cloud-type map;
+- cloud light shafts in the atmosphere;
+- an ambient-occlusion volume;
+- RDR2-style ray placement;
+- weather simulation;
+- lightning.
+
+## 4. Data
+
+All of it is generated at init or on definition change; none is per frame.
+
+- **Shape noise:** 128³ RGBA8, tileable (~8 MiB), generated by compute at init.
+  - R is Perlin-Worley (billowy base); G, B and A are Worley fBm at increasing frequency.
+  - The density function blends wispy and billowy channels by profile depth and
+    cloud type (garden's composite).
+  - Octave count and persistence come from KSA's Worley generator: inverted cellular
+    noise, then a min/max normalize pass.
+- **Detail noise:** 32³ RGBA8 Worley fBm for edge erosion at sub-100 m scale.
+  It is skipped beyond a distance threshold.
+- **Vertical profile LUT:** 2D RG16F, cloud type × height fraction.
+  - R is the shape gradient (where the type can exist); G is the density gradient
+    (denser at the base, thinner at the top).
+  - It is built on the CPU from analytic curves. Only the cumulus column is used
+    at first; the LUT keeps stratocumulus and stratus columns ready.
+- **Max-coverage pyramid:** the max reduction of the `CloudMaps` coverage layer,
+  from about 1024×512 down to 1×1, R8.
+  - `CloudMaps` mips are means, which cannot bound anything.
+  - It is built on the GPU when a map loads, or in `bake_cloud_maps.py` alongside
+    the mean mips.
+  - Bodies with procedural weather use a constant bound of 1.
+- **Cell field:** a 2D Worley cell pattern at `shape_size_km` scale, multiplied into
+  map coverage.
+  - Earth's map is ~2.5 km/texel at the equator; it defines regions, not individual
+    cumulus.
+  - The cell field breaks covered regions into separate cells, the role KSA's
+    detail tiles play.
+
+`CloudDefinition` fields come back into use rather than new ones being added:
+- `shape_size_km`: cell field and base noise scale;
+- `detail_size_km`: detail noise scale;
+- `erosion`: maximum erosion depth and edge sharpness;
+- `type`: LUT column.
+
+`SurfaceFluidGPU` already carries detail size and erosion. `fluid_flags.z`
+(reserved 0) becomes the volumetric body index, or `UINT32_MAX` for none.
+
+## 5. Density and bounds
+
+For a point `p`, relative to the focus body:
+
+1. **Height fraction `h`.** Geodetic-style height in the oblate shell
+   `[base, base + thickness]`, using the same flattening transform as
+   `fluid_spherical` and `fluid_sphere_roots`.
+2. **Coverage `c`.** `cloud_weather(body, dir, footprint)` × cell field. The footprint
+   comes from distance × pixel angle × upscale factor; no finite differences are
+   taken in shared memory.
+3. **Dimensional profile.** `d = c + shape(h, type) − 1`. If `d ≤ 0`, return 0
+   before any 3D fetch.
+4. **Base erosion.** Shape noise with **capped-depth erosion**: noise erodes at most
+   a fraction of the way into `d` (KSA's `erosionMaxDepth`, about 0.6), so cores
+   survive and only the edges break up.
+5. **Detail erosion.** Applied near the camera only.
+6. **Density.** `σ = eroded × density(h, type) × density × extinction_per_km`.
+
+**Anti-tiling.** Base noise uses three hash-offset samples blended over a triangle
+grid in octahedral coordinates (Deliot–Heitz tiling and blending, applied on the
+sphere as in KSA). This costs 3× fetches, so it is a quality option, measured in
+phase 3.
+
+**Bounds (closed form).** A span is skipped when the max pyramid cell covering its
+footprint gives `c_max + max_shape(h-range) − 1 ≤ 0`.
+- The profile's support also tightens the shell per type: below `h_min(c_max)` and
+  above `h_max(c_max)` density is provably zero.
+- The march first clips its interval to that tightened shell.
+- Then it steps coarsely: each coarse step is sized to the current pyramid cell,
+  and the march falls back to fine steps when the bound says density may be present.
+  This is garden's back-up-one-step scheme, but conservative rather than heuristic.
+
+**Precision.**
+- Positions are camera-relative FP32. The body centre comes from
+  `BodyInstanceGPU::view_center`; the focus body is within thousands of km, so
+  height resolution is ~0.5 m at Earth radius, or about 1e-4 of a 4 km slab.
+- Noise coordinates must not grow unbounded with wind. The CPU accumulates the wind
+  offset in FP64, wrapped at the noise period, as `OceanWaves` does for its cascades.
+- This follows the project rule against subtracting large FP32 positions.
+
+## 6. Lighting
+
+Per sample, for the dominant star:
+
+- **Optical depth to light.** A short march of 4–6 geometrically growing steps up to
+  ~1–2 km, plus a **shadow volume** lookup beyond (KSA). The shadow volume is:
+  - a camera-centred, shell-aligned 3D texture (~128×128×32 R16F, horizontal
+    radius ~150 km);
+  - storing optical depth from each texel toward the star, through the coarse
+    density with no detail erosion;
+  - updated a few slices per frame, and rebuilt when the star direction or camera
+    moves past thresholds or the wind offset drifts;
+  - sampled with tricubic B-spline filtering (8 bilinear taps) to hide its resolution.
+- **Phase.** A blend of two Henyey-Greenstein lobes: a strong forward lobe for direct
+  light, a softer mixed lobe for scattered light (KSA/RDR2 style). Garden's "max of
+  silver lobe" is the alternative. Both are kept behind constants until look
+  development picks one.
+- **Multiple scattering.**
+  - Wrenninge octave approximation, using KSA's rational fit
+    `1 / (1 + 0.35τ + 0.065τ²)` for the scattered term.
+  - Nubis "dark edge": the scattered term is scaled by profile depth.
+  - Garden's away-from-star brightening is evaluated against the reference mode
+    before it is adopted.
+- **Per-pixel terms, evaluated once at the light-weighted mean position** (as the
+  sheet does today):
+  - star colour and irradiance;
+  - atmospheric transmittance to the star (surface LUT, bindings 12/13);
+  - eclipse and ring shadows (`cloud_star_shadow`);
+  - sky irradiance × an occlusion proxy from the accumulated height and profile depth.
+- **Other stars.** They use the per-pixel term only, with the dominant star's optical
+  depth as a proxy (decided 2026-11-14: the visible difference is expected to be small).
+- **Apparent star direction (required).** Every light term uses the star direction
+  *as refracted at the sample's radius*, not the geometric one: the phase angle, the
+  short light march, the shadow-volume axis, the transmittance lookup and the
+  visibility horizon. Clouds then stay lit for the few minutes after geometric
+  sunset that the refracted sun is still up, matching the bent sky.
+  - The source is the solar-refraction table of
+    [atmospheric_refraction_plan.md](atmospheric_refraction_plan.md) Phase 3a
+    (64 radii × 256 `μ_true` → `μ_app` and escape visibility), which does not exist
+    yet. It is built from `PreparedRefraction`'s angular travel integrals on the CPU,
+    per atmosphere revision, in phase 2, and is shared with the sheet and surfaces
+    later.
+  - The camera's observer table (`refract_direction`) is not used: it is valid only
+    at the camera's radius and for its own zenith, while cloud samples span ~150 km
+    of horizon and up to the layer top.
+  - Transmittance uses the straight-ray LUT at the apparent `μ`, the same
+    approximation the limb images document.
+- **Accumulation.**
+  - Front-to-back, with early exit at `T < 1/255`.
+  - On exit, the remaining transmittance is credited to the current sample, KSA's
+    infinite-series correction, so early exit does not darken.
+  - Iteration cap as a guardrail.
+- **Output to the layer.**
+  - Premultiplied radiance, with exposure applied as in the sheet.
+  - Opacity `1 − T`.
+  - The transmittance-weighted mean distance, as reverse-Z depth.
+  - No aerial perspective, because the composite applies it.
+
+## 7. Frame pipeline
+
+```
+main pass: spheres, terrain, 2D sheet (writes cloud layer when not volumetric) ...
+end_rendering
+[clouds] shadow volume slices          compute, amortized
+[clouds] march                         compute, ¼ (or 1/16) of pixels, writes low-res
+                                       radiance+T (RGBA16F), mean distance (R32F),
+                                       sampled scene depth (R32F)
+[clouds] reconstruct                   compute, full res: reproject history by mean
+                                       distance, depth-aware neighbourhood clamp,
+                                       write cloud_layer_color_/depth_ (+ history copy)
+composite_atmospheres                  unchanged (reads 33/34)
+```
+
+**Reconstruction.**
+- **History.** Reprojected with the previous view-projection at the cloud's mean
+  distance. Wind motion per frame is below a pixel, so it is ignored at first.
+- **Clamp.** The history is clamped in YCoCg against the 3×3 low-resolution
+  neighbourhood. Only neighbours whose sampled scene depth is within 10% of the
+  target pixel's depth take part, as in KSA's upscaler.
+- **Fallback.** If no neighbour matches (thin geometry such as tree lines), the pixel
+  uses the nearest-depth neighbour and records a discontinuity.
+- **Resets.** History is reset on a camera cut, a projection change, a focus-body
+  change or a definition change, with reasons and counters modelled on
+  `ShadowHistoryReset` / `ShadowHistoryDiagnostics`.
+- **Ray placement** (RDR2/KSA: move a block's ray to a depth its neighbours miss)
+  is added only if measured flicker at depth edges needs it.
+
+**Fallbacks.**
+- Progressive atmosphere shadows have no cloud layer in their history, so they use
+  the 2D sheet.
+- Without the inline layer, the sheet is used.
+- The two-bodies-overlap race in the inline layer cannot happen here: only one body
+  marches.
+
+## 8. Altitude hand-off and the closed-form slab
+
+- **Weights.** A volumetric weight `w` ramps from 1 to 0 between `fade_start` and
+  `fade_end` above the layer top. The values are placeholders (`fade_start` 30 km,
+  `fade_end` 80 km), tuned in phase 5.
+- **Blending.** While `0 < w < 1`, the sheet is drawn with opacity × `(1 − w)` and
+  the march output × `w`. The reconstruct pass then mixes the two layer entries
+  rather than compositing one over the other, because the sheet lies inside the
+  volume's slab.
+  - The stored depth is the opacity-weighted mean.
+  - The march skips entirely when `w = 0`; the sheet skips when `w = 1`.
+- **Closed-form slab.** The sheet is upgraded to match the volume's average
+  appearance:
+  - opacity from the exact chord through the slab (the sheet already does this);
+  - direct light attenuated by `exp(−τ_slab / μ_star)` from the top, so undersides
+    darken consistently;
+  - top brightness calibrated against the reference march's horizontal average at
+    the same coverage.
+
+  The calibration is a test (§11), not tuning by eye.
+
+## 9. Settings and code layout
+
+- **`RenderSettings`:**
+  - `cloud_volumetric` (bool);
+  - `cloud_volumetric_quality` (0: 4×4 blocks, 1: 2×2 blocks, 2: full-res reference);
+  - `cloud_volumetric_anti_tiling` (bool).
+
+  They persist via `SF_SETTING`, are validated in `render_settings.hpp`, appear in the
+  benchmark report fields, and in the Settings UI under the existing cloud checkbox.
+- **New files:**
+  - `src/rendering/cloud_volume.hpp/.cpp`: `CloudVolumeRenderer`, which owns the
+    noise, LUT, max pyramid, shadow volume, history and pipelines. It is called from
+    `CelestialRenderer`, which owns the cloud layer.
+  - `shaders/clouds/{noise_generate,shadow_volume,march,reconstruct}.comp`.
+  - `shaders/common/cloud_volume.glsl`: density, bounds, phase and lighting, shared by
+    the march, shadow volume and test probes.
+- **Bindings.** Shared resources keep their existing numbers (0, 1, 2, 7, 9, 12, 13,
+  28, 29, 35, 36, 39). New resources get numbers from the compute pipelines' own
+  push-descriptor layouts, recorded in `project_map.md` when allocated.
+
+## 10. Phases
+
+| Phase | Content | Exit criteria |
+|---|---|---|
+| 1. Data & density | Noise generation, profile LUT, max pyramid, cell field, `cloud_volume.glsl` density and bounds; GPU probe shader | Density probe contracts pass (§11); noise and density slice previews reviewed |
+| 2. Reference march | Full-res brute force: fixed small steps, long light march, no bounds, no temporal; solar-refraction table for the apparent star direction (§6) | Look development with the user; it becomes the ground truth for phases 3–5 |
+| 3. Production march | ¼-res rays, closed-form bounds, adaptive steps, short light march + shadow volume, mean-position lighting | Converged image within agreed error of reference (mean < 2%, see §11); bounds never skip density; cost measured against §1 targets |
+| 4. Temporal reconstruction | History, depth-aware clamp, resets, diagnostics | Static camera converges to the ¼-res result; ground and aircraft benchmarks free of ghosting by capture review; budget met |
+| 5. Hand-off | Fade weights, layer mixing, closed-form slab calibration | Fade midpoint matches both endpoints within tolerance; `cloud_volumetric` may default on |
+| 6. Surface shadows | Terrain/ocean sample shadow-volume optical depth (surface cloud shadows are currently disabled) | Shadow contracts; cost measured |
+
+### Phase 1 status (2026-11-14)
+
+Built:
+- **`CloudVolumeRenderer`** (`src/rendering/cloud_volume.hpp/.cpp`), owned by `CelestialRenderer`. It creates the
+  noise at init and prepares the focus body each frame (nearest clouded body less than `CLOUD_VOLUME_FADE_END_KM`
+  above its layer top). Nothing consumes it yet; `fluid_flags.z` is still 0 and no setting exists.
+- **Noise** (`shaders/clouds/noise_generate.comp`): 128³ shape (R Perlin-Worley, GBA Worley fBm at 4/8/16 cells
+  per tile) and 32³ detail (Worley fBm at 2/4/8/16), two passes with a per-channel min/max normalize. A tile spans
+  `CLOUD_NOISE_TILE_CELLS` (4) × `shape_size_km` or `detail_size_km`.
+- **Profile LUT**: 128 heights × 4 types (stratus, mixed, cumulus, cirrus), RG16F, from `cloud_profile()`. The
+  per-type height interval for 64 thresholds is computed from the half-rounded texels, so it bounds the filtered
+  value exactly. `cloud_style.x` now carries `cloud_type_index(type)` (it was a constant 2).
+- **Max-coverage pyramid** (`build_cloud_bound_pyramid`, `CloudMaps::bound_image`): 1024×512 → 1×1 R8 per atlas
+  layer, built on the CPU from mip 0 and dilated by `2·2^L+1` texels for the density's mip cap
+  `CLOUD_VOLUME_MAX_COVERAGE_LOD` (1).
+- **`shaders/common/cloud_volume.glsl`**: `cloud_shell`, `cloud_height_fraction`, `cloud_volume_sample` (coverage ×
+  cell field, `d = c + shape − 1`, capped base erosion, distance-faded detail erosion), `cloud_coverage_bound`,
+  `cloud_height_interval` and `cloud_span_may_have_density`. `cloud_weather_lod` caps the map mip.
+- **Precision**: the CPU (`CloudWindOffset`, FP64) sends `fract((camera_fixed − wind)/tile)` anchors and the camera's
+  offset from the body; noise coordinates are camera-relative, so no large FP32 value is formed.
+- **Bindings**: 40 parameters UBO (`CloudVolumeGPU`), 41 shape noise, 42 detail noise, 43 profile LUT (all linear),
+  44 coverage bounds (`texelFetch`).
+
+Results:
+- `StellarRenderingTests --cloud-volume-only` (also part of `--clouds-only`) passes: profile intervals, pyramid
+  dilation and mip coverage, wind continuity across the FP64 wrap, oblate height fraction against FP64 at the poles
+  and equator (< 2e-4), zero coverage (mapped and procedural), capped core at full coverage, zero density at the
+  shell boundaries, tile-periodic anchors, and **bound conservativeness**: 57,344 random spans over seven
+  coverage/type/map configurations, with no rejected span holding a positive profile or density; 22% of the spans
+  that touch the shell are rejected by coverage or profile. The first run caught a real bug (a zero texel ignored
+  the coverage bias).
+- Init cost: the pyramid takes ~115 ms on the CPU for Earth's 16k map; noise takes ~7 ms on the GPU once the shader
+  is cached (~130–330 ms including the first runtime compile).
+- `--cloud-volume-preview <dir>` writes noise slices and top/side density slices at four Earth sites.
+
+Finding for phase 2: **coverage calibration.** Multiplying the cell field into the map coverage, then thresholding
+by the profile and erosion, leaves far less cloud than the map says: mean cell-modulated coverage 0.12 at an
+Atlantic site, where the sheet would show the raw map value. The fraction of cloudy columns must track map coverage
+for the hand-off to work, so phase 2 adds a contract (column cloud fraction against map coverage) and makes the cell
+field redistribute coverage instead of only removing it.
+
+## 11. Tests and benchmarks
+
+These follow the existing conventions: GPU contracts in the local `tests/` directory,
+probe shaders under `shaders/tests/`, and `--self-test` for pipeline compilation.
+
+- **Density probes (phase 1):**
+  - zero coverage gives zero density;
+  - profile endpoints (`h = 0, 1`) give zero;
+  - capped erosion keeps the core of full coverage non-zero;
+  - wind wrap is continuous across the FP64 wrap;
+  - oblate height fraction matches the CPU at the poles and the equator.
+- **Bound conservativeness (phase 1, critical):** random rays and points, asserting
+  that density is never > 0 inside an interval the bounds skip.
+- **March convergence (phase 3):** production versus reference, mean and maximum
+  relative error on fixed views (ground, aircraft, inside layer, layer top, grazing).
+- **Shadow volume (phase 3):** volume optical depth versus a direct long march at
+  random points.
+- **Temporal (phase 4):**
+  - a static camera converges within N frames;
+  - a scripted pan stays below an error ceiling against per-frame full-res reference.
+- **Hand-off (phase 5):** mean luminance and coverage of slab versus reference at the
+  fade midpoint.
+- **Previews:** `--cloud-preview` gains volumetric captures at the same five views.
+- **Benchmarks:**
+  - `run_benchmark.py` on earth-ground and a new aircraft-altitude fixture (~10 km,
+    under scattered cumulus), with `--benchmark-variant no-clouds` as the baseline;
+  - 1440p via `--benchmark-hidden`;
+  - `--benchmark-capture` PFM A/B for image checks.
+
+Known unrelated failure: `--distant-atmosphere-only` (inline layer drops a small
+distant body's clouds); see `oceans_clouds.md` and project memory.
+
+## 12. Risks and open questions
+
+1. **Multiple stars (resolved 2026-11-14).** Non-dominant stars use per-pixel
+   lighting with the dominant star's optical depth as a proxy; marching a second star
+   would double the light cost for a small visible difference.
+2. **Budget.** The atmosphere stack already costs 2–3 ms at 1440p in heavy views.
+   If phase 3 misses the target, 4×4 blocks become the default.
+3. **Single-depth transport.** Long grazing paths through distant cloud get aerial
+   perspective at one mean depth. KSA accepts this. The reference mode quantifies the
+   error before anything more is done about it.
+4. **Thin occluders.** Trees and terrain silhouettes are the hardest reconstruction
+   case. Ray placement is the planned remedy, added on evidence.
+5. **Camera inside cloud.** Near-field noise aliasing, and the near-plane start of
+   the march.
+6. **Refraction.** The host atmosphere's refraction of its own clouds, seen from
+   inside, is ignored (the sheet refracts shell positions for exterior views).
+7. **Cell field realism.** A Worley cell field may look regular from aircraft
+   altitude. Options are KSA-style authored detail tiles, or a second cell octave.
+
+Later work, after phase 6:
+- per-texel cloud-type map;
+- an ambient-occlusion volume (KSA keeps a second volume for this);
+- cloud light shafts in the atmosphere shadow pass;
+- several layers per body (KSA marches front and back passes per layer);
+- volumetric cirrus;
+- flow maps.
+
+## 13. References
+
+- A. Schneider, N. Vos, *The Real-time Volumetric Cloudscapes of Horizon Zero Dawn*,
+  SIGGRAPH 2015 Advances.
+- A. Schneider, *Nubis: Authoring Real-Time Volumetric Cloudscapes with the Decima
+  Engine* (2017), *Nubis, Evolved* (2022), *Nubis³* (2023), SIGGRAPH Advances.
+- S. Hillaire, *Physically Based Sky, Atmosphere and Cloud Rendering in Frostbite*,
+  SIGGRAPH 2016 course.
+- F. Bauer, *Creating the Atmospheric World of Red Dead Redemption 2*, SIGGRAPH 2019
+  Advances (phase blend, ray placement).
+- M. Wrenninge, *Oz: The Great and Volumetric*, SIGGRAPH 2013 talk (multiple-scattering
+  octaves).
+- T. Deliot, E. Heitz, *Procedural Stochastic Textures by Tiling and Blending*, 2018.
+- Kitten Space Agency cloud shaders (blackrack), local install
+  `Content/Core/Shaders/Clouds`: architecture reference only.
+- garden, `cfnptr/garden` (`shaders/clouds`, `source/system/render/clouds.cpp`),
+  Apache-2.0.

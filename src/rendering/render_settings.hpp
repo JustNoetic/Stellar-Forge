@@ -22,6 +22,14 @@ struct RenderSettings {
     bool show_orbits = true;
     float orbit_opacity = 1.0f;
     uint32_t orbit_segments = 1030;
+    uint32_t ephem_frame_mode = 0;
+    uint32_t ephem_rotating_pair = 0;
+    float ephem_lagrange_days = 240.0f;
+    uint32_t ephem_sample_points = 5000;
+    bool ephem_trail_fade = true;
+    float ephem_trail_days = 30.0f;
+    float ephem_lead_days = 10.0f;
+    bool ephem_hide_outside = true;
     float star_point_size = DEFAULT_POINT_DIAMETER_PX;
     float star_intensity = 1.0f;
     bool vsync = false;
@@ -57,6 +65,9 @@ struct RenderSettings {
     bool atmosphere_shadow_adaptive = true;
     bool atmosphere_shadow_vrs = true;
     uint32_t atmosphere_shadow_vrs_scale = 4;
+    // Shadow ray budget per atmosphere, in percent of viewport pixels. Each body integrates at the finest rate (native,
+    // then 1/2, 1/4, ... up to atmosphere_shadow_vrs_scale) whose ray count fits; 0 always uses the VRS rate.
+    float atmosphere_shadow_vrs_budget = 6.25f;
     uint32_t atmosphere_shadow_noise_type = 0;
     uint32_t atmosphere_shadow_samples = 4;
     bool ring_shadows_enabled = true;
@@ -64,7 +75,6 @@ struct RenderSettings {
     bool planetshine_enabled = true;
     bool oceans_enabled = true;
     bool clouds_enabled = true;
-    uint32_t cloud_mode = 0;
     bool cloud_sheet_inline = true;
     bool cloud_shadows_enabled = false;
     bool atmosphere_planetshine_reference = false;
@@ -95,7 +105,6 @@ public:
             !std::isfinite(candidate.bloom_rotation_deg) || candidate.bloom_rotation_deg < 0.0f || candidate.bloom_rotation_deg > 90.0f ||
             !std::isfinite(candidate.bloom_spike_threshold) || candidate.bloom_spike_threshold < 0.25f || candidate.bloom_spike_threshold > 4096.0f)
             return {false, false, "Bloom requires a valid mode, strength and diffraction from 0 to 1, highlight limit from 1 to 4096, radius from 0.25 to 4, rotation from 0 to 90 degrees, and spike threshold from 0.25 to 4096."};
-        if (candidate.cloud_mode > 1) return {false, false, "Cloud mode must be 2D texture or volumetric."};
         if (!std::isfinite(candidate.ring_shadow_softness) || candidate.ring_shadow_softness < 0.25f || candidate.ring_shadow_softness > 4.0f)
             return {false, false, "Ring shadow softness must be 0.25 to 4."};
         if (candidate.atmosphere_shadow_samples != 4 && candidate.atmosphere_shadow_samples != 8 && candidate.atmosphere_shadow_samples != 16)
@@ -103,6 +112,9 @@ public:
         if (candidate.atmosphere_shadow_vrs_scale < 2 || candidate.atmosphere_shadow_vrs_scale > 16 ||
             (candidate.atmosphere_shadow_vrs_scale & (candidate.atmosphere_shadow_vrs_scale-1)) != 0)
             return {false, false, "Atmospheric shadow VRS uses a 2, 4, 8 or 16 pixel coarse grid."};
+        if (!std::isfinite(candidate.atmosphere_shadow_vrs_budget) || candidate.atmosphere_shadow_vrs_budget < 0.0f ||
+            candidate.atmosphere_shadow_vrs_budget > 100.0f)
+            return {false, false, "Atmospheric shadow ray budget must be 0 to 100% of the viewport."};
         if (candidate.atmosphere_shadow_noise_type > 1)
             return {false, false, "Atmospheric shadow noise type must be 0 (IGN) or 1 (STBN)."};
         if (!std::isfinite(candidate.terrain_error_pixels) || candidate.terrain_error_pixels < 0.5f || candidate.terrain_error_pixels > 16.0f ||
@@ -113,6 +125,13 @@ public:
         if (!std::isfinite(candidate.orbit_opacity) || candidate.orbit_opacity < 0.0f || candidate.orbit_opacity > 1.0f ||
             candidate.orbit_segments < 128 || candidate.orbit_segments > 8192) {
             return {false, false, "Orbit opacity must be 0 to 1 and segment count 128 to 8192."};
+        }
+        if (candidate.ephem_frame_mode > 2 || candidate.ephem_rotating_pair > 4 ||
+            !std::isfinite(candidate.ephem_lagrange_days) || candidate.ephem_lagrange_days < 5.0f || candidate.ephem_lagrange_days > 3650.0f ||
+            candidate.ephem_sample_points < 256 || candidate.ephem_sample_points > 25000 ||
+            !std::isfinite(candidate.ephem_trail_days) || candidate.ephem_trail_days < 0.1f || candidate.ephem_trail_days > 3650.0f ||
+            !std::isfinite(candidate.ephem_lead_days) || candidate.ephem_lead_days < 0.0f || candidate.ephem_lead_days > 3650.0f) {
+            return {false, false, "Invalid ephemeris trajectory settings."};
         }
         if (!std::isfinite(candidate.exposure) || candidate.exposure < 0.0f ||
             !std::isfinite(candidate.star_point_size) || candidate.star_point_size < 1.5f || candidate.star_point_size > 6.0f ||

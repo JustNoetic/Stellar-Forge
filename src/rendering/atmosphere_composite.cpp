@@ -211,6 +211,11 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 1, 3);
             ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
+        // The shared coarse textures only grow between resizes.
+        for (auto* image : {&shadow_coarse_fraction_, &shadow_coarse_guide_}) {
+            if (*image) retired_images_.push_back({*image, ctx.recording_serial()});
+            *image = {};
+        }
         t->shadow_history_reusable = false;
         t->shadow_history_reproject = false;
         t->shadow_reset_reasons |= ShadowHistoryViewport;
@@ -232,8 +237,9 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
             ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_GENERAL);
         }
     }
+    // prepare_shadows picks the rate from the shadow ray budget; rate 0 integrates every pixel.
     bool vrs = !temporal && shadow_vrs_enabled_ && header.flags.w == 0u && t->cached.camera.w == 1.0f &&
-               color.extent.width >= 64 && color.extent.height >= 64;
+               (header.flags.y >> 8u & 15u) != 0u && color.extent.width >= 64 && color.extent.height >= 64;
     ctx.transition_image(cmd, t->shadow_fraction, VK_IMAGE_LAYOUT_GENERAL);
     ctx.transition_image(cmd, t->shadow_depth, VK_IMAGE_LAYOUT_GENERAL);
     bool reproject = temporal && t->shadow_history_reproject;
@@ -310,8 +316,12 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
         }
     }
     if (vrs) {
-        uint32_t scale = 1u << std::clamp(header.flags.y >> 8u & 15u, 1u, 4u);
-        uint32_t width = (color.extent.width+scale-1)/scale, height = (color.extent.height+scale-1)/scale;
+        // The coarse textures cover this body's coarse rectangle, indexed from its corner, so the ray budget also
+        // bounds their size. They are shared by all bodies and only grow.
+        uint32_t cw = uint32_t(std::max(0, header.shadow_coarse_bounds.z-header.shadow_coarse_bounds.x));
+        uint32_t ch = uint32_t(std::max(0, header.shadow_coarse_bounds.w-header.shadow_coarse_bounds.y));
+        uint32_t width = std::max({cw, shadow_coarse_fraction_.extent.width, 1u});
+        uint32_t height = std::max({ch, shadow_coarse_fraction_.extent.height, 1u});
         if (shadow_coarse_fraction_.extent.width != width || shadow_coarse_fraction_.extent.height != height) {
             for (auto* image : {&shadow_coarse_fraction_, &shadow_coarse_guide_}) {
                 if (*image) retired_images_.push_back({*image, ctx.recording_serial()});
@@ -329,8 +339,6 @@ void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ct
         coarse_writes.insert(coarse_writes.end(), transparency_writes.begin(), transparency_writes.end());
         auto& coarse = closed ? shadow_closed_pipelines_[transparent ? 3 : 2]
             : transparent ? shadow_coarse_transparency_pipeline_ : shadow_coarse_pipeline_;
-        uint32_t cw = uint32_t(std::max(0, header.shadow_coarse_bounds.z-header.shadow_coarse_bounds.x));
-        uint32_t ch = uint32_t(std::max(0, header.shadow_coarse_bounds.w-header.shadow_coarse_bounds.y));
         uint32_t coarse_timer = ctx.begin_gpu_timer(cmd, "atmosphere_shadow_coarse");
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, coarse.handle);
         ctx.push_descriptors(cmd, coarse, coarse_writes);

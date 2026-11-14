@@ -477,9 +477,8 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
         header.flags.x = 0;
     }
     if (!casters.empty() && extent.width > 0 && extent.height > 0) {
-        int scale = 1 << std::clamp(int(header.flags.y >> 8u & 15u), 1, 4);
         int w = int(extent.width), h = int(extent.height);
-        int cw = (w + scale - 1) / scale, ch = (h + scale - 1) / scale;
+        header.shadow_bounds = {0, 0, w, h};
         if (view_cull) {
             shadow_ndc_min -= frustum.margin;
             shadow_ndc_max += frustum.margin;
@@ -493,16 +492,22 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                 std::min(((px1 + 7) / 8) * 8, w),
                 std::min(((py1 + 7) / 8) * 8, h)
             };
-            header.shadow_coarse_bounds = {
-                header.shadow_bounds.x / scale,
-                header.shadow_bounds.y / scale,
-                std::min((header.shadow_bounds.z - 1) / scale + 2, cw),
-                std::min((header.shadow_bounds.w - 1) / scale + 2, ch)
-            };
-        } else {
-            header.shadow_bounds = {0, 0, w, h};
-            header.shadow_coarse_bounds = {0, 0, cw, ch};
         }
+        // Fixed ray budget: the finest rate whose integrated rays fit (native = log2 rate 0), up to the VRS rate.
+        const auto& bounds = header.shadow_bounds;
+        double area = double(bounds.z - bounds.x) * double(bounds.w - bounds.y);
+        double budget = double(settings.atmosphere_shadow_vrs_budget) * 0.01 * double(w) * double(h);
+        int max_rate = std::bit_width(std::clamp(settings.atmosphere_shadow_vrs_scale, 2u, 16u)) - 1;
+        int rate = 0;
+        while (rate < max_rate && area > budget * double(1 << (2 * rate))) ++rate;
+        header.flags.y = (header.flags.y & ~(15u << 8u)) | (uint32_t(rate) << 8u);
+        int scale = 1 << rate;
+        header.shadow_coarse_bounds = {
+            bounds.x / scale,
+            bounds.y / scale,
+            std::min((bounds.z - 1) / scale + 2, (w + scale - 1) / scale),
+            std::min((bounds.w - 1) / scale + 2, (h + scale - 1) / scale)
+        };
     }
     VkDeviceSize bytes = sizeof(header)+casters.size()*sizeof(AtmosphereShadowCasterGPU);
     if (buffer.size < bytes) {

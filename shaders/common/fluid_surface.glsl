@@ -65,7 +65,8 @@ struct CloudWeather {
     float coverage;
 };
 
-CloudWeather cloud_weather(uint body, vec3 fixed_direction, float footprint_km) {
+// max_lod caps the map mip; the volumetric bound pyramid is dilated for CLOUD_VOLUME_MAX_COVERAGE_LOD.
+CloudWeather cloud_weather_lod(uint body, vec3 fixed_direction, float footprint_km, float max_lod) {
     SurfaceFluidGPU f = fluids[body];
     CloudWeather weather;
     weather.coverage = 0.0;
@@ -81,7 +82,7 @@ CloudWeather cloud_weather(uint body, vec3 fixed_direction, float footprint_km) 
         vec2 dimensions = vec2(textureSize(cloud_coverage_maps, 0).xy);
         float longitude_scale = 1.0/max(length(dir.xz), 0.02);
         float pixels_per_km = max(dimensions.x*longitude_scale/(2.0*FLUID_PI), dimensions.y/FLUID_PI)/f.cloud_motion.w;
-        float lod = clamp(log2(max(footprint_km*pixels_per_km, 1.0)), 0.0, float(textureQueryLevels(cloud_coverage_maps)-1));
+        float lod = clamp(log2(max(footprint_km*pixels_per_km, 1.0)), 0.0, min(float(textureQueryLevels(cloud_coverage_maps)-1), max_lod));
         float half_texel = 0.5/float(textureSize(cloud_coverage_maps, int(ceil(lod))).y);
         uv.y = clamp(uv.y, half_texel, 1.0-half_texel);
         coverage = textureLod(cloud_coverage_maps, vec3(uv, f.cloud_style.w-1.0), lod).r;
@@ -94,81 +95,8 @@ CloudWeather cloud_weather(uint body, vec3 fixed_direction, float footprint_km) 
     return weather;
 }
 
-float cloud_top_softness(float top) {
-    return min(top*0.5, clamp(top*0.18, 0.02, 0.12));
-}
-
-float cloud_profile(float height, float top) {
-    if (height <= 0.0 || height >= top || top <= 0.0) return 0.0;
-    float base = smoothstep(0.0, min(0.05, top*0.25), height);
-    return base*(1.0-smoothstep(top-cloud_top_softness(top), top, height));
-}
-
-float cloud_bulk_density(float height, CloudWeather weather) {
-    return cloud_profile(height, weather.coverage)*mix(0.4, 1.0, weather.coverage);
-}
-
-float cloud_column_above(float height, float top) {
-    if (height >= top || top <= 0.0) return 0.0;
-    float base = min(0.05, top*0.25);
-    float cap = cloud_top_softness(top), start = top-cap;
-    if (height < base) {
-        float x = clamp(height/base, 0.0, 1.0);
-        return start+0.5*cap-base*(0.5+x*x*x-0.5*x*x*x*x);
-    }
-    if (height <= start) return start-max(height, 0.0)+0.5*cap;
-    float x = clamp((height-start)/cap, 0.0, 1.0);
-    return cap*(0.5-x+x*x*x-0.5*x*x*x*x);
-}
-
-float cloud_profile_average(float height, float span, float top) {
-    span = abs(span);
-    if (span < 1e-3) return cloud_profile(height, top);
-    return max(cloud_column_above(height-0.5*span, top)-cloud_column_above(height+0.5*span, top), 0.0)/span;
-}
-
-float cloud_ramp_integral(float x) {
-    if (x <= 0.0) return 0.0;
-    if (x >= 1.0) return x-0.5;
-    return x*x*x*(1.0-0.5*x);
-}
-
-float cloud_ramp_average(float value, float span, float width) {
-    span = abs(span);
-    if (span < 1e-3) return smoothstep(0.0, width, value);
-    return width*(cloud_ramp_integral((value+0.5*span)/width)-cloud_ramp_integral((value-0.5*span)/width))/span;
-}
-
-float cloud_profile_average(float height, float span, float top, float top_change) {
-    if (top <= 0.0) return 0.0;
-    if (abs(top_change) < 1e-4) return cloud_profile_average(height, span, top);
-    float base = cloud_ramp_average(height, span, min(0.05, top*0.25));
-    float cap = cloud_ramp_average(top-height, top_change-span, cloud_top_softness(top));
-    return clamp(base+cap-1.0, 0.0, 1.0);
-}
-
-float cloud_local_top(uint body, vec3 fixed_position_km, float height_fraction, float height_span, CloudWeather weather, float footprint_km) {
-    SurfaceFluidGPU f = fluids[body];
-    float detail_scale = max(f.cloud_style.y, 0.05);
-    float detail_weight = 1.0-clamp(footprint_km/detail_scale-0.5, 0.0, 1.0);
-    float erosion = 0.1*f.cloud_style.z*detail_weight;
-    if (erosion <= 0.0 || height_fraction-0.5*height_span >= weather.coverage ||
-        weather.coverage-height_fraction-0.5*height_span > cloud_top_softness(weather.coverage)+erosion) return weather.coverage;
-    vec3 direction = fluid_rotate_pole(normalize(fixed_position_km), f.cloud_motion.y);
-    vec3 p = direction*(f.cloud_motion.w/detail_scale)+f.cloud_motion.z*vec3(0.7, 0.4, 0.5);
-    return max(weather.coverage-erosion*(1.0-value_noise(p)), 0.0);
-}
-
-float cloud_density(uint body, vec3 fixed_position_km, float height_fraction, CloudWeather weather, float footprint_km) {
-    if (cloud_bulk_density(height_fraction, weather) <= 0.0) return 0.0;
-    float top = cloud_local_top(body, fixed_position_km, height_fraction, 0.0, weather, footprint_km);
-    return cloud_profile(height_fraction, top)*mix(0.4, 1.0, weather.coverage);
-}
-
-float cloud_density_average(uint body, vec3 fixed_position_km, float height, float span, CloudWeather weather, float top_change, float footprint_km) {
-    if (cloud_profile_average(height, span, weather.coverage, top_change) <= 0.0) return 0.0;
-    float top = cloud_local_top(body, fixed_position_km, height, abs(span)+abs(top_change), weather, footprint_km);
-    return cloud_profile_average(height, span, top, clamp(top_change, -2.0*top, 2.0*top))*mix(0.4, 1.0, weather.coverage);
+CloudWeather cloud_weather(uint body, vec3 fixed_direction, float footprint_km) {
+    return cloud_weather_lod(body, fixed_direction, footprint_km, 1e6);
 }
 
 float ocean_beckmann_lambda(float cosine, float roughness) {

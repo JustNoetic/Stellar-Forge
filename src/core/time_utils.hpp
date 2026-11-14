@@ -53,6 +53,7 @@ constexpr CivilDate civil_from_days(int64_t z) noexcept {
 }
 
 DateTimeUTC parse_iso_or_default(std::string_view iso_str, DateTimeUTC fallback = {2026, 1, 1, 12, 0, 0, "UTC"});
+DateTimeUTC current_wall_clock_date(bool use_local_tz = false);
 DateTimeUTC calculate_sim_date(std::string_view epoch_utc, units::Years sim_time, bool use_local_tz = false);
 std::string format_sim_date(std::string_view epoch_utc, units::Years sim_time, bool use_local_tz = false);
 units::Years sim_time_from_date(std::string_view epoch_utc, const DateTimeUTC& target, bool input_is_utc = true);

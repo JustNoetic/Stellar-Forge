@@ -1,13 +1,14 @@
 # Oceans and clouds
 
-Procedural ocean surfaces and switchable texture-mapped / ray-marched cloud layers, designed with the Kitten
-Space Agency water/cloud shaders as a reference (moment-filtered Beckmann ocean
-BRDF, Bruneton Fresnel fit, whitecap coverage, Henyey-Greenstein cloud
-phase, Wrenninge-style multiple-scattering attenuation, erosion of a coverage
-field by detail noise). Cloud weather comes from optional grayscale coverage
-maps; volume detail uses analytic/hash noise. Ocean waves come from FFT cascades
+Procedural ocean surfaces and texture-mapped cloud shells, designed with the Kitten
+Space Agency water shaders as a reference (moment-filtered Beckmann ocean
+BRDF, Bruneton Fresnel fit, whitecap coverage). Cloud weather comes from optional
+grayscale coverage maps. Ocean waves come from FFT cascades
 of a JONSWAP spectrum (shading only, no geometric displacement). Both render in the
 existing scene passes, without temporal reconstruction.
+
+The experimental volumetric cloud mode was removed on 2026-11-13 so it can be
+rewritten (see "Volumetric clouds (removed)" below).
 
 ## Body definition
 
@@ -36,10 +37,9 @@ it enabled, serialize it back. Earth in the Solar System preset enables both.
   intermediate values bias the mask, rather than promising an exact area percentage.
 - Only cumulus is active. Legacy `type` names still parse and serialize for
   compatibility, but no mixed/stratus/cirrus shaping runs in the renderer.
-- `base_altitude_km` is a common flat base. `thickness_km` is the maximum height
-  above that base: a texel with brightness 0.5 produces a half-height column,
-  while white reaches the maximum. Increasing altitude selects progressively
-  brighter, smaller contours, producing tapered mounds.
+- `base_altitude_km` is the layer base. The sheet is drawn at
+  `base + thickness_km/2`; `density × extinction_per_km × thickness_km` sets its
+  optical thickness.
 - `automatic_altitude`: derived cloud base instead of `base_altitude_km`.
   Defaults on when no explicit base is supplied; existing explicit bases remain
   manual. `base_altitude_km` is also the fallback if a physical estimate is unavailable.
@@ -62,9 +62,8 @@ it enabled, serialize it back. Earth in the Solar System preset enables both.
 - `density` multiplies the explicit `extinction_per_km`; there is no hidden ×12.
 - `shape_size_km` is retained for serialization compatibility and is inactive.
   The coverage map defines the large cloud shapes.
-- `detail_size_km` and `erosion` only perturb the cap of a column. The noise is
-  anchored at the surface and is constant through that column, so it cannot
-  stretch the bulk sideways or create a cloud above its map-defined ceiling.
+- `detail_size_km` and `erosion` are retained for serialization and are
+  inactive (they shaped the removed volumetric caps).
   `feature_size_km` only controls weather when no map is available.
 - No inspector UI yet; edit `system.json` and reload.
 
@@ -73,7 +72,7 @@ it enabled, serialize it back. Earth in the Solar System preset enables both.
 `SurfaceFluidBuffer` (binding 28, `shaders/common/fluid_surface.glsl`), built each
 frame by `CelestialRenderer::prepare_fluids`:
 
-- header: `fluid_flags` (oceans, clouds, cloud mode, focus body),
+- header: `fluid_flags` (oceans, clouds, reserved 0, focus body),
   `fluid_header` (z: residual mean-square slope, w: Jacobian variance),
   `OceanCascadesGPU` (tangent frame, per-cascade UV offset and 1/size).
   Binding 32 is the ocean moment array (`OceanWaves::moments`).
@@ -83,8 +82,7 @@ frame by `CelestialRenderer::prepare_fluids`:
   handle (0 = procedural weather; actual array layer = handle − 1);
   `cloud_noise` is reserved. Binding 29 is the linear R8 coverage array.
 
-Render settings: `oceans_enabled`, `clouds_enabled`, `cloud_mode` (0 = 2D texture,
-1 = experimental volumetric; default 0)
+Render settings: `oceans_enabled`, `clouds_enabled`, `cloud_sheet_inline`
 (Settings → Lighting & Rings; persisted in `data/settings.json`).
 Cloud shadows are disabled, with no UI toggle. The legacy saved shadow setting
 is ignored by rendering.
@@ -133,14 +131,12 @@ Shaded in `celestial/sphere.frag` (spheres and terrain).
 
 ## Clouds
 
-### 2D texture mode (default)
+### 2D texture shell
 
-- Settings → Lighting & Rings → Cloud rendering switches modes immediately and
-  persists the choice. The volumetric implementation remains available.
 - The existing coarse 64×32 sphere is only a conservative raster proxy. Each
   fragment intersects the exact oblate shell at `base + thickness/2`; no terrain
   tessellation, displaced vertices, volume noise or ray marching is needed.
-  Manual and automatically prepared bases work in both modes.
+  Manual and automatically prepared bases both apply.
 - One filtered coverage lookup per fragment uses the existing R8
   atlas, longitude wrap, polar clamping, wind and projected-footprint mip LOD.
   Coverage supplies opacity; `density × extinction_per_km × thickness_km`
@@ -153,7 +149,8 @@ Shaded in `celestial/sphere.frag` (spheres and terrain).
   shader from 80 to 56 registers, removed a local-memory spill and reduced the
   cloud draw by about 30% (0.22 → 0.15 ms full-disc 1080p, RTX 4060 Ti);
   captures are unchanged except at the limb. Lighting uses attenuated starlight
-  and sky irradiance from the existing surface-atmosphere lookup at cloud height;
+  and sky irradiance from the existing surface-atmosphere lookup at cloud height,
+  along with ringshine and per-body planetshine;
   cloud undersides have reduced direct illumination. The sky contribution is
   `0.5 × sky_irradiance` on both sides. It requires atmospheric surface lighting;
   Direct sunlight only suppresses it with the other indirect-light terms.
@@ -164,8 +161,8 @@ Shaded in `celestial/sphere.frag` (spheres and terrain).
   atmosphere compositor applies `T * premultiplied_color + alpha * scattering`
   using the same aerial LUT as the surface, then resolves depth-sorted layers.
   There is no additional aerial LUT or atmospheric integration pass.
-- `celestial/cloud_sheet.frag` is a dedicated shader; volumetric code is compiled
-  separately in `cloud.frag`. Atmospheres with no eligible shadow casters select
+- `celestial/cloud_sheet.frag` (with `common/cloud_sheet.glsl`) is the cloud
+  shader; `celestial/cloud.vert` places the proxy mesh. Atmospheres with no eligible shadow casters select
   an `ATMOSPHERE_UNSHADOWED` transparent-composition variant, excluding the general
   shadow-integration fallback. Active eclipses/ring shadows and the atmospheric
   shadow reference mode retain the full shader. The LUT sampling and skylight
@@ -269,50 +266,33 @@ Image differences from the old path concentrate on transparent fragments behind
 overcast cloud. Those fragments are now hidden; the old path drew them through
 the cloud.
 
-### Experimental volumetric mode
+### Volumetric clouds (removed)
 
-- `celestial/cloud.{vert,frag}`: the sphere mesh scaled to the cloud top
-  (inflated 0.6% to contain the true ellipsoid) drawn after terrain with
-  front-face culling. Normal rendering captures the integrated cloud as one
-  premultiplied transparent fragment at its opacity-weighted mean distance.
-  Back faces provide one exit surface per ray from inside or outside the proxy;
-  the fragment computes the exact ellipsoidal slab interval
-  (top/bottom/ground roots) and depth itself. Face selection does not switch at
-  the true cloud top, which lies inside the inflated proxy mesh.
-- 8–48 steps through the slab. Map brightness supplies local height;
-  the density profile has a fixed base and a soft cap. One octave of inexpensive
-  surface-anchored value noise only erodes caps. Empty columns and interiors
-  skip noise. Analytic integration of the vertical profile and interpolated
-  map-defined cap between samples preserves thin clouds and reduces holes and
-  step bands. Mips filter the coverage/height
-  field by pixel footprint and the horizontal width of a march step.
-- Lighting per star: atmosphere transmittance and skylight from the surface
-  atmosphere LUT at the segment midpoint, three-lobe HG phase and an analytic
-  integral of the local column toward the sun. There are no secondary light-ray
-  map/noise probes. Multiple-scattering uses the rational
-  attenuation `1/(1+0.35τ+0.065τ²)`.
-- The existing transparency renderer carries the colour pass's opacity and
-  weighted distance through atmosphere composition without another raymarch
-  or opaque depth writes. The hardware/legacy fallback uses a conservative
-  depth estimate with at most eight map-only samples.
-- Cloud shadows on surfaces are disabled. Cloud self-shading remains active.
-- Skipped when the body is under 2 px.
+The experimental ray-marched mode (`celestial/cloud.frag`, `cloud_mode` 1) was
+removed on 2026-11-13; it remains in git history. It was a 2.5D height field
+(coverage brightness extruded into columns with one octave of cap erosion),
+marched 8–48 uniform steps through the whole slab, approximated self-shadowing
+with a horizontally infinite column, and composited the column as one fragment
+at its weighted mean depth. Those choices limited it to tapered mounds with no
+sub-texel detail, banding at grazing angles and single-depth aerial
+perspective, so it is being rewritten rather than tuned. The rewrite's design
+is [volumetric_clouds_plan.md](volumetric_clouds_plan.md).
 
-`StellarRenderingTests --clouds-only` checks visibility below, inside and above
-the cloud layer and across the inflated mesh boundary, including oblate bodies
-and oblique views. Outward rays above the layer must remain clear.
-The same suite probes coverage endpoints, longitude seams, poles, mip filtering,
-brightness-driven heights, nested tapered contours, fixed bases, wind and cap
-erosion on the GPU. Visibility runs both capture and legacy paths, including
-cloud-only capture activation when rings and orbit lines are disabled.
-It also checks the 2D shell in capture and legacy paths: views above and below,
-oblate bodies, proxy crossings, planet occlusion, zero coverage and clear outward
-rays above the shell. An underside lighting probe disables view-atmosphere
-composition and compares normal sky lighting against Direct sunlight only,
-verifying that cloud skylight is independent of aerial perspective. Baker tests
-verify native non-power-of-two texel preservation and complete mip layouts.
-CPU state contracts cover automatic altitude, gravity,
-humidity, composition, pressure inversion and serialized cloud fields.
+Reusable pieces for the rewrite: `CloudDefinition` and automatic base altitude,
+`CloudMaps` coverage and `cloud_weather`, the exact oblate shell roots and
+inflated proxy mesh in `cloud.vert`, and the inline cloud layer (bindings 35/36)
+that the atmosphere composite already transports and shadows.
+
+`StellarRenderingTests --clouds-only` probes coverage endpoints, longitude seams,
+poles, mip filtering and wind on the GPU. It checks the 2D shell in capture and
+legacy paths: views above and below, oblate bodies, proxy crossings, planet
+occlusion, zero coverage and clear outward rays above the shell. An underside
+lighting probe disables view-atmosphere composition and compares normal sky
+lighting against Direct sunlight only, verifying that cloud skylight is
+independent of aerial perspective. Baker tests verify native non-power-of-two
+texel preservation and complete mip layouts. CPU state contracts cover automatic
+altitude, gravity, humidity, composition, pressure inversion and serialized
+cloud fields.
 
 `StellarRenderingTests --cloud-benchmark <report.json>` measures cloud-off/on
 orbital views at offscreen 1080p and 4K using native coverage. It excludes UI,
@@ -348,18 +328,17 @@ only actual maps, without a full-resolution unused fallback layer; the shared
 image helper supports a one-layer array view. Earth uses the original
 16000×8000 JPEG via a 14-level, approximately 162.8 MiB R8 pack. Longitude repeats, latitude clamps at
 each mip, and geodetic latitude matches the surface map convention. The cloud
-coverage/height field drifts with wind; evolution changes only fine cap breakup.
+coverage field drifts with wind.
 New packs/catalog entries require a renderer restart. Body cloud values can be
 edited in `system.json` and reloaded. Corrupt or missing packs log a warning and
 fall back to procedural weather.
 
 ## Known limitations
 
-- Cumulus uses one bounded height field. The integrated column is represented as
-  one weighted transparent layer; embedded rings/lines and overlapping media
-  still require combined volumetric transport for exact ordering.
-- Close silhouettes are limited by the coverage map resolution. The height
-  field does not represent overhangs or full 3D billows.
+- Clouds are a single shell crossing: close views reveal a flat sheet with no
+  volume, billows or silhouettes until the volumetric rewrite lands.
+- Detail is limited by the coverage map resolution (about 2.5 km per texel on
+  Earth).
 - Clouds are not seen by eclipse/ring shadow code, atmospheric multiple
   scattering or planetshine.
 - No refraction/underwater pass, no shoreline depth colour after the sea-level

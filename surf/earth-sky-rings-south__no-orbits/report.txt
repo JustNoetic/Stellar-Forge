@@ -1,0 +1,12 @@
+Stellar Forge benchmark - average timings
+2560x1440, 240 frames x 1 repeats per scene; 90 warmup frames excluded
+
+Scene          Frame ms       FPS     CPU ms     GPU ms     Sim ms  Record ms    Wait ms
+earth-sky-rings-south      5.383     185.8      0.702      3.199      0.000      0.699      4.622
+
+GPU pass averages (ms)
+Scene         Celestial       Gaia     Orbits  Composite         UI
+earth-sky-rings-south      1.089      0.003      0.000      0.432      0.000
+
+CPU = simulation + camera + render recording (wall time). Wait = fence + acquire + present.
+CPU and GPU overlap; do not add them. FPS = 1000 / average frame ms.

@@ -101,6 +101,42 @@ void App::render_body_inspector() {
 
     ImGui::Separator();
 
+    if (system().definition().motion_model == ephemeris::MotionModel::Spice && !inspect_bary &&
+        (!b.definition.mission_start_utc.empty() || (b.definition.is_spacecraft && b.definition.has_finite_spice_coverage()))) {
+        if (b.render.spice_valid) {
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.45f, 1.0f), "SPICE Status: Active (In Coverage)");
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "SPICE Status: Outside Mission Coverage");
+        }
+        if (!b.definition.mission_start_utc.empty()) {
+            ImGui::TextDisabled("Start: %s UTC", b.definition.mission_start_utc.c_str());
+        }
+        if (!b.definition.mission_end_utc.empty()) {
+            ImGui::TextDisabled("End:   %s UTC", b.definition.mission_end_utc.c_str());
+        }
+        if (b.definition.has_finite_spice_coverage()) {
+            if (ImGui::Button("Jump to Mission Start", ImVec2(-1.0f, 0.0f))) {
+                units::Years target_t{};
+                if (system().definition().spice_epoch_et.has_value()) {
+                    const double span = std::max(0.0, b.definition.spice_end_et - b.definition.spice_start_et);
+                    const double offset = std::min(60.0, span * 0.01);
+                    const double delta_sec = (b.definition.spice_start_et + offset) - *system().definition().spice_epoch_et;
+                    target_t = units::to_years(units::Seconds{delta_sec});
+                } else if (!b.definition.mission_start_utc.empty()) {
+                    auto dt = time::parse_iso_or_default(b.definition.mission_start_utc);
+                    target_t = time::sim_time_from_date(system().definition().epoch_utc, dt, true);
+                }
+                auto res = simulation_.apply(ephemeris::JumpToTime{target_t});
+                if (res) {
+                    camera_.focus_body(insp_idx, system(), true, false);
+                } else {
+                    simulation_error_ = res.error;
+                }
+            }
+        }
+        ImGui::Separator();
+    }
+
     if (system().definition().motion_model != ephemeris::MotionModel::Spice && !inspect_bary) {
         if (ImGui::Button("+ Add Satellite to This Body", ImVec2(-1.0f, 0.0f))) {
             ui_state_.add_body.reset_for_parent(system(), insp_idx);

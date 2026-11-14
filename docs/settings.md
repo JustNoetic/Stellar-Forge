@@ -21,10 +21,12 @@ again restores the previous window position, size and maximized state. The
 shortcut also works while UI controls have keyboard focus. Fullscreen is session
 state and is not saved to preferences.
 
-Lighting & Rings includes Cloud rendering: 2D texture (default) or Volumetric
-(experimental). `cloud_mode` persists as 0 or 1 alongside `clouds_enabled`.
-The 2D mode reuses existing coverage mips and atmosphere transport; see
-`oceans_clouds.md` for per-body altitude and moisture controls.
+Lighting & Rings includes Clouds and "Composite clouds with the atmosphere"
+(`clouds_enabled`, `cloud_sheet_inline`). Clouds render as a 2D texture shell
+that reuses existing coverage mips and atmosphere transport; see
+`oceans_clouds.md` for per-body altitude and moisture controls. The former
+volumetric mode was removed; a saved `cloud_mode` key is ignored on load and
+dropped on the next save.
 
 Interactive sessions load `data/settings.json` through `paths::external_path`.
 Graphics settings, panel visibility and sizes, interface scale, distance units,

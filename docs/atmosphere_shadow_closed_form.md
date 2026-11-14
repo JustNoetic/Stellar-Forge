@@ -105,6 +105,5 @@ the cached weights' screen resolution; the sampled path, which uses the same cac
 shows it too.
 
 Clouds receive the same eclipse and ring shadows as the surface
-(`shaders/common/cloud_shadow.glsl`), applied to their direct and sky light in both
-the sheet and volumetric modes. They previously used unshadowed sunlight, so only the
+(`shaders/common/cloud_shadow.glsl`), applied to their direct and sky light. They previously used unshadowed sunlight, so only the
 haze in front of them darkened.

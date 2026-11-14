@@ -94,6 +94,7 @@ class SpiceEphemeris {
 public:
     static std::shared_ptr<SpiceEphemeris> open(std::string& error);
     static std::shared_ptr<SpiceEphemeris> reload(std::string& error);
+    static std::shared_ptr<SpiceEphemeris> active();
     ~SpiceEphemeris();
     SpiceEphemeris(const SpiceEphemeris&) = delete;
     SpiceEphemeris& operator=(const SpiceEphemeris&) = delete;
@@ -101,6 +102,7 @@ public:
     CommandResult epoch(std::string_view utc, double& et) const;
     CommandResult state(int target, double et, BodyMotion& motion) const;
     CommandResult state_relative(int target, int observer, double et, BodyMotion& motion) const;
+    CommandResult state_clamped(const BodyDefinition& body, double et, BodyMotion& motion, bool* in_coverage = nullptr) const;
     CommandResult furnish_file(const std::filesystem::path& path);
     BspInspectResult inspect_bsp(const std::filesystem::path& bsp_path);
 
@@ -117,7 +119,7 @@ public:
     CommandResult spk_close(int handle);
 
     std::string body_name(int spice_id) const;
-    std::string et_to_utc(double et, const char* format = "C") const;
+    std::string et_to_utc(double et, const char* format = "C", int prec = 0) const;
     bool body_gm_and_radius(int spice_id, double fallback_mass_kg, double fallback_radius_km,
                             double& mass_msun, double& radius_rsun) const;
     const std::vector<std::filesystem::path>& loaded_kernels() const noexcept { return loaded_kernels_; }
@@ -132,10 +134,14 @@ private:
     CommandResult initialize();
     CommandResult result() const;
     bool query_raw_state(int target, int observer, double et, double state_out[6]) const;
+    bool query_state_vec(int target, int observer, double et, double state_out[6], int depth = 0) const;
+    void scan_bsp_segments(const std::filesystem::path& path);
 
     mutable std::recursive_mutex mutex_;
     void* library_ = nullptr;
     std::vector<std::filesystem::path> loaded_kernels_;
+    std::unordered_map<int, int> body_centers_;
+    std::unordered_map<int, std::pair<double, double>> body_coverage_;
 
     void (*furnish_)(const char*) = nullptr;
     void (*unload_)(const char*) = nullptr;

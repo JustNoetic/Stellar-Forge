@@ -16,6 +16,20 @@ layout(location = 1) out float phase;
 layout(location = 2) flat out float patched;
 
 void main() {
+    if (pc.parameters.w > 0.5) {
+        OrbitData v = orbits[gl_VertexIndex];
+        dvec3 position = v.d0.xyz;
+        gl_Position = pc.view_projection * vec4(refract_position(vec3(position - pc.eye.xyz)), 1.0);
+        float alpha = float(v.d0.w);
+        vec3 rgb = vec3(v.d3.xyz) * 0.4;
+        float maximum = max(rgb.r, max(rgb.g, rgb.b));
+        if (maximum > 0.0001 && maximum < 0.25) rgb *= 0.25 / maximum;
+        else if (maximum <= 0.0001) rgb = vec3(0.25);
+        color = vec4(rgb, alpha * pc.parameters.y);
+        phase = 0.0;
+        patched = 0.0;
+        return;
+    }
     OrbitData orbit = orbits[gl_InstanceIndex];
     float t = float(gl_VertexIndex) / pc.parameters.x;
     dvec3 position = orbit_curve_point(orbit, t);

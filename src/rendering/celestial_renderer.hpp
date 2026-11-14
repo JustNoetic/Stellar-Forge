@@ -4,6 +4,7 @@
 #include "rendering/render_settings.hpp"
 #include "rendering/planetshine.hpp"
 #include "rendering/cloud_maps.hpp"
+#include "rendering/cloud_volume.hpp"
 #include "rendering/ocean_waves.hpp"
 #include "rendering/atmosphere_renderer.hpp"
 #include "rendering/ring_renderer.hpp"
@@ -97,6 +98,8 @@ public:
     void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                               rhi::Image* physical_color = nullptr);
     const TransparencyRenderer& transparency() const noexcept { return transparency_; }
+    const CloudMaps& cloud_maps() const noexcept { return cloud_maps_; }
+    const CloudVolumeRenderer& cloud_volume() const noexcept { return cloud_volume_; }
     std::array<rhi::PushDescriptorWrite, 2> refraction_writes(rhi::VkContext& ctx) const { return refraction_.writes(ctx); }
     const RefractionHost& refraction_host() const noexcept { return refraction_.host(); }
     uint32_t refraction_observer_builds() const noexcept { return refraction_.observer_builds(); }
@@ -150,7 +153,7 @@ private:
                         uint32_t count, float pixel_scale);
 
     rhi::Pipeline sphere_pipeline_{};
-    std::array<rhi::Pipeline, 2> cloud_pipeline_{}, cloud_depth_pipeline_{}, cloud_transparency_pipeline_{};
+    rhi::Pipeline cloud_pipeline_{}, cloud_depth_pipeline_{}, cloud_transparency_pipeline_{};
     // Inline 2D clouds: the sheet pass stores each pixel's front cloud crossing in a cloud layer (colour with
     // 2*body+opacity in alpha, and reverse-Z depth), which the atmosphere composite blends with its own transport.
     rhi::Pipeline cloud_inline_pipeline_{};
@@ -161,6 +164,7 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> fluid_ssbos_{};
     std::vector<uint32_t> cloud_bodies_;
     CloudMaps cloud_maps_;
+    CloudVolumeRenderer cloud_volume_;
     OceanWaves ocean_;
     int ocean_focus_ = -1;
     rhi::Pipeline point_pipeline_{}, atmosphere_point_pipeline_{};

@@ -383,7 +383,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         auto& p = frame.p;
         // The 2D sheet is blended here from the cloud layer; progressive shadows keep it as a transparent fragment
         // because their history has no cloud endpoint layer.
-        bool inline_clouds = settings.clouds_enabled && settings.cloud_mode == 0 && settings.cloud_sheet_inline &&
+        bool inline_clouds = settings.clouds_enabled && settings.cloud_sheet_inline &&
             !settings.atmosphere_shadow_temporal && ctx.fragment_stores_enabled() && b.definition.clouds.enabled;
         p.cloud_layer = glm::vec4(float(candidate.index), inline_clouds ? 1.0f : 0.0f, 0.0f, 0.0f);
         t.limb_active = frame.limb_active;

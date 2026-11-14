@@ -1,5 +1,6 @@
 #include "ephemeris/orbit_curves.hpp"
 #include "ephemeris/jacobi.hpp"
+#include "ephemeris/spice_ephemeris.hpp"
 #include "core/math_utils.hpp"
 #include <algorithm>
 #include <cmath>
@@ -184,6 +185,381 @@ std::vector<OrbitCurve> compute_orbit_curves(const SystemSnapshot& sys) {
         curves.push_back(curve);
     }
     return curves;
+}
+
+namespace {
+
+bool finite_vector(const glm::dvec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+bool compute_synodic_basis(const BodyMotion& p1, const BodyMotion& p2,
+                           glm::dvec3& e_r, glm::dvec3& e_t, glm::dvec3& e_n, double& dist_au) {
+    glm::dvec3 d = p2.position.value - p1.position.value;
+    dist_au = glm::length(d);
+    if (!std::isfinite(dist_au) || dist_au <= 1e-12) return false;
+    e_r = d / dist_au;
+    glm::dvec3 dv = p2.velocity.value - p1.velocity.value;
+    glm::dvec3 h = glm::cross(d, dv);
+    double h_len = glm::length(h);
+    if (!std::isfinite(h_len) || h_len <= 1e-15) {
+        glm::dvec3 ref = std::abs(e_r.z) < 0.9 ? glm::dvec3(0.0, 0.0, 1.0) : glm::dvec3(0.0, 1.0, 0.0);
+        e_n = glm::normalize(glm::cross(e_r, ref));
+    } else {
+        e_n = h / h_len;
+    }
+    e_t = glm::normalize(glm::cross(e_n, e_r));
+    return true;
+}
+
+int find_body_by_spice_id(const SystemDefinition& def, int target_id) {
+    for (size_t i = 0; i < def.bodies.size(); ++i) {
+        int id = def.bodies[i].spice_id;
+        if (id == target_id) return static_cast<int>(i);
+        if (target_id > 100 && target_id < 1000 && target_id % 100 == 99 && id == target_id / 100) return static_cast<int>(i);
+        if (target_id > 0 && target_id < 10 && id == target_id * 100 + 99) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+} // namespace
+
+void SpiceTrajectoryCache::evaluate(const SystemSnapshot& sys, const EphemerisOrbitConfig& config,
+                                    std::vector<OrbitPolyline>& out_polylines,
+                                    std::vector<bool>& out_covered_bodies) {
+    out_polylines.clear();
+    out_covered_bodies.assign(sys.size(), false);
+    if (sys.empty() || sys.definition().motion_model != MotionModel::Spice) {
+        entries_.clear();
+        return;
+    }
+
+    auto spice = SpiceEphemeris::active();
+    if (!spice) {
+        std::string err;
+        spice = SpiceEphemeris::open(err);
+    }
+    if (!spice) return;
+
+    const auto& def = sys.definition();
+    double epoch_et = 0.0;
+    if (def.spice_epoch_et.has_value() && std::isfinite(*def.spice_epoch_et)) {
+        epoch_et = *def.spice_epoch_et;
+    } else if (!spice->epoch(def.epoch_utc, epoch_et)) {
+        return;
+    }
+    const double cur_et = epoch_et + units::to_seconds(sys.time()).value;
+
+    const bool structure_changed = (generation_ != sys.generation() ||
+                                    definition_revision_ != sys.definition_revision() ||
+                                    config_.frame_mode != config.frame_mode ||
+                                    config_.rotating_pair != config.rotating_pair ||
+                                    std::abs(config_.lagrange_days - config.lagrange_days) > 0.1f ||
+                                    config_.sample_points != config.sample_points ||
+                                    config_.trail_fade != config.trail_fade);
+
+    constexpr double kFiniteMissionMaxSec = 50.0 * 365.25 * 86400.0;
+    const bool is_custom_bsp = !def.custom_bsp_path.empty();
+
+    if (structure_changed) {
+        entries_.clear();
+        generation_ = sys.generation();
+        definition_revision_ = sys.definition_revision();
+
+        struct PairSpec { int p1; int p2; int anchor; };
+        static constexpr PairSpec kPairs[] = {
+            {10, 399, 399},
+            {399, 301, 399},
+            {10, 599, 599},
+            {10, 699, 699},
+            {699, 606, 606}
+        };
+        const PairSpec manual_pair = kPairs[std::min<uint32_t>(config.rotating_pair, 4u)];
+        const int manual_p1_idx = find_body_by_spice_id(def, manual_pair.p1);
+        const int manual_p2_idx = find_body_by_spice_id(def, manual_pair.p2);
+        const int manual_anchor_idx = find_body_by_spice_id(def, manual_pair.anchor);
+
+        for (size_t i = 0; i < sys.size(); ++i) {
+            const auto& b = def.bodies[i];
+            if (b.is_star || b.spice_id == 0) continue;
+
+            const bool finite_mission = b.has_finite_spice_coverage() && (b.spice_end_et - b.spice_start_et) < kFiniteMissionMaxSec;
+            const bool use_polyline = b.is_spacecraft || finite_mission || is_custom_bsp || (config.frame_mode == 2);
+            if (!use_polyline) continue;
+
+            int parent_idx = sys.reference_parent(i);
+            if (parent_idx < 0 || static_cast<size_t>(parent_idx) >= sys.size()) {
+                parent_idx = b.parent_idx;
+            }
+            if (parent_idx < 0 || static_cast<size_t>(parent_idx) >= sys.size() || parent_idx == static_cast<int>(i)) {
+                parent_idx = def.star_idx;
+            }
+            if (parent_idx < 0 || static_cast<size_t>(parent_idx) >= sys.size() || parent_idx == static_cast<int>(i)) {
+                continue;
+            }
+
+            CachedBody entry{};
+            entry.body_index = static_cast<int>(i);
+            entry.spice_id = b.spice_id;
+            entry.parent_index = parent_idx;
+            entry.parent_spice_id = def.bodies[parent_idx].spice_id;
+
+            if (config.frame_mode == 2) {
+                if (manual_p1_idx >= 0 && manual_p2_idx >= 0 && manual_anchor_idx >= 0 &&
+                    static_cast<int>(i) != manual_p1_idx && static_cast<int>(i) != manual_p2_idx) {
+                    entry.rotating = true;
+                    entry.rot_p1_idx = manual_p1_idx;
+                    entry.rot_p2_idx = manual_p2_idx;
+                    entry.rot_anchor_idx = manual_anchor_idx;
+                }
+            } else if (config.frame_mode == 0 && b.is_spacecraft) {
+                if (b.spice_id == -170) {
+                    int sun_i = find_body_by_spice_id(def, 10);
+                    int earth_i = find_body_by_spice_id(def, 399);
+                    if (sun_i >= 0 && earth_i >= 0) {
+                        entry.rotating = true;
+                        entry.rot_p1_idx = sun_i;
+                        entry.rot_p2_idx = earth_i;
+                        entry.rot_anchor_idx = earth_i;
+                    }
+                } else {
+                    int gp_idx = sys.reference_parent(parent_idx);
+                    if (gp_idx >= 0 && static_cast<size_t>(gp_idx) < sys.size() && gp_idx != parent_idx) {
+                        const double m1 = def.bodies[gp_idx].mass_msun;
+                        const double m2 = def.bodies[parent_idx].mass_msun;
+                        if (m1 > 0.0 && m2 > 0.0) {
+                            const double d_p = glm::length(sys.body(parent_idx).motion.position.value - sys.body(gp_idx).motion.position.value);
+                            const double r_hill = d_p * std::cbrt(m2 / (3.0 * m1));
+                            const double d_sc = glm::length(sys.body(i).motion.position.value - sys.body(parent_idx).motion.position.value);
+                            if (r_hill > 0.0 && d_sc >= 0.35 * r_hill && d_sc <= 1.85 * r_hill) {
+                                entry.rotating = true;
+                                entry.rot_p1_idx = gp_idx;
+                                entry.rot_p2_idx = parent_idx;
+                                entry.rot_anchor_idx = parent_idx;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (entry.rotating) {
+                entry.rot_p1_spice = def.bodies[entry.rot_p1_idx].spice_id;
+                entry.rot_p2_spice = def.bodies[entry.rot_p2_idx].spice_id;
+                entry.rot_anchor_spice = def.bodies[entry.rot_anchor_idx].spice_id;
+            }
+            entries_.push_back(std::move(entry));
+        }
+    }
+    config_ = config;
+
+    auto sample_entry = [&](CachedBody& entry) {
+        const auto& b = def.bodies[entry.body_index];
+        double cov_start = b.has_finite_spice_coverage() ? b.spice_start_et : (cur_et - 180.0 * 86400.0);
+        double cov_end = b.has_finite_spice_coverage() ? b.spice_end_et : (cur_et + 180.0 * 86400.0);
+        if (cov_end <= cov_start) cov_end = cov_start + 86400.0;
+
+        double win_start = cov_start;
+        double win_end = cov_end;
+        const double ref_et = std::clamp(cur_et, cov_start, cov_end);
+
+        if (entry.rotating) {
+            const double half_w = 0.5 * std::max(5.0, static_cast<double>(config.lagrange_days)) * 86400.0;
+            win_start = std::max(cov_start, ref_et - half_w);
+            win_end = std::min(cov_end, ref_et + half_w);
+        } else if ((cov_end - cov_start) > 400.0 * 86400.0 && config.trail_fade) {
+            const double back_s = ( static_cast<double>(config.trail_days) + 45.0) * 86400.0;
+            const double fwd_s = (static_cast<double>(config.lead_days) + 45.0) * 86400.0;
+            win_start = std::max(cov_start, ref_et - back_s);
+            win_end = std::min(cov_end, ref_et + fwd_s);
+        }
+
+        const double span = std::max(1.0, win_end - win_start);
+        const double eps = std::min(1.0, span * 1e-4);
+        const double t0 = win_start + eps;
+        const double t1 = win_end - eps;
+        if (t1 <= t0) return;
+
+        auto eval_coord = [&](double t, glm::dvec3& out) -> bool {
+            BodyMotion bm{};
+            if (!spice->state(entry.spice_id, t, bm)) return false;
+            if (entry.rotating) {
+                BodyMotion m1{}, m2{};
+                if (!spice->state(entry.rot_p1_spice, t, m1) || !spice->state(entry.rot_p2_spice, t, m2)) return false;
+                glm::dvec3 e_r{}, e_t{}, e_n{};
+                double dist = 0.0;
+                if (!compute_synodic_basis(m1, m2, e_r, e_t, e_n, dist)) return false;
+                const glm::dvec3 anchor_pos = (entry.rot_anchor_spice == entry.rot_p1_spice) ? m1.position.value : m2.position.value;
+                const glm::dvec3 rel = bm.position.value - anchor_pos;
+                out = glm::dvec3(glm::dot(rel, e_r), glm::dot(rel, e_t), glm::dot(rel, e_n)) / dist;
+                return finite_vector(out);
+            } else {
+                BodyMotion pm{};
+                if (!spice->state(entry.parent_spice_id, t, pm)) return false;
+                out = bm.position.value - pm.position.value;
+                return finite_vector(out);
+            }
+        };
+
+        const size_t max_pts = std::clamp<size_t>(config.sample_points, 256, 25000);
+        const size_t coarse_pts = std::clamp<size_t>(max_pts / 3, 96, 1600);
+
+        entry.ets.clear();
+        entry.coords.clear();
+        entry.ets.reserve(max_pts);
+        entry.coords.reserve(max_pts);
+
+        std::vector<double> coarse_t(coarse_pts);
+        std::vector<glm::dvec3> coarse_p(coarse_pts);
+        std::vector<bool> coarse_ok(coarse_pts, false);
+        for (size_t k = 0; k < coarse_pts; ++k) {
+            double frac = static_cast<double>(k) / static_cast<double>(coarse_pts - 1);
+            coarse_t[k] = t0 + frac * (t1 - t0);
+            coarse_ok[k] = eval_coord(coarse_t[k], coarse_p[k]);
+        }
+
+        auto subdivide = [&](auto& self, double ta, const glm::dvec3& pa, double tb, const glm::dvec3& pb, int depth) -> void {
+            if (depth >= 5 || entry.ets.size() + 2 >= max_pts) {
+                entry.ets.push_back(tb);
+                entry.coords.push_back(pb);
+                return;
+            }
+            const double tm = 0.5 * (ta + tb);
+            glm::dvec3 pm{};
+            if (!eval_coord(tm, pm)) {
+                entry.ets.push_back(tb);
+                entry.coords.push_back(pb);
+                return;
+            }
+            const glm::dvec3 v1 = pm - pa;
+            const glm::dvec3 v2 = pb - pm;
+            const double l1 = glm::length(v1);
+            const double l2 = glm::length(v2);
+            bool need_split = false;
+            if (l1 > 1e-12 && l2 > 1e-12) {
+                const double cos_ang = glm::dot(v1, v2) / (l1 * l2);
+                if (cos_ang < 0.9992) need_split = true;
+            }
+            if (need_split) {
+                self(self, ta, pa, tm, pm, depth + 1);
+                self(self, tm, pm, tb, pb, depth + 1);
+            } else {
+                entry.ets.push_back(tb);
+                entry.coords.push_back(pb);
+            }
+        };
+
+        bool started = false;
+        for (size_t k = 0; k < coarse_pts; ++k) {
+            if (!coarse_ok[k]) continue;
+            if (!started) {
+                entry.ets.push_back(coarse_t[k]);
+                entry.coords.push_back(coarse_p[k]);
+                started = true;
+            } else {
+                subdivide(subdivide, entry.ets.back(), entry.coords.back(), coarse_t[k], coarse_p[k], 0);
+            }
+        }
+
+        entry.start_et = win_start;
+        entry.end_et = win_end;
+    };
+
+    for (auto& entry : entries_) {
+        if (entry.body_index < 0 || static_cast<size_t>(entry.body_index) >= sys.size()) continue;
+        out_covered_bodies[entry.body_index] = true;
+
+        const auto& bview = sys.body(entry.body_index);
+        if (config.hide_outside && !bview.render.spice_valid) {
+            continue;
+        }
+
+        const auto& bdef = bview.definition;
+        const double cov_start = bdef.has_finite_spice_coverage() ? bdef.spice_start_et : (cur_et - 180.0 * 86400.0);
+        const double cov_end = bdef.has_finite_spice_coverage() ? bdef.spice_end_et : (cur_et + 180.0 * 86400.0);
+        const double clamped_et = std::clamp(cur_et, cov_start, cov_end);
+
+        bool need_resample = entry.ets.empty();
+        if (!need_resample) {
+            const double margin = 5.0 * 86400.0;
+            if (clamped_et < entry.start_et + margin && entry.start_et > cov_start + 60.0) need_resample = true;
+            if (clamped_et > entry.end_et - margin && entry.end_et < cov_end - 60.0) need_resample = true;
+        }
+        if (need_resample) {
+            sample_entry(entry);
+        }
+        if (entry.coords.size() < 2) continue;
+
+        glm::dvec3 rot_er{}, rot_et{}, rot_en{}, anchor_pos{};
+        double rot_dist = 1.0;
+        if (entry.rotating) {
+            const auto& m1 = sys.body(entry.rot_p1_idx).motion;
+            const auto& m2 = sys.body(entry.rot_p2_idx).motion;
+            if (!compute_synodic_basis(m1, m2, rot_er, rot_et, rot_en, rot_dist)) continue;
+            anchor_pos = sys.body(entry.rot_anchor_idx).motion.position.value;
+        } else {
+            anchor_pos = sys.body(entry.parent_index).motion.position.value;
+        }
+
+        auto to_world = [&](const glm::dvec3& c) -> glm::dvec3 {
+            if (entry.rotating) {
+                return anchor_pos + rot_dist * (c.x * rot_er + c.y * rot_et + c.z * rot_en);
+            }
+            return anchor_pos + c;
+        };
+
+        auto compute_alpha = [&](double t_sample) -> float {
+            if (!config.trail_fade) {
+                return (t_sample <= cur_et) ? 0.90f : 0.35f;
+            }
+            const double dt_days = (t_sample - cur_et) / 86400.0;
+            if (dt_days <= 0.0) {
+                const double trail_d = std::max(0.05, static_cast<double>(config.trail_days));
+                if (-dt_days > trail_d) return 0.06f;
+                const double u = std::clamp(1.0 + dt_days / trail_d, 0.0, 1.0);
+                const double s = u * u * (3.0 - 2.0 * u);
+                return static_cast<float>(0.06 + 0.94 * s);
+            } else {
+                const double lead_d = static_cast<double>(config.lead_days);
+                if (lead_d <= 1e-4 || dt_days > lead_d) return 0.06f;
+                const double u = std::clamp(1.0 - dt_days / lead_d, 0.0, 1.0);
+                const double s = u * u * (3.0 - 2.0 * u);
+                return static_cast<float>(0.06 + 0.54 * s);
+            }
+        };
+
+        OrbitPolyline poly{};
+        poly.body_index = entry.body_index;
+        poly.color = bdef.color_rgb;
+        poly.center = EclipticPosition{anchor_pos};
+        const size_t n = entry.coords.size();
+        poly.positions.reserve(n + 1);
+        poly.alphas.reserve(n + 1);
+
+        bool inserted_now = !bview.render.spice_valid;
+        double max_r2 = 0.0;
+
+        for (size_t k = 0; k < n; ++k) {
+            const double tk = entry.ets[k];
+            if (!inserted_now && tk >= cur_et) {
+                const glm::dvec3 cur_pos = bview.motion.position.value;
+                poly.positions.push_back(EclipticPosition{cur_pos});
+                poly.alphas.push_back(1.0f);
+                const glm::dvec3 d = cur_pos - anchor_pos;
+                max_r2 = std::max(max_r2, glm::dot(d, d));
+                inserted_now = true;
+            }
+            const glm::dvec3 wp = to_world(entry.coords[k]);
+            poly.positions.push_back(EclipticPosition{wp});
+            poly.alphas.push_back(compute_alpha(tk));
+            const glm::dvec3 d = wp - anchor_pos;
+            max_r2 = std::max(max_r2, glm::dot(d, d));
+        }
+
+        poly.extent_au = std::sqrt(max_r2);
+        if (poly.positions.size() >= 2) {
+            out_polylines.push_back(std::move(poly));
+        }
+    }
 }
 
 }

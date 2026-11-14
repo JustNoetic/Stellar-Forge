@@ -2,6 +2,26 @@ const float CLOUD_DEPTH_BIAS = 1.0000005;
 const float CLOUD_RELIEF_LIGHT = 0.15;
 const float CLOUD_RELIEF_FADE_COSINE = 0.25;
 
+vec3 cloud_light_response(SurfaceFluidGPU f, SurfaceAtmosphereSample lookup, bool atmosphere, bool underside,
+                          vec3 local, vec3 normal, vec3 pole, float flattening, vec3 light) {
+    vec3 transmission, sky = vec3(0.0);
+    if (atmosphere) {
+        vec3 uv = surface_atmosphere_coordinates(lookup, light);
+        transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+        sky = textureLod(surface_atmosphere_lut, uv+vec3(0, 0, 1), 0.0).rgb;
+    } else {
+        vec3 spherical = fluid_spherical(local, pole, flattening);
+        float radius = length(spherical)*FLUID_AU_KM;
+        float horizon = -sqrt(max(1.0-pow(f.cloud_motion.w/radius, 2.0), 0.0));
+        float mu = dot(normalize(spherical), normalize(fluid_spherical(light, pole, flattening)));
+        transmission = vec3(smoothstep(horizon-0.005, horizon+0.005, mu));
+    }
+    float sun_cosine = max(dot(normal, light), 0.0);
+    float diffuse = CLOUD_RELIEF_LIGHT*smoothstep(0.0, CLOUD_RELIEF_FADE_COSINE, sun_cosine)+(1.0-CLOUD_RELIEF_LIGHT)*sun_cosine;
+    if (underside) diffuse *= 0.25;
+    return transmission*diffuse+sky*0.5;
+}
+
 vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pole, float flattening, mat3 rotation) {
     SurfaceFluidGPU f = fluids[body];
     vec3 normal = normalize(local+pole*dot(local, pole)*(flattening*(2.0+flattening)));
@@ -24,25 +44,22 @@ vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pol
         float d_au = max(length(to_star), 1e-5);
         vec3 light = to_star/d_au;
         float irradiance = u_scene.hdr_enabled != 0u ? u_scene.stars_color_lum[s].w/(d_au*d_au) : 1.0;
-        vec3 transmission, sky = vec3(0.0);
-        if (atmosphere) {
-            vec3 uv = surface_atmosphere_coordinates(lookup, light);
-            transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
-            sky = textureLod(surface_atmosphere_lut, uv+vec3(0, 0, 1), 0.0).rgb;
-        } else {
-            vec3 spherical = fluid_spherical(local, pole, flattening);
-            float radius = length(spherical)*FLUID_AU_KM;
-            float horizon = -sqrt(max(1.0-pow(f.cloud_motion.w/radius, 2.0), 0.0));
-            float mu = dot(normalize(spherical), normalize(fluid_spherical(light, pole, flattening)));
-            transmission = vec3(smoothstep(horizon-0.005, horizon+0.005, mu));
-        }
-        float sun_cosine = max(dot(normal, light), 0.0);
-        float diffuse = CLOUD_RELIEF_LIGHT*smoothstep(0.0, CLOUD_RELIEF_FADE_COSINE, sun_cosine)+(1.0-CLOUD_RELIEF_LIGHT)*sun_cosine;
-        if (underside) diffuse *= 0.25;
         vec3 shadow = cloud_star_shadow(body, ray*distance, s);
-        radiance += u_scene.stars_color_lum[s].rgb*irradiance*(transmission*diffuse+sky*0.5)*shadow;
+        radiance += u_scene.stars_color_lum[s].rgb*irradiance*
+            cloud_light_response(f, lookup, atmosphere, underside, local, normal, pole, flattening, light)*shadow;
     }
     radiance += cloud_ringshine(body, local, ray*distance, false)*(underside ? 0.25 : 1.0);
+    BodyInstanceGPU b = bodies[body];
+    float shine_floor = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+    vec3 up = normalize(local);
+    for (int i = 0; i < 4; ++i) {
+        vec3 shine = b.shine_irradiance[i].rgb;
+        vec3 light = b.shine_direction[i].xyz;
+        if (!any(greaterThan(shine, vec3(0.0))) ||
+            (dot(normal, light) < 0.0 && dot(up, light) < -0.05) ||
+            4000.0*dot(shine, vec3(0.2126, 0.7152, 0.0722)) <= shine_floor) continue;
+        radiance += shine*cloud_light_response(f, lookup, atmosphere, underside, local, normal, pole, flattening, light);
+    }
     float exposure = u_scene.hdr_enabled != 0u ? u_scene.screen_params.w : 1.0;
     return vec4(radiance*f.cloud_color.rgb*(opacity*exposure), opacity);
 }

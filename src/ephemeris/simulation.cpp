@@ -82,14 +82,19 @@ CommandResult Simulation::replace_system(LoadedSystem loaded) {
             auto f_status = candidate.spice_->furnish_file(definition.custom_bsp_path);
             if (!f_status) return f_status;
         }
-        auto status = candidate.spice_->epoch(definition.epoch_utc, candidate.epoch_et_);
-        if (!status) return status;
+        if (definition.spice_epoch_et.has_value() && std::isfinite(*definition.spice_epoch_et)) {
+            candidate.epoch_et_ = *definition.spice_epoch_et;
+        } else {
+            auto status = candidate.spice_->epoch(definition.epoch_utc, candidate.epoch_et_);
+            if (!status) return status;
+            definition.spice_epoch_et = candidate.epoch_et_;
+        }
         std::vector<BodyDefinition> available;
         std::vector<BodyMotion> states;
         for (const auto& body : definition.bodies) {
             if (body.spice_id == 0) return {false, false, "Missing SPICE ID for " + body.name};
             BodyMotion state;
-            status = candidate.spice_->state(body.spice_id, candidate.epoch_et_, state);
+            auto status = candidate.spice_->state_clamped(body, candidate.epoch_et_, state);
             if (!status) {
                 if (!body.is_spacecraft) return {false, false, body.name + ": " + status.error};
                 log::warn("Omitting spacecraft '{}' without SPICE coverage at {}", body.name, definition.epoch_utc);
@@ -196,13 +201,16 @@ CommandResult Simulation::apply(SetMotionModel command) {
         for (const auto& b : snapshot_.definition().bodies) {
             if (b.spice_id == 0) return {false, false, "Body '" + b.name + "' has no SPICE ID."};
             BodyMotion test_motion;
-            auto status = spice_->state(b.spice_id, test_et, test_motion);
+            auto status = spice_->state_clamped(b, test_et, test_motion);
             if (!status) return {false, false, b.name + ": " + status.error};
         }
     }
 
     auto updated = std::make_shared<SystemDefinition>(*snapshot_.definition_);
     updated->motion_model = command.model;
+    if (command.model == MotionModel::Spice) {
+        updated->spice_epoch_et = epoch_et_;
+    }
     snapshot_.definition_ = std::move(updated);
     ++snapshot_.definition_revision_;
 
@@ -213,7 +221,7 @@ CommandResult Simulation::apply(SetMotionModel command) {
     } else if (command.model == MotionModel::Spice) {
         double et = epoch_et_ + units::to_seconds(clock_.time).value;
         for (size_t i = 0; i < snapshot_.size(); ++i) {
-            spice_->state(snapshot_.definition().bodies[i].spice_id, et, snapshot_.motions_[i]);
+            spice_->state_clamped(snapshot_.definition().bodies[i], et, snapshot_.motions_[i]);
         }
         recenter();
     }
@@ -801,7 +809,7 @@ CommandResult Simulation::apply(JumpToTime command) {
         std::vector<BodyMotion> new_motions(snapshot_.size());
         for (size_t i = 0; i < snapshot_.size(); ++i) {
             const auto& body = snapshot_.definition().bodies[i];
-            auto status = spice_->state(body.spice_id, et, new_motions[i]);
+            auto status = spice_->state_clamped(body, et, new_motions[i]);
             if (!status) {
                 if (!body.is_spacecraft) {
                     return {false, false, std::format("{}: {}", body.name, status.error)};
@@ -925,10 +933,13 @@ CommandResult Simulation::advance(units::Seconds elapsed) {
                 snapshot_.motions_.swap(previous_motions_);
                 return {false, false, "SPICE runtime uninitialized."};
             }
-            auto status = spice_->state(body.spice_id, epoch_et_ + units::to_seconds(units::Years{next_time}).value, motion);
+            auto status = spice_->state_clamped(body, epoch_et_ + units::to_seconds(units::Years{next_time}).value, motion);
             if (!status) {
-                snapshot_.motions_.swap(previous_motions_);
-                return {false, false, body.name + ": " + status.error};
+                if (!body.is_spacecraft) {
+                    snapshot_.motions_.swap(previous_motions_);
+                    return {false, false, body.name + ": " + status.error};
+                }
+                motion = previous_motions_[i];
             }
         }
         if (!finite_vector(motion.position.value) || !finite_vector(motion.velocity.value)) {
@@ -1024,6 +1035,11 @@ void Simulation::prepare_render_state(bool definitions_changed) {
         }
         render.position = ecliptic_to_render(snapshot_.motions_[i].position);
         render.velocity = ecliptic_to_render(snapshot_.motions_[i].velocity);
+        render.spice_valid = true;
+        if (snapshot_.definition_->motion_model == MotionModel::Spice && body.has_finite_spice_coverage()) {
+            const double cur_et = epoch_et_ + seconds;
+            render.spice_valid = (cur_et >= body.spice_start_et && cur_et <= body.spice_end_et);
+        }
         if (definitions_changed) render.pole = glm::normalize(ecliptic_to_render(body.pole_ecl));
         double w0 = body.w0_deg * DEG_TO_RAD;
         if (body.tidally_locked && body.parent_idx >= 0 && static_cast<size_t>(body.parent_idx) < snapshot_.size()) {

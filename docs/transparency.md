@@ -32,16 +32,15 @@ Fragment allocation targets two fragments per viewport pixel, capped at 128 MiB 
 
 2D cloud sheets composited inline by the atmosphere pass (the default; see
 `oceans_clouds.md`) do not use the fragment list, and do not enable capture. Fragments behind such a
-cloud are rewritten during atmospheric transport so they resolve beneath it. Volumetric cumulus, and 2D
-sheets on the fallback path, still enable capture when rings and orbit lines are disabled.
-Clouds append their integrated premultiplied radiance, opacity and
-opacity-weighted mean ray distance during their single colour march. Their
-enclosing mesh is only a ray proxy, so clouds use analytically reconstructed
-entry depth instead of early testing that mesh's far-side depth. The existing
-opaque-depth checks in atmospheric composition and resolve filter the captured
-layer. Ordinary cloud rendering no longer needs a second density march or
-opaque cloud depth writes. Hardware without fragment atomics and the legacy
-reference mode retain a cheap map-only depth estimate.
+cloud are rewritten during atmospheric transport so they resolve beneath it. 2D sheets on the
+fallback path still enable capture when rings and orbit lines are disabled.
+They append the premultiplied radiance and opacity of their single shell
+crossing at its exact depth. Their enclosing mesh is only a ray proxy, so clouds
+use analytically reconstructed crossing depth instead of early testing that
+mesh's far-side depth. The existing opaque-depth checks in atmospheric
+composition and resolve filter the captured layer. Hardware without fragment
+atomics and the legacy reference mode write fully opaque crossings to depth in
+a separate depth-only pass.
 
 When the global record budget is exhausted, excess fragments use ordinary draw-order blending into the background. They remain visible, but ordering and their atmospheric endpoint are approximate in this overload condition. A GPU overflow counter, asynchronously copied to frame-owned host buffers, exposes this condition through `TransparencyRenderer::stats`; the renderer logs when overflow begins. Hardware without fragment storage atomics uses the legacy renderer and logs that fallback. `RenderSettings::transparency_reference_legacy` exists for controlled comparisons. Existing batched terrain/ring raster microbenchmarks explicitly use this legacy raster path; their timings omit the new resolve. The transparency benchmark measures the complete new path.
 

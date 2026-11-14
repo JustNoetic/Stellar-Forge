@@ -254,7 +254,7 @@ void App::run_benchmark() {
                 {"refraction", settings.refraction_enabled}, {"terrain", settings.terrain_imported_enabled}, {"normals", settings.terrain_normal_maps_enabled},
                 {"textures", settings.surface_textures_enabled}, {"rings", settings.show_rings}, {"ring_shadows", settings.ring_shadows_enabled},
                 {"direct_sunlight_only", settings.direct_sunlight_only},
-                {"clouds", settings.clouds_enabled}, {"cloud_mode", settings.cloud_mode}, {"cloud_sheet_inline", settings.cloud_sheet_inline}, {"legacy_transparency", settings.transparency_reference_legacy},
+                {"clouds", settings.clouds_enabled}, {"cloud_sheet_inline", settings.cloud_sheet_inline}, {"legacy_transparency", settings.transparency_reference_legacy},
                 {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
                 {"shadow_cached_weights", settings.atmosphere_shadow_cached_weights}, {"shadow_fast_rings", settings.atmosphere_shadow_fast_rings}, {"shadow_analytic", settings.atmosphere_shadow_analytic},
                 {"shadow_closed_form", settings.atmosphere_shadow_closed_form}};

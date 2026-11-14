@@ -35,6 +35,7 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
         s.atmosphere_shadow_adaptive = false;
     }
     if (variant == "no-shadow-vrs") s.atmosphere_shadow_vrs = false;
+    if (variant == "always-shadow-vrs") s.atmosphere_shadow_vrs_budget = 0.0f;
     if (variant == "no-atmosphere") s.show_atmospheres = false;
     if (variant == "no-aerial") s.aerial_perspective_enabled = false;
     if (variant == "no-shadows") s.atmosphere_shadows_enabled = false;
@@ -42,6 +43,7 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "no-secondary") s.planetshine_enabled = s.ringshine_enabled = false;
     if (variant == "no-planetshine") s.planetshine_enabled = false;
     if (variant == "no-ringshine") s.ringshine_enabled = false;
+    if (variant == "single-box-ring-shadows") s.ring_shadow_single_box = true;
     if (variant == "high-exposure") s.exposure = 1e4f;
     if (variant == "no-orbits") s.show_orbits = false;
     if (variant == "no-gaia") s.show_gaia_stars = false;
@@ -236,6 +238,19 @@ inline Camera audit_camera(const ephemeris::SystemSnapshot& system, std::string_
         camera.fov_deg = 45.0;
         auto equatorward = glm::normalize(-pole*side-up*glm::dot(-pole*side, up));
         audit_look(camera, equatorward*std::cos(25*DEG_TO_RAD)+up*std::sin(25*DEG_TO_RAD), up);
+        return camera;
+    }
+    if (scene.starts_with("earth-far-rings")) {
+        // The ringed Earth seen whole from N radii (default 10) on the day side, 25 degrees above the ring plane on the
+        // shadowed hemisphere's side, so the ring shadow bands cross a disc a few hundred pixels across.
+        double range = scene.size() > 16 ? std::stod(std::string(scene.substr(16))) : 10.0;
+        auto pole = body.render.pole;
+        auto equatorial = glm::normalize(sun-pole*glm::dot(sun, pole));
+        double side = glm::dot(sun, pole) >= 0 ? -1.0 : 1.0;
+        auto normal = glm::normalize(equatorial*std::cos(25*DEG_TO_RAD)+pole*(side*std::sin(25*DEG_TO_RAD)));
+        camera.cam_pos_rel = normal*(range*body.definition.radius_au());
+        camera.fov_deg = 45.0;
+        audit_look(camera, -normal, glm::normalize(pole-normal*glm::dot(pole, normal)));
         return camera;
     }
     if (scene.starts_with("earth-sky-rings")) {
