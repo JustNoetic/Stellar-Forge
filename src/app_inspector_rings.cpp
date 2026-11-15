@@ -12,6 +12,7 @@
 #include <ctime>
 #include <exception>
 #include <format>
+#include <random>
 #include <stdexcept>
 
 namespace sf {
@@ -111,6 +112,9 @@ void App::render_body_rings_tab(int insp_idx) {
                         re.procedural.inner_mult = p.inner_radius_ratio;
                         re.procedural.outer_mult = p.outer_radius_ratio;
                         re.procedural.opacity = p.opacity;
+                        re.procedural.opacity_variety = p.opacity_variety;
+                        re.procedural.single_band_color_variety = p.single_band_color_variety;
+                        re.procedural.per_band_color_variety = p.per_band_color_variety;
                     }
                     if (sel) ImGui::SetItemDefaultFocus();
                 }
@@ -122,8 +126,32 @@ void App::render_body_rings_tab(int insp_idx) {
             ImGui::SetNextItemWidth(seed_w);
             ImGui::DragInt("##Seed##proc", &re.procedural.seed, 1.0f, 0, 999999);
             ImGui::SameLine(0.0f, 8.0f);
+            static std::mt19937 ui_rng{std::random_device{}()};
             if (ImGui::Button("Random##proc", ImVec2(75.0f, 0.0f))) {
-                re.procedural.seed = std::rand() % 1000000;
+                re.procedural.seed = static_cast<int>(ui_rng() % 1000000u);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Randomize only the generation seed.");
+            }
+            if (ImGui::Button("Randomize Parameters##proc", ImVec2(-1.0f, 0.0f))) {
+                re.procedural.seed = static_cast<int>(ui_rng() % 1000000u);
+                auto rcfg = rendering::ProceduralRingConfig::randomize_from_preset(
+                    presets[cur_p_idx], static_cast<uint32_t>(re.procedural.seed));
+                re.procedural.band_count = rcfg.band_count;
+                re.procedural.gap_count = rcfg.gap_count;
+                re.procedural.striation_freq = rcfg.striation_freq;
+                re.procedural.contrast = rcfg.contrast;
+                re.procedural.base_density = rcfg.base_density;
+                re.procedural.core_boost = rcfg.core_boost;
+                re.procedural.inner_mult = rcfg.inner_radius_ratio;
+                re.procedural.outer_mult = rcfg.outer_radius_ratio;
+                re.procedural.opacity = rcfg.opacity;
+                re.procedural.opacity_variety = rcfg.opacity_variety;
+                re.procedural.single_band_color_variety = rcfg.single_band_color_variety;
+                re.procedural.per_band_color_variety = rcfg.per_band_color_variety;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Randomize seed and ring parameter sliders within the selected preset's material limits.");
             }
 
             ImGui::SliderInt("Bands##proc", &re.procedural.band_count, 1, 8);
@@ -132,6 +160,18 @@ void App::render_body_rings_tab(int insp_idx) {
             ImGui::SliderFloat("Sharpness##proc", &re.procedural.contrast, 0.5f, 3.5f, "%.2f");
             ImGui::SliderFloat("Density (Tau)##proc", &re.procedural.base_density, 0.05f, 8.0f, "%.2f");
             ImGui::SliderFloat("Core Opacity##proc", &re.procedural.core_boost, 0.5f, 5.0f, "%.2f");
+            ImGui::SliderFloat("Opacity Variety##proc", &re.procedural.opacity_variety, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Controls intra-band opacity shelf, ripple, and striation modulation depth (0 = uniform, 1 = balanced, 2 = extreme).");
+            }
+            ImGui::SliderFloat("Single-Band Color Variety##proc", &re.procedural.single_band_color_variety, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Controls compositional color variation within each individual band (0 = uniform hue, 1 = subtle, 2 = vivid).");
+            }
+            ImGui::SliderFloat("Per-Band Color Variety##proc", &re.procedural.per_band_color_variety, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Controls color and albedo tint differences between separate bands (0 = identical palette, 1 = subtle, 2 = distinct).");
+            }
 
             ui::drag_float("Inner (R_eq)##proc", &re.procedural.inner_mult, 0.01f, 1.05f, 4.0f, "%.2f R");
             float min_out = re.procedural.inner_mult + 0.05f;
@@ -152,8 +192,8 @@ void App::render_body_rings_tab(int insp_idx) {
             ImGui::Spacing();
 
             auto make_config = [&]() {
-                rendering::ProceduralRingConfig cfg;
-                cfg.seed = static_cast<uint32_t>(re.procedural.seed);
+                const auto& p = rendering::get_ring_preset(re.procedural.preset_idx);
+                auto cfg = rendering::ProceduralRingConfig::from_preset(p, static_cast<uint32_t>(re.procedural.seed));
                 cfg.band_count = re.procedural.band_count;
                 cfg.gap_count = re.procedural.gap_count;
                 cfg.striation_freq = re.procedural.striation_freq;
@@ -164,14 +204,9 @@ void App::render_body_rings_tab(int insp_idx) {
                 cfg.outer_radius_ratio = re.procedural.outer_mult;
                 cfg.tint_color = re.procedural.tint;
                 cfg.opacity = re.procedural.opacity;
-                const auto& p = rendering::get_ring_preset(re.procedural.preset_idx);
-                cfg.asymmetry = p.asymmetry;
-                cfg.backscatter = p.backscatter;
-                cfg.scatter = p.scatter;
-                cfg.unlit_factor = p.unlit_factor;
-                cfg.color_deep = p.color_deep;
-                cfg.color_mid = p.color_mid;
-                cfg.color_thin = p.color_thin;
+                cfg.opacity_variety = re.procedural.opacity_variety;
+                cfg.single_band_color_variety = re.procedural.single_band_color_variety;
+                cfg.per_band_color_variety = re.procedural.per_band_color_variety;
                 return cfg;
             };
 
@@ -179,9 +214,7 @@ void App::render_body_rings_tab(int insp_idx) {
                 auto cfg = make_config();
                 auto result = rendering::generate_procedural_ring_profile(cfg);
                 celestial_renderer_.set_custom_ring_texture(system().name(), b.definition.name, result.profile);
-                ephemeris::RingLayerDefinition nl{};
-                rendering::apply_procedural_ring_layer(result, nl);
-                rings = {std::move(nl)};
+                rings = rendering::build_procedural_ring_layers(result);
                 tex_in = rings[0].inner;
                 tex_out = rings[0].outer;
                 re.selected_layer = 0;
@@ -195,7 +228,7 @@ void App::render_body_rings_tab(int insp_idx) {
                 auto result = rendering::generate_procedural_ring_profile(cfg);
                 ephemeris::RingLayerDefinition nl{};
                 if (rendering::bake_and_save_procedural_ring_texture(system().name(), b.definition.name, result, nl)) {
-                    rings = {std::move(nl)};
+                    rings = rendering::build_procedural_ring_layers(result);
                     tex_in = rings[0].inner;
                     tex_out = rings[0].outer;
                     re.selected_layer = 0;

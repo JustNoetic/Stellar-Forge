@@ -443,12 +443,15 @@ struct ProceduralRingDraft {
     int gap_count = 3;
     float striation_freq = 160.0f;
     float contrast = 1.7f;
-    float base_density = 2.2f;
-    float core_boost = 2.5f;
+    float base_density = 1.15f;
+    float core_boost = 1.65f;
     float inner_mult = 1.20f;
     float outer_mult = 2.30f;
     glm::vec3 tint{1.0f, 1.0f, 1.0f};
     float opacity = 1.0f;
+    float opacity_variety = 1.0f;
+    float single_band_color_variety = 1.0f;
+    float per_band_color_variety = 1.0f;
 };
 
 struct RingEditState {
