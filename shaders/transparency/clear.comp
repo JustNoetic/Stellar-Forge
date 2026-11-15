@@ -10,6 +10,6 @@ void main() {
         fragment_count = 0u;
         overflow_count = 0u;
         fragment_capacity = pc.capacity;
-        reserved = 0u;
+        fragment_stride = (pc.capacity + 3u) & ~3u;
     }
 }

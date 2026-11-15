@@ -12,8 +12,13 @@ static bool ring_host(const ephemeris::BodyDefinition& def) {
     return !def.rings.empty() && !def.is_star && !def.is_black_hole && !def.is_spacecraft;
 }
 
+static uint32_t ring_pipeline_table(bool transparency, bool planetshine, bool numerical, bool refracted) {
+    uint32_t ps_mode = !planetshine ? 0u : (numerical ? 2u : 1u);
+    return ps_mode * 4u + (refracted ? 2u : 0u) + (transparency ? 1u : 0u);
+}
+
 static rhi::GraphicsPipelineDesc ring_pipeline_desc(const rhi::VkContext& ctx, uint32_t variant_idx,
-                                                      bool transparency, bool numerical) {
+                                                      bool transparency, bool planetshine, bool numerical, bool refracted) {
     rhi::GraphicsPipelineDesc desc{};
     desc.vert_path = "celestial/ring.vert";
     desc.frag_path = "celestial/ring.frag";
@@ -54,7 +59,9 @@ static rhi::GraphicsPipelineDesc ring_pipeline_desc(const rhi::VkContext& ctx, u
         {"RING_FINITE_SOURCE", light_mode == 1 ? "1" : "0"},
         {"RING_SINGLE_STAR", light_mode >= 2 ? "1" : "0"},
         {"RING_FIXED_SIDE", light_mode == 2 ? "1" : light_mode == 3 ? "0" : "-1"},
+        {"RING_PLANETSHINE", planetshine ? "1" : "0"},
         {"RING_PLANETSHINE_NUMERICAL", numerical ? "1" : "0"},
+        {"RING_REFRACTION", refracted ? "1" : "0"},
     };
     if (transparency) {
         desc.macros.push_back({"TRANSPARENCY_CAPTURE", "1"});
@@ -106,12 +113,14 @@ void RingRenderer::init(rhi::VkContext& ctx) {
         VkDeviceSize(RING_SHADOW_LUT_WIDTH) * RING_SHADOW_LUT_ANGLES * MAX_RING_HOSTS * sizeof(float);
     staging_.init(ctx, rebuild_bytes * rhi::FRAMES_IN_FLIGHT);
 
-    for (uint32_t i = 0; i < pipelines_.size(); ++i) {
-        pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, ring_pipeline_desc(ctx, i, false, false));
+    auto& default_opaque = pipeline_tables_[ring_pipeline_table(false, true, false, false)];
+    for (uint32_t i = 0; i < default_opaque.size(); ++i) {
+        default_opaque[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, ring_pipeline_desc(ctx, i, false, true, false, false));
     }
     if (ctx.fragment_stores_enabled()) {
-        for (uint32_t i = 0; i < transparency_pipelines_.size(); ++i) {
-            transparency_pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, ring_pipeline_desc(ctx, i, true, false));
+        auto& default_transp = pipeline_tables_[ring_pipeline_table(true, true, false, false)];
+        for (uint32_t i = 0; i < default_transp.size(); ++i) {
+            default_transp[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, ring_pipeline_desc(ctx, i, true, true, false, false));
         }
     }
     for (auto& atlas : ringshine_atlases_) {
@@ -186,10 +195,9 @@ void RingRenderer::shutdown(rhi::VkContext& ctx) {
     ctx.destroy_image(ring_planetshine_dummy_);
     for (auto& atlas : ring_planetshine_atlases_) ctx.destroy_image(atlas);
     rhi::ShaderCache::destroy_pipeline(ctx, ringshine_pipeline_);
-    for (auto& pipeline : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
-    for (auto& pipeline : transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
-    for (auto& pipeline : numerical_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
-    for (auto& pipeline : numerical_transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    for (auto& table : pipeline_tables_) {
+        for (auto& pipeline : table) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    }
     ctx.destroy_image(shadow_lut_);
     rhi::ShaderCache::destroy_pipeline(ctx, penumbra_pipeline_);
     ctx.destroy_image(penumbra_table_);
@@ -496,14 +504,12 @@ void RingRenderer::update_penumbra(VkCommandBuffer cmd, rhi::VkContext& ctx, con
     ctx.end_gpu_timer(cmd, timer);
 }
 
-rhi::Pipeline& RingRenderer::select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency, bool numerical) {
-    if (!numerical) {
-        return transparency ? transparency_pipelines_[variant_idx] : pipelines_[variant_idx];
-    }
-    auto& table = transparency ? numerical_transparency_pipelines_ : numerical_pipelines_;
+rhi::Pipeline& RingRenderer::select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency,
+                                            bool planetshine, bool numerical, bool refracted) {
+    auto& table = pipeline_tables_[ring_pipeline_table(transparency, planetshine, numerical, refracted)];
     if (table[variant_idx].handle == VK_NULL_HANDLE) {
         table[variant_idx] = rhi::ShaderCache::create_graphics_pipeline(
-            ctx, ring_pipeline_desc(ctx, variant_idx, transparency, true));
+            ctx, ring_pipeline_desc(ctx, variant_idx, transparency, planetshine, numerical, refracted));
     }
     return table[variant_idx];
 }
@@ -527,8 +533,10 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
     render_writes_.insert(render_writes_.end(), transparency_writes.begin(), transparency_writes.end());
 
     bool transparency = !transparency_writes.empty();
+    bool planetshine = settings.planetshine_enabled && !settings.direct_sunlight_only;
     bool numerical = settings.ring_planetshine_mode != 0;
-    const rhi::Pipeline& layout_ref = transparency ? transparency_pipelines_[0] : pipelines_[0];
+    bool refracted = refraction_body_ >= 0;
+    const rhi::Pipeline& layout_ref = select_pipeline(ctx, 0, transparency, planetshine, numerical, refracted);
     ctx.push_descriptors(cmd, layout_ref, render_writes_);
 
     uint32_t draw_count = std::min(active_host_count_, MAX_RING_HOSTS);
@@ -552,14 +560,13 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
         auto draw = [&](uint32_t first, uint32_t count, uint32_t packed, uint32_t segments, uint32_t pipeline_index) {
             if (bound_pipeline != pipeline_index) {
                 bound_pipeline = pipeline_index;
-                const rhi::Pipeline& pipe = select_pipeline(ctx, bound_pipeline, transparency, numerical);
+                const rhi::Pipeline& pipe = select_pipeline(ctx, bound_pipeline, transparency, planetshine, numerical, refracted);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.handle);
             }
             ctx.push_constants(cmd, layout_ref, Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});
             vkCmdDrawIndexed(cmd, count, 1, first, 0, 0);
         };
         const auto& host = hosts_gpu_[host_idx];
-        bool refracted = refraction_body_ >= 0;
         auto classification = classify_ring_draw(glm::vec3(host.center_min_r), glm::vec3(host.pole_max_r), host.pole_max_r.w, stars);
         if (stars.size() != 1 && classification.lighting != RingLightingMode::FiniteSource)
             classification.lighting = RingLightingMode::Point;

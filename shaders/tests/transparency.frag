@@ -11,6 +11,6 @@ layout(location = 0) out vec4 out_color;
 void main() {
     out_color = vec4(pc.color.rgb*pc.color.a, pc.color.a);
 #ifdef TRANSPARENCY_CAPTURE
-    if (capture_transparency(out_color)) out_color = vec4(0.0);
+    if (capture_transparency(out_color, gl_FragCoord.z, false, false)) out_color = vec4(0.0);
 #endif
 }

@@ -188,15 +188,14 @@ private:
     void bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingshineJob& job);
     void ensure_ring_planetshine_atlas(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t frame);
     void bake_ring_planetshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingPlanetshineJob& job);
-    rhi::Pipeline& select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency, bool numerical);
+    static constexpr uint32_t PIPELINE_TABLE_COUNT = 12;
+    rhi::Pipeline& select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency,
+                                   bool planetshine, bool numerical, bool refracted);
 
     AnnulusMesh mesh_{};
     int refraction_body_ = -1;
 
-    std::array<rhi::Pipeline, 16> pipelines_{};
-    std::array<rhi::Pipeline, 16> transparency_pipelines_{};
-    std::array<rhi::Pipeline, 16> numerical_pipelines_{};
-    std::array<rhi::Pipeline, 16> numerical_transparency_pipelines_{};
+    std::array<std::array<rhi::Pipeline, 16>, PIPELINE_TABLE_COUNT> pipeline_tables_{};
     rhi::Image gradient_atlas_{};
     rhi::Image shadow_lut_{};
     rhi::Pipeline penumbra_pipeline_{};

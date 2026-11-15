@@ -1,4 +1,5 @@
 const float RING_MAX_ALPHA = 0.99999994;
+const float RING_MS_MIN_TAU = 1e-3;
 
 float ring_tau(float alpha) {
     float a = clamp(alpha, 0.0, RING_MAX_ALPHA);
@@ -58,7 +59,8 @@ float ring_phase_hg(float cos_theta, float g) {
     float one_m_g = (gg >= 0.0) ? (1.0 - gg) : (1.0 + gg);
     float delta_mu = (gg >= 0.0) ? (1.0 - mu) : (1.0 + mu);
     float denom = max(one_m_g * one_m_g + 2.0 * abs(gg) * delta_mu, 1e-6);
-    return (1.0 - gg * gg) / (denom * sqrt(denom));
+    float inv_s = inversesqrt(denom);
+    return (1.0 - gg * gg) * inv_s * inv_s * inv_s;
 }
 
 float ring_phase_dhg(float cos_theta, float scatter, float g_fwd, float g_back, float tau_val, bool is_textured) {
@@ -91,7 +93,7 @@ vec3 ring_slab_x(float mu, float tau_val, vec3 w0) {
 
 vec3 ring_multiple_scattering(float tau_val, float mu_s, float mu_v, bool same_side, vec3 linear_rgb) {
     float tau = max(tau_val, 0.0);
-    if (tau < 1e-5) return vec3(0.0);
+    if (tau < RING_MS_MIN_TAU) return vec3(0.0);
 
     float luma = dot(linear_rgb, vec3(0.2126, 0.7152, 0.0722));
     vec3 w_transport = clamp(mix(vec3(luma), linear_rgb, 0.20) * 0.78, vec3(0.0), vec3(0.92));
@@ -157,7 +159,7 @@ vec4 ring_transfer_face(float total_tau, float mu_v, float sun_elev, bool same_s
     float mu_s = max(abs(sun_elev), 1e-5);
     float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
     float tau = max(total_tau, 0.0);
-    if (tau < 1e-5) {
+    if (tau < RING_MS_MIN_TAU) {
         return vec4(transfer, 0.0, 0.0, 0.0);
     }
     if (same_side) {
@@ -181,16 +183,16 @@ RingMediumOptics ring_medium_setup(float total_tau, float mu_v, vec4 props, vec3
     m.w_f = clamp(base_w + (is_textured ? (0.12 * m.dust_factor - 0.08 * m.core_factor) : 0.0), 0.0, 1.0);
     m.eff_rgb = clamp(linear_rgb, vec3(0.0), vec3(1.0));
 
-    if (m.tau >= 1e-5) {
+    if (m.tau >= RING_MS_MIN_TAU) {
         float luma = dot(m.eff_rgb, vec3(0.2126, 0.7152, 0.0722));
-        vec3 w_transport = clamp(mix(vec3(luma), m.eff_rgb, 0.20) * 0.78, vec3(0.0), vec3(0.92));
-        m.w_color = clamp(m.eff_rgb * 0.78, vec3(0.0), vec3(0.96));
-        vec3 root = sqrt(max(vec3(1.0) - w_transport, vec3(1e-6)));
+        vec3 w_transport = mix(vec3(luma), m.eff_rgb, 0.20) * 0.78;
+        m.w_color = m.eff_rgb * 0.78;
+        vec3 root = sqrt(vec3(1.0) - w_transport);
         m.k_diff = 1.7320508 * root;
         vec3 k_slab = m.k_diff + vec3(0.5);
-        float ms_v = max(mu_v, 1e-4);
-        vec3 h_v = vec3(1.0 + mu_v * 1.7320508) / (vec3(1.0) + mu_v * m.k_diff);
-        m.x_v = vec3(1.0) + (h_v - vec3(1.0)) * (vec3(1.0) - exp(-m.tau * (vec3(1.0 / ms_v) + k_slab)));
+        float inv_ms_v = 1.0 / max(mu_v, 1e-4);
+        vec3 h_v_m1 = (mu_v * (vec3(1.7320508) - m.k_diff)) / (vec3(1.0) + mu_v * m.k_diff);
+        m.x_v = vec3(1.0) + h_v_m1 * (vec3(1.0) - exp(-m.tau * (vec3(inv_ms_v) + k_slab)));
     } else {
         m.w_color = vec3(0.0);
         m.k_diff = vec3(0.0);
@@ -207,12 +209,12 @@ vec3 ring_radiance_face(RingMediumOptics m, vec4 tf, float mu_v, float sun_elev,
 
     vec3 ss = m.eff_rgb * (0.25 * phase * opp * tf.x);
     vec3 ms = vec3(0.0);
-    if (m.tau >= 1e-5) {
+    if (m.tau >= RING_MS_MIN_TAU) {
         float mu_s = max(abs(sun_elev), 1e-5);
         float ms_s = max(mu_s, 1e-4);
         vec3 k_slab = m.k_diff + vec3(0.5);
-        vec3 h_s = vec3(1.0 + mu_s * 1.7320508) / (vec3(1.0) + mu_s * m.k_diff);
-        vec3 x_s = vec3(1.0) + (h_s - vec3(1.0)) * (vec3(1.0) - exp(-m.tau * (vec3(1.0 / ms_s) + k_slab)));
+        vec3 h_s_m1 = (mu_s * (vec3(1.7320508) - m.k_diff)) / (vec3(1.0) + mu_s * m.k_diff);
+        vec3 x_s = vec3(1.0) + h_s_m1 * (vec3(1.0) - exp(-m.tau * (vec3(1.0 / ms_s) + k_slab)));
         vec3 multi_bounce = max(x_s * m.x_v - vec3(1.0), vec3(0.0));
 
         if (same_side) {
@@ -236,14 +238,13 @@ vec3 ring_radiance_core(float total_tau, float mu_v, float sun_elev, float cos_t
     return ring_radiance_face(m, tf, mu_v, sun_elev, cos_theta, props, is_textured, same_side, broaden, opp);
 }
 
-vec3 ring_radiance_planetshine_pair(float total_tau, float mu_v, vec4 props, vec3 linear_rgb, bool is_textured,
-                                    bool has_same, vec3 same_flux, vec4 same_tf, float same_elev,
-                                    float same_phase, float same_broaden, float same_opp,
-                                    bool has_other, vec3 other_flux, vec4 other_tf, float other_elev,
-                                    float other_phase, float other_broaden) {
+vec3 ring_radiance_planetshine_pair_medium(RingMediumOptics m, float total_tau, float mu_v, vec4 props, bool is_textured,
+                                           bool has_same, vec3 same_flux, vec4 same_tf, float same_elev,
+                                           float same_phase, float same_broaden, float same_opp,
+                                           bool has_other, vec3 other_flux, vec4 other_tf, float other_elev,
+                                           float other_phase, float other_broaden) {
     bool do_other = has_other && (props.w > 0.0);
     if (!has_same && !do_other) return vec3(0.0);
-    RingMediumOptics m = ring_medium_setup(total_tau, mu_v, props, linear_rgb, is_textured);
     vec3 out_rad = vec3(0.0);
     if (has_same) {
         out_rad += same_flux * ring_radiance_face(
@@ -254,6 +255,20 @@ vec3 ring_radiance_planetshine_pair(float total_tau, float mu_v, vec4 props, vec
             m, other_tf, mu_v, other_elev, other_phase, props, is_textured, false, other_broaden, 1.0);
     }
     return out_rad;
+}
+
+vec3 ring_radiance_planetshine_pair(float total_tau, float mu_v, vec4 props, vec3 linear_rgb, bool is_textured,
+                                    bool has_same, vec3 same_flux, vec4 same_tf, float same_elev,
+                                    float same_phase, float same_broaden, float same_opp,
+                                    bool has_other, vec3 other_flux, vec4 other_tf, float other_elev,
+                                    float other_phase, float other_broaden) {
+    bool do_other = has_other && (props.w > 0.0);
+    if (!has_same && !do_other) return vec3(0.0);
+    RingMediumOptics m = ring_medium_setup(total_tau, mu_v, props, linear_rgb, is_textured);
+    return ring_radiance_planetshine_pair_medium(
+        m, total_tau, mu_v, props, is_textured,
+        has_same, same_flux, same_tf, same_elev, same_phase, same_broaden, same_opp,
+        has_other, other_flux, other_tf, other_elev, other_phase, other_broaden);
 }
 
 vec3 ring_radiance_rgb(float total_tau, float mu_v, float sun_elev, float cos_theta,

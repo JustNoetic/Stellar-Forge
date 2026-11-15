@@ -10,10 +10,9 @@ void TransparencyRenderer::init(rhi::VkContext& ctx) {
         sf::log::warn("Fragment storage atomics are unavailable; transparent objects use legacy draw-order blending.");
     std::vector<rhi::DescriptorLayoutBinding> bindings{
         {14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT},
-        {15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT}};
-    clear_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/clear.comp", bindings, sizeof(uint32_t));
-    bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT});
-    bindings.push_back({3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT});
+        {15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT},
+        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}};
     resolve_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/resolve.comp", bindings);
     bindings.push_back({5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT});
     const std::array macros{std::pair<std::string, std::string>{"BLOOM_OUTPUT", "1"}};
@@ -30,7 +29,6 @@ void TransparencyRenderer::shutdown(rhi::VkContext& ctx) {
     }
     retired_.clear();
     for (auto& buffer : counters_) ctx.destroy_buffer(buffer);
-    rhi::ShaderCache::destroy_pipeline(ctx, clear_);
     rhi::ShaderCache::destroy_pipeline(ctx, resolve_);
     rhi::ShaderCache::destroy_pipeline(ctx, bloom_resolve_);
 }
@@ -52,24 +50,35 @@ void TransparencyRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, VkE
     auto timer = ctx.begin_gpu_timer(cmd, "transparency_clear");
     if (heads_.extent.width != extent.width || heads_.extent.height != extent.height) {
         if (heads_) retired_.push_back({heads_, {}, ctx.recording_serial()});
-        heads_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_STORAGE_BIT);
+        heads_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R32_UINT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     }
     uint32_t capacity = uint32_t(std::min<uint64_t>(uint64_t(extent.width)*extent.height*2, 8*1024*1024));
-    capacity = std::min(capacity, uint32_t((ctx.device_properties().limits.maxStorageBufferRange-16)/16));
+    uint32_t max_cap = uint32_t(((ctx.device_properties().limits.maxStorageBufferRange - 16) / 16) & ~3u);
+    capacity = std::min(capacity, max_cap);
+    uint32_t stride = (capacity + 3u) & ~3u;
     if (capacity > capacity_) {
         if (fragments_) retired_.push_back({{}, fragments_, ctx.recording_serial()});
         capacity_ = capacity;
-        fragments_ = ctx.create_device_buffer(16+VkDeviceSize(capacity_)*16,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        fragments_ = ctx.create_device_buffer(16 + VkDeviceSize(stride) * 16,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
-    ctx.transition_image(cmd, heads_, VK_IMAGE_LAYOUT_GENERAL);
-    ctx.memory_barrier(cmd);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, clear_.handle);
-    ctx.push_descriptors(cmd, clear_, writes());
-    ctx.push_constants(cmd, clear_, capacity);
-    vkCmdDispatch(cmd, (extent.width+7)/8, (extent.height+7)/8, 1);
-    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    ctx.transition_image(cmd, heads_, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    ctx.memory_barrier(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkClearColorValue clear_val{};
+    clear_val.uint32[0] = 0xffffffffu;
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, heads_.handle, VK_IMAGE_LAYOUT_GENERAL, &clear_val, 1, &range);
+    const uint32_t header[4]{0u, 0u, capacity, stride};
+    vkCmdUpdateBuffer(cmd, fragments_.handle, 0, sizeof(header), header);
+    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     ctx.end_gpu_timer(cmd, timer);
 }
 

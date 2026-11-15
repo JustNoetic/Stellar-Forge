@@ -429,18 +429,21 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
         float cloud_depth;
         bool clouded = cloud_layer_fetch(transparent_pixel, texelFetch(scene_depth, transparent_pixel, 0).r, cloud, cloud_depth);
         bool cloud_transported = false, cloud_missed = false;
+        bool single = (current & TRANSPARENCY_MULTI_BIT) == 0u;
+        current &= TRANSPARENCY_INDEX_MASK;
         if (transparent_span > 0.0) {
             while (current != TRANSPARENCY_END) {
-                uvec4 fragment = fragments[current];
+                uint frag_depth_bits = transparent_depth_bits(current);
+                uint frag_next = single ? TRANSPARENCY_END : transparent_next(current);
 #ifdef ATMOSPHERE_TILE_DEFERRED
-                if ((fragment.z & TRANSPARENT_DEFERRED_BIT) == 0u) {
-                    current = fragment.w;
+                if ((frag_depth_bits & TRANSPARENT_DEFERRED_BIT) == 0u) {
+                    current = frag_next;
                     continue;
                 }
-                fragment.z &= ~TRANSPARENT_DEFERRED_BIT;
-                fragments[current].z = fragment.z;
+                frag_depth_bits &= ~TRANSPARENT_DEFERRED_BIT;
+                set_transparent_depth_bits(current, frag_depth_bits);
 #endif
-                float fragment_depth = uintBitsToFloat(fragment.z);
+                float fragment_depth = uintBitsToFloat(frag_depth_bits);
                 bool need_cloud = clouded && fragment_depth < cloud_depth && !cloud_transported;
                 bool fragment_valid = false, fragment_missed = false;
                 for (int pass = need_cloud ? 0 : 1; pass < 2; ++pass) {
@@ -482,7 +485,8 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                 }
                 if (fragment_valid) {
                     bool missed = fragment_missed;
-                    vec4 color = transparent_color(fragment);
+                    uvec2 frag_packed = transparent_color_packed(current);
+                    vec4 color = transparent_color(frag_packed);
                     color.rgb = color.rgb*T+color.a*L*atm.depth_params.x;
 #ifdef ATMOSPHERE_LIMB
                     if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, fragment_depth)) < top_radius()) {
@@ -496,13 +500,13 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                     }
 #ifdef ATMOSPHERE_TILE_LEAN
                     if (missed) {
-                        fragments[current].z = fragment.z | TRANSPARENT_DEFERRED_BIT;
+                        set_transparent_depth_bits(current, frag_depth_bits | TRANSPARENT_DEFERRED_BIT);
                         deferred_any = true;
                     } else
 #endif
-                    fragments[current].xy = pack_transparent_color(color, transparent_excludes_bloom(fragment));
+                    set_transparent_color_packed(current, pack_transparent_color(color, transparent_excludes_bloom(frag_packed)));
                 }
-                current = fragment.w;
+                current = frag_next;
             }
         }
     }

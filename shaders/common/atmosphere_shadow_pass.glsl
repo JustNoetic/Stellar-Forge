@@ -114,9 +114,17 @@ void evaluate_shadow_pixel(ivec2 pixel) {
 #ifdef ATMOSPHERE_SHADOW_TRANSPARENCY
     if (path > 0.0) {
         uint current = imageLoad(transparency_heads, pixel).x;
-        while (current != TRANSPARENCY_END) {
-            transparent_depth = max(transparent_depth, uintBitsToFloat(fragments[current].z));
-            current = fragments[current].w;
+        if (current != TRANSPARENCY_END) {
+            bool single = (current & TRANSPARENCY_MULTI_BIT) == 0u;
+            current &= TRANSPARENCY_INDEX_MASK;
+            if (single) {
+                transparent_depth = uintBitsToFloat(transparent_depth_bits(current));
+            } else {
+                while (current != TRANSPARENCY_END) {
+                    transparent_depth = max(transparent_depth, uintBitsToFloat(transparent_depth_bits(current)));
+                    current = transparent_next(current);
+                }
+            }
         }
     }
 #endif

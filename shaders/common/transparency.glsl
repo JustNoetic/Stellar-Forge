@@ -3,19 +3,51 @@ layout(std430, set = 0, binding = 15) buffer TransparentFragments {
     uint fragment_count;
     uint overflow_count;
     uint fragment_capacity;
-    uint reserved;
-    uvec4 fragments[];
+    uint fragment_stride;
+    uvec2 fragment_data[];
 };
 
 const uint TRANSPARENCY_END = 0xffffffffu;
+const uint TRANSPARENCY_MULTI_BIT = 0x80000000u;
+const uint TRANSPARENCY_DEPTH_BIT = 0x40000000u;
+const uint TRANSPARENCY_INDEX_MASK = 0x3fffffffu;
 
-vec4 transparent_color(uvec4 fragment) {
-    vec4 color = vec4(unpackHalf2x16(fragment.x), unpackHalf2x16(fragment.y));
+uvec2 transparent_color_packed(uint idx) { return fragment_data[idx]; }
+
+void set_transparent_color_packed(uint idx, uvec2 packed) { fragment_data[idx] = packed; }
+
+uint transparent_depth_bits(uint idx) {
+    uvec2 pair = fragment_data[fragment_stride + (idx >> 1u)];
+    return (idx & 1u) == 0u ? pair.x : pair.y;
+}
+
+void set_transparent_depth_bits(uint idx, uint bits) {
+    uint slot = fragment_stride + (idx >> 1u);
+    if ((idx & 1u) == 0u) fragment_data[slot].x = bits;
+    else fragment_data[slot].y = bits;
+}
+
+uint transparent_next(uint idx) {
+    uvec2 pair = fragment_data[fragment_stride + (fragment_stride >> 1u) + (idx >> 1u)];
+    return (idx & 1u) == 0u ? pair.x : pair.y;
+}
+
+void set_transparent_next(uint idx, uint next) {
+    uint slot = fragment_stride + (fragment_stride >> 1u) + (idx >> 1u);
+    if ((idx & 1u) == 0u) fragment_data[slot].x = next;
+    else fragment_data[slot].y = next;
+}
+
+vec4 transparent_color(uvec2 packed) {
+    vec4 color = vec4(unpackHalf2x16(packed.x), unpackHalf2x16(packed.y));
     color.a = abs(color.a);
     return color;
 }
 
-bool transparent_excludes_bloom(uvec4 fragment) { return (fragment.y & 0x80000000u) != 0u; }
+vec4 transparent_color(uvec4 fragment) { return transparent_color(fragment.xy); }
+
+bool transparent_excludes_bloom(uvec2 packed) { return (packed.y & 0x80000000u) != 0u; }
+bool transparent_excludes_bloom(uvec4 fragment) { return transparent_excludes_bloom(fragment.xy); }
 
 uvec2 pack_transparent_color(vec4 color, bool exclude_bloom) {
     color = clamp(color, vec4(0.0), vec4(65000.0, 65000.0, 65000.0, 1.0));
@@ -27,7 +59,7 @@ uvec2 pack_transparent_color(vec4 color, bool exclude_bloom) {
 uvec2 pack_transparent_color(vec4 color) { return pack_transparent_color(color, false); }
 
 #ifdef TRANSPARENCY_CAPTURE
-bool capture_transparency(vec4 color, float depth, bool exclude_bloom) {
+bool capture_transparency(vec4 color, float depth, bool exclude_bloom, bool needs_depth_test) {
 #ifdef GL_KHR_shader_subgroup_ballot
     bool active_lane = !gl_HelperInvocation && color.a > 0.0;
     uvec4 ballot = subgroupBallot(active_lane);
@@ -53,11 +85,22 @@ bool capture_transparency(vec4 color, float depth, bool exclude_bloom) {
         return false;
     }
 #endif
-    uint previous = imageAtomicExchange(transparency_heads, ivec2(gl_FragCoord.xy), index);
-    fragments[index] = uvec4(pack_transparent_color(color, exclude_bloom), floatBitsToUint(depth), previous);
+    uint entry = index | (needs_depth_test ? TRANSPARENCY_DEPTH_BIT : 0u);
+    uint previous = imageAtomicExchange(transparency_heads, ivec2(gl_FragCoord.xy), entry);
+    uint prev_next = TRANSPARENCY_END;
+    if (previous != TRANSPARENCY_END) {
+        imageAtomicOr(transparency_heads, ivec2(gl_FragCoord.xy), TRANSPARENCY_MULTI_BIT);
+        prev_next = previous & TRANSPARENCY_INDEX_MASK;
+    }
+    set_transparent_color_packed(index, pack_transparent_color(color, exclude_bloom));
+    set_transparent_depth_bits(index, floatBitsToUint(depth));
+    set_transparent_next(index, prev_next);
     return true;
 }
 
-bool capture_transparency(vec4 color, float depth) { return capture_transparency(color, depth, false); }
-bool capture_transparency(vec4 color) { return capture_transparency(color, gl_FragCoord.z, false); }
+bool capture_transparency(vec4 color, float depth, bool exclude_bloom) {
+    return capture_transparency(color, depth, exclude_bloom, true);
+}
+bool capture_transparency(vec4 color, float depth) { return capture_transparency(color, depth, false, true); }
+bool capture_transparency(vec4 color) { return capture_transparency(color, gl_FragCoord.z, false, true); }
 #endif

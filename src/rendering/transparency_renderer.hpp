@@ -29,7 +29,7 @@ public:
 private:
     rhi::Image heads_;
     rhi::Buffer fragments_;
-    rhi::Pipeline clear_, resolve_, bloom_resolve_;
+    rhi::Pipeline resolve_, bloom_resolve_;
     uint32_t capacity_ = 0;
     bool active_ = false;
     struct Retired {
