@@ -9,11 +9,6 @@ layout(location = 0) in vec3 f_local_pos;
 layout(location = 1) in vec3 f_normal;
 layout(location = 2) flat in uint f_host_idx;
 
-layout(location = 3) in vec3 f_shine_top;
-layout(location = 4) in vec3 f_shine_bottom;
-layout(location = 5) in vec3 f_shine_top_direction;
-layout(location = 6) in vec3 f_shine_bottom_direction;
-
 layout(location = 0) out vec4 out_color;
 #ifdef TRANSPARENCY_CAPTURE
 #include "common/transparency.glsl"
@@ -22,8 +17,16 @@ layout(location = 0) out vec4 out_color;
 #include "common/celestial_scene.glsl"
 #include "common/eclipse_shadow.glsl"
 #include "common/surface_ring_shadow.glsl"
+#ifndef RING_PLANETSHINE_NUMERICAL
+#define RING_PLANETSHINE_NUMERICAL 0
+#endif
+
 #include "common/ring_optics.glsl"
+#if RING_PLANETSHINE_NUMERICAL
 #include "common/ring_planetshine_disk.glsl"
+#else
+#include "common/ring_planetshine_lookup.glsl"
+#endif
 #include "common/ring_push.glsl"
 #include "common/ring_refraction.glsl"
 
@@ -181,51 +184,119 @@ void main() {
     }
 
     if (u_scene.ringshine_params.z != 0u) {
-        vec3 same_flux = cam_side >= 0.0 ? f_shine_top : f_shine_bottom;
-        vec3 other_flux = cam_side >= 0.0 ? f_shine_bottom : f_shine_top;
-        vec3 same_direction = cam_side >= 0.0 ? f_shine_top_direction : f_shine_bottom_direction;
-        vec3 other_direction = cam_side >= 0.0 ? f_shine_bottom_direction : f_shine_top_direction;
-        bool has_same = any(greaterThan(same_flux, vec3(0.0)));
-        bool has_other = any(greaterThan(other_flux, vec3(0.0)));
-        vec3 same_light = same_direction/max(length(same_direction), 1e-20);
-        vec3 other_light = other_direction/max(length(other_direction), 1e-20);
-        float same_elevation = dot(pole_n, same_light), other_elevation = dot(pole_n, other_light);
-        float same_phase = clamp(-dot(same_light, V), -1.0, 1.0);
-        float other_phase = clamp(-dot(other_light, V), -1.0, 1.0);
-        float angular_radius = clamp(ring_hosts[f_host_idx].tangent_radius.w/max(r, 1e-12), 0.0, 1.0);
-        float broaden = 1.0/(1.0+1.2*angular_radius);
-        uint remaining = active_mask;
-        while (remaining != 0u) {
-            uint slot = uint(findLSB(remaining));
-            uint i = (u_push.packed_segments >> (slot*3u)) & 7u;
-            remaining &= remaining-1u;
-            RingSegmentGPU seg = ring_hosts[f_host_idx].segments[i];
-            vec4 props = vec4(seg.phase_row.xy*broaden, seg.bounds_opacity_scatter.w, seg.phase_row.z);
-            vec3 response = vec3(0.0);
-            if (has_same) response += same_flux*ring_radiance_rgb(total_tau, mu_v, same_elevation, same_phase,
-                props, samples[slot].xyz, seg.color_flags.w > 0.5, true);
-            if (has_other) response += other_flux*ring_radiance_rgb(total_tau, mu_v, other_elevation, other_phase,
-                props, samples[slot].xyz, seg.color_flags.w > 0.5, false);
-            total_illum += (samples[slot].w/total_tau)*response;
-        }
-        if (u_scene.ringshine_params.w == 1u) {
-            for (int q = 0; q < RING_DISK_SAMPLES; ++q) {
-                vec3 incident;
-                vec4 source = ring_host_disk_sample(f_host_idx, hit_local, pole_n, q, incident);
-                if (!any(greaterThan(incident, vec3(0.0)))) continue;
-                float sun = dot(pole_n, source.xyz), phase = clamp(-dot(source.xyz, V), -1.0, 1.0);
-                uint pending = active_mask;
-                while (pending != 0u) {
-                    uint slot = uint(findLSB(pending)); pending &= pending-1u;
-                    uint i = (u_push.packed_segments >> (slot*3u)) & 7u;
-                    RingSegmentGPU seg = ring_hosts[f_host_idx].segments[i];
-                    vec4 props = vec4(seg.phase_row.xy, seg.bounds_opacity_scatter.w, seg.phase_row.z);
-                    vec3 response = ring_radiance_rgb(total_tau, mu_v, sun, phase, props,
-                        samples[slot].xyz, seg.color_flags.w > 0.5, cam_side*sun >= 0.0);
-                    total_illum += incident*(samples[slot].w/total_tau)*response;
-                }
+        uint host_body = ring_hosts[f_host_idx].counts_indices.x;
+        vec3 moon_same_flux = vec3(0.0);
+        vec3 moon_other_flux = vec3(0.0);
+        vec3 moon_same_dir = vec3(0.0);
+        vec3 moon_other_dir = vec3(0.0);
+        float moon_same_sin = 0.0;
+        float moon_other_sin = 0.0;
+        float moon_same_w = 0.0;
+        float moon_other_w = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            vec3 flux = bodies[host_body].shine_irradiance[i].rgb;
+            if (!any(greaterThan(flux, vec3(0.0)))) continue;
+            vec3 light = bodies[host_body].shine_direction[i].xyz;
+            float ext_sin_rad = sin(clamp(bodies[host_body].shine_direction[i].w, 0.0, 1.5));
+            float w = max(dot(flux, vec3(0.2126, 0.7152, 0.0722)), 1e-30);
+            if (cam_side * dot(pole_n, light) >= 0.0) {
+                moon_same_flux += flux;
+                moon_same_dir += light * w;
+                moon_same_sin += ext_sin_rad * w;
+                moon_same_w += w;
+            } else {
+                moon_other_flux += flux;
+                moon_other_dir += light * w;
+                moon_other_sin += ext_sin_rad * w;
+                moon_other_w += w;
             }
         }
+        bool has_moon_same = any(greaterThan(moon_same_flux, vec3(0.0)));
+        bool has_moon_other = any(greaterThan(moon_other_flux, vec3(0.0)));
+        if (has_moon_same || has_moon_other) {
+            vec3 ms_light = has_moon_same ? normalize(moon_same_dir) : vec3(0.0, 1.0, 0.0);
+            vec3 mo_light = has_moon_other ? normalize(moon_other_dir) : vec3(0.0, 1.0, 0.0);
+            float ms_sin = has_moon_same ? (moon_same_sin / moon_same_w) : 0.0;
+            float mo_sin = has_moon_other ? (moon_other_sin / moon_other_w) : 0.0;
+            float ms_elev = dot(pole_n, ms_light);
+            float mo_elev = dot(pole_n, mo_light);
+            float ms_phase = clamp(-dot(ms_light, V), -1.0, 1.0);
+            float mo_phase = clamp(-dot(mo_light, V), -1.0, 1.0);
+            vec3 ms_terms = (has_moon_same && ms_sin > 1e-5) ? ring_extended_terms(ms_phase, ms_sin, true) : vec3(0.0);
+            vec3 mo_terms = (has_moon_other && mo_sin > 1e-5) ? ring_extended_terms(mo_phase, mo_sin, false) : vec3(0.0);
+            uint pending = active_mask;
+            while (pending != 0u) {
+                uint slot = uint(findLSB(pending));
+                pending &= pending - 1u;
+                uint seg_idx = (u_push.packed_segments >> (slot * 3u)) & 7u;
+                RingSegmentGPU seg = ring_hosts[f_host_idx].segments[seg_idx];
+                vec4 props = vec4(seg.phase_row.xy, seg.bounds_opacity_scatter.w, seg.phase_row.z);
+                vec3 response = vec3(0.0);
+                if (has_moon_same) response += moon_same_flux * ring_radiance_rgb_extended_terms(total_tau, mu_v, ms_elev, ms_phase,
+                    props, samples[slot].xyz, seg.color_flags.w > 0.5, true, ms_sin, ms_terms);
+                if (has_moon_other) response += moon_other_flux * ring_radiance_rgb_extended_terms(total_tau, mu_v, mo_elev, mo_phase,
+                    props, samples[slot].xyz, seg.color_flags.w > 0.5, false, mo_sin, mo_terms);
+                total_illum += (samples[slot].w / total_tau) * response;
+            }
+        }
+#if !RING_PLANETSHINE_NUMERICAL
+        float host_radius = bodies[host_body].pos_radius.w;
+        vec3 host_albedo = clamp(bodies[host_body].color_is_star.rgb, 0.0, 1.0);
+        for (uint s = 0u; s < (RING_SINGLE_STAR != 0 ? 1u : u_scene.num_stars); ++s) {
+            if (!star_lights_body(host_body, s)) continue;
+            vec3 to_star = u_scene.stars_pos_radius[s].xyz - host_center;
+            float star_dist = length(to_star);
+            if (star_dist <= 1e-12) continue;
+            float irradiance = (u_scene.hdr_enabled != 0u) ? (u_scene.stars_color_lum[s].w / (star_dist * star_dist)) : 1.0;
+            vec3 flux_scale = host_albedo * u_scene.stars_color_lum[s].rgb * irradiance;
+            vec3 same_flux, same_light, other_flux, other_light;
+            float same_spread, other_spread;
+            ring_planetshine_sample_star(f_host_idx, s, hit_local, pole_n, to_star / star_dist,
+                                         flux_scale, host_radius, cam_side,
+                                         same_flux, same_light, same_spread,
+                                         other_flux, other_light, other_spread);
+            bool has_same = any(greaterThan(same_flux, vec3(0.0)));
+            bool has_other = any(greaterThan(other_flux, vec3(0.0)));
+            if (!has_same && !has_other) continue;
+            float same_elevation = dot(pole_n, same_light);
+            float other_elevation = dot(pole_n, other_light);
+            float same_phase = clamp(-dot(same_light, V), -1.0, 1.0);
+            float other_phase = clamp(-dot(other_light, V), -1.0, 1.0);
+            vec3 same_terms = (has_same && same_spread > 1e-5) ? ring_extended_terms(same_phase, same_spread, true) : vec3(0.0);
+            vec3 other_terms = (has_other && other_spread > 1e-5) ? ring_extended_terms(other_phase, other_spread, false) : vec3(0.0);
+            uint remaining = active_mask;
+            while (remaining != 0u) {
+                uint slot = uint(findLSB(remaining));
+                remaining &= remaining - 1u;
+                uint seg_idx = (u_push.packed_segments >> (slot * 3u)) & 7u;
+                RingSegmentGPU seg = ring_hosts[f_host_idx].segments[seg_idx];
+                vec4 props = vec4(seg.phase_row.xy, seg.bounds_opacity_scatter.w, seg.phase_row.z);
+                vec3 response = vec3(0.0);
+                if (has_same) response += same_flux * ring_radiance_rgb_extended_terms(total_tau, mu_v, same_elevation, same_phase,
+                    props, samples[slot].xyz, seg.color_flags.w > 0.5, true, same_spread, same_terms);
+                if (has_other) response += other_flux * ring_radiance_rgb_extended_terms(total_tau, mu_v, other_elevation, other_phase,
+                    props, samples[slot].xyz, seg.color_flags.w > 0.5, false, other_spread, other_terms);
+                total_illum += (samples[slot].w / total_tau) * response;
+            }
+        }
+#else
+        for (int q = 0; q < RING_DISK_SAMPLES; ++q) {
+            vec3 incident;
+            vec4 source = ring_host_disk_sample(f_host_idx, hit_local, pole_n, q, incident);
+            if (!any(greaterThan(incident, vec3(0.0)))) continue;
+            float sun = dot(pole_n, source.xyz), phase = clamp(-dot(source.xyz, V), -1.0, 1.0);
+            uint pending = active_mask;
+            while (pending != 0u) {
+                uint slot = uint(findLSB(pending)); pending &= pending-1u;
+                uint i = (u_push.packed_segments >> (slot*3u)) & 7u;
+                RingSegmentGPU seg = ring_hosts[f_host_idx].segments[i];
+                vec4 props = vec4(seg.phase_row.xy, seg.bounds_opacity_scatter.w, seg.phase_row.z);
+                vec3 response = ring_radiance_rgb(total_tau, mu_v, sun, phase, props,
+                    samples[slot].xyz, seg.color_flags.w > 0.5, cam_side*sun >= 0.0);
+                total_illum += incident*(samples[slot].w/total_tau)*response;
+            }
+        }
+#endif
     }
 
     float exposure = (u_scene.hdr_enabled != 0u) ? u_scene.screen_params.w : 1.0;

@@ -337,6 +337,7 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     materials_.update(sys);
     planetshine_ = prepare_planetshine(sys, settings.planetshine_enabled && !settings.direct_sunlight_only,
         settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_);
+    rings_.update_ring_planetshine(cmd, ctx, cam, sys, settings, count, extent, materials_);
     });
     measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_, &refraction_.host()); });
     measure("cpu_planetshine_maps_ms", [&] { bake_planetshine_maps(cmd, ctx, cam, sys, extent, count); });

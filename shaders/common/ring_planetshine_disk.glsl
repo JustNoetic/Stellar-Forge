@@ -22,19 +22,35 @@ vec4 ring_host_disk_sample(uint host_index, vec3 hit_local, vec3 pole, int q, ou
     BodyInstanceGPU host = bodies[body_index];
     float radius = host.pos_radius.w, distance = length(hit_local);
     incident = vec3(0.0);
-    if (distance <= radius) return vec4(0.0);
+    if (distance <= radius || radius <= 1e-12) return vec4(0.0);
     float ratio = clamp(radius/distance, 0.0, 0.999);
-    vec4 sample_ray = ring_disk_sample(-hit_local/distance, pole, ratio, q);
-    vec3 D = sample_ray.xyz;
+    vec3 center = -hit_local/distance;
+    vec3 vertical = pole-center*dot(pole,center);
+    if (dot(vertical,vertical)<1e-8) {
+        vec3 axis = abs(center.x)<0.8 ? vec3(1,0,0) : vec3(0,0,1);
+        vertical = axis-center*dot(axis,center);
+    }
+    vertical = normalize(vertical);
+    vec3 horizontal = cross(center,vertical);
+    int row = q/16;
+    float azimuth = (float(q%16)+0.5)*(2.0*3.141592653589793/16.0);
+    float rho = sqrt(RING_DISK_R2[row]);
+    float r_sin = ratio*rho;
+    float cosine = sqrt(1.0-r_sin*r_sin);
+    vec3 tangent = vertical*sin(azimuth)+horizontal*cos(azimuth);
+    vec3 D = center*cosine+r_sin*tangent;
+    vec4 sample_ray = vec4(D, RING_DISK_W[row]/(16.0*cosine));
     float polar = max(1.0-clamp(host.pole_oblateness.w, 0.0, 0.95), 0.05);
-    float eta = 1.0/(polar*polar), oq = dot(hit_local, pole), dq = dot(D, pole);
-    float c = dot(hit_local, hit_local)+(eta-1.0)*oq*oq-radius*radius;
-    float a = 1.0+(eta-1.0)*dq*dq, b = dot(hit_local, D)+(eta-1.0)*oq*dq;
+    float eta = 1.0/(polar*polar);
+    vec3 p_close = -center*(ratio*rho*rho)+tangent*(cosine*rho);
+    float pq = dot(p_close, pole), dq = dot(D, pole);
+    float a = 1.0+(eta-1.0)*dq*dq;
+    float b = (eta-1.0)*pq*dq;
+    float c = rho*rho+(eta-1.0)*pq*pq-1.0;
     float discriminant = b*b-a*c;
     if (discriminant <= 0.0) return sample_ray;
     float along = (-b-sqrt(discriminant))/a;
-    if (along <= 0.0) return sample_ray;
-    vec3 Q = hit_local+along*D;
+    vec3 Q = (p_close+along*D)*radius;
     vec3 normal = normalize(Q+pole*((eta-1.0)*dot(Q, pole)));
     vec3 host_center = ring_hosts[host_index].center_min_r.xyz;
     for (uint s = 0u; s < u_scene.num_stars; ++s) {

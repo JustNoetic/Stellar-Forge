@@ -135,6 +135,69 @@ vec3 ring_radiance_rgb(float total_tau, float mu_v, float sun_elev, float cos_th
     return (ss + ms) * side_scale;
 }
 
+float ring_opposition_factor_extended_terms(float alpha_rad, float tau_val, float spread) {
+    float eff_alpha = sqrt(alpha_rad * alpha_rad + 0.36 * spread * spread);
+
+    float shoe_width = 0.030;
+    float shoe_amp = 0.55 * smoothstep(0.02, 0.45, tau_val) * (shoe_width / (shoe_width + 0.75 * spread));
+    float shoe = shoe_amp / (1.0 + eff_alpha / shoe_width);
+
+    float cboe_width = 0.0025;
+    float cboe_amp = 0.35 * smoothstep(0.005, 0.18, tau_val) * (cboe_width / (cboe_width + 0.75 * spread));
+    float x_cb = eff_alpha / cboe_width;
+    float cboe = cboe_amp / (1.0 + x_cb * x_cb);
+
+    return 1.0 + shoe + cboe;
+}
+
+float ring_opposition_factor_extended(float cos_alpha, float tau_val, float source_sin_radius) {
+    float ca = clamp(cos_alpha, -1.0, 1.0);
+    float alpha_rad = acos(clamp(ca, -1.0, 1.0 - 1e-7));
+    float spread = asin(clamp(source_sin_radius, 0.0, 0.999));
+    return ring_opposition_factor_extended_terms(alpha_rad, tau_val, spread);
+}
+
+vec3 ring_extended_terms(float cos_theta, float source_sin_radius, bool same_side) {
+    float broaden = 1.0 / (1.0 + 1.2 * source_sin_radius);
+    float spread = asin(clamp(source_sin_radius, 0.0, 0.999));
+    float alpha_rad = same_side ? acos(clamp(-cos_theta, -1.0, 1.0 - 1e-7)) : 0.0;
+    return vec3(broaden, spread, alpha_rad);
+}
+
+vec3 ring_radiance_rgb_extended_terms(float total_tau, float mu_v, float sun_elev, float cos_theta,
+                                      vec4 props, vec3 linear_rgb, bool is_textured, bool same_side,
+                                      float source_sin_radius, vec3 ext_terms) {
+    if (source_sin_radius <= 1e-5) {
+        return ring_radiance_rgb(total_tau, mu_v, sun_elev, cos_theta, props, linear_rgb, is_textured, same_side);
+    }
+    float mu_s = max(abs(sun_elev), 1e-5);
+    float g_fwd = props.x * ext_terms.x;
+    float g_back = props.y * ext_terms.x;
+    float scatter = props.z;
+    float unlit_factor = props.w;
+
+    vec3 eff_rgb = clamp(linear_rgb, vec3(0.0), vec3(1.0));
+    float phase = ring_phase_dhg(cos_theta, scatter, g_fwd, g_back, total_tau, is_textured);
+    float opp = same_side ? ring_opposition_factor_extended_terms(ext_terms.z, total_tau, ext_terms.y) : 1.0;
+    float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
+
+    vec3 ss = eff_rgb * (0.25 * phase * opp * transfer);
+    vec3 ms = ring_multiple_scattering(total_tau, mu_s, mu_v, same_side, eff_rgb);
+    float side_scale = same_side ? 1.0 : unlit_factor;
+    return (ss + ms) * side_scale;
+}
+
+vec3 ring_radiance_rgb_extended(float total_tau, float mu_v, float sun_elev, float cos_theta,
+                                vec4 props, vec3 linear_rgb, bool is_textured, bool same_side,
+                                float source_sin_radius) {
+    if (source_sin_radius <= 1e-5) {
+        return ring_radiance_rgb(total_tau, mu_v, sun_elev, cos_theta, props, linear_rgb, is_textured, same_side);
+    }
+    vec3 ext_terms = ring_extended_terms(cos_theta, source_sin_radius, same_side);
+    return ring_radiance_rgb_extended_terms(total_tau, mu_v, sun_elev, cos_theta, props, linear_rgb,
+                                            is_textured, same_side, source_sin_radius, ext_terms);
+}
+
 int ring_visible_source_count(float sin_elevation, float sin_radius) {
     return (sin_radius > 1e-6 && abs(sin_elevation) < sin_radius) ? 4 : 1;
 }

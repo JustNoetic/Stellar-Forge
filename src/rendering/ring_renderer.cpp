@@ -5,12 +5,61 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <format>
 
 namespace sf::rendering {
 
 static bool ring_host(const ephemeris::BodyDefinition& def) {
     return !def.rings.empty() && !def.is_star && !def.is_black_hole && !def.is_spacecraft;
+}
+
+static rhi::GraphicsPipelineDesc ring_pipeline_desc(const rhi::VkContext& ctx, uint32_t variant_idx,
+                                                      bool transparency, bool numerical) {
+    rhi::GraphicsPipelineDesc desc{};
+    desc.vert_path = "celestial/ring.vert";
+    desc.frag_path = "celestial/ring.frag";
+    desc.vertex_bindings = {{0, sizeof(glm::vec3), VK_VERTEX_INPUT_RATE_VERTEX}};
+    desc.vertex_attributes = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}};
+    desc.bindings = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+    };
+    if (transparency) {
+        desc.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
+        desc.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT});
+    }
+    desc.push_constant_size = sizeof(uint32_t) * 4;
+    desc.depth_test = true;
+    desc.depth_write = false;
+    desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    desc.premultiplied_blend = true;
+    desc.capture_statistics = ctx.pipeline_statistics_enabled();
+    desc.cull_mode = VK_CULL_MODE_NONE;
+
+    uint32_t light_mode = variant_idx / 4;
+    desc.macros = {
+        {"RING_DRAW_CAPACITY", std::to_string(1u << (variant_idx % 4))},
+        {"RING_FINITE_SOURCE", light_mode == 1 ? "1" : "0"},
+        {"RING_SINGLE_STAR", light_mode >= 2 ? "1" : "0"},
+        {"RING_FIXED_SIDE", light_mode == 2 ? "1" : light_mode == 3 ? "0" : "-1"},
+        {"RING_PLANETSHINE_NUMERICAL", numerical ? "1" : "0"},
+    };
+    if (transparency) {
+        desc.macros.push_back({"TRANSPARENCY_CAPTURE", "1"});
+    }
+    return desc;
 }
 
 void RingRenderer::init(rhi::VkContext& ctx) {
@@ -57,53 +106,12 @@ void RingRenderer::init(rhi::VkContext& ctx) {
         VkDeviceSize(RING_SHADOW_LUT_WIDTH) * RING_SHADOW_LUT_ANGLES * MAX_RING_HOSTS * sizeof(float);
     staging_.init(ctx, rebuild_bytes * rhi::FRAMES_IN_FLIGHT);
 
-    rhi::GraphicsPipelineDesc desc{};
-    desc.vert_path = "celestial/ring.vert";
-    desc.frag_path = "celestial/ring.frag";
-    desc.vertex_bindings = {{0, sizeof(glm::vec3), VK_VERTEX_INPUT_RATE_VERTEX}};
-    desc.vertex_attributes = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}};
-    desc.bindings = {
-        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {22, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {23, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {24, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {27, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-    };
-    desc.push_constant_size = sizeof(uint32_t) * 4;
-    desc.depth_test = true;
-    desc.depth_write = false;
-    desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
-    desc.premultiplied_blend = true;
-    desc.capture_statistics = ctx.pipeline_statistics_enabled();
-    desc.cull_mode = VK_CULL_MODE_NONE;
     for (uint32_t i = 0; i < pipelines_.size(); ++i) {
-        uint32_t light_mode = i / 4;
-        desc.macros = {{"RING_DRAW_CAPACITY", std::to_string(1u << (i % 4))},
-                       {"RING_FINITE_SOURCE", light_mode == 1 ? "1" : "0"},
-                       {"RING_SINGLE_STAR", light_mode >= 2 ? "1" : "0"},
-                       {"RING_FIXED_SIDE", light_mode == 2 ? "1" : light_mode == 3 ? "0" : "-1"}};
-        pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+        pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, ring_pipeline_desc(ctx, i, false, false));
     }
     if (ctx.fragment_stores_enabled()) {
-        desc.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
-        desc.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT});
         for (uint32_t i = 0; i < transparency_pipelines_.size(); ++i) {
-            uint32_t light_mode = i / 4;
-            desc.macros = {{"RING_DRAW_CAPACITY", std::to_string(1u << (i % 4))},
-                {"RING_FINITE_SOURCE", light_mode == 1 ? "1" : "0"},
-                {"RING_SINGLE_STAR", light_mode >= 2 ? "1" : "0"},
-                {"RING_FIXED_SIDE", light_mode == 2 ? "1" : light_mode == 3 ? "0" : "-1"},
-                {"TRANSPARENCY_CAPTURE", "1"}};
-            transparency_pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+            transparency_pipelines_[i] = rhi::ShaderCache::create_graphics_pipeline(ctx, ring_pipeline_desc(ctx, i, true, false));
         }
     }
     for (auto& atlas : ringshine_atlases_) {
@@ -145,6 +153,27 @@ void RingRenderer::init(rhi::VkContext& ctx) {
         buffer = ctx.create_host_buffer(MAX_RING_HOSTS * 4096 * sizeof(glm::vec2), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
 
+    {
+        const rhi::DescriptorLayoutBinding rp_bindings[] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1}};
+        ring_planetshine_pipeline_ = rhi::ShaderCache::create_compute_pipeline(
+            ctx, "celestial/ring_planetshine_map.comp", rp_bindings, 80);
+        ring_planetshine_dummy_ = ctx.create_image_2d(
+            1, 1, VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, 2, true);
+        ctx.immediate_submit([&](VkCommandBuffer imm) {
+            ctx.transition_image(imm, ring_planetshine_dummy_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+            vkCmdClearColorImage(imm, ring_planetshine_dummy_.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            ctx.transition_image(imm, ring_planetshine_dummy_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        });
+    }
+
     hosts_gpu_.reserve(MAX_RING_HOSTS);
     host_draw_ranges_.reserve(MAX_RING_HOSTS);
     force_rebuild_ = true;
@@ -153,9 +182,14 @@ void RingRenderer::init(rhi::VkContext& ctx) {
 void RingRenderer::shutdown(rhi::VkContext& ctx) {
     cached_hosts_.clear();
     staging_.shutdown(ctx);
+    rhi::ShaderCache::destroy_pipeline(ctx, ring_planetshine_pipeline_);
+    ctx.destroy_image(ring_planetshine_dummy_);
+    for (auto& atlas : ring_planetshine_atlases_) ctx.destroy_image(atlas);
     rhi::ShaderCache::destroy_pipeline(ctx, ringshine_pipeline_);
     for (auto& pipeline : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     for (auto& pipeline : transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    for (auto& pipeline : numerical_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    for (auto& pipeline : numerical_transparency_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     ctx.destroy_image(shadow_lut_);
     rhi::ShaderCache::destroy_pipeline(ctx, penumbra_pipeline_);
     ctx.destroy_image(penumbra_table_);
@@ -462,6 +496,18 @@ void RingRenderer::update_penumbra(VkCommandBuffer cmd, rhi::VkContext& ctx, con
     ctx.end_gpu_timer(cmd, timer);
 }
 
+rhi::Pipeline& RingRenderer::select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency, bool numerical) {
+    if (!numerical) {
+        return transparency ? transparency_pipelines_[variant_idx] : pipelines_[variant_idx];
+    }
+    auto& table = transparency ? numerical_transparency_pipelines_ : numerical_pipelines_;
+    if (table[variant_idx].handle == VK_NULL_HANDLE) {
+        table[variant_idx] = rhi::ShaderCache::create_graphics_pipeline(
+            ctx, ring_pipeline_desc(ctx, variant_idx, transparency, true));
+    }
+    return table[variant_idx];
+}
+
 void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
                           std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
                           std::span<const rhi::PushDescriptorWrite> transparency_writes) {
@@ -469,41 +515,51 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
 
     auto timer = ctx.begin_gpu_timer(cmd, "rings");
     uint32_t f_idx = ctx.frame_index();
-    std::vector<rhi::PushDescriptorWrite> writes(scene_writes.begin(), scene_writes.end());
-    writes.push_back(rhi::PushDescriptorWrite::storage_buffer(7, host_ssbos_[f_idx], 0, MAX_RING_HOSTS * sizeof(RingHostGPU)));
-    writes.push_back(rhi::PushDescriptorWrite::sampled_image(8, gradient_atlas_, ctx.sampler_linear_clamp()));
-    writes.push_back(rhi::PushDescriptorWrite::sampled_image(9, shadow_lut_, ctx.sampler_linear_clamp()));
-    writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
-    auto& pipelines = transparency_writes.empty() ? pipelines_ : transparency_pipelines_;
+    render_writes_.clear();
+    render_writes_.reserve(scene_writes.size() + 4 + transparency_writes.size());
+    render_writes_.insert(render_writes_.end(), scene_writes.begin(), scene_writes.end());
+    render_writes_.push_back(rhi::PushDescriptorWrite::storage_buffer(7, host_ssbos_[f_idx], 0, MAX_RING_HOSTS * sizeof(RingHostGPU)));
+    render_writes_.push_back(rhi::PushDescriptorWrite::sampled_image(8, gradient_atlas_, ctx.sampler_linear_clamp()));
+    render_writes_.push_back(rhi::PushDescriptorWrite::sampled_image(9, shadow_lut_, ctx.sampler_linear_clamp()));
+    const rhi::Image& rp_atlas = ring_planetshine_atlases_[f_idx].handle != VK_NULL_HANDLE
+        ? ring_planetshine_atlases_[f_idx] : ring_planetshine_dummy_;
+    render_writes_.push_back(rhi::PushDescriptorWrite::sampled_image(17, rp_atlas, ctx.sampler_linear_clamp()));
+    render_writes_.insert(render_writes_.end(), transparency_writes.begin(), transparency_writes.end());
 
-    uint32_t bound_pipeline = 7;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[bound_pipeline].handle);
-    ctx.push_descriptors(cmd, pipelines[bound_pipeline], writes);
+    bool transparency = !transparency_writes.empty();
+    bool numerical = settings.ring_planetshine_mode != 0;
+    const rhi::Pipeline& layout_ref = transparency ? transparency_pipelines_[0] : pipelines_[0];
+    ctx.push_descriptors(cmd, layout_ref, render_writes_);
 
-    std::vector<uint32_t> order(active_host_count_);
-    for (uint32_t i = 0; i < active_host_count_; ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+    uint32_t draw_count = std::min(active_host_count_, MAX_RING_HOSTS);
+    std::array<uint32_t, MAX_RING_HOSTS> order{};
+    for (uint32_t i = 0; i < draw_count; ++i) order[i] = i;
+    std::sort(order.begin(), order.begin() + draw_count, [&](uint32_t a, uint32_t b) {
         float da = glm::dot(glm::vec3(hosts_gpu_[a].center_min_r), glm::vec3(hosts_gpu_[a].center_min_r));
         float db = glm::dot(glm::vec3(hosts_gpu_[b].center_min_r), glm::vec3(hosts_gpu_[b].center_min_r));
         return da > db;
     });
 
-    for (uint32_t host_idx : order) {
+    const auto& mesh = mesh_;
+    VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertices.handle, &offset);
+    vkCmdBindIndexBuffer(cmd, mesh.indices.handle, 0, VK_INDEX_TYPE_UINT32);
+
+    uint32_t bound_pipeline = UINT32_MAX;
+    for (uint32_t idx = 0; idx < draw_count; ++idx) {
+        uint32_t host_idx = order[idx];
         struct Push { uint32_t host_index, packed_segments, segment_count, filter_profiles; };
         auto draw = [&](uint32_t first, uint32_t count, uint32_t packed, uint32_t segments, uint32_t pipeline_index) {
             if (bound_pipeline != pipeline_index) {
                 bound_pipeline = pipeline_index;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[bound_pipeline].handle);
+                const rhi::Pipeline& pipe = select_pipeline(ctx, bound_pipeline, transparency, numerical);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.handle);
             }
-            ctx.push_constants(cmd, pipelines[bound_pipeline], Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});
+            ctx.push_constants(cmd, layout_ref, Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});
             vkCmdDrawIndexed(cmd, count, 1, first, 0, 0);
         };
         const auto& host = hosts_gpu_[host_idx];
         bool refracted = refraction_body_ >= 0;
-        const auto& mesh = mesh_;
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertices.handle, &offset);
-        vkCmdBindIndexBuffer(cmd, mesh.indices.handle, 0, VK_INDEX_TYPE_UINT32);
         auto classification = classify_ring_draw(glm::vec3(host.center_min_r), glm::vec3(host.pole_max_r), host.pole_max_r.w, stars);
         if (stars.size() != 1 && classification.lighting != RingLightingMode::FiniteSource)
             classification.lighting = RingLightingMode::Point;
@@ -535,11 +591,14 @@ struct RingshinePush {
 static_assert(sizeof(RingshinePush) == 80);
 
 double quantize_elevation(double elevation) {
-    return std::stod(std::format("{:.5f}", elevation));
+    return std::round(elevation * 100000.0) * 1e-5;
 }
 
 double quantize_sin_radius(double value) {
-    return std::stod(std::format("{:.6g}", value));
+    if (value <= 0.0) return 0.0;
+    int exp = 0;
+    double mantissa = std::frexp(value, &exp);
+    return std::ldexp(std::round(mantissa * 1048576.0) / 1048576.0, exp);
 }
 }
 
@@ -694,6 +753,161 @@ void RingRenderer::update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, co
         bake_ringshine_tile(cmd, ctx, job);
     }
     ringshine_frame_bakes_ = static_cast<uint32_t>(jobs.size());
+}
+
+void RingRenderer::ensure_ring_planetshine_atlas(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t frame) {
+    auto& atlas = ring_planetshine_atlases_[frame];
+    if (atlas.handle != VK_NULL_HANDLE) return;
+    atlas = ctx.create_image_2d(
+        RING_PLANETSHINE_TILE_WIDTH * RING_PLANETSHINE_STARS,
+        RING_PLANETSHINE_TILE_HEIGHT * MAX_RING_HOSTS,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        1, 2, true);
+    ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkClearColorValue zero{};
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+    vkCmdClearColorImage(cmd, atlas.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+    ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+void RingRenderer::bake_ring_planetshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingPlanetshineJob& job) {
+    struct RingPlanetshineBakePush {
+        glm::uvec4 tile{};
+        glm::vec4 params{};
+        physics::SurfaceMaterialGPU material{};
+    };
+    static_assert(sizeof(RingPlanetshineBakePush) == 80);
+
+    RingPlanetshineBakePush push{};
+    push.tile = glm::uvec4(job.host_idx, job.star_col, 0u, 0u);
+    push.params = glm::vec4(
+        static_cast<float>(job.key.elevation),
+        static_cast<float>(job.key.sin_radius),
+        static_cast<float>(job.key.flattening),
+        0.0f);
+    push.material = job.key.material;
+
+    ctx.push_constants(cmd, ring_planetshine_pipeline_, push);
+    vkCmdDispatch(cmd, (RING_PLANETSHINE_TILE_WIDTH + 7u) / 8u, (RING_PLANETSHINE_TILE_HEIGHT + 7u) / 8u, 1u);
+    ring_planetshine_cache_[ctx.frame_index()][{job.host_idx, job.star_col}] = job.key;
+    ++ring_planetshine_bakes_;
+}
+
+void RingRenderer::update_ring_planetshine(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                                           const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
+                                           uint32_t body_count, VkExtent2D extent, const SurfaceMaterialCache& materials) {
+    ring_planetshine_frame_bakes_ = 0;
+    if (settings.direct_sunlight_only || !settings.planetshine_enabled || !settings.show_rings ||
+        settings.ring_planetshine_mode != 0 || active_host_count_ == 0) return;
+
+    std::array<glm::dvec3, RING_PLANETSHINE_STARS> star_pos{};
+    std::array<double, RING_PLANETSHINE_STARS> star_radius{};
+    std::array<uint32_t, RING_PLANETSHINE_STARS> star_body{};
+    uint32_t star_count = 0;
+    bool has_real_star = false;
+    for (uint32_t bi = 0; bi < body_count && star_count < RING_PLANETSHINE_STARS; ++bi) {
+        const auto& def = sys.body(bi).definition;
+        if (!def.is_star) continue;
+        has_real_star = true;
+        star_pos[star_count] = sys.body(bi).render.position.value;
+        star_radius[star_count] = def.opaque_radius_au();
+        star_body[star_count] = bi;
+        ++star_count;
+    }
+    if (!has_real_star) {
+        star_pos[0] = glm::dvec3(0.0);
+        star_radius[0] = SOLAR_RADII_TO_AU;
+        star_body[0] = UINT32_MAX;
+        star_count = 1;
+    }
+
+    bool cull = extent.width > 0 && extent.height > 0;
+    double tan_y = cull ? std::tan(cam.fov_deg * DEG_TO_RAD * 0.5) : 0.0;
+    double tan_x = cull ? tan_y * double(extent.width) / double(extent.height) : 0.0;
+    double sec_x = std::sqrt(1.0 + tan_x * tan_x);
+    double sec_y = std::sqrt(1.0 + tan_y * tan_y);
+    double focal = (cull && tan_y > 0.0) ? double(extent.height) / (2.0 * tan_y) : 0.0;
+    glm::dvec3 eye = cam.eye_pos_render().value;
+
+    uint32_t f_idx = ctx.frame_index();
+    auto& cache = ring_planetshine_cache_[f_idx];
+    ring_planetshine_jobs_.clear();
+    for (uint32_t h = 0; h < active_host_count_; ++h) {
+        const RingHostGPU& host = hosts_gpu_[h];
+        uint32_t bi = host.counts_indices.x;
+        if (bi >= body_count) continue;
+        const auto body_view = sys.body(bi);
+        glm::dvec3 center = body_view.render.position.value;
+        if (cull) {
+            double ring_outer = std::max(double(host.pole_max_r.w), body_view.definition.radius_au());
+            glm::dvec3 to_body = center - eye;
+            double depth = glm::dot(to_body, cam.forward_dir());
+            bool inside_ring = glm::length(to_body) < ring_outer * 1.1;
+            if (!inside_ring && (depth + ring_outer <= 0.0 ||
+                std::abs(glm::dot(to_body, cam.right_dir())) > depth * tan_x + ring_outer * sec_x ||
+                std::abs(glm::dot(to_body, cam.up_dir())) > depth * tan_y + ring_outer * sec_y)) {
+                continue;
+            }
+            if (!inside_ring && focal > 0.0 && depth > ring_outer &&
+                ring_outer / (depth - ring_outer) * focal <= 0.25) {
+                continue;
+            }
+        }
+
+        glm::dvec3 pole = glm::length(body_view.render.pole) > 1e-9
+            ? glm::normalize(body_view.render.pole) : glm::dvec3(0.0, 1.0, 0.0);
+        double flattening = std::clamp(body_view.definition.oblateness, 0.0, 0.95);
+        const auto& mat = materials.material(bi);
+        for (uint32_t s = 0; s < star_count; ++s) {
+            if (star_body[s] != UINT32_MAX && !sys.illuminates(star_body[s], bi)) continue;
+            glm::dvec3 dir = star_pos[s] - center;
+            double dist = glm::length(dir);
+            if (dist <= 1e-12) continue;
+            double elevation = std::clamp(glm::dot(dir, pole) / dist, -1.0, 1.0);
+            RingPlanetshineTileKey key{};
+            key.flattening = flattening;
+            key.elevation = quantize_elevation(elevation);
+            key.sin_radius = quantize_sin_radius(std::clamp(star_radius[s] / dist, 0.0, 0.999));
+            key.material = mat;
+
+            auto it = cache.find({h, s});
+            if (it == cache.end() || !(it->second == key)) {
+                ring_planetshine_jobs_.push_back({h, s, key});
+            }
+        }
+    }
+    for (auto it = cache.begin(); it != cache.end();) {
+        if (it->first.first < active_host_count_ && it->first.second < star_count) ++it;
+        else it = cache.erase(it);
+    }
+    if (ring_planetshine_jobs_.empty()) return;
+
+    uint32_t ring_ps_timer = ctx.begin_gpu_timer(cmd, "ring_planetshine_bake");
+    ensure_ring_planetshine_atlas(cmd, ctx, f_idx);
+    auto& atlas = ring_planetshine_atlases_[f_idx];
+    ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ring_planetshine_pipeline_.handle);
+    const rhi::PushDescriptorWrite writes[] = {
+        rhi::PushDescriptorWrite::storage_image(0, atlas)};
+    ctx.push_descriptors(cmd, ring_planetshine_pipeline_, writes);
+    for (const auto& job : ring_planetshine_jobs_) {
+        bake_ring_planetshine_tile(cmd, ctx, job);
+    }
+    ctx.transition_image(cmd, atlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    ctx.end_gpu_timer(cmd, ring_ps_timer);
+    ring_planetshine_frame_bakes_ = static_cast<uint32_t>(ring_planetshine_jobs_.size());
 }
 
 PlanetshineGPU RingRenderer::atmosphere_sources(const ephemeris::SystemSnapshot& system,

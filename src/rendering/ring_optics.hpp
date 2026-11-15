@@ -21,6 +21,9 @@ inline constexpr uint32_t RING_ANGULAR_SEGMENTS = 128;
 inline constexpr uint32_t RING_RADIAL_SUBDIVISIONS = 32;
 inline constexpr uint32_t RINGSHINE_TILE_WIDTH = 65;
 inline constexpr uint32_t RINGSHINE_TILE_HEIGHT = 65;
+inline constexpr uint32_t RING_PLANETSHINE_TILE_WIDTH = 65;
+inline constexpr uint32_t RING_PLANETSHINE_TILE_HEIGHT = 65;
+inline constexpr uint32_t RING_PLANETSHINE_STARS = 16;
 inline constexpr float RING_MAX_ALPHA = 0.99999994f;
 
 struct RingDrawRange {

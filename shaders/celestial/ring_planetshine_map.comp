@@ -1,0 +1,162 @@
+#version 460
+
+#include "common/surface_material.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) writeonly uniform image2DArray destination;
+
+layout(push_constant) uniform RingPlanetshineBakePush {
+    uvec4 tile;
+    vec4 params;
+    SurfaceMaterial material;
+} u_push;
+
+const float RP_PI = 3.14159265358979323846;
+const float RP_MAX_SIN = 0.999;
+
+const float GL8_X[4] = float[4](
+    0.1834346424956498,
+    0.5255324099163290,
+    0.7966664774136267,
+    0.9602898564975363
+);
+const float GL8_W[4] = float[4](
+    0.3626837833783620,
+    0.3137066458778873,
+    0.2223810344533745,
+    0.1012285362903763
+);
+
+bool disk_hit_normal(vec2 sx_sy, float u, float eta_obl, float b_app,
+                     out vec3 normal, out vec3 D, out vec2 disk_pt, out float cos_theta) {
+    disk_pt = vec2(sx_sy.x, b_app * sx_sy.y);
+    float rho2 = dot(disk_pt, disk_pt);
+    cos_theta = sqrt(max(0.0, 1.0 - u * u * rho2));
+    D = vec3(u * disk_pt.x, u * disk_pt.y, cos_theta);
+    vec3 p_close = vec3(cos_theta * disk_pt.x, cos_theta * disk_pt.y, -u * rho2);
+    float A = 1.0 + (eta_obl - 1.0) * D.y * D.y;
+    float B = (eta_obl - 1.0) * p_close.y * D.y;
+    float C = rho2 + (eta_obl - 1.0) * p_close.y * p_close.y - 1.0;
+    float disc = B * B - A * C;
+    if (disc <= 0.0) {
+        normal = vec3(0.0);
+        return false;
+    }
+    float s = (-B - sqrt(disc)) / A;
+    vec3 Q = p_close + s * D;
+    normal = normalize(vec3(Q.x, eta_obl * Q.y, Q.z));
+    return true;
+}
+
+vec3 boundary_normal(vec2 sx_sy, float u, float eta_obl, float b_app) {
+    vec2 disk_pt = vec2(sx_sy.x, b_app * sx_sy.y);
+    float rho2 = dot(disk_pt, disk_pt);
+    float cos_theta = sqrt(max(0.0, 1.0 - u * u * rho2));
+    vec3 D = vec3(u * disk_pt.x, u * disk_pt.y, cos_theta);
+    vec3 p_close = vec3(cos_theta * disk_pt.x, cos_theta * disk_pt.y, -u * rho2);
+    float A = 1.0 + (eta_obl - 1.0) * D.y * D.y;
+    float B = (eta_obl - 1.0) * p_close.y * D.y;
+    float C = rho2 + (eta_obl - 1.0) * p_close.y * p_close.y - 1.0;
+    float disc = max(B * B - A * C, 0.0);
+    float s = (-B - sqrt(disc)) / A;
+    vec3 Q = p_close + s * D;
+    return normalize(vec3(Q.x, eta_obl * Q.y, Q.z));
+}
+
+void main() {
+    uint ix = gl_GlobalInvocationID.x;
+    uint iy = gl_GlobalInvocationID.y;
+    if (ix >= 65u || iy >= 65u) return;
+
+    float tx = float(ix) / 64.0;
+    float ty = float(iy) / 64.0;
+    float u = sin(tx * asin(RP_MAX_SIN));
+    float phi = ty * RP_PI;
+
+    float elevation = clamp(u_push.params.x, -1.0, 1.0);
+    float cos_decl = sqrt(max(0.0, 1.0 - elevation * elevation));
+    float sin_star = clamp(u_push.params.y, 0.0, 0.999);
+    float flattening = clamp(u_push.params.z, 0.0, 0.95);
+    float polar = max(1.0 - flattening, 0.05);
+    float eta_obl = 1.0 / (polar * polar);
+    float b_app = 1.0 / sqrt(1.0 + (eta_obl - 1.0) * (1.0 - u * u));
+
+    vec3 sun = vec3(cos_decl * sin(phi), elevation, -cos_decl * cos(phi));
+    vec2 sun_s = vec2(sun.x, sun.y * b_app * eta_obl);
+    float sun_s_len = length(sun_s);
+    vec2 u_xi = sun_s_len > 1e-6 ? sun_s / sun_s_len : vec2(1.0, 0.0);
+    vec2 u_eta = vec2(-u_xi.y, u_xi.x);
+    float lit_thresh = -(sin_star * 1.1 + 1e-4);
+
+    vec4 top_m = vec4(0.0);
+    vec4 bot_m = vec4(0.0);
+
+    for (int half_idx = 0; half_idx < 2; ++half_idx) {
+        float eta_base = half_idx == 0 ? -0.5 : 0.5;
+        for (int row = 0; row < 8; ++row) {
+            float t_eta = (row < 4) ? -GL8_X[3 - row] : GL8_X[row - 4];
+            float w_eta = (row < 4) ? GL8_W[3 - row] : GL8_W[row - 4];
+            float eta = eta_base + 0.5 * t_eta;
+            float xi_limb = sqrt(max(0.0, 1.0 - eta * eta));
+            if (xi_limb <= 1e-6) continue;
+
+            float dot_pos = dot(boundary_normal(xi_limb * u_xi + eta * u_eta, u, eta_obl, b_app), sun);
+            float dot_neg = dot(boundary_normal(-xi_limb * u_xi + eta * u_eta, u, eta_obl, b_app), sun);
+            float dot_mid = dot(boundary_normal(eta * u_eta, u, eta_obl, b_app), sun);
+
+            if (dot_pos <= lit_thresh && dot_mid <= lit_thresh && dot_neg <= lit_thresh) continue;
+
+            float xi_min = -xi_limb;
+            float xi_max = xi_limb;
+            if (sun_s_len > 1e-4 && dot_pos > lit_thresh && dot_neg <= lit_thresh) {
+                float lo = -xi_limb;
+                float hi = xi_limb;
+                for (int b = 0; b < 8; ++b) {
+                    float mid = 0.5 * (lo + hi);
+                    float d_val = dot(boundary_normal(mid * u_xi + eta * u_eta, u, eta_obl, b_app), sun);
+                    if (d_val > lit_thresh) hi = mid;
+                    else lo = mid;
+                }
+                xi_min = lo;
+            }
+
+            float xi_half = 0.5 * (xi_max - xi_min);
+            float xi_mid = 0.5 * (xi_max + xi_min);
+            if (xi_half <= 1e-7) continue;
+
+            for (int col = 0; col < 8; ++col) {
+                float t_xi = (col < 4) ? -GL8_X[3 - col] : GL8_X[col - 4];
+                float w_xi = (col < 4) ? GL8_W[3 - col] : GL8_W[col - 4];
+                float xi = xi_mid + xi_half * t_xi;
+                vec2 sx_sy = xi * u_xi + eta * u_eta;
+
+                vec3 normal, D;
+                vec2 disk_pt;
+                float cos_theta;
+                if (!disk_hit_normal(sx_sy, u, eta_obl, b_app, normal, D, disk_pt, cos_theta)) continue;
+
+                float resp = surface_direct_response(normal, -D, sun, sin_star, max(dot(normal, sun), 0.0), u_push.material);
+                if (resp <= 0.0) continue;
+
+                float w_omega = (b_app * 0.5 * w_eta * xi_half * w_xi) / (RP_PI * max(cos_theta, 1e-6));
+                float contrib = resp * w_omega;
+                float rho2 = dot(disk_pt, disk_pt);
+                vec4 moment = vec4(contrib, contrib * disk_pt.x, contrib * disk_pt.y, contrib * rho2);
+
+                if (disk_pt.y > 0.0) {
+                    top_m += moment;
+                } else if (disk_pt.y < 0.0) {
+                    bot_m += moment;
+                } else {
+                    top_m += 0.5 * moment;
+                    bot_m += 0.5 * moment;
+                }
+            }
+        }
+    }
+
+    ivec2 texel = ivec2(int(u_push.tile.y * 65u + ix), int(u_push.tile.x * 65u + iy));
+    imageStore(destination, ivec3(texel, 0), top_m);
+    imageStore(destination, ivec3(texel, 1), bot_m);
+}

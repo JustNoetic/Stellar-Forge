@@ -111,6 +111,8 @@ public:
     uint32_t ringshine_bake_count() const noexcept { return rings_.ringshine_bake_count(); }
     uint64_t ring_profile_revision() const noexcept { return rings_.shadow_revision(); }
     uint32_t ringshine_frame_bake_count() const noexcept { return rings_.ringshine_frame_bake_count(); }
+    uint32_t ring_planetshine_bake_count() const noexcept { return rings_.ring_planetshine_bake_count(); }
+    uint32_t ring_planetshine_frame_bake_count() const noexcept { return rings_.ring_planetshine_frame_bake_count(); }
     std::span<const uint32_t> ringshine_sample_counts() const noexcept { return rings_.ringshine_sample_counts(); }
     void set_color_sources(std::vector<terrain::ColorBinding> bindings) { textures_.set_sources(std::move(bindings)); }
     void set_color_source(std::string body, std::shared_ptr<const terrain::SurfaceSource> source) {

@@ -91,6 +91,9 @@ public:
     void update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                           const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, uint32_t body_count,
                           VkExtent2D extent);
+    void update_ring_planetshine(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
+                                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
+                                 uint32_t body_count, VkExtent2D extent, const SurfaceMaterialCache& materials);
 
     void invalidate_texture_cache() noexcept {
         force_rebuild_ = true;
@@ -122,6 +125,8 @@ public:
     const rhi::Image& ringshine_atlas(uint32_t frame) const noexcept { return ringshine_atlases_[frame]; }
     uint32_t ringshine_bake_count() const noexcept { return ringshine_bakes_; }
     uint32_t ringshine_frame_bake_count() const noexcept { return ringshine_frame_bakes_; }
+    uint32_t ring_planetshine_bake_count() const noexcept { return ring_planetshine_bakes_; }
+    uint32_t ring_planetshine_frame_bake_count() const noexcept { return ring_planetshine_frame_bakes_; }
     std::span<const uint32_t> ringshine_sample_counts() const noexcept { return ringshine_sample_counts_; }
     PlanetshineGPU atmosphere_sources(const ephemeris::SystemSnapshot& system,
                                      const RenderSettings& settings, uint32_t body_index) const;
@@ -156,6 +161,22 @@ private:
         uint32_t star_col = 0;
         RingshineTileKey key{};
     };
+    struct RingPlanetshineTileKey {
+        double flattening = 0.0;
+        double elevation = 0.0;
+        double sin_radius = 0.0;
+        physics::SurfaceMaterialGPU material{};
+        bool operator==(const RingPlanetshineTileKey& o) const noexcept {
+            return flattening == o.flattening && elevation == o.elevation && sin_radius == o.sin_radius
+                && material.grain == o.material.grain && material.surface == o.material.surface
+                && glm::vec3(material.opposition) == glm::vec3(o.material.opposition);
+        }
+    };
+    struct RingPlanetshineJob {
+        uint32_t host_idx = 0;
+        uint32_t star_col = 0;
+        RingPlanetshineTileKey key{};
+    };
 
     struct AnnulusMesh {
         rhi::Buffer vertices{}, indices{};
@@ -165,12 +186,17 @@ private:
     void update_penumbra(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count);
     void rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, const ephemeris::SystemSnapshot& sys, uint32_t body_count);
     void bake_ringshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingshineJob& job);
+    void ensure_ring_planetshine_atlas(VkCommandBuffer cmd, rhi::VkContext& ctx, uint32_t frame);
+    void bake_ring_planetshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingPlanetshineJob& job);
+    rhi::Pipeline& select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency, bool numerical);
 
     AnnulusMesh mesh_{};
     int refraction_body_ = -1;
 
     std::array<rhi::Pipeline, 16> pipelines_{};
     std::array<rhi::Pipeline, 16> transparency_pipelines_{};
+    std::array<rhi::Pipeline, 16> numerical_pipelines_{};
+    std::array<rhi::Pipeline, 16> numerical_transparency_pipelines_{};
     rhi::Image gradient_atlas_{};
     rhi::Image shadow_lut_{};
     rhi::Pipeline penumbra_pipeline_{};
@@ -181,6 +207,14 @@ private:
     std::array<std::map<std::pair<uint32_t, uint32_t>, RingshineTileKey>, rhi::FRAMES_IN_FLIGHT> ringshine_cache_;
     uint32_t ringshine_bakes_ = 0;
     uint32_t ringshine_frame_bakes_ = 0;
+    rhi::Pipeline ring_planetshine_pipeline_{};
+    rhi::Image ring_planetshine_dummy_{};
+    std::array<rhi::Image, rhi::FRAMES_IN_FLIGHT> ring_planetshine_atlases_{};
+    std::array<std::map<std::pair<uint32_t, uint32_t>, RingPlanetshineTileKey>, rhi::FRAMES_IN_FLIGHT> ring_planetshine_cache_;
+    std::vector<RingPlanetshineJob> ring_planetshine_jobs_;
+    std::vector<rhi::PushDescriptorWrite> render_writes_;
+    uint32_t ring_planetshine_bakes_ = 0;
+    uint32_t ring_planetshine_frame_bakes_ = 0;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> ringshine_radial_buffers_{};
     std::array<uint64_t, rhi::FRAMES_IN_FLIGHT> ringshine_radial_upload_serials_{};
     std::vector<glm::vec2> ringshine_radial_samples_;
