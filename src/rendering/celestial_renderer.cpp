@@ -563,21 +563,109 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         for (uint32_t s = 0; s < ubo.num_stars; ++s) {
             uint32_t range = (i * ubo.num_stars + s) * 2;
             uint32_t start = static_cast<uint32_t>(eclipse_words_.size());
-            for (uint32_t j = 0; j < count; ++j) {
-                if (i == j || inst_ptr[j].color_is_star.w > 0.5f) continue;
-                if (i >= count && inst_ptr[j].pos_radius.w <= 0.0f) continue;
-                auto caster = inst_ptr[j].pos_radius;
-                if (j < eclipse_bounds.size() && eclipse_bounds[j].x > 0) {
-                    double distance = glm::length(glm::dvec3(caster)-glm::dvec3(receiver_bounds))+receiver_bounds.w;
-                    caster.w = float(eclipse_bounds[j].x+distance*eclipse_bounds[j].y);
+            if (i < count) {
+                for (uint32_t j = 0; j < count; ++j) {
+                    if (i == j || inst_ptr[j].color_is_star.w > 0.5f) continue;
+                    auto caster = inst_ptr[j].pos_radius;
+                    if (j < eclipse_bounds.size() && eclipse_bounds[j].x > 0) {
+                        double distance = glm::length(glm::dvec3(caster)-glm::dvec3(receiver_bounds))+receiver_bounds.w;
+                        caster.w = float(eclipse_bounds[j].x+distance*eclipse_bounds[j].y);
+                    }
+                    if (eclipse_could_shadow(receiver_bounds, ubo.stars_pos_radius[s], caster))
+                        eclipse_words_.push_back(j);
                 }
-                if (eclipse_could_shadow(receiver_bounds, ubo.stars_pos_radius[s], caster))
-                    eclipse_words_.push_back(j);
+                eclipse_words_[range] = start;
+                eclipse_words_[range + 1] = static_cast<uint32_t>(eclipse_words_.size()) - start;
+            } else {
+                const auto& host = rings_.hosts()[i - count];
+                glm::dvec3 ring_center(host.center_min_r);
+                glm::dvec3 ring_pole(host.pole_max_r);
+                glm::dvec3 ring_u(host.tangent_radius);
+                glm::dvec3 ring_v(host.bitangent_oblateness);
+                double inner_r = double(host.center_min_r.w);
+                double outer_r = double(host.pole_max_r.w);
+                std::vector<std::pair<glm::vec4, RingShadowFootprint>> accepted;
+                for (uint32_t j = 0; j < count; ++j) {
+                    if (inst_ptr[j].color_is_star.w > 0.5f || inst_ptr[j].pos_radius.w <= 0.0f) continue;
+                    auto caster = inst_ptr[j].pos_radius;
+                    if (j < eclipse_bounds.size() && eclipse_bounds[j].x > 0) {
+                        double distance = glm::length(glm::dvec3(caster)-glm::dvec3(receiver_bounds))+receiver_bounds.w;
+                        caster.w = float(eclipse_bounds[j].x+distance*eclipse_bounds[j].y);
+                    }
+                    RingShadowFootprint fp;
+                    bool keep = false;
+                    if (j == host.counts_indices.x) {
+                        keep = eclipse_could_shadow(receiver_bounds, ubo.stars_pos_radius[s], caster);
+                        if (keep) eclipse_ring_shadow_footprint(ring_center, ring_pole, inner_r, outer_r, ubo.stars_pos_radius[s], caster, fp);
+                    } else {
+                        keep = eclipse_ring_shadow_footprint(ring_center, ring_pole, inner_r, outer_r, ubo.stars_pos_radius[s], caster, fp);
+                    }
+                    if (keep) {
+                        eclipse_words_.push_back(j);
+                        accepted.emplace_back(caster, fp);
+                    }
+                }
+                uint32_t cand_count = static_cast<uint32_t>(eclipse_words_.size()) - start;
+                eclipse_words_[range] = start;
+                eclipse_words_[range + 1] = cand_count;
+                ring_eclipse_candidate_counts_[(i - count) * ubo.num_stars + s] = cand_count;
+
+                if (cand_count > 0u) {
+                    size_t grid_start = eclipse_words_.size();
+                    eclipse_words_.resize(grid_start + 1024u, 0u);
+                    uint32_t* grid = eclipse_words_.data() + grid_start;
+                    double grid_r = std::max(outer_r * 1.04, 1e-12);
+                    double cell_w = (2.0 * grid_r) / 32.0;
+                    double cell_r = (0.5 * std::sqrt(2.0) + 1e-3) * cell_w;
+                    double r_pad = 0.03 * std::max(outer_r, 1e-12);
+                    double ann_min = std::max(0.0, inner_r - r_pad);
+                    double ann_max = outer_r + r_pad;
+
+                    auto stamp_disk = [&](glm::dvec3 rel_c, double disk_r, uint32_t bit) {
+                        double cx_local = glm::dot(rel_c, ring_u);
+                        double cy_local = glm::dot(rel_c, ring_v);
+                        int ix0 = std::clamp(int(std::floor((cx_local - disk_r + grid_r) / cell_w)), 0, 31);
+                        int ix1 = std::clamp(int(std::floor((cx_local + disk_r + grid_r) / cell_w)), 0, 31);
+                        int iy0 = std::clamp(int(std::floor((cy_local - disk_r + grid_r) / cell_w)), 0, 31);
+                        int iy1 = std::clamp(int(std::floor((cy_local + disk_r + grid_r) / cell_w)), 0, 31);
+                        double r2 = disk_r * disk_r;
+                        double half_c = 0.5 * cell_w;
+                        for (int iy = iy0; iy <= iy1; ++iy) {
+                            double cy = -grid_r + (double(iy) + 0.5) * cell_w;
+                            double dy = std::max(0.0, std::abs(cy_local - cy) - half_c);
+                            for (int ix = ix0; ix <= ix1; ++ix) {
+                                double cx = -grid_r + (double(ix) + 0.5) * cell_w;
+                                double dx = std::max(0.0, std::abs(cx_local - cx) - half_c);
+                                if (dx * dx + dy * dy <= r2) grid[iy * 32 + ix] |= bit;
+                            }
+                        }
+                    };
+
+                    for (uint32_t c = 0; c < cand_count; ++c) {
+                        uint32_t bit = c < 31u ? (1u << c) : 0x80000000u;
+                        const auto& [caster, fp] = accepted[c];
+                        bool wide_or_unbounded = !fp.bounded ||
+                            (fp.has_cone && fp.cone_radius > grid_r) ||
+                            (fp.has_sphere && fp.sphere_radius > grid_r);
+                        if (!wide_or_unbounded) {
+                            if (fp.has_sphere) stamp_disk(fp.sphere_center, fp.sphere_radius, bit);
+                            if (fp.has_cone) stamp_disk(fp.cone_center, fp.cone_radius, bit);
+                        } else {
+                            for (int iy = 0; iy < 32; ++iy) {
+                                double cy = -grid_r + (double(iy) + 0.5) * cell_w;
+                                for (int ix = 0; ix < 32; ++ix) {
+                                    double cx = -grid_r + (double(ix) + 0.5) * cell_w;
+                                    double d_cent = std::hypot(cx, cy);
+                                    if (d_cent + cell_r < ann_min || d_cent - cell_r > ann_max) continue;
+                                    glm::vec3 cell_world = glm::vec3(ring_center + ring_u * cx + ring_v * cy);
+                                    if (eclipse_could_shadow(glm::vec4(cell_world, float(cell_r)), ubo.stars_pos_radius[s], caster))
+                                        grid[iy * 32 + ix] |= bit;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            eclipse_words_[range] = start;
-            eclipse_words_[range + 1] = static_cast<uint32_t>(eclipse_words_.size()) - start;
-            if (i >= count)
-                ring_eclipse_candidate_counts_[(i - count) * ubo.num_stars + s] = eclipse_words_[range + 1];
         }
     }
     ubo.ring_shadow_params = {static_cast<uint32_t>(eclipse_words_.size()),

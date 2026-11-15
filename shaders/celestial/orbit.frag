@@ -1,4 +1,7 @@
 #version 460
+#ifdef TRANSPARENCY_CAPTURE
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
 layout(early_fragment_tests) in;
 #ifdef TRANSPARENCY_CAPTURE
 #include "common/transparency.glsl"

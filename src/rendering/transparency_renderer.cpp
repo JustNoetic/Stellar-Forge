@@ -82,11 +82,20 @@ void TransparencyRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                                    rhi::Image* physical_color) {
     if (!active_) return;
     auto timer = ctx.begin_gpu_timer(cmd, "transparency_resolve");
-    ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL);
-    ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    ctx.memory_barrier(cmd);
+    ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    if (physical_color) {
+        ctx.transition_image(cmd, *physical_color, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     auto& pipeline = physical_color ? bloom_resolve_ : resolve_;
-    if (physical_color) ctx.transition_image(cmd, *physical_color, VK_IMAGE_LAYOUT_GENERAL);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
     auto resources = writes();
     std::vector<rhi::PushDescriptorWrite> descriptors = {resources[0], resources[1], rhi::PushDescriptorWrite::storage_image(4, color),

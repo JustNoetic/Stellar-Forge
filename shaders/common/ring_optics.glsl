@@ -116,23 +116,150 @@ vec3 ring_multiple_scattering(float tau_val, float mu_s, float mu_v, bool same_s
     return 0.25 * w_color * multi_bounce * y_env;
 }
 
+struct RingMediumOptics {
+    float tau;
+    float dust_factor;
+    float core_factor;
+    float w_f;
+    vec3 eff_rgb;
+    vec3 w_color;
+    vec3 k_diff;
+    vec3 x_v;
+};
+
+float ring_fast_asin(float x) {
+    float ax = clamp(abs(x), 0.0, 1.0);
+    float res;
+    if (ax < 0.05) {
+        float x2 = ax * ax;
+        res = ax * (1.0 + x2 * (1.0 / 6.0 + 0.075 * x2));
+    } else {
+        res = 1.5707963267948966 - sqrt(max(0.0, 1.0 - ax)) *
+            (1.5707288 + ax * (-0.2121144 + ax * (0.0742610 - 0.0187293 * ax)));
+    }
+    return x < 0.0 ? -res : res;
+}
+
+float ring_fast_acos_pos(float x) {
+    float ax = clamp(x, 0.0, 1.0);
+    return sqrt(max(0.0, 1.0 - ax)) *
+        (1.5707288 + ax * (-0.2121144 + ax * (0.0742610 - 0.0187293 * ax)));
+}
+
+float ring_fast_acos(float x) {
+    float c = clamp(x, -1.0, 1.0);
+    float pos = ring_fast_acos_pos(abs(c));
+    return c < 0.0 ? (3.1415926535897932 - pos) : pos;
+}
+
+// Segment-invariant scalar transfer factors for one face side.
+vec4 ring_transfer_face(float total_tau, float mu_v, float sun_elev, bool same_side) {
+    float mu_s = max(abs(sun_elev), 1e-5);
+    float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
+    float tau = max(total_tau, 0.0);
+    if (tau < 1e-5) {
+        return vec4(transfer, 0.0, 0.0, 0.0);
+    }
+    if (same_side) {
+        float slab_r = ring_transfer(tau * 1.5, mu_s, mu_v, true);
+        return vec4(transfer, slab_r, 0.0, 0.0);
+    }
+    float ms_s = max(mu_s, 1e-4);
+    float ms_v = max(mu_v, 1e-4);
+    float slab_t = (mu_s >= 1e-4 && mu_v >= 1e-4) ? transfer : ring_transfer(tau, ms_s, ms_v, false);
+    float slant_tau = min(tau * (0.5 / ms_s + 0.5 / ms_v), 80.0);
+    float buildup = 1.0 - exp(-slant_tau);
+    return vec4(transfer, slab_t, slant_tau, buildup);
+}
+
+RingMediumOptics ring_medium_setup(float total_tau, float mu_v, vec4 props, vec3 linear_rgb, bool is_textured) {
+    RingMediumOptics m;
+    m.tau = max(total_tau, 0.0);
+    m.dust_factor = 1.0 - smoothstep(0.05, 0.50, total_tau);
+    m.core_factor = smoothstep(0.30, 1.80, total_tau);
+    float base_w = (is_textured && props.z > 1.0) ? 0.35 : clamp(props.z, 0.0, 1.0);
+    m.w_f = clamp(base_w + (is_textured ? (0.12 * m.dust_factor - 0.08 * m.core_factor) : 0.0), 0.0, 1.0);
+    m.eff_rgb = clamp(linear_rgb, vec3(0.0), vec3(1.0));
+
+    if (m.tau >= 1e-5) {
+        float luma = dot(m.eff_rgb, vec3(0.2126, 0.7152, 0.0722));
+        vec3 w_transport = clamp(mix(vec3(luma), m.eff_rgb, 0.20) * 0.78, vec3(0.0), vec3(0.92));
+        m.w_color = clamp(m.eff_rgb * 0.78, vec3(0.0), vec3(0.96));
+        vec3 root = sqrt(max(vec3(1.0) - w_transport, vec3(1e-6)));
+        m.k_diff = 1.7320508 * root;
+        vec3 k_slab = m.k_diff + vec3(0.5);
+        float ms_v = max(mu_v, 1e-4);
+        vec3 h_v = vec3(1.0 + mu_v * 1.7320508) / (vec3(1.0) + mu_v * m.k_diff);
+        m.x_v = vec3(1.0) + (h_v - vec3(1.0)) * (vec3(1.0) - exp(-m.tau * (vec3(1.0 / ms_v) + k_slab)));
+    } else {
+        m.w_color = vec3(0.0);
+        m.k_diff = vec3(0.0);
+        m.x_v = vec3(1.0);
+    }
+    return m;
+}
+
+vec3 ring_radiance_face(RingMediumOptics m, vec4 tf, float mu_v, float sun_elev, float cos_theta,
+                        vec4 props, bool is_textured, bool same_side, float broaden, float opp) {
+    float g_fwd = clamp(props.x * broaden + (is_textured ? 0.14 * m.dust_factor : 0.0), -0.92, 0.92);
+    float g_back_mag = clamp(abs(props.y * broaden) + (is_textured ? 0.08 * m.core_factor : 0.0), 0.0, 0.92);
+    float phase = mix(ring_phase_hg(cos_theta, -g_back_mag), ring_phase_hg(cos_theta, g_fwd), m.w_f);
+
+    vec3 ss = m.eff_rgb * (0.25 * phase * opp * tf.x);
+    vec3 ms = vec3(0.0);
+    if (m.tau >= 1e-5) {
+        float mu_s = max(abs(sun_elev), 1e-5);
+        float ms_s = max(mu_s, 1e-4);
+        vec3 k_slab = m.k_diff + vec3(0.5);
+        vec3 h_s = vec3(1.0 + mu_s * 1.7320508) / (vec3(1.0) + mu_s * m.k_diff);
+        vec3 x_s = vec3(1.0) + (h_s - vec3(1.0)) * (vec3(1.0) - exp(-m.tau * (vec3(1.0 / ms_s) + k_slab)));
+        vec3 multi_bounce = max(x_s * m.x_v - vec3(1.0), vec3(0.0));
+
+        if (same_side) {
+            ms = 0.35 * m.w_color * multi_bounce * tf.y;
+        } else {
+            float ms_v = max(mu_v, 1e-4);
+            vec3 diff_core = (ms_s / (ms_s + ms_v)) * tf.z * exp(-tf.z * (vec3(0.55) + 0.45 * m.k_diff));
+            vec3 y_env = (vec3(tf.y) + 0.35 * diff_core) * tf.w;
+            ms = 0.25 * m.w_color * multi_bounce * y_env;
+        }
+    }
+    float side_scale = same_side ? 1.0 : props.w;
+    return (ss + ms) * side_scale;
+}
+
+vec3 ring_radiance_core(float total_tau, float mu_v, float sun_elev, float cos_theta,
+                        vec4 props, vec3 linear_rgb, bool is_textured, bool same_side,
+                        float broaden, float opp) {
+    vec4 tf = ring_transfer_face(total_tau, mu_v, sun_elev, same_side);
+    RingMediumOptics m = ring_medium_setup(total_tau, mu_v, props, linear_rgb, is_textured);
+    return ring_radiance_face(m, tf, mu_v, sun_elev, cos_theta, props, is_textured, same_side, broaden, opp);
+}
+
+vec3 ring_radiance_planetshine_pair(float total_tau, float mu_v, vec4 props, vec3 linear_rgb, bool is_textured,
+                                    bool has_same, vec3 same_flux, vec4 same_tf, float same_elev,
+                                    float same_phase, float same_broaden, float same_opp,
+                                    bool has_other, vec3 other_flux, vec4 other_tf, float other_elev,
+                                    float other_phase, float other_broaden) {
+    bool do_other = has_other && (props.w > 0.0);
+    if (!has_same && !do_other) return vec3(0.0);
+    RingMediumOptics m = ring_medium_setup(total_tau, mu_v, props, linear_rgb, is_textured);
+    vec3 out_rad = vec3(0.0);
+    if (has_same) {
+        out_rad += same_flux * ring_radiance_face(
+            m, same_tf, mu_v, same_elev, same_phase, props, is_textured, true, same_broaden, same_opp);
+    }
+    if (do_other) {
+        out_rad += other_flux * ring_radiance_face(
+            m, other_tf, mu_v, other_elev, other_phase, props, is_textured, false, other_broaden, 1.0);
+    }
+    return out_rad;
+}
+
 vec3 ring_radiance_rgb(float total_tau, float mu_v, float sun_elev, float cos_theta,
                        vec4 props, vec3 linear_rgb, bool is_textured, bool same_side) {
-    float mu_s = max(abs(sun_elev), 1e-5);
-    float g_fwd = props.x;
-    float g_back = props.y;
-    float scatter = props.z;
-    float unlit_factor = props.w;
-
-    vec3 eff_rgb = clamp(linear_rgb, vec3(0.0), vec3(1.0));
-    float phase = ring_phase_dhg(cos_theta, scatter, g_fwd, g_back, total_tau, is_textured);
     float opp = same_side ? ring_opposition_factor(-cos_theta, total_tau) : 1.0;
-    float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
-
-    vec3 ss = eff_rgb * (0.25 * phase * opp * transfer);
-    vec3 ms = ring_multiple_scattering(total_tau, mu_s, mu_v, same_side, eff_rgb);
-    float side_scale = same_side ? 1.0 : unlit_factor;
-    return (ss + ms) * side_scale;
+    return ring_radiance_core(total_tau, mu_v, sun_elev, cos_theta, props, linear_rgb, is_textured, same_side, 1.0, opp);
 }
 
 float ring_opposition_factor_extended_terms(float alpha_rad, float tau_val, float spread) {
@@ -152,15 +279,15 @@ float ring_opposition_factor_extended_terms(float alpha_rad, float tau_val, floa
 
 float ring_opposition_factor_extended(float cos_alpha, float tau_val, float source_sin_radius) {
     float ca = clamp(cos_alpha, -1.0, 1.0);
-    float alpha_rad = acos(clamp(ca, -1.0, 1.0 - 1e-7));
-    float spread = asin(clamp(source_sin_radius, 0.0, 0.999));
+    float alpha_rad = ring_fast_acos(clamp(ca, -1.0, 1.0 - 1e-7));
+    float spread = ring_fast_asin(clamp(source_sin_radius, 0.0, 0.999));
     return ring_opposition_factor_extended_terms(alpha_rad, tau_val, spread);
 }
 
 vec3 ring_extended_terms(float cos_theta, float source_sin_radius, bool same_side) {
     float broaden = 1.0 / (1.0 + 1.2 * source_sin_radius);
-    float spread = asin(clamp(source_sin_radius, 0.0, 0.999));
-    float alpha_rad = same_side ? acos(clamp(-cos_theta, -1.0, 1.0 - 1e-7)) : 0.0;
+    float spread = ring_fast_asin(clamp(source_sin_radius, 0.0, 0.999));
+    float alpha_rad = same_side ? ring_fast_acos(clamp(-cos_theta, -1.0, 1.0 - 1e-7)) : 0.0;
     return vec3(broaden, spread, alpha_rad);
 }
 
@@ -170,21 +297,8 @@ vec3 ring_radiance_rgb_extended_terms(float total_tau, float mu_v, float sun_ele
     if (source_sin_radius <= 1e-5) {
         return ring_radiance_rgb(total_tau, mu_v, sun_elev, cos_theta, props, linear_rgb, is_textured, same_side);
     }
-    float mu_s = max(abs(sun_elev), 1e-5);
-    float g_fwd = props.x * ext_terms.x;
-    float g_back = props.y * ext_terms.x;
-    float scatter = props.z;
-    float unlit_factor = props.w;
-
-    vec3 eff_rgb = clamp(linear_rgb, vec3(0.0), vec3(1.0));
-    float phase = ring_phase_dhg(cos_theta, scatter, g_fwd, g_back, total_tau, is_textured);
     float opp = same_side ? ring_opposition_factor_extended_terms(ext_terms.z, total_tau, ext_terms.y) : 1.0;
-    float transfer = ring_transfer(total_tau, mu_s, mu_v, same_side);
-
-    vec3 ss = eff_rgb * (0.25 * phase * opp * transfer);
-    vec3 ms = ring_multiple_scattering(total_tau, mu_s, mu_v, same_side, eff_rgb);
-    float side_scale = same_side ? 1.0 : unlit_factor;
-    return (ss + ms) * side_scale;
+    return ring_radiance_core(total_tau, mu_v, sun_elev, cos_theta, props, linear_rgb, is_textured, same_side, ext_terms.x, opp);
 }
 
 vec3 ring_radiance_rgb_extended(float total_tau, float mu_v, float sun_elev, float cos_theta,

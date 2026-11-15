@@ -1,4 +1,7 @@
 #version 460
+#ifdef TRANSPARENCY_CAPTURE
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
 
 layout(location = 0) in vec3 f_world_pos;
 layout(location = 1) flat in uint f_body_idx;

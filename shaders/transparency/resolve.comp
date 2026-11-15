@@ -7,75 +7,160 @@ layout(set = 0, binding = 3) uniform sampler2D opaque_depth;
 layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D physical_color;
 #endif
 
-bool fragment_before(uint a, uint b) {
-    uvec4 x = fragments[a], y = fragments[b];
+const uint LOCAL_SORT_CAPACITY = 8u;
+
+bool fragment_before_val(uvec3 x, uvec3 y) {
     if (x.z != y.z) return x.z < y.z;
     if (x.x != y.x) return x.x < y.x;
     return (x.y & 0x7fffffffu) <= (y.y & 0x7fffffffu);
+}
+
+bool fragment_before(uint a, uint b) {
+    return fragment_before_val(fragments[a].xyz, fragments[b].xyz);
+}
+
+uint sort_linked_list(uint sorted) {
+    if (sorted == TRANSPARENCY_END || fragments[sorted].w == TRANSPARENCY_END) return sorted;
+    for (uint width = 1u; ; width *= 2u) {
+        uint p = sorted;
+        sorted = TRANSPARENCY_END;
+        uint tail = TRANSPARENCY_END;
+        uint merges = 0u;
+        while (p != TRANSPARENCY_END) {
+            ++merges;
+            uint q = p;
+            uint left = 0u;
+            for (uint i = 0u; i < width && q != TRANSPARENCY_END; ++i) {
+                ++left;
+                q = fragments[q].w;
+            }
+            uint right = width;
+            while (left > 0u || (right > 0u && q != TRANSPARENCY_END)) {
+                uint selected;
+                if (left == 0u) {
+                    selected = q; q = fragments[q].w; --right;
+                } else if (right == 0u || q == TRANSPARENCY_END) {
+                    selected = p; p = fragments[p].w; --left;
+                } else if (fragment_before(p, q)) {
+                    selected = p; p = fragments[p].w; --left;
+                } else {
+                    selected = q; q = fragments[q].w; --right;
+                }
+                if (tail == TRANSPARENCY_END) sorted = selected;
+                else fragments[tail].w = selected;
+                tail = selected;
+            }
+            p = q;
+        }
+        fragments[tail].w = TRANSPARENCY_END;
+        if (merges <= 1u) break;
+    }
+    return sorted;
+}
+
+void resolve_multi(ivec2 pixel, uint current, uint depth) {
+    uvec3 local[LOCAL_SORT_CAPACITY];
+    uint kept = 0u;
+    bool overflowed = false;
+    uint node = current;
+    while (node != TRANSPARENCY_END) {
+        uvec4 fragment = fragments[node];
+        if (fragment.z >= depth) {
+            if (kept < LOCAL_SORT_CAPACITY) {
+                local[kept] = fragment.xyz;
+                ++kept;
+            } else {
+                overflowed = true;
+                break;
+            }
+        }
+        node = fragment.w;
+    }
+    if (kept == 0u) {
+#ifdef BLOOM_OUTPUT
+        vec4 background = imageLoad(hdr_color, pixel);
+        imageStore(physical_color, pixel, vec4(min(background.rgb, vec3(65000.0)), 1.0));
+#endif
+        return;
+    }
+
+    vec4 background = imageLoad(hdr_color, pixel);
+#ifdef BLOOM_OUTPUT
+    vec3 physical = background.rgb;
+#endif
+    if (!overflowed) {
+        for (uint i = 1u; i < kept; ++i) {
+            uvec3 key = local[i];
+            uint j = i;
+            while (j > 0u && !fragment_before_val(local[j - 1u], key)) {
+                local[j] = local[j - 1u];
+                --j;
+            }
+            local[j] = key;
+        }
+        for (uint i = 0u; i < kept; ++i) {
+            uvec4 fragment = uvec4(local[i], 0u);
+            vec4 color = transparent_color(fragment);
+            background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+#ifdef BLOOM_OUTPUT
+            if (!transparent_excludes_bloom(fragment)) physical = color.rgb+(1.0-color.a)*physical;
+#endif
+        }
+    } else {
+        uint sorted = sort_linked_list(current);
+        while (sorted != TRANSPARENCY_END) {
+            uvec4 fragment = fragments[sorted];
+            vec4 color = transparent_color(fragment);
+            if (fragment.z >= depth) {
+                background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+#ifdef BLOOM_OUTPUT
+                if (!transparent_excludes_bloom(fragment)) physical = color.rgb+(1.0-color.a)*physical;
+#endif
+            }
+            sorted = fragment.w;
+        }
+    }
+    imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+#ifdef BLOOM_OUTPUT
+    imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
+#endif
 }
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, imageSize(transparency_heads)))) return;
     uint current = imageLoad(transparency_heads, pixel).x;
-#ifndef BLOOM_OUTPUT
-    if (current == TRANSPARENCY_END) return;
-#endif
-    uint sorted = current;
-    if (current != TRANSPARENCY_END && fragments[current].w != TRANSPARENCY_END) {
-        for (uint width = 1u; ; width *= 2u) {
-            uint p = sorted;
-            sorted = TRANSPARENCY_END;
-            uint tail = TRANSPARENCY_END;
-            uint merges = 0u;
-            while (p != TRANSPARENCY_END) {
-                ++merges;
-                uint q = p;
-                uint left = 0u;
-                for (uint i = 0u; i < width && q != TRANSPARENCY_END; ++i) {
-                    ++left;
-                    q = fragments[q].w;
-                }
-                uint right = width;
-                while (left > 0u || (right > 0u && q != TRANSPARENCY_END)) {
-                    uint selected;
-                    if (left == 0u) {
-                        selected = q; q = fragments[q].w; --right;
-                    } else if (right == 0u || q == TRANSPARENCY_END) {
-                        selected = p; p = fragments[p].w; --left;
-                    } else if (fragment_before(p, q)) {
-                        selected = p; p = fragments[p].w; --left;
-                    } else {
-                        selected = q; q = fragments[q].w; --right;
-                    }
-                    if (tail == TRANSPARENCY_END) sorted = selected;
-                    else fragments[tail].w = selected;
-                    tail = selected;
-                }
-                p = q;
-            }
-            fragments[tail].w = TRANSPARENCY_END;
-            if (merges <= 1u) break;
-        }
-    }
-    vec4 background = imageLoad(hdr_color, pixel);
+    if (current == TRANSPARENCY_END) {
 #ifdef BLOOM_OUTPUT
-    vec3 physical = background.rgb;
+        vec4 background = imageLoad(hdr_color, pixel);
+        imageStore(physical_color, pixel, vec4(min(background.rgb, vec3(65000.0)), 1.0));
 #endif
+        return;
+    }
+
     uint depth = floatBitsToUint(texelFetch(opaque_depth, pixel, 0).r);
-    while (sorted != TRANSPARENCY_END) {
-        uvec4 fragment = fragments[sorted];
-        vec4 color = transparent_color(fragment);
-        if (fragment.z >= depth) {
-            background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+    uvec4 first = fragments[current];
+    if (first.w == TRANSPARENCY_END) {
+        if (first.z < depth) {
 #ifdef BLOOM_OUTPUT
-            if (!transparent_excludes_bloom(fragment)) physical = color.rgb+(1.0-color.a)*physical;
+            vec4 background = imageLoad(hdr_color, pixel);
+            imageStore(physical_color, pixel, vec4(min(background.rgb, vec3(65000.0)), 1.0));
 #endif
+            return;
         }
-        sorted = fragment.w;
-    }
-    imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+        vec4 background = imageLoad(hdr_color, pixel);
 #ifdef BLOOM_OUTPUT
-    imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
+        vec3 physical = background.rgb;
 #endif
+        vec4 color = transparent_color(first);
+        background.rgb = color.rgb+(1.0-color.a)*background.rgb;
+        imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+#ifdef BLOOM_OUTPUT
+        if (!transparent_excludes_bloom(first)) physical = background.rgb;
+        imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
+#endif
+        return;
+    }
+
+    resolve_multi(pixel, current, depth);
 }

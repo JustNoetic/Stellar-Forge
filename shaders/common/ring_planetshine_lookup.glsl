@@ -32,6 +32,17 @@ void ring_planetshine_unpack_face(vec4 moment, vec3 flux_scale, float u,
     light = normalize(d_r * e_r + d_t.x * e_phi_folded + d_t.y * pole_n);
 }
 
+float ring_fast_atan_pos(float y_abs, float x) {
+    float x_abs = abs(x);
+    float a = min(x_abs, y_abs);
+    float b = max(x_abs, y_abs);
+    float t = (b > 1e-20) ? (a / b) : 0.0;
+    float t2 = t * t;
+    float r = t * (0.9998660 + t2 * (-0.3302995 + t2 * (0.1801410 + t2 * (-0.0851330 + t2 * 0.0208351))));
+    float phi = (y_abs > x_abs) ? (1.5707963267948966 - r) : r;
+    return (x < 0.0) ? (RP_LOOKUP_PI - phi) : phi;
+}
+
 bool ring_planetshine_sample_moments(uint host_idx, uint star_col, vec3 hit_local, vec3 pole_n,
                                        vec3 star_dir, float host_radius, float cam_side,
                                        out vec4 same_m, out vec4 other_m, out float u,
@@ -46,28 +57,30 @@ bool ring_planetshine_sample_moments(uint host_idx, uint star_col, vec3 hit_loca
     if (r <= max(host_radius, 1e-12)) return false;
 
     u = clamp(host_radius / r, 0.0, RP_LOOKUP_MAX_SIN);
-    float alpha = u < 1e-3 ? u + (1.0 / 6.0) * u * u * u : asin(u);
+    float alpha = ring_fast_asin(u);
     float tx = clamp(alpha * RP_LOOKUP_INV_MAX_ALPHA, 0.0, 1.0);
 
     e_r = -hit_local / r;
+    vec3 radial = -e_r;
+    vec3 e_t = cross(pole_n, e_r);
     vec3 sun_horiz = star_dir - pole_n * dot(star_dir, pole_n);
-    float sun_horiz_len = length(sun_horiz);
-    vec3 sun_x;
-    if (sun_horiz_len > 1e-7) {
-        sun_x = sun_horiz / sun_horiz_len;
+    float sun_horiz_sq = dot(sun_horiz, sun_horiz);
+    float cos_phi_u;
+    float sin_phi_u;
+    if (sun_horiz_sq > 1e-14) {
+        cos_phi_u = dot(radial, sun_horiz);
+        sin_phi_u = dot(e_t, star_dir);
     } else {
         vec3 axis = abs(pole_n.x) < 0.8 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 0.0, 1.0);
-        sun_x = normalize(axis - pole_n * dot(axis, pole_n));
+        vec3 sun_x = normalize(axis - pole_n * dot(axis, pole_n));
+        vec3 sun_y = cross(pole_n, sun_x);
+        cos_phi_u = dot(radial, sun_x);
+        sin_phi_u = dot(radial, sun_y);
     }
-    vec3 sun_y = cross(pole_n, sun_x);
-    vec3 radial = -e_r;
-    float cos_phi = clamp(dot(radial, sun_x), -1.0, 1.0);
-    float sin_phi_signed = dot(radial, sun_y);
-    float phi = atan(abs(sin_phi_signed), cos_phi);
+    float phi = ring_fast_atan_pos(abs(sin_phi_u), cos_phi_u);
     float ty = clamp(phi / RP_LOOKUP_PI, 0.0, 1.0);
 
-    vec3 e_t = cross(pole_n, e_r);
-    float phi_sign = sin_phi_signed >= 0.0 ? 1.0 : -1.0;
+    float phi_sign = sin_phi_u >= 0.0 ? 1.0 : -1.0;
     e_phi_folded = e_t * phi_sign;
 
     vec2 uv = (vec2(float(star_col), float(host_idx)) * 65.0 + 0.5 + vec2(tx, ty) * 64.0)

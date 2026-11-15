@@ -310,7 +310,7 @@ std::vector<RingDrawRange> build_ring_draw_ranges(std::span<const ephemeris::Rin
     std::vector<RingDrawRange> ranges;
     if (angular_segments < 3 || radial_subdivisions == 0 || max_radius <= min_radius || planet_radius_au <= 0.0) return ranges;
     double chord = std::cos(3.14159265358979323846 / angular_segments);
-    double padding = max_radius * 0.001;
+    double padding = max_radius * 0.02;
     for (uint32_t strip = 0; strip < radial_subdivisions; ++strip) {
         double inner = std::lerp(min_radius, max_radius, double(strip) / radial_subdivisions) * chord - padding;
         double outer = std::lerp(min_radius, max_radius, double(strip + 1) / radial_subdivisions) + padding;

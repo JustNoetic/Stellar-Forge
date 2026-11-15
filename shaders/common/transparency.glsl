@@ -28,12 +28,31 @@ uvec2 pack_transparent_color(vec4 color) { return pack_transparent_color(color, 
 
 #ifdef TRANSPARENCY_CAPTURE
 bool capture_transparency(vec4 color, float depth, bool exclude_bloom) {
+#ifdef GL_KHR_shader_subgroup_ballot
+    bool active_lane = !gl_HelperInvocation && color.a > 0.0;
+    uvec4 ballot = subgroupBallot(active_lane);
+    if (!active_lane) return true;
+    uint count = subgroupBallotBitCount(ballot);
+    uint local_offset = subgroupBallotExclusiveBitCount(ballot);
+    uint first_lane = subgroupBallotFindLSB(ballot);
+    uint base = 0u;
+    if (gl_SubgroupInvocationID == first_lane) {
+        base = atomicAdd(fragment_count, count);
+        uint overflow = base >= fragment_capacity ? count :
+                        (count > fragment_capacity - base ? count - (fragment_capacity - base) : 0u);
+        if (overflow > 0u) atomicAdd(overflow_count, overflow);
+    }
+    base = subgroupBroadcast(base, first_lane);
+    uint index = base + local_offset;
+    if (index >= fragment_capacity) return false;
+#else
     if (color.a <= 0.0) return true;
     uint index = atomicAdd(fragment_count, 1u);
     if (index >= fragment_capacity) {
         atomicAdd(overflow_count, 1u);
         return false;
     }
+#endif
     uint previous = imageAtomicExchange(transparency_heads, ivec2(gl_FragCoord.xy), index);
     fragments[index] = uvec4(pack_transparent_color(color, exclude_bloom), floatBitsToUint(depth), previous);
     return true;

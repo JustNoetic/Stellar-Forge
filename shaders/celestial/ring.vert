@@ -23,6 +23,10 @@ void main() {
         outer += expansion;
     }
     float r = mix(inner, outer, in_polar.x);
+    if (!refraction_active()) {
+        if (in_polar.x <= 0.0) r = max(0.0, inner - outer * 0.02);
+        else if (in_polar.x >= 1.0) r = outer * 1.025;
+    }
     vec3 local_pos = r * (in_polar.y * ring_hosts[h].tangent_radius.xyz + in_polar.z * ring_hosts[h].bitangent_oblateness.xyz);
     vec3 world_pos = ring_hosts[h].center_min_r.xyz + local_pos;
 
