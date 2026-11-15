@@ -81,7 +81,7 @@ static const std::vector<KnownSpiceBody>& known_spice_bodies() {
         {299, "Venus", "Terrestrial", "#e0c8a0", 6051.8, 4.8675e24, "Sun", false, "", ""},
         {399, "Earth", "Terrestrial", "#3b5d9c", 6371.0, 5.972e24, "Sun", false, "", ""},
         {301, "Moon", "Moon", "#d0d0d0", 1737.4, 7.342e22, "Earth", false, "", ""},
-        {-1024, "Artemis II (Orion)", "Spacecraft", "#00ffff", 0.010, 26000.0, "Earth", true, "2026-04-02 02:00:00", "2026-04-10 23:50:00"},
+        {-1024, "Artemis II (Orion)", "Spacecraft", "#00ffff", 0.010, 26000.0, "Earth", true, "2026-04-02 01:58:00", "2026-04-10 23:53:00"},
         {-82, "Cassini", "Spacecraft", "#e0a040", 0.010, 5712.0, "Saturn", true, "2004-07-01 14:00:00", "2017-09-15 09:58:00"},
         {-170, "JWST", "Spacecraft", "#ffd700", 0.010, 6500.0, "Earth", true, "", ""},
         {499, "Mars", "Terrestrial", "#c1440e", 3389.5, 6.4171e23, "Sun", false, "", ""},
