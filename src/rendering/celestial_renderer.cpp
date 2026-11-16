@@ -788,13 +788,13 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             ctx.push_descriptors(cmd, cloud_inline_pipeline_, inline_writes);
             for (uint32_t body : inline_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
         }
-        bool capture = transparency_.active() && cloud_transparency_pipeline_.handle;
-        const auto& pipeline = capture ? cloud_transparency_pipeline_ : cloud_pipeline_;
-        if (capture) {
-            auto capture_writes = transparency_.writes();
-            cloud_writes.insert(cloud_writes.end(), capture_writes.begin(), capture_writes.end());
-        }
         if (!layered_bodies.empty()) {
+            bool capture = transparency_.active() && cloud_transparency_pipeline_.handle;
+            const auto& pipeline = capture ? cloud_transparency_pipeline_ : cloud_pipeline_;
+            if (capture) {
+                auto capture_writes = transparency_.writes();
+                cloud_writes.insert(cloud_writes.end(), capture_writes.begin(), capture_writes.end());
+            }
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
             ctx.push_descriptors(cmd, pipeline, cloud_writes);
             for (uint32_t body : layered_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
@@ -873,6 +873,7 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
                 f.cloud_style = glm::vec4(static_cast<float>(cloud_type_index(d.clouds.type)), static_cast<float>(d.clouds.detail_size_km),
                     static_cast<float>(d.clouds.erosion), static_cast<float>(cloud_maps_.layer(d.clouds.coverage_map)));
                 f.cloud_noise.x = static_cast<float>(d.clouds.shape_size_km);
+                f.cloud_noise.y = static_cast<float>(atmospheres_.inline_cloud_slot(i));
                 double drift = std::fmod(d.clouds.wind_speed_ms * seconds / (radius_km * 1000.0), TWO_PI);
                 double evolution = std::fmod(d.clouds.evolution * seconds / 3600.0, 1000.0);
                 f.cloud_motion = glm::vec4(static_cast<float>(d.clouds.feature_size_km), static_cast<float>(drift),
@@ -909,7 +910,7 @@ void CelestialRenderer::prepare_cloud_layer(VkCommandBuffer cmd, rhi::VkContext&
     if (cloud_layer_depth_.extent.width != extent.width || cloud_layer_depth_.extent.height != extent.height) {
         for (auto* image : {&cloud_layer_color_, &cloud_layer_depth_})
             if (*image) retired_cloud_layers_.emplace_back(*image, ctx.recording_serial());
-        cloud_layer_color_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R32G32B32A32_SFLOAT,
+        cloud_layer_color_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         cloud_layer_depth_ = ctx.create_image_2d(extent.width, extent.height, VK_FORMAT_R32_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);

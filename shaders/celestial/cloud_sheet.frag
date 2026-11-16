@@ -18,7 +18,7 @@ layout(location = 3) in vec3 f_refraction_shift;
 #include "common/transparency.glsl"
 #endif
 #ifdef CLOUD_SHEET_INLINE
-layout(rgba32f, set = 0, binding = 35) uniform writeonly image2D cloud_layer_color;
+layout(rgba16f, set = 0, binding = 35) uniform writeonly image2D cloud_layer_color;
 layout(r32f, set = 0, binding = 36) uniform writeonly image2D cloud_layer_depth;
 #endif
 

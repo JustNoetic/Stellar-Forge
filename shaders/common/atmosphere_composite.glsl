@@ -44,37 +44,63 @@ vec4 cubic_weights(float f) {
     return vec4(g*g*g, 3.0*f*f*f-6.0*f*f+4.0, -3.0*f*f*f+3.0*f*f+3.0*f+1.0, f*f*f)/6.0;
 }
 
-struct AerialFilter { vec2 x, y, sx, sy; float z; };
+struct AerialFilterXY {
+    vec2 x, y, sx, sy;
+    float range;
+    bool valid;
+};
 
-AerialFilter aerial_filter(vec3 direction, float range, float path, ivec3 size, sampler2D ranges) {
-    vec2 uv = sky_uv(direction, size.xy);
-    float half_texel = 0.5/float(size.y);
-    vec2 y_bounds = uv.y < 0.5 ? vec2(half_texel, 0.5-half_texel) : vec2(0.5+half_texel, 1.0-half_texel);
-    if (abs(uv.y-0.5) < 1.0/float(size.y) || atm.camera.z-bottom_radius() < 0.01)
-        range = textureLod(ranges, uv, 0.0).r;
-    float fraction = clamp(path/max(range, 1e-8), 0.0, 1.0);
-    float coordinate = atm.camera.z < top_radius() ? sqrt(fraction) : fraction;
-    float slice = min(floor(coordinate*float(size.z-1)), float(size.z-2));
-    float t0 = aerial_distance(slice/float(size.z-1), range);
-    float t1 = aerial_distance((slice+1.0)/float(size.z-1), range);
-    float depth_blend = clamp((path-t0)/max(t1-t0, 1e-8), 0.0, 1.0);
-    float z = (0.5+slice+depth_blend)/float(size.z);
-    vec2 grid = uv*vec2(size.xy)-0.5;
-    vec2 base = floor(grid), f = fract(grid);
-    vec4 wx = cubic_weights(f.x), wy = cubic_weights(f.y);
-    vec2 sx = vec2(wx.x+wx.y, wx.z+wx.w), sy = vec2(wy.x+wy.y, wy.z+wy.w);
-    vec2 x = (0.5+mod(base.x+vec2(-1.0, 1.0)+vec2(wx.y, wx.w)/sx, float(size.x-1)))/float(size.x);
-    vec2 y = (base.y+vec2(-0.5, 1.5)+vec2(wy.y, wy.w)/sy)/float(size.y);
-    y = clamp(y, y_bounds.x, y_bounds.y);
-    return AerialFilter(x, y, sx, sy, z);
+struct TransportCache {
+    AerialFilterXY aerial;
+#ifdef ATMOSPHERE_SECONDARY
+    AerialFilterXY secondary;
+#endif
+};
+
+TransportCache init_transport_cache() {
+    TransportCache c;
+    c.aerial.valid = false;
+#ifdef ATMOSPHERE_SECONDARY
+    c.secondary.valid = false;
+#endif
+    return c;
 }
 
-void aerial_transport(vec3 direction, float span, float path, out vec3 L, out vec3 T) {
-    AerialFilter f = aerial_filter(direction, span, path, AERIAL_SIZE, aerial_range_lut);
+AerialFilterXY aerial_filter_xy(vec3 direction, float range, ivec3 size, sampler2D ranges) {
+    AerialFilterXY f;
+    vec2 uv = sky_uv(direction, size.xy);
+    f.range = (abs(uv.y-0.5) < 1.0/float(size.y) || atm.camera.z-bottom_radius() < 0.01)
+        ? textureLod(ranges, uv, 0.0).r : range;
+    vec2 grid = uv*vec2(size.xy)-0.5;
+    vec2 base = floor(grid), t = fract(grid);
+    vec4 wx = cubic_weights(t.x), wy = cubic_weights(t.y);
+    f.sx = vec2(wx.x+wx.y, wx.z+wx.w);
+    f.sy = vec2(wy.x+wy.y, wy.z+wy.w);
+    f.x = (0.5+mod(base.x+vec2(-1.0, 1.0)+vec2(wx.y, wx.w)/f.sx, float(size.x-1)))/float(size.x);
+    float half_texel = 0.5/float(size.y);
+    vec2 y_bounds = uv.y < 0.5 ? vec2(half_texel, 0.5-half_texel) : vec2(0.5+half_texel, 1.0-half_texel);
+    f.y = clamp((base.y+vec2(-0.5, 1.5)+vec2(wy.y, wy.w)/f.sy)/float(size.y), y_bounds.x, y_bounds.y);
+    f.valid = true;
+    return f;
+}
+
+float aerial_filter_z(float range, float path, int depth_slices) {
+    float fraction = clamp(path/max(range, 1e-8), 0.0, 1.0);
+    float coordinate = atm.camera.z < top_radius() ? sqrt(fraction) : fraction;
+    float slice = min(floor(coordinate*float(depth_slices-1)), float(depth_slices-2));
+    float t0 = aerial_distance(slice/float(depth_slices-1), range);
+    float t1 = aerial_distance((slice+1.0)/float(depth_slices-1), range);
+    float depth_blend = clamp((path-t0)/max(t1-t0, 1e-8), 0.0, 1.0);
+    return (0.5+slice+depth_blend)/float(depth_slices);
+}
+
+void aerial_transport(vec3 direction, float span, float path, inout AerialFilterXY f, out vec3 L, out vec3 T) {
+    if (!f.valid) f = aerial_filter_xy(direction, span, AERIAL_SIZE, aerial_range_lut);
+    float z = aerial_filter_z(f.range, path, AERIAL_SIZE.z);
     L = vec3(0.0);
     vec3 tau = vec3(0.0);
     for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i) {
-        vec3 lookup = vec3(f.x[i], f.y[j], f.z);
+        vec3 lookup = vec3(f.x[i], f.y[j], z);
         float weight = f.sx[i]*f.sy[j];
         L += weight*textureLod(aerial_radiance_lut, lookup, 0.0).rgb;
         tau += weight*textureLod(aerial_optical_depth_lut, lookup, 0.0).rgb;
@@ -83,13 +109,15 @@ void aerial_transport(vec3 direction, float span, float path, out vec3 L, out ve
 }
 
 #ifdef ATMOSPHERE_SECONDARY
-vec3 secondary_radiance(vec3 direction, float span, float path, bool finite_endpoint) {
+vec3 secondary_radiance(vec3 direction, float span, float path, bool finite_endpoint, inout AerialFilterXY f) {
     if (!finite_endpoint)
         return textureLod(secondary_sky_lut, sky_uv(direction, textureSize(secondary_sky_lut, 0)), 0.0).rgb;
-    AerialFilter f = aerial_filter(direction, span, path, textureSize(secondary_aerial_lut, 0), secondary_range_lut);
+    ivec3 size = textureSize(secondary_aerial_lut, 0);
+    if (!f.valid) f = aerial_filter_xy(direction, span, size, secondary_range_lut);
+    float z = aerial_filter_z(f.range, path, size.z);
     vec3 L = vec3(0.0);
     for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i)
-        L += f.sx[i]*f.sy[j]*textureLod(secondary_aerial_lut, vec3(f.x[i], f.y[j], f.z), 0.0).rgb;
+        L += f.sx[i]*f.sy[j]*textureLod(secondary_aerial_lut, vec3(f.x[i], f.y[j], z), 0.0).rgb;
     return L;
 }
 #endif
@@ -107,14 +135,16 @@ vec3 finite_transmittance(vec3 x, vec3 p, vec3 direction, vec3 extinction, float
     return mix(exp(-extinction * path), T_lut, smoothstep(0.5, 2.0, path));
 }
 
-void atmosphere_shadow_loss(ivec2 pixel, float depth, inout vec3 L) {
+void atmosphere_shadow_loss(ivec2 pixel, float depth, int preferred_layer, inout vec3 L) {
 #ifndef ATMOSPHERE_UNSHADOWED
     if (shadow_flags.x != 0u) {
         if (any(lessThan(pixel, shadow_bounds.xy)) || any(greaterThanEqual(pixel, shadow_bounds.zw))) return;
         if (any(greaterThan(L, vec3(0.0)))) {
             vec3 fraction = vec3(0.0);
             bool cached = false;
-            for (int layer = 0; layer < 3; ++layer) {
+            for (int k = 0; k < 3; ++k) {
+                int layer = preferred_layer + k;
+                if (layer >= 3) layer -= 3;
                 if (texelFetch(shadow_endpoint_lut, ivec3(pixel, layer), 0).r == depth) {
                     fraction = texelFetch(shadow_deficit_lut, ivec3(pixel, layer), 0).rgb;
                     cached = true;
@@ -132,6 +162,7 @@ void atmosphere_shadow_loss(ivec2 pixel, float depth, inout vec3 L) {
 }
 
 bool atmosphere_transport_ray_base(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float span, float depth,
+                                   int shadow_layer, inout TransportCache cache,
                                    out vec3 L, out vec3 T, out float path, out bool finite_endpoint) {
     path = span;
     finite_endpoint = false;
@@ -151,30 +182,33 @@ bool atmosphere_transport_ray_base(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, 
         }
     }
     if (finite_endpoint) {
-        aerial_transport(d, span, path, L, T);
+        aerial_transport(d, span, path, cache.aerial, L, T);
     } else {
         vec2 uv = sky_uv(d);
         L = textureLod(radiance_lut, uv, 0.0).rgb;
         T = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
     }
-    atmosphere_shadow_loss(pixel, depth, L);
+    atmosphere_shadow_loss(pixel, depth, shadow_layer, L);
     return true;
 }
 
-void atmosphere_finish_radiance(vec3 d, float span, float path, bool finite_endpoint, float depth, inout vec3 L) {
+void atmosphere_finish_radiance(vec3 d, float span, float path, bool finite_endpoint, float depth,
+                                inout TransportCache cache, inout vec3 L) {
 #ifdef ATMOSPHERE_SECONDARY
     // Matches the base early return: surface pixels without aerial perspective carry no in-scatter.
     if (depth <= 0.0 || atm.depth_params.y != 0.0)
-        L += secondary.irradiance.rgb*secondary_radiance(d, span, path, finite_endpoint);
+        L += secondary.irradiance.rgb*secondary_radiance(d, span, path, finite_endpoint, cache.secondary);
 #endif
     L *= atm.depth_params.w;
 }
 
-bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float span, float depth, out vec3 L, out vec3 T) {
+bool atmosphere_transport_ray(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float span, float depth,
+                              int shadow_layer, inout TransportCache cache, out vec3 L, out vec3 T) {
     float path;
     bool finite_endpoint;
-    if (!atmosphere_transport_ray_base(pixel, ndc, d, segment, span, depth, L, T, path, finite_endpoint)) return false;
-    atmosphere_finish_radiance(d, span, path, finite_endpoint, depth, L);
+    if (!atmosphere_transport_ray_base(pixel, ndc, d, segment, span, depth, shadow_layer, cache, L, T, path, finite_endpoint))
+        return false;
+    atmosphere_finish_radiance(d, span, path, finite_endpoint, depth, cache, L);
     return true;
 }
 
@@ -325,7 +359,8 @@ float limb_depth_distance(vec2 ndc, float depth) {
     return length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
 }
 
-bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment, float span, float depth, out vec3 L, out vec3 T) {
+bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment, float span, float depth,
+                    int shadow_layer, inout TransportCache cache, out vec3 L, out vec3 T) {
     float path = span;
     bool surface_seen = false;
     if (depth > 0.0) {
@@ -339,7 +374,8 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
     if (f.resolved) {
         L = vec3(0.0);
         T = vec3(1.0);
-        if (span > 0.0 && !atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, L, T)) return false;
+        if (span > 0.0 && !atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, shadow_layer, cache, L, T))
+            return false;
     } else {
         L = vec3(0.0);
         vec3 ground, sky;
@@ -349,7 +385,7 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
         float space = max(1.0-ground_weight-sky_weight, 0.0);
         T = surface_seen && ground_weight > 0.0 ? ground/ground_weight
           : sky_weight+space > 0.0 ? (sky+space)/(sky_weight+space) : ground/max(ground_weight, 1e-20);
-        if (span > 0.0) atmosphere_shadow_loss(pixel, depth, L);
+        if (span > 0.0) atmosphere_shadow_loss(pixel, depth, shadow_layer, L);
         L *= atm.depth_params.w;
     }
     if (!surface_seen || !f.resolved) L += limb_star_image(f)*atm.depth_params.w;
@@ -358,22 +394,20 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
 }
 #endif
 
-bool atmosphere_transport(ivec2 pixel, ivec2 size, float depth, out vec3 L, out vec3 T) {
-    if (any(greaterThanEqual(pixel, size))) return false;
-    vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
-    vec3 d = view_direction(ndc);
-    float span;
-    vec2 segment = atmosphere_segment(atm.camera.xyz, d, span);
+bool atmosphere_transport_endpoint(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, float span,
 #ifdef ATMOSPHERE_LIMB
-    LimbFootprint limb;
-    if (limb_footprint(ndc, d, size, limb)) return limb_transport(pixel, limb, ndc, d, segment, span, depth, L, T);
+                                   bool has_limb, LimbFootprint limb,
+#endif
+                                   float depth, int shadow_layer, inout TransportCache cache, out vec3 L, out vec3 T) {
+#ifdef ATMOSPHERE_LIMB
+    if (has_limb) return limb_transport(pixel, limb, ndc, d, segment, span, depth, shadow_layer, cache, L, T);
 #endif
     if (span <= 0.0) return false;
-    return atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, L, T);
+    return atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, shadow_layer, cache, L, T);
 }
 
 // The 2D cloud sheet of this atmosphere's body at this pixel, as the cloud pass wrote it (premultiplied colour with
-// exposure applied; alpha carries 2*body+opacity), when it lies in front of the opaque scene.
+// exposure applied; alpha carries 2*slot+opacity), when it lies in front of the opaque scene.
 bool cloud_layer_fetch(ivec2 pixel, float scene_depth, out vec4 color, out float depth) {
     color = vec4(0.0);
     depth = 0.0;
@@ -381,25 +415,55 @@ bool cloud_layer_fetch(ivec2 pixel, float scene_depth, out vec4 color, out float
     depth = texelFetch(cloud_layer_depth, pixel, 0).r;
     if (depth <= scene_depth) return false;
     color = texelFetch(cloud_layer_color, pixel, 0);
-    float body = floor(color.a*0.5);
-    if (body != atm.cloud_layer.x) return false;
-    color.a -= 2.0*body;
+    float slot = floor(color.a*0.5);
+    if (slot != atm.cloud_layer.z) return false;
+    color.a -= 2.0*slot;
     return true;
 }
 
-// The cloud's premultiplied colour as seen from the camera: it receives the atmosphere in front of it.
-vec4 cloud_layer_transported(ivec2 pixel, ivec2 size, vec4 cloud, float cloud_depth) {
-    vec3 L, T;
-    if (atmosphere_transport(pixel, size, cloud_depth, L, T)) cloud.rgb = cloud.rgb*T+cloud.a*L*atm.depth_params.x;
-    return cloud;
-}
+bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 scattered, out vec3 transmitted) {
+    scattered = vec3(0.0);
+    transmitted = vec3(1.0);
+    if (any(greaterThanEqual(pixel, size))) return false;
+    vec4 cloud;
+    float cloud_depth;
+    bool clouded = cloud_layer_fetch(pixel, depth, cloud, cloud_depth);
+    bool opaque_cloud = clouded && cloud.a >= 0.99999;
 
-// Places the cloud sheet between the camera and the background transport, hiding (1-alpha) of the background and of
-// the air behind it.
-void apply_cloud_layer(ivec2 pixel, ivec2 size, vec4 cloud, float cloud_depth, inout vec3 scattered, inout vec3 transmitted) {
-    cloud = cloud_layer_transported(pixel, size, cloud, cloud_depth);
-    scattered = scattered*(1.0-cloud.a)+cloud.rgb;
-    transmitted *= 1.0-cloud.a;
+    vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
+    vec3 d = view_direction(ndc);
+    float span;
+    vec2 segment = atmosphere_segment(atm.camera.xyz, d, span);
+#ifdef ATMOSPHERE_LIMB
+    LimbFootprint limb;
+    bool has_limb = limb_footprint(ndc, d, size, limb);
+#endif
+    TransportCache cache = init_transport_cache();
+    vec3 L, T;
+    bool background = false;
+    if (!opaque_cloud) {
+        background = atmosphere_transport_endpoint(pixel, ndc, d, segment, span,
+#ifdef ATMOSPHERE_LIMB
+            has_limb, limb,
+#endif
+            depth, 0, cache, L, T);
+        if (background) {
+            scattered = L*atm.depth_params.x;
+            transmitted = T;
+        }
+    }
+    if (!background && !clouded) return false;
+    if (clouded) {
+        if (atmosphere_transport_endpoint(pixel, ndc, d, segment, span,
+#ifdef ATMOSPHERE_LIMB
+            has_limb, limb,
+#endif
+            cloud_depth, 2, cache, L, T))
+            cloud.rgb = cloud.rgb*T+cloud.a*L*atm.depth_params.x;
+        scattered = scattered*(1.0-cloud.a)+cloud.rgb;
+        transmitted *= 1.0-cloud.a;
+    }
+    return true;
 }
 
 #ifdef ATMOSPHERE_TRANSPARENCY
@@ -431,6 +495,7 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
         bool cloud_transported = false, cloud_missed = false;
         bool single = (current & TRANSPARENCY_MULTI_BIT) == 0u;
         current &= TRANSPARENCY_INDEX_MASK;
+        TransportCache cache = init_transport_cache();
         if (transparent_span > 0.0) {
             while (current != TRANSPARENCY_END) {
                 uint frag_depth_bits = transparent_depth_bits(current);
@@ -453,7 +518,8 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                     shadow_cache_missed = false;
                     vec3 endpoint_L, endpoint_T;
                     bool valid = atmosphere_transport_ray_base(transparent_pixel, transparent_ndc, transparent_dir,
-                        transparent_segment, transparent_span, endpoint_depth, endpoint_L, endpoint_T, path, finite_endpoint);
+                        transparent_segment, transparent_span, endpoint_depth, pass == 0 ? 2 : 1, cache,
+                        endpoint_L, endpoint_T, path, finite_endpoint);
                     if (valid) {
 #ifndef ATMOSPHERE_SHADOW_DATA_ONLY
                         if (shadow_cache_missed && any(greaterThan(endpoint_L, vec3(0.0)))) {
@@ -462,7 +528,7 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                             endpoint_L = max(endpoint_L - endpoint_L * fraction, vec3(0.0));
                         }
 #endif
-                        atmosphere_finish_radiance(transparent_dir, transparent_span, path, finite_endpoint, endpoint_depth, endpoint_L);
+                        atmosphere_finish_radiance(transparent_dir, transparent_span, path, finite_endpoint, endpoint_depth, cache, endpoint_L);
                     }
                     if (pass == 0) {
                         if (valid) {
@@ -515,7 +581,6 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
 #endif
 
 void main() {
-    vec3 L, T;
 #if defined(ATMOSPHERE_TILE_DEFERRED)
     transport_transparent_fragments(atmosphere_tile_pixel());
 #elif defined(ATMOSPHERE_TILE_LEAN)
@@ -529,13 +594,8 @@ void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     ivec2 size = textureSize(scene_depth, 0);
     float depth = texelFetch(scene_depth, pixel, 0).r;
-    bool background = atmosphere_transport(pixel, size, depth, L, T);
-    vec4 cloud;
-    float cloud_depth;
-    bool clouded = cloud_layer_fetch(pixel, depth, cloud, cloud_depth);
-    if (!background && !clouded) discard;
-    vec3 scattered = background ? L*atm.depth_params.x : vec3(0.0), transmitted = background ? T : vec3(1.0);
-    if (clouded) apply_cloud_layer(pixel, size, cloud, cloud_depth, scattered, transmitted);
+    vec3 scattered, transmitted;
+    if (!composite_atmosphere_pixel(pixel, size, depth, scattered, transmitted)) discard;
     out_scattered = vec4(min(scattered, vec3(65000.0)), 0.0);
     out_transmittance = vec4(transmitted, 1.0);
 #elif !defined(ATMOSPHERE_TRANSPARENT_ONLY)
@@ -543,13 +603,8 @@ void main() {
     ivec2 size = imageSize(hdr_color);
     if (any(greaterThanEqual(pixel, size))) return;
     float depth = texelFetch(scene_depth, pixel, 0).r;
-    bool background = atmosphere_transport(pixel, size, depth, L, T);
-    vec4 cloud;
-    float cloud_depth;
-    bool clouded = cloud_layer_fetch(pixel, depth, cloud, cloud_depth);
-    if (!background && !clouded) return;
-    vec3 scattered = background ? L*atm.depth_params.x : vec3(0.0), transmitted = background ? T : vec3(1.0);
-    if (clouded) apply_cloud_layer(pixel, size, cloud, cloud_depth, scattered, transmitted);
+    vec3 scattered, transmitted;
+    if (!composite_atmosphere_pixel(pixel, size, depth, scattered, transmitted)) return;
     vec4 color = imageLoad(hdr_color, pixel);
     imageStore(hdr_color, pixel, vec4(min(color.rgb*transmitted+scattered, vec3(65000.0)), color.a));
 #endif

@@ -58,7 +58,7 @@ struct alignas(16) AtmosphereParametersGPU {
     std::array<glm::vec4, 16> star_radiance{};
     std::array<glm::vec4, 16> star_disc{};
     glm::vec4 limb_image{};
-    glm::vec4 cloud_layer{}; // x: body index, y: 1 when the 2D cloud sheet is composited inline
+    glm::vec4 cloud_layer{}; // x: body index, y: 1 when the 2D cloud sheet is composited inline, z: dense inline slot
 };
 
 AtmosphereParametersGPU make_atmosphere_parameters(const ephemeris::BodyDefinition& body,
@@ -121,6 +121,7 @@ public:
                    std::span<const rhi::PushDescriptorWrite> cloud_writes = {});
     // True when this frame's atmosphere composite of `body` blends its 2D cloud sheet from the cloud layer.
     bool composites_clouds(uint32_t body) const noexcept;
+    uint32_t inline_cloud_slot(uint32_t body) const noexcept;
     const AtmosphereStats& stats() const noexcept { return stats_; }
     ShadowHistoryDiagnostics shadow_history_diagnostics(rhi::VkContext& ctx) const;
     const rhi::Buffer& point_responses(uint32_t frame) const noexcept { return point_responses_[frame]; }

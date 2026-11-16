@@ -119,8 +119,8 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
         "atmosphere/transparent.comp", transparent_bindings, 0, unshadowed_limb);
     surface_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/surface_irradiance.comp", source_bindings, sizeof(glm::uvec2));
     {
-        const float zero[4] = {};
-        dummy_cloud_color_ = ctx.create_image_2d(1, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        const uint16_t zero[4] = {};
+        dummy_cloud_color_ = ctx.create_image_2d(1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         ctx.upload_image_2d(dummy_cloud_color_, zero, sizeof(zero));
         dummy_cloud_depth_ = ctx.create_image_2d(1, 1, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         ctx.upload_image_2d(dummy_cloud_depth_, zero, sizeof(float));
@@ -362,6 +362,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
     const LutRecorder lut{cmd, ctx};
     ring_penumbra_ = ring_lighting ? &ring_lighting->penumbra_table() : &ring_penumbra_dummy_;
     if (!*ring_penumbra_) ring_penumbra_ = &ring_penumbra_dummy_;
+    uint32_t inline_cloud_slot = 0;
     uint32_t timer = candidates.empty() ? UINT32_MAX : ctx.begin_gpu_timer(cmd, "atmosphere_luts");
     for (size_t i = 0; i < candidates.size(); ++i) {
         auto candidate = candidates[i];
@@ -384,8 +385,10 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         // The 2D sheet is blended here from the cloud layer; progressive shadows keep it as a transparent fragment
         // because their history has no cloud endpoint layer.
         bool inline_clouds = settings.clouds_enabled && settings.cloud_sheet_inline &&
-            !settings.atmosphere_shadow_temporal && ctx.fragment_stores_enabled() && b.definition.clouds.enabled;
-        p.cloud_layer = glm::vec4(float(candidate.index), inline_clouds ? 1.0f : 0.0f, 0.0f, 0.0f);
+            !settings.atmosphere_shadow_temporal && ctx.fragment_stores_enabled() && b.definition.clouds.enabled &&
+            p.depth_params.w > 0.0f;
+        p.cloud_layer = glm::vec4(float(candidate.index), inline_clouds ? 1.0f : 0.0f,
+            inline_clouds ? float(inline_cloud_slot++) : 0.0f, 0.0f);
         t.limb_active = frame.limb_active;
         if (frame.point_radius >= 2.5) t.point_valid = false;
         if (p.depth_params.w > 0.0f && !t.aerial_radiance) {
@@ -461,6 +464,13 @@ bool AtmosphereRenderer::composites_clouds(uint32_t body) const noexcept {
     return std::any_of(active_.begin(), active_.end(), [&](const Tables* t) {
         return t->body_index == body && t->cached.depth_params.w > 0.0f && t->cached.cloud_layer.y > 0.5f;
     });
+}
+
+uint32_t AtmosphereRenderer::inline_cloud_slot(uint32_t body) const noexcept {
+    for (const Tables* t : active_)
+        if (t->body_index == body && t->cached.depth_params.w > 0.0f && t->cached.cloud_layer.y > 0.5f)
+            return static_cast<uint32_t>(t->cached.cloud_layer.z);
+    return 0;
 }
 
 bool AtmosphereRenderer::begin_prepare(rhi::VkContext& ctx, const ephemeris::SystemSnapshot& system, const RenderSettings& settings,

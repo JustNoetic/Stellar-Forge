@@ -96,7 +96,7 @@ void render_cloud_sheet() {
 #ifdef CLOUD_SHEET_INLINE
     // The atmosphere composite blends this layer with its own transport and occlusion test against scene depth.
     ivec2 pixel = ivec2(gl_FragCoord.xy);
-    imageStore(cloud_layer_color, pixel, vec4(color.rgb, 2.0*float(f_body_idx)+min(color.a, 1.0)));
+    imageStore(cloud_layer_color, pixel, vec4(min(color.rgb, vec3(65000.0)), 2.0*f.cloud_noise.y+min(color.a, 1.0)));
     imageStore(cloud_layer_depth, pixel, vec4(depth));
     out_color = vec4(0.0);
 #else
