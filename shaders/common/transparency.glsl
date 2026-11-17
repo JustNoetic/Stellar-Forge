@@ -7,6 +7,30 @@ layout(std430, set = 0, binding = 15) buffer TransparentFragments {
     uvec2 fragment_data[];
 };
 
+#ifdef TRANSPARENCY_RING_SLOT
+layout(rgba16f, set = 0, binding = 45) uniform image2D ring_slot_color;
+layout(r32ui, set = 0, binding = 46) uniform uimage2D ring_slot_depth;
+// Slot depth bits: reverse-Z depth below 2.0 leaves the top two bits free. A ring fragment that loses the claim sets
+// CONTENDED, after which the slot is treated as one more list fragment; DEFERRED marks it for the deferred transport.
+const uint RING_SLOT_CONTENDED = 0x80000000u;
+const uint RING_SLOT_DEFERRED = 0x40000000u;
+const uint RING_SLOT_DEPTH_MASK = 0x3fffffffu;
+
+uint ring_slot_bits(ivec2 pixel) {
+    return all(lessThan(pixel, imageSize(ring_slot_depth))) ? imageLoad(ring_slot_depth, pixel).x : 0u;
+}
+
+// The slot stores transmittance 1-a, which half floats resolve finely near 0 where dense rings need it.
+vec4 load_ring_slot(ivec2 pixel) {
+    vec4 color = imageLoad(ring_slot_color, pixel);
+    return vec4(color.rgb, 1.0-color.a);
+}
+
+void store_ring_slot(ivec2 pixel, vec4 color) {
+    imageStore(ring_slot_color, pixel, vec4(clamp(color.rgb, vec3(0.0), vec3(65000.0)), clamp(1.0-color.a, 0.0, 1.0)));
+}
+#endif
+
 const uint TRANSPARENCY_END = 0xffffffffu;
 const uint TRANSPARENCY_MULTI_BIT = 0x80000000u;
 const uint TRANSPARENCY_DEPTH_BIT = 0x40000000u;
@@ -97,6 +121,22 @@ bool capture_transparency(vec4 color, float depth, bool exclude_bloom, bool need
     set_transparent_next(index, prev_next);
     return true;
 }
+
+#ifdef TRANSPARENCY_RING_SLOT
+// The first ring fragment at a pixel claims the fixed slot; later ones fall back to the list.
+bool capture_ring(vec4 color, float depth, bool needs_depth_test) {
+    if (!gl_HelperInvocation && color.a > 0.0) {
+        ivec2 pixel = ivec2(gl_FragCoord.xy);
+        uint previous = imageAtomicCompSwap(ring_slot_depth, pixel, 0u, floatBitsToUint(depth));
+        if (previous == 0u) {
+            store_ring_slot(pixel, color);
+            return true;
+        }
+        if ((previous & RING_SLOT_CONTENDED) == 0u) imageAtomicOr(ring_slot_depth, pixel, RING_SLOT_CONTENDED);
+    }
+    return capture_transparency(color, depth, false, needs_depth_test);
+}
+#endif
 
 bool capture_transparency(vec4 color, float depth, bool exclude_bloom) {
     return capture_transparency(color, depth, exclude_bloom, true);

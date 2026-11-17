@@ -1,6 +1,8 @@
 #version 460
+#define TRANSPARENCY_RING_SLOT
 #include "common/transparency.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform Push { uint slot_mode; } pc;
 layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
 layout(set = 0, binding = 3) uniform sampler2D opaque_depth;
 #ifdef BLOOM_OUTPUT
@@ -8,6 +10,12 @@ layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D physical_color;
 #endif
 
 const uint LOCAL_SORT_CAPACITY = 8u;
+// Sort key colour standing for the ring slot, whose fp32 colour is blended in its place; packed colours never use it.
+const uvec2 RING_SLOT_KEY = uvec2(0xffffffffu);
+vec4 ring_color = vec4(0.0);
+
+vec4 key_color(uvec2 packed) { return packed == RING_SLOT_KEY ? ring_color : transparent_color(packed); }
+bool key_excludes_bloom(uvec2 packed) { return packed != RING_SLOT_KEY && transparent_excludes_bloom(packed); }
 
 bool fragment_before_val(uvec3 x, uvec3 y) {
     if (x.z != y.z) return x.z < y.z;
@@ -33,11 +41,11 @@ void blend_single(ivec2 pixel, uvec2 packed) {
 #ifdef BLOOM_OUTPUT
     vec3 physical = background.rgb;
 #endif
-    vec4 color = transparent_color(packed);
+    vec4 color = key_color(packed);
     background.rgb = color.rgb + (1.0 - color.a) * background.rgb;
     imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
 #ifdef BLOOM_OUTPUT
-    if (!transparent_excludes_bloom(packed)) physical = background.rgb;
+    if (!key_excludes_bloom(packed)) physical = background.rgb;
     imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
 #endif
 }
@@ -81,10 +89,11 @@ uint sort_linked_list(uint sorted) {
     return sorted;
 }
 
-void resolve_multi(ivec2 pixel, uint current, uint depth) {
+void resolve_multi(ivec2 pixel, uint current, uint depth, bool ringed, uvec3 ring) {
     uvec3 local[LOCAL_SORT_CAPACITY];
     uint kept = 0u;
     bool overflowed = false;
+    if (ringed) local[kept++] = ring;
     uint node = current;
     while (node != TRANSPARENCY_END) {
         uint frag_depth = transparent_depth_bits(node);
@@ -120,24 +129,35 @@ void resolve_multi(ivec2 pixel, uint current, uint depth) {
         }
         for (uint i = 0u; i < kept; ++i) {
             uvec2 packed = local[i].xy;
-            vec4 color = transparent_color(packed);
+            vec4 color = key_color(packed);
             background.rgb = color.rgb + (1.0 - color.a) * background.rgb;
 #ifdef BLOOM_OUTPUT
-            if (!transparent_excludes_bloom(packed)) physical = color.rgb + (1.0 - color.a) * physical;
+            if (!key_excludes_bloom(packed)) physical = color.rgb + (1.0 - color.a) * physical;
 #endif
         }
     } else {
         uint sorted = sort_linked_list(current);
-        while (sorted != TRANSPARENCY_END) {
-            if (transparent_depth_bits(sorted) >= depth) {
-                uvec2 packed = transparent_color_packed(sorted);
-                vec4 color = transparent_color(packed);
+        while (sorted != TRANSPARENCY_END || ringed) {
+            uvec3 key;
+            if (sorted == TRANSPARENCY_END) {
+                key = ring;
+                ringed = false;
+            } else {
+                key = uvec3(transparent_color_packed(sorted), transparent_depth_bits(sorted));
+                if (ringed && fragment_before_val(ring, key)) {
+                    key = ring;
+                    ringed = false;
+                } else {
+                    sorted = transparent_next(sorted);
+                }
+            }
+            if (key.z >= depth) {
+                vec4 color = key_color(key.xy);
                 background.rgb = color.rgb + (1.0 - color.a) * background.rgb;
 #ifdef BLOOM_OUTPUT
-                if (!transparent_excludes_bloom(packed)) physical = color.rgb + (1.0 - color.a) * physical;
+                if (!key_excludes_bloom(key.xy)) physical = color.rgb + (1.0 - color.a) * physical;
 #endif
             }
-            sorted = transparent_next(sorted);
         }
     }
     imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
@@ -150,6 +170,17 @@ void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, imageSize(transparency_heads)))) return;
     uint head = imageLoad(transparency_heads, pixel).x;
+    if (pc.slot_mode == 2u || (pc.slot_mode == 1u && head != TRANSPARENCY_END)) {
+        uint ring_bits = imageLoad(ring_slot_depth, pixel).x & RING_SLOT_DEPTH_MASK;
+        uint depth = floatBitsToUint(texelFetch(opaque_depth, pixel, 0).r);
+        if (ring_bits != 0u && ring_bits >= depth) {
+            ring_color = load_ring_slot(pixel);
+            uvec3 ring = uvec3(RING_SLOT_KEY, ring_bits);
+            if (head == TRANSPARENCY_END) blend_single(pixel, ring.xy);
+            else resolve_multi(pixel, head & TRANSPARENCY_INDEX_MASK, depth, true, ring);
+            return;
+        }
+    }
     if (head == TRANSPARENCY_END) {
         write_physical_passthrough(pixel);
         return;
@@ -220,5 +251,5 @@ void main() {
         return;
     }
 
-    resolve_multi(pixel, idx0, depth);
+    resolve_multi(pixel, idx0, depth, false, uvec3(0u));
 }

@@ -115,6 +115,7 @@ public:
     }
 
     uint32_t host_count() const noexcept { return active_host_count_; }
+    bool drawn(const RenderSettings& settings) const noexcept { return settings.show_rings && active_host_count_ != 0; }
     std::span<const RingHostGPU> hosts() const noexcept { return hosts_gpu_; }
     const rhi::Buffer& host_buffer(uint32_t frame) const noexcept { return host_ssbos_[frame]; }
     const rhi::Image& gradient_atlas() const noexcept { return gradient_atlas_; }

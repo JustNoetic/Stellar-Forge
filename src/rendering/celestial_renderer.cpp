@@ -835,7 +835,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         eclipse_refraction_.write(ctx),
         rhi::PushDescriptorWrite::storage_buffer(25, phases, 0, phase_bytes),
     };
-    auto transparency_writes = transparency_.writes();
+    auto transparency_writes = transparency_.slot_writes();
+    ring_slot_active_ = transparency_.active() && rings_.drawn(settings);
     rings_.render(cmd, ctx, settings, ring_base_writes, {ubo.stars_pos_radius, ubo.num_stars},
         transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{});
     if (timings) (*timings)["cpu_surface_draw_ms"] = elapsed_ms(draw_start);
@@ -957,10 +958,14 @@ void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContex
         cloud_layer = {rhi::PushDescriptorWrite::sampled_image(33, cloud_layer_color_, ctx.sampler_nearest_clamp()),
                        rhi::PushDescriptorWrite::sampled_image(34, cloud_layer_depth_, ctx.sampler_nearest_clamp())};
     }
-    atmospheres_.composite(cmd, ctx, color, depth,
+    auto slot_writes = transparency_.slot_writes();
+    bool ring_slot = ring_slot_active_ && transparency_.active();
+    bool blended = atmospheres_.composite(cmd, ctx, color, depth,
         transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{}, draw,
-        cloud_layer_active_ ? std::span<const rhi::PushDescriptorWrite>{cloud_layer} : std::span<const rhi::PushDescriptorWrite>{});
-    transparency_.resolve(cmd, ctx, color, depth, physical_color);
+        cloud_layer_active_ ? std::span<const rhi::PushDescriptorWrite>{cloud_layer} : std::span<const rhi::PushDescriptorWrite>{},
+        transparency_.active() ? std::span{slot_writes}.subspan(2) : std::span<const rhi::PushDescriptorWrite>{}, ring_slot);
+    transparency_.resolve(cmd, ctx, color, depth, physical_color, !ring_slot ? 0u : blended ? 1u : 2u);
+    ring_slot_active_ = false;
 }
 
 } // namespace sf::rendering

@@ -4,18 +4,42 @@
 
 namespace sf::rendering {
 
-void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
+std::array<rhi::PushDescriptorWrite, 2> AtmosphereRenderer::dummy_slot_writes() const {
+    return {rhi::PushDescriptorWrite::storage_image(45, dummy_slot_color_),
+            rhi::PushDescriptorWrite::storage_image(46, dummy_slot_uint_)};
+}
+
+bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                                    std::span<const rhi::PushDescriptorWrite> transparency_writes,
                                    const std::function<void(uint32_t)>& draw_point,
-                                   std::span<const rhi::PushDescriptorWrite> cloud_writes) {
-    if (active_.empty()) return;
+                                   std::span<const rhi::PushDescriptorWrite> cloud_writes,
+                                   std::span<const rhi::PushDescriptorWrite> slot_writes, bool ring_slot) {
+    if (active_.empty()) return false;
     auto clouds = cloud_layer_writes(ctx, cloud_writes);
+    // The ring slot travels with the list bindings; placeholders keep the layouts satisfied without one.
+    bool has_slot = !transparency_writes.empty() && slot_writes.size() == 2;
+    ring_slot = ring_slot && has_slot;
+    auto dummy_slots = dummy_slot_writes();
+    std::span<const rhi::PushDescriptorWrite> slots = has_slot ? slot_writes : std::span<const rhi::PushDescriptorWrite>{dummy_slots};
+    std::vector<rhi::PushDescriptorWrite> transparency;
+    if (!transparency_writes.empty()) {
+        transparency.assign(transparency_writes.begin(), transparency_writes.end());
+        transparency.insert(transparency.end(), slots.begin(), slots.end());
+    }
+    // The last composited atmosphere blends the ring slot; earlier ones transport it in place. A body point drawn
+    // after that blend would cover the ring, so then the resolve blends it instead.
+    int last = -1;
+    for (int i = 0; i < int(active_.size()); ++i)
+        if (active_[i]->cached.depth_params.w > 0.0f) last = i;
+    bool fused = ring_slot && last >= 0 &&
+        (!draw_point || (active_[last]->cached.depth_params.w >= 1.0f && last == int(active_.size())-1));
+    auto ring_mode = [&](int index) { return !ring_slot ? 0u : fused && index == last ? 2u : 1u; };
     ctx.transition_image(cmd, color, dual_source_ ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL);
     ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     uint32_t timer = ctx.begin_gpu_timer(cmd, "atmosphere_composite");
     if (!transparency_writes.empty()) ctx.memory_barrier(cmd);
     for (auto* t : active_)
-        if (t->shadow_active) resolve_shadows(cmd, ctx, *t, color, depth, transparency_writes, clouds);
+        if (t->shadow_active) resolve_shadows(cmd, ctx, *t, color, depth, transparency, clouds, slots);
     if (shadow_diagnostics_enabled_ && shadow_temporal_enabled_ && stats_.shadow_updates != 0) {
         ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
@@ -45,7 +69,7 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 rhi::PushDescriptorWrite::sampled_image(16, t->shadow_active ? t->shadow_fraction : surface_lut_, ctx.sampler_nearest_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(17, t->shadow_active ? t->shadow_depth : surface_lut_, ctx.sampler_nearest_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
-            writes.insert(writes.end(), transparency_writes.begin(), transparency_writes.end());
+            writes.insert(writes.end(), transparency.begin(), transparency.end());
             writes.insert(writes.end(), clouds.begin(), clouds.end());
             bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
             auto& pipeline = t->limb_active
@@ -92,7 +116,13 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         ctx.begin_rendering(cmd, {color.extent.width, color.extent.height}, {&attachment, 1});
         ctx.set_viewport_and_scissor(cmd, {color.extent.width, color.extent.height});
     }
-    for (auto* t : active_) {
+    rhi::PushDescriptorWrite dummy_list[] = {rhi::PushDescriptorWrite::storage_image(14, dummy_slot_uint_),
+                                             rhi::PushDescriptorWrite::storage_buffer(15, dummy_fragments_)};
+    std::span<const rhi::PushDescriptorWrite> list = transparency_writes.empty()
+        ? std::span<const rhi::PushDescriptorWrite>{dummy_list} : transparency_writes;
+    for (int index = 0; index < int(active_.size()); ++index) {
+        auto* t = active_[index];
+        CompositePush push{t->secondary_irradiance, glm::uvec4(ring_mode(index), 0u, 0u, 0u)};
         auto point = [&] {
             if (!draw_point || t->cached.depth_params.w >= 1.0f) return;
             if (!dual_source_) {
@@ -134,14 +164,16 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             std::vector<rhi::PushDescriptorWrite> graphics;
             for (const auto& write : writes) if (write.binding != 4) graphics.push_back(write);
             graphics.insert(graphics.end(), clouds.begin(), clouds.end());
+            graphics.insert(graphics.end(), list.begin(), list.end());
+            graphics.insert(graphics.end(), slots.begin(), slots.end());
             if (t->secondary_active) {
                 graphics.push_back(rhi::PushDescriptorWrite::sampled_image(28, t->secondary_sky, ctx.sampler_linear_clamp()));
                 graphics.push_back(rhi::PushDescriptorWrite::sampled_image(29, t->secondary_aerial, ctx.sampler_linear_clamp()));
                 graphics.push_back(rhi::PushDescriptorWrite::sampled_image(30, t->secondary_range, ctx.sampler_linear_clamp()));
-                ctx.push_constants(cmd, pipeline, t->secondary_irradiance);
             }
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
             ctx.push_descriptors(cmd, pipeline, graphics);
+            ctx.push_constants(cmd, pipeline, push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
         } else {
             bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
@@ -151,25 +183,36 @@ void AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
                 : (transparency_writes.empty() ? composite_pipeline_ :
                     shadow_shader ? composite_transparency_pipeline_ : unshadowed_composite_transparency_pipeline_);
             std::vector<rhi::PushDescriptorWrite> compute(std::begin(writes), std::end(writes));
-            compute.insert(compute.end(), transparency_writes.begin(), transparency_writes.end());
+            compute.insert(compute.end(), transparency.begin(), transparency.end());
             compute.insert(compute.end(), clouds.begin(), clouds.end());
             if (t->secondary_active) {
                 compute.push_back(rhi::PushDescriptorWrite::sampled_image(28, t->secondary_sky, ctx.sampler_linear_clamp()));
                 compute.push_back(rhi::PushDescriptorWrite::sampled_image(29, t->secondary_aerial, ctx.sampler_linear_clamp()));
                 compute.push_back(rhi::PushDescriptorWrite::sampled_image(30, t->secondary_range, ctx.sampler_linear_clamp()));
-                ctx.push_constants(cmd, pipeline, t->secondary_irradiance);
             }
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
             ctx.push_descriptors(cmd, pipeline, compute);
+            if (!transparency_writes.empty()) ctx.push_constants(cmd, pipeline, push);
+            else if (t->secondary_active) ctx.push_constants(cmd, pipeline, t->secondary_irradiance);
             vkCmdDispatch(cmd, (color.extent.width+7)/8, (color.extent.height+7)/8, 1);
             ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
         point();
+        // Later draws read the ring slot this one transported in place.
+        if (dual_source_ && ring_slot && index < last) {
+            ctx.end_rendering(cmd);
+            ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            auto attachment = rhi::RenderingAttachment::load_color(color);
+            ctx.begin_rendering(cmd, {color.extent.width, color.extent.height}, {&attachment, 1});
+            ctx.set_viewport_and_scissor(cmd, {color.extent.width, color.extent.height});
+        }
     }
     if (dual_source_) ctx.end_rendering(cmd);
     ctx.end_gpu_timer(cmd, opaque_timer);
     ctx.end_gpu_timer(cmd, timer);
+    return fused;
 }
 
 void AtmosphereRenderer::begin_tiles(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Buffer& tiles, VkExtent2D extent) {
@@ -201,7 +244,8 @@ std::array<rhi::PushDescriptorWrite, 2> AtmosphereRenderer::cloud_layer_writes(r
 
 void AtmosphereRenderer::resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ctx, Tables& table, rhi::Image& color, rhi::Image& depth,
                                          std::span<const rhi::PushDescriptorWrite> transparency_writes,
-                                         std::span<const rhi::PushDescriptorWrite> cloud_writes) {
+                                         std::span<const rhi::PushDescriptorWrite> cloud_writes,
+                                         std::span<const rhi::PushDescriptorWrite>) {
     auto* t = &table;
     if (t->shadow_fraction.extent.width != color.extent.width || t->shadow_fraction.extent.height != color.extent.height) {
         for (auto* image : {&t->shadow_fraction, &t->shadow_depth}) {

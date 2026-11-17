@@ -177,6 +177,7 @@ private:
     RingRenderer rings_;
     AtmosphereRenderer atmospheres_;
     TransparencyRenderer transparency_;
+    bool ring_slot_active_ = false;
     RefractionRenderer refraction_;
     EclipseRefractionRenderer eclipse_refraction_;
     std::vector<float> atmosphere_minima_;

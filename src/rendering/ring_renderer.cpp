@@ -44,6 +44,8 @@ static rhi::GraphicsPipelineDesc ring_pipeline_desc(const rhi::VkContext& ctx, u
     if (transparency) {
         desc.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
         desc.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT});
+        desc.bindings.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
+        desc.bindings.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
     }
     desc.push_constant_size = sizeof(uint32_t) * 4;
     desc.depth_test = true;

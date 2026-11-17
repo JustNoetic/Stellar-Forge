@@ -17,6 +17,12 @@ inline constexpr rhi::DescriptorLayoutBinding source_bindings[] = {
     {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
     {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT}};
 
+// Push constants of the composite variants: secondary irradiance, then the ring slot mode in ring.x.
+struct CompositePush {
+    glm::vec4 irradiance{0.0f};
+    glm::uvec4 ring{0u};
+};
+
 inline constexpr rhi::DescriptorLayoutBinding composite_bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT}, {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
         {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},

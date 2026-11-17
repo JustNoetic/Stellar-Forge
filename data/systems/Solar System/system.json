@@ -158,7 +158,7 @@
     "oblateness": 0.0,
     "omega": 29.124,
     "parentId": "Sun",
-    "pole_dec": 61.45000000000011,
+    "pole_dec": 61.450000000000124,
     "pole_ra": 281.01,
     "r": 0.0035,
     "rotation_period": 1407.6,
@@ -278,7 +278,7 @@
     "oblateness": 0.0,
     "omega": 54.884,
     "parentId": "Sun",
-    "pole_dec": 67.16000000000007,
+    "pole_dec": 67.16000000000005,
     "pole_ra": 272.76,
     "r": 0.0086,
     "rotation_period": -5832.5,
@@ -1631,8 +1631,8 @@
     "ring_texture_outer": 2.26624,
     "rings": [
       {
-        "asymmetry": -0.47999998927116394,
-        "backscatter": -0.5899999737739563,
+        "asymmetry": 0.3700000047683716,
+        "backscatter": -0.33000001311302185,
         "color": "#ffffff",
         "gradient": [
           {
@@ -1648,7 +1648,7 @@
         "is_textured": true,
         "opacity": 1.0,
         "outer": 2.26624,
-        "scatter": 0.75,
+        "scatter": 0.14000000059604645,
         "unlit_factor": 1.0
       },
       {

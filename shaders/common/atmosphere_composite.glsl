@@ -24,7 +24,10 @@ layout(set = 0, binding = 16) uniform sampler2DArray shadow_deficit_lut;
 layout(set = 0, binding = 17) uniform sampler2DArray shadow_endpoint_lut;
 layout(set = 0, binding = 33) uniform sampler2D cloud_layer_color;
 layout(set = 0, binding = 34) uniform sampler2D cloud_layer_depth;
-#ifdef ATMOSPHERE_TRANSPARENCY
+#if defined(ATMOSPHERE_RING_SLOT) || defined(ATMOSPHERE_TRANSPARENCY)
+#define TRANSPARENCY_RING_SLOT
+#endif
+#if defined(ATMOSPHERE_TRANSPARENCY) || defined(ATMOSPHERE_RING_SLOT)
 #include "common/transparency.glsl"
 #endif
 #if defined(ATMOSPHERE_TILE_LEAN) || defined(ATMOSPHERE_TILE_DEFERRED)
@@ -36,7 +39,15 @@ bool shadow_cache_missed = false;
 layout(set = 0, binding = 28) uniform sampler2D secondary_sky_lut;
 layout(set = 0, binding = 29) uniform sampler3D secondary_aerial_lut;
 layout(set = 0, binding = 30) uniform sampler2D secondary_range_lut;
-layout(push_constant) uniform SecondaryLighting { vec4 irradiance; } secondary;
+#endif
+#if defined(ATMOSPHERE_SECONDARY) || defined(ATMOSPHERE_RING_SLOT)
+// ring.x: 0 ignores the ring slot, 1 transports it in place, 2 also blends it where no list fragment exists.
+layout(push_constant) uniform CompositePush {
+    vec4 irradiance;
+#ifdef ATMOSPHERE_RING_SLOT
+    uvec4 ring;
+#endif
+} secondary;
 #endif
 
 vec4 cubic_weights(float f) {
@@ -66,12 +77,11 @@ TransportCache init_transport_cache() {
     return c;
 }
 
-AerialFilterXY aerial_filter_xy(vec3 direction, float range, ivec3 size, sampler2D ranges) {
+AerialFilterXY sky_filter_xy(vec3 direction, ivec2 size, out vec2 uv) {
     AerialFilterXY f;
-    vec2 uv = sky_uv(direction, size.xy);
-    f.range = (abs(uv.y-0.5) < 1.0/float(size.y) || atm.camera.z-bottom_radius() < 0.01)
-        ? textureLod(ranges, uv, 0.0).r : range;
-    vec2 grid = uv*vec2(size.xy)-0.5;
+    uv = sky_uv(direction, size);
+    f.range = 0.0;
+    vec2 grid = uv*vec2(size)-0.5;
     vec2 base = floor(grid), t = fract(grid);
     vec4 wx = cubic_weights(t.x), wy = cubic_weights(t.y);
     f.sx = vec2(wx.x+wx.y, wx.z+wx.w);
@@ -82,6 +92,28 @@ AerialFilterXY aerial_filter_xy(vec3 direction, float range, ivec3 size, sampler
     f.y = clamp((base.y+vec2(-0.5, 1.5)+vec2(wy.y, wy.w)/f.sy)/float(size.y), y_bounds.x, y_bounds.y);
     f.valid = true;
     return f;
+}
+
+AerialFilterXY aerial_filter_xy(vec3 direction, float range, ivec3 size, sampler2D ranges) {
+    vec2 uv;
+    AerialFilterXY f = sky_filter_xy(direction, size.xy, uv);
+    f.range = (abs(uv.y-0.5) < 1.0/float(size.y) || atm.camera.z-bottom_radius() < 0.01)
+        ? textureLod(ranges, uv, 0.0).r : range;
+    return f;
+}
+
+void sky_transport(vec3 direction, out vec3 L, out vec3 T) {
+    vec2 uv;
+    AerialFilterXY f = sky_filter_xy(direction, SKY_SIZE, uv);
+    L = vec3(0.0);
+    T = vec3(0.0);
+    for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i) {
+        vec2 lookup = vec2(f.x[i], f.y[j]);
+        float weight = f.sx[i]*f.sy[j];
+        L += weight*textureLod(radiance_lut, lookup, 0.0).rgb;
+        T += weight*clamp(textureLod(throughput_lut, lookup, 0.0).rgb, 0.0, 1.0);
+    }
+    T = clamp(T, 0.0, 1.0);
 }
 
 float aerial_filter_z(float range, float path, int depth_slices) {
@@ -110,8 +142,14 @@ void aerial_transport(vec3 direction, float span, float path, inout AerialFilter
 
 #ifdef ATMOSPHERE_SECONDARY
 vec3 secondary_radiance(vec3 direction, float span, float path, bool finite_endpoint, inout AerialFilterXY f) {
-    if (!finite_endpoint)
-        return textureLod(secondary_sky_lut, sky_uv(direction, textureSize(secondary_sky_lut, 0)), 0.0).rgb;
+    if (!finite_endpoint) {
+        vec2 uv;
+        AerialFilterXY sf = sky_filter_xy(direction, textureSize(secondary_sky_lut, 0), uv);
+        vec3 L = vec3(0.0);
+        for (int j = 0; j < 2; ++j) for (int i = 0; i < 2; ++i)
+            L += sf.sx[i]*sf.sy[j]*textureLod(secondary_sky_lut, vec2(sf.x[i], sf.y[j]), 0.0).rgb;
+        return L;
+    }
     ivec3 size = textureSize(secondary_aerial_lut, 0);
     if (!f.valid) f = aerial_filter_xy(direction, span, size, secondary_range_lut);
     float z = aerial_filter_z(f.range, path, size.z);
@@ -184,11 +222,9 @@ bool atmosphere_transport_ray_base(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, 
     if (finite_endpoint) {
         aerial_transport(d, span, path, cache.aerial, L, T);
     } else {
-        vec2 uv = sky_uv(d);
-        L = textureLod(radiance_lut, uv, 0.0).rgb;
-        T = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
+        sky_transport(d, L, T);
     }
-    atmosphere_shadow_loss(pixel, depth, shadow_layer, L);
+    atmosphere_shadow_loss(pixel, finite_endpoint ? depth : 0.0, shadow_layer, L);
     return true;
 }
 
@@ -291,6 +327,80 @@ vec3 limb_bend_at(float t) {
     return mix(atm.limb_bend[index].rgb, atm.limb_bend[index+1].rgb, row-float(index));
 }
 
+const int LIMB_SPECTRAL_SAMPLES = 16;
+
+const vec2 LIMB_SPEC_DISP[16] = vec2[16](
+    vec2(+0.0177838, 0.0018827),
+    vec2(+0.0143002, 0.0016149),
+    vec2(+0.0112996, 0.0013964),
+    vec2(+0.0086954, 0.0012162),
+    vec2(+0.0064198, 0.0010661),
+    vec2(+0.0044190, 0.0009400),
+    vec2(+0.0026501, 0.0008333),
+    vec2(+0.0010781, 0.0007423),
+    vec2(-0.0003254, 0.0006642),
+    vec2(-0.0015839, 0.0005967),
+    vec2(-0.0027169, 0.0005382),
+    vec2(-0.0037406, 0.0004872),
+    vec2(-0.0046687, 0.0004424),
+    vec2(-0.0055129, 0.0004030),
+    vec2(-0.0062831, 0.0003682),
+    vec2(-0.0069877, 0.0003373));
+
+const vec3 LIMB_SPEC_TAU[16] = vec3[16](
+    vec3(+0.941909, -2.109551, +2.167642),
+    vec3(+0.368136, -0.878957, +1.510821),
+    vec3(+0.020376, -0.052737, +1.032361),
+    vec3(-0.168256, +0.483643, +0.684613),
+    vec3(-0.244744, +0.811282, +0.433462),
+    vec3(-0.242404, +0.988205, +0.254198),
+    vec3(-0.185039, +1.056306, +0.128733),
+    vec3(-0.089769, +1.046062, +0.043706),
+    vec3(+0.031042, +0.979795, -0.010837),
+    vec3(+0.168432, +0.873934, -0.042366),
+    vec3(+0.315901, +0.740624, -0.056525),
+    vec3(+0.468737, +0.588863, -0.057600),
+    vec3(+0.623537, +0.425328, -0.048865),
+    vec3(+0.777859, +0.254971, -0.032829),
+    vec3(+0.929968, +0.081454, -0.011423),
+    vec3(+1.078657, -0.092524, +0.013867));
+
+const vec3 LIMB_SPEC_RGB[16] = vec3[16](
+    vec3(+0.000719, -0.001140, +0.012524),
+    vec3(+0.017616, -0.017522, +0.127470),
+    vec3(+0.039457, -0.045465, +0.367013),
+    vec3(+0.005446, -0.023604, +0.364184),
+    vec3(-0.037944, +0.028553, +0.195334),
+    vec3(-0.086282, +0.102445, +0.057638),
+    vec3(-0.131352, +0.216156, -0.001767),
+    vec3(-0.107294, +0.288862, -0.029038),
+    vec3(+0.018233, +0.262936, -0.033942),
+    vec3(+0.194881, +0.175771, -0.028275),
+    vec3(+0.341658, +0.065212, -0.017838),
+    vec3(+0.364740, -0.012882, -0.008185),
+    vec3(+0.242227, -0.026248, -0.003104),
+    vec3(+0.103899, -0.011861, -0.001252),
+    vec3(+0.028916, -0.001744, -0.000554),
+    vec3(+0.005081, +0.000531, -0.000208));
+
+float limb_bin_integral(float z) {
+    if (z <= 0.0) return 0.0;
+    if (z >= 1.0) return z - 0.5;
+    return 0.5*z*z;
+}
+
+float limb_bin_t(float target, float start, float slope, float hw) {
+    if (hw <= 1e-4*slope) return clamp((target-start)/slope, 0.0, 1.0);
+    if (slope <= 1e-4*hw) return clamp((target-(start+0.5*slope)+hw)/(2.0*hw), 0.0, 1.0);
+    return clamp((slope/(2.0*hw))*(limb_bin_integral((target+hw-start)/slope)-limb_bin_integral((target-hw-start)/slope)), 0.0, 1.0);
+}
+
+float limb_spectral_transmit(vec3 tau, int k) {
+    float tau_k = max(dot(LIMB_SPEC_TAU[k], tau), 0.0);
+    if (k < 3 && tau.b >= tau.g) tau_k = max(tau_k, tau.b);
+    return exp(-tau_k);
+}
+
 vec3 limb_star_image(LimbFootprint f) {
     if (atm.limb_image.x < 0.5) return vec3(0.0);
     float reach = 0.5*(f.wide+f.narrow);
@@ -300,8 +410,8 @@ vec3 limb_star_image(LimbFootprint f) {
     int begin = int(first*rows), end = min(int(ceil(last*rows)), LIMB_BEND_ROWS-1);
     float lowest = limb_row_angle(f, true, first), highest = limb_row_angle(f, true, last);
     vec3 high_bend = limb_bend_at(last);
-    float exit_low = lowest-atm.limb_image.y;
-    float exit_high = highest-min(high_bend.r, min(high_bend.g, high_bend.b));
+    float exit_low = lowest-1.02*atm.limb_image.y;
+    float exit_high = highest-0.99*min(high_bend.r, min(high_bend.g, high_bend.b));
     vec3 image = vec3(0.0);
     vec3 pole = limb_pole();
     vec3 plane = vec3(-f.across.y, f.across.x, 0.0);
@@ -320,25 +430,57 @@ vec3 limb_star_image(LimbFootprint f) {
         float center = 0.5*(s0+s1), chord = 0.5*abs(s1-s0);
         float to_true = true_chord/max(chord, 1e-30);
         if (center+chord < exit_low || center-chord > exit_high) continue;
+        vec3 star_image = vec3(0.0);
         for (int row = begin; row < end; ++row) {
             if (atm.limb_bend[row].w < 0.5 || atm.limb_bend[row+1].w < 0.5) continue;
             float t0 = max(float(row)/rows, first), t1 = min(float(row+1)/rows, last);
             if (t1 <= t0) continue;
             float a0 = limb_row_angle(f, true, t0), a1 = limb_row_angle(f, true, t1);
-            vec3 start = a0-limb_bend_at(t0), slope = max(a1-limb_bend_at(t1)-start, vec3(1e-12));
-            vec3 enter = clamp((center-chord-start)/slope, 0.0, 1.0), leave = clamp((center+chord-start)/slope, 0.0, 1.0);
-            if (all(lessThanEqual(leave, enter))) continue;
-            for (int channel = 0; channel < 3; ++channel) {
-                if (leave[channel] <= enter[channel]) continue;
-                float share = limb_coverage(f, mix(a0, a1, leave[channel]))-limb_coverage(f, mix(a0, a1, enter[channel]));
-                float middle = 0.5*(enter[channel]+leave[channel]);
-                float offset = (start[channel]+slope[channel]*middle-center)*to_true;
+            vec3 b0 = limb_bend_at(t0), b1 = limb_bend_at(t1);
+            float s0_r = max((b0.g-b0.r)*151.0493, 0.0), s0_b = b0.b > b0.g ? (b0.b-b0.g)*90.2860 : s0_r;
+            float s1_r = max((b1.g-b1.r)*151.0493, 0.0), s1_b = b1.b > b1.g ? (b1.b-b1.g)*90.2860 : s1_r;
+            float b_hi0 = b0.g+0.0197407*s0_b, b_hi1 = b1.g+0.0197407*s1_b;
+            float b_lo0 = b0.g-0.0073177*s0_r, b_lo1 = b1.g-0.0073177*s1_r;
+            if (center+chord < min(a0-b_hi0, a1-b_hi1) || center-chord > max(a0-b_lo0, a1-b_lo1)) continue;
+            if (center-chord <= min(a0-b_hi0, a1-b_hi1) && center+chord >= max(a0-b_lo0, a1-b_lo1)) {
+                float share = limb_coverage(f, a1)-limb_coverage(f, a0);
+                vec2 uv = sky_grid_uv(f.azimuth, 0.5*(t0+t1), true, SKY_SIZE);
+                vec3 transmitted_rgb = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
+                if (!any(greaterThan(transmitted_rgb, vec3(1e-7)))) continue;
+                vec3 tau = -log(max(transmitted_rgb, vec3(1e-10)));
+                float mid_a = 0.5*(a0+a1)-0.5*(b0.g+b1.g);
+                float slope_r = 0.5*(s0_r+s1_r), slope_b = 0.5*(s0_b+s1_b);
+                for (int k = 0; k < LIMB_SPECTRAL_SAMPLES; ++k) {
+                    float dd = LIMB_SPEC_DISP[k].x;
+                    float offset = (mid_a-dd*(dd >= 0.0 ? slope_b : slope_r)-center)*to_true;
+                    float rim = 1.0-sqrt(max(1.0-(side*side+offset*offset)/(sun.w*sun.w), 0.0));
+                    star_image += share*limb_spectral_transmit(tau, k)*(1.0-0.4*rim-0.2*rim*rim)*LIMB_SPEC_RGB[k];
+                }
+                continue;
+            }
+            for (int k = 0; k < LIMB_SPECTRAL_SAMPLES; ++k) {
+                vec2 disp = LIMB_SPEC_DISP[k];
+                float start = a0-(b0.g+disp.x*(disp.x >= 0.0 ? s0_b : s0_r));
+                float end_s = a1-(b1.g+disp.x*(disp.x >= 0.0 ? s1_b : s1_r));
+                float slope = max(end_s-start, 1e-12);
+                float hw = disp.y*(disp.x >= 0.0 ? 0.5*(s0_b+s1_b) : 0.5*(s0_r+s1_r));
+                float enter = limb_bin_t(center-chord, start, slope, hw);
+                float leave = limb_bin_t(center+chord, start, slope, hw);
+                if (leave <= enter) continue;
+                float cov_share = limb_coverage(f, mix(a0, a1, leave))-limb_coverage(f, mix(a0, a1, enter));
+                float row_share = (limb_coverage(f, a1)-limb_coverage(f, a0))*(leave-enter);
+                float share = mix(cov_share, row_share, smoothstep(0.1*slope, 0.5*slope, hw));
+                float middle = 0.5*(enter+leave);
+                float offset = (start+slope*middle-center)*to_true;
                 float rim = 1.0-sqrt(max(1.0-(side*side+offset*offset)/(sun.w*sun.w), 0.0));
                 vec2 uv = sky_grid_uv(f.azimuth, mix(t0, t1, middle), true, SKY_SIZE);
-                float transmitted = clamp(textureLod(throughput_lut, uv, 0.0)[channel], 0.0, 1.0);
-                image[channel] += share*transmitted*radiance[channel]*(1.0-0.4*rim-0.2*rim*rim);
+                vec3 transmitted_rgb = clamp(textureLod(throughput_lut, uv, 0.0).rgb, 0.0, 1.0);
+                if (!any(greaterThan(transmitted_rgb, vec3(1e-7)))) continue;
+                vec3 tau = -log(max(transmitted_rgb, vec3(1e-10)));
+                star_image += share*limb_spectral_transmit(tau, k)*(1.0-0.4*rim-0.2*rim*rim)*LIMB_SPEC_RGB[k];
             }
         }
+        image += max(star_image, vec3(0.0))*radiance;
     }
     return image;
 }
@@ -362,13 +504,12 @@ float limb_depth_distance(vec2 ndc, float depth) {
 bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment, float span, float depth,
                     int shadow_layer, inout TransportCache cache, out vec3 L, out vec3 T) {
     float path = span;
-    bool surface_seen = false;
+    bool surface_seen = false, finite_endpoint = false;
     if (depth > 0.0) {
         float distance = limb_depth_distance(ndc, depth);
         float closest = -dot(atm.camera.xyz, d);
         if (distance < closest-top_radius()) return false;
         surface_seen = distance < closest+top_radius();
-        bool finite_endpoint;
         if (span > 0.0) path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
     }
     if (f.resolved) {
@@ -385,7 +526,7 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
         float space = max(1.0-ground_weight-sky_weight, 0.0);
         T = surface_seen && ground_weight > 0.0 ? ground/ground_weight
           : sky_weight+space > 0.0 ? (sky+space)/(sky_weight+space) : ground/max(ground_weight, 1e-20);
-        if (span > 0.0) atmosphere_shadow_loss(pixel, depth, shadow_layer, L);
+        if (span > 0.0) atmosphere_shadow_loss(pixel, finite_endpoint ? depth : 0.0, shadow_layer, L);
         L *= atm.depth_params.w;
     }
     if (!surface_seen || !f.resolved) L += limb_star_image(f)*atm.depth_params.w;
@@ -429,6 +570,22 @@ bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 s
     float cloud_depth;
     bool clouded = cloud_layer_fetch(pixel, depth, cloud, cloud_depth);
     bool opaque_cloud = clouded && cloud.a >= 0.99999;
+#ifdef ATMOSPHERE_RING_SLOT
+    // The ring slot is transported like a transparent fragment: P -> T(d)P + aS(d). The last composite blends it
+    // over this atmosphere's result unless list fragments need it sorted in the resolve; earlier ones store it.
+    vec4 ring = vec4(0.0);
+    float ring_depth = 0.0;
+    bool ringed = false, blend_ring = false;
+    if (secondary.ring.x != 0u) {
+        uint slot = imageLoad(ring_slot_depth, pixel).x;
+        ring_depth = uintBitsToFloat(slot & RING_SLOT_DEPTH_MASK);
+        ringed = (slot & RING_SLOT_CONTENDED) == 0u && ring_depth > 0.0 && ring_depth >= depth;
+        if (ringed) {
+            ring = load_ring_slot(pixel);
+            blend_ring = secondary.ring.x == 2u && imageLoad(transparency_heads, pixel).x == TRANSPARENCY_END;
+        }
+    }
+#endif
 
     vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
     vec3 d = view_direction(ndc);
@@ -452,7 +609,31 @@ bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 s
             transmitted = T;
         }
     }
+#ifdef ATMOSPHERE_RING_SLOT
+    bool ring_changed = false;
+    if (ringed && span > 0.0) {
+        float path;
+        bool finite_endpoint;
+        vec3 ring_L, ring_T;
+        if (atmosphere_transport_ray_base(pixel, ndc, d, segment, span, ring_depth, 1, cache, ring_L, ring_T, path, finite_endpoint)) {
+            atmosphere_finish_radiance(d, span, path, finite_endpoint, ring_depth, cache, ring_L);
+            ring.rgb = ring.rgb*ring_T+ring.a*ring_L*atm.depth_params.x;
+#ifdef ATMOSPHERE_LIMB
+            if (has_limb && !limb.resolved && length(atm.camera.xyz+d*limb_depth_distance(ndc, ring_depth)) < top_radius()) {
+                ring *= limb_coverage(limb, limb.limb);
+                ring.rgb += ring.a*limb_star_image(limb)*atm.depth_params.w*atm.depth_params.x;
+            }
+#endif
+            ring_changed = true;
+        }
+    }
+    if (!background && !clouded && !blend_ring) {
+        if (ring_changed) store_ring_slot(pixel, ring);
+        return false;
+    }
+#else
     if (!background && !clouded) return false;
+#endif
     if (clouded) {
         if (atmosphere_transport_endpoint(pixel, ndc, d, segment, span,
 #ifdef ATMOSPHERE_LIMB
@@ -462,7 +643,22 @@ bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 s
             cloud.rgb = cloud.rgb*T+cloud.a*L*atm.depth_params.x;
         scattered = scattered*(1.0-cloud.a)+cloud.rgb;
         transmitted *= 1.0-cloud.a;
+#ifdef ATMOSPHERE_RING_SLOT
+        // A ring behind the cloud becomes (1-c)P + aC, which blended over the clouded background hides it behind the cloud.
+        if (ringed && ring_depth < cloud_depth) {
+            ring.rgb = ring.rgb*(1.0-cloud.a)+ring.a*cloud.rgb;
+            ring_changed = true;
+        }
+#endif
     }
+#ifdef ATMOSPHERE_RING_SLOT
+    if (blend_ring) {
+        scattered = ring.rgb+(1.0-ring.a)*scattered;
+        transmitted *= 1.0-ring.a;
+    } else if (ring_changed) {
+        store_ring_slot(pixel, ring);
+    }
+#endif
     return true;
 }
 
@@ -495,18 +691,31 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
         bool cloud_transported = false, cloud_missed = false;
         bool single = (current & TRANSPARENCY_MULTI_BIT) == 0u;
         current &= TRANSPARENCY_INDEX_MASK;
+        // A contended ring slot (the loser of its claim is in this list) is transported last, as one more fragment.
+        uint slot = ring_slot_bits(transparent_pixel);
+        bool slot_pending = (slot & RING_SLOT_CONTENDED) != 0u;
         TransportCache cache = init_transport_cache();
         if (transparent_span > 0.0) {
-            while (current != TRANSPARENCY_END) {
-                uint frag_depth_bits = transparent_depth_bits(current);
-                uint frag_next = single ? TRANSPARENCY_END : transparent_next(current);
+            while (current != TRANSPARENCY_END || slot_pending) {
+                bool is_slot = current == TRANSPARENCY_END;
+                uint frag_depth_bits, frag_next;
+                if (is_slot) {
+                    slot_pending = false;
+                    frag_depth_bits = slot & RING_SLOT_DEPTH_MASK;
+                    if ((slot & RING_SLOT_DEFERRED) != 0u) frag_depth_bits |= 0x80000000u;
+                    frag_next = TRANSPARENCY_END;
+                } else {
+                    frag_depth_bits = transparent_depth_bits(current);
+                    frag_next = single ? TRANSPARENCY_END : transparent_next(current);
+                }
 #ifdef ATMOSPHERE_TILE_DEFERRED
                 if ((frag_depth_bits & TRANSPARENT_DEFERRED_BIT) == 0u) {
                     current = frag_next;
                     continue;
                 }
                 frag_depth_bits &= ~TRANSPARENT_DEFERRED_BIT;
-                set_transparent_depth_bits(current, frag_depth_bits);
+                if (is_slot) imageStore(ring_slot_depth, transparent_pixel, uvec4(slot & ~RING_SLOT_DEFERRED));
+                else set_transparent_depth_bits(current, frag_depth_bits);
 #endif
                 float fragment_depth = uintBitsToFloat(frag_depth_bits);
                 bool need_cloud = clouded && fragment_depth < cloud_depth && !cloud_transported;
@@ -551,8 +760,8 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                 }
                 if (fragment_valid) {
                     bool missed = fragment_missed;
-                    uvec2 frag_packed = transparent_color_packed(current);
-                    vec4 color = transparent_color(frag_packed);
+                    uvec2 frag_packed = is_slot ? uvec2(0u) : transparent_color_packed(current);
+                    vec4 color = is_slot ? load_ring_slot(transparent_pixel) : transparent_color(frag_packed);
                     color.rgb = color.rgb*T+color.a*L*atm.depth_params.x;
 #ifdef ATMOSPHERE_LIMB
                     if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, fragment_depth)) < top_radius()) {
@@ -566,11 +775,13 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                     }
 #ifdef ATMOSPHERE_TILE_LEAN
                     if (missed) {
-                        set_transparent_depth_bits(current, frag_depth_bits | TRANSPARENT_DEFERRED_BIT);
+                        if (is_slot) imageStore(ring_slot_depth, transparent_pixel, uvec4(slot | RING_SLOT_DEFERRED));
+                        else set_transparent_depth_bits(current, frag_depth_bits | TRANSPARENT_DEFERRED_BIT);
                         deferred_any = true;
                     } else
 #endif
-                    set_transparent_color_packed(current, pack_transparent_color(color, transparent_excludes_bloom(frag_packed)));
+                    if (is_slot) store_ring_slot(transparent_pixel, color);
+                    else set_transparent_color_packed(current, pack_transparent_color(color, transparent_excludes_bloom(frag_packed)));
                 }
                 current = frag_next;
             }

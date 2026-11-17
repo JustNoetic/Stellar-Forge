@@ -47,6 +47,8 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     std::vector<rhi::DescriptorLayoutBinding> shadow_transparency(std::begin(shadow), std::end(shadow));
     shadow_transparency.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_transparency.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_transparency.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    shadow_transparency.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_transparency.comp", shadow_transparency);
     auto accumulate = std::vector<rhi::DescriptorLayoutBinding>(std::begin(shadow), std::end(shadow));
     accumulate.push_back({23, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
@@ -59,6 +61,8 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     shadow_rotate_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_rotate.comp", rotate, sizeof(glm::uvec2));
     rotate.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     rotate.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    rotate.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    rotate.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_rotate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_rotate_transparency.comp", rotate, sizeof(glm::uvec2));
     const rhi::DescriptorLayoutBinding reproject[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, stage}, {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage},
@@ -68,11 +72,15 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     shadow_reproject_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_reproject.comp", reproject, 2*sizeof(glm::mat4));
     accumulate.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     accumulate.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    accumulate.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    accumulate.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_accumulate_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_accumulate_transparency.comp", accumulate, sizeof(glm::uvec2));
     shadow_coarse_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_coarse.comp", shadow);
     std::vector<rhi::DescriptorLayoutBinding> coarse_transparency(std::begin(shadow), std::end(shadow));
     coarse_transparency.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     coarse_transparency.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    coarse_transparency.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    coarse_transparency.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_coarse_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
         "atmosphere/shadow_coarse_transparency.comp", coarse_transparency);
     const std::pair<std::string, std::string> tile_deferred[] = {{"ATMOSPHERE_TILE_DEFERRED", "1"}};
@@ -83,6 +91,8 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     shadow_vrs_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs.comp", shadow_vrs);
     shadow_vrs.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_vrs.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    shadow_vrs.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    shadow_vrs.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     shadow_vrs_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/shadow_vrs_transparency.comp", shadow_vrs);
     {
         const std::pair<std::string, std::string> closed[] = {{"ATMOSPHERE_SHADOW_CLOSED_FORM", "1"}};
@@ -94,11 +104,15 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
     std::vector<rhi::DescriptorLayoutBinding> transparent_bindings(std::begin(composite_bindings), std::end(composite_bindings));
     transparent_bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     transparent_bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    transparent_bindings.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    transparent_bindings.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    const std::pair<std::string, std::string> ring_slot[] = {{"ATMOSPHERE_RING_SLOT", "1"}};
+    const std::pair<std::string, std::string> unshadowed_ring_slot[] = {{"ATMOSPHERE_UNSHADOWED", "1"}, {"ATMOSPHERE_RING_SLOT", "1"}};
     composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
-        "atmosphere/composite_transparency.comp", transparent_bindings);
+        "atmosphere/composite_transparency.comp", transparent_bindings, sizeof(CompositePush), ring_slot);
     const std::pair<std::string, std::string> unshadowed[] = {{"ATMOSPHERE_UNSHADOWED", "1"}};
     unshadowed_composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
-        "atmosphere/composite_transparency.comp", transparent_bindings, 0, unshadowed);
+        "atmosphere/composite_transparency.comp", transparent_bindings, sizeof(CompositePush), unshadowed_ring_slot);
     std::erase_if(transparent_bindings, [](auto binding) { return binding.binding == 4; });
     auto tiled_bindings = transparent_bindings;
     tiled_bindings.push_back({37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
@@ -124,6 +138,18 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
         ctx.upload_image_2d(dummy_cloud_color_, zero, sizeof(zero));
         dummy_cloud_depth_ = ctx.create_image_2d(1, 1, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         ctx.upload_image_2d(dummy_cloud_depth_, zero, sizeof(float));
+        dummy_slot_color_ = ctx.create_image_2d(1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        dummy_slot_uint_ = ctx.create_image_2d(1, 1, VK_FORMAT_R32_UINT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        const uint32_t empty[8] = {0u, 0u, 0u, 0u, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        dummy_fragments_ = ctx.create_device_buffer(sizeof(empty), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, empty);
+        ctx.immediate_submit([&](VkCommandBuffer cmd) {
+            VkClearColorValue clear{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            for (auto* image : {&dummy_slot_color_, &dummy_slot_uint_}) {
+                ctx.transition_image(cmd, *image, VK_IMAGE_LAYOUT_GENERAL);
+                vkCmdClearColorImage(cmd, image->handle, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+            }
+        });
     }
     surface_lut_ = ctx.create_image_2d(128, 32, VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, 1, 96);
@@ -163,12 +189,17 @@ void AtmosphereRenderer::init(rhi::VkContext& ctx) {
             binding.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
             desc.bindings.push_back(binding);
         }
+        for (auto binding : {14u, 45u, 46u})
+            desc.bindings.push_back({binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
+        desc.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT});
+        desc.push_constant_size = sizeof(CompositePush);
         desc.depth_format = VK_FORMAT_UNDEFINED;
         desc.depth_test = desc.depth_write = false;
         desc.cull_mode = VK_CULL_MODE_NONE;
         desc.dual_source_blend = true;
+        desc.macros = {{"ATMOSPHERE_RING_SLOT", "1"}};
         dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
-        desc.macros = {{"ATMOSPHERE_LIMB", "1"}};
+        desc.macros = {{"ATMOSPHERE_LIMB", "1"}, {"ATMOSPHERE_RING_SLOT", "1"}};
         limb_dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     }
     init_secondary(ctx);
@@ -184,10 +215,15 @@ void AtmosphereRenderer::init_secondary(rhi::VkContext& ctx) {
     secondary_composite_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "atmosphere/composite.comp", composite, sizeof(glm::vec4), macros);
     composite.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
     composite.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
+    composite.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    composite.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage});
+    const std::pair<std::string, std::string> ring_slot[] = {{"ATMOSPHERE_SECONDARY", "1"}, {"ATMOSPHERE_RING_SLOT", "1"}};
+    const std::pair<std::string, std::string> unshadowed_ring_slot[] = {{"ATMOSPHERE_SECONDARY", "1"}, {"ATMOSPHERE_UNSHADOWED", "1"},
+                                                                        {"ATMOSPHERE_RING_SLOT", "1"}};
     secondary_composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
-        "atmosphere/composite_transparency.comp", composite, sizeof(glm::vec4), macros);
+        "atmosphere/composite_transparency.comp", composite, sizeof(CompositePush), ring_slot);
     secondary_unshadowed_composite_transparency_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx,
-        "atmosphere/composite_transparency.comp", composite, sizeof(glm::vec4), unshadowed);
+        "atmosphere/composite_transparency.comp", composite, sizeof(CompositePush), unshadowed_ring_slot);
     std::erase_if(composite, [](auto binding) { return binding.binding == 4; });
     auto tiled = composite;
     tiled.push_back({37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage});
@@ -214,10 +250,9 @@ void AtmosphereRenderer::init_secondary(rhi::VkContext& ctx) {
         desc.vert_path = "post/fullscreen.vert";
         desc.frag_path = "atmosphere/composite.frag";
         desc.capture_statistics = ctx.pipeline_statistics_enabled();
-        desc.macros.assign(std::begin(macros), std::end(macros));
-        desc.push_constant_size = sizeof(glm::vec4);
+        desc.macros.assign(std::begin(ring_slot), std::end(ring_slot));
+        desc.push_constant_size = sizeof(CompositePush);
         for (auto binding : composite) {
-            if (binding.binding == 14 || binding.binding == 15) continue;
             binding.stages = VK_SHADER_STAGE_FRAGMENT_BIT;
             desc.bindings.push_back(binding);
         }
@@ -227,6 +262,7 @@ void AtmosphereRenderer::init_secondary(rhi::VkContext& ctx) {
         desc.dual_source_blend = true;
         secondary_dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
         desc.macros.assign(std::begin(limb), std::end(limb));
+        desc.macros.push_back({"ATMOSPHERE_RING_SLOT", "1"});
         limb_secondary_dual_source_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
     }
 }
@@ -315,6 +351,9 @@ void AtmosphereRenderer::shutdown(rhi::VkContext& ctx) {
     ctx.destroy_image(surface_lut_);
     ctx.destroy_image(dummy_cloud_color_);
     ctx.destroy_image(dummy_cloud_depth_);
+    ctx.destroy_image(dummy_slot_color_);
+    ctx.destroy_image(dummy_slot_uint_);
+    ctx.destroy_buffer(dummy_fragments_);
     if (stbn_tex_) ctx.destroy_image(stbn_tex_);
     if (dummy_stbn_) ctx.destroy_image(dummy_stbn_);
     for (auto& buffer : surface_records_) ctx.destroy_buffer(buffer);

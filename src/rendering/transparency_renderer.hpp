@@ -17,17 +17,20 @@ public:
     void init(rhi::VkContext& ctx);
     void shutdown(rhi::VkContext& ctx);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, VkExtent2D extent, bool enabled);
+    // slot_mode 0 ignores the ring slot, 1 merges it only where list fragments exist (the atmosphere composite
+    // blended the rest), 2 merges it everywhere.
     void resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
-                 rhi::Image* physical_color = nullptr);
+                 rhi::Image* physical_color = nullptr, uint32_t slot_mode = 0);
     bool active() const noexcept { return active_; }
     std::array<rhi::PushDescriptorWrite, 2> writes() const;
+    std::array<rhi::PushDescriptorWrite, 4> slot_writes() const;
     const rhi::Buffer& fragments() const noexcept { return fragments_; }
     uint32_t capacity() const noexcept { return capacity_; }
     TransparencyStats stats(rhi::VkContext& ctx) const;
     const TransparencyStats& last_stats() const noexcept { return last_stats_; }
 
 private:
-    rhi::Image heads_;
+    rhi::Image heads_, slot_color_, slot_depth_;
     rhi::Buffer fragments_;
     rhi::Pipeline resolve_, bloom_resolve_;
     uint32_t capacity_ = 0;

@@ -4,6 +4,40 @@ Rings and orbit lines use a shared per-pixel linked-list A-buffer. Opaque sphere
 
 `TransparencyRenderer::prepare` clears an R32_UINT head image and the allocation counters before scene rendering. `CelestialRenderer` supplies the same head image and fragment buffer to rings and the application orbit pass. `composite_atmospheres` transports the opaque/background HDR image and each stored fragment, then resolves transparent surfaces in per-pixel depth order. An in-place linked-list merge sort uses O(n log n) work and no fixed per-pixel layer truncation. Equal-depth records use packed color as a deterministic tie break. Empty pixels skip fragment sorting and HDR read/write in the resolve pass.
 
+## Ring layer slot
+
+Ring views usually hold about one transparent fragment per pixel, and almost all of it is ring. Sending that through the list cost a 16-byte record, a separate transparent-transport dispatch and a resolve read for every ring pixel. So rings first try a fixed per-pixel slot (`transparency.glsl`, `TRANSPARENCY_RING_SLOT`): an RGBA16F colour image at binding 45 and an R32UI depth image at binding 46, cleared to 0 in `prepare`.
+
+- **Claim.** `capture_ring` claims the slot with a compare-and-swap of its reverse-Z depth bits against 0. A ring fragment that loses the claim sets `RING_SLOT_CONTENDED` (bit 31) and is appended to the list as usual. Reverse-Z depth stays below 2.0, so the top two bits are free.
+- **Contended slots** are treated as one more list fragment everywhere: transport, shadow prefix and resolve sort. Overlapping ring layers therefore order exactly as before.
+- **Transmittance storage.** The slot stores transmittance `1-a`, not alpha. Dense rings sit at alpha near 1, where half floats quantize `1-a` coarsely (one ulp is 4.9e-4); at high exposure that doubled the light seen through them. Readers use `load_ring_slot` / `store_ring_slot`.
+- **Fused transport.** The atmosphere composite (both paths, macro `ATMOSPHERE_RING_SLOT`, mode in `CompositePush::ring`) transports an uncontended, visible slot in the same invocation that composites the background. It reuses the pixel's ray setup and shadow lookup and applies the behind-cloud rewrite `(1-c)P + a·C`.
+- **Fused blend.** When the pixel has no list fragments and this is the last atmosphere drawn, the dual-source pass also blends the ring straight in: `scattered = P' + (1-a)S` and `transmitted = (1-a)T`. Otherwise it writes the transported slot back.
+- **Resolve.** The resolve then takes slot mode 1 (merge the slot only where list fragments exist) or mode 2 (merge it everywhere). The slot enters the sort under the marker key `RING_SLOT_KEY`, so its colour stays fp32 and is never repacked to half.
+- **Several atmospheres.** With more than one atmosphere, dual-source draws before the last are separated by a fragment storage barrier, because each draw may rewrite the slot.
+- **Lean pass misses.** A contended slot that misses the shadow endpoint cache in the lean pass is marked with `RING_SLOT_DEFERRED` (bit 30) for the deferred pass, the same way a list record is marked with its depth sign bit.
+
+The shadow pass picks the slot as the transparent prefix endpoint when it is uncontended and visible. The nearest list fragment, usually an orbit line, then takes the cloud layer's endpoint when no cloud occupies it. Under the closed form, that endpoint only gets a slot when its path is under `CLOSED_FORM_CLOUD_SPLIT_SHARE` of the primary path. Endpoints past atmosphere exit all see the full column, so their deficits are stored and looked up under the key 0 rather than their own depth. This lets an opaque background and a ring beyond the atmosphere share one cache entry instead of missing to the deferred pass.
+
+At 2560×1440 on the RTX 4060 Ti, mean GPU frame time against the list-only path:
+
+| Scene | Before | After | Transparent transport | Resolve |
+| --- | ---: | ---: | ---: | ---: |
+| `earth-sky-rings` | 4.50 ms | 3.75 ms | 0.85 → 0.14 ms (deferred 0.27 → 0.00) | 0.28 → 0.11 ms |
+| `earth-sky-rings-south` | 3.65 ms | 3.13 ms | 0.61 → 0.06 ms | — |
+| `saturn-limb` | 3.14 ms | 2.90 ms | — | — |
+| `saturn` | 2.72 ms | 2.56 ms | — | — |
+
+The opaque composite grows by 0.08–0.23 ms because it now carries the ring. `earth-full-rings` and `earth-ground-rings` read 0.05–0.1 ms slower; this was not separated from run-to-run noise. A floor of about 0.06 ms remains for the transparent dispatch on pixels with no list fragments, and about 0.08 ms for the resolve, which includes the bloom physical-light copy.
+
+Images were compared against the list path with `--benchmark-capture`:
+
+- Earth scenes match within 2 half-float ulps.
+- Remaining differences come from three sources:
+  - the finer transmittance and fp32 slot colour; the old path also flushed denormal ring colours to 0;
+  - a shifted shadow prefix where orbit lines cross rings;
+  - hidden refracted ring fragments, which the old path could take as the prefix endpoint and the new one does not.
+
 ## Atmospheric transport
 
 When bloom is enabled, an optional resolve output excludes orbit guides from
@@ -28,7 +62,7 @@ The compute atmosphere path transforms stored fragments in the same dispatch as 
 
 ## Bounds and lifetime
 
-Fragment allocation targets two fragments per viewport pixel, capped at 128 MiB of records and the device storage-buffer range. The separate head image uses four bytes per pixel. Steady allocation is approximately 71.2 MiB at 1920x1080 and 159.6 MiB at 3840x2160. Allocation is lazy, retained at its high-water mark, and skipped when no visible clouds, rings or multi-body orbit pass require it. Resized images and grown buffers retire after GPU completion; normal frames introduce no queue wait.
+Fragment allocation targets two fragments per viewport pixel, capped at 128 MiB of records and the device storage-buffer range. The separate head image uses four bytes per pixel, and the ring slot another twelve (RGBA16F colour, R32UI depth); the atmosphere renderer binds 1×1 dummies when no slot exists. Steady allocation is approximately 71.2 MiB at 1920x1080 and 159.6 MiB at 3840x2160. Allocation is lazy, retained at its high-water mark, and skipped when no visible clouds, rings or multi-body orbit pass require it. Resized images and grown buffers retire after GPU completion; normal frames introduce no queue wait.
 
 2D cloud sheets composited inline by the atmosphere pass (the default; see
 `oceans_clouds.md`) do not use the fragment list, and do not enable capture. Fragments behind such a

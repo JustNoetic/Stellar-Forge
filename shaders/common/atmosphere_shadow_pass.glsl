@@ -16,6 +16,7 @@ layout(rgba16f, set = 0, binding = 18) uniform writeonly image2DArray current_de
 layout(r32f, set = 0, binding = 19) uniform writeonly image2DArray current_depth;
 #endif
 #ifdef ATMOSPHERE_SHADOW_TRANSPARENCY
+#define TRANSPARENCY_RING_SLOT
 #include "common/transparency.glsl"
 #endif
 layout(set = 0, binding = 34) uniform sampler2D cloud_layer_depth;
@@ -110,27 +111,43 @@ void evaluate_shadow_pixel(ivec2 pixel) {
     vec2 segment = atmosphere_segment(atm.camera.xyz, direction, span);
     float depth = texelFetch(scene_depth, pixel, 0).r;
     float path = span > 0.0 ? shadow_endpoint_path(ndc, direction, depth, segment, span) : 0.0;
-    float transparent_depth = -1.0;
+    float transparent_depth = -1.0, list_depth = -1.0;
 #ifdef ATMOSPHERE_SHADOW_TRANSPARENCY
+    // The prefix endpoint is a sole visible ring slot, else the nearest list fragment (a contended slot counts as one).
+    // Behind a sole ring slot, the nearest list fragment takes the cloud layer when there is no cloud.
     if (path > 0.0) {
+        uint slot = ring_slot_bits(pixel);
+        float ring_depth = uintBitsToFloat(slot & RING_SLOT_DEPTH_MASK);
         uint current = imageLoad(transparency_heads, pixel).x;
         if (current != TRANSPARENCY_END) {
             bool single = (current & TRANSPARENCY_MULTI_BIT) == 0u;
             current &= TRANSPARENCY_INDEX_MASK;
             if (single) {
-                transparent_depth = uintBitsToFloat(transparent_depth_bits(current));
+                list_depth = uintBitsToFloat(transparent_depth_bits(current));
             } else {
                 while (current != TRANSPARENCY_END) {
-                    transparent_depth = max(transparent_depth, uintBitsToFloat(transparent_depth_bits(current)));
+                    list_depth = max(list_depth, uintBitsToFloat(transparent_depth_bits(current)));
                     current = transparent_next(current);
                 }
             }
+        }
+        if ((slot & RING_SLOT_CONTENDED) == 0u && ring_depth > 0.0 && ring_depth >= depth) {
+            transparent_depth = ring_depth;
+        } else {
+            transparent_depth = max((slot & RING_SLOT_CONTENDED) != 0u ? ring_depth : -1.0, list_depth);
+            list_depth = -1.0;
         }
     }
 #endif
     float prefix_path = transparent_depth >= 0.0 && path > 0.0 ? shadow_endpoint_path(ndc, direction, transparent_depth, segment, span) : 0.0;
     float cloud_depth = path > 0.0 ? shadow_cloud_depth(pixel, depth) : -1.0;
+    bool list_endpoint = cloud_depth < 0.0 && list_depth >= depth;
+    if (list_endpoint) cloud_depth = list_depth;
     float cloud_path = cloud_depth >= 0.0 ? shadow_endpoint_path(ndc, direction, cloud_depth, segment, span) : 0.0;
+#ifdef ATMOSPHERE_SHADOW_CLOSED_FORM
+    // A shorter list endpoint would take the ring's integration slot; it is left to the deferred transport.
+    if (list_endpoint && cloud_path < CLOSED_FORM_CLOUD_SPLIT_SHARE*path) cloud_depth = -1.0, cloud_path = 0.0;
+#endif
     vec3 fraction = vec3(0.0), prefix_fraction = vec3(0.0), cloud_fraction = vec3(0.0);
 #ifdef ATMOSPHERE_SHADOW_COARSE
     // Every covered texel is integrated; the full-resolution VRS pass only upsamples.
@@ -193,11 +210,16 @@ void evaluate_shadow_pixel(ivec2 pixel) {
     }
     fraction = accumulate_shadow(pixel, 0, depth, estimate.energy, estimate.loss, count);
     prefix_fraction = accumulate_shadow(pixel, 1, transparent_depth, estimate.prefix_energy, estimate.prefix_loss, count);
-    store_shadow(pixel, 0, depth, fraction);
-    store_shadow(pixel, 1, transparent_depth, prefix_fraction);
+    store_shadow(pixel, 0, path > 0.0 && path >= span ? 0.0 : depth, fraction);
+    store_shadow(pixel, 1, prefix_path > 0.0 && prefix_path >= span ? 0.0 : transparent_depth, prefix_fraction);
     imageStore(current_depth, ivec3(pixel, 2), vec4(-1.0));
 #else
     if (path > 0.0) {
+        // Endpoints past the atmosphere's exit all see the full column: they share the opaque deficit, stored under
+        // the key 0 that transport looks up for any endpoint without a finite path.
+        bool full = path >= span;
+        if (full && prefix_path >= span) prefix_path = 0.0;
+        if (full && cloud_path >= span) cloud_path = 0.0;
 #ifdef ATMOSPHERE_SHADOW_VRS
         fraction = reconstruct_shadow_vrs(pixel, 0, depth > 0.0, segment, path);
         if (prefix_path > 0.0) prefix_fraction = reconstruct_shadow_vrs(pixel, 1, true, segment, prefix_path);
@@ -206,7 +228,7 @@ void evaluate_shadow_pixel(ivec2 pixel) {
         if (!shadow_cached_column_unlit(direction, segment, path))
             shadow_integrate(pixel, direction, segment, path, prefix_path, cloud_path, fraction, prefix_fraction, cloud_fraction);
 #endif
-        store_shadow(pixel, 0, depth, fraction);
+        store_shadow(pixel, 0, full ? 0.0 : depth, fraction);
         if (cloud_path > 0.0)
             store_shadow(pixel, 2, cloud_depth, cloud_fraction);
         else

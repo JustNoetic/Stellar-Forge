@@ -115,10 +115,14 @@ public:
                  bool shadow_diagnostics = false, std::span<const PlanetshineGPU> planetshine = {},
                  const RingRenderer* ring_lighting = nullptr, const RefractionHost* refraction = nullptr);
     // cloud_writes bind the inline cloud layer (33: colour, 34: depth); empty binds cleared placeholders.
-    void composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
+    // slot_writes bind the ring slot (45: colour, 46: depth) beside transparency_writes; empty binds placeholders.
+    // With ring_slot set, the composite transports the slot and returns true when it also blended it wherever no
+    // list fragment exists; otherwise the resolve must blend it.
+    bool composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                    std::span<const rhi::PushDescriptorWrite> transparency_writes = {},
                    const std::function<void(uint32_t)>& draw_point = {},
-                   std::span<const rhi::PushDescriptorWrite> cloud_writes = {});
+                   std::span<const rhi::PushDescriptorWrite> cloud_writes = {},
+                   std::span<const rhi::PushDescriptorWrite> slot_writes = {}, bool ring_slot = false);
     // True when this frame's atmosphere composite of `body` blends its 2D cloud sheet from the cloud layer.
     bool composites_clouds(uint32_t body) const noexcept;
     uint32_t inline_cloud_slot(uint32_t body) const noexcept;
@@ -195,7 +199,8 @@ private:
                         std::span<const PlanetshineGPU> planetshine, const RingRenderer* ring_lighting);
     void resolve_shadows(VkCommandBuffer cmd, rhi::VkContext& ctx, Tables& table, rhi::Image& color, rhi::Image& depth,
                          std::span<const rhi::PushDescriptorWrite> transparency_writes,
-                         std::span<const rhi::PushDescriptorWrite> cloud_writes);
+                         std::span<const rhi::PushDescriptorWrite> cloud_writes,
+                         std::span<const rhi::PushDescriptorWrite> slot_writes);
     std::array<rhi::PushDescriptorWrite, 2> cloud_layer_writes(rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> cloud_writes) const;
     void retire_shadow_history(rhi::VkContext& ctx, Tables& table);
     static void begin_tiles(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Buffer& tiles, VkExtent2D extent);
@@ -212,6 +217,10 @@ private:
     rhi::Pipeline legacy_sky_pipeline_, legacy_aerial_pipeline_;
     rhi::Pipeline dual_source_pipeline_, surface_pipeline_;
     rhi::Image dummy_cloud_color_, dummy_cloud_depth_;
+    // Storage placeholders for the ring slot (45, 46) and list (14, 15) when a composite has none.
+    rhi::Image dummy_slot_color_, dummy_slot_uint_;
+    rhi::Buffer dummy_fragments_;
+    std::array<rhi::PushDescriptorWrite, 2> dummy_slot_writes() const;
     rhi::Pipeline limb_dual_source_pipeline_, limb_transparent_pipeline_, limb_unshadowed_transparent_pipeline_;
     rhi::Pipeline limb_secondary_dual_source_pipeline_, limb_secondary_transparent_pipeline_, limb_secondary_unshadowed_transparent_pipeline_;
     // Lean transparent transport that reads only cached shadow endpoints; the shadowed pipelines above then run as

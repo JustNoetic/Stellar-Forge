@@ -21,6 +21,7 @@ layout(location = 2) flat in uint f_host_idx;
 
 layout(location = 0) out vec4 out_color;
 #ifdef TRANSPARENCY_CAPTURE
+#define TRANSPARENCY_RING_SLOT
 #include "common/transparency.glsl"
 #endif
 
@@ -416,6 +417,6 @@ void main() {
     vec3 final_color = max(total_illum, vec3(0.0)) * exposure;
     out_color = vec4(final_color * max_cov, physical_alpha * max_cov);
 #ifdef TRANSPARENCY_CAPTURE
-    if (capture_transparency(out_color, fragment_depth, false, RING_REFRACTION != 0)) out_color = vec4(0.0);
+    if (capture_ring(out_color, fragment_depth, RING_REFRACTION != 0)) out_color = vec4(0.0);
 #endif
 }
