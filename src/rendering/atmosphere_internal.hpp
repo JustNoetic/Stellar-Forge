@@ -83,7 +83,7 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                      AtmosphereShadowHeaderGPU& previous, std::vector<AtmosphereShadowCasterGPU>& previous_casters,
                      uint32_t sequence, uint32_t& changes, const RingPenumbraSlots* penumbra_slots = nullptr);
 AtmosphereFrame make_atmosphere_frame(const ephemeris::SystemSnapshot& system, uint32_t index, const Camera& camera,
-                                      const RenderSettings& settings, VkExtent2D extent, const glm::dmat3& apparent,
+                                      const RenderSettings& settings, VkExtent2D extent, const AtmosphereRefraction& refraction_warp,
                                       double candidate_distance, double focal, glm::dvec3 eye, std::span<const float> minimum_heights_km);
 
 }

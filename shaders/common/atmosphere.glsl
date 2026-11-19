@@ -41,6 +41,11 @@ layout(std140, set = 0, binding = 0) uniform AtmosphereParameters {
     vec4 star_disc[16];
     vec4 limb_image;
     vec4 cloud_layer; // x: body index, y: 1 when the 2D cloud sheet is composited inline from the cloud layer
+    vec4 refract_view[3];
+    vec4 refract_to_atm[3];
+    vec4 refract_trig;
+    vec4 refract_domain;
+    vec4 refract_bend[16];
 } atm;
 
 const float DEPTH_DISTANCE_TOLERANCE = 1e-6;
@@ -114,9 +119,10 @@ float depth_endpoint_path(float distance, vec3 d, vec2 segment, float span, out 
     float path = distance-segment.x;
     float sea = min(sea_level_path(d, segment), span);
     float measured = sea >= 0.0 ? smoothstep(tolerance, 2.0*tolerance, abs(path-sea)) : 1.0;
-    finite_endpoint = measured < 1.0 || path < span-tolerance;
+    float resolved = min(mix(sea, path, measured), span);
+    finite_endpoint = (measured < 1.0 || path < span-tolerance) && resolved < span;
     if (!finite_endpoint) return span;
-    return min(mix(sea, path, measured), span);
+    return resolved;
 }
 
 float particle_density(int layer, float height) {
@@ -162,13 +168,22 @@ vec3 atmosphere_direction(vec3 world) {
     return vec3(dot(d, atm.axis_x.xyz), dot(d, atm.axis_y.xyz), dot(d, atm.axis_z.xyz));
 }
 
-vec3 view_direction(vec2 ndc) {
+#include "atmosphere_refraction.glsl"
+
+vec3 view_direction(vec2 ndc, out float refract_slope) {
+    refract_slope = 0.0;
+    if (atm.refract_domain.w > 0.5) return refracted_view_direction(ndc, refract_slope);
     if (atm.view_ray[2].w > 0.5) {
         vec3 n = vec3(ndc, 1.0);
         return normalize(vec3(dot(atm.view_ray[0].xyz, n), dot(atm.view_ray[1].xyz, n), dot(atm.view_ray[2].xyz, n)));
     }
     vec4 world = atm.inverse_view_projection*vec4(ndc, 1.0, 1.0);
     return atmosphere_direction(world.xyz/world.w);
+}
+
+vec3 view_direction(vec2 ndc) {
+    float refract_slope;
+    return view_direction(ndc, refract_slope);
 }
 
 float aerial_distance(float fraction, float range) {

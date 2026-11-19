@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/camera.hpp"
+#include "rendering/refraction_tables.hpp"
 #include "rendering/render_settings.hpp"
 #include "rhi/vk_context.hpp"
 #include <array>
@@ -13,7 +14,6 @@ namespace sf::rendering {
 struct RingHostGPU;
 class RingRenderer;
 struct PlanetshineGPU;
-struct RefractionHost;
 struct AtmosphereFrame;
 struct AtmosphereChanges;
 struct LutRecorder;
@@ -59,6 +59,11 @@ struct alignas(16) AtmosphereParametersGPU {
     std::array<glm::vec4, 16> star_disc{};
     glm::vec4 limb_image{};
     glm::vec4 cloud_layer{}; // x: body index, y: 1 when the 2D cloud sheet is composited inline, z: dense inline slot
+    std::array<glm::vec4, 3> refract_view{};
+    std::array<glm::vec4, 3> refract_to_atm{};
+    glm::vec4 refract_trig{};
+    glm::vec4 refract_domain{};
+    std::array<glm::vec4, 16> refract_bend{};
 };
 
 AtmosphereParametersGPU make_atmosphere_parameters(const ephemeris::BodyDefinition& body,
@@ -183,11 +188,11 @@ private:
         bool aerial_valid = false;
         bool stellar_source_resolved = true;
     };
-    struct Candidate { uint32_t index; double distance; glm::dmat3 apparent; };
+    struct Candidate { uint32_t index; double distance; AtmosphereRefraction refraction; };
     bool begin_prepare(rhi::VkContext& ctx, const ephemeris::SystemSnapshot& system, const RenderSettings& settings,
                        VkExtent2D extent, const rhi::Image* ring_shadow_lut, bool shadow_diagnostics);
     std::vector<Candidate> select_candidates(const Camera& camera, const ephemeris::SystemSnapshot& system, VkExtent2D extent,
-                                             const RefractionHost* refraction) const;
+                                             double focal, const RefractionHost* refraction) const;
     void assign_tables(std::span<const Candidate> candidates, const ephemeris::SystemSnapshot& system,
                        std::vector<size_t>& slots, std::vector<size_t>& surface_slots) const;
     void update_shadow_history(Tables& t, const AtmosphereFrame& frame, glm::dvec3 relative_eye, bool identity_dirty,

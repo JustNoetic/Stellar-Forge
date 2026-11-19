@@ -9,7 +9,7 @@
 
 namespace sf::rendering {
 
-static_assert(sizeof(AtmosphereParametersGPU) == 14944);
+static_assert(sizeof(AtmosphereParametersGPU) == 15328);
 static_assert(sizeof(AtmosphereParametersGPU) <= 16384);
 static_assert(sizeof(AtmosphereShadowHeaderGPU) == 592);
 static_assert(sizeof(AtmosphereShadowCasterGPU) == 48);
@@ -576,7 +576,7 @@ AtmosphereParametersGPU make_atmosphere_parameters(const ephemeris::BodyDefiniti
 }
 
 AtmosphereFrame make_atmosphere_frame(const ephemeris::SystemSnapshot& system, uint32_t index, const Camera& camera,
-                                      const RenderSettings& settings, VkExtent2D extent, const glm::dmat3& apparent,
+                                      const RenderSettings& settings, VkExtent2D extent, const AtmosphereRefraction& refraction_warp,
                                       double candidate_distance, double focal, glm::dvec3 eye, std::span<const float> minimum_heights_km) {
     bool limb_active = false;
     const auto b = system.body(index);
@@ -624,15 +624,37 @@ AtmosphereFrame make_atmosphere_frame(const ephemeris::SystemSnapshot& system, u
     }
     auto projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au());
     auto view = camera.view_matrix_eye_relative();
-    glm::dmat3 apparent_to_true = glm::transpose(apparent);
+    glm::dmat3 apparent_to_true = glm::transpose(refraction_warp.apparent);
     p.inverse_view_projection = glm::mat4(glm::dmat4(apparent_to_true)*glm::dmat4(glm::inverse(projection*view)));
-    glm::dmat3 view_to_world = apparent_to_true*glm::inverse(glm::dmat3(glm::mat3(view)));
+    glm::dmat3 world_from_view = glm::inverse(glm::dmat3(glm::mat3(view)));
+    glm::dmat3 view_to_world = apparent_to_true*world_from_view;
     glm::dvec3 ray_scale{1.0/projection[0][0], 1.0/projection[1][1], -1.0};
     for (int k = 0; k < 3; ++k) {
         glm::dvec3 axis = k == 0 ? x : k == 1 ? y : z;
         glm::dvec3 row;
         for (int j = 0; j < 3; ++j) row[j] = glm::dot(axis, atmosphere_space(view_to_world[j]))*ray_scale[j];
         p.view_ray[k] = {glm::vec3(row), 1.0f};
+    }
+    if (refraction_warp.differential) {
+        auto to_host = [&](glm::dvec3 v) {
+            return v+refraction_warp.host_pole*(glm::dot(v, refraction_warp.host_pole)*refraction_warp.host_stretch);
+        };
+        auto from_host = [&](glm::dvec3 v) {
+            return v-refraction_warp.host_pole*(glm::dot(v, refraction_warp.host_pole)*refraction_warp.host_stretch/(1.0+refraction_warp.host_stretch));
+        };
+        for (int k = 0; k < 3; ++k) {
+            glm::dvec3 row;
+            for (int j = 0; j < 3; ++j)
+                row[j] = glm::dot(refraction_warp.host_apparent_basis[k], to_host(world_from_view[j]))*ray_scale[j];
+            p.refract_view[k] = {glm::vec3(row), 0.0f};
+        }
+        for (int j = 0; j < 3; ++j) {
+            glm::dvec3 atm_f = atmosphere_space(from_host(refraction_warp.host_true_basis[j]));
+            p.refract_to_atm[j] = {float(glm::dot(atm_f, x)), float(glm::dot(atm_f, y)), float(glm::dot(atm_f, z)), 0.0f};
+        }
+        p.refract_trig = refraction_warp.trig;
+        p.refract_domain = refraction_warp.domain;
+        p.refract_bend = refraction_warp.bend;
     }
     p.depth_params.x = settings.hdr_enabled ? settings.exposure : 1.0f;
     p.depth_params.y = settings.aerial_perspective_enabled ? 1.0f : 0.0f;

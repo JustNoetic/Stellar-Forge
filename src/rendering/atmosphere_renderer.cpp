@@ -393,10 +393,10 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
                                  std::span<const PlanetshineGPU> planetshine, const RingRenderer* ring_lighting,
                                  const RefractionHost* refraction) {
     if (!begin_prepare(ctx, system, settings, extent, ring_shadow_lut, shadow_diagnostics)) return;
-    auto candidates = select_candidates(camera, system, extent, refraction);
+    double focal = double(extent.height)/(2.0*std::tan(camera.fov_deg*DEG_TO_RAD*0.5));
+    auto candidates = select_candidates(camera, system, extent, focal, refraction);
     std::vector<size_t> slots, surface_slots;
     assign_tables(candidates, system, slots, surface_slots);
-    double focal = double(extent.height)/(2.0*std::tan(camera.fov_deg*DEG_TO_RAD*0.5));
     glm::dvec3 eye = camera.eye_pos_render().value;
     const LutRecorder lut{cmd, ctx};
     ring_penumbra_ = ring_lighting ? &ring_lighting->penumbra_table() : &ring_penumbra_dummy_;
@@ -418,7 +418,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         }
         auto& t = *tables_[slot];
         const auto b = system.body(candidate.index);
-        auto frame = make_atmosphere_frame(system, candidate.index, camera, settings, extent, candidate.apparent,
+        auto frame = make_atmosphere_frame(system, candidate.index, camera, settings, extent, candidate.refraction,
                                            candidate.distance, focal, eye, minimum_heights_km);
         auto& p = frame.p;
         // The 2D sheet is blended here from the cloud layer; progressive shadows keep it as a transparent fragment
@@ -463,7 +463,7 @@ void AtmosphereRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const
         double refraction_pad = refraction && refraction->refraction && int(candidate.index) != refraction->body
             ? refraction->max_displacement : 0.0;
         t.shadow_active = prepare_shadows(ctx, t.shadows[ctx.frame_index()], system, candidate.index, eye, frame.radius+frame.height,
-                        float(frame.bottom*frame.polar_ratio), float(focal), camera, candidate.apparent, extent, refraction_pad,
+                        float(frame.bottom*frame.polar_ratio), float(focal), camera, candidate.refraction.apparent, extent, refraction_pad,
                         settings, ring_shadow_lut ? rings : std::span<const RingHostGPU>{},
                         t.shadow_header, t.shadow_casters, uint32_t(prepare_serial_), shadow_changes,
                         ring_shadow_lut && ring_lighting ? &ring_lighting->penumbra_slots() : nullptr);
@@ -558,7 +558,7 @@ bool AtmosphereRenderer::begin_prepare(rhi::VkContext& ctx, const ephemeris::Sys
 }
 
 std::vector<AtmosphereRenderer::Candidate> AtmosphereRenderer::select_candidates(const Camera& camera, const ephemeris::SystemSnapshot& system,
-                                                                             VkExtent2D extent, const RefractionHost* refraction) const {
+                                                                             VkExtent2D extent, double focal, const RefractionHost* refraction) const {
     std::vector<Candidate> candidates;
     double tan_y = std::tan(camera.fov_deg*DEG_TO_RAD*0.5);
     double tan_x = tan_y*double(extent.width)/std::max(1u, extent.height);
@@ -570,7 +570,9 @@ std::vector<AtmosphereRenderer::Candidate> AtmosphereRenderer::select_candidates
             std::abs(glm::dot(to_body, camera.up_dir())) > depth*ty+outer*std::sqrt(1.0+ty*ty);
     };
     double pad = refraction && refraction->refraction ? refraction->max_displacement : 0.0;
-    auto padded = [&](double tangent) { return std::tan(std::min(std::atan(tangent)+pad, 1.5)); };
+    auto padded_by = [](double tangent, double angle) {
+        return angle > 0.0 ? std::tan(std::min(std::atan(tangent)+angle, 1.5)) : tangent;
+    };
     for (uint32_t i = 0; i < system.size(); ++i) {
         const auto b = system.body(i);
         const auto& a = b.definition.atmosphere;
@@ -580,17 +582,17 @@ std::vector<AtmosphereRenderer::Candidate> AtmosphereRenderer::select_candidates
         double distance = glm::length(to_body);
         double height = b.render.atmosphere ? b.render.atmosphere->height_km : a.height_km;
         double outer = radius+height;
-        glm::dmat3 apparent(1.0);
+        AtmosphereRefraction warp;
         if (distance > outer) {
             bool refracted = pad > 0.0 && int(i) != refraction->body;
-            if (outside(to_body, outer, refracted ? padded(tan_x) : tan_x, refracted ? padded(tan_y) : tan_y)) continue;
+            if (outside(to_body, outer, refracted ? padded_by(tan_x, pad) : tan_x, refracted ? padded_by(tan_y, pad) : tan_y)) continue;
             if (refracted) {
-                apparent = apparent_rotation(*refraction, b.render.position.value-eye);
-                if (outside(apparent*to_body, outer, tan_x, tan_y)) continue;
+                warp = prepare_atmosphere_refraction(*refraction, b.render.position.value-eye, outer, focal);
+                if (outside(warp.apparent*to_body, outer, padded_by(tan_x, warp.pad), padded_by(tan_y, warp.pad))) continue;
             }
         }
         if (i >= 1024) continue;
-        candidates.push_back({i, distance, apparent});
+        candidates.push_back({i, distance, warp});
     }
     std::sort(candidates.begin(), candidates.end(), [](auto a, auto b) { return a.distance > b.distance; });
     return candidates;
@@ -686,6 +688,7 @@ void AtmosphereRenderer::update_shadow_history(Tables& t, const AtmosphereFrame&
     atmosphere_key.sun_irradiance = p.sun_irradiance;
     atmosphere_key.inverse_view_projection = p.inverse_view_projection;
     atmosphere_key.view_ray = p.view_ray;
+    atmosphere_key.refract_view = p.refract_view;
     atmosphere_key.depth_params = p.depth_params;
     if (std::memcmp(&p, &atmosphere_key, sizeof(p)) != 0) t.shadow_reset_reasons |= ShadowHistoryAtmosphere;
     if (t.shadow_ring_revision != ring_shadow_revision || t.shadow_ring_image != ring_shadow_lut_->handle)

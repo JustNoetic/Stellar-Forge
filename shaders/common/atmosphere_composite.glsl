@@ -205,8 +205,7 @@ bool atmosphere_transport_ray_base(ivec2 pixel, vec2 ndc, vec3 d, vec2 segment, 
     path = span;
     finite_endpoint = false;
     if (depth > 0.0) {
-        vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
-        float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
+        float distance = depth_atmosphere_distance(ndc, depth, d);
         path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
         if (path <= 0.0) return false;
         if (atm.depth_params.y == 0.0) {
@@ -255,7 +254,7 @@ const int LIMB_BEND_ROWS = 64;
 
 struct LimbFootprint { vec2 across; float center, wide, narrow, limb, edge, azimuth; bool resolved; };
 
-bool limb_footprint(vec2 ndc, vec3 d, ivec2 size, out LimbFootprint f) {
+bool limb_footprint(vec2 ndc, vec3 d, float refract_slope, ivec2 size, out LimbFootprint f) {
     float sine = length(d.xy);
     if (sine < atm.limb_image.z || sine > atm.limb_image.w || d.z >= 0.0) return false;
     float r = atm.camera.z;
@@ -267,7 +266,8 @@ bool limb_footprint(vec2 ndc, vec3 d, ivec2 size, out LimbFootprint f) {
     vec3 row_z = vec3(atm.view_ray[0].z, atm.view_ray[1].z, atm.view_ray[2].z);
     f.across = d.xy/max(sine, 1e-30);
     vec3 radial = vec3(f.across*-d.z, sine);
-    vec2 steps = abs(vec2(dot(radial, row_x), dot(radial, row_y)))*2.0/(vec2(size)*length(row_x*ndc.x+row_y*ndc.y+row_z));
+    vec2 steps = refract_limb_steps(ndc, size, radial, refract_slope,
+        vec2(dot(radial, row_x), dot(radial, row_y)), length(row_x*ndc.x+row_y*ndc.y+row_z));
     f.wide = max(steps.x, steps.y);
     f.narrow = max(min(steps.x, steps.y), 1e-3*f.wide);
     float reach = 0.5*(f.wide+f.narrow);
@@ -496,9 +496,8 @@ bool limb_star_behind(vec3 d) {
     return false;
 }
 
-float limb_depth_distance(vec2 ndc, float depth) {
-    vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
-    return length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
+float limb_depth_distance(vec2 ndc, float depth, vec3 d) {
+    return depth_atmosphere_distance(ndc, depth, d);
 }
 
 bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment, float span, float depth,
@@ -506,7 +505,7 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
     float path = span;
     bool surface_seen = false, finite_endpoint = false;
     if (depth > 0.0) {
-        float distance = limb_depth_distance(ndc, depth);
+        float distance = limb_depth_distance(ndc, depth, d);
         float closest = -dot(atm.camera.xyz, d);
         if (distance < closest-top_radius()) return false;
         surface_seen = distance < closest+top_radius();
@@ -588,12 +587,13 @@ bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 s
 #endif
 
     vec2 ndc = (vec2(pixel)+0.5)/vec2(size)*2.0-1.0;
-    vec3 d = view_direction(ndc);
+    float refract_slope;
+    vec3 d = view_direction(ndc, refract_slope);
     float span;
     vec2 segment = atmosphere_segment(atm.camera.xyz, d, span);
 #ifdef ATMOSPHERE_LIMB
     LimbFootprint limb;
-    bool has_limb = limb_footprint(ndc, d, size, limb);
+    bool has_limb = limb_footprint(ndc, d, refract_slope, size, limb);
 #endif
     TransportCache cache = init_transport_cache();
     vec3 L, T;
@@ -619,7 +619,7 @@ bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 s
             atmosphere_finish_radiance(d, span, path, finite_endpoint, ring_depth, cache, ring_L);
             ring.rgb = ring.rgb*ring_T+ring.a*ring_L*atm.depth_params.x;
 #ifdef ATMOSPHERE_LIMB
-            if (has_limb && !limb.resolved && length(atm.camera.xyz+d*limb_depth_distance(ndc, ring_depth)) < top_radius()) {
+            if (has_limb && !limb.resolved && length(atm.camera.xyz+d*limb_depth_distance(ndc, ring_depth, d)) < top_radius()) {
                 ring *= limb_coverage(limb, limb.limb);
                 ring.rgb += ring.a*limb_star_image(limb)*atm.depth_params.w*atm.depth_params.x;
             }
@@ -673,12 +673,13 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
     uint current = imageLoad(transparency_heads, transparent_pixel).x;
     if (current != TRANSPARENCY_END) {
         vec2 transparent_ndc = (vec2(transparent_pixel)+0.5)/vec2(transparent_size)*2.0-1.0;
-        vec3 transparent_dir = view_direction(transparent_ndc);
+        float transparent_slope;
+        vec3 transparent_dir = view_direction(transparent_ndc, transparent_slope);
         float transparent_span;
         vec2 transparent_segment = atmosphere_segment(atm.camera.xyz, transparent_dir, transparent_span);
 #ifdef ATMOSPHERE_LIMB
         LimbFootprint transparent_limb;
-        bool thin_limb = limb_footprint(transparent_ndc, transparent_dir, transparent_size, transparent_limb) && !transparent_limb.resolved;
+        bool thin_limb = limb_footprint(transparent_ndc, transparent_dir, transparent_slope, transparent_size, transparent_limb) && !transparent_limb.resolved;
         float limb_cover = thin_limb ? limb_coverage(transparent_limb, transparent_limb.limb) : 1.0;
         vec3 limb_light = thin_limb ? limb_star_image(transparent_limb)*atm.depth_params.w*atm.depth_params.x : vec3(0.0);
 #endif
@@ -743,7 +744,7 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                         if (valid) {
                             cloud.rgb = cloud.rgb*endpoint_T+cloud.a*endpoint_L*atm.depth_params.x;
 #ifdef ATMOSPHERE_LIMB
-                            if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, cloud_depth)) < top_radius()) {
+                            if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, cloud_depth, transparent_dir)) < top_radius()) {
                                 cloud *= limb_cover;
                                 cloud.rgb += cloud.a*limb_light;
                             }
@@ -764,7 +765,7 @@ bool transport_transparent_fragments(ivec2 transparent_pixel) {
                     vec4 color = is_slot ? load_ring_slot(transparent_pixel) : transparent_color(frag_packed);
                     color.rgb = color.rgb*T+color.a*L*atm.depth_params.x;
 #ifdef ATMOSPHERE_LIMB
-                    if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, fragment_depth)) < top_radius()) {
+                    if (thin_limb && length(atm.camera.xyz+transparent_dir*limb_depth_distance(transparent_ndc, fragment_depth, transparent_dir)) < top_radius()) {
                         color *= limb_cover;
                         color.rgb += color.a*limb_light;
                     }

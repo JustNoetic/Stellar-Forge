@@ -66,8 +66,7 @@ vec3 accumulate_shadow(ivec2 pixel, int layer, float depth, vec3 energy, vec3 lo
 float shadow_endpoint_path(vec2 ndc, vec3 direction, float depth, vec2 segment, float span) {
     if (depth <= 0.0) return span;
     if (atm.depth_params.y == 0.0) return 0.0;
-    vec4 surface = atm.inverse_view_projection*vec4(ndc, depth, 1.0);
-    float distance = length(world_to_atmosphere(surface.xyz/surface.w))*149597870.7;
+    float distance = depth_atmosphere_distance(ndc, depth, direction);
     bool finite_endpoint;
     return max(depth_endpoint_path(distance, direction, segment, span, finite_endpoint), 0.0);
 }
