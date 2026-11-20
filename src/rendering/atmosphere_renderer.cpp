@@ -582,13 +582,14 @@ std::vector<AtmosphereRenderer::Candidate> AtmosphereRenderer::select_candidates
         double distance = glm::length(to_body);
         double height = b.render.atmosphere ? b.render.atmosphere->height_km : a.height_km;
         double outer = radius+height;
+        double cull_radius = std::max(outer, 3.0*distance/std::max(focal, 1e-9));
         AtmosphereRefraction warp;
         if (distance > outer) {
             bool refracted = pad > 0.0 && int(i) != refraction->body;
-            if (outside(to_body, outer, refracted ? padded_by(tan_x, pad) : tan_x, refracted ? padded_by(tan_y, pad) : tan_y)) continue;
+            if (outside(to_body, cull_radius, refracted ? padded_by(tan_x, pad) : tan_x, refracted ? padded_by(tan_y, pad) : tan_y)) continue;
             if (refracted) {
                 warp = prepare_atmosphere_refraction(*refraction, b.render.position.value-eye, outer, focal);
-                if (outside(warp.apparent*to_body, outer, padded_by(tan_x, warp.pad), padded_by(tan_y, warp.pad))) continue;
+                if (outside(warp.apparent*to_body, cull_radius, padded_by(tan_x, warp.pad), padded_by(tan_y, warp.pad))) continue;
             }
         }
         if (i >= 1024) continue;

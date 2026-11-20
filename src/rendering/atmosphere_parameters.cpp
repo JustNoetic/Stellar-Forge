@@ -606,20 +606,20 @@ AtmosphereFrame make_atmosphere_frame(const ephemeris::SystemSnapshot& system, u
         double d = glm::length(delta);
         if (d < 1e-12) continue;
         glm::dvec3 direction = glm::normalize(atmosphere_space(delta/d));
-        uint32_t index = static_cast<uint32_t>(p.camera.w++);
-        p.sun_direction[index] = {glm::vec3(glm::dot(direction, x), glm::dot(direction, y), glm::dot(direction, z)),
+        uint32_t star_slot = static_cast<uint32_t>(p.camera.w++);
+        p.sun_direction[star_slot] = {glm::vec3(glm::dot(direction, x), glm::dot(direction, y), glm::dot(direction, z)),
             float(std::asin(std::clamp(star.opaque_radius_au()/d, 1e-7, 1.0)))};
         float irradiance = settings.hdr_enabled ? static_cast<float>(std::max(star.definition.lum_eq, 0.0)/(d*d)) : 1.0f;
         if (!system.illuminates(s, index)) irradiance = 0.0f;
-        p.sun_irradiance[index] = {star.definition.color_rgb*(irradiance*static_cast<float>(PI)), 0.0f};
+        p.sun_irradiance[star_slot] = {star.definition.color_rgb*(irradiance*static_cast<float>(PI)), 0.0f};
         double star_radius = std::max(star.definition.radius_au(), 1e-12);
         float radiance = !system.illuminates(s, index) ? 0.0f :
             settings.hdr_enabled ? static_cast<float>(std::max(star.definition.lum_eq, 0.0)/(star_radius*star_radius)) : 1.0f;
-        p.star_radiance[index] = {star.definition.color_rgb*radiance, 0.0f};
+        p.star_radiance[star_slot] = {star.definition.color_rgb*radiance, 0.0f};
         glm::dvec3 sight = star.render.position.value-eye;
         double range = glm::length(sight);
         glm::dvec3 seen = range > 1e-12 ? sight/range : glm::normalize(delta);
-        p.star_disc[index] = {glm::vec3(glm::dot(seen, x), glm::dot(seen, y), glm::dot(seen, z)),
+        p.star_disc[star_slot] = {glm::vec3(glm::dot(seen, x), glm::dot(seen, y), glm::dot(seen, z)),
             float(std::asin(std::clamp(star.opaque_radius_au()/std::max(range, 1e-12), 1e-7, 1.0)))};
     }
     auto projection = camera.proj_matrix(float(extent.width)/std::max(1u, extent.height), camera.compute_near_plane_au());

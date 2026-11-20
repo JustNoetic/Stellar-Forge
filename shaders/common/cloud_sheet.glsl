@@ -70,6 +70,8 @@ float cloud_sheet_depth(BodyInstanceGPU b, vec3 local) {
 
 void render_cloud_sheet() {
     BodyInstanceGPU b = bodies[f_body_idx];
+    float weight = mesh_weight(apparent_radius_px(b.pos_radius));
+    if (weight <= 0.0) discard;
     SurfaceFluidGPU f = fluids[f_body_idx];
     vec3 pole = body_pole(b);
     float flattening = fluid_flattening(b);
@@ -91,6 +93,7 @@ void render_cloud_sheet() {
     if (distance <= 1e-12 || hit >= ground_offset) discard;
     vec3 local = f_body_offset+ray*hit;
     vec4 color = cloud_sheet_color(f_body_idx, ray, local, distance, pole, flattening, body_surface_rotation(pole, b.spin_flags.x));
+    color *= weight;
     if (color.a < 1e-3) discard;
     float depth = cloud_sheet_depth(b, local);
 #ifdef CLOUD_SHEET_INLINE

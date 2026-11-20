@@ -104,7 +104,8 @@ void main() {
     if (b.spin_flags.z > 0.5 || weight <= 0.0) return;
 
     vec3 center = b.pos_radius.xyz;
-    vec4 apparent = b.color_is_star.w > 0.5 && refraction_exterior() ? vec4(center, 1.0) : refract_point(center);
+    bool is_host = refraction_active() && all(equal(center, u_refraction.host.xyz));
+    vec4 apparent = (is_host || (b.color_is_star.w > 0.5 && refraction_exterior())) ? vec4(center, 1.0) : refract_point(center);
     if (apparent.w <= 0.0) return;
     vec4 clip = u_scene.view_proj * vec4(apparent.xyz, 1.0);
     if (clip.w <= 0.0) return;

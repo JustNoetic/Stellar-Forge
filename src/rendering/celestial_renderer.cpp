@@ -357,7 +357,7 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
             if (visible_clouds || composited) continue;
             double distance = glm::length(camera_relative(body.render.position, cam.eye_pos_render()));
             visible_clouds = cloud.enabled && cloud.coverage > 0 && cloud.density > 0 && cloud.extinction_per_km > 0 &&
-                body.definition.radius_au()/std::max(distance, 1e-15)*pixels > 2;
+                body.definition.radius_au()/std::max(distance, 1e-15)*pixels > 1.5;
         }
     }
     prepare_cloud_layer(cmd, ctx, extent);
@@ -881,7 +881,7 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
                     static_cast<float>(evolution), static_cast<float>(radius_km));
                 double apparent_px = d.radius_au() / std::max(distance, 1e-15) * pixel_scale;
                 if (settings.clouds_enabled && d.clouds.coverage > 0 && d.clouds.density > 0 &&
-                    d.clouds.extinction_per_km > 0 && apparent_px > 2.0) clouds.emplace_back(distance, i);
+                    d.clouds.extinction_per_km > 0 && apparent_px > 1.5) clouds.emplace_back(distance, i);
             }
         }
         fluids[i] = f;
