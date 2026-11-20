@@ -26,6 +26,8 @@ struct Camera {
     int movement_mode = 0;
     bool cam_look_aim = true;
     bool horizon_align = true;
+    bool custom_basis = false;
+    glm::dvec3 custom_forward{0.0, 0.0, -1.0};
     bool is_near_surface = false;
     bool horizon_settling = false;
     double horizon_roll_error_deg = 0.0;

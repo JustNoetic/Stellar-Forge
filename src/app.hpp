@@ -11,6 +11,7 @@
 #include "rendering/render_settings.hpp"
 #include "rendering/bloom_renderer.hpp"
 #include "rendering/celestial_renderer.hpp"
+#include "rendering/hdri_exporter.hpp"
 #include "rendering/star_catalog.hpp"
 #include "rendering/orbit_renderer.hpp"
 #include "rendering/size_comparator.hpp"
@@ -88,11 +89,13 @@ private:
     void render_create_system_modal();
     void render_delete_system_modal();
     void render_export_nbody_modal();
+    void render_export_hdri_modal();
     void render_ephem_setup_modal();
     void render_ephem_download_modal();
     void render_bsp_import_modal();
     void render_jump_timeline_modal();
     void open_export_nbody_modal();
+    void open_export_hdri_modal();
     void open_jump_timeline_modal();
     void trigger_timeline_bsp_export();
     void trigger_ephemeris_mode();
@@ -147,6 +150,9 @@ private:
     rendering::CelestialRenderer celestial_renderer_{};
     rendering::OrbitRenderer orbit_renderer_{};
     rendering::BloomRenderer bloom_renderer_{};
+    rendering::HdriExporter hdri_exporter_{};
+    bool pending_hdri_export_start_ = false;
+    bool pending_hdri_export_cancel_ = false;
     rendering::SizeComparatorRenderer size_renderer_{};
     comparison::SizeComparison size_comparison_{};
     comparison::SizeView size_view_{};

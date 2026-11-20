@@ -18,8 +18,10 @@ static uint32_t ring_pipeline_table(bool transparency, bool planetshine, bool nu
 }
 
 static rhi::GraphicsPipelineDesc ring_pipeline_desc(const rhi::VkContext& ctx, uint32_t variant_idx,
-                                                      bool transparency, bool planetshine, bool numerical, bool refracted) {
+                                                      bool transparency, bool planetshine, bool numerical, bool refracted,
+                                                      VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT) {
     rhi::GraphicsPipelineDesc desc{};
+    desc.color_formats = {color_format};
     desc.vert_path = "celestial/ring.vert";
     desc.frag_path = "celestial/ring.frag";
     desc.vertex_bindings = {{0, sizeof(glm::vec3), VK_VERTEX_INPUT_RATE_VERTEX}};
@@ -198,6 +200,9 @@ void RingRenderer::shutdown(rhi::VkContext& ctx) {
     for (auto& atlas : ring_planetshine_atlases_) ctx.destroy_image(atlas);
     rhi::ShaderCache::destroy_pipeline(ctx, ringshine_pipeline_);
     for (auto& table : pipeline_tables_) {
+        for (auto& pipeline : table) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    }
+    for (auto& table : pipeline_tables_fp32_) {
         for (auto& pipeline : table) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     }
     ctx.destroy_image(shadow_lut_);
@@ -507,18 +512,21 @@ void RingRenderer::update_penumbra(VkCommandBuffer cmd, rhi::VkContext& ctx, con
 }
 
 rhi::Pipeline& RingRenderer::select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency,
-                                            bool planetshine, bool numerical, bool refracted) {
-    auto& table = pipeline_tables_[ring_pipeline_table(transparency, planetshine, numerical, refracted)];
+                                            bool planetshine, bool numerical, bool refracted,
+                                            VkFormat color_format) {
+    auto& tables = (color_format == VK_FORMAT_R32G32B32A32_SFLOAT) ? pipeline_tables_fp32_ : pipeline_tables_;
+    auto& table = tables[ring_pipeline_table(transparency, planetshine, numerical, refracted)];
     if (table[variant_idx].handle == VK_NULL_HANDLE) {
         table[variant_idx] = rhi::ShaderCache::create_graphics_pipeline(
-            ctx, ring_pipeline_desc(ctx, variant_idx, transparency, planetshine, numerical, refracted));
+            ctx, ring_pipeline_desc(ctx, variant_idx, transparency, planetshine, numerical, refracted, color_format));
     }
     return table[variant_idx];
 }
 
 void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
                           std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
-                          std::span<const rhi::PushDescriptorWrite> transparency_writes) {
+                          std::span<const rhi::PushDescriptorWrite> transparency_writes,
+                          VkFormat color_format) {
     if (!settings.show_rings || active_host_count_ == 0) return;
 
     auto timer = ctx.begin_gpu_timer(cmd, "rings");
@@ -538,7 +546,7 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
     bool planetshine = settings.planetshine_enabled && !settings.direct_sunlight_only;
     bool numerical = settings.ring_planetshine_mode != 0;
     bool refracted = refraction_body_ >= 0;
-    const rhi::Pipeline& layout_ref = select_pipeline(ctx, 0, transparency, planetshine, numerical, refracted);
+    const rhi::Pipeline& layout_ref = select_pipeline(ctx, 0, transparency, planetshine, numerical, refracted, color_format);
     ctx.push_descriptors(cmd, layout_ref, render_writes_);
 
     uint32_t draw_count = std::min(active_host_count_, MAX_RING_HOSTS);
@@ -562,7 +570,7 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
         auto draw = [&](uint32_t first, uint32_t count, uint32_t packed, uint32_t segments, uint32_t pipeline_index) {
             if (bound_pipeline != pipeline_index) {
                 bound_pipeline = pipeline_index;
-                const rhi::Pipeline& pipe = select_pipeline(ctx, bound_pipeline, transparency, planetshine, numerical, refracted);
+                const rhi::Pipeline& pipe = select_pipeline(ctx, bound_pipeline, transparency, planetshine, numerical, refracted, color_format);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.handle);
             }
             ctx.push_constants(cmd, layout_ref, Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});

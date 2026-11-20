@@ -162,6 +162,7 @@ void App::render_ui() {
     render_create_system_modal();
     render_delete_system_modal();
     render_export_nbody_modal();
+    render_export_hdri_modal();
     render_jump_timeline_modal();
     render_ephem_setup_modal();
     render_ephem_download_modal();
@@ -281,6 +282,9 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
         }
         if (ImGui::MenuItem("Export Timeline to SPK (.bsp)...")) {
             trigger_timeline_bsp_export();
+        }
+        if (ImGui::MenuItem("Export Skybox HDRI (.exr)...", nullptr, false, !size_comparison_active_)) {
+            open_export_hdri_modal();
         }
         if (system().definition().motion_model != ephemeris::MotionModel::NBody) {
             if (ImGui::MenuItem("Export to N-Body System...")) {

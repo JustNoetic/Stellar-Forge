@@ -209,6 +209,13 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
     volkLoadDevice(device_);
     vkGetDeviceQueue(device_, graphics_queue_family_, 0, &graphics_queue_);
 
+    VkFormatProperties fp32_props{};
+    vkGetPhysicalDeviceFormatProperties(physical_device_, VK_FORMAT_R32G32B32A32_SFLOAT, &fp32_props);
+    constexpr VkFormatFeatureFlags fp32_req = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    rgba32f_hdr_supported_ = (fp32_props.optimalTilingFeatures & fp32_req) == fp32_req;
+
     VmaVulkanFunctions vma_funcs{};
     vma_funcs.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     vma_funcs.vkGetDeviceProcAddr = vkGetDeviceProcAddr;

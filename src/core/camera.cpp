@@ -172,6 +172,12 @@ glm::dmat3 rodrigues_rotation(const glm::dvec3& axis, double angle_rad) noexcept
 }
 
 glm::dvec3 Camera::forward_dir() const noexcept {
+    if (custom_basis) {
+        double n = glm::length(custom_forward);
+        if (n > 1e-30) {
+            return custom_forward / n;
+        }
+    }
     if (cam_look_aim) {
         double r = glm::length(cam_pos_rel);
         if (r > 1e-30) {

@@ -87,7 +87,8 @@ public:
                  const ephemeris::SystemSnapshot& sys, uint32_t body_count, int refraction_body = -1);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
                 std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
-                std::span<const rhi::PushDescriptorWrite> transparency_writes = {});
+                std::span<const rhi::PushDescriptorWrite> transparency_writes = {},
+                VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT);
     void update_ringshine(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                           const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, uint32_t body_count,
                           VkExtent2D extent);
@@ -191,12 +192,14 @@ private:
     void bake_ring_planetshine_tile(VkCommandBuffer cmd, rhi::VkContext& ctx, const RingPlanetshineJob& job);
     static constexpr uint32_t PIPELINE_TABLE_COUNT = 12;
     rhi::Pipeline& select_pipeline(rhi::VkContext& ctx, uint32_t variant_idx, bool transparency,
-                                   bool planetshine, bool numerical, bool refracted);
+                                   bool planetshine, bool numerical, bool refracted,
+                                   VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT);
 
     AnnulusMesh mesh_{};
     int refraction_body_ = -1;
 
     std::array<std::array<rhi::Pipeline, 16>, PIPELINE_TABLE_COUNT> pipeline_tables_{};
+    std::array<std::array<rhi::Pipeline, 16>, PIPELINE_TABLE_COUNT> pipeline_tables_fp32_{};
     rhi::Image gradient_atlas_{};
     rhi::Image shadow_lut_{};
     rhi::Pipeline penumbra_pipeline_{};

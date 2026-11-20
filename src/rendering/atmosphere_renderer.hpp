@@ -239,6 +239,13 @@ private:
     rhi::Pipeline secondary_transparent_pipeline_, secondary_composite_transparency_pipeline_;
     rhi::Pipeline secondary_unshadowed_transparent_pipeline_, secondary_unshadowed_composite_transparency_pipeline_;
     void init_secondary(rhi::VkContext& ctx);
+    struct Fp32CompositePipelines {
+        rhi::Pipeline composite, composite_transparency, unshadowed_composite_transparency;
+        rhi::Pipeline secondary_composite, secondary_composite_transparency, secondary_unshadowed_composite_transparency;
+        rhi::Pipeline dual_source, limb_dual_source, secondary_dual_source, limb_secondary_dual_source;
+        bool ready = false;
+    } fp32_composite_;
+    void ensure_fp32_composite_pipelines(rhi::VkContext& ctx);
     rhi::Pipeline transparent_pipeline_, composite_transparency_pipeline_;
     rhi::Pipeline unshadowed_transparent_pipeline_, unshadowed_composite_transparency_pipeline_;
     rhi::Pipeline shadow_pipeline_, shadow_transparency_pipeline_;

@@ -153,6 +153,7 @@ public:
     bool bresenham_lines_enabled() const noexcept { return bresenham_lines_enabled_; }
     bool dual_source_blend_enabled() const noexcept { return dual_source_blend_enabled_; }
     bool fragment_stores_enabled() const noexcept { return fragment_stores_enabled_; }
+    bool rgba32f_hdr_supported() const noexcept { return rgba32f_hdr_supported_; }
     bool pipeline_statistics_enabled() const noexcept { return pipeline_statistics_enabled_; }
     void log_pipeline_statistics(VkPipeline pipeline, std::string_view name) const;
 
@@ -176,6 +177,7 @@ private:
     bool bresenham_lines_enabled_ = false;
     bool dual_source_blend_enabled_ = false;
     bool fragment_stores_enabled_ = false;
+    bool rgba32f_hdr_supported_ = false;
     bool pipeline_statistics_enabled_ = false;
     VkDevice device_ = VK_NULL_HANDLE;
     uint32_t graphics_queue_family_ = 0;

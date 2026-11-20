@@ -86,7 +86,8 @@ public:
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                 const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
-                std::map<std::string, double>* timings = nullptr, bool gpu_diagnostics = false);
+                std::map<std::string, double>* timings = nullptr, bool gpu_diagnostics = false,
+                VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT);
     const terrain::TerrainStats& terrain_stats() const noexcept { return terrain_.stats(); }
     const terrain::TextureStats& texture_stats() const noexcept { return textures_.stats(); }
     const terrain::TextureStats& normal_stats() const noexcept { return normals_.stats(); }
@@ -159,6 +160,11 @@ private:
     // Inline 2D clouds: the sheet pass stores each pixel's front cloud crossing in a cloud layer (colour with
     // 2*slot+opacity in alpha, and reverse-Z depth), which the atmosphere composite blends with its own transport.
     rhi::Pipeline cloud_inline_pipeline_{};
+    struct Fp32Pipelines {
+        rhi::Pipeline sphere, cloud, cloud_depth, cloud_transparency, point, atmosphere_point;
+        bool ready = false;
+    } fp32_pipelines_;
+    void ensure_fp32_pipelines(rhi::VkContext& ctx);
     rhi::Image cloud_layer_color_, cloud_layer_depth_;
     std::vector<std::pair<rhi::Image, uint64_t>> retired_cloud_layers_;
     bool cloud_layer_active_ = false;

@@ -344,6 +344,21 @@ struct ExportNBodyDraft {
     }
 };
 
+struct ExportHdriDraft {
+    bool active = false;
+    std::string output_path;
+    int quality_idx = 4; // 8K default
+    int orientation_idx = 0; // CameraHorizon
+    int exposure_idx = 0; // NormalizedCurrent
+    std::string error;
+
+    void reset(std::string_view default_path) {
+        active = true;
+        output_path = std::string(default_path);
+        error.clear();
+    }
+};
+
 struct EphemerisSetupDraft {
     bool active = false;
     std::string external_bsp_path;
@@ -540,6 +555,7 @@ struct WorkspaceState {
     bool confirm_delete_system = false;
     std::string delete_system_name;
     ExportNBodyDraft export_nbody{};
+    ExportHdriDraft export_hdri{};
     EphemerisSetupDraft ephem_setup{};
     BspImportDraft bsp_import{};
     bool show_ephem_download_modal = false;

@@ -33,6 +33,7 @@ void TransparencyRenderer::shutdown(rhi::VkContext& ctx) {
     }
     retired_.clear();
     for (auto& buffer : counters_) ctx.destroy_buffer(buffer);
+    rhi::ShaderCache::destroy_pipeline(ctx, resolve_fp32_);
     rhi::ShaderCache::destroy_pipeline(ctx, resolve_);
     rhi::ShaderCache::destroy_pipeline(ctx, bloom_resolve_);
 }
@@ -126,7 +127,19 @@ void TransparencyRenderer::resolve(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
     }
     ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    auto& pipeline = physical_color ? bloom_resolve_ : resolve_;
+    bool fp32 = color.format == VK_FORMAT_R32G32B32A32_SFLOAT && !physical_color;
+    if (fp32 && !resolve_fp32_) {
+        std::vector<rhi::DescriptorLayoutBinding> bindings{
+            {14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT},
+            {15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+            {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT},
+            {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT},
+            {45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT},
+            {46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT}};
+        const std::array macros{std::pair<std::string, std::string>{"HDR_RGBA32F", "1"}};
+        resolve_fp32_ = rhi::ShaderCache::create_compute_pipeline(ctx, "transparency/resolve.comp", bindings, sizeof(uint32_t), macros);
+    }
+    auto& pipeline = physical_color ? bloom_resolve_ : (fp32 ? resolve_fp32_ : resolve_);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
     auto resources = slot_writes();
     std::vector<rhi::PushDescriptorWrite> descriptors(resources.begin(), resources.end());

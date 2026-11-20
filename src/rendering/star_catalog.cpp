@@ -190,6 +190,7 @@ bool StarCatalog::init(rhi::VkContext& ctx, const std::filesystem::path& bin_pat
 
 void StarCatalog::shutdown(rhi::VkContext& ctx) {
     if (loaded_) refraction_fallback_.shutdown(ctx);
+    rhi::ShaderCache::destroy_pipeline(ctx, pipeline_fp32_);
     rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, cull_pipeline_);
     for (uint32_t i = 0; i < rhi::FRAMES_IN_FLIGHT; ++i) {
@@ -284,18 +285,41 @@ void StarCatalog::cull(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& c
 
 void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                          units::Years sim_time, const RenderSettings& settings, VkExtent2D extent,
-                         std::span<const rhi::PushDescriptorWrite> refraction_writes) const {
+                         std::span<const rhi::PushDescriptorWrite> refraction_writes,
+                         VkFormat color_format) const {
     if (!loaded_ || !settings.show_gaia_stars || count_ == 0) {
         return;
     }
 
+    if (color_format == VK_FORMAT_R32G32B32A32_SFLOAT && !pipeline_fp32_) {
+        rhi::GraphicsPipelineDesc desc{};
+        desc.vert_path = "celestial/starfield.vert";
+        desc.frag_path = "celestial/starfield.frag";
+        desc.bindings = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+            {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+            {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        };
+        desc.push_constant_size = sizeof(StarfieldPushConstants);
+        desc.color_formats = {VK_FORMAT_R32G32B32A32_SFLOAT};
+        desc.depth_format = VK_FORMAT_D32_SFLOAT;
+        desc.depth_test = true;
+        desc.depth_write = false;
+        desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
+        desc.additive_blend = true;
+        desc.cull_mode = VK_CULL_MODE_NONE;
+        pipeline_fp32_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+    }
+
+    const auto& pipe = (color_format == VK_FORMAT_R32G32B32A32_SFLOAT) ? pipeline_fp32_ : pipeline_;
     uint32_t f_idx = ctx.frame_index();
     const auto& indirect_buf = indirect_buffers_[f_idx];
     const auto& visible_buf = visible_index_buffers_[f_idx];
 
     StarfieldPushConstants pc = make_push_constants(cam, sim_time, settings, extent, count_);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_.handle);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.handle);
     rhi::PushDescriptorWrite writes[] = {
         rhi::PushDescriptorWrite::storage_buffer(0, star_ssbo_),
         rhi::PushDescriptorWrite::storage_buffer(1, visible_buf),
@@ -306,8 +330,8 @@ void StarCatalog::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera&
     if (refraction_writes.empty()) refraction_writes = fallback;
     writes[2] = refraction_writes[0];
     writes[3] = refraction_writes[1];
-    ctx.push_descriptors(cmd, pipeline_, writes);
-    ctx.push_constants(cmd, pipeline_, pc);
+    ctx.push_descriptors(cmd, pipe, writes);
+    ctx.push_constants(cmd, pipe, pc);
     vkCmdDrawIndirect(cmd, indirect_buf.handle, 0, 1, sizeof(VkDrawIndirectCommand));
 }
 

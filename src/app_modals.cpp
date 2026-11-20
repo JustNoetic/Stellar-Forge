@@ -463,4 +463,171 @@ void App::render_export_nbody_modal() {
     }
 }
 
+void App::open_export_hdri_modal() {
+    if (hdri_exporter_.active()) return;
+    auto dt = time::calculate_sim_date(system().definition().epoch_utc, system().time());
+    std::string slug;
+    for (char c : system().name()) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_') {
+            slug += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        } else if (c == ' ') {
+            slug += '_';
+        }
+    }
+    if (slug.empty()) slug = "scene";
+    auto default_path = paths::external_path("exports", "hdri",
+        std::format("{}_{:04d}-{:02d}-{:02d}_8k.exr", slug, dt.year, dt.month, dt.day));
+    ui_state_.export_hdri.reset(default_path.string());
+}
+
+void App::render_export_hdri_modal() {
+    if (!ui_state_.export_hdri.active) return;
+
+    ImGui::SetNextWindowSize(ImVec2(540.0f, 430.0f), ImGuiCond_Always);
+    ImGui::OpenPopup("Export Skybox HDRI (.exr)###export_hdri_modal");
+    bool open = ui_state_.export_hdri.active;
+    if (ImGui::BeginPopupModal("Export Skybox HDRI (.exr)###export_hdri_modal", &open, ImGuiWindowFlags_NoResize)) {
+        auto& ed = ui_state_.export_hdri;
+        const bool running = hdri_exporter_.active() && !hdri_exporter_.finished();
+        const bool finished = hdri_exporter_.finished();
+
+        if (!open && !running) {
+            if (finished) hdri_exporter_.acknowledge();
+            ed.active = false;
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+
+        ui::heading("Export 32-bit Lighting HDRI (.exr)",
+                    "Equirectangular 360 skybox without tone mapping, bloom, or orbit guides.");
+
+        std::string date_str = time::format_sim_date(system().definition().epoch_utc, system().time());
+        ImGui::Text("System: %s", system().name().c_str());
+        ImGui::Text("Epoch: %s", date_str.c_str());
+        ImGui::TextDisabled("Format: 32-bit float RGB OpenEXR (uncompressed scanlines, Blender World Z-up)");
+        ImGui::Spacing();
+
+        if (running) {
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::Text("%s", hdri_exporter_.status_text().c_str());
+            ImGui::ProgressBar(hdri_exporter_.progress(), ImVec2(-1.0f, 24.0f));
+            ImGui::Spacing();
+            ImGui::TextDisabled("Freezing simulation and capturing 6 orthogonal HDR faces...");
+            ImGui::Spacing();
+            if (ImGui::Button("Cancel Export", ImVec2(-1.0f, 32.0f))) {
+                pending_hdri_export_cancel_ = true;
+                ed.active = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+            return;
+        }
+
+        if (finished) {
+            ImGui::Separator();
+            ImGui::Spacing();
+            if (hdri_exporter_.succeeded()) {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.55f, 1.0f), "Export completed successfully.");
+                ImGui::TextWrapped("Saved to: %s", hdri_exporter_.output_path().string().c_str());
+                ImGui::Spacing();
+                ImGui::TextDisabled("In Blender: World Properties -> Color -> Environment Texture -> open .exr (Linear).");
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Export failed:");
+                ImGui::TextWrapped("%s", hdri_exporter_.error().c_str());
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            if (ImGui::Button("Done", ImVec2(-1.0f, 32.0f))) {
+                hdri_exporter_.acknowledge();
+                ed.active = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+            return;
+        }
+
+        const uint32_t max_dim = vk_.device_properties().limits.maxImageDimension2D;
+        const char* quality_labels[int(rendering::HdriQuality::Count)]{};
+        for (int i = 0; i < int(rendering::HdriQuality::Count); ++i) {
+            quality_labels[i] = rendering::HdriExporter::preset_info(static_cast<rendering::HdriQuality>(i), max_dim).label;
+        }
+        ui::field("Quality / Resolution", [&](const char* id) {
+            ImGui::Combo(id, &ed.quality_idx, quality_labels, int(rendering::HdriQuality::Count));
+        });
+
+        const auto pinfo = rendering::HdriExporter::preset_info(static_cast<rendering::HdriQuality>(ed.quality_idx), max_dim);
+        const double approx_mb = (double(pinfo.width) * double(pinfo.height) * 12.0) / (1024.0 * 1024.0);
+        if (approx_mb >= 1024.0) {
+            ImGui::TextDisabled("  %u x %u equirectangular (%u px faces) | ~%.2f GB .exr",
+                                pinfo.width, pinfo.height, pinfo.face_size, approx_mb / 1024.0);
+        } else {
+            ImGui::TextDisabled("  %u x %u equirectangular (%u px faces) | ~%.0f MB .exr",
+                                pinfo.width, pinfo.height, pinfo.face_size, approx_mb);
+        }
+
+        const char* orient_labels[] = {
+            "Camera Horizon (Blender Z-up, current view centered)",
+            "Ecliptic North (Blender Z-up)"
+        };
+        ui::field("Orientation", [&](const char* id) {
+            ImGui::Combo(id, &ed.orientation_idx, orient_labels, 2);
+        });
+
+        std::string norm_label = std::format("Current Exposure Normalization ({:.3g}x)", render_settings_.values().exposure);
+        const char* exp_labels[] = {norm_label.c_str(), "Raw Physical Radiance (1.0x)"};
+        ui::field("Exposure Scaling", [&](const char* id) {
+            ImGui::Combo(id, &ed.exposure_idx, exp_labels, 2);
+        });
+
+        ui::field("Output File (.exr)", [&](const char* id) {
+            float browse_w = 90.0f;
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - browse_w - 6.0f);
+            char buf[1024];
+            std::strncpy(buf, ed.output_path.c_str(), sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+            if (ImGui::InputText(id, buf, sizeof(buf))) {
+                ed.output_path = buf;
+            }
+            ImGui::SameLine(0.0f, 6.0f);
+            if (ImGui::Button("Browse...", ImVec2(browse_w, 0.0f))) {
+                if (auto picked = rendering::HdriExporter::save_file_dialog(ed.output_path)) {
+                    ed.output_path = picked->string();
+                }
+            }
+        });
+
+        if (!ed.error.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", ed.error.c_str());
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        float half_w = (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.38f, 0.43f, 1.0f));
+        if (ImGui::Button("Export (.exr)", ImVec2(half_w, 32.0f))) {
+            if (ed.output_path.empty()) {
+                ed.error = "Output path cannot be empty.";
+            } else {
+                ed.error.clear();
+                pending_hdri_export_start_ = true;
+            }
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine(0.0f, 10.0f);
+        if (ImGui::Button("Cancel", ImVec2(half_w, 32.0f))) {
+            ed.active = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
 } // namespace sf

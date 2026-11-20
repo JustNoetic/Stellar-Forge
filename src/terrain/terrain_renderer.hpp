@@ -74,7 +74,8 @@ public:
     void prepare(rhi::VkContext& ctx, const Camera& camera, const ephemeris::SystemSnapshot& system,
                  const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count,
                  const rendering::RefractionHost* refraction = nullptr);
-    void render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene);
+    void render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene,
+                VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT);
     void bake(VkCommandBuffer cmd, rhi::VkContext& ctx) { cache_.bake(cmd, ctx); }
     bool covers(uint32_t body) const noexcept;
     const TerrainStats& stats() const noexcept { return stats_; }
@@ -136,10 +137,12 @@ private:
         std::unique_ptr<HeightStream> stream;
         std::string reported_error;
     };
+    rhi::Pipeline& pipeline_for(rhi::VkContext& ctx, uint32_t mode, VkFormat color_format);
     rhi::Pipeline pipeline_{};
     rhi::Pipeline precise_pipeline_{};
     rhi::Pipeline reference_pipeline_{};
     rhi::Pipeline cached_fp64_pipeline_{};
+    std::array<rhi::Pipeline, 4> fp32_pipelines_{};
     rhi::Buffer indices_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> patches_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> cached_patches_{};

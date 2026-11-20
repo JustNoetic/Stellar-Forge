@@ -3,7 +3,11 @@
 #include "common/transparency.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(push_constant) uniform Push { uint slot_mode; } pc;
+#ifdef HDR_RGBA32F
+layout(rgba32f, set = 0, binding = 4) uniform image2D hdr_color;
+#else
 layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
+#endif
 layout(set = 0, binding = 3) uniform sampler2D opaque_depth;
 #ifdef BLOOM_OUTPUT
 layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D physical_color;
@@ -43,7 +47,11 @@ void blend_single(ivec2 pixel, uvec2 packed) {
 #endif
     vec4 color = key_color(packed);
     background.rgb = color.rgb + (1.0 - color.a) * background.rgb;
+#ifdef HDR_RGBA32F
+    imageStore(hdr_color, pixel, vec4(background.rgb, background.a));
+#else
     imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+#endif
 #ifdef BLOOM_OUTPUT
     if (!key_excludes_bloom(packed)) physical = background.rgb;
     imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
@@ -160,7 +168,11 @@ void resolve_multi(ivec2 pixel, uint current, uint depth, bool ringed, uvec3 rin
             }
         }
     }
+#ifdef HDR_RGBA32F
+    imageStore(hdr_color, pixel, vec4(background.rgb, background.a));
+#else
     imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+#endif
 #ifdef BLOOM_OUTPUT
     imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
 #endif
@@ -247,7 +259,11 @@ void main() {
         if (!transparent_excludes_bloom(b.xy)) physical = cb.rgb + (1.0 - cb.a) * physical;
         imageStore(physical_color, pixel, vec4(min(physical, vec3(65000.0)), 1.0));
 #endif
+#ifdef HDR_RGBA32F
+        imageStore(hdr_color, pixel, vec4(background.rgb, background.a));
+#else
         imageStore(hdr_color, pixel, vec4(min(background.rgb, vec3(65000.0)), background.a));
+#endif
         return;
     }
 

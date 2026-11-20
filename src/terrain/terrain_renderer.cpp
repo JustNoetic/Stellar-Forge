@@ -12,6 +12,42 @@ namespace sf::terrain {
 
 namespace {
 
+rhi::GraphicsPipelineDesc make_terrain_pipeline_desc(uint32_t mode, VkFormat color_format) {
+    rhi::GraphicsPipelineDesc desc;
+    desc.vert_path = mode == 0 ? "terrain/terrain_reference.vert" : "terrain/terrain.vert";
+    desc.frag_path = "celestial/sphere.frag";
+    desc.color_formats = {color_format};
+    desc.macros = {{"TERRAIN_SURFACE", "1"}};
+    if (mode == 2) desc.macros.push_back({"TERRAIN_PRECISE_PROJECTION", "1"});
+    else if (mode == 3) desc.macros.push_back({"TERRAIN_CACHED_FP64", "1"});
+    desc.bindings = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+    };
+    if (mode != 0) desc.bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1});
+    return desc;
+}
+
 class SelectionSource final : public TerrainSource {
 public:
     SelectionSource(const HeightSource& source, std::unordered_map<uint64_t, SurfaceTile>& cache, double floor_m)
@@ -49,42 +85,10 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         buffer = ctx.create_host_buffer(MAX_PATCHES * sizeof(PatchGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     for (auto& buffer : cached_patches_)
         buffer = ctx.create_host_buffer(MAX_PATCHES * sizeof(CachedPatchGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    rhi::GraphicsPipelineDesc desc;
-    desc.vert_path = "terrain/terrain_reference.vert";
-    desc.frag_path = "celestial/sphere.frag";
-    desc.macros = {{"TERRAIN_SURFACE", "1"}};
-    desc.bindings = {
-        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
-        {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
-        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
-        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
-        {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-        {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
-    };
-    reference_pipeline_ =rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
-    desc.vert_path = "terrain/terrain.vert";
-    desc.bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1});
-    pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
-    desc.macros.push_back({"TERRAIN_PRECISE_PROJECTION", "1"});
-    precise_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
-    desc.macros = {{"TERRAIN_SURFACE", "1"}, {"TERRAIN_CACHED_FP64", "1"}};
-    cached_fp64_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, desc);
+    reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(0, VK_FORMAT_R16G16B16A16_SFLOAT));
+    pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(1, VK_FORMAT_R16G16B16A16_SFLOAT));
+    precise_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(2, VK_FORMAT_R16G16B16A16_SFLOAT));
+    cached_fp64_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(3, VK_FORMAT_R16G16B16A16_SFLOAT));
     cache_.init(ctx);
     auto config_path = paths::external_path("data", "terrain.json");
     if (load_config && std::filesystem::exists(config_path)) {
@@ -101,6 +105,7 @@ void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, precise_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, reference_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, cached_fp64_pipeline_);
+    for (auto& pipeline : fp32_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
     for (auto& buffer : patches_) ctx.destroy_buffer(buffer);
     for (auto& buffer : cached_patches_) ctx.destroy_buffer(buffer);
     cache_.shutdown(ctx);
@@ -526,14 +531,24 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                                               stats_.cached_patches*sizeof(CachedPatchGPU));
 }
 
-void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene) {
+rhi::Pipeline& TerrainRenderer::pipeline_for(rhi::VkContext& ctx, uint32_t mode, VkFormat color_format) {
+    if (color_format == VK_FORMAT_R32G32B32A32_SFLOAT) {
+        auto& pipe = fp32_pipelines_[std::min(mode, 3u)];
+        if (!pipe) pipe = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(mode, color_format));
+        return pipe;
+    }
+    return mode == 0 ? reference_pipeline_ : mode == 1 ? pipeline_ : mode == 2 ? precise_pipeline_ : cached_fp64_pipeline_;
+}
+
+void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene,
+                             VkFormat color_format) {
     if (prepared_.empty()) return;
     std::vector<rhi::PushDescriptorWrite> writes(scene.begin(), scene.end());
     vkCmdBindIndexBuffer(cmd, indices_.handle, 0, VK_INDEX_TYPE_UINT32);
     constexpr uint32_t index_count = GRID_CELLS * GRID_CELLS * 6;
     for (uint32_t index = 0; index < batch_count_; ++index) {
         auto [first, count, mode, mask] = batches_[index];
-        auto& pipeline = mode == 0 ? reference_pipeline_ : mode == 1 ? pipeline_ : mode == 2 ? precise_pipeline_ : cached_fp64_pipeline_;
+        auto& pipeline = pipeline_for(ctx, mode, color_format);
         writes.resize(scene.size());
         if (mode == 0) {
             writes.push_back(rhi::PushDescriptorWrite::storage_buffer(3, patches_[ctx.frame_index()], 0, prepared_.size() * sizeof(PatchGPU)));

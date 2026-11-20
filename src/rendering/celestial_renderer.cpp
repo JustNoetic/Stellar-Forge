@@ -242,6 +242,13 @@ void CelestialRenderer::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, atmosphere_point_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, sphere_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, fp32_pipelines_.sphere);
+    rhi::ShaderCache::destroy_pipeline(ctx, fp32_pipelines_.cloud);
+    rhi::ShaderCache::destroy_pipeline(ctx, fp32_pipelines_.cloud_depth);
+    rhi::ShaderCache::destroy_pipeline(ctx, fp32_pipelines_.cloud_transparency);
+    rhi::ShaderCache::destroy_pipeline(ctx, fp32_pipelines_.point);
+    rhi::ShaderCache::destroy_pipeline(ctx, fp32_pipelines_.atmosphere_point);
+    fp32_pipelines_.ready = false;
     rhi::ShaderCache::destroy_pipeline(ctx, planetshine_map_pipeline_);
     ctx.destroy_image(planetshine_maps_);
     for (auto& buffer : planetshine_bodies_) ctx.destroy_buffer(buffer);
@@ -441,9 +448,108 @@ void CelestialRenderer::bake_planetshine_maps(VkCommandBuffer cmd, rhi::VkContex
     ctx.end_gpu_timer(cmd, timer);
 }
 
+void CelestialRenderer::ensure_fp32_pipelines(rhi::VkContext& ctx) {
+    if (fp32_pipelines_.ready) return;
+    fp32_pipelines_.ready = true;
+    const rhi::DescriptorLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+    };
+    rhi::GraphicsPipelineDesc sphere_desc{};
+    sphere_desc.vert_path = "celestial/sphere.vert";
+    sphere_desc.frag_path = "celestial/sphere.frag";
+    sphere_desc.bindings.assign(std::begin(bindings), std::end(bindings));
+    sphere_desc.vertex_bindings = {{0, sizeof(SphereVertex), VK_VERTEX_INPUT_RATE_VERTEX}};
+    sphere_desc.vertex_attributes = {
+        {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(SphereVertex, pos)},
+        {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(SphereVertex, normal)},
+    };
+    sphere_desc.color_formats = {VK_FORMAT_R32G32B32A32_SFLOAT};
+    sphere_desc.depth_format = VK_FORMAT_D32_SFLOAT;
+    sphere_desc.depth_test = true;
+    sphere_desc.depth_write = true;
+    sphere_desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    sphere_desc.cull_mode = VK_CULL_MODE_BACK_BIT;
+    sphere_desc.front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    fp32_pipelines_.sphere = rhi::ShaderCache::create_graphics_pipeline(ctx, sphere_desc);
+
+    rhi::GraphicsPipelineDesc cloud_desc = sphere_desc;
+    cloud_desc.vert_path = "celestial/cloud.vert";
+    cloud_desc.frag_path = "celestial/cloud_sheet.frag";
+    cloud_desc.bindings = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {21, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_VERTEX_BIT, 1},
+        {28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {29, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {26, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+    };
+    cloud_desc.depth_write = false;
+    cloud_desc.premultiplied_blend = true;
+    cloud_desc.cull_mode = VK_CULL_MODE_FRONT_BIT;
+    fp32_pipelines_.cloud = rhi::ShaderCache::create_graphics_pipeline(ctx, cloud_desc);
+    if (ctx.fragment_stores_enabled()) {
+        auto capture = cloud_desc;
+        capture.macros = {{"TRANSPARENCY_CAPTURE", "1"}};
+        capture.bindings.push_back({14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+        capture.bindings.push_back({15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1});
+        fp32_pipelines_.cloud_transparency = rhi::ShaderCache::create_graphics_pipeline(ctx, capture);
+    }
+    cloud_desc.macros = {{"CLOUD_DEPTH_ONLY", "1"}};
+    cloud_desc.depth_write = true;
+    cloud_desc.premultiplied_blend = false;
+    cloud_desc.additive_blend = true;
+    fp32_pipelines_.cloud_depth = rhi::ShaderCache::create_graphics_pipeline(ctx, cloud_desc);
+
+    rhi::GraphicsPipelineDesc point_desc{};
+    point_desc.vert_path = "celestial/point_celestial.vert";
+    point_desc.frag_path = "celestial/point_celestial.frag";
+    point_desc.bindings.assign(std::begin(bindings), std::end(bindings));
+    point_desc.bindings.push_back({27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1});
+    point_desc.push_constant_size = sizeof(uint32_t);
+    point_desc.color_formats = {VK_FORMAT_R32G32B32A32_SFLOAT};
+    point_desc.depth_format = VK_FORMAT_D32_SFLOAT;
+    point_desc.depth_test = false;
+    point_desc.depth_write = false;
+    point_desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    point_desc.additive_blend = true;
+    point_desc.cull_mode = VK_CULL_MODE_NONE;
+    fp32_pipelines_.point = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
+    point_desc.depth_format = VK_FORMAT_UNDEFINED;
+    fp32_pipelines_.atmosphere_point = rhi::ShaderCache::create_graphics_pipeline(ctx, point_desc);
+}
+
 void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                                const ephemeris::SystemSnapshot& sys, const RenderSettings& settings, VkExtent2D extent,
-                               std::map<std::string, double>* timings, bool gpu_diagnostics) {
+                               std::map<std::string, double>* timings, bool gpu_diagnostics,
+                               VkFormat color_format) {
     bool profile_gpu = timings || gpu_diagnostics;
     auto setup_start = timings ? SteadyClock::now() : SteadyClock::time_point{};
     ring_eclipse_candidate_counts_.clear();
@@ -733,11 +839,14 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         refraction[1],
     };
 
+    bool fp32 = color_format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    if (fp32) ensure_fp32_pipelines(ctx);
+    const auto& sphere_pipe = fp32 ? fp32_pipelines_.sphere : sphere_pipeline_;
     if (timings) (*timings)["cpu_surface_setup_ms"] = elapsed_ms(setup_start);
     auto draw_start = timings ? SteadyClock::now() : SteadyClock::time_point{};
     auto sphere_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_spheres") : UINT32_MAX;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipeline_.handle);
-    ctx.push_descriptors(cmd, sphere_pipeline_, writes);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sphere_pipe.handle);
+    ctx.push_descriptors(cmd, sphere_pipe, writes);
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &sphere_vbo_.handle, &offset);
     vkCmdBindIndexBuffer(cmd, sphere_ibo_.handle, 0, VK_INDEX_TYPE_UINT32);
@@ -754,7 +863,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
 
     ctx.end_gpu_timer(cmd, sphere_timer);
     auto terrain_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_terrain_draw") : UINT32_MAX;
-    terrain_.render(cmd, ctx, writes);
+    terrain_.render(cmd, ctx, writes, color_format);
     ctx.end_gpu_timer(cmd, terrain_timer);
 
     if (!cloud_bodies_.empty()) {
@@ -789,8 +898,11 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             for (uint32_t body : inline_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
         }
         if (!layered_bodies.empty()) {
-            bool capture = transparency_.active() && cloud_transparency_pipeline_.handle;
-            const auto& pipeline = capture ? cloud_transparency_pipeline_ : cloud_pipeline_;
+            const auto& cloud_transp_pipe = fp32 ? fp32_pipelines_.cloud_transparency : cloud_transparency_pipeline_;
+            const auto& cloud_pipe = fp32 ? fp32_pipelines_.cloud : cloud_pipeline_;
+            const auto& cloud_depth_pipe = fp32 ? fp32_pipelines_.cloud_depth : cloud_depth_pipeline_;
+            bool capture = transparency_.active() && cloud_transp_pipe.handle;
+            const auto& pipeline = capture ? cloud_transp_pipe : cloud_pipe;
             if (capture) {
                 auto capture_writes = transparency_.writes();
                 cloud_writes.insert(cloud_writes.end(), capture_writes.begin(), capture_writes.end());
@@ -799,8 +911,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             ctx.push_descriptors(cmd, pipeline, cloud_writes);
             for (uint32_t body : layered_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
             if (!capture) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloud_depth_pipeline_.handle);
-                ctx.push_descriptors(cmd, cloud_depth_pipeline_, cloud_writes);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloud_depth_pipe.handle);
+                ctx.push_descriptors(cmd, cloud_depth_pipe, cloud_writes);
                 for (uint32_t body : layered_bodies) vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, body);
             }
         }
@@ -808,11 +920,12 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     }
 
     auto points_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_points") : UINT32_MAX;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, point_pipeline_.handle);
+    const auto& point_pipe = fp32 ? fp32_pipelines_.point : point_pipeline_;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, point_pipe.handle);
     std::vector<rhi::PushDescriptorWrite> point_writes(std::begin(writes), std::end(writes));
     point_writes.push_back(rhi::PushDescriptorWrite::storage_buffer(27, atmospheres_.point_responses(f_idx)));
-    ctx.push_descriptors(cmd, point_pipeline_, point_writes);
-    ctx.push_constants(cmd, point_pipeline_, uint32_t(0));
+    ctx.push_descriptors(cmd, point_pipe, point_writes);
+    ctx.push_constants(cmd, point_pipe, uint32_t(0));
     atmosphere_points_ready_ = true;
     for (uint32_t first = 0; first < count;) {
         if (skip_surface_body(first)) { ++first; continue; }
@@ -838,7 +951,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     auto transparency_writes = transparency_.slot_writes();
     ring_slot_active_ = transparency_.active() && rings_.drawn(settings);
     rings_.render(cmd, ctx, settings, ring_base_writes, {ubo.stars_pos_radius, ubo.num_stars},
-        transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{});
+        transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{},
+        color_format);
     if (timings) (*timings)["cpu_surface_draw_ms"] = elapsed_ms(draw_start);
 }
 
@@ -935,6 +1049,8 @@ void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContex
     auto transparency_writes = transparency_.writes();
     auto refraction = refraction_.writes(ctx);
     uint32_t frame = ctx.frame_index();
+    bool fp32 = color.format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    if (fp32) ensure_fp32_pipelines(ctx);
     auto draw = [&](uint32_t body) {
         if (!atmosphere_points_ready_) return;
         const rhi::PushDescriptorWrite writes[] = {
@@ -944,9 +1060,10 @@ void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContex
             rhi::PushDescriptorWrite::storage_buffer(25, material_phases_[frame]),
             rhi::PushDescriptorWrite::storage_buffer(27, atmospheres_.point_responses(frame)),
             eclipse_refraction_.write(ctx), refraction[0], refraction[1]};
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, atmosphere_point_pipeline_.handle);
-        ctx.push_descriptors(cmd, atmosphere_point_pipeline_, writes);
-        ctx.push_constants(cmd, atmosphere_point_pipeline_, uint32_t(1));
+        const auto& atm_point_pipe = fp32 ? fp32_pipelines_.atmosphere_point : atmosphere_point_pipeline_;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, atm_point_pipe.handle);
+        ctx.push_descriptors(cmd, atm_point_pipe, writes);
+        ctx.push_constants(cmd, atm_point_pipe, uint32_t(1));
         vkCmdDraw(cmd, 6, 1, 0, body);
     };
     std::array<rhi::PushDescriptorWrite, 2> cloud_layer{};

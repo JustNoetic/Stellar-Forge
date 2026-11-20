@@ -28,7 +28,8 @@ public:
 
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
                 units::Years sim_time, const RenderSettings& settings, VkExtent2D extent,
-                std::span<const rhi::PushDescriptorWrite> refraction_writes = {}) const;
+                std::span<const rhi::PushDescriptorWrite> refraction_writes = {},
+                VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT) const;
 
     bool loaded() const noexcept { return loaded_; }
     uint32_t count() const noexcept { return count_; }
@@ -42,6 +43,7 @@ private:
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> visible_index_buffers_{};
     rhi::Pipeline cull_pipeline_{};
     rhi::Pipeline pipeline_{};
+    mutable rhi::Pipeline pipeline_fp32_{};
     RefractionFallback refraction_fallback_;
 };
 

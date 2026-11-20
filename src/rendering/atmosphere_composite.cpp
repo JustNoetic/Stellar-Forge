@@ -36,6 +36,8 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
     auto ring_mode = [&](int index) { return !ring_slot ? 0u : fused && index == last ? 2u : 1u; };
     ctx.transition_image(cmd, color, dual_source_ ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL);
     ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    bool fp32 = color.format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    if (fp32) ensure_fp32_composite_pipelines(ctx);
     uint32_t timer = ctx.begin_gpu_timer(cmd, "atmosphere_composite");
     if (!transparency_writes.empty()) ctx.memory_barrier(cmd);
     for (auto* t : active_)
@@ -158,9 +160,13 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             rhi::PushDescriptorWrite::sampled_image(17, t->shadow_active ? t->shadow_depth : surface_lut_, ctx.sampler_nearest_clamp()),
             rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
         if (dual_source_) {
-            auto& pipeline = t->limb_active
-                ? (t->secondary_active ? limb_secondary_dual_source_pipeline_ : limb_dual_source_pipeline_)
-                : (t->secondary_active ? secondary_dual_source_pipeline_ : dual_source_pipeline_);
+            auto& pipeline = fp32
+                ? (t->limb_active
+                    ? (t->secondary_active ? fp32_composite_.limb_secondary_dual_source : fp32_composite_.limb_dual_source)
+                    : (t->secondary_active ? fp32_composite_.secondary_dual_source : fp32_composite_.dual_source))
+                : (t->limb_active
+                    ? (t->secondary_active ? limb_secondary_dual_source_pipeline_ : limb_dual_source_pipeline_)
+                    : (t->secondary_active ? secondary_dual_source_pipeline_ : dual_source_pipeline_));
             std::vector<rhi::PushDescriptorWrite> graphics;
             for (const auto& write : writes) if (write.binding != 4) graphics.push_back(write);
             graphics.insert(graphics.end(), clouds.begin(), clouds.end());
@@ -177,11 +183,17 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             vkCmdDraw(cmd, 3, 1, 0, 0);
         } else {
             bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
-            auto& pipeline = t->secondary_active
-                ? (transparency_writes.empty() ? secondary_composite_pipeline_ :
-                    shadow_shader ? secondary_composite_transparency_pipeline_ : secondary_unshadowed_composite_transparency_pipeline_)
-                : (transparency_writes.empty() ? composite_pipeline_ :
-                    shadow_shader ? composite_transparency_pipeline_ : unshadowed_composite_transparency_pipeline_);
+            auto& pipeline = fp32
+                ? (t->secondary_active
+                    ? (transparency_writes.empty() ? fp32_composite_.secondary_composite :
+                        shadow_shader ? fp32_composite_.secondary_composite_transparency : fp32_composite_.secondary_unshadowed_composite_transparency)
+                    : (transparency_writes.empty() ? fp32_composite_.composite :
+                        shadow_shader ? fp32_composite_.composite_transparency : fp32_composite_.unshadowed_composite_transparency))
+                : (t->secondary_active
+                    ? (transparency_writes.empty() ? secondary_composite_pipeline_ :
+                        shadow_shader ? secondary_composite_transparency_pipeline_ : secondary_unshadowed_composite_transparency_pipeline_)
+                    : (transparency_writes.empty() ? composite_pipeline_ :
+                        shadow_shader ? composite_transparency_pipeline_ : unshadowed_composite_transparency_pipeline_));
             std::vector<rhi::PushDescriptorWrite> compute(std::begin(writes), std::end(writes));
             compute.insert(compute.end(), transparency.begin(), transparency.end());
             compute.insert(compute.end(), clouds.begin(), clouds.end());

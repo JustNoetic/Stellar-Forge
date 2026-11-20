@@ -6,7 +6,11 @@ layout(set = 0, binding = 1) uniform sampler2D radiance_lut;
 layout(set = 0, binding = 2) uniform sampler2D throughput_lut;
 layout(set = 0, binding = 3) uniform sampler2D scene_depth;
 #if !defined(ATMOSPHERE_FRAGMENT) && !defined(ATMOSPHERE_TRANSPARENT_ONLY)
+#ifdef HDR_RGBA32F
+layout(rgba32f, set = 0, binding = 4) uniform image2D hdr_color;
+#else
 layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
+#endif
 #elif defined(ATMOSPHERE_FRAGMENT)
 layout(location = 0, index = 0) out vec4 out_scattered;
 layout(location = 0, index = 1) out vec4 out_transmittance;
@@ -808,7 +812,11 @@ void main() {
     float depth = texelFetch(scene_depth, pixel, 0).r;
     vec3 scattered, transmitted;
     if (!composite_atmosphere_pixel(pixel, size, depth, scattered, transmitted)) discard;
+#ifdef HDR_RGBA32F
+    out_scattered = vec4(scattered, 0.0);
+#else
     out_scattered = vec4(min(scattered, vec3(65000.0)), 0.0);
+#endif
     out_transmittance = vec4(transmitted, 1.0);
 #elif !defined(ATMOSPHERE_TRANSPARENT_ONLY)
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -818,6 +826,10 @@ void main() {
     vec3 scattered, transmitted;
     if (!composite_atmosphere_pixel(pixel, size, depth, scattered, transmitted)) return;
     vec4 color = imageLoad(hdr_color, pixel);
+#ifdef HDR_RGBA32F
+    imageStore(hdr_color, pixel, vec4(color.rgb*transmitted+scattered, color.a));
+#else
     imageStore(hdr_color, pixel, vec4(min(color.rgb*transmitted+scattered, vec3(65000.0)), color.a));
+#endif
 #endif
 }

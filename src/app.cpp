@@ -359,6 +359,31 @@ void App::run() {
             }
         }
         render_frame();
+        if (pending_hdri_export_cancel_) {
+            pending_hdri_export_cancel_ = false;
+            bool restore_paused = hdri_exporter_.was_paused();
+            hdri_exporter_.cancel(vk_);
+            simulation_.apply(ephemeris::SetPaused{restore_paused});
+        } else if (pending_hdri_export_start_) {
+            pending_hdri_export_start_ = false;
+            vk_.wait_idle();
+            bool was_paused = simulation_.clock().paused;
+            simulation_.apply(ephemeris::SetPaused{true});
+            const auto& ed = ui_state_.export_hdri;
+            rendering::HdriExportOptions opts{};
+            opts.output_path = ed.output_path;
+            opts.quality = static_cast<rendering::HdriQuality>(std::clamp(ed.quality_idx, 0, int(rendering::HdriQuality::Count) - 1));
+            opts.orientation = ed.orientation_idx == 1 ? rendering::HdriOrientation::EclipticNorth : rendering::HdriOrientation::CameraHorizon;
+            opts.exposure_mode = ed.exposure_idx == 1 ? rendering::HdriExposureMode::RawPhysical : rendering::HdriExposureMode::NormalizedCurrent;
+            hdri_exporter_.begin(opts, camera_, render_settings_.values(),
+                                 vk_.device_properties().limits.maxImageDimension2D,
+                                 vk_.rgba32f_hdr_supported(), was_paused);
+        } else if (hdri_exporter_.active() && !hdri_exporter_.finished()) {
+            vk_.wait_idle();
+            if (!hdri_exporter_.step(vk_, celestial_renderer_, star_catalog_, scene())) {
+                simulation_.apply(ephemeris::SetPaused{hdri_exporter_.was_paused()});
+            }
+        }
         save_preferences();
 
         ++frames_rendered;
@@ -374,6 +399,7 @@ void App::shutdown() {
     comparisons_.clear();
     simulation_.set_threaded(false);
     vk_.wait_idle();
+    hdri_exporter_.shutdown(vk_);
     rhi::ShaderCache::destroy_pipeline(vk_, size_composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(vk_, composite_pipeline_);
     rhi::ShaderCache::destroy_pipeline(vk_, bloom_composite_pipeline_);
@@ -717,23 +743,41 @@ bool App::render_frame(benchmark::FrameSample* sample) {
         }
     }
 
-    if (size_comparison_active_ && !ui_settings_.ui_visible) update_size_comparison();
-
-    if (self_test_) {
-        auto result = simulation_.apply(ephemeris::SetTimeWarp{simulation_.clock().warp * 1.25});
-        if (!result) throw std::runtime_error(result.error);
-    }
-    compose_scene();
+    bool hdri_busy = hdri_exporter_.active() && !hdri_exporter_.finished();
     double camera_update_ms = 0.0;
-    {
-        ScopedTimer timer(sample ? &camera_update_ms : nullptr);
-        camera_.update(frame_dt_, scene());
+    if (!hdri_busy) {
+        if (size_comparison_active_ && !ui_settings_.ui_visible) update_size_comparison();
+
+        if (self_test_) {
+            auto result = simulation_.apply(ephemeris::SetTimeWarp{simulation_.clock().warp * 1.25});
+            if (!result) throw std::runtime_error(result.error);
+        }
+        compose_scene();
+        {
+            ScopedTimer timer(sample ? &camera_update_ms : nullptr);
+            camera_.update(frame_dt_, scene());
+        }
+        if (sample) sample->cpu_camera_ms += camera_update_ms;
+        if (self_test_ && camera_.origin_render != scene().body(camera_.tracking_idx).render.position.value)
+            throw std::runtime_error("Camera tracking and rendered body use different snapshots after a time-warp change.");
     }
-    if (sample) sample->cpu_camera_ms += camera_update_ms;
-    if (self_test_ && camera_.origin_render != scene().body(camera_.tracking_idx).render.position.value)
-        throw std::runtime_error("Camera tracking and rendered body use different snapshots after a time-warp change.");
 
     VkExtent2D ext = vk_.swapchain_extent();
+
+    if (hdri_busy) {
+        vk_.transition_raw_image(cmd, vk_.swapchain_image(swapchain_idx), VK_IMAGE_ASPECT_COLOR_BIT,
+                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                 VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        rhi::RenderingAttachment swap_att{};
+        swap_att.view = vk_.swapchain_view(swapchain_idx);
+        swap_att.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        swap_att.load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        swap_att.clear.color = {{0.02f, 0.02f, 0.03f, 1.0f}};
+        swap_att.store_op = VK_ATTACHMENT_STORE_OP_STORE;
+        vk_.begin_rendering(cmd, ext, std::span{&swap_att, 1}, nullptr);
+        vk_.end_rendering(cmd);
+    } else {
 
     bool bloom_enabled = !size_comparison_active_ && rendering::BloomRenderer::enabled(render_settings_.values());
     rhi::Image* bloom_scene = nullptr;
@@ -853,6 +897,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
     vk_.end_rendering(cmd);
     vk_.end_gpu_timer(cmd, t_tonemap);
     vk_.end_gpu_timer(cmd, t_post);
+    }
 
     uint32_t t_ui = vk_.begin_gpu_timer(cmd, "gpu_ui");
     if (surface_preview_dirty_ && surface_preview_img_ && surface_preview_staging_) {
