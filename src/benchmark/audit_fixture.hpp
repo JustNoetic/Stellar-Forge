@@ -47,9 +47,10 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "high-exposure") s.exposure = 1e4f;
     if (variant == "no-orbits") s.show_orbits = false;
     if (variant == "no-gaia") s.show_gaia_stars = false;
-    if (variant == "smooth") s.terrain_imported_enabled = s.terrain_enabled = s.terrain_normal_maps_enabled = false;
+    if (variant == "smooth") s.terrain_imported_enabled = s.terrain_enabled = s.terrain_normal_maps_enabled = s.terrain_self_shadows_enabled = false;
     if (variant == "no-textures") s.surface_textures_enabled = false;
     if (variant == "no-normals") s.terrain_normal_maps_enabled = false;
+    if (variant == "no-terrain-shadows") s.terrain_self_shadows_enabled = false;
     if (variant == "no-rings") s.show_rings = false;
     if (variant == "no-ring-shadows") s.ring_shadows_enabled = false;
 }

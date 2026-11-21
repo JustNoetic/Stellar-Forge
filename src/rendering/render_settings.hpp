@@ -36,6 +36,7 @@ struct RenderSettings {
     bool terrain_enabled = false;
     bool terrain_imported_enabled = true;
     bool terrain_normal_maps_enabled = true;
+    bool terrain_self_shadows_enabled = true;
     bool surface_textures_enabled = true;
     bool terrain_debug_tiles = false;
     bool terrain_reference_fp64 = false;

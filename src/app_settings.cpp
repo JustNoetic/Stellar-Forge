@@ -250,6 +250,9 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
         ImGui::Checkbox("Surface Textures", &render_draft.surface_textures_enabled);
         ImGui::Checkbox("Imported Elevation", &render_draft.terrain_imported_enabled);
         ImGui::Checkbox("Detailed Terrain Shading", &render_draft.terrain_normal_maps_enabled);
+        ImGui::BeginDisabled(!render_draft.terrain_imported_enabled);
+        ImGui::Checkbox("Terrain Self-Shadowing", &render_draft.terrain_self_shadows_enabled);
+        ImGui::EndDisabled();
         ImGui::Checkbox("Synthetic Terrain Preview", &render_draft.terrain_enabled);
         ui::section("Detail & performance", "Lower pixel error increases surface detail and GPU work.");
         ui::field("Terrain Error##terrain_error", [&](const char* id) {

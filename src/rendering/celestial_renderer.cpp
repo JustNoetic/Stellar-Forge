@@ -81,7 +81,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     cloud_volume_.init(ctx);
     ocean_.init(ctx);
     textures_.init(ctx);
-    normals_.init(ctx, true);
+    normals_.init(ctx, true, true);
     rings_.init(ctx);
     atmospheres_.init(ctx);
     transparency_.init(ctx);
@@ -120,6 +120,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {47, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     planetshine_maps_ = ctx.create_image_2d(PLANETSHINE_MAP_WIDTH, PLANETSHINE_MAP_HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -326,7 +327,12 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
     measure("cpu_refraction_prepare_ms", [&] { refraction_.prepare(cmd, ctx, cam, sys, settings); });
     measure("cpu_textures_prepare_ms", [&] { textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled); });
-    measure("cpu_normals_prepare_ms", [&] { normals_.prepare(cmd, ctx, cam, sys, extent, settings.terrain_imported_enabled && settings.terrain_normal_maps_enabled); });
+    measure("cpu_normals_prepare_ms", [&] {
+        normals_.prepare(cmd, ctx, cam, sys, extent,
+            settings.terrain_imported_enabled && settings.terrain_normal_maps_enabled,
+            settings.terrain_imported_enabled && settings.terrain_self_shadows_enabled,
+            settings.oceans_enabled);
+    });
     measure("cpu_rings_prepare_ms", [&] { rings_.prepare(cmd, ctx, cam, sys, count, refraction_.host().body); });
     measure("cpu_ringshine_prepare_ms", [&] {
     uint32_t ringshine_timer = ctx.begin_gpu_timer(cmd, "ringshine_bake");
@@ -473,6 +479,7 @@ void CelestialRenderer::ensure_fp32_pipelines(rhi::VkContext& ctx) {
         {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {47, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     rhi::GraphicsPipelineDesc sphere_desc{};
     sphere_desc.vert_path = "celestial/sphere.vert";
@@ -826,6 +833,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::sampled_image(39, rings_.penumbra_table(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::sampled_image(10, normals_.image(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(11, normals_.pages(f_idx)),
+        rhi::PushDescriptorWrite::sampled_image(47, normals_.horizon_image(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::sampled_image(12, atmospheres_.surface_lut(), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(13, atmospheres_.surface_records(f_idx)),
         rhi::PushDescriptorWrite::sampled_image(16, rings_.ringshine_atlas(f_idx), ctx.sampler_linear_clamp()),

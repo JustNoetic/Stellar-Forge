@@ -1,0 +1,33 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform HeightMipPush {
+    uint mode;
+    uint size;
+    float height_scale_m;
+    float ocean_floor_m;
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2DArray u_src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2DArray u_dst;
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (coord.x >= int(pc.size) || coord.y >= int(pc.size) || coord.z >= 6) return;
+    if (pc.mode == 0u) {
+        float h_m = max(texelFetch(u_src, coord, 0).r, pc.ocean_floor_m);
+        float h = h_m / max(pc.height_scale_m, 1.0);
+        imageStore(u_dst, coord, vec4(h, h, h, 0.0));
+        return;
+    }
+    ivec2 base = coord.xy * 2;
+    vec3 a = texelFetch(u_src, ivec3(base.x, base.y, coord.z), 0).rgb;
+    vec3 b = texelFetch(u_src, ivec3(base.x + 1, base.y, coord.z), 0).rgb;
+    vec3 c = texelFetch(u_src, ivec3(base.x, base.y + 1, coord.z), 0).rgb;
+    vec3 d = texelFetch(u_src, ivec3(base.x + 1, base.y + 1, coord.z), 0).rgb;
+    float avg_r = 0.25 * (a.r + b.r + c.r + d.r);
+    float max_g = max(max(a.g, b.g), max(c.g, d.g));
+    float min_b = min(min(a.b, b.b), min(c.b, d.b));
+    imageStore(u_dst, coord, vec4(avg_r, max_g, min_b, 0.0));
+}

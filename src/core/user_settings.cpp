@@ -37,6 +37,7 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(terrain_enabled);
     SF_SETTING(terrain_imported_enabled);
     SF_SETTING(terrain_normal_maps_enabled);
+    SF_SETTING(terrain_self_shadows_enabled);
     SF_SETTING(surface_textures_enabled);
     SF_SETTING(terrain_debug_tiles);
     SF_SETTING(terrain_reference_fp64);

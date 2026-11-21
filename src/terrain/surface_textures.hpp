@@ -19,7 +19,20 @@ inline constexpr uint32_t COLOR_SLOTS = 512;
 inline constexpr uint32_t COLOR_UPLOADS = 16;
 inline constexpr uint32_t COLOR_BODIES = 1024;
 inline constexpr uint32_t COLOR_SOURCES = 32;
+inline constexpr uint32_t HORIZON_DIRECTIONS = 16;
+inline constexpr uint32_t HORIZON_LAYERS_PER_SLOT = 4;
+inline constexpr uint32_t HORIZON_APRON_PAD = 30;
+inline constexpr uint32_t HORIZON_APRON_SIDE = COLOR_SIDE + 2*HORIZON_APRON_PAD;
+inline constexpr uint32_t HORIZON_BAKES_PER_FRAME = 16;
 using ColorTile = std::array<uint8_t, COLOR_BYTES>;
+
+struct alignas(16) HorizonBakeJobGPU {
+    glm::uvec4 address{0};
+    glm::uvec4 target{0};
+    glm::vec4 metrics{0};
+    glm::vec4 bounds{0};
+};
+static_assert(sizeof(HorizonBakeJobGPU) == 64);
 
 struct SurfaceSource {
     virtual ~SurfaceSource() = default;
@@ -42,11 +55,24 @@ struct ColorSource final : SurfaceSource {
 };
 
 struct NormalSource final : SurfaceSource {
+    struct TileWithApron {
+        std::vector<std::byte> normals;
+        std::vector<float> apron_m;
+    };
     explicit NormalSource(std::shared_ptr<const HeightSource> height);
     uint32_t count() const noexcept override { return 2*((1u << (2*(level+1)))-1); }
     std::vector<std::byte> load(TileId tile) const override;
+    TileWithApron load_with_apron(TileId tile) const;
+    std::vector<float> load_apron(TileId tile) const;
+    uint32_t global_level() const noexcept { return std::min(level, 2u); }
+    uint32_t global_face_size() const noexcept { return COLOR_CORE << global_level(); }
+    std::vector<float> load_global_face(uint32_t face) const;
     bool compatible(double radius_m, double polar) const noexcept override;
     std::shared_ptr<const HeightSource> height;
+    double height_scale_m = 1.0;
+
+private:
+    TileWithApron evaluate_tile(TileId tile, bool need_normals, bool need_apron) const;
 };
 
 struct ColorBinding {
@@ -65,6 +91,8 @@ struct TextureStats {
     uint32_t evictions = 0;
     uint32_t selection_rebuilds = 0;
     uint32_t selection_nodes = 0;
+    uint32_t horizon_bakes = 0;
+    uint32_t global_height_uploads = 0;
 };
 
 struct SurfaceTextureView {
@@ -72,11 +100,12 @@ struct SurfaceTextureView {
     SelectionView view;
     double radius_pixels = 0;
     uint32_t index = 0;
+    float ocean_floor_m = -1e30f;
 };
 
 class SurfaceTextures {
 public:
-    void init(rhi::VkContext& ctx, bool normals = false);
+    void init(rhi::VkContext& ctx, bool normals = false, bool horizons = false);
     void shutdown(rhi::VkContext& ctx);
     void set_sources(std::vector<ColorBinding> bindings);
     void set_color_source(std::string body, std::shared_ptr<const SurfaceSource> source);
@@ -84,27 +113,57 @@ public:
     std::shared_ptr<const SurfaceSource> color_source(std::string_view body) const noexcept;
     std::vector<std::pair<std::string, std::filesystem::path>> load_catalog(const std::filesystem::path& path);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
-                 const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled);
-    void prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const SurfaceTextureView> views, bool enabled);
+                 const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled,
+                 bool horizons_enabled = false, bool oceans_enabled = false);
+    void prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const SurfaceTextureView> views,
+                       bool enabled, bool horizons_enabled = false);
     int source_index(const ephemeris::BodyDefinition& body) const;
     const rhi::Image& image() const noexcept { return atlas_; }
+    const rhi::Image& horizon_image() const noexcept { return horizon_atlas_; }
     const rhi::Buffer& pages(uint32_t frame) const noexcept { return pages_[frame]; }
     const TextureStats& stats() const noexcept { return stats_; }
 
 private:
     struct SelectionEntry { SelectionView view; Selection selection; bool valid = false; };
-    struct Completed { GeometryKey key; std::vector<std::byte> payload; };
+    struct Completed { GeometryKey key; std::vector<std::byte> payload; std::vector<float> apron_m; };
+    struct ApronReady { GeometryKey key; std::vector<float> apron_m; };
+    struct GlobalFaceRequest { uint32_t source = 0; uint32_t face = 0; SourceDomain domain; };
+    struct GlobalFaceReady { uint32_t source = 0; uint32_t face = 0; SourceDomain domain; std::vector<float> heights_m; };
+    struct GlobalHeightState {
+        rhi::Image raw;
+        rhi::Image pyramid;
+        std::vector<VkImageView> mip_views;
+        uint32_t uploaded_mask = 0;
+        bool enqueued = false;
+        bool pyramid_initialized = false;
+        bool pyramid_built = false;
+        float built_ocean_floor_m = -1e30f;
+    };
+    struct RetiredGlobal {
+        rhi::Image raw;
+        rhi::Image pyramid;
+        std::vector<VkImageView> mip_views;
+        uint64_t serial = 0;
+    };
     GeometryKey key(uint32_t source, TileId tile) const;
     void request(const GeometryKey& key);
     void run(std::stop_token stop);
     rhi::Image atlas_;
+    rhi::Image horizon_atlas_;
+    rhi::Image apron_scratch_;
+    std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> horizon_jobs_;
+    rhi::Pipeline horizon_pipeline_;
+    rhi::Pipeline height_mip_pipeline_;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> pages_;
     rhi::StagingUploads staging_;
     GeometryResidency slots_{COLOR_SLOTS};
     uint32_t capacity_ = COLOR_SLOTS;
     std::array<std::optional<GeometryKey>, COLOR_SLOTS> owners_;
+    std::array<uint8_t, COLOR_SLOTS> horizon_valid_{};
     std::vector<ColorBinding> sources_;
     std::vector<SelectionEntry> selections_;
+    std::vector<GlobalHeightState> globals_;
+    std::vector<RetiredGlobal> retired_globals_;
     SelectionScratch selection_scratch_;
     std::vector<uint32_t> offsets_;
     std::vector<uint32_t> words_;
@@ -115,10 +174,18 @@ private:
     std::unordered_set<GeometryKey, GeometryKeyHash> pending_;
     std::unordered_set<GeometryKey, GeometryKeyHash> failed_;
     std::vector<Completed> ready_;
+    std::deque<GeometryKey> rebake_queue_;
+    std::unordered_set<GeometryKey, GeometryKeyHash> rebake_pending_;
+    std::vector<ApronReady> apron_ready_;
+    std::deque<GlobalFaceRequest> global_queue_;
+    uint32_t global_pending_ = 0;
+    std::vector<GlobalFaceReady> global_ready_;
     std::string error_;
     bool reported_error_ = false;
     bool planning_ = false;
     bool normals_ = false;
+    bool horizons_ = false;
+    std::atomic<bool> horizons_active_{false};
     std::jthread worker_;
 };
 

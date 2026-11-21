@@ -19,6 +19,7 @@ layout(location = 6) in vec2 f_tile_uv;
 #include "common/surface_depth.glsl"
 #include "common/eclipse_shadow.glsl"
 #include "common/surface_textures.glsl"
+#include "common/terrain_horizon.glsl"
 #include "common/surface_ring_shadow.glsl"
 #include "common/ringshine_lookup.glsl"
 #include "common/planetshine_lookup.glsl"
@@ -43,8 +44,9 @@ void main() {
         discard;
     }
 
-    vec3 N = surface_shading_normal(f_body_idx, f_local_pos, normalize(f_normal),
-        body_surface_rotation(body_pole(b), b.spin_flags.x));
+    mat3 rotation = body_surface_rotation(body_pole(b), b.spin_flags.x);
+    SurfaceNormalLookup normal_lookup = surface_normal_lookup(f_body_idx, f_local_pos);
+    vec3 N = surface_shading_normal_from_lookup(normal_lookup, normalize(f_normal), rotation);
     vec3 V = normalize(-f_world_pos);
     float emission_cosine = dot(N, V);
 #ifdef TERRAIN_SURFACE
@@ -103,7 +105,6 @@ void main() {
             float q = max(1.0-b.pole_oblateness.w, 0.05);
             vec3 local = normalize(f_local_pos);
             vec3 fixed_normal = normalize(vec3(local.x, local.y/(q*q), local.z));
-            mat3 rotation = body_surface_rotation(pole, b.spin_flags.x);
             ocean_up = normalize(rotation*fixed_normal);
             mat3 fixed_from_world = transpose(rotation)*(FLUID_AU_KM*1000.0);
             water = ocean_surface(f_body_idx, fixed_normal, fixed_from_world*f_world_pos,
@@ -143,10 +144,20 @@ void main() {
             }
         }
 
+        vec2 terrain_vis = vec2(1.0);
+        if ((normal_lookup.flags & 2u) != 0u && normal_lookup.coarse_slot != 0u
+            && any(greaterThan(shadow, vec3(0.0)))
+            && (any(greaterThan(direct, vec3(0.0))) || ocean > 0.0)) {
+            mat3 world_to_local = transpose(rotation);
+            terrain_vis = terrain_self_shadow(normal_lookup, normalize(f_local_pos),
+                max(1.0 - b.pole_oblateness.w, 0.05), world_to_local * N, world_to_local * L,
+                asin(clamp(star_r / d_au, 0.0, 1.0)));
+        }
+
         total_light += albedo * star_col * irradiance * diffuse * shadow;
 
         if (any(greaterThan(direct, vec3(0.0))) && any(greaterThan(shadow, vec3(0.0)))) {
-            total_light += albedo * star_col * irradiance * direct * shadow;
+            total_light += albedo * star_col * irradiance * direct * shadow * terrain_vis.x;
         }
 
         if (ocean > 0.0) {
@@ -159,7 +170,7 @@ void main() {
             float sun_radius = star_r/d_au;
             float specular = 3.141592653589793*ocean_specular(water.normal, V, L,
                 water.roughness_squared+0.5*sun_radius*sun_radius)*(1.0-water.foam);
-            vec3 reflected = transmission*specular+water_fresnel*diffuse*(1.0-water.foam);
+            vec3 reflected = transmission*specular*terrain_vis.y+water_fresnel*diffuse*(1.0-water.foam);
             total_light += ocean*star_col*irradiance*shadow*reflected;
         }
     }

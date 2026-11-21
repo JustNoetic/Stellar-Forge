@@ -1,0 +1,144 @@
+#version 460
+
+#include "common/terrain_horizon_math.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform HorizonBakePush {
+    uint job_offset;
+} pc;
+
+struct HorizonBakeJobGPU {
+    uvec4 address;
+    uvec4 target;
+    vec4 metrics;
+    vec4 bounds;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer HorizonJobs {
+    HorizonBakeJobGPU jobs[];
+};
+
+layout(set = 0, binding = 1) uniform sampler2DArray u_apron_heights;
+layout(set = 0, binding = 2) uniform sampler2DArray u_global_heights;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2DArray u_horizon_out;
+
+float sample_apron_bilinear(vec2 pos, int layer) {
+    vec2 clamped = clamp(pos, vec2(0.0), vec2(191.0));
+    ivec2 p0 = ivec2(floor(clamped));
+    ivec2 p1 = min(p0 + ivec2(1), ivec2(191));
+    vec2 f = clamped - vec2(p0);
+    float h00 = texelFetch(u_apron_heights, ivec3(p0.x, p0.y, layer), 0).r;
+    float h10 = texelFetch(u_apron_heights, ivec3(p1.x, p0.y, layer), 0).r;
+    float h01 = texelFetch(u_apron_heights, ivec3(p0.x, p1.y, layer), 0).r;
+    float h11 = texelFetch(u_apron_heights, ivec3(p1.x, p1.y, layer), 0).r;
+    return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+float eval_sin_theta(vec3 d_dir, vec3 dir_s, vec3 ell_scale, vec3 U0, float h0, float h_s) {
+    vec3 U_s = normalize(dir_s / ell_scale);
+    vec3 delta = d_dir * ell_scale + U0 * (h_s - h0) + (U_s - U0) * h_s;
+    return dot(delta, U0) / max(length(delta), 1e-12);
+}
+
+void main() {
+    uint tx = gl_GlobalInvocationID.x;
+    uint ty = gl_GlobalInvocationID.y;
+    if (tx >= 132u || ty >= 132u) return;
+
+    HorizonBakeJobGPU job = jobs[pc.job_offset + gl_WorkGroupID.z];
+    uint face = job.address.x;
+    uint level = job.address.y;
+    vec2 tile_xy = vec2(job.address.zw);
+    uint dst_slot = job.target.x;
+    int apron_layer = int(job.target.y);
+    float global_face_size = float(job.target.z);
+
+    float radius_m = max(job.metrics.x, 1.0);
+    float polar_ratio = clamp(job.metrics.y, 0.05, 1.0);
+    float height_scale_m = max(job.metrics.z, 1.0);
+    float ocean_floor_m = job.metrics.w;
+    float global_min_m = max(job.bounds.x, ocean_floor_m);
+    float global_max_m = max(job.bounds.y, ocean_floor_m);
+    float max_mip = job.bounds.z;
+
+    float width = ldexp(2.0, -int(level));
+    vec2 uv0 = vec2(-1.0) + (tile_xy + (vec2(float(tx), float(ty)) - 2.0 + 0.5) / 128.0) * width;
+    vec3 raw0 = horizon_cube_vector(face, uv0);
+    float raw0_len = length(raw0);
+    vec3 dir0 = raw0 / raw0_len;
+    vec3 ell_scale = vec3(1.0, polar_ratio, 1.0);
+    vec3 U0 = normalize(dir0 / ell_scale);
+
+    float h0_m = max(texelFetch(u_apron_heights, ivec3(int(tx) + 30, int(ty) + 30, apron_layer), 0).r, ocean_floor_m);
+    float h0 = h0_m / radius_m;
+
+    vec3 T, B;
+    horizon_tangent_basis(face, U0, T, B);
+
+    vec3 face_axis = horizon_cube_vector(face, vec2(0.0));
+    vec3 face_u = horizon_cube_vector(face, vec2(1.0, 0.0)) - face_axis;
+    vec3 face_v = horizon_cube_vector(face, vec2(0.0, 1.0)) - face_axis;
+
+    float texel_sigma = (width / 128.0) / max(raw0_len, 1.0);
+    float h_min = global_min_m / radius_m;
+    float h_max = global_max_m / radius_m;
+    float sigma_max = min(1.5, (sqrt(2.0 * max(h0 - h_min, 0.0)) + sqrt(2.0 * max(h_max - h_min, 0.0))) / polar_ratio + 0.01);
+
+    float encoded[16];
+    for (uint k = 0u; k < 16u; ++k) {
+        float phi = float(k) * (HORIZON_TWO_PI / 16.0);
+        vec3 dir_h = cos(phi) * T + sin(phi) * B;
+        vec3 dir_tangent = normalize(dir_h / ell_scale);
+        float best_sin = -HORIZON_NEG_MAX;
+        float sigma = 1.5 * texel_sigma;
+
+        for (int step = 0; step < 64; ++step) {
+            float sh = sin(0.5 * sigma);
+            vec3 d_dir = dir_tangent * sin(sigma) - dir0 * (2.0 * sh * sh);
+            vec3 dir_s = normalize(dir0 + d_dir);
+            float denom = dot(dir_s, face_axis);
+            if (denom <= 0.25) break;
+            vec2 uv_s = vec2(dot(dir_s, face_u), dot(dir_s, face_v)) / denom;
+            vec2 apos = ((uv_s + 1.0) / width - tile_xy) * 128.0 + 32.0 - 0.5;
+            if (apos.x < 0.0 || apos.x > 191.0 || apos.y < 0.0 || apos.y > 191.0) break;
+            float h_s_m = max(sample_apron_bilinear(apos, apron_layer), ocean_floor_m);
+            best_sin = max(best_sin, eval_sin_theta(d_dir, dir_s, ell_scale, U0, h0, h_s_m / radius_m));
+            float stride = step < 16 ? 1.0 : (step < 32 ? 2.0 : 4.0);
+            sigma += stride * texel_sigma;
+        }
+
+        for (int step = 0; step < 48 && sigma <= sigma_max; ++step) {
+            float dh_max = h_max - h0;
+            float upper_sin = (dh_max >= 0.0 ? dh_max / max(polar_ratio * sigma, 1e-6) : dh_max / max(sigma, 1e-6))
+                            - 0.45 * polar_ratio * sigma;
+            if (upper_sin <= best_sin) break;
+            float sh = sin(0.5 * sigma);
+            vec3 d_dir = dir_tangent * sin(sigma) - dir0 * (2.0 * sh * sh);
+            vec3 dir_s = normalize(dir0 + d_dir);
+            vec3 fuv = horizon_face_uv(dir_s);
+            vec2 guv = clamp(fuv.xy * 0.5 + 0.5, 0.0, 1.0);
+            float ds = sigma * 0.15;
+            float mip = clamp(floor(log2(max(ds * global_face_size * 0.5, 1.0))), 0.0, max_mip);
+            vec2 gm = textureLod(u_global_heights, vec3(guv, fuv.z), mip).rg;
+            float h_upper = gm.g * height_scale_m / radius_m;
+            float sin_upper = eval_sin_theta(d_dir, dir_s, ell_scale, U0, h0, h_upper);
+            if (sin_upper > best_sin) {
+                if (mip > 0.5) {
+                    float h_ref = textureLod(u_global_heights, vec3(guv, fuv.z), mip - 1.0).r * height_scale_m / radius_m;
+                    best_sin = max(best_sin, eval_sin_theta(d_dir, dir_s, ell_scale, U0, h0, h_ref));
+                } else {
+                    best_sin = max(best_sin, sin_upper);
+                }
+            }
+            sigma *= 1.15;
+        }
+
+        encoded[k] = encode_horizon_sin(best_sin);
+    }
+
+    for (uint g = 0u; g < 4u; ++g) {
+        vec4 packed = vec4(encoded[g * 4u], encoded[g * 4u + 1u], encoded[g * 4u + 2u], encoded[g * 4u + 3u]);
+        imageStore(u_horizon_out, ivec3(int(tx), int(ty), int(dst_slot * 4u + g)), packed);
+    }
+}
