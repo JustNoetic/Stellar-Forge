@@ -100,6 +100,28 @@ std::shared_ptr<const ColorSource> ColorSource::open(const std::filesystem::path
     result->payload = directory/"tiles.rgba";
     if (result->count() != expected || std::filesystem::file_size(result->payload) != uint64_t(expected)*COLOR_BYTES)
         throw std::runtime_error("Incomplete albedo tile pack");
+    glm::dvec3 sum_rgb(0.0);
+    double sum_w = 0.0;
+    auto srgb_to_linear = [](uint8_t byte) {
+        double x = double(byte)/255.0;
+        return x <= 0.04045 ? x/12.92 : std::pow((x+0.055)/1.055, 2.4);
+    };
+    for (uint32_t face = 0; face < 6; ++face) {
+        auto tile = result->read({face, 0, 0, 0});
+        for (uint32_t y = 0; y < COLOR_CORE; ++y) {
+            double v = -1.0+2.0*(double(y)+0.5)/double(COLOR_CORE);
+            for (uint32_t x = 0; x < COLOR_CORE; ++x) {
+                double u = -1.0+2.0*(double(x)+0.5)/double(COLOR_CORE);
+                double w = std::pow(1.0+u*u+v*v, -1.5);
+                size_t offset = ((size_t(y)+COLOR_GUTTER)*COLOR_SIDE+(size_t(x)+COLOR_GUTTER))*4;
+                sum_rgb.r += w*srgb_to_linear((*tile)[offset]);
+                sum_rgb.g += w*srgb_to_linear((*tile)[offset+1]);
+                sum_rgb.b += w*srgb_to_linear((*tile)[offset+2]);
+                sum_w += w;
+            }
+        }
+    }
+    if (sum_w > 0.0) result->mean_albedo_ = glm::vec3(sum_rgb/sum_w);
     return result;
 }
 
@@ -517,6 +539,12 @@ int SurfaceTextures::source_index(const ephemeris::BodyDefinition& body) const {
         if (sources_[i].body == body.name && sources_[i].source->compatible(
             body.radius_au()*AU_TO_KM*1000, std::clamp(1-body.oblateness, .05, 1.0))) return int(i);
     return -1;
+}
+
+std::optional<glm::vec3> SurfaceTextures::mean_albedo(const ephemeris::BodyDefinition& body) const noexcept {
+    int idx = source_index(body);
+    if (idx < 0) return std::nullopt;
+    return sources_[idx].source->mean_albedo();
 }
 
 void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,

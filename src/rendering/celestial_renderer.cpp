@@ -348,8 +348,41 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     });
     measure("cpu_planetshine_prepare_ms", [&] {
     materials_.update(sys);
+    planetshine_albedos_.resize(count);
+    for (uint32_t j = 0; j < count; ++j) {
+        const auto& b = sys.body(j);
+        const auto& d = b.definition;
+        glm::dvec3 albedo = glm::clamp(glm::dvec3(d.color_rgb), glm::dvec3(0.0), glm::dvec3(1.0));
+        if (settings.surface_textures_enabled) {
+            if (auto tex = textures_.mean_albedo(d))
+                albedo = glm::clamp(glm::dvec3(*tex), glm::dvec3(0.0), glm::dvec3(1.0));
+        }
+        if (settings.clouds_enabled && d.clouds.enabled) {
+            double cloud_alpha = cloud_maps_.mean_disk_opacity(d.clouds);
+            glm::dvec3 cloud_col = glm::clamp(glm::dvec3(d.clouds.color), glm::dvec3(0.0), glm::dvec3(1.0));
+            albedo = glm::mix(albedo, cloud_col, cloud_alpha);
+        }
+        if (settings.show_atmospheres && d.atmosphere.enabled && b.render.atmosphere &&
+            !d.atmosphere.pressure_reference && d.type != "Gas Giant" && d.type != "Ice Giant") {
+            double aerosol_tau = 0.0;
+            if (d.atmosphere.automatic_aerosols) {
+                for (const auto& layer : d.atmosphere.aerosols) aerosol_tau += layer.optical_depth_550;
+            } else {
+                aerosol_tau = double(std::max({d.atmosphere.mie_extinction.r, d.atmosphere.mie_extinction.g,
+                    d.atmosphere.mie_extinction.b})) * double(d.atmosphere.mie_scale_height_km);
+            }
+            if (aerosol_tau < 1.0) {
+                glm::dvec3 tau_r = glm::clamp(glm::dvec3(b.render.atmosphere->rayleigh)
+                    * std::max(b.render.atmosphere->surface.scale_height_km, 0.0), glm::dvec3(0.0), glm::dvec3(2.0));
+                glm::dvec3 r_atm = (0.75 * tau_r) / (glm::dvec3(1.0) + 0.75 * tau_r);
+                glm::dvec3 t_atm = glm::dvec3(1.0) / (glm::dvec3(1.0) + 0.75 * tau_r);
+                albedo = r_atm + (t_atm * t_atm * albedo) / glm::max(glm::dvec3(1.0) - r_atm * albedo, glm::dvec3(1e-4));
+            }
+        }
+        planetshine_albedos_[j] = glm::vec3(glm::clamp(albedo, glm::dvec3(0.0), glm::dvec3(1.0)));
+    }
     planetshine_ = prepare_planetshine(sys, settings.planetshine_enabled && !settings.direct_sunlight_only,
-        settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_);
+        settings.hdr_enabled, MAX_CELESTIAL_BODIES, &materials_, planetshine_albedos_);
     rings_.update_ring_planetshine(cmd, ctx, cam, sys, settings, count, extent, materials_);
     });
     measure("cpu_atmosphere_prepare_ms", [&] { atmospheres_.prepare(cmd, ctx, cam, sys, settings, extent, atmosphere_minima_, rings_.hosts(), &rings_.shadow_lut(), rings_.shadow_revision(), shadow_diagnostics, planetshine_, &rings_, &refraction_.host()); });

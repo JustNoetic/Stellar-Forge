@@ -59,6 +59,7 @@ vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pol
             (dot(normal, light) < 0.0 && dot(up, light) < -0.05) ||
             4000.0*dot(shine, vec3(0.2126, 0.7152, 0.0722)) <= shine_floor) continue;
         radiance += shine*cloud_light_response(f, lookup, atmosphere, underside, local, normal, pole, flattening, light);
+        shine_floor = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
     }
     float exposure = u_scene.hdr_enabled != 0u ? u_scene.screen_params.w : 1.0;
     return vec4(radiance*f.cloud_color.rgb*(opacity*exposure), opacity);

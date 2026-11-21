@@ -1,14 +1,17 @@
 #pragma once
 
 #include "rhi/vk_context.hpp"
+#include <array>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+namespace sf::ephemeris { struct CloudDefinition; }
+
 namespace sf::rendering {
 
-// Max reduction of a coverage map for conservative empty-space bounds (volumetric_clouds_plan.md ง4/ง5). The mean
+// Max reduction of a coverage map for conservative empty-space bounds (volumetric_clouds_plan.md ยง4/ยง5). The mean
 // mips in the atlas cannot bound anything. Level 0 has at most `max_width` cells; each cell holds the maximum over
 // its source texels dilated by `dilation_texels`, so a bilinear read of the atlas at any mip up to the dilation's
 // footprint never exceeds the cell covering the read point.
@@ -28,11 +31,13 @@ public:
     // R8 max-coverage pyramid with the atlas's layers (texelFetch only).
     const rhi::Image& bound_image() const noexcept { return bounds_; }
     uint32_t layer(const std::string& name) const noexcept;
+    double mean_disk_opacity(const ephemeris::CloudDefinition& clouds) const noexcept;
 
 private:
     rhi::Image atlas_;
     rhi::Image bounds_;
     std::unordered_map<std::string, uint32_t> layers_;
+    std::unordered_map<std::string, std::array<float, 256>> histograms_;
 };
 
 }

@@ -6,14 +6,14 @@ struct SurfaceMaterial {
     vec4 surface;
     vec4 opposition;
 };
-float hapke_raw(float mu0, float mu, float cos_phase, SurfaceMaterial m) {
+float hapke_raw_blurred(float mu0, float mu, float cos_phase, SurfaceMaterial m, float half_angle_blur) {
     if (mu0 <= 0.0 || mu <= 0.0) return 0.0;
     mu0 = min(1.0, mu0); mu = min(1.0, mu);
     float c = clamp(cos_phase, -1.0, 1.0);
     float b = m.grain.z, back = m.grain.w;
-    float pf = (1.0-b*b) * ((1.0-back)/pow(max(1e-9, 1.0+b*b+2.0*b*c), 1.5)
-                              + back/pow(max(1e-9, 1.0+b*b-2.0*b*c), 1.5));
-    float tan_half = sqrt(max(0.0, (1.0-c)/max(1e-12, 1.0+c)));
+    float d1 = max(1e-9, 1.0+b*b+2.0*b*c), d2 = max(1e-9, 1.0+b*b-2.0*b*c);
+    float pf = (1.0-b*b) * ((1.0-back)/(d1*sqrt(d1)) + back/(d2*sqrt(d2)));
+    float tan_half = sqrt(max(0.0, (1.0-c)/max(1e-12, 1.0+c)) + half_angle_blur*half_angle_blur);
     float sh = m.surface.x/(1.0+tan_half/m.surface.y);
     float x = tan_half/m.opposition.y;
     float ratio = x > 0.001 ? (1.0-exp(-x))/x : 1.0-0.5*x+x*x/6.0;
@@ -49,6 +49,10 @@ float hapke_raw(float mu0, float mu, float cos_phase, SurfaceMaterial m) {
     float h0 = (1.0+2.0*u0)/(1.0+2.0*u0*gamma);
     float h = (1.0+2.0*u)/(1.0+2.0*u*gamma);
     return max(0.0, 0.25*m.grain.y*u0/max(1e-10, u0+u) * ((1.0+sh)*pf+h0*h-1.0) * shadow * (1.0+cb));
+}
+
+float hapke_raw(float mu0, float mu, float cos_phase, SurfaceMaterial m) {
+    return hapke_raw_blurred(mu0, mu, cos_phase, m, 0.0);
 }
 
 float surface_point_response(vec3 N, vec3 V, vec3 L, SurfaceMaterial m, float emission_cosine) {

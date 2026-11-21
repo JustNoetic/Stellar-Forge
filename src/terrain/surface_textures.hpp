@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 
@@ -41,6 +42,7 @@ struct SurfaceSource {
     double polar_ratio = 1;
     virtual uint32_t count() const noexcept = 0;
     virtual std::vector<std::byte> load(TileId tile) const = 0;
+    virtual std::optional<glm::vec3> mean_albedo() const noexcept { return std::nullopt; }
     uint32_t index(TileId tile) const;
     virtual bool compatible(double radius_m, double polar) const noexcept;
 };
@@ -48,10 +50,12 @@ struct SurfaceSource {
 struct ColorSource final : SurfaceSource {
     std::filesystem::path payload;
     std::vector<uint32_t> checksums;
+    std::optional<glm::vec3> mean_albedo_;
     static std::shared_ptr<const ColorSource> open(const std::filesystem::path& directory);
     std::shared_ptr<const ColorTile> read(TileId tile) const;
     uint32_t count() const noexcept override { return uint32_t(checksums.size()); }
     std::vector<std::byte> load(TileId tile) const override;
+    std::optional<glm::vec3> mean_albedo() const noexcept override { return mean_albedo_; }
 };
 
 struct NormalSource final : SurfaceSource {
@@ -118,6 +122,7 @@ public:
     void prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const SurfaceTextureView> views,
                        bool enabled, bool horizons_enabled = false);
     int source_index(const ephemeris::BodyDefinition& body) const;
+    std::optional<glm::vec3> mean_albedo(const ephemeris::BodyDefinition& body) const noexcept;
     const rhi::Image& image() const noexcept { return atlas_; }
     const rhi::Image& horizon_image() const noexcept { return horizon_atlas_; }
     const rhi::Buffer& pages(uint32_t frame) const noexcept { return pages_[frame]; }

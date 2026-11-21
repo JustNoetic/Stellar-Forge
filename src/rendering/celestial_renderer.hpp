@@ -187,6 +187,7 @@ private:
     RefractionRenderer refraction_;
     EclipseRefractionRenderer eclipse_refraction_;
     std::vector<float> atmosphere_minima_;
+    std::vector<glm::vec3> planetshine_albedos_;
     std::vector<PlanetshineGPU> planetshine_;
     SurfaceMaterialCache materials_;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> material_phases_{};

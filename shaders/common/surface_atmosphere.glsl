@@ -69,6 +69,23 @@ vec3 surface_small_skylight(SurfaceAtmosphereSample lookup, vec3 sun, float radi
     return diffuse*lookup.height_layer_scale.z;
 }
 
+float surface_hapke_disk_response(vec3 N, vec3 V, vec3 L, float sin_radius, SurfaceMaterial m, float emission_cosine) {
+    float mu = clamp(dot(N, L), -1.0, 1.0);
+    float s = clamp(sin_radius, 0.0, 1.0);
+    if (mu <= -s || emission_cosine <= 0.0) return 0.0;
+    float radius = asin(s);
+    float blur = 0.33*radius;
+    if (mu >= s || radius < 1e-5)
+        return hapke_raw_blurred(mu, emission_cosine, dot(V, L), m, blur)*m.opposition.z*m.surface.w;
+    float lambert = stellar_lambert_irradiance(mu, s);
+    if (lambert <= 0.0) return 0.0;
+    float h_eff = 0.5*(asin(mu)+radius);
+    float mu_eff = sin(h_eff);
+    vec3 L_eff = N*mu_eff+stellar_tangent(N, L)*cos(h_eff);
+    float resp = hapke_raw_blurred(mu_eff, emission_cosine, dot(V, L_eff), m, blur)*m.opposition.z*m.surface.w;
+    return resp*(lambert/max(mu_eff, 1e-7));
+}
+
 vec3 surface_stellar_light(uint body, vec3 local, vec3 base_chord, vec3 N, vec3 V, vec3 sun,
                           float sin_radius, float emission_cosine, SurfaceMaterial material, uint source, out vec3 diffuse) {
     bool atmosphere = surface_atmospheres[body].w > 0.5;
@@ -82,6 +99,10 @@ vec3 surface_stellar_light(uint body, vec3 local, vec3 base_chord, vec3 N, vec3 
         vec4 sky = textureLod(surface_atmosphere_lut, uv+vec3(0,0,1), 0.0);
         diffuse = sky.rgb*lookup.height_layer_scale.z;
         indirect = sky.a > 0.5;
+    } else {
+        if (material.grain.x < 0.5)
+            return vec3(stellar_lambert_irradiance(clamp(dot(N, sun), -1.0, 1.0), clamp(sin_radius, 0.0, 1.0))*material.surface.w);
+        return vec3(surface_hapke_disk_response(N, V, sun, sin_radius, material, emission_cosine));
     }
     float radius = asin(clamp(sin_radius, 0.0, 1.0));
     float mu = clamp(dot(N, sun), -1.0, 1.0);
@@ -156,4 +177,32 @@ vec3 surface_stellar_light(uint body, vec3 local, vec3 base_chord, vec3 N, vec3 
     else diffuse = point_diffuse;
     diffuse = mix(diffuse, point_diffuse, point_weight);
     return mix(direct, point_direct, point_weight);
+}
+
+vec3 surface_planetshine_light(uint body, vec3 local, vec3 base_chord, vec3 N, vec3 V, vec3 light,
+                               float sin_radius, float emission_cosine, SurfaceMaterial material, out vec3 diffuse) {
+    diffuse = vec3(0.0);
+    float mu = clamp(dot(N, light), -1.0, 1.0);
+    float s = clamp(sin_radius, 0.0, 1.0);
+    bool atmosphere = surface_atmospheres[body].w > 0.5;
+    if (!atmosphere) {
+        if (material.grain.x < 0.5)
+            return vec3(stellar_lambert_irradiance(mu, s)*material.surface.w);
+        return vec3(surface_hapke_disk_response(N, V, light, s, material, emission_cosine));
+    }
+    SurfaceAtmosphereSample lookup = surface_atmosphere_sample(body, local, base_chord, N);
+    vec3 uv = surface_atmosphere_coordinates(lookup, light);
+    diffuse = textureLod(surface_atmosphere_lut, uv+vec3(0,0,1), 0.0).rgb*lookup.height_layer_scale.z;
+    if (mu <= -s) return vec3(0.0);
+    float radius = asin(s);
+    vec3 sample_dir = light;
+    if (mu < s && radius > 1e-5) {
+        float h_eff = 0.5*(asin(mu)+radius);
+        sample_dir = N*sin(h_eff)+stellar_tangent(N, light)*cos(h_eff);
+    }
+    vec3 transmission = textureLod(surface_atmosphere_lut, surface_atmosphere_coordinates(lookup, sample_dir), 0.0).rgb;
+    float response = material.grain.x < 0.5
+        ? stellar_lambert_irradiance(mu, s)*material.surface.w
+        : surface_hapke_disk_response(N, V, light, s, material, emission_cosine);
+    return transmission*response;
 }

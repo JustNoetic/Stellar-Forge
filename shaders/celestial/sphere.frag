@@ -226,10 +226,10 @@ void main() {
             || (dot(N, light) < 0.0 && dot(surface_up, light) < -0.05)
             || 4000.0*dot(albedo*b.shine_irradiance[i].rgb, vec3(0.2126, 0.7152, 0.0722)) <= shine_floor) continue;
         vec3 diffuse;
-        vec3 direct = surface_stellar_light(f_body_idx, f_body_offset, f_base_chord,
-            N, V, light, sin(b.shine_direction[i].w), emission_cosine, b.material, 16u, diffuse);
-        total_light += albedo*b.shine_irradiance[i].rgb
-                     *(direct+diffuse);
+        vec3 direct = surface_planetshine_light(f_body_idx, f_body_offset, f_base_chord,
+            N, V, light, sin(b.shine_direction[i].w), emission_cosine, b.material, diffuse);
+        total_light += albedo*b.shine_irradiance[i].rgb*(direct+diffuse);
+        shine_floor = dot(total_light, vec3(0.2126, 0.7152, 0.0722));
     }
 
     vec3 rgb = total_light * exposure * mesh_weight;

@@ -1,7 +1,9 @@
 #include "rendering/cloud_maps.hpp"
 #include "rendering/cloud_volume.hpp"
+#include "core/constants.hpp"
 #include "core/path_utils.hpp"
 #include "core/log.hpp"
+#include "ephemeris/system_manager.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -62,6 +64,7 @@ CloudBoundPyramid build_cloud_bound_pyramid(std::span<const uint8_t> level0, uin
 }
 
 void CloudMaps::init(rhi::VkContext& ctx) {
+    histograms_.clear();
     struct Pack { std::string name; std::vector<uint8_t> bytes; };
     std::vector<Pack> packs;
     uint32_t width = 1, height = 1, mip_count = 1;
@@ -86,11 +89,18 @@ void CloudMaps::init(rhi::VkContext& ctx) {
                     (!packs.empty() && (pack_width != width || pack_height != height)))
                     throw std::runtime_error("Cloud atlas maps must have matching dimensions and complete mip pyramids");
                 uint64_t offset = 0;
+                uint32_t hist_w = 0, hist_h = 0;
+                uint64_t hist_offset = 0;
                 for (uint32_t mip = 0; mip < pack_mips; ++mip) {
                     const auto& level = manifest->at("levels").at(mip);
                     uint32_t w = std::max(pack_width >> mip, 1u), h = std::max(pack_height >> mip, 1u);
                     if (level.at("width") != w || level.at("height") != h || level.at("offset") != offset)
                         throw std::runtime_error("Invalid cloud coverage mip layout");
+                    if (hist_w == 0 && (w <= 256 || mip + 1 == pack_mips)) {
+                        hist_w = w;
+                        hist_h = h;
+                        hist_offset = offset;
+                    }
                     offset += uint64_t(w) * h;
                 }
                 if (std::filesystem::file_size(directory / "coverage.r8") != offset)
@@ -98,6 +108,19 @@ void CloudMaps::init(rhi::VkContext& ctx) {
                 auto bytes = paths::read_binary_file(directory / "coverage.r8");
                 if (!bytes || bytes->size() != offset) throw std::runtime_error("Cannot read cloud coverage pack");
                 width = pack_width; height = pack_height; mip_count = pack_mips;
+                std::array<double, 256> hist_d{};
+                double weight_sum = 0.0;
+                for (uint32_t y = 0; y < hist_h; ++y) {
+                    double wt = std::cos((0.5 - (double(y) + 0.5) / double(hist_h)) * PI);
+                    const uint8_t* row = bytes->data() + hist_offset + size_t(y) * hist_w;
+                    for (uint32_t x = 0; x < hist_w; ++x) hist_d[row[x]] += wt;
+                    weight_sum += wt * double(hist_w);
+                }
+                if (weight_sum > 0.0) {
+                    std::array<float, 256> hist{};
+                    for (size_t k = 0; k < 256; ++k) hist[k] = float(hist_d[k] / weight_sum);
+                    histograms_[name] = hist;
+                }
                 packs.push_back({name, std::move(*bytes)});
             } catch (const std::exception& error) {
                 log::warn("Cloud map '{}': {}", name, error.what());
@@ -171,11 +194,52 @@ void CloudMaps::shutdown(rhi::VkContext& ctx) {
     ctx.destroy_image(atlas_);
     ctx.destroy_image(bounds_);
     layers_.clear();
+    histograms_.clear();
 }
 
 uint32_t CloudMaps::layer(const std::string& name) const noexcept {
     auto found = layers_.find(name);
     return found == layers_.end() ? 0 : found->second;
+}
+
+double CloudMaps::mean_disk_opacity(const ephemeris::CloudDefinition& clouds) const noexcept {
+    if (!clouds.enabled || clouds.coverage <= 0.0 || clouds.density <= 0.0 ||
+        clouds.extinction_per_km <= 0.0 || clouds.thickness_km <= 0.0)
+        return 0.0;
+    static const std::array<double, 256> lut = [] {
+        std::array<double, 256> table{};
+        table[0] = 0.0;
+        table[255] = 1.0;
+        for (size_t k = 1; k < 255; ++k) {
+            double c = double(k) / 255.0;
+            double sum = 0.0;
+            for (int m = 0; m < 32; ++m) {
+                double mu = (double(m) + 0.5) / 32.0;
+                double op = 1.0 - std::pow(1.0 - c, 1.0 / std::max(mu, 0.04));
+                sum += op * 2.0 * mu / 32.0;
+            }
+            table[k] = sum;
+        }
+        return table;
+    }();
+    auto disk_opacity = [&](double c) {
+        double x = std::clamp(c, 0.0, 1.0) * 255.0;
+        size_t lo = std::min(size_t(x), size_t(254));
+        double frac = x - double(lo);
+        return lut[lo] * (1.0 - frac) + lut[lo + 1] * frac;
+    };
+    double mean_cov = 0.0;
+    if (auto found = histograms_.find(clouds.coverage_map); found != histograms_.end()) {
+        double shift = 2.0 * (clouds.coverage - 0.5);
+        for (size_t b = 0; b < 256; ++b) {
+            if (found->second[b] > 0.0f)
+                mean_cov += double(found->second[b]) * disk_opacity(double(b) / 255.0 + shift);
+        }
+    } else {
+        mean_cov = disk_opacity(clouds.coverage);
+    }
+    double optical = 1.0 - std::exp(-clouds.density * clouds.extinction_per_km * clouds.thickness_km);
+    return std::clamp(mean_cov * optical, 0.0, 1.0);
 }
 
 }

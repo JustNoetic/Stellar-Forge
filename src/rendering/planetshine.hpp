@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <span>
 #include <vector>
 
 namespace sf::rendering {
@@ -27,7 +28,8 @@ inline double planetshine_phase(double cosine, double radius_distance) {
 
 inline std::vector<PlanetshineGPU> prepare_planetshine(const ephemeris::SystemSnapshot& system,
                                                       bool enabled, bool hdr, uint32_t limit = 1024,
-                                                      SurfaceMaterialCache* prepared_materials = nullptr) {
+                                                      SurfaceMaterialCache* prepared_materials = nullptr,
+                                                      std::span<const glm::vec3> source_albedos = {}) {
     uint32_t count = std::min(uint32_t(system.size()), limit);
     std::vector<PlanetshineGPU> result(count);
     if (!enabled) return result;
@@ -87,7 +89,9 @@ inline std::vector<PlanetshineGPU> prepare_planetshine(const ephemeris::SystemSn
             if (distance2 <= radius*radius*1.1025 || radius*radius < distance2*1e-8) continue;
             double distance = std::sqrt(distance2);
             glm::dvec3 direction = delta/distance, color(0.0), direction_moment(0.0);
-            glm::dvec3 albedo = glm::clamp(glm::dvec3(source.definition.color_rgb), glm::dvec3(0.0), glm::dvec3(1.0));
+            glm::dvec3 albedo = j < source_albedos.size()
+                ? glm::clamp(glm::dvec3(source_albedos[j]), glm::dvec3(0.0), glm::dvec3(1.0))
+                : glm::clamp(glm::dvec3(source.definition.color_rgb), glm::dvec3(0.0), glm::dvec3(1.0));
             for (uint32_t s = 0; s < star_count; ++s) {
                 const auto& light = lighting[j][s];
                 if (glm::dot(light.color, light.color) == 0.0) continue;
@@ -111,6 +115,15 @@ inline std::vector<PlanetshineGPU> prepare_planetshine(const ephemeris::SystemSn
             *weakest = weight;
             result[i].direction[slot] = {glm::vec3(glm::dot(direction_moment, direction_moment) > 1e-30 ? glm::normalize(direction_moment) : direction), float(std::asin(std::min(radius/distance, 1.0)))};
             result[i].irradiance[slot] = {glm::vec3(color), 0.0f};
+        }
+        for (size_t a = 0; a < PLANETSHINE_LIGHTS; ++a) {
+            for (size_t b = a+1; b < PLANETSHINE_LIGHTS; ++b) {
+                if (weights[b] > weights[a]) {
+                    std::swap(weights[a], weights[b]);
+                    std::swap(result[i].direction[a], result[i].direction[b]);
+                    std::swap(result[i].irradiance[a], result[i].irradiance[b]);
+                }
+            }
         }
     }
     return result;

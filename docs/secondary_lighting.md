@@ -10,12 +10,14 @@ Settings → Lighting & Rings → **Direct sunlight only** is available for atmo
 ## Planetshine
 
 `src/rendering/planetshine.hpp` prepares up to four separate reflected sources per
-receiver from double precision snapshot positions. The source radiance uses
-`color_rgb` as its uniform linear reflectance, stellar luminosity and inverse-square
-star distance, and the integrated material phase response. Receiver irradiance scales
-with `source_radius² / receiver_distance²`. Non-HDR mode replaces only the stellar
-inverse-square scale with one, matching direct lighting. The original artistic 1.5
-multiplier is absent.
+receiver from double precision snapshot positions, sorted brightest-first by luminance.
+The source radiance uses an effective disk reflectance (`color_rgb` or, when enabled and
+loaded, the solid-angle-weighted linear mean of `ColorSource` root tiles, mixed with
+disk-projected cloud coverage opacity and a thin-Rayleigh single-scattering layer),
+stellar luminosity and inverse-square star distance, and the integrated material phase
+response. Receiver irradiance scales with `source_radius² / receiver_distance²`. Non-HDR
+mode replaces only the stellar inverse-square scale with one, matching direct lighting.
+The original artistic 1.5 multiplier is absent.
 
 The original Lambert/Hapke photometry lives in `src/physics/surface_material.hpp`
 and `shaders/common/surface_material.glsl`. Moon/Luna automatically resolve to lunar
@@ -46,11 +48,15 @@ radius, pole, sources, material, atmosphere record or any surface atmosphere LUT
 changes; paused scenes bake once. The layer (plus one) travels in
 `shine_irradiance[0].w`. The map ignores shading normals, so moonlight shows no
 normal-map relief, like surface ringshine. RGBA16F is insufficient: unexposed moonlight
-irradiance (~1e-9) underflows half precision. Hapke receivers, receivers beyond 32 layers
-and sub-pixel bodies keep the per-fragment path, which skips sources below both the shading
-and geometric horizons and sources under 0.1% of the light already accumulated at four
-times their unit response. On the Saturn-midnight benchmark the map removes 0.6 ms
-(1440p) and matches the per-fragment result within 0.15% at exposure ×10⁴.
+irradiance (~1e-9) underflows half precision. Hapke receivers, receivers beyond 32 layers and sub-pixel bodies keep the per-fragment
+path, which skips sources below both the shading and geometric horizons, updates the
+accumulated luminance floor after each brightest-first source, and evaluates a 1-sample
+finite-disk response (`surface_planetshine_light`) using `stellar_lambert_irradiance`
+or `surface_hapke_disk_response` (centroid horizon elevation + analytically broadened
+opposition/roughness half-angle `0.33 * radius`, rather than the 32-sample stellar-disk
+atmospheric quadrature). Airless receivers in `surface_stellar_light` use the same
+closed-form Lambert / 1-sample Hapke disk response. On the Saturn-midnight benchmark the
+map removes 0.6 ms (1440p) and matches the per-fragment result within 0.15% at exposure ×10⁴.
 
 Emitter eclipses use the original smooth angular penumbra and source/caster area
 bounds. Finite-distance phase remapping extinguishes the visible illuminated cap at
@@ -64,7 +70,8 @@ sources, including finite-disk sampling near horizons and opposition. Terrain bo
 its emission cosine using the visible geometric triangle, as in the original.
 Unresolved body billboards use the same integrated phase curves, rather than a
 separate approximate surface model. Existing surface textures remain receiver albedo;
-source texture means and cloud reflectance are deferred.
+effective source reflectance incorporates loaded surface tile means, disk-projected
+cloud opacity, and thin-Rayleigh atmospheric scattering.
 
 Candidates below `radius² / distance² = 1e-8` are discarded and the four brightest
 remaining sources are selected by luminance. Stars, black holes and spacecraft do
@@ -133,9 +140,10 @@ The default shared bake is described in [the shared-light report](atmosphere_sec
 
 ## Approximation limits
 
-- Source reflectance is configured color; texture means and cloud reflectance remain
-  deferred. Neither spin-dependent source texture integration nor recursive bounces
-  are implemented.
+- Source reflectance uses a single disk-averaged albedo (effective texture mean,
+  disk-projected cloud opacity, and thin-Rayleigh reflectance) rather than textured or
+  phase-resolved crescent surface/cloud integration. Neither spin-dependent texture
+  integration nor recursive bounces are implemented.
 - External sources use receiver-center distances and directions. Five-point angular
   sampling accounts for disk extent at the receiving BRDF but does not resolve a
   textured source image or per-point parallax across a body.
