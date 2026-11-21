@@ -510,7 +510,12 @@ void App::on_key(int key, int, int action, int mods) {
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
         simulation_.apply(ephemeris::SetPaused{!simulation_.clock().paused});
     } else if (key == GLFW_KEY_F && action == GLFW_PRESS) {
-        camera_.snap_to_tracked(scene());
+        if (ui_state_.inspected_body >= 0 && ui_state_.inspected_body < static_cast<int>(scene().size())) {
+            bool is_primary = comparisons_.empty() || composer_.map().source(size_t(ui_state_.inspected_body)).slot == 0;
+            camera_.center_body(ui_state_.inspected_body, scene(), is_primary && ui_state_.inspect_barycenter);
+        } else {
+            camera_.snap_to_tracked(scene());
+        }
     } else if (key == GLFW_KEY_R) {
         simulation_.apply(ephemeris::SetTimeWarp{1.0});
     } else if (key == GLFW_KEY_BACKSPACE && action == GLFW_PRESS) {

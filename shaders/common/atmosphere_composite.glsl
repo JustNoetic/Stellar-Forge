@@ -515,7 +515,7 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
         surface_seen = distance < closest+top_radius();
         if (span > 0.0) path = depth_endpoint_path(distance, d, segment, span, finite_endpoint);
     }
-    if (f.resolved) {
+    if (f.resolved || surface_seen) {
         L = vec3(0.0);
         T = vec3(1.0);
         if (span > 0.0 && !atmosphere_transport_ray(pixel, ndc, d, segment, span, depth, shadow_layer, cache, L, T))
@@ -527,8 +527,7 @@ bool limb_transport(ivec2 pixel, LimbFootprint f, vec2 ndc, vec3 d, vec2 segment
         limb_integrate(f, false, L, ground, ground_weight);
         limb_integrate(f, true, L, sky, sky_weight);
         float space = max(1.0-ground_weight-sky_weight, 0.0);
-        T = surface_seen && ground_weight > 0.0 ? ground/ground_weight
-          : sky_weight+space > 0.0 ? (sky+space)/(sky_weight+space) : ground/max(ground_weight, 1e-20);
+        T = sky_weight+space > 0.0 ? (sky+space)/(sky_weight+space) : ground/max(ground_weight, 1e-20);
         if (span > 0.0) atmosphere_shadow_loss(pixel, finite_endpoint ? depth : 0.0, shadow_layer, L);
         L *= atm.depth_params.w;
     }

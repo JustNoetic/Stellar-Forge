@@ -114,6 +114,30 @@ void apply_orbit_rotation(Camera& cam, double dx, double dy, double sensitivity)
     }
 }
 
+void aim_at_centered(Camera& cam, const ephemeris::SystemSnapshot& sys) {
+    if (cam.centered_idx < 0 || cam.centered_idx >= static_cast<int>(sys.size())) {
+        return;
+    }
+    glm::dvec3 target_pos{0.0};
+    if (cam.centered_barycenter) {
+        auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
+        target_pos = ecliptic_to_render(EclipticPosition{coords.subsystems[cam.centered_idx].position}).value;
+    } else {
+        target_pos = sys.body(cam.centered_idx).render.position.value;
+    }
+    glm::dvec3 eye = cam.origin_render + cam.cam_pos_rel;
+    glm::dvec3 to_target = target_pos - eye;
+    double dist = glm::length(to_target);
+    if (dist > 1e-12) {
+        glm::dvec3 fwd = to_target / dist;
+        auto [yn, pn] = forward_to_angles(fwd);
+        cam.yaw_deg = cam.yaw_actual_deg = yn;
+        cam.pitch_deg = cam.pitch_actual_deg = pn;
+        cam.up = orthogonalize_up(cam.up, fwd);
+        cam.cam_look_aim = false;
+    }
+}
+
 } // namespace
 
 double ellipsoid_surface_radius(double r_eq, double f, const glm::dvec3& pole, const glm::dvec3& dir) noexcept {
@@ -228,27 +252,6 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
         origin_render = target_au;
     }
 
-    if (centered_idx >= 0 && centered_idx < static_cast<int>(sys.size())) {
-        glm::dvec3 target_pos{0.0};
-        if (centered_barycenter) {
-            auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
-            target_pos = ecliptic_to_render(EclipticPosition{coords.subsystems[centered_idx].position}).value;
-        } else {
-            target_pos = sys.body(centered_idx).render.position.value;
-        }
-        glm::dvec3 eye = origin_render + cam_pos_rel;
-        glm::dvec3 to_target = target_pos - eye;
-        double dist = glm::length(to_target);
-        if (dist > 1e-12) {
-            glm::dvec3 fwd = to_target / dist;
-            auto [yn, pn] = forward_to_angles(fwd);
-            yaw_deg = yaw_actual_deg = yn;
-            pitch_deg = pitch_actual_deg = pn;
-            up = orthogonalize_up(up, fwd);
-            cam_look_aim = true;
-        }
-    }
-
     double ref_r = track_r > 0.0 ? ellipsoid_surface_radius(track_r, track_f, track_pole, cam_pos_rel) : 0.0;
     reference_altitude_au = std::max(0.0, glm::length(cam_pos_rel) - ref_r);
     is_near_surface = (track_r > 0.0 && reference_altitude_au < ROT_FOLLOW_ALT_AU);
@@ -303,6 +306,27 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
         prev_spin_track_idx = -1;
     }
 
+    glm::dvec3 front = forward_dir();
+    glm::dvec3 right_v = right_dir();
+    glm::dvec3 move{0.0};
+    if (key_w) move += front;
+    if (key_s) move -= front;
+    if (key_d) move += right_v;
+    if (key_a) move -= right_v;
+
+    double nm = glm::length(move);
+    if (nm > 1e-12) {
+        if (cam_look_aim) {
+            auto [yn, pn] = forward_to_angles(front);
+            yaw_deg = yaw_actual_deg = yn;
+            pitch_deg = pitch_actual_deg = pn;
+            cam_look_aim = false;
+        }
+        cam_pos_rel += (move / nm) * flight_speed_au_s * dt_sec;
+    }
+
+    aim_at_centered(*this, sys);
+
     horizon_settling = false;
     horizon_roll_error_deg = 0.0;
     if (horizon_align && is_near_surface && dt_sec > 0.0 && !key_q && !key_e) {
@@ -334,25 +358,6 @@ void Camera::update(units::Seconds elapsed, const ephemeris::SystemSnapshot& sys
         up = glm::normalize(rodrigues_rotation(fwd, roll_speed) * up_dir());
     }
 
-    glm::dvec3 front = forward_dir();
-    glm::dvec3 right_v = right_dir();
-    glm::dvec3 move{0.0};
-    if (key_w) move += front;
-    if (key_s) move -= front;
-    if (key_d) move += right_v;
-    if (key_a) move -= right_v;
-
-    double nm = glm::length(move);
-    if (nm > 1e-12) {
-        if (cam_look_aim) {
-            auto [yn, pn] = forward_to_angles(front);
-            yaw_deg = yaw_actual_deg = yn;
-            pitch_deg = pitch_actual_deg = pn;
-            cam_look_aim = false;
-        }
-        cam_pos_rel += (move / nm) * flight_speed_au_s * dt_sec;
-    }
-
     cam_vel = (cam_pos_rel - rel_prev) / std::max(dt_sec, 1e-9);
 }
 
@@ -380,7 +385,7 @@ void Camera::on_cursor_pos(double xpos, double ypos, const ephemeris::SystemSnap
         return;
     }
 
-    if (std::abs(dx) > 0.0 || std::abs(dy) > 0.0) {
+    if (!(left_dragging && right_dragging) && (std::abs(dx) > 0.0 || std::abs(dy) > 0.0)) {
         centered_idx = -1;
     }
 
@@ -422,7 +427,6 @@ void Camera::on_scroll(double yoffset, bool shift_held) {
         fov_deg = std::clamp(fov_deg, 0.001, 120.0);
     } else if (movement_mode == 1) {
         approach_delta += yoffset * 0.15;
-        centered_idx = -1;
     } else {
         flight_speed_au_s = std::clamp(flight_speed_au_s * std::pow(2.0, yoffset), 1e-12, MAX_FLIGHT_SPEED_AU_S);
     }
@@ -505,26 +509,8 @@ void Camera::center_body(int body_idx, const ephemeris::SystemSnapshot& sys, boo
     }
     centered_idx = body_idx;
     centered_barycenter = is_barycenter;
-
-    glm::dvec3 target_pos{0.0};
-    if (is_barycenter) {
-        auto coords = ephemeris::extract_jacobi(sys.definition(), sys.motions(), sys.orbit_hierarchy());
-        target_pos = ecliptic_to_render(EclipticPosition{coords.subsystems[body_idx].position}).value;
-    } else {
-        target_pos = sys.body(body_idx).render.position.value;
-    }
-    glm::dvec3 eye = eye_pos_render().value;
-    glm::dvec3 to_target = target_pos - eye;
-    double dist = glm::length(to_target);
-    if (dist > 1e-12) {
-        glm::dvec3 fwd = to_target / dist;
-        auto [yn, pn] = forward_to_angles(fwd);
-        yaw_deg = yaw_actual_deg = yn;
-        pitch_deg = pitch_actual_deg = pn;
-        up = orthogonalize_up(up, fwd);
-        cam_look_aim = true;
-        approach_delta = 0.0;
-    }
+    aim_at_centered(*this, sys);
+    approach_delta = 0.0;
 }
 
 glm::mat4 Camera::view_matrix_origin_relative() const noexcept {

@@ -308,7 +308,12 @@ void App::render_main_menu_bar(rendering::RenderSettings& render_draft) {
             camera_.movement_mode = 1;
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Snap Look to Tracked (F)")) {
+        bool has_selection = ui_state_.inspected_body >= 0 && ui_state_.inspected_body < static_cast<int>(scene().size());
+        if (ImGui::MenuItem("Center Selected Object (F)", nullptr, false, has_selection)) {
+            bool is_primary = comparisons_.empty() || composer_.map().source(size_t(ui_state_.inspected_body)).slot == 0;
+            camera_.center_body(ui_state_.inspected_body, scene(), is_primary && ui_state_.inspect_barycenter);
+        }
+        if (ImGui::MenuItem("Snap Look to Tracked")) {
             camera_.snap_to_tracked(scene());
         }
         ImGui::MenuItem("Auto Horizon Level (< 200 km)", nullptr, &camera_.horizon_align);
