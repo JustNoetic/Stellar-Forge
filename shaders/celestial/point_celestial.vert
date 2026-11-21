@@ -54,20 +54,31 @@ float point_visibility(vec3 center, uint self_idx, float stellar_radius) {
     return visibility;
 }
 
+vec4 star_direction_distance(uint body, uint star) {
+    if (u_scene.eclipse_params.z == 0u) {
+        vec3 delta = u_scene.stars_pos_radius[star].xyz - bodies[body].pos_radius.xyz;
+        float d = max(length(delta), 1e-12);
+        return vec4(delta / d, d);
+    }
+    uint offset = u_scene.eclipse_params.z + (body * u_scene.num_stars + star) * 4u;
+    return uintBitsToFloat(uvec4(eclipse_words[offset], eclipse_words[offset + 1u], eclipse_words[offset + 2u], eclipse_words[offset + 3u]));
+}
+
 vec3 disc_radiance(BodyInstanceGPU b, vec3 V) {
     if (b.color_is_star.w < 0.5) {
         vec3 sum = vec3(0.0);
         for (uint s = 0; s < u_scene.num_stars; ++s) {
             if (!star_lights_body(uint(b.spin_flags.w), s)) continue;
-            vec3 delta = u_scene.stars_pos_radius[s].xyz-b.pos_radius.xyz;
-            float distance = max(length(delta), 1e-12);
+            vec4 star_dir_dist = star_direction_distance(uint(b.spin_flags.w), s);
+            float distance = max(star_dir_dist.w, 1e-12);
+            vec3 L = star_dir_dist.xyz;
             float flux = u_scene.hdr_enabled != 0u ? u_scene.stars_color_lum[s].w/(distance*distance) : 1.0;
             float radius = asin(clamp(u_scene.stars_pos_radius[s].w/distance, 0.0, 0.84));
             vec3 eclipse = u_scene.eclipse_params.y == 0u ? vec3(1.0)
                 : evaluate_eclipse_shadow(b.pos_radius.xyz, u_scene.stars_pos_radius[s].xyz, u_scene.stars_pos_radius[s].w, uint(b.spin_flags.w), s);
             vec4 air = atmosphere_points[uint(b.spin_flags.w)*16u+s];
             vec3 response = air.w > 0.5 ? air.rgb
-                : b.color_is_star.rgb*material_disk_response(b.material, dot(V, delta/distance), radius);
+                : b.color_is_star.rgb*material_disk_response(b.material, dot(V, L), radius);
             sum += u_scene.stars_color_lum[s].rgb*flux*response*eclipse;
         }
         for (int k = 0; k < 4; ++k)

@@ -663,7 +663,8 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         }
     }
 
-    if (ubo.num_stars == 0) {
+    bool has_real_stars = ubo.num_stars > 0;
+    if (!has_real_stars) {
         ubo.num_stars = 1;
         ubo.stars_pos_radius[0] = glm::vec4(glm::vec3(-eye_pos), static_cast<float>(SOLAR_RADII_TO_AU));
         ubo.stars_color_lum[0] = glm::vec4(1.0f, 0.95f, 0.90f, 1.0f);
@@ -824,6 +825,20 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         ubo.eclipse_params.y = uint32_t(eclipse_words_.size());
         eclipse_words_.resize(eclipse_words_.size()+eclipse_records.size()*4);
         std::memcpy(eclipse_words_.data()+ubo.eclipse_params.y, eclipse_records.data(), eclipse_records.size_bytes());
+    }
+    ubo.eclipse_params.z = uint32_t(eclipse_words_.size());
+    eclipse_words_.reserve(ubo.eclipse_params.z + size_t(count) * ubo.num_stars * 4u);
+    for (uint32_t i = 0; i < count; ++i) {
+        const glm::dvec3& body_pos = sys.body(i).render.position.value;
+        for (uint32_t s = 0; s < ubo.num_stars; ++s) {
+            glm::dvec3 star_pos = has_real_stars ? sys.body(star_bodies[s]).render.position.value : glm::dvec3(0.0);
+            glm::dvec3 delta = star_pos - body_pos;
+            double dist = glm::length(delta);
+            glm::vec3 dir = dist > 1e-12 ? glm::vec3(delta / dist) : glm::vec3(0.0f, 0.0f, 1.0f);
+            glm::vec4 packed(dir, static_cast<float>(dist));
+            auto words = std::bit_cast<std::array<uint32_t, 4>>(packed);
+            eclipse_words_.insert(eclipse_words_.end(), words.begin(), words.end());
+        }
     }
     auto& eclipse_buffer = eclipse_ssbos_[f_idx];
     VkDeviceSize eclipse_bytes = eclipse_words_.size() * sizeof(uint32_t);
