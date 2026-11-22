@@ -22,13 +22,22 @@ vec3 cloud_light_response(SurfaceFluidGPU f, SurfaceAtmosphereSample lookup, boo
     return transmission*diffuse+sky*0.5;
 }
 
-vec4 cloud_sheet_color(uint body, vec3 ray, vec3 local, float distance, vec3 pole, float flattening, mat3 rotation) {
+vec4 cloud_sheet_color(uint body, vec3 ray, vec3 ray_dx, vec3 ray_dy, vec3 local, float distance, vec3 pole, float flattening, mat3 rotation) {
     SurfaceFluidGPU f = fluids[body];
     vec3 normal = normalize(local+pole*dot(local, pole)*(flattening*(2.0+flattening)));
-    float cosine = max(abs(dot(normal, ray)), 0.04);
-    float pixel_angle = 1.0/max(u_scene.screen_params.y*u_scene.screen_params.z, 1.0);
-    float footprint = distance*FLUID_AU_KM*pixel_angle/cosine;
-    CloudWeather weather = cloud_weather(body, normalize(transpose(rotation)*local), footprint);
+    float raw_cos = dot(normal, ray);
+    float cosine = max(abs(raw_cos), 0.04);
+    float safe_cos = raw_cos >= 0.0 ? cosine : -cosine;
+    vec3 d_local_dx = distance*(ray_dx-ray*(dot(ray_dx, normal)/safe_cos));
+    vec3 d_local_dy = distance*(ray_dy-ray*(dot(ray_dy, normal)/safe_cos));
+    mat3 to_fixed = transpose(rotation);
+    float inv_len = 1.0/max(length(local), 1e-12);
+    vec3 fixed_dir = normalize(to_fixed*local);
+    vec3 tx = to_fixed*d_local_dx*inv_len;
+    vec3 ty = to_fixed*d_local_dy*inv_len;
+    vec3 d_dir_dx = tx-fixed_dir*dot(fixed_dir, tx);
+    vec3 d_dir_dy = ty-fixed_dir*dot(fixed_dir, ty);
+    CloudWeather weather = cloud_weather_grad(body, fixed_dir, d_dir_dx, d_dir_dy);
     float opacity = 1.0-pow(max(1.0-weather.coverage, 0.0), 1.0/cosine);
     opacity *= 1.0-exp(-f.cloud_shape.w*f.cloud_shape.z);
     if (opacity < 1e-3) return vec4(0.0);
@@ -77,6 +86,8 @@ void render_cloud_sheet() {
     vec3 pole = body_pole(b);
     float flattening = fluid_flattening(b);
     vec3 ray = normalize(f_world_pos);
+    vec3 ray_dx = dFdx(ray);
+    vec3 ray_dy = dFdy(ray);
     float anchor_distance = length(f_world_pos);
     vec3 origin = fluid_spherical(f_body_offset, pole, flattening);
     vec3 direction = fluid_spherical(ray, pole, flattening);
@@ -93,7 +104,7 @@ void render_cloud_sheet() {
     float distance = anchor_distance+hit;
     if (distance <= 1e-12 || hit >= ground_offset) discard;
     vec3 local = f_body_offset+ray*hit;
-    vec4 color = cloud_sheet_color(f_body_idx, ray, local, distance, pole, flattening, body_surface_rotation(pole, b.spin_flags.x));
+    vec4 color = cloud_sheet_color(f_body_idx, ray, ray_dx, ray_dy, local, distance, pole, flattening, body_surface_rotation(pole, b.spin_flags.x));
     color *= weight;
     if (color.a < 1e-3) discard;
     float depth = cloud_sheet_depth(b, local);

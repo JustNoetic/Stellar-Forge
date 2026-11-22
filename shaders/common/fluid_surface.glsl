@@ -119,6 +119,54 @@ CloudWeather cloud_weather(uint body, vec3 fixed_direction, float footprint_km) 
     return cloud_weather_lod(body, fixed_direction, footprint_km, 1e6);
 }
 
+CloudWeather cloud_weather_grad(uint body, vec3 fixed_direction, vec3 d_dir_dx, vec3 d_dir_dy) {
+    SurfaceFluidGPU f = fluids[body];
+    CloudWeather weather;
+    weather.coverage = 0.0;
+    if (f.cloud_shape.x <= 0.0) return weather;
+    vec3 dir = fluid_rotate_pole(fixed_direction, f.cloud_motion.y);
+    float scale = f.cloud_motion.w/max(f.cloud_motion.x, 1e-3);
+    vec3 evolution = f.cloud_motion.z*vec3(0.31, 0.17, 0.23);
+    float coverage;
+    if (f.cloud_style.w > 0.5) {
+        vec3 ddx = fluid_rotate_pole(d_dir_dx, f.cloud_motion.y);
+        vec3 ddy = fluid_rotate_pole(d_dir_dy, f.cloud_motion.y);
+        float polar = max(1.0-bodies[body].pole_oblateness.w, 0.05);
+        float p2 = polar*polar;
+        float r2 = dot(dir.xz, dir.xz);
+        float r = sqrt(r2);
+        vec2 uv = vec2(atan(dir.x, dir.z)/(2.0*FLUID_PI)+0.5,
+            0.5-atan(dir.y/p2, r)/FLUID_PI);
+        float r2_u = max(r2, 4e-4);
+        float inv_r = r > 1e-4 ? 1.0/r : 0.0;
+        float denom_v = FLUID_PI*p2*max(r2+(dir.y*dir.y)/(p2*p2), 1e-6);
+        vec2 d_uv_dx = vec2(
+            (dir.z*ddx.x-dir.x*ddx.z)/(2.0*FLUID_PI*r2_u),
+            -(r*ddx.y-dir.y*(dir.x*ddx.x+dir.z*ddx.z)*inv_r)/denom_v
+        );
+        vec2 d_uv_dy = vec2(
+            (dir.z*ddy.x-dir.x*ddy.z)/(2.0*FLUID_PI*r2_u),
+            -(r*ddy.y-dir.y*(dir.x*ddy.x+dir.z*ddy.z)*inv_r)/denom_v
+        );
+        vec2 dimensions = vec2(textureSize(cloud_coverage_maps, 0).xy);
+        vec2 gx = d_uv_dx*dimensions;
+        vec2 gy = d_uv_dy*dimensions;
+        float a = dot(gx, gx), b = dot(gx, gy), c = dot(gy, gy);
+        float disc = sqrt(max((a-c)*(a-c)+4.0*b*b, 0.0));
+        float min_texel_step = sqrt(max(0.5*(a+c-disc), 0.0));
+        float approx_lod = clamp(log2(max(min_texel_step, 1.0)), 0.0, float(textureQueryLevels(cloud_coverage_maps)-1));
+        float half_texel = 0.5/float(textureSize(cloud_coverage_maps, int(ceil(approx_lod))).y);
+        uv.y = clamp(uv.y, half_texel, 1.0-half_texel);
+        coverage = textureGrad(cloud_coverage_maps, vec3(uv, f.cloud_style.w-1.0), d_uv_dx, d_uv_dy).r;
+    } else {
+        float w = fbm_noise(dir*scale+evolution, 4, 2.07, 0.5);
+        w += 0.04*cos(asin(clamp(dir.y, -1.0, 1.0))*6.0);
+        coverage = smoothstep(0.35, 0.65, w);
+    }
+    weather.coverage = clamp(coverage+2.0*(f.cloud_shape.x-0.5), 0.0, 1.0);
+    return weather;
+}
+
 float ocean_beckmann_lambda(float cosine, float roughness) {
     cosine = clamp(cosine, 1e-3, 1.0);
     float tangent = sqrt(max(1.0-cosine*cosine, 0.0))/cosine;

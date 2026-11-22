@@ -161,6 +161,7 @@ public:
     VkSampler sampler_linear_clamp() const noexcept { return sampler_linear_clamp_; }
     VkSampler sampler_linear_repeat() const noexcept { return sampler_linear_repeat_; }
     VkSampler sampler_nearest_clamp() const noexcept { return sampler_nearest_clamp_; }
+    VkSampler sampler_equirect_aniso() const noexcept { return sampler_equirect_aniso_; }
 
 private:
     void create_swapchain();
@@ -207,6 +208,7 @@ private:
     VkSampler sampler_linear_clamp_ = VK_NULL_HANDLE;
     VkSampler sampler_linear_repeat_ = VK_NULL_HANDLE;
     VkSampler sampler_nearest_clamp_ = VK_NULL_HANDLE;
+    VkSampler sampler_equirect_aniso_ = VK_NULL_HANDLE;
 
     std::unordered_map<std::string, double> gpu_timings_ms_;
     bool capture_gpu_timings_ = false;

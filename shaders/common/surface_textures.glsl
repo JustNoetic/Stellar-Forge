@@ -85,18 +85,59 @@ vec4 surface_albedo_sample_at(uint body, vec2 uv01, uint face, float raw_lod, ve
     return mix(a, b, frac);
 }
 
+struct SurfaceFootprint {
+    float raw_lod;
+    vec3 major_dir;
+    uint taps;
+};
+
+SurfaceFootprint surface_footprint(vec3 ddx, vec3 ddy, float tex_error_px) {
+    float a = dot(ddx, ddx);
+    float b = dot(ddx, ddy);
+    float c = dot(ddy, ddy);
+    float trace = a + c;
+    float diff = a - c;
+    float disc = sqrt(max(diff * diff + 4.0 * b * b, 0.0));
+    float major_len = sqrt(max(0.5 * (trace + disc), 0.0));
+    float minor_len = sqrt(max(0.5 * (trace - disc), 0.0));
+    const float MAX_ANISO = 8.0;
+    float aniso = clamp(major_len / max(minor_len, 1e-9), 1.0, MAX_ANISO);
+    uint taps = aniso <= 1.15 ? 1u : uint(clamp(ceil(aniso), 2.0, MAX_ANISO));
+    float footprint = major_len / float(taps);
+    vec2 axis = disc > 1e-18
+        ? normalize(diff >= 0.0 ? vec2(diff + disc, 2.0 * b) : vec2(2.0 * b, -diff + disc))
+        : vec2(1.0, 0.0);
+    SurfaceFootprint result;
+    result.raw_lod = log2(3.0 / max(128.0 * footprint * tex_error_px, 1e-9));
+    result.major_dir = axis.x * ddx + axis.y * ddy;
+    result.taps = taps;
+    return result;
+}
+
+vec4 surface_albedo_sample_aniso(uint body, vec3 direction, vec2 uv01, uint face, SurfaceFootprint fp, vec3 fallback) {
+    if (fp.taps <= 1u) return surface_albedo_sample_at(body, uv01, face, fp.raw_lod, fallback);
+    if (surface_words[body*4u] == 0u) return vec4(fallback, 0.0);
+    vec4 accum = vec4(0.0);
+    for (uint i = 0u; i < fp.taps; ++i) {
+        float t = (float(i) + 0.5) / float(fp.taps) - 0.5;
+        vec3 tap_dir = normalize(direction + t * fp.major_dir);
+        vec3 tap_face_uv = surface_face_uv(tap_dir);
+        vec2 tap_uv01 = clamp(tap_face_uv.xy * 0.5 + 0.5, 0.0, 1.0);
+        accum += surface_albedo_sample_at(body, tap_uv01, uint(tap_face_uv.z), fp.raw_lod, fallback);
+    }
+    return accum / float(fp.taps);
+}
+
 vec3 surface_albedo_at(uint body, vec2 uv01, uint face, float raw_lod, vec3 fallback) {
     return surface_albedo_sample_at(body, uv01, face, raw_lod, fallback).rgb;
 }
 
 vec3 surface_albedo(uint body, vec3 local_direction, vec3 fallback) {
     vec3 direction = normalize(local_direction);
-    float footprint = max(length(dFdx(direction)), length(dFdy(direction)));
-    uint base = surface_words[body*4u];
-    if (base == 0u) return fallback;
+    SurfaceFootprint fp = surface_footprint(dFdx(direction), dFdy(direction), 1.0);
+    if (surface_words[body*4u] == 0u) return fallback;
     vec3 face_uv = surface_face_uv(direction);
-    float raw_lod = log2(3.0/max(128.0*footprint, 1e-9));
-    return surface_albedo_at(body, clamp(face_uv.xy*.5+.5, 0.0, 1.0), uint(face_uv.z), raw_lod, fallback);
+    return surface_albedo_sample_aniso(body, direction, clamp(face_uv.xy*.5+.5, 0.0, 1.0), uint(face_uv.z), fp, fallback).rgb;
 }
 
 vec3 surface_normal_level(uint base, vec3 face_uv, uint level, vec3 fallback) {
@@ -211,6 +252,24 @@ vec3 surface_local_normal_from_lookup(SurfaceNormalLookup lookup, vec3 local_fal
     return normalize(mix(a, b, lookup.blend));
 }
 
+vec3 surface_local_normal_aniso(uint body, vec3 direction, SurfaceNormalLookup center_lookup,
+                                  SurfaceFootprint fp, vec3 local_fallback) {
+    if (fp.taps <= 1u) return surface_local_normal_from_lookup(center_lookup, local_fallback);
+    uint flags = normal_lookup_flags(center_lookup);
+    uint coarse_slot = normal_lookup_coarse_slot(center_lookup);
+    if ((flags & 1u) == 0u || coarse_slot == 0u) return normalize(local_fallback);
+    vec3 accum = vec3(0.0);
+    for (uint i = 0u; i < fp.taps; ++i) {
+        float t = (float(i) + 0.5) / float(fp.taps) - 0.5;
+        vec3 tap_dir = normalize(direction + t * fp.major_dir);
+        vec3 tap_face_uv = surface_face_uv(tap_dir);
+        vec2 tap_uv01 = clamp(tap_face_uv.xy * 0.5 + 0.5, 0.0, 1.0);
+        SurfaceNormalLookup tap_lookup = surface_normal_lookup_at(body, tap_uv01, uint(tap_face_uv.z), fp.raw_lod);
+        accum += surface_local_normal_from_lookup(tap_lookup, local_fallback);
+    }
+    return normalize(accum);
+}
+
 vec3 surface_shading_normal_from_lookup(SurfaceNormalLookup lookup, vec3 fallback, mat3 rotation) {
     uint flags = normal_lookup_flags(lookup);
     uint coarse_slot = normal_lookup_coarse_slot(lookup);
@@ -225,5 +284,10 @@ vec3 surface_shading_normal_from_lookup(SurfaceNormalLookup lookup, vec3 fallbac
 }
 
 vec3 surface_shading_normal(uint body, vec3 local_direction, vec3 fallback, mat3 rotation) {
-    return surface_shading_normal_from_lookup(surface_normal_lookup(body, local_direction), fallback, rotation);
+    vec3 direction = normalize(local_direction);
+    SurfaceFootprint fp = surface_footprint(dFdx(direction), dFdy(direction), 1.0);
+    vec3 face_uv = surface_face_uv(direction);
+    SurfaceNormalLookup center_lookup = surface_normal_lookup_at(body, clamp(face_uv.xy*.5+.5, 0.0, 1.0), uint(face_uv.z), fp.raw_lod);
+    if (fp.taps <= 1u) return surface_shading_normal_from_lookup(center_lookup, fallback, rotation);
+    return normalize(rotation * surface_local_normal_aniso(body, direction, center_lookup, fp, transpose(rotation)*fallback));
 }

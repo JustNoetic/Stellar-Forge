@@ -330,12 +330,16 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     };
     uint32_t count = std::min(static_cast<uint32_t>(sys.size()), MAX_CELESTIAL_BODIES);
     measure("cpu_refraction_prepare_ms", [&] { refraction_.prepare(cmd, ctx, cam, sys, settings); });
-    measure("cpu_textures_prepare_ms", [&] { textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled); });
+    measure("cpu_textures_prepare_ms", [&] {
+        textures_.prepare(cmd, ctx, cam, sys, extent, settings.surface_textures_enabled,
+            false, false, double(settings.surface_texture_error_pixels));
+    });
     measure("cpu_normals_prepare_ms", [&] {
         normals_.prepare(cmd, ctx, cam, sys, extent,
             settings.terrain_imported_enabled && settings.terrain_normal_maps_enabled,
             settings.terrain_imported_enabled && settings.terrain_self_shadows_enabled,
-            settings.oceans_enabled);
+            settings.oceans_enabled,
+            double(settings.surface_texture_error_pixels));
     });
     measure("cpu_rings_prepare_ms", [&] { rings_.prepare(cmd, ctx, cam, sys, count, extent, &refraction_.host()); });
     measure("cpu_ringshine_prepare_ms", [&] {
@@ -638,6 +642,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     ubo.projection = proj;
     ubo.screen_params = {fb_w, fb_h, fov_factor, settings.exposure};
     ubo.point_params.x = std::clamp(settings.star_point_size, 1.5f, 6.0f);
+    ubo.point_params.y = std::clamp(settings.surface_texture_error_pixels, 0.125f, 4.0f);
     ubo.num_bodies = count;
     ubo.hdr_enabled = settings.hdr_enabled ? 1u : 0u;
     ubo.num_ring_hosts = (settings.show_rings && settings.ring_shadows_enabled) ? rings_.host_count() : 0u;
@@ -908,7 +913,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::sampled_image(16, rings_.ringshine_atlas(f_idx), ctx.sampler_linear_clamp()),
         rhi::PushDescriptorWrite::storage_buffer(25, phases, 0, phase_bytes),
         rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
-        rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
+        rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_equirect_aniso()),
         rhi::PushDescriptorWrite::sampled_image(31, planetshine_maps_, ctx.sampler_linear_repeat()),
         rhi::PushDescriptorWrite::sampled_image(32, ocean_.moments(), ctx.sampler_linear_repeat()),
         rhi::PushDescriptorWrite::storage_buffer(48, normals_.horizon_bounds()),
@@ -1092,7 +1097,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             refraction[0],
             refraction[1],
             rhi::PushDescriptorWrite::storage_buffer(28, fluid_ssbos_[f_idx], 0, fluid_bytes),
-            rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
+            rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_equirect_aniso()),
             rhi::PushDescriptorWrite::storage_buffer(2, eclipse_buffer, 0, eclipse_bytes),
             rhi::PushDescriptorWrite::storage_buffer(7, rings_.host_buffer(f_idx), 0, MAX_RING_HOSTS * sizeof(RingHostGPU)),
             rhi::PushDescriptorWrite::sampled_image(9, rings_.shadow_lut(), ctx.sampler_linear_clamp()),

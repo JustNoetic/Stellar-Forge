@@ -519,7 +519,7 @@ void SurfaceTextures::run(std::stop_token stop) {
 
 void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                               const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled,
-                              bool horizons_enabled, bool oceans_enabled) {
+                              bool horizons_enabled, bool oceans_enabled, double target_error_pixels) {
     std::vector<SurfaceTextureView> views;
     double tan_y = std::tan(camera.fov_deg*DEG_TO_RAD*.5);
     double focal = std::max(1u, extent.height)/(2*tan_y);
@@ -540,7 +540,7 @@ void SurfaceTextures::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Ca
             ? float(body.definition.ocean.sea_level_km * 1000.0) : -1e30f;
         views.push_back(input);
     }
-    prepare_views(cmd, ctx, views, enabled, horizons_enabled);
+    prepare_views(cmd, ctx, views, enabled, horizons_enabled, target_error_pixels);
 }
 
 int SurfaceTextures::source_index(const ephemeris::BodyDefinition& body) const {
@@ -558,7 +558,7 @@ std::optional<glm::vec3> SurfaceTextures::mean_albedo(const ephemeris::BodyDefin
 
 void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                                     std::span<const SurfaceTextureView> views, bool enabled,
-                                    bool horizons_enabled) {
+                                    bool horizons_enabled, double target_error_pixels) {
     stats_ = {};
     stats_.sources = uint32_t(sources_.size());
     stats_.capacity = capacity_;
@@ -624,7 +624,7 @@ void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                 if (sources_[s].body != body.name || !sources_[s].source->compatible(
                     body.radius_au()*AU_TO_KM*1000, std::clamp(1-body.oblateness, .05, 1.0))) continue;
                 SelectionView view = input.view;
-                view.target_error_pixels = 1.0;
+                view.target_error_pixels = std::clamp(target_error_pixels, 0.125, 4.0);
                 view.polar_ratio = sources_[s].source->polar_ratio;
                 view.height_amplitude = .0015;
                 view.max_level = sources_[s].source->level;

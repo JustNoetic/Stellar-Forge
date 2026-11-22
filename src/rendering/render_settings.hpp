@@ -38,6 +38,7 @@ struct RenderSettings {
     bool terrain_normal_maps_enabled = true;
     bool terrain_self_shadows_enabled = true;
     bool surface_textures_enabled = true;
+    float surface_texture_error_pixels = 1.0f;
     bool terrain_debug_tiles = false;
     bool terrain_reference_fp64 = false;
     bool terrain_cached_fp64 = false;
@@ -107,6 +108,10 @@ public:
             return {false, false, "Atmospheric shadow ray budget must be 0 to 100% of the viewport."};
         if (candidate.atmosphere_shadow_noise_type > 1)
             return {false, false, "Atmospheric shadow noise type must be 0 (IGN) or 1 (STBN)."};
+        if (!std::isfinite(candidate.surface_texture_error_pixels) ||
+            candidate.surface_texture_error_pixels < 0.125f || candidate.surface_texture_error_pixels > 4.0f) {
+            return {false, false, "Surface texture error must be 0.125 to 4 pixels."};
+        }
         if (!std::isfinite(candidate.terrain_error_pixels) || candidate.terrain_error_pixels < 0.5f || candidate.terrain_error_pixels > 16.0f ||
             !std::isfinite(candidate.terrain_height_km) || candidate.terrain_height_km < 0.0f || candidate.terrain_height_km > 20.0f ||
             candidate.terrain_patch_limit < 64 || candidate.terrain_patch_limit > 4096) {

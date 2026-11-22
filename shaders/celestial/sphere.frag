@@ -149,11 +149,12 @@ void main() {
 #endif
 #if SURFACE_ALBEDO_MAP || SURFACE_NORMALS || SURFACE_HORIZONS
     vec3 surf_dir = normalize(f_local_pos);
-    float surf_footprint = max(length(dFdx(surf_dir)), length(dFdy(surf_dir)));
+    float tex_error_px = u_scene.point_params.y > 0.0 ? u_scene.point_params.y : 1.0;
+    SurfaceFootprint surf_fp = surface_footprint(dFdx(surf_dir), dFdy(surf_dir), tex_error_px);
     vec3 surf_face_uv = surface_face_uv(surf_dir);
     vec2 surf_uv01 = clamp(surf_face_uv.xy * 0.5 + 0.5, 0.0, 1.0);
     uint surf_face = uint(surf_face_uv.z);
-    float surf_raw_lod = log2(3.0 / max(128.0 * surf_footprint, 1e-9));
+    float surf_raw_lod = surf_fp.raw_lod;
 #endif
 #if SURFACE_FULL_LIGHTING && defined(TERRAIN_SURFACE)
     vec3 geometric = cross(dFdx(f_world_pos), dFdy(f_world_pos));
@@ -173,7 +174,7 @@ void main() {
         SurfaceNormalLookup normal_lookup = surface_normal_lookup_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod);
 #endif
 #if SURFACE_NORMALS
-        vec3 N_local = surface_local_normal_from_lookup(normal_lookup, transpose(rotation) * normalize(f_normal));
+        vec3 N_local = surface_local_normal_aniso(f_body_idx, surf_dir, normal_lookup, surf_fp, transpose(rotation) * normalize(f_normal));
         N = normalize(rotation * N_local);
 #else
         N = normalize(f_normal);
@@ -206,7 +207,7 @@ void main() {
     SurfaceNormalLookup normal_lookup = surface_normal_lookup_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod);
 #endif
 #if SURFACE_NORMALS
-    vec3 N_local = surface_local_normal_from_lookup(normal_lookup, transpose(rotation) * normalize(f_normal));
+    vec3 N_local = surface_local_normal_aniso(f_body_idx, surf_dir, normal_lookup, surf_fp, transpose(rotation) * normalize(f_normal));
     N = normalize(rotation * N_local);
 #else
     N = normalize(f_normal);
@@ -217,7 +218,7 @@ void main() {
 #endif
 
 #if SURFACE_ALBEDO_MAP
-    vec4 albedo_sample = surface_albedo_sample_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod, b.color_is_star.rgb);
+    vec4 albedo_sample = surface_albedo_sample_aniso(f_body_idx, surf_dir, surf_uv01, surf_face, surf_fp, b.color_is_star.rgb);
     vec3 albedo = albedo_sample.rgb;
 #else
     vec3 base_albedo = b.color_is_star.rgb;

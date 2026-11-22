@@ -249,6 +249,16 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
         ImGui::EndDisabled();
         ImGui::Checkbox("Synthetic Terrain Preview", &render_draft.terrain_enabled);
         ui::section("Detail & performance", "Lower pixel error increases surface detail and GPU work.");
+        ImGui::BeginDisabled(!render_draft.surface_textures_enabled &&
+            !(render_draft.terrain_imported_enabled && render_draft.terrain_normal_maps_enabled));
+        ui::field("Texture Error##surface_texture_error", [&](const char* id) {
+            ImGui::SliderFloat(id, &render_draft.surface_texture_error_pixels, 0.125f, 4.0f, "%.3g px",
+                ImGuiSliderFlags_Logarithmic);
+        });
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Pixel threshold for surface texture and normal-map LOD transitions. Lower values choose higher-resolution tiles sooner.");
+        }
+        ImGui::EndDisabled();
         ui::field("Terrain Error##terrain_error", [&](const char* id) {
             ImGui::SliderFloat(id, &render_draft.terrain_error_pixels, 0.5f, 16.0f, "%.1f px");
         });

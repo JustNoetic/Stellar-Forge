@@ -121,9 +121,10 @@ public:
     std::vector<std::pair<std::string, std::filesystem::path>> load_catalog(const std::filesystem::path& path);
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& camera,
                  const ephemeris::SystemSnapshot& system, VkExtent2D extent, bool enabled,
-                 bool horizons_enabled = false, bool oceans_enabled = false);
+                 bool horizons_enabled = false, bool oceans_enabled = false,
+                 double target_error_pixels = 1.0);
     void prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const SurfaceTextureView> views,
-                       bool enabled, bool horizons_enabled = false);
+                       bool enabled, bool horizons_enabled = false, double target_error_pixels = 1.0);
     int source_index(const ephemeris::BodyDefinition& body) const;
     std::optional<glm::vec3> mean_albedo(const ephemeris::BodyDefinition& body) const noexcept;
     const rhi::Image& image() const noexcept { return atlas_; }

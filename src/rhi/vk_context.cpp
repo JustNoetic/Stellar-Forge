@@ -293,6 +293,14 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
     samp_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     VK_CHECK(vkCreateSampler(device_, &samp_ci, nullptr, &sampler_linear_repeat_));
 
+    VkSamplerCreateInfo aniso_ci = samp_ci;
+    aniso_ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    aniso_ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    aniso_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    aniso_ci.anisotropyEnable = VK_TRUE;
+    aniso_ci.maxAnisotropy = std::min(16.0f, device_props_.limits.maxSamplerAnisotropy);
+    VK_CHECK(vkCreateSampler(device_, &aniso_ci, nullptr, &sampler_equirect_aniso_));
+
     samp_ci.magFilter = VK_FILTER_NEAREST;
     samp_ci.minFilter = VK_FILTER_NEAREST;
     samp_ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
@@ -311,6 +319,7 @@ void VkContext::shutdown() {
     vkDestroySampler(device_, sampler_linear_clamp_, nullptr);
     vkDestroySampler(device_, sampler_linear_repeat_, nullptr);
     vkDestroySampler(device_, sampler_nearest_clamp_, nullptr);
+    vkDestroySampler(device_, sampler_equirect_aniso_, nullptr);
 
     vkDestroyDescriptorPool(device_, imgui_pool_, nullptr);
 
