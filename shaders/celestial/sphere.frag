@@ -197,7 +197,8 @@ void main() {
 #endif
 
 #if SURFACE_ALBEDO_MAP
-    vec3 albedo = surface_albedo_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod, b.color_is_star.rgb);
+    vec4 albedo_sample = surface_albedo_sample_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod, b.color_is_star.rgb);
+    vec3 albedo = albedo_sample.rgb;
 #else
     vec3 base_albedo = b.color_is_star.rgb;
     float lat_band = sin(f_local_pos.y * 18.0) * 0.04 + cos(f_local_pos.x * 9.0 + f_local_pos.z * 9.0) * 0.03;
@@ -218,25 +219,34 @@ void main() {
         SurfaceFluidGPU fluid = fluids[f_body_idx];
         float mode = fluid.ocean_deep.w;
         water_albedo = fluid.ocean_deep.rgb;
-        if (mode > 2.5) {
+        if (mode > 2.5 && mode < 3.5) {
             ocean = 1.0;
         } else {
             float luminance = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
             float blue = (albedo.b - max(albedo.r, albedo.g * 0.85)) / max(albedo.b, 1e-4);
             float albedo_mask = smoothstep(0.05, 0.25, blue) * (1.0 - smoothstep(0.12, 0.3, luminance));
-#ifdef TERRAIN_SURFACE
-            if (mode > 1.5) {
-                vec3 pole = body_pole(b);
-                float height_km = length(fluid_spherical(f_body_offset, pole, fluid_flattening(b))) * FLUID_AU_KM
-                                - fluid.ocean_params.z;
-                float tolerance_km = max(0.002, length(f_world_pos) * FLUID_AU_KM * 2e-7);
-                ocean = 1.0 - smoothstep(tolerance_km, 2.0 * tolerance_km, height_km);
-                water_albedo = mix(fluid.ocean_deep.rgb, fluid.ocean_shallow.rgb, albedo_mask * 0.5);
-            } else
-#endif
-            {
+            if (mode > 3.5) {
+#if SURFACE_ALBEDO_MAP
+                ocean = surface_has_water_mask(f_body_idx) ? albedo_sample.a : albedo_mask;
+#else
                 ocean = albedo_mask;
+#endif
                 water_albedo = mix(fluid.ocean_deep.rgb, albedo, 0.5);
+            } else {
+#ifdef TERRAIN_SURFACE
+                if (mode > 1.5) {
+                    vec3 pole = body_pole(b);
+                    float height_km = length(fluid_spherical(f_body_offset, pole, fluid_flattening(b))) * FLUID_AU_KM
+                                    - fluid.ocean_params.z;
+                    float tolerance_km = max(0.002, length(f_world_pos) * FLUID_AU_KM * 2e-7);
+                    ocean = 1.0 - smoothstep(tolerance_km, 2.0 * tolerance_km, height_km);
+                    water_albedo = mix(fluid.ocean_deep.rgb, fluid.ocean_shallow.rgb, albedo_mask * 0.5);
+                } else
+#endif
+                {
+                    ocean = albedo_mask;
+                    water_albedo = mix(fluid.ocean_deep.rgb, albedo, 0.5);
+                }
             }
         }
     }
@@ -285,6 +295,7 @@ void main() {
             water_fresnel = ocean_fresnel(max(dot(water.normal, V), 0.0), sqrt(water.roughness_squared * 0.5));
             water_albedo = mix(water_albedo * (1.0 - water_fresnel), vec3(0.55), water.foam);
             albedo = mix(albedo, water_albedo, ocean);
+            N = normalize(mix(N, ocean_up, ocean));
         }
 #endif
 
@@ -328,7 +339,12 @@ void main() {
         total_light += albedo * star_col * irradiance * diffuse * shadow;
 #endif
         if (any(greaterThan(direct, vec3(0.0))) && any(greaterThan(shadow, vec3(0.0)))) {
-            total_light += albedo * star_col * irradiance * direct * shadow * terrain_vis.x;
+#if SURFACE_OCEAN
+            float direct_vis = mix(terrain_vis.x, terrain_vis.y, ocean);
+#else
+            float direct_vis = terrain_vis.x;
+#endif
+            total_light += albedo * star_col * irradiance * direct * shadow * direct_vis;
         }
 #if SURFACE_OCEAN
         if (has_ocean) {
@@ -371,6 +387,7 @@ void main() {
         water_fresnel = ocean_fresnel(max(dot(water.normal, V), 0.0), sqrt(water.roughness_squared * 0.5));
         water_albedo = mix(water_albedo * (1.0 - water_fresnel), vec3(0.55), water.foam);
         albedo = mix(albedo, water_albedo, ocean);
+        N = normalize(mix(N, ocean_up, ocean));
     }
 #endif
 
@@ -427,7 +444,12 @@ void main() {
         total_light += albedo * star_col * irradiance * diffuse * shadow;
 #endif
         if (any(greaterThan(direct, vec3(0.0))) && any(greaterThan(shadow, vec3(0.0)))) {
-            total_light += albedo * star_col * irradiance * direct * shadow * terrain_vis.x;
+#if SURFACE_OCEAN
+            float direct_vis = mix(terrain_vis.x, terrain_vis.y, ocean);
+#else
+            float direct_vis = terrain_vis.x;
+#endif
+            total_light += albedo * star_col * irradiance * direct * shadow * direct_vis;
         }
 #if SURFACE_OCEAN
         if (has_ocean) {

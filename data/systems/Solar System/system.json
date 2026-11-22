@@ -379,8 +379,8 @@
     "color_pole": "#2c6cff",
     "e": 0.016708,
     "height_range_km": [
-      -10.0,
-      8.0
+      -8.171429,
+      6.4
     ],
     "inc": 5e-05,
     "j4": -1.6e-06,
@@ -400,7 +400,7 @@
       ],
       "enabled": true,
       "foam": 0.5,
-      "mask": "albedo",
+      "mask": "specular",
       "sea_level_km": 0.0,
       "shallow_color": [
         0.019999999552965164,

@@ -81,8 +81,50 @@ class Raster:
         return result
 
 
+def condition_height_with_specular(values, scale, offset, specular_path, sea_level_m=0.0):
+    import numpy as np
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = 268435456
+
+    h_m = values.astype(np.float32) * np.float32(scale) + np.float32(offset)
+    height, width = h_m.shape
+    with Image.open(specular_path) as spec_img:
+        if spec_img.size != (width, height):
+            spec_img = spec_img.convert("L").resize((width, height), Image.Resampling.BILINEAR)
+        else:
+            spec_img = spec_img.convert("L")
+        water = np.asarray(spec_img, dtype=np.uint8) >= 128
+
+    sea = water & (h_m <= np.float32(sea_level_m + 1e-3))
+    for _ in range(6):
+        row_or = sea.copy()
+        row_or[:, 1:] |= sea[:, :-1]
+        row_or[:, 0] |= sea[:, -1]
+        row_or[:, :-1] |= sea[:, 1:]
+        row_or[:, -1] |= sea[:, 0]
+        dilated = row_or.copy()
+        dilated[1:, :] |= row_or[:-1, :]
+        dilated[:-1, :] |= row_or[1:, :]
+        dilated &= water
+        if np.array_equal(dilated, sea):
+            del row_or, dilated
+            break
+        sea = dilated
+        del row_or
+
+    sea_f32 = np.float32(sea_level_m)
+    h_m[sea] = np.minimum(h_m[sea], sea_f32)
+    del water, sea
+
+    digest = hashlib.sha256()
+    with Path(specular_path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return h_m, digest.hexdigest()
+
+
 class ImageRaster:
-    def __init__(self, path, scale=None, offset=0.0, height_range_m=None):
+    def __init__(self, path, scale=None, offset=0.0, height_range_m=None, specular_path=None, sea_level_m=0.0):
         import numpy as np
         from PIL import Image
         Image.MAX_IMAGE_PIXELS = 268435456
@@ -106,6 +148,13 @@ class ImageRaster:
         self.scale, self.offset = float(scale), float(offset)
         if not math.isfinite(self.scale) or not math.isfinite(self.offset):
             raise ValueError("Image elevation requires finite explicit scale and offset")
+        self.specular_sha256 = None
+        if specular_path is not None:
+            self.values, self.specular_sha256 = condition_height_with_specular(
+                self.values, self.scale, self.offset, specular_path, sea_level_m=sea_level_m
+            )
+            self.scale = 1.0
+            self.offset = 0.0
 
     def sample(self, longitude, latitude):
         x = ((longitude+180) % 360)/360*self.width-.5

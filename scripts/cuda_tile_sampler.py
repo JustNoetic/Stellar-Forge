@@ -7,6 +7,8 @@ CUDA_KERNEL_CODE = r'''
 extern "C" __global__ void sample_level_kernel(
     const unsigned char* __restrict__ source,
     int width, int height,
+    const unsigned char* __restrict__ mask_source,
+    int mask_width, int mask_height, int has_mask,
     int level, int tile_start, int num_tiles,
     double polar, double prime, int latitude_mode,
     const float* __restrict__ decode_lut,
@@ -99,7 +101,33 @@ extern "C" __global__ void sample_level_kernel(
 
         output[out_idx + c] = encode_lut[enc_idx];
     }
-    output[out_idx + 3] = 255;
+    if (has_mask != 0) {
+        double msx = u_mod * (double)mask_width - 0.5;
+        double msy = v_tex * (double)mask_height - 0.5;
+        if (msy < 0.0) msy = 0.0;
+        if (msy > (double)(mask_height - 1)) msy = (double)(mask_height - 1);
+        int mix_i = (int)floor(msx);
+        int miy = (int)floor(msy);
+        double mfx = msx - (double)mix_i;
+        double mfy = msy - (double)miy;
+        int mx0 = mix_i % mask_width;
+        if (mx0 < 0) mx0 += mask_width;
+        int mx1 = (mix_i + 1) % mask_width;
+        if (mx1 < 0) mx1 += mask_width;
+        int my1 = miy + 1 < mask_height ? miy + 1 : mask_height - 1;
+        double m00 = (double)mask_source[(size_t)miy * mask_width + mx0];
+        double m10 = (double)mask_source[(size_t)miy * mask_width + mx1];
+        double m01 = (double)mask_source[(size_t)my1 * mask_width + mx0];
+        double m11 = (double)mask_source[(size_t)my1 * mask_width + mx1];
+        double mval = (m00 * (1.0 - mfx) + m10 * mfx) * (1.0 - mfy)
+                    + (m01 * (1.0 - mfx) + m11 * mfx) * mfy;
+        int m_u8 = (int)nearbyint(mval);
+        if (m_u8 < 0) m_u8 = 0;
+        if (m_u8 > 255) m_u8 = 255;
+        output[out_idx + 3] = (unsigned char)m_u8;
+    } else {
+        output[out_idx + 3] = 255;
+    }
 }
 
 extern "C" __global__ void sample_height_face_kernel(
@@ -242,17 +270,25 @@ class CudaTileSampler:
         self.d_encode = cp.asarray(encode_lut.astype(np.uint8)) if encode_lut is not None else None
         self._current_source = None
         self._d_source = None
+        self._d_mask = None
 
-    def set_source(self, source_array):
+    def set_source(self, source_array, mask_array=None):
         """Upload or update source mip on GPU."""
         contiguous = np.ascontiguousarray(source_array, dtype=np.uint8)
         self._d_source = self.cp.asarray(contiguous)
+        if mask_array is not None:
+            self._d_mask = self.cp.asarray(np.ascontiguousarray(mask_array, dtype=np.uint8))
+        else:
+            self._d_mask = None
 
     def sample_level(self, level, polar, prime, latitude="geodetic"):
         """Sample all 6 * 4^level tiles for this level using GPU."""
         latitude_mode = 0 if latitude == "geodetic" else 1 if latitude == "planetocentric" else 2
         total_tiles = 6 * (1 << level) * (1 << level)
         height, width = self._d_source.shape[:2]
+        has_mask = 1 if self._d_mask is not None else 0
+        mask_buf = self._d_mask if has_mask else self._d_source
+        mask_h, mask_w = (self._d_mask.shape[:2] if has_mask else (1, 1))
 
         tiles_out = []
         for start in range(0, total_tiles, self.CHUNK_SIZE):
@@ -262,6 +298,7 @@ class CudaTileSampler:
             grid = ((132 + 15) // 16, (132 + 15) // 16, chunk_count)
             self.kernel(grid, (16, 16, 1), (
                 self._d_source, np.int32(width), np.int32(height),
+                mask_buf, np.int32(mask_w), np.int32(mask_h), np.int32(has_mask),
                 np.int32(level), np.int32(start), np.int32(chunk_count),
                 np.float64(polar), np.float64(prime), np.int32(latitude_mode),
                 self.d_decode, self.d_encode, d_chunk_out

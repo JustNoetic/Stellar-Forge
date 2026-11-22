@@ -28,8 +28,10 @@ it enabled, serialize it back. Earth in the Solar System preset enables both.
             "evolution": 0.05, "color": [1.0, 1.0, 1.0] }
 ```
 
-- `mask`: `albedo` (classify dark blue albedo texels as water), `height`
-  (terrain below `sea_level_km`; spheres fall back to albedo) or `global`.
+- `mask`: `albedo` (classify dark blue albedo texels as water), `specular`
+  (linear alpha water mask baked from `<Body>_specular.*` into the albedo pack,
+  falling back to `albedo` when absent), `height` (terrain below
+  `sea_level_km`; spheres fall back to albedo) or `global`.
 - Colours accept RGB triples (linear) or `#rrggbb`.
 - `evolution`: noise-domain units per simulated hour (cloud shape change).
 - `coverage_map`: key in `data/clouds.json`; missing maps use procedural weather.

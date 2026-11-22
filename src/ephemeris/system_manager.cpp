@@ -99,8 +99,8 @@ OceanDefinition parse_ocean(const nlohmann::json& j) {
     if (!j.is_object()) throw std::invalid_argument("ocean must be an object.");
     o.enabled = j.value("enabled", true);
     o.mask = j.value("mask", o.mask);
-    if (o.mask != "albedo" && o.mask != "height" && o.mask != "global")
-        throw std::invalid_argument("ocean.mask must be albedo, height or global.");
+    if (o.mask != "albedo" && o.mask != "height" && o.mask != "global" && o.mask != "specular")
+        throw std::invalid_argument("ocean.mask must be albedo, height, global or specular.");
     o.sea_level_km = json_bounded(j, "sea_level_km", o.sea_level_km, -100.0, 100.0);
     o.deep_color = json_rgb(j, "deep_color", o.deep_color);
     o.shallow_color = json_rgb(j, "shallow_color", o.shallow_color);

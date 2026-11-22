@@ -43,6 +43,7 @@ struct SurfaceSource {
     virtual uint32_t count() const noexcept = 0;
     virtual std::vector<std::byte> load(TileId tile) const = 0;
     virtual std::optional<glm::vec3> mean_albedo() const noexcept { return std::nullopt; }
+    virtual bool has_specular_mask() const noexcept { return false; }
     uint32_t index(TileId tile) const;
     virtual bool compatible(double radius_m, double polar) const noexcept;
 };
@@ -51,11 +52,13 @@ struct ColorSource final : SurfaceSource {
     std::filesystem::path payload;
     std::vector<uint32_t> checksums;
     std::optional<glm::vec3> mean_albedo_;
+    bool has_specular_ = false;
     static std::shared_ptr<const ColorSource> open(const std::filesystem::path& directory);
     std::shared_ptr<const ColorTile> read(TileId tile) const;
     uint32_t count() const noexcept override { return uint32_t(checksums.size()); }
     std::vector<std::byte> load(TileId tile) const override;
     std::optional<glm::vec3> mean_albedo() const noexcept override { return mean_albedo_; }
+    bool has_specular_mask() const noexcept override { return has_specular_; }
 };
 
 struct NormalSource final : SurfaceSource {

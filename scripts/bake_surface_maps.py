@@ -75,13 +75,49 @@ def sample(source, u, v):
             +(DECODE[source[ny, ix]]*(1-fx)+DECODE[source[ny, nx]]*fx)*fy)
 
 
+def reduce_linear_mask(source):
+    height, width = source.shape[:2]
+    result = np.empty(((height+1)//2, (width+1)//2), dtype=np.uint8)
+    x = np.arange(result.shape[1])*2
+    for start in range(0, result.shape[0], 64):
+        y = np.arange(start, min(start+64, result.shape[0]))*2
+        a = source[y[:, None], x].astype(np.float32)
+        b = source[y[:, None], np.minimum(x+1, width-1)].astype(np.float32)
+        c = source[np.minimum(y+1, height-1)[:, None], x].astype(np.float32)
+        d = source[np.minimum(y+1, height-1)[:, None], np.minimum(x+1, width-1)].astype(np.float32)
+        result[start:start+len(y)] = np.rint(np.clip((a+b+c+d)*.25, 0, 255)).astype(np.uint8)
+    return result
+
+
+def sample_mask(source, u, v):
+    height, width = source.shape[:2]
+    x, y = (u % 1)*width-.5, np.clip(v*height-.5, 0, height-1)
+    ix, iy = np.floor(x).astype(np.int64), np.floor(y).astype(np.int64)
+    fx, fy = x-ix, y-iy
+    nx, ny = (ix+1) % width, np.minimum(iy+1, height-1)
+    ix %= width
+    vals = ((source[iy, ix].astype(np.float32)*(1-fx)+source[iy, nx].astype(np.float32)*fx)*(1-fy)
+            +(source[ny, ix].astype(np.float32)*(1-fx)+source[ny, nx].astype(np.float32)*fx)*fy)
+    return np.rint(np.clip(vals, 0, 255)).astype(np.uint8)
+
+
+def find_specular_map(folder, body_name):
+    folder = Path(folder)
+    if not folder.is_dir():
+        return None
+    stem = f"{body_name}_specular".casefold()
+    return next((path for path in sorted(folder.iterdir())
+                 if path.is_file() and path.stem.casefold() == stem
+                 and path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff")), None)
+
+
 def recommended_lod(image_path):
     with Image.open(image_path) as image:
         return min(5, max(0, math.ceil(math.log2(max(1, image.width / (CORE * 4))))))
 
 
 def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodetic",
-               backend="auto", sampler=None, rebake=False, progress_cb=None):
+               backend="auto", sampler=None, rebake=False, progress_cb=None, specular_path=None):
     output = Path(output)
     if not 0 <= level <= 5 or not .05 <= polar <= 1 or not math.isfinite(prime):
         raise ValueError("Albedo requires data LOD 0..5 and a valid oblate reference shape")
@@ -89,6 +125,8 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
         raise ValueError("Unknown source latitude convention")
     provenance = dict(source_sha256=file_hash(source_path), polar_ratio=polar, prime_meridian_rad=prime,
                       latitude=latitude, data_level=level, core=CORE, gutter=GUTTER, version=1)
+    if specular_path is not None:
+        provenance["specular_sha256"] = file_hash(specular_path)
     total_tiles = 2 * (4**(level + 1) - 1)
     if output.exists() and not rebake:
         existing = json.loads((output/"manifest.json").read_text(encoding="utf-8"))
@@ -104,6 +142,14 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
     pyramid = [source]
     while pyramid[-1].shape[1] > CORE*4 and min(pyramid[-1].shape[:2]) > 1:
         pyramid.append(reduce_linear(pyramid[-1]))
+
+    mask_pyramid = None
+    if specular_path is not None:
+        with Image.open(specular_path) as mask_img:
+            mask_source = np.asarray(mask_img.convert("L"), dtype=np.uint8)
+        mask_pyramid = [mask_source]
+        while mask_pyramid[-1].shape[1] > CORE*4 and min(mask_pyramid[-1].shape[:2]) > 1:
+            mask_pyramid.append(reduce_linear_mask(mask_pyramid[-1]))
 
     use_cuda = False
     if backend in ("auto", "cuda"):
@@ -131,8 +177,12 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
             for depth in range(level+1):
                 mip = min(len(pyramid)-1, max(0, int(math.log2(max(1, source.shape[1]/(CORE*4*(1 << depth)))))))
                 source_mip = pyramid[mip]
+                mask_mip = None
+                if mask_pyramid is not None:
+                    mask_idx = min(len(mask_pyramid)-1, max(0, int(math.log2(max(1, mask_pyramid[0].shape[1]/(CORE*4*(1 << depth)))))))
+                    mask_mip = mask_pyramid[mask_idx]
                 if use_cuda and sampler is not None:
-                    sampler.set_source(source_mip)
+                    sampler.set_source(source_mip, mask_mip)
                     tiles = sampler.sample_level(depth, polar, prime, latitude)
                     for tile in tiles:
                         encoded = tile.tobytes()
@@ -147,6 +197,8 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
                                 u, v = coordinates(face, depth, tx, ty, polar, prime, latitude)
                                 rgba = np.full((SIDE, SIDE, 4), 255, dtype=np.uint8)
                                 rgba[:, :, :3] = encode(sample(source_mip, u, v))
+                                if mask_mip is not None:
+                                    rgba[:, :, 3] = sample_mask(mask_mip, u, v)
                                 encoded = rgba.tobytes()
                                 payload.write(encoded)
                                 checksums.append(zlib.crc32(encoded))
@@ -156,6 +208,8 @@ def bake_color(source_path, output, level=3, polar=1, prime=0, latitude="geodeti
                         orientation="x-east-y-north-z-prime", data_level=level, core=CORE, gutter=GUTTER,
                         polar_ratio=polar, prime_meridian_rad=prime, latitude=latitude,
                         provenance=provenance, checksums=checksums)
+        if specular_path is not None:
+            manifest["has_specular"] = True
         digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).digest()
         manifest.update(identity=int.from_bytes(digest[:8], "little") or 1, revision=1)
         (temporary/"manifest.json").write_text(json.dumps(manifest, indent=2)+"\n", encoding="utf-8")
@@ -183,6 +237,7 @@ def discover_available_bodies(root, definitions):
                 "source": source,
                 "has_height": has_height,
                 "height_path": height if has_height else None,
+                "specular_path": find_specular_map(folder, folder.name),
                 "definition": definitions[folder.name]
             })
     return items
@@ -278,6 +333,8 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
                 hr = body.get("height_range_km")
                 if isinstance(hr, list) and len(hr) == 2 and (hr[0] != 0 or hr[1] != 0):
                     definitions[name]["height_range_km"] = hr
+                if isinstance(body.get("ocean"), dict):
+                    definitions[name]["ocean"] = body["ocean"]
     constants = (project/"src/core/constants.hpp").read_text()
     solar_radius_m = float(re.search(r"SOLAR_RADIUS_KM\s*=\s*([\d.]+)", constants).group(1))*1000
 
@@ -322,9 +379,13 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
     for item, lod in jobs:
         body = item["definition"]
         polar = 1 - float(body.get("oblateness", 0))
-        fingerprint = hashlib.sha256(f"{file_hash(item['source'])}:{polar}:{lod}:geodetic-v1".encode()).hexdigest()[:12]
+        spec_path = item.get("specular_path")
+        spec_hash = file_hash(spec_path) if spec_path is not None else ""
+        albedo_fp_src = f"{file_hash(item['source'])}:{spec_hash}:{polar}:{lod}:geodetic-v1" if spec_hash else f"{file_hash(item['source'])}:{polar}:{lod}:geodetic-v1"
+        fingerprint = hashlib.sha256(albedo_fp_src.encode()).hexdigest()[:12]
         dataset = output_root/item["body"].lower()/fingerprint
-        bake_color(item["source"], dataset/"albedo", lod, polar, backend=backend, sampler=sampler, rebake=rebake)
+        bake_color(item["source"], dataset/"albedo", lod, polar, backend=backend, sampler=sampler,
+                   rebake=rebake, specular_path=spec_path)
 
         binding = dict(body=item["body"], albedo=(dataset/"albedo").resolve().relative_to(project).as_posix())
 
@@ -332,16 +393,26 @@ def bake_library(root, output_root, catalog_path, level=None, selected_names=Non
             low, high = (float(v)*1000 for v in body["height_range_km"])
             radius_m = float(body["r"])*solar_radius_m
             height_lod = level if level is not None else recommended_lod(item["height_path"])
-            height_tag = hashlib.sha256(f"{file_hash(item['height_path'])}:{polar}:{radius_m}:{low}:{high}:{height_lod}:{CORE}:cubic-v1".encode()).hexdigest()[:12]
+            ocean_cfg = body.get("ocean", {})
+            sea_level_m = float(ocean_cfg.get("sea_level_km", 0.0))*1000.0 if ocean_cfg.get("enabled", False) else 0.0
+            height_fp_src = f"{file_hash(item['height_path'])}:{polar}:{radius_m}:{low}:{high}:{height_lod}:{CORE}:cubic-v1"
+            if spec_hash:
+                height_fp_src += f":{spec_hash}:{sea_level_m}:sea-conditioned-v1"
+            height_tag = hashlib.sha256(height_fp_src.encode()).hexdigest()[:12]
             height_output = output_root/item["body"].lower()/height_tag/"height"
             if not height_output.exists() or rebake:
                 if height_output.exists():
                     shutil.rmtree(height_output)
-                raster = ImageRaster(item["height_path"], height_range_m=(low, high))
+                raster = ImageRaster(item["height_path"], height_range_m=(low, high),
+                                     specular_path=spec_path, sea_level_m=sea_level_m)
+                provenance = dict(source_sha256=file_hash(item["height_path"]), scale=raster.scale, offset=raster.offset,
+                                  interpretation="legacy-visual-range-no-geoid-correction", source_height_range_m=[low, high])
+                if raster.specular_sha256 is not None:
+                    provenance.update(specular_sha256=raster.specular_sha256, sea_level_m=sea_level_m,
+                                      conditioning="specular-sea-v1")
                 import_tiles(height_output, height_lod, radius_m, polar, 0,
                     lambda lon, lat, direction: raster.sample(lon, lat),
-                    dict(source_sha256=file_hash(item["height_path"]), scale=raster.scale, offset=raster.offset,
-                         interpretation="legacy-visual-range-no-geoid-correction", source_height_range_m=[low, high]),
+                    provenance,
                     item["body"]+" legacy visual elevation",
                     cells=CORE, gutter=GUTTER, reconstruction="cubic-bspline", raster=raster, cuda_sampler=sampler)
             binding["height"] = height_output.resolve().relative_to(project).as_posix()
@@ -388,9 +459,23 @@ def inspect_image_cli(source_file, preview_out=None):
     return 0
 
 
+def _body_sea_level_m(project, body_name):
+    for rel in ("data/systems/Solar System/system.json", "data/system.json"):
+        path = project / rel
+        if not path.exists():
+            continue
+        for body in json.loads(path.read_text(encoding="utf-8")):
+            if body.get("name") == body_name and isinstance(body.get("ocean"), dict):
+                ocean_cfg = body["ocean"]
+                if ocean_cfg.get("enabled", False):
+                    return float(ocean_cfg.get("sea_level_km", 0.0)) * 1000.0
+                return 0.0
+    return 0.0
+
+
 def bake_single_body(body_name, map_type, source_file, output_root, catalog_path,
                      level=None, polar=1.0, radius_m=6371000.0, height_min_km=-10.0, height_max_km=10.0,
-                     backend="auto", copy_to_dir=None, rebake=True):
+                     backend="auto", copy_to_dir=None, rebake=True, specular_file=None, sea_level_km=None):
     from import_terrain import ImageRaster, import_tiles
     project = Path(__file__).resolve().parents[1]
     source_file = Path(source_file)
@@ -418,6 +503,10 @@ def bake_single_body(body_name, map_type, source_file, output_root, catalog_path
     backend_str = f"CUDA ({cuda_name})" if sampler is not None else "CPU (NumPy)"
     print(f"BACKEND|{backend_str}", flush=True)
 
+    spec_path = Path(specular_file) if specular_file is not None else find_specular_map(source_file.parent, body_name)
+    if spec_path is not None and not spec_path.is_file():
+        raise FileNotFoundError(f"Specular image not found: {spec_path}")
+
     if copy_to_dir is not None:
         dest_dir = Path(copy_to_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -433,6 +522,8 @@ def bake_single_body(body_name, map_type, source_file, output_root, catalog_path
         if source_file.resolve() != dest_path.resolve():
             shutil.copy2(source_file, dest_path)
         source_file = dest_path
+        if spec_path is None:
+            spec_path = find_specular_map(dest_dir, body_name)
 
     lod = int(level) if level is not None else recommended_lod(source_file)
     lod = max(0, min(5, lod))
@@ -444,12 +535,14 @@ def bake_single_body(body_name, map_type, source_file, output_root, catalog_path
     existing = json.loads(catalog_path.read_text(encoding="utf-8")) if catalog_path.exists() else {"version": 1, "bodies": []}
     existing_map = {item["body"]: dict(item) for item in existing.get("bodies", [])}
     binding = existing_map.get(body_name, {"body": body_name})
+    spec_hash = file_hash(spec_path) if spec_path is not None else ""
 
     if map_type == "albedo":
-        fingerprint = hashlib.sha256(f"{file_hash(source_file)}:{polar}:{lod}:geodetic-v1".encode()).hexdigest()[:12]
+        fp_src = f"{file_hash(source_file)}:{spec_hash}:{polar}:{lod}:geodetic-v1" if spec_hash else f"{file_hash(source_file)}:{polar}:{lod}:geodetic-v1"
+        fingerprint = hashlib.sha256(fp_src.encode()).hexdigest()[:12]
         albedo_out = output_root / body_name.lower() / fingerprint / "albedo"
         bake_color(source_file, albedo_out, lod, polar, backend=backend, sampler=sampler,
-                   rebake=rebake, progress_cb=report_progress)
+                   rebake=rebake, progress_cb=report_progress, specular_path=spec_path)
         rel_path = albedo_out.resolve().relative_to(project).as_posix()
         binding["albedo"] = rel_path
         existing_map[body_name] = binding
@@ -464,16 +557,25 @@ def bake_single_body(body_name, map_type, source_file, output_root, catalog_path
             raise ValueError("Minimum elevation must not exceed maximum elevation")
         if max(abs(low_m), abs(high_m)) >= radius_m * 0.01:
             raise ValueError(f"Elevation range [{height_min_km:.2f}, {height_max_km:.2f}] km exceeds 1% of equatorial radius ({radius_m * 0.00001:.2f} km)")
-        height_tag = hashlib.sha256(f"{file_hash(source_file)}:{polar}:{radius_m}:{low_m}:{high_m}:{lod}:{CORE}:cubic-v1".encode()).hexdigest()[:12]
+        sea_level_m = float(sea_level_km) * 1000.0 if sea_level_km is not None else _body_sea_level_m(project, body_name)
+        height_fp_src = f"{file_hash(source_file)}:{polar}:{radius_m}:{low_m}:{high_m}:{lod}:{CORE}:cubic-v1"
+        if spec_hash:
+            height_fp_src += f":{spec_hash}:{sea_level_m}:sea-conditioned-v1"
+        height_tag = hashlib.sha256(height_fp_src.encode()).hexdigest()[:12]
         height_out = output_root / body_name.lower() / height_tag / "height"
         if height_out.exists():
             shutil.rmtree(height_out)
-        raster = ImageRaster(source_file, height_range_m=(low_m, high_m))
+        raster = ImageRaster(source_file, height_range_m=(low_m, high_m),
+                             specular_path=spec_path, sea_level_m=sea_level_m)
+        provenance = dict(source_sha256=file_hash(source_file), scale=raster.scale, offset=raster.offset,
+                          interpretation="legacy-visual-range-no-geoid-correction", source_height_range_m=[low_m, high_m])
+        if raster.specular_sha256 is not None:
+            provenance.update(specular_sha256=raster.specular_sha256, sea_level_m=sea_level_m,
+                              conditioning="specular-sea-v1")
         import_tiles(
             height_out, lod, radius_m, polar, 0,
             lambda lon, lat, direction: raster.sample(lon, lat),
-            dict(source_sha256=file_hash(source_file), scale=raster.scale, offset=raster.offset,
-                 interpretation="legacy-visual-range-no-geoid-correction", source_height_range_m=[low_m, high_m]),
+            provenance,
             f"{body_name} legacy visual elevation",
             cells=CORE, gutter=GUTTER, reconstruction="cubic-bspline",
             raster=raster, cuda_sampler=sampler, progress_cb=report_progress
@@ -507,6 +609,8 @@ def main():
     parser.add_argument("--single-body", type=str, default=None, help="Single body name for direct in-sim baking")
     parser.add_argument("--map-type", choices=("albedo", "height"), default="albedo", help="Map layer type for --single-body")
     parser.add_argument("--source-file", type=Path, default=None, help="Direct source image file for --single-body")
+    parser.add_argument("--specular-file", type=Path, default=None, help="Optional specular water mask image for --single-body")
+    parser.add_argument("--sea-level-km", type=float, default=None, help="Optional sea level in km for --single-body height conditioning")
     parser.add_argument("--polar-ratio", type=float, default=1.0, help="Oblate polar ratio (1 - oblateness) for --single-body")
     parser.add_argument("--radius-m", type=float, default=6371000.0, help="Equatorial radius in meters for --single-body")
     parser.add_argument("--height-min-km", type=float, default=-10.0, help="Minimum elevation in km for --single-body height")
@@ -535,6 +639,8 @@ def main():
             backend=args.backend,
             copy_to_dir=args.copy_to_dir,
             rebake=True,
+            specular_file=args.specular_file,
+            sea_level_km=args.sea_level_km,
         )
 
     # Determine if we should run interactively
@@ -543,14 +649,16 @@ def main():
 
     if args.list:
         definitions = {body["name"]: body for body in json.loads((project/"data/system.json").read_text())}
-    user_solar = project/"data/systems/Solar System/system.json"
-    if user_solar.exists():
-        for body in json.loads(user_solar.read_text()):
-            name = body.get("name")
-            if name in definitions:
-                hr = body.get("height_range_km")
-                if isinstance(hr, list) and len(hr) == 2 and (hr[0] != 0 or hr[1] != 0):
-                    definitions[name]["height_range_km"] = hr
+        user_solar = project/"data/systems/Solar System/system.json"
+        if user_solar.exists():
+            for body in json.loads(user_solar.read_text()):
+                name = body.get("name")
+                if name in definitions:
+                    hr = body.get("height_range_km")
+                    if isinstance(hr, list) and len(hr) == 2 and (hr[0] != 0 or hr[1] != 0):
+                        definitions[name]["height_range_km"] = hr
+                    if isinstance(body.get("ocean"), dict):
+                        definitions[name]["ocean"] = body["ocean"]
         items = discover_available_bodies(args.source_root, definitions)
         print(f"Found {len(items)} bodies in {args.source_root}:")
         for idx, item in enumerate(items, 1):

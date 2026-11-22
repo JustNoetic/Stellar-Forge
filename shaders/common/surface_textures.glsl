@@ -53,16 +53,20 @@ vec3 surface_level(uint base, vec3 face_uv, uint level, vec3 fallback) {
     return surface_level_uv(base, clamp(face_uv.xy*.5+.5, 0.0, 1.0), uint(face_uv.z), level, fallback);
 }
 
-vec3 surface_albedo_at(uint body, vec2 uv01, uint face, float raw_lod, vec3 fallback) {
+bool surface_has_water_mask(uint body) {
+    return (surface_words[body*4u+2u] & 2u) != 0u;
+}
+
+vec4 surface_albedo_sample_at(uint body, vec2 uv01, uint face, float raw_lod, vec3 fallback) {
     uint base = surface_words[body*4u];
-    if (base == 0u) return fallback;
+    if (base == 0u) return vec4(fallback, 0.0);
     uint maximum = surface_words[body*4u+1u];
     float level = clamp(raw_lod, 0.0, float(maximum));
     uint coarse = uint(floor(level));
     float frac = fract(level);
     vec2 coarse_uv;
     uint coarse_slot = surface_slot_uv(base, uv01, face, coarse, coarse_uv);
-    if (coarse_slot == 0u) return fallback;
+    if (coarse_slot == 0u) return vec4(fallback, 0.0);
     uint fine_slot = coarse_slot;
     vec2 fine_uv = coarse_uv;
     if (frac > 0.0 && coarse < maximum) {
@@ -76,9 +80,13 @@ vec3 surface_albedo_at(uint body, vec2 uv01, uint face, float raw_lod, vec3 fall
             fine_uv = (2.0+flocal*128.0)/132.0;
         }
     }
-    vec3 a = textureLod(u_surface_tiles, vec3(coarse_uv, float(coarse_slot-1u)), 0.0).rgb;
-    vec3 b = (fine_slot == coarse_slot) ? a : textureLod(u_surface_tiles, vec3(fine_uv, float(fine_slot-1u)), 0.0).rgb;
+    vec4 a = textureLod(u_surface_tiles, vec3(coarse_uv, float(coarse_slot-1u)), 0.0);
+    vec4 b = (fine_slot == coarse_slot) ? a : textureLod(u_surface_tiles, vec3(fine_uv, float(fine_slot-1u)), 0.0);
     return mix(a, b, frac);
+}
+
+vec3 surface_albedo_at(uint body, vec2 uv01, uint face, float raw_lod, vec3 fallback) {
+    return surface_albedo_sample_at(body, uv01, face, raw_lod, fallback).rgb;
 }
 
 vec3 surface_albedo(uint body, vec3 local_direction, vec3 fallback) {

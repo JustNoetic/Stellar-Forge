@@ -92,6 +92,7 @@ std::shared_ptr<const ColorSource> ColorSource::open(const std::filesystem::path
     result->domain = {j.at("identity"), j.at("revision")};
     result->level = j.at("data_level");
     result->polar_ratio = j.at("polar_ratio");
+    result->has_specular_ = j.value("has_specular", false);
     if (result->level > 5 || result->domain.identity == 0 || result->domain.revision == 0 ||
         !std::isfinite(result->polar_ratio) || result->polar_ratio < .05 || result->polar_ratio > 1)
         throw std::runtime_error("Invalid albedo domain or shape");
@@ -945,7 +946,8 @@ void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                         }
                     }
                 }
-                uint32_t flags = (enabled ? 1u : 0u) | (all_horizons_ready ? 2u : 0u);
+                uint32_t flags = (enabled ? 1u : 0u)
+                    | ((all_horizons_ready || (!normals_ && enabled && sources_[s].source->has_specular_mask())) ? 2u : 0u);
                 if (roots && flags != 0u) {
                     words_[i*4] = offsets_[s];
                     words_[i*4+1] = sources_[s].source->level;

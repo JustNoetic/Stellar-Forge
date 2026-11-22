@@ -1133,7 +1133,9 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
             glm::dvec3 camera_offset = -camera_relative(b.render.position, cam.eye_pos_render());
             double distance = glm::length(camera_offset);
             if (d.ocean.enabled) {
-                float mode = d.ocean.mask == "global" ? 3.0f : d.ocean.mask == "height" ? 2.0f : 1.0f;
+                float mode = d.ocean.mask == "specular" ? 4.0f
+                           : d.ocean.mask == "global" ? 3.0f
+                           : d.ocean.mask == "height" ? 2.0f : 1.0f;
                 f.ocean_deep = glm::vec4(d.ocean.deep_color, mode);
                 f.ocean_shallow = glm::vec4(d.ocean.shallow_color, static_cast<float>(d.ocean.foam));
                 f.ocean_params = glm::vec4(static_cast<float>(d.ocean.wind_speed_ms),
