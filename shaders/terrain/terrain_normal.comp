@@ -1,0 +1,70 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 1) readonly buffer HeightPages {
+    uint height_words[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer HeightPool {
+    float height_pool[];
+};
+
+#include "common/height_sample.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer NormalJobs {
+    NormalBakeJobGPU jobs[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer NormalOut {
+    uvec2 normal_out[];
+};
+
+void main() {
+    uint tx = gl_GlobalInvocationID.x;
+    uint ty = gl_GlobalInvocationID.y;
+    if (tx >= 132u || ty >= 132u) return;
+
+    uint job_idx = gl_WorkGroupID.z;
+    NormalBakeJobGPU job = jobs[job_idx];
+    uint face = job.address.x;
+    uint level = job.address.y;
+    uint tile_x = job.address.z;
+    uint tile_y = job.address.w;
+
+    uint page_base = job.target.y;
+    uint cells = job.target.z;
+    uint flags = job.target.w;
+    bool cubic = (flags & 1u) != 0u;
+    uint gutter = (flags >> 1u) & 127u;
+
+    float radius_m = max(job.metrics.x, 1.0);
+    float polar_ratio = clamp(job.metrics.y, 0.05, 1.0);
+    float height_scale_m = max(job.metrics.z, 1.0);
+    vec3 ell_scale = vec3(1.0, polar_ratio, 1.0);
+
+    float width = ldexp(2.0, -int(level));
+    float step_uv = width / float(cells) * 0.25;
+    float u = -1.0 + (float(tile_x) + (float(tx) - 2.0 + 0.5) / 128.0) * width;
+    float v = -1.0 + (float(tile_y) + (float(ty) - 2.0 + 0.5) / 128.0) * width;
+
+    float h_m = height_sample_world(page_base, level, face, u, v, cells, gutter, cubic);
+    float h_up_m = height_sample_world(page_base, level, face, u + step_uv, v, cells, gutter, cubic);
+    float h_um_m = height_sample_world(page_base, level, face, u - step_uv, v, cells, gutter, cubic);
+    float h_vp_m = height_sample_world(page_base, level, face, u, v + step_uv, cells, gutter, cubic);
+    float h_vm_m = height_sample_world(page_base, level, face, u, v - step_uv, cells, gutter, cubic);
+
+    vec3 du = height_ellipsoid_delta(
+        horizon_cube_vector(face, vec2(u + step_uv, v)),
+        horizon_cube_vector(face, vec2(u - step_uv, v)),
+        h_up_m, h_um_m, ell_scale, radius_m);
+    vec3 dv = height_ellipsoid_delta(
+        horizon_cube_vector(face, vec2(u, v + step_uv)),
+        horizon_cube_vector(face, vec2(u, v - step_uv)),
+        h_vp_m, h_vm_m, ell_scale, radius_m);
+
+    vec3 n = normalize(cross(du, dv));
+    float h_norm = clamp(h_m / height_scale_m, -1.0, 1.0);
+    uint out_idx = job_idx * (132u * 132u) + ty * 132u + tx;
+    normal_out[out_idx] = uvec2(packSnorm2x16(n.xy), packSnorm2x16(vec2(n.z, h_norm)));
+}

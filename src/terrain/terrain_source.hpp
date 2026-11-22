@@ -91,6 +91,7 @@ public:
     const HeightSourceInfo& info() const noexcept { return info_; }
     const HeightRecord& record(TileId tile) const;
     HeightTile read(TileId tile) const;
+    std::shared_ptr<const HeightTile> read_shared(TileId tile) const;
     void retain_envelope(TileId tile, const HeightTile& payload) const;
     double morph_error(uint32_t level) const noexcept;
     double approximation_error(TileId tile, uint32_t stride = 1) const;
@@ -114,8 +115,10 @@ private:
     std::vector<HeightRecord> records_;
     std::array<size_t, MAX_LEVEL + 1> level_offsets_{};
     mutable std::mutex envelope_mutex_;
+    mutable std::mutex coarse_mutex_;
     mutable std::atomic<uint64_t> bounds_revision_{0};
     mutable std::list<std::pair<uint64_t, Envelope>> envelopes_;
+    mutable std::list<std::pair<uint64_t, std::shared_ptr<const HeightTile>>> coarse_tiles_;
 };
 
 double height_sample(const HeightTile& payload, double x, double y) noexcept;

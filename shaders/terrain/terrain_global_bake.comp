@@ -1,0 +1,43 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform GlobalBakePush {
+    uint page_base;
+    uint glevel;
+    uint face_size;
+    uint grid_cells;
+    uint gutter;
+    uint cubic;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer HeightPages {
+    uint height_words[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer HeightPool {
+    float height_pool[];
+};
+
+layout(set = 0, binding = 2, r32f) uniform writeonly image2DArray u_global_raw_out;
+
+#include "common/height_sample.glsl"
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+    if (coord.x >= int(pc.face_size) || coord.y >= int(pc.face_size) || coord.z >= 6) return;
+    uint n = 1u << pc.glevel;
+    uint tx = uint(coord.x) / 128u;
+    uint ty = uint(coord.y) / 128u;
+    uint lx = uint(coord.x) % 128u;
+    uint ly = uint(coord.y) % 128u;
+    uint n2 = n * n;
+    uint slot_val = height_words[pc.page_base + (2u + uint(coord.z)) * n2 - 2u + ty * n + tx];
+    float h_m = 0.0;
+    if (slot_val != 0u) {
+        float gx = (float(lx) + 0.5) / 128.0 * float(pc.grid_cells);
+        float gy = (float(ly) + 0.5) / 128.0 * float(pc.grid_cells);
+        h_m = height_pool_sample(slot_val - 1u, pc.grid_cells, pc.gutter, pc.cubic != 0u, gx, gy);
+    }
+    imageStore(u_global_raw_out, coord, vec4(h_m, 0.0, 0.0, 0.0));
+}

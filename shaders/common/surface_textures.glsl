@@ -140,6 +140,9 @@ vec3 surface_albedo(uint body, vec3 local_direction, vec3 fallback) {
     return surface_albedo_sample_aniso(body, direction, clamp(face_uv.xy*.5+.5, 0.0, 1.0), uint(face_uv.z), fp, fallback).rgb;
 }
 
+const uint NORMAL_SLOT_MASK = 0x3FFFFFFFu;
+const uint NORMAL_HORIZON_BIT = 0x80000000u;
+
 vec3 surface_normal_level(uint base, vec3 face_uv, uint level, vec3 fallback) {
     vec2 uv = clamp(face_uv.xy*.5+.5, 0.0, 1.0);
     uint face = uint(face_uv.z);
@@ -148,7 +151,7 @@ vec3 surface_normal_level(uint base, vec3 face_uv, uint level, vec3 fallback) {
         uvec2 tile = min(uvec2(uv*float(n)), uvec2(n-1u));
         uint n2 = n*n;
         uint address = (2u+face)*n2-2u+tile.y*n+tile.x;
-        uint slot = normal_words[base+address];
+        uint slot = normal_words[base+address] & NORMAL_SLOT_MASK;
         if (slot != 0u) {
             vec2 local = uv*float(n)-vec2(tile);
             return textureLod(u_normal_tiles, vec3((2.0+local*128.0)/132.0, float(slot-1u)), 0.0).xyz;
@@ -170,12 +173,13 @@ uint normal_lookup_face(SurfaceNormalLookup lookup) { return (lookup.packed >> 2
 uint normal_lookup_coarse_slot(SurfaceNormalLookup lookup) { return (lookup.packed >> 5u) & 8191u; }
 uint normal_lookup_fine_slot(SurfaceNormalLookup lookup) { return (lookup.packed >> 18u) & 8191u; }
 
-uint surface_normal_slot_uv(uint base, vec2 uv, uint face, uint level, out vec2 uv_out) {
+uint surface_normal_slot_uv_masked(uint base, vec2 uv, uint face, uint level, uint required_mask, out vec2 uv_out) {
     uint n = 1u << level;
     uvec2 tile = min(uvec2(uv*float(n)), uvec2(n-1u));
     uint n2 = n*n;
-    uint slot = normal_words[base+(2u+face)*n2-2u+tile.y*n+tile.x];
-    if (slot != 0u) {
+    uint word = normal_words[base+(2u+face)*n2-2u+tile.y*n+tile.x];
+    uint slot = word & NORMAL_SLOT_MASK;
+    if (slot != 0u && (word & required_mask) == required_mask) {
         vec2 local = uv*float(n)-vec2(tile);
         uv_out = (2.0+local*128.0)/132.0;
         return slot;
@@ -185,8 +189,9 @@ uint surface_normal_slot_uv(uint base, vec2 uv, uint face, uint level, out vec2 
         n >>= 1u;
         tile = min(uvec2(uv*float(n)), uvec2(n-1u));
         n2 = n*n;
-        slot = normal_words[base+(2u+face)*n2-2u+tile.y*n+tile.x];
-        if (slot != 0u) {
+        word = normal_words[base+(2u+face)*n2-2u+tile.y*n+tile.x];
+        slot = word & NORMAL_SLOT_MASK;
+        if (slot != 0u && (word & required_mask) == required_mask) {
             vec2 local = uv*float(n)-vec2(tile);
             uv_out = (2.0+local*128.0)/132.0;
             return slot;
@@ -196,11 +201,15 @@ uint surface_normal_slot_uv(uint base, vec2 uv, uint face, uint level, out vec2 
     return 0u;
 }
 
+uint surface_normal_slot_uv(uint base, vec2 uv, uint face, uint level, out vec2 uv_out) {
+    return surface_normal_slot_uv_masked(base, uv, face, level, 0u, uv_out);
+}
+
 uint surface_normal_slot(uint base, vec3 face_uv, uint level, out vec2 uv_out) {
     return surface_normal_slot_uv(base, clamp(face_uv.xy*.5+.5, 0.0, 1.0), uint(face_uv.z), level, uv_out);
 }
 
-SurfaceNormalLookup surface_normal_lookup_at(uint body, vec2 uv01, uint face, float raw_lod) {
+SurfaceNormalLookup surface_lookup_at_masked(uint body, vec2 uv01, uint face, float raw_lod, uint required_mask) {
     uint base = normal_words[body*4u];
     uint flags = normal_words[body*4u+2u] & 3u;
     SurfaceNormalLookup lookup;
@@ -214,15 +223,16 @@ SurfaceNormalLookup surface_normal_lookup_at(uint body, vec2 uv01, uint face, fl
     uint coarse = uint(floor(level));
     float frac = fract(level);
     lookup.blend = frac;
-    uint coarse_slot = surface_normal_slot_uv(base, uv01, face, coarse, lookup.coarse_uv);
+    uint coarse_slot = surface_normal_slot_uv_masked(base, uv01, face, coarse, required_mask, lookup.coarse_uv);
     uint fine_slot = coarse_slot;
     lookup.fine_uv = lookup.coarse_uv;
-    if (frac > 0.0 && coarse < maximum) {
+    if (frac > 0.0 && coarse < maximum && coarse_slot != 0u) {
         uint fn = 1u << (coarse+1u);
         uvec2 ftile = min(uvec2(uv01*float(fn)), uvec2(fn-1u));
         uint fn2 = fn*fn;
-        uint slot = normal_words[base+(2u+face)*fn2-2u+ftile.y*fn+ftile.x];
-        if (slot != 0u) {
+        uint fword = normal_words[base+(2u+face)*fn2-2u+ftile.y*fn+ftile.x];
+        uint slot = fword & NORMAL_SLOT_MASK;
+        if (slot != 0u && (fword & required_mask) == required_mask) {
             fine_slot = slot;
             vec2 flocal = uv01*float(fn)-vec2(ftile);
             lookup.fine_uv = (2.0+flocal*128.0)/132.0;
@@ -230,6 +240,14 @@ SurfaceNormalLookup surface_normal_lookup_at(uint body, vec2 uv01, uint face, fl
     }
     lookup.packed |= (coarse_slot << 5u) | (fine_slot << 18u);
     return lookup;
+}
+
+SurfaceNormalLookup surface_normal_lookup_at(uint body, vec2 uv01, uint face, float raw_lod) {
+    return surface_lookup_at_masked(body, uv01, face, raw_lod, 0u);
+}
+
+SurfaceNormalLookup surface_horizon_lookup_at(uint body, vec2 uv01, uint face, float raw_lod) {
+    return surface_lookup_at_masked(body, uv01, face, raw_lod, NORMAL_HORIZON_BIT);
 }
 
 SurfaceNormalLookup surface_normal_lookup(uint body, vec3 local_direction) {

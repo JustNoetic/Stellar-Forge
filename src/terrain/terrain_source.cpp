@@ -129,29 +129,53 @@ const HeightRecord& HeightSource::record(TileId tile) const {
 }
 
 HeightTile HeightSource::read(TileId tile) const {
+    return *read_shared(tile);
+}
+
+std::shared_ptr<const HeightTile> HeightSource::read_shared(TileId tile) const {
     const auto& r = record(tile);
     if (r.tile.level == info_.data_level) {
         std::lock_guard lock(envelope_mutex_);
         for (auto i = envelopes_.begin(); i != envelopes_.end(); ++i) {
             if (i->first == r.tile.key()) {
                 envelopes_.splice(envelopes_.begin(), envelopes_, i);
-                return *i->second.payload;
+                return i->second.payload;
+            }
+        }
+    } else {
+        std::lock_guard lock(coarse_mutex_);
+        for (auto i = coarse_tiles_.begin(); i != coarse_tiles_.end(); ++i) {
+            if (i->first == r.tile.key()) {
+                coarse_tiles_.splice(coarse_tiles_.begin(), coarse_tiles_, i);
+                return i->second;
             }
         }
     }
-    HeightTile result;
-    result.cells = info_.grid_cells;
-    result.gutter = info_.gutter;
-    result.side = info_.grid_cells + 1 + 2 * info_.gutter;
-    result.cubic = info_.cubic;
-    result.heights_m.resize(size_t(result.side) * result.side);
+    auto result = std::make_shared<HeightTile>();
+    result->cells = info_.grid_cells;
+    result->gutter = info_.gutter;
+    result->side = info_.grid_cells + 1 + 2 * info_.gutter;
+    result->cubic = info_.cubic;
+    result->heights_m.resize(size_t(result->side) * result->side);
     std::ifstream input(payload_, std::ios::binary);
     input.seekg(std::streamoff(r.offset));
-    input.read(reinterpret_cast<char*>(result.heights_m.data()), std::streamsize(result.heights_m.size() * sizeof(float)));
-    require(bool(input) && height_checksum(std::as_bytes(std::span{result.heights_m})) == r.checksum,
+    input.read(reinterpret_cast<char*>(result->heights_m.data()), std::streamsize(result->heights_m.size() * sizeof(float)));
+    require(bool(input) && height_checksum(std::as_bytes(std::span{result->heights_m})) == r.checksum,
             "Terrain payload is truncated or corrupt");
-    for (float height : result.heights_m) require(std::isfinite(height), "Terrain payload contains a nonfinite height");
-    if (r.tile.level == info_.data_level) retain_envelope(r.tile, result);
+    for (float height : result->heights_m) require(std::isfinite(height), "Terrain payload contains a nonfinite height");
+    if (r.tile.level == info_.data_level) {
+        retain_envelope(r.tile, *result);
+    } else {
+        std::lock_guard lock(coarse_mutex_);
+        for (auto i = coarse_tiles_.begin(); i != coarse_tiles_.end(); ++i) {
+            if (i->first == r.tile.key()) {
+                coarse_tiles_.splice(coarse_tiles_.begin(), coarse_tiles_, i);
+                return i->second;
+            }
+        }
+        if (coarse_tiles_.size() == 512) coarse_tiles_.pop_back();
+        coarse_tiles_.emplace_front(r.tile.key(), result);
+    }
     return result;
 }
 

@@ -1,0 +1,46 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 1) readonly buffer HeightPages {
+    uint height_words[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer HeightPool {
+    float height_pool[];
+};
+
+#include "common/height_sample.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer ApronJobs {
+    NormalBakeJobGPU jobs[];
+};
+
+layout(set = 0, binding = 3, r32f) uniform writeonly image2DArray u_apron_out;
+
+void main() {
+    uint ax = gl_GlobalInvocationID.x;
+    uint ay = gl_GlobalInvocationID.y;
+    if (ax >= 192u || ay >= 192u) return;
+
+    uint job_idx = gl_WorkGroupID.z;
+    NormalBakeJobGPU job = jobs[job_idx];
+    uint face = job.address.x;
+    uint level = job.address.y;
+    uint tile_x = job.address.z;
+    uint tile_y = job.address.w;
+
+    uint page_base = job.target.y;
+    uint cells = job.target.z;
+    uint flags = job.target.w;
+    bool cubic = (flags & 1u) != 0u;
+    uint gutter = (flags >> 1u) & 127u;
+
+    float width = ldexp(2.0, -int(level));
+    float u = -1.0 + (float(tile_x) + (float(ax) - 32.0 + 0.5) / 128.0) * width;
+    float v = -1.0 + (float(tile_y) + (float(ay) - 32.0 + 0.5) / 128.0) * width;
+
+    bool inner = ax >= 30u && ax < 162u && ay >= 30u && ay < 162u;
+    float h_m = height_sample_world(page_base, level, face, u, v, cells, gutter, inner && cubic);
+    imageStore(u_apron_out, ivec3(int(ax), int(ay), int(job_idx)), vec4(h_m, 0.0, 0.0, 0.0));
+}

@@ -173,6 +173,9 @@ void main() {
         mat3 rotation = body_surface_rotation(body_pole(b), b.spin_flags.x);
         SurfaceNormalLookup normal_lookup = surface_normal_lookup_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod);
 #endif
+#if SURFACE_HORIZONS
+        SurfaceNormalLookup horizon_lookup = surface_horizon_lookup_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod);
+#endif
 #if SURFACE_NORMALS
         vec3 N_local = surface_local_normal_aniso(f_body_idx, surf_dir, normal_lookup, surf_fp, transpose(rotation) * normalize(f_normal));
         N = normalize(rotation * N_local);
@@ -194,7 +197,7 @@ void main() {
             bool check_horizon = dot(N, L0) > -star_ang;
 #endif
             if (check_horizon) {
-                terrain_vis = terrain_self_shadow(normal_lookup, surf_dir,
+                terrain_vis = terrain_self_shadow(horizon_lookup, surf_dir,
                     max(1.0 - b.pole_oblateness.w, 0.05), N_local, transpose(rotation) * L0,
                     star_ang, SURFACE_OCEAN != 0);
             }
@@ -205,6 +208,9 @@ void main() {
 #if SURFACE_NORMALS || SURFACE_HORIZONS
     mat3 rotation = body_surface_rotation(body_pole(b), b.spin_flags.x);
     SurfaceNormalLookup normal_lookup = surface_normal_lookup_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod);
+#endif
+#if SURFACE_HORIZONS
+    SurfaceNormalLookup horizon_lookup = surface_horizon_lookup_at(f_body_idx, surf_uv01, surf_face, surf_raw_lod);
 #endif
 #if SURFACE_NORMALS
     vec3 N_local = surface_local_normal_aniso(f_body_idx, surf_dir, normal_lookup, surf_fp, transpose(rotation) * normalize(f_normal));
@@ -445,7 +451,7 @@ void main() {
 #if SURFACE_HORIZONS
         vec2 terrain_vis = vec2(1.0);
         if (any(greaterThan(shadow, vec3(0.0))) && (any(greaterThan(direct, vec3(0.0))) || has_ocean)) {
-            terrain_vis = terrain_self_shadow(normal_lookup, surf_dir,
+            terrain_vis = terrain_self_shadow(horizon_lookup, surf_dir,
                 max(1.0 - b.pole_oblateness.w, 0.05), N_local, transpose(rotation) * L,
                 asin(clamp(sin_r, 0.0, 1.0)), has_ocean);
         }
