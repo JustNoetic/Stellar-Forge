@@ -125,8 +125,15 @@ public:
     std::optional<glm::vec3> mean_albedo(const ephemeris::BodyDefinition& body) const noexcept;
     const rhi::Image& image() const noexcept { return atlas_; }
     const rhi::Image& horizon_image() const noexcept { return horizon_atlas_; }
+    const rhi::Buffer& horizon_bounds() const noexcept { return horizon_bounds_; }
     const rhi::Buffer& pages(uint32_t frame) const noexcept { return pages_[frame]; }
     const TextureStats& stats() const noexcept { return stats_; }
+    bool body_active(uint32_t body) const noexcept {
+        return body < COLOR_BODIES && words_.size() >= COLOR_BODIES * 4 && words_[body * 4] != 0u;
+    }
+    uint32_t body_flags(uint32_t body) const noexcept {
+        return body_active(body) ? words_[body * 4 + 2] : 0u;
+    }
 
 private:
     struct SelectionEntry { SelectionView view; Selection selection; bool valid = false; };
@@ -155,6 +162,7 @@ private:
     void run(std::stop_token stop);
     rhi::Image atlas_;
     rhi::Image horizon_atlas_;
+    rhi::Buffer horizon_bounds_;
     rhi::Image apron_scratch_;
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> horizon_jobs_;
     rhi::Pipeline horizon_pipeline_;

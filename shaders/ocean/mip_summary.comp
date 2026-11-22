@@ -1,0 +1,24 @@
+#version 460
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2DArray ocean_moments;
+layout(std430, set = 0, binding = 1) writeonly buffer OceanMipSummary {
+    vec4 prefix_sv[6];
+    vec4 prefix_j[6];
+};
+
+void main() {
+    int top_mip = textureQueryLevels(ocean_moments) - 1;
+    vec4 sv_acc = vec4(0.0);
+    vec4 j_acc = vec4(0.0);
+    prefix_sv[0] = vec4(0.0);
+    prefix_j[0] = vec4(0.0);
+    for (int i = 0; i < 5; ++i) {
+        vec4 s = texelFetch(ocean_moments, ivec3(0, 0, 2 * i), top_mip);
+        vec4 j = texelFetch(ocean_moments, ivec3(0, 0, 2 * i + 1), top_mip);
+        sv_acc += vec4(s.xy, max(s.z - s.x * s.x, 0.0) + max(s.w - s.y * s.y, 0.0), 0.0);
+        j_acc += vec4(j.x, max(j.y - j.x * j.x, 0.0), 0.0, 0.0);
+        prefix_sv[i + 1] = sv_acc;
+        prefix_j[i + 1] = j_acc;
+    }
+}

@@ -58,6 +58,7 @@ public:
 
     Image create_image_2d(uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags usage,
                           uint32_t mip_levels = 1, uint32_t array_layers = 1, bool array_view = false);
+    Image create_cubemap(uint32_t size, VkFormat format, VkImageUsageFlags usage);
     Image create_image_3d(uint32_t width, uint32_t height, uint32_t depth, VkFormat format,
                           VkImageUsageFlags usage, uint32_t mip_levels = 1);
     void upload_image_2d(Image& image, const void* pixels, VkDeviceSize byte_size,

@@ -3,6 +3,7 @@
 #include "core/path_utils.hpp"
 #include "core/log.hpp"
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <cmath>
 #include <cstring>
@@ -12,14 +13,29 @@ namespace sf::terrain {
 
 namespace {
 
-rhi::GraphicsPipelineDesc make_terrain_pipeline_desc(uint32_t mode, VkFormat color_format) {
+rhi::GraphicsPipelineDesc make_terrain_pipeline_desc(const rhi::VkContext& ctx, uint32_t mode, uint32_t shader_key, VkFormat color_format) {
     rhi::GraphicsPipelineDesc desc;
     desc.vert_path = mode == 0 ? "terrain/terrain_reference.vert" : "terrain/terrain.vert";
     desc.frag_path = "celestial/sphere.frag";
     desc.color_formats = {color_format};
-    desc.macros = {{"TERRAIN_SURFACE", "1"}};
+    auto flag = [&](uint32_t bit) { return (shader_key & bit) != 0u ? "1" : "0"; };
+    desc.macros = {
+        {"TERRAIN_SURFACE", "1"},
+        {"SURFACE_FULL_LIGHTING", flag(SURFACE_BIT_FULL_LIGHTING)},
+        {"SURFACE_ATMOSPHERE", flag(SURFACE_BIT_ATMOSPHERE)},
+        {"SURFACE_OCEAN", flag(SURFACE_BIT_OCEAN)},
+        {"SURFACE_OCEAN_FFT", flag(SURFACE_BIT_OCEAN_FFT)},
+        {"SURFACE_ALBEDO_MAP", flag(SURFACE_BIT_ALBEDO_MAP)},
+        {"SURFACE_NORMALS", flag(SURFACE_BIT_NORMALS)},
+        {"SURFACE_HORIZONS", flag(SURFACE_BIT_HORIZONS)},
+        {"SURFACE_SHADOW_CASTERS", flag(SURFACE_BIT_SHADOW_CASTERS)},
+        {"SURFACE_PLANETSHINE", flag(SURFACE_BIT_PLANETSHINE)},
+        {"SURFACE_DEBUG", flag(SURFACE_BIT_DEBUG)},
+        {"SURFACE_ATM_HORIZON_CLEAR", flag(SURFACE_BIT_ATM_HORIZON_CLEAR)},
+    };
     if (mode == 2) desc.macros.push_back({"TERRAIN_PRECISE_PROJECTION", "1"});
     else if (mode == 3) desc.macros.push_back({"TERRAIN_CACHED_FP64", "1"});
+    desc.capture_statistics = ctx.pipeline_statistics_enabled();
     desc.bindings = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
@@ -44,6 +60,9 @@ rhi::GraphicsPipelineDesc make_terrain_pipeline_desc(uint32_t mode, VkFormat col
         {31, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {47, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {49, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {50, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     if (mode != 0) desc.bindings.push_back({4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 1});
     return desc;
@@ -86,10 +105,6 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
         buffer = ctx.create_host_buffer(MAX_PATCHES * sizeof(PatchGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     for (auto& buffer : cached_patches_)
         buffer = ctx.create_host_buffer(MAX_PATCHES * sizeof(CachedPatchGPU), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    reference_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(0, VK_FORMAT_R16G16B16A16_SFLOAT));
-    pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(1, VK_FORMAT_R16G16B16A16_SFLOAT));
-    precise_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(2, VK_FORMAT_R16G16B16A16_SFLOAT));
-    cached_fp64_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(3, VK_FORMAT_R16G16B16A16_SFLOAT));
     cache_.init(ctx);
     auto config_path = paths::external_path("data", "terrain.json");
     if (load_config && std::filesystem::exists(config_path)) {
@@ -102,11 +117,8 @@ void TerrainRenderer::init(rhi::VkContext& ctx, bool load_config) {
 
 void TerrainRenderer::shutdown(rhi::VkContext& ctx) {
     streams_.clear();
-    rhi::ShaderCache::destroy_pipeline(ctx, pipeline_);
-    rhi::ShaderCache::destroy_pipeline(ctx, precise_pipeline_);
-    rhi::ShaderCache::destroy_pipeline(ctx, reference_pipeline_);
-    rhi::ShaderCache::destroy_pipeline(ctx, cached_fp64_pipeline_);
-    for (auto& pipeline : fp32_pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    for (auto& [key, pipeline] : pipelines_) rhi::ShaderCache::destroy_pipeline(ctx, pipeline);
+    pipelines_.clear();
     for (auto& buffer : patches_) ctx.destroy_buffer(buffer);
     for (auto& buffer : cached_patches_) ctx.destroy_buffer(buffer);
     cache_.shutdown(ctx);
@@ -164,7 +176,6 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                               const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count,
                               const rendering::RefractionHost* refraction) {
     prepared_.clear();
-    batch_count_ = 0;
     covered_.assign(body_count, 0);
     relief_extents_.clear();
     stats_ = {};
@@ -506,60 +517,114 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             log::error("Terrain source '{}': {}", binding.body, binding.reported_error);
         }
     }
-    auto* references = static_cast<PatchGPU*>(patches_[ctx.frame_index()].mapped);
-    auto* cached = static_cast<CachedPatchGPU*>(cached_patches_[ctx.frame_index()].mapped);
-    std::array<uint32_t, 64> counts{}, offsets{};
-    for (const auto& patch : prepared_) ++counts[patch.mode*16 + patch.draw->reference.metadata.y];
-    uint32_t first = 0;
-    for (uint32_t group = 0; group < counts.size(); ++group) {
-        offsets[group] = first;
-        if (counts[group]) batches_[batch_count_++] = {first, counts[group], group/16, group%16};
-        first += counts[group];
-    }
     for (const auto& patch : prepared_) {
-        uint32_t index = offsets[patch.mode*16 + patch.draw->reference.metadata.y]++;
-        if (patch.mode == 0) {
-            std::memcpy(references + index, &patch.draw->reference, sizeof(PatchGPU));
-            ++stats_.reference_patches;
-        } else {
-            std::memcpy(cached + index, &patch.draw->cached, sizeof(CachedPatchGPU));
-            cached[index].metadata.y = patch.slot;
-            ++stats_.cached_patches;
-        }
+        if (patch.mode == 0) ++stats_.reference_patches;
+        else ++stats_.cached_patches;
     }
-    if (stats_.reference_patches) ctx.flush_buffer(patches_[ctx.frame_index()], 0, stats_.reference_patches*sizeof(PatchGPU));
-    if (stats_.cached_patches) ctx.flush_buffer(cached_patches_[ctx.frame_index()], stats_.reference_patches*sizeof(CachedPatchGPU),
-                                              stats_.cached_patches*sizeof(CachedPatchGPU));
+    ++prepared_generation_;
 }
 
-rhi::Pipeline& TerrainRenderer::pipeline_for(rhi::VkContext& ctx, uint32_t mode, VkFormat color_format) {
-    if (color_format == VK_FORMAT_R32G32B32A32_SFLOAT) {
-        auto& pipe = fp32_pipelines_[std::min(mode, 3u)];
-        if (!pipe) pipe = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(mode, color_format));
-        return pipe;
-    }
-    return mode == 0 ? reference_pipeline_ : mode == 1 ? pipeline_ : mode == 2 ? precise_pipeline_ : cached_fp64_pipeline_;
+rhi::Pipeline& TerrainRenderer::pipeline_for(rhi::VkContext& ctx, uint32_t mode, uint32_t shader_key, VkFormat color_format) {
+    uint32_t masked = shader_key & SURFACE_BIT_ALL;
+    uint64_t key = (uint64_t(static_cast<uint32_t>(color_format)) << 13) | (uint64_t(mode & 3u) << 11) | uint64_t(masked);
+    auto& pipe = pipelines_[key];
+    if (!pipe) pipe = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(ctx, mode, masked, color_format));
+    return pipe;
 }
 
 void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene,
-                             VkFormat color_format) {
+                             std::span<const uint32_t> body_shader_keys, VkFormat color_format) {
     if (prepared_.empty()) return;
+    uint32_t f_idx = ctx.frame_index();
+    auto& upload = frame_uploads_[f_idx];
+    bool keys_match = upload.body_keys.size() == body_shader_keys.size()
+        && std::equal(upload.body_keys.begin(), upload.body_keys.end(), body_shader_keys.begin());
+    if (upload.generation != prepared_generation_ || !keys_match) {
+        upload.generation = prepared_generation_;
+        upload.body_keys.assign(body_shader_keys.begin(), body_shader_keys.end());
+        upload.batches.clear();
+        upload.ref_count = 0;
+        upload.cached_count = 0;
+        groups_.clear();
+        patch_group_.resize(prepared_.size());
+        auto shader_key_for = [&](uint32_t body_idx) -> uint32_t {
+            return body_idx < body_shader_keys.size() ? (body_shader_keys[body_idx] & SURFACE_BIT_ALL) : SURFACE_BIT_ALL;
+        };
+        for (size_t i = 0; i < prepared_.size(); ++i) {
+            const auto& patch = prepared_[i];
+            uint32_t skey = shader_key_for(patch.draw->reference.metadata.x);
+            uint32_t mask = patch.draw->reference.metadata.y;
+            size_t g_idx = groups_.size();
+            for (size_t g = 0; g < groups_.size(); ++g) {
+                if (groups_[g].mode == patch.mode && groups_[g].shader_key == skey) {
+                    g_idx = g;
+                    break;
+                }
+            }
+            if (g_idx == groups_.size()) groups_.push_back({patch.mode, skey});
+            ++groups_[g_idx].counts[mask];
+            patch_group_[i] = static_cast<uint16_t>(g_idx);
+        }
+        for (auto& g : groups_) {
+            uint32_t& cursor = g.mode == 0 ? upload.ref_count : upload.cached_count;
+            for (uint32_t m = 0; m < 16; ++m) {
+                if (g.counts[m]) {
+                    g.offsets[m] = cursor;
+                    cursor += g.counts[m];
+                }
+            }
+        }
+        auto* references = static_cast<PatchGPU*>(patches_[f_idx].mapped);
+        auto* cached = static_cast<CachedPatchGPU*>(cached_patches_[f_idx].mapped);
+        for (size_t i = 0; i < prepared_.size(); ++i) {
+            const auto& patch = prepared_[i];
+            auto& g = groups_[patch_group_[i]];
+            uint32_t mask = patch.draw->reference.metadata.y;
+            uint32_t dst = g.offsets[mask]++;
+            if (patch.mode == 0) {
+                std::memcpy(references + dst, &patch.draw->reference, sizeof(PatchGPU));
+            } else {
+                std::memcpy(cached + dst, &patch.draw->cached, sizeof(CachedPatchGPU));
+                cached[dst].metadata.y = patch.slot;
+            }
+        }
+        if (upload.ref_count) ctx.flush_buffer(patches_[f_idx], 0, upload.ref_count * sizeof(PatchGPU));
+        if (upload.cached_count) ctx.flush_buffer(cached_patches_[f_idx], 0, upload.cached_count * sizeof(CachedPatchGPU));
+        upload.batches.reserve(groups_.size());
+        for (const auto& g : groups_) {
+            GroupBatch gb;
+            gb.mode = g.mode;
+            gb.shader_key = g.shader_key;
+            for (uint32_t m = 0; m < 16; ++m) {
+                if (g.counts[m]) {
+                    gb.draws[m] = {g.offsets[m] - g.counts[m], g.counts[m]};
+                    gb.mask_bits |= uint16_t(1u << m);
+                }
+            }
+            upload.batches.push_back(gb);
+        }
+    }
     std::vector<rhi::PushDescriptorWrite> writes(scene.begin(), scene.end());
     vkCmdBindIndexBuffer(cmd, indices_.handle, 0, VK_INDEX_TYPE_UINT32);
     constexpr uint32_t index_count = GRID_CELLS * GRID_CELLS * 6;
-    for (uint32_t index = 0; index < batch_count_; ++index) {
-        auto [first, count, mode, mask] = batches_[index];
-        auto& pipeline = pipeline_for(ctx, mode, color_format);
+    for (const auto& gb : upload.batches) {
+        auto& pipeline = pipeline_for(ctx, gb.mode, gb.shader_key, color_format);
         writes.resize(scene.size());
-        if (mode == 0) {
-            writes.push_back(rhi::PushDescriptorWrite::storage_buffer(3, patches_[ctx.frame_index()], 0, prepared_.size() * sizeof(PatchGPU)));
+        if (gb.mode == 0) {
+            writes.push_back(rhi::PushDescriptorWrite::storage_buffer(3, patches_[f_idx], 0, upload.ref_count * sizeof(PatchGPU)));
         } else {
-            writes.push_back(rhi::PushDescriptorWrite::storage_buffer(3, cached_patches_[ctx.frame_index()], 0, prepared_.size() * sizeof(CachedPatchGPU)));
+            writes.push_back(rhi::PushDescriptorWrite::storage_buffer(3, cached_patches_[f_idx], 0, upload.cached_count * sizeof(CachedPatchGPU)));
             writes.push_back(rhi::PushDescriptorWrite::storage_buffer(4, cache_.buffer()));
         }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
         ctx.push_descriptors(cmd, pipeline, writes);
-        vkCmdDrawIndexed(cmd, index_count, count, mask * index_count, 0, first);
+        uint32_t bits = gb.mask_bits;
+        while (bits != 0u) {
+            uint32_t mask = uint32_t(std::countr_zero(bits));
+            bits &= bits - 1u;
+            auto [first, count] = gb.draws[mask];
+            vkCmdDrawIndexed(cmd, index_count, count, mask * index_count, 0, first);
+        }
     }
 }
 

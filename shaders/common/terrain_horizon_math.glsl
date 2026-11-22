@@ -55,6 +55,13 @@ float decode_horizon_sin(float u) {
     return -HORIZON_NEG_MAX * t * t;
 }
 
+vec4 decode_horizon_sin4(vec4 u) {
+    vec4 c = clamp(u, vec4(0.0), vec4(1.0));
+    vec4 tp = (c - HORIZON_ZERO_U) * (1.0 / (1.0 - HORIZON_ZERO_U));
+    vec4 tn = 1.0 - c * (1.0 / HORIZON_ZERO_U);
+    return mix(-HORIZON_NEG_MAX * tn * tn, tp * tp, greaterThanEqual(c, vec4(HORIZON_ZERO_U)));
+}
+
 float horizon_disk_above(float alpha, float theta_h, float star_ang_rad) {
     float r = max(star_ang_rad, 1e-5);
     float u = clamp((theta_h - alpha) / r, -1.0, 1.0);

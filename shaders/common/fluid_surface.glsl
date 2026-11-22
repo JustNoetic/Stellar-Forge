@@ -6,6 +6,17 @@ const float FLUID_AU_KM = 149597870.7;
 const float FLUID_PI = 3.141592653589793;
 const uint OCEAN_CASCADE_COUNT = 5u;
 
+#ifndef SURFACE_OCEAN_FFT
+#define SURFACE_OCEAN_FFT 1
+#endif
+#ifndef SF_DONT_UNROLL
+#if defined(SF_ENABLE_DONT_UNROLL) && defined(GL_EXT_control_flow_attributes)
+#define SF_DONT_UNROLL [[dont_unroll]]
+#else
+#define SF_DONT_UNROLL
+#endif
+#endif
+
 struct SurfaceFluidGPU {
     vec4 ocean_deep;
     vec4 ocean_shallow;
@@ -19,6 +30,15 @@ struct SurfaceFluidGPU {
 
 layout(set = 0, binding = 29) uniform sampler2DArray cloud_coverage_maps;
 layout(set = 0, binding = 32) uniform sampler2DArray ocean_moments;
+#ifdef SURFACE_OCEAN_WIND_LUT
+layout(set = 0, binding = 50) uniform samplerCube ocean_wind_lut;
+#endif
+#ifdef SURFACE_OCEAN_MIP_SUMMARY
+layout(std430, set = 0, binding = 49) readonly buffer OceanMipSummary {
+    vec4 ocean_mip_prefix_sv[6];
+    vec4 ocean_mip_prefix_j[6];
+};
+#endif
 
 layout(std430, set = 0, binding = 28) readonly buffer SurfaceFluidBuffer {
     uvec4 fluid_flags;
@@ -139,20 +159,54 @@ float ocean_below(float x) {
 
 OceanSurface ocean_surface(uint body, vec3 fixed_normal, vec3 fixed_from_camera_m, vec3 fixed_dx_m, vec3 fixed_dy_m, mat3 rotation) {
     SurfaceFluidGPU f = fluids[body];
+#ifdef SURFACE_OCEAN_WIND_LUT
+    float wind = 0.55 + 0.9 * textureLod(ocean_wind_lut, fixed_normal, 0.0).r;
+#else
     float wind = 0.55+0.9*fbm_noise(fixed_normal*7.0+vec3(3.1, 1.7, 5.3), 3, 2.1, 0.5);
+#endif
     float u = f.ocean_params.x*sqrt(wind);
     float whitecaps = clamp(3.84e-6*pow(max(u, 0.0), 3.41)*f.ocean_shallow.w*2.0, 1e-5, 0.5);
     OceanSurface o;
+#if SURFACE_OCEAN_FFT
     if (fluid_flags.w != body) {
+#endif
         o.normal = normalize(rotation*fixed_normal);
         o.roughness_squared = f.ocean_params.y*wind+0.001;
         o.foam = min(whitecaps, 0.8);
         return o;
+#if SURFACE_OCEAN_FFT
     }
     vec3 tangent = ocean_tangent.xyz, bitangent = ocean_bitangent.xyz;
     vec2 p = vec2(dot(fixed_from_camera_m, tangent), dot(fixed_from_camera_m, bitangent));
     vec2 px = vec2(dot(fixed_dx_m, tangent), dot(fixed_dx_m, bitangent));
     vec2 py = vec2(dot(fixed_dy_m, tangent), dot(fixed_dy_m, bitangent));
+#ifdef SURFACE_OCEAN_MIP_SUMMARY
+    uint first_c = fluid_flags.z & 7u;
+    uint last_c = (fluid_flags.z >> 4u) & 7u;
+    float footprint2 = max(dot(px, px), dot(py, py));
+    SF_DONT_UNROLL
+    while (first_c <= last_c && (ocean_cascades[first_c].w <= 0.0 || footprint2 * (ocean_cascades[first_c].z * ocean_cascades[first_c].z) >= 1.0)) {
+        ++first_c;
+    }
+    vec4 base_sv = ocean_mip_prefix_sv[first_c];
+    vec4 base_j = ocean_mip_prefix_j[first_c];
+    vec2 slope = base_sv.xy;
+    float variance = base_sv.z;
+    float jacobian = base_j.x;
+    float jacobian_variance = base_j.y;
+    SF_DONT_UNROLL
+    for (uint i = first_c; i <= last_c; ++i) {
+        vec4 c = ocean_cascades[i];
+        if (c.w <= 0.0) continue;
+        vec2 uv = p*c.z+c.xy;
+        vec4 s = textureGrad(ocean_moments, vec3(uv, float(2u*i)), px*c.z, py*c.z);
+        vec4 j = textureGrad(ocean_moments, vec3(uv, float(2u*i+1u)), px*c.z, py*c.z);
+        slope += s.xy;
+        variance += max(s.z-s.x*s.x, 0.0)+max(s.w-s.y*s.y, 0.0);
+        jacobian += j.x;
+        jacobian_variance += max(j.y-j.x*j.x, 0.0);
+    }
+#else
     vec2 slope = vec2(0.0);
     float variance = 0.0, jacobian = 0.0, jacobian_variance = 0.0;
     for (uint i = 0u; i < OCEAN_CASCADE_COUNT; ++i) {
@@ -165,6 +219,7 @@ OceanSurface ocean_surface(uint body, vec3 fixed_normal, vec3 fixed_from_camera_
         jacobian += j.x;
         jacobian_variance += max(j.y-j.x*j.x, 0.0);
     }
+#endif
     float scale = sqrt(wind);
     slope *= scale;
     vec3 gradient = slope.x*tangent+slope.y*bitangent;
@@ -176,6 +231,7 @@ OceanSurface ocean_surface(uint body, vec3 fixed_normal, vec3 fixed_from_camera_
     float local = max(sqrt(jacobian_variance)*scale, 0.02*spread+1e-4);
     o.foam = min(ocean_below((threshold-1.0-jacobian*scale)/local), 0.8);
     return o;
+#endif
 }
 
 #endif

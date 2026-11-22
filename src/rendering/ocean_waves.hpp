@@ -48,15 +48,20 @@ public:
     double residual_mean_square_slope(double target) const noexcept;
     double mean_square_slope() const noexcept { return spectrum_.total_mean_square_slope; }
     const rhi::Image& moments() const noexcept { return moments_; }
+    const rhi::Buffer& mip_summary() const noexcept { return mip_summary_; }
+    const rhi::Image& wind_lut() const noexcept { return wind_lut_; }
+    double cascade_mean_square_slope(uint32_t c) const noexcept { return c < OCEAN_CASCADE_COUNT ? spectrum_.mean_square_slope[c] : 0.0; }
     uint64_t spectrum_builds() const noexcept { return spectrum_builds_; }
 
 private:
     rhi::Image field_{};
     rhi::Image base_{};
     rhi::Image moments_{};
+    rhi::Image wind_lut_{};
+    rhi::Buffer mip_summary_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> amplitudes_{};
     std::array<uint64_t, rhi::FRAMES_IN_FLIGHT> uploaded_{};
-    rhi::Pipeline evolve_pipeline_{}, fft_pipeline_{}, moments_pipeline_{};
+    rhi::Pipeline evolve_pipeline_{}, fft_pipeline_{}, moments_pipeline_{}, mip_summary_pipeline_{};
     OceanSpectrumParameters parameters_{};
     OceanSpectrum spectrum_{};
     uint64_t spectrum_builds_ = 0;

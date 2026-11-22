@@ -224,12 +224,215 @@ int find_body_by_spice_id(const SystemDefinition& def, int target_id) {
 
 } // namespace
 
+SpiceTrajectoryCache::~SpiceTrajectoryCache() {
+    {
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
+    }
+}
+
+void SpiceTrajectoryCache::ensure_worker() {
+    if (!worker_.joinable()) {
+        worker_ = std::thread(&SpiceTrajectoryCache::worker_loop, this);
+    }
+}
+
+void SpiceTrajectoryCache::worker_loop() {
+    for (;;) {
+        SampleJob job{};
+        {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [&] { return stopping_ || !pending_jobs_.empty(); });
+            if (stopping_) return;
+            job = std::move(pending_jobs_.front());
+            pending_jobs_.erase(pending_jobs_.begin());
+            if (job.epoch != request_epoch_) continue;
+        }
+
+        SampleResult res = run_sample_job(job);
+
+        {
+            std::lock_guard lock(mutex_);
+            if (stopping_) return;
+            if (res.epoch == request_epoch_) {
+                completed_results_.push_back(std::move(res));
+            }
+        }
+    }
+}
+
+SpiceTrajectoryCache::SampleResult SpiceTrajectoryCache::run_sample_job(const SampleJob& job) {
+    SampleResult res{};
+    res.epoch = job.epoch;
+    res.entry_index = job.entry_index;
+
+    double win_start = job.cov_start;
+    double win_end = job.cov_end;
+    if (job.rotating) {
+        const double half_w = 0.5 * std::max(5.0, static_cast<double>(job.config.lagrange_days)) * 86400.0;
+        win_start = std::max(job.cov_start, job.ref_et - half_w);
+        win_end = std::min(job.cov_end, job.ref_et + half_w);
+    } else if ((job.cov_end - job.cov_start) > 400.0 * 86400.0 && job.config.trail_fade) {
+        const double back_s = (static_cast<double>(job.config.trail_days) + 45.0) * 86400.0;
+        const double fwd_s = (static_cast<double>(job.config.lead_days) + 45.0) * 86400.0;
+        win_start = std::max(job.cov_start, job.ref_et - back_s);
+        win_end = std::min(job.cov_end, job.ref_et + fwd_s);
+    }
+
+    const double span = std::max(1.0, win_end - win_start);
+    const double eps = std::min(1.0, span * 1e-4);
+    const double t0 = win_start + eps;
+    const double t1 = win_end - eps;
+    if (t1 <= t0) return res;
+
+    auto eval_coord = [&](double t, glm::dvec3& out) -> bool {
+        BodyMotion bm{};
+        if (job.rotating) {
+            if (!job.spice->state(job.spice_id, t, bm)) return false;
+            BodyMotion m1{}, m2{};
+            if (!job.spice->state(job.rot_p1_spice, t, m1) || !job.spice->state(job.rot_p2_spice, t, m2)) return false;
+            glm::dvec3 e_r{}, e_t{}, e_n{};
+            double dist = 0.0;
+            if (!compute_synodic_basis(m1, m2, e_r, e_t, e_n, dist)) return false;
+            const glm::dvec3 anchor_pos = (job.rot_anchor_spice == job.rot_p1_spice) ? m1.position.value : m2.position.value;
+            const glm::dvec3 rel = bm.position.value - anchor_pos;
+            out = glm::dvec3(glm::dot(rel, e_r), glm::dot(rel, e_t), glm::dot(rel, e_n)) / dist;
+            return finite_vector(out);
+        } else {
+            if (!job.spice->state_relative(job.spice_id, job.parent_spice_id, t, bm)) return false;
+            out = bm.position.value;
+            return finite_vector(out);
+        }
+    };
+
+    const size_t max_pts = std::clamp<size_t>(job.config.sample_points, 256, 25000);
+    const size_t full_coarse = std::clamp<size_t>(max_pts / 3, 96, 1600);
+
+    auto sample_range = [&](double ra, double rb, size_t slice_max_pts,
+                            std::vector<double>& dst_ets, std::vector<glm::dvec3>& dst_coords) {
+        if (rb <= ra || slice_max_pts < 2) return;
+        const double frac_span = std::clamp((rb - ra) / span, 0.0, 1.0);
+        const size_t slice_coarse = std::clamp<size_t>(
+            static_cast<size_t>(std::ceil(static_cast<double>(full_coarse) * frac_span)), 8, full_coarse);
+
+        std::vector<double> coarse_t(slice_coarse);
+        std::vector<glm::dvec3> coarse_p(slice_coarse);
+        std::vector<bool> coarse_ok(slice_coarse, false);
+        for (size_t k = 0; k < slice_coarse; ++k) {
+            const double frac = static_cast<double>(k) / static_cast<double>(slice_coarse - 1);
+            coarse_t[k] = ra + frac * (rb - ra);
+            coarse_ok[k] = eval_coord(coarse_t[k], coarse_p[k]);
+        }
+
+        const size_t start_size = dst_ets.size();
+        auto subdivide = [&](auto& self, double ta, const glm::dvec3& pa, double tb, const glm::dvec3& pb, int depth) -> void {
+            if (depth >= 5 || (dst_ets.size() - start_size) + 2 >= slice_max_pts) {
+                dst_ets.push_back(tb);
+                dst_coords.push_back(pb);
+                return;
+            }
+            const double tm = 0.5 * (ta + tb);
+            glm::dvec3 pm{};
+            if (!eval_coord(tm, pm)) {
+                dst_ets.push_back(tb);
+                dst_coords.push_back(pb);
+                return;
+            }
+            const glm::dvec3 v1 = pm - pa;
+            const glm::dvec3 v2 = pb - pm;
+            const double l1 = glm::length(v1);
+            const double l2 = glm::length(v2);
+            bool need_split = false;
+            if (l1 > 1e-12 && l2 > 1e-12) {
+                const double cos_ang = glm::dot(v1, v2) / (l1 * l2);
+                if (cos_ang < 0.9992) need_split = true;
+            }
+            if (need_split) {
+                self(self, ta, pa, tm, pm, depth + 1);
+                self(self, tm, pm, tb, pb, depth + 1);
+            } else {
+                dst_ets.push_back(tb);
+                dst_coords.push_back(pb);
+            }
+        };
+
+        bool started = false;
+        for (size_t k = 0; k < slice_coarse; ++k) {
+            if (!coarse_ok[k]) continue;
+            if (!started) {
+                if (dst_ets.empty() || coarse_t[k] > dst_ets.back() + 1e-6) {
+                    dst_ets.push_back(coarse_t[k]);
+                    dst_coords.push_back(coarse_p[k]);
+                }
+                started = true;
+            } else {
+                subdivide(subdivide, dst_ets.back(), dst_coords.back(), coarse_t[k], coarse_p[k], 0);
+            }
+        }
+    };
+
+    const bool has_overlap = !job.prev_ets.empty() &&
+                             win_end > job.prev_start_et &&
+                             win_start < job.prev_end_et;
+
+    if (has_overlap) {
+        auto it_beg = std::lower_bound(job.prev_ets.begin(), job.prev_ets.end(), t0);
+        auto it_end = std::upper_bound(job.prev_ets.begin(), job.prev_ets.end(), t1);
+        const size_t keep_beg = static_cast<size_t>(it_beg - job.prev_ets.begin());
+        const size_t keep_end = static_cast<size_t>(it_end - job.prev_ets.begin());
+
+        if (keep_beg < keep_end) {
+            const size_t kept_count = keep_end - keep_beg;
+            const size_t remaining_budget = (max_pts > kept_count) ? (max_pts - kept_count) : 64;
+            res.ets.reserve(kept_count + remaining_budget);
+            res.coords.reserve(kept_count + remaining_budget);
+
+            if (t0 < job.prev_ets[keep_beg] - 1.0 && win_start < job.prev_start_et) {
+                sample_range(t0, job.prev_ets[keep_beg], std::max<size_t>(remaining_budget / 2, 32), res.ets, res.coords);
+            }
+
+            for (size_t k = keep_beg; k < keep_end; ++k) {
+                if (res.ets.empty() || job.prev_ets[k] > res.ets.back() + 1e-6) {
+                    res.ets.push_back(job.prev_ets[k]);
+                    res.coords.push_back(job.prev_coords[k]);
+                }
+            }
+
+            if (t1 > res.ets.back() + 1.0 && win_end > job.prev_end_et) {
+                const size_t tail_budget = (max_pts > res.ets.size()) ? (max_pts - res.ets.size()) : 32;
+                sample_range(res.ets.back(), t1, std::max<size_t>(tail_budget, 32), res.ets, res.coords);
+            }
+
+            res.start_et = win_start;
+            res.end_et = win_end;
+            return res;
+        }
+    }
+
+    res.ets.reserve(max_pts);
+    res.coords.reserve(max_pts);
+    sample_range(t0, t1, max_pts, res.ets, res.coords);
+    res.start_et = win_start;
+    res.end_et = win_end;
+    return res;
+}
+
 void SpiceTrajectoryCache::evaluate(const SystemSnapshot& sys, const EphemerisOrbitConfig& config,
                                     std::vector<OrbitPolyline>& out_polylines,
                                     std::vector<bool>& out_covered_bodies) {
     out_polylines.clear();
     out_covered_bodies.assign(sys.size(), false);
     if (sys.empty() || sys.definition().motion_model != MotionModel::Spice) {
+        {
+            std::lock_guard lock(mutex_);
+            ++request_epoch_;
+            pending_jobs_.clear();
+            completed_results_.clear();
+        }
         entries_.clear();
         return;
     }
@@ -262,6 +465,12 @@ void SpiceTrajectoryCache::evaluate(const SystemSnapshot& sys, const EphemerisOr
     const bool is_custom_bsp = !def.custom_bsp_path.empty();
 
     if (structure_changed) {
+        {
+            std::lock_guard lock(mutex_);
+            ++request_epoch_;
+            pending_jobs_.clear();
+            completed_results_.clear();
+        }
         entries_.clear();
         generation_ = sys.generation();
         definition_revision_ = sys.definition_revision();
@@ -352,119 +561,27 @@ void SpiceTrajectoryCache::evaluate(const SystemSnapshot& sys, const EphemerisOr
     }
     config_ = config;
 
-    auto sample_entry = [&](CachedBody& entry) {
-        const auto& b = def.bodies[entry.body_index];
-        double cov_start = b.has_finite_spice_coverage() ? b.spice_start_et : (cur_et - 180.0 * 86400.0);
-        double cov_end = b.has_finite_spice_coverage() ? b.spice_end_et : (cur_et + 180.0 * 86400.0);
-        if (cov_end <= cov_start) cov_end = cov_start + 86400.0;
-
-        double win_start = cov_start;
-        double win_end = cov_end;
-        const double ref_et = std::clamp(cur_et, cov_start, cov_end);
-
-        if (entry.rotating) {
-            const double half_w = 0.5 * std::max(5.0, static_cast<double>(config.lagrange_days)) * 86400.0;
-            win_start = std::max(cov_start, ref_et - half_w);
-            win_end = std::min(cov_end, ref_et + half_w);
-        } else if ((cov_end - cov_start) > 400.0 * 86400.0 && config.trail_fade) {
-            const double back_s = ( static_cast<double>(config.trail_days) + 45.0) * 86400.0;
-            const double fwd_s = (static_cast<double>(config.lead_days) + 45.0) * 86400.0;
-            win_start = std::max(cov_start, ref_et - back_s);
-            win_end = std::min(cov_end, ref_et + fwd_s);
+    std::vector<SampleResult> completed;
+    uint64_t current_epoch = 0;
+    {
+        std::lock_guard lock(mutex_);
+        current_epoch = request_epoch_;
+        completed.swap(completed_results_);
+    }
+    for (auto& res : completed) {
+        if (res.epoch == current_epoch && res.entry_index < entries_.size()) {
+            auto& entry = entries_[res.entry_index];
+            entry.ets = std::move(res.ets);
+            entry.coords = std::move(res.coords);
+            entry.start_et = res.start_et;
+            entry.end_et = res.end_et;
+            entry.sampling_in_flight = false;
         }
+    }
 
-        const double span = std::max(1.0, win_end - win_start);
-        const double eps = std::min(1.0, span * 1e-4);
-        const double t0 = win_start + eps;
-        const double t1 = win_end - eps;
-        if (t1 <= t0) return;
-
-        auto eval_coord = [&](double t, glm::dvec3& out) -> bool {
-            BodyMotion bm{};
-            if (!spice->state(entry.spice_id, t, bm)) return false;
-            if (entry.rotating) {
-                BodyMotion m1{}, m2{};
-                if (!spice->state(entry.rot_p1_spice, t, m1) || !spice->state(entry.rot_p2_spice, t, m2)) return false;
-                glm::dvec3 e_r{}, e_t{}, e_n{};
-                double dist = 0.0;
-                if (!compute_synodic_basis(m1, m2, e_r, e_t, e_n, dist)) return false;
-                const glm::dvec3 anchor_pos = (entry.rot_anchor_spice == entry.rot_p1_spice) ? m1.position.value : m2.position.value;
-                const glm::dvec3 rel = bm.position.value - anchor_pos;
-                out = glm::dvec3(glm::dot(rel, e_r), glm::dot(rel, e_t), glm::dot(rel, e_n)) / dist;
-                return finite_vector(out);
-            } else {
-                BodyMotion pm{};
-                if (!spice->state(entry.parent_spice_id, t, pm)) return false;
-                out = bm.position.value - pm.position.value;
-                return finite_vector(out);
-            }
-        };
-
-        const size_t max_pts = std::clamp<size_t>(config.sample_points, 256, 25000);
-        const size_t coarse_pts = std::clamp<size_t>(max_pts / 3, 96, 1600);
-
-        entry.ets.clear();
-        entry.coords.clear();
-        entry.ets.reserve(max_pts);
-        entry.coords.reserve(max_pts);
-
-        std::vector<double> coarse_t(coarse_pts);
-        std::vector<glm::dvec3> coarse_p(coarse_pts);
-        std::vector<bool> coarse_ok(coarse_pts, false);
-        for (size_t k = 0; k < coarse_pts; ++k) {
-            double frac = static_cast<double>(k) / static_cast<double>(coarse_pts - 1);
-            coarse_t[k] = t0 + frac * (t1 - t0);
-            coarse_ok[k] = eval_coord(coarse_t[k], coarse_p[k]);
-        }
-
-        auto subdivide = [&](auto& self, double ta, const glm::dvec3& pa, double tb, const glm::dvec3& pb, int depth) -> void {
-            if (depth >= 5 || entry.ets.size() + 2 >= max_pts) {
-                entry.ets.push_back(tb);
-                entry.coords.push_back(pb);
-                return;
-            }
-            const double tm = 0.5 * (ta + tb);
-            glm::dvec3 pm{};
-            if (!eval_coord(tm, pm)) {
-                entry.ets.push_back(tb);
-                entry.coords.push_back(pb);
-                return;
-            }
-            const glm::dvec3 v1 = pm - pa;
-            const glm::dvec3 v2 = pb - pm;
-            const double l1 = glm::length(v1);
-            const double l2 = glm::length(v2);
-            bool need_split = false;
-            if (l1 > 1e-12 && l2 > 1e-12) {
-                const double cos_ang = glm::dot(v1, v2) / (l1 * l2);
-                if (cos_ang < 0.9992) need_split = true;
-            }
-            if (need_split) {
-                self(self, ta, pa, tm, pm, depth + 1);
-                self(self, tm, pm, tb, pb, depth + 1);
-            } else {
-                entry.ets.push_back(tb);
-                entry.coords.push_back(pb);
-            }
-        };
-
-        bool started = false;
-        for (size_t k = 0; k < coarse_pts; ++k) {
-            if (!coarse_ok[k]) continue;
-            if (!started) {
-                entry.ets.push_back(coarse_t[k]);
-                entry.coords.push_back(coarse_p[k]);
-                started = true;
-            } else {
-                subdivide(subdivide, entry.ets.back(), entry.coords.back(), coarse_t[k], coarse_p[k], 0);
-            }
-        }
-
-        entry.start_et = win_start;
-        entry.end_et = win_end;
-    };
-
-    for (auto& entry : entries_) {
+    std::vector<SampleJob> new_jobs;
+    for (size_t idx = 0; idx < entries_.size(); ++idx) {
+        auto& entry = entries_[idx];
         if (entry.body_index < 0 || static_cast<size_t>(entry.body_index) >= sys.size()) continue;
         out_covered_bodies[entry.body_index] = true;
 
@@ -475,17 +592,39 @@ void SpiceTrajectoryCache::evaluate(const SystemSnapshot& sys, const EphemerisOr
 
         const auto& bdef = bview.definition;
         const double cov_start = bdef.has_finite_spice_coverage() ? bdef.spice_start_et : (cur_et - 180.0 * 86400.0);
-        const double cov_end = bdef.has_finite_spice_coverage() ? bdef.spice_end_et : (cur_et + 180.0 * 86400.0);
+        double cov_end = bdef.has_finite_spice_coverage() ? bdef.spice_end_et : (cur_et + 180.0 * 86400.0);
+        if (cov_end <= cov_start) cov_end = cov_start + 86400.0;
         const double clamped_et = std::clamp(cur_et, cov_start, cov_end);
 
         bool need_resample = entry.ets.empty();
         if (!need_resample) {
-            const double margin = 5.0 * 86400.0;
+            const double cached_span = std::max(1.0, entry.end_et - entry.start_et);
+            const double margin = std::min(5.0 * 86400.0, 0.25 * cached_span);
             if (clamped_et < entry.start_et + margin && entry.start_et > cov_start + 60.0) need_resample = true;
             if (clamped_et > entry.end_et - margin && entry.end_et < cov_end - 60.0) need_resample = true;
+            if (clamped_et < entry.start_et || clamped_et > entry.end_et) need_resample = true;
         }
-        if (need_resample) {
-            sample_entry(entry);
+        if (need_resample && !entry.sampling_in_flight) {
+            entry.sampling_in_flight = true;
+            SampleJob job{};
+            job.epoch = current_epoch;
+            job.entry_index = idx;
+            job.spice = spice;
+            job.spice_id = entry.spice_id;
+            job.parent_spice_id = entry.parent_spice_id;
+            job.rotating = entry.rotating;
+            job.rot_p1_spice = entry.rot_p1_spice;
+            job.rot_p2_spice = entry.rot_p2_spice;
+            job.rot_anchor_spice = entry.rot_anchor_spice;
+            job.cov_start = cov_start;
+            job.cov_end = cov_end;
+            job.ref_et = clamped_et;
+            job.config = config;
+            job.prev_start_et = entry.start_et;
+            job.prev_end_et = entry.end_et;
+            job.prev_ets = entry.ets;
+            job.prev_coords = entry.coords;
+            new_jobs.push_back(std::move(job));
         }
         if (entry.coords.size() < 2) continue;
 
@@ -555,10 +694,29 @@ void SpiceTrajectoryCache::evaluate(const SystemSnapshot& sys, const EphemerisOr
             max_r2 = std::max(max_r2, glm::dot(d, d));
         }
 
+        if (!inserted_now) {
+            const glm::dvec3 cur_pos = bview.motion.position.value;
+            poly.positions.push_back(EclipticPosition{cur_pos});
+            poly.alphas.push_back(1.0f);
+            const glm::dvec3 d = cur_pos - anchor_pos;
+            max_r2 = std::max(max_r2, glm::dot(d, d));
+        }
+
         poly.extent_au = std::sqrt(max_r2);
         if (poly.positions.size() >= 2) {
             out_polylines.push_back(std::move(poly));
         }
+    }
+
+    if (!new_jobs.empty()) {
+        ensure_worker();
+        {
+            std::lock_guard lock(mutex_);
+            for (auto& j : new_jobs) {
+                pending_jobs_.push_back(std::move(j));
+            }
+        }
+        cv_.notify_one();
     }
 }
 

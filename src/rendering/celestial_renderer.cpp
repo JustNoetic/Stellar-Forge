@@ -121,6 +121,9 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
         {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {47, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {49, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {50, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
 
     planetshine_maps_ = ctx.create_image_2d(PLANETSHINE_MAP_WIDTH, PLANETSHINE_MAP_HEIGHT, VK_FORMAT_R32G32B32A32_SFLOAT,
@@ -157,6 +160,7 @@ void CelestialRenderer::init(rhi::VkContext& ctx, bool load_surface_assets) {
     sphere_desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
     sphere_desc.cull_mode = VK_CULL_MODE_BACK_BIT;
     sphere_desc.front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    sphere_desc.capture_statistics = ctx.pipeline_statistics_enabled();
 
     sphere_pipeline_ = rhi::ShaderCache::create_graphics_pipeline(ctx, sphere_desc);
 
@@ -421,6 +425,16 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
     }
     const auto& body = sys.body(static_cast<uint32_t>(focus.body));
     const auto& d = body.definition;
+    double g = surface_gravity(d);
+    double u = std::max(d.ocean.wind_speed_ms, 0.5);
+    double peak = std::max(22.0 * std::cbrt(g * g / (u * OCEAN_FETCH_M)), 0.855 * g / u);
+    double peak_wavelength_m = TWO_PI * g / (peak * peak);
+    double min_footprint_m = focus.altitude_m * 2.0 * std::tan(0.5 * cam.fov_deg * DEG_TO_RAD)
+                           / std::max(double(extent.height), 1.0);
+    if (min_footprint_m >= 8.0 * peak_wavelength_m) {
+        ocean_.reset();
+        return;
+    }
     ocean_.track(body.revisions.identity, focus.camera_fixed_m);
     uint32_t timer = ctx.begin_gpu_timer(cmd, "gpu_ocean_waves");
     ocean_.update(cmd, ctx, {d.ocean.wind_speed_ms, d.ocean.wind_direction_deg * DEG_TO_RAD, surface_gravity(d)},
@@ -513,6 +527,9 @@ void CelestialRenderer::ensure_fp32_pipelines(rhi::VkContext& ctx) {
         {32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {39, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
         {47, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {49, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {50, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
     };
     rhi::GraphicsPipelineDesc sphere_desc{};
     sphere_desc.vert_path = "celestial/sphere.vert";
@@ -890,6 +907,9 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         rhi::PushDescriptorWrite::sampled_image(29, cloud_maps_.image(), ctx.sampler_linear_repeat()),
         rhi::PushDescriptorWrite::sampled_image(31, planetshine_maps_, ctx.sampler_linear_repeat()),
         rhi::PushDescriptorWrite::sampled_image(32, ocean_.moments(), ctx.sampler_linear_repeat()),
+        rhi::PushDescriptorWrite::storage_buffer(48, normals_.horizon_bounds()),
+        rhi::PushDescriptorWrite::storage_buffer(49, ocean_.mip_summary()),
+        rhi::PushDescriptorWrite::sampled_image(50, ocean_.wind_lut(), ctx.sampler_linear_clamp()),
         eclipse_refraction_.write(ctx),
         refraction[0],
         refraction[1],
@@ -918,8 +938,91 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
     }
 
     ctx.end_gpu_timer(cmd, sphere_timer);
+    body_shader_keys_.assign(count, 0u);
+    const auto* atm_records = static_cast<const glm::vec4*>(atmospheres_.surface_records(f_idx).mapped);
+    glm::dvec3 star0_pos_d = has_real_stars ? sys.body(star_bodies[0]).render.position.value : glm::dvec3(0.0);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!terrain_.covers(i)) continue;
+        if (settings.terrain_debug_tiles) {
+            body_shader_keys_[i] = terrain::SURFACE_BIT_DEBUG;
+            continue;
+        }
+        uint32_t key = 0u;
+        const auto& body = sys.body(i);
+        const auto& inst = inst_ptr[i];
+        if (atm_records[i].w > 0.5f) key |= terrain::SURFACE_BIT_ATMOSPHERE;
+        bool has_ocean = settings.oceans_enabled && body.definition.ocean.enabled &&
+            !body.definition.is_star && !body.definition.is_black_hole;
+        if (has_ocean) {
+            key |= terrain::SURFACE_BIT_OCEAN;
+            if (ocean_focus_ == int(i)) key |= terrain::SURFACE_BIT_OCEAN_FFT;
+        }
+        if (textures_.body_active(i)) key |= terrain::SURFACE_BIT_ALBEDO_MAP;
+        uint32_t nflags = normals_.body_flags(i);
+        if ((nflags & 1u) != 0u) key |= terrain::SURFACE_BIT_NORMALS;
+        if ((nflags & 2u) != 0u) key |= terrain::SURFACE_BIT_HORIZONS;
+        bool has_baked_shine = i < planetshine_layers_.size() && planetshine_layers_[i] > 0u;
+        if (has_baked_shine) key |= terrain::SURFACE_BIT_PLANETSHINE;
+        bool shadow_casters = ubo.num_ring_hosts > 0u && settings.ring_shadow_reference_all_hosts;
+        for (uint32_t s = 0; !shadow_casters && s < ubo.num_stars; ++s) {
+            uint32_t range = (i * ubo.num_stars + s) * 2u;
+            if (eclipse_words_[range + 1u] > 0u) shadow_casters = true;
+            if (!surface_ring_candidate_masks_.empty() && surface_ring_candidate_masks_[i * ubo.num_stars + s] != 0u)
+                shadow_casters = true;
+        }
+        if (!shadow_casters && ubo.ringshine_params.x != 0u) {
+            for (uint32_t r = 0; r < ubo.ringshine_params.y; ++r) {
+                if (rings_.hosts()[r].counts_indices.x == i) {
+                    shadow_casters = true;
+                    break;
+                }
+            }
+        }
+        if (shadow_casters) key |= terrain::SURFACE_BIT_SHADOW_CASTERS;
+        bool has_unbaked_shine = false;
+        if (!has_baked_shine) {
+            for (int k = 0; k < 4; ++k) {
+                const auto& irr = inst.planetshine.irradiance[k];
+                if (irr.x > 0.0f || irr.y > 0.0f || irr.z > 0.0f) {
+                    has_unbaked_shine = true;
+                    break;
+                }
+            }
+        }
+        bool large_star = false;
+        if (ubo.num_stars == 1u) {
+            double dist_d = glm::length(star0_pos_d - body.render.position.value);
+            double outer_r = double(inst.pos_radius.w) + double(terrain_.relief_extent_au(i));
+            if (double(ubo.stars_pos_radius[0].w) / std::max(dist_d - outer_r, 1e-12) >= 0.0049)
+                large_star = true;
+        }
+        if (ubo.num_stars != 1u || inst.material.grain.x >= 0.5f || inst.spin_flags.z > 0.5f ||
+            inst.color_is_star.w > 0.5f || has_unbaked_shine || large_star) {
+            key |= terrain::SURFACE_BIT_FULL_LIGHTING;
+        }
+        if ((key & terrain::SURFACE_BIT_FULL_LIGHTING) == 0u && (key & terrain::SURFACE_BIT_ATMOSPHERE) != 0u) {
+            double flattening = 1.0 / std::max(1.0 - body.definition.oblateness, 0.05) - 1.0;
+            glm::dvec3 cam_rel = -camera_relative(body.render.position, cam.eye_pos_render());
+            double d_cam = glm::length(cam_rel);
+            double outer_r = double(inst.pos_radius.w) + double(terrain_.relief_extent_au(i));
+            if (flattening < 0.0101 && d_cam > outer_r) {
+                double theta_cap = std::acos(std::clamp(outer_r / d_cam, 0.0, 1.0));
+                glm::dvec3 to_star = star0_pos_d - body.render.position.value;
+                double d_star = glm::length(to_star);
+                if (d_star > 1e-12) {
+                    double sin_r = double(ubo.stars_pos_radius[0].w) / std::max(d_star - outer_r, 1e-12);
+                    double theta_sun = std::acos(std::clamp(glm::dot(cam_rel / d_cam, to_star / d_star), -1.0, 1.0));
+                    double worst_angle = theta_sun + theta_cap + 2.0 * body.definition.oblateness + 0.05;
+                    if (worst_angle < 0.5 * PI && std::cos(worst_angle) > 4.5 * sin_r) {
+                        key |= terrain::SURFACE_BIT_ATM_HORIZON_CLEAR;
+                    }
+                }
+            }
+        }
+        body_shader_keys_[i] = key;
+    }
     auto terrain_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_terrain_draw") : UINT32_MAX;
-    terrain_.render(cmd, ctx, writes, color_format);
+    terrain_.render(cmd, ctx, writes, body_shader_keys_, color_format);
     ctx.end_gpu_timer(cmd, terrain_timer);
 
     if (!cloud_bodies_.empty()) {
@@ -1017,7 +1120,7 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
     auto* bytes = static_cast<std::byte*>(fluid_ssbos_[frame].mapped);
     auto* fluids = reinterpret_cast<SurfaceFluidGPU*>(bytes + sizeof(SurfaceFluidHeaderGPU));
     SurfaceFluidHeaderGPU header{};
-    header.flags = {settings.oceans_enabled ? 1u : 0u, settings.clouds_enabled ? 1u : 0u, 0u, UINT32_MAX};
+    header.flags = {settings.oceans_enabled ? 1u : 0u, settings.clouds_enabled ? 1u : 0u, 0x40u, UINT32_MAX};
     double seconds = sys.time().value * SECONDS_PER_YEAR;
     std::vector<std::pair<double, uint32_t>> clouds;
 
@@ -1058,8 +1161,28 @@ void CelestialRenderer::prepare_fluids(uint32_t frame, const Camera& cam, const 
     }
 
     if (ocean_focus_ >= 0 && static_cast<uint32_t>(ocean_focus_) < count) {
-        const auto& d = sys.body(static_cast<uint32_t>(ocean_focus_)).definition;
-        header.flags.w = static_cast<uint32_t>(ocean_focus_);
+        uint32_t fi = static_cast<uint32_t>(ocean_focus_);
+        const auto& d = sys.body(fi).definition;
+        double alt_m = std::max(glm::length(camera_relative(sys.body(fi).render.position, cam.eye_pos_render())) * AU_TO_KM * 1000.0
+            - double(fluids[fi].ocean_params.z) * 1000.0, 0.0);
+        double min_footprint_m = alt_m / std::max(double(pixel_scale), 1.0) * 0.95;
+        uint32_t last_c = 0u;
+        bool has_nonzero = false;
+        for (uint32_t c = 0; c < OCEAN_CASCADE_COUNT; ++c) {
+            if (ocean_.cascade_mean_square_slope(c) > 1e-18) {
+                last_c = c;
+                has_nonzero = true;
+            }
+        }
+        uint32_t first_c = OCEAN_CASCADE_COUNT;
+        if (has_nonzero) {
+            first_c = 0u;
+            while (first_c <= last_c && (ocean_.cascade_mean_square_slope(first_c) <= 1e-18 || min_footprint_m >= OCEAN_CASCADE_SIZES_M[first_c])) {
+                ++first_c;
+            }
+        }
+        header.flags.z = (first_c & 7u) | (last_c << 4u);
+        header.flags.w = fi;
         header.ocean = ocean_.cascades();
         header.header.z = static_cast<float>(ocean_.residual_mean_square_slope(cox_munk_variance(d.ocean.wind_speed_ms)));
         header.header.w = static_cast<float>(OCEAN_CHOPPINESS * OCEAN_CHOPPINESS * ocean_.mean_square_slope());

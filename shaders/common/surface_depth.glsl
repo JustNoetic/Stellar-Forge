@@ -1,11 +1,11 @@
-float curved_surface_depth(BodyInstanceGPU b, vec3 world_pos, vec3 body_offset, vec3 apparent_pos, vec3 base_chord, float depth) {
+float curved_surface_depth_sag(BodyInstanceGPU b, vec3 world_pos, vec3 body_offset, vec3 apparent_pos, float curvature, float depth) {
+    if (curvature <= 1e-7) return depth;
     vec3 pole = body_pole(b);
     float flattening = 1.0/max(1.0-b.pole_oblateness.w, 0.05)-1.0;
     vec3 ray = normalize(world_pos);
     vec3 point = body_offset/b.pos_radius.w;
     point += pole*dot(point, pole)*flattening;
     vec3 scaled_ray = ray+pole*dot(ray, pole)*flattening;
-    float curvature = max(0.0, 1.0-length(base_chord));
     float surface_radius = length(point)+curvature;
     float a = dot(scaled_ray, scaled_ray);
     vec3 perpendicular = cross(point, scaled_ray);
@@ -20,4 +20,8 @@ float curved_surface_depth(BodyInstanceGPU b, vec3 world_pos, vec3 body_offset, 
         }
     }
     return depth;
+}
+
+float curved_surface_depth(BodyInstanceGPU b, vec3 world_pos, vec3 body_offset, vec3 apparent_pos, vec3 base_chord, float depth) {
+    return curved_surface_depth_sag(b, world_pos, body_offset, apparent_pos, max(0.0, 1.0-length(base_chord)), depth);
 }

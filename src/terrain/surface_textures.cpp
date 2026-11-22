@@ -262,6 +262,8 @@ void SurfaceTextures::init(rhi::VkContext& ctx, bool normals, bool horizons) {
     slots_ = GeometryResidency{capacity_};
     atlas_ = ctx.create_image_2d(COLOR_SIDE, COLOR_SIDE, normals ? VK_FORMAT_R16G16B16A16_SNORM : VK_FORMAT_R8G8B8A8_SRGB,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, capacity_);
+    horizon_bounds_ = ctx.create_device_buffer(std::max(capacity_, 1u) * sizeof(uint32_t),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     if (horizons_) {
         horizon_atlas_ = ctx.create_image_2d(COLOR_SIDE, COLOR_SIDE, VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, 1, capacity_*HORIZON_LAYERS_PER_SLOT, true);
@@ -271,6 +273,10 @@ void SurfaceTextures::init(rhi::VkContext& ctx, bool normals, bool horizons) {
     ctx.immediate_submit([&](VkCommandBuffer cmd) {
         ctx.transition_image(cmd, atlas_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        vkCmdFillBuffer(cmd, horizon_bounds_.handle, 0, std::max(capacity_, 1u) * sizeof(uint32_t), 255u);
+        ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         if (horizons_) {
             ctx.transition_image(cmd, horizon_atlas_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -292,6 +298,7 @@ void SurfaceTextures::init(rhi::VkContext& ctx, bool normals, bool horizons) {
             {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
             {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
             {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
         };
         horizon_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "terrain/terrain_horizon.comp",
             horizon_bindings, sizeof(uint32_t));
@@ -344,6 +351,7 @@ void SurfaceTextures::shutdown(rhi::VkContext& ctx) {
     for (auto& job_buf : horizon_jobs_) ctx.destroy_buffer(job_buf);
     ctx.destroy_image(apron_scratch_);
     ctx.destroy_image(horizon_atlas_);
+    ctx.destroy_buffer(horizon_bounds_);
     staging_.shutdown(ctx);
     for (auto& page : pages_) ctx.destroy_buffer(page);
     ctx.destroy_image(atlas_);
@@ -866,6 +874,14 @@ void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
+        ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        for (const auto& item : bake_batch) {
+            vkCmdFillBuffer(cmd, horizon_bounds_.handle, item.dst_slot * sizeof(uint32_t), sizeof(uint32_t), 0u);
+        }
+        ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, horizon_pipeline_.handle);
         for (uint32_t offset = 0; offset < count;) {
             uint32_t src = bake_batch[offset].source;
@@ -877,6 +893,7 @@ void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                 rhi::PushDescriptorWrite::sampled_image(1, apron_scratch_, ctx.sampler_nearest_clamp()),
                 rhi::PushDescriptorWrite::sampled_image(2, globals_[src].pyramid, ctx.sampler_linear_clamp()),
                 rhi::PushDescriptorWrite::storage_image(3, horizon_atlas_),
+                rhi::PushDescriptorWrite::storage_buffer(4, horizon_bounds_),
             });
             ctx.push_constants(cmd, horizon_pipeline_, offset);
             vkCmdDispatch(cmd, (COLOR_SIDE + 7) / 8, (COLOR_SIDE + 7) / 8, slice);
@@ -890,6 +907,8 @@ void SurfaceTextures::prepare_views(VkCommandBuffer cmd, rhi::VkContext& ctx,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
             horizon_valid_[item.dst_slot] = 1;
         }
+        ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         stats_.horizon_bakes = count;
     }
 

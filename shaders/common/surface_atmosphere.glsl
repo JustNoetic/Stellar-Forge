@@ -1,4 +1,14 @@
 #include "stellar_disk.glsl"
+#ifndef SF_DONT_UNROLL
+#if defined(SF_ENABLE_DONT_UNROLL) && defined(GL_EXT_control_flow_attributes)
+#define SF_DONT_UNROLL [[dont_unroll]]
+#else
+#define SF_DONT_UNROLL
+#endif
+#endif
+#ifndef SURFACE_ATM_HORIZON_CLEAR
+#define SURFACE_ATM_HORIZON_CLEAR 0
+#endif
 layout(set = 0, binding = 12) uniform sampler2DArray surface_atmosphere_lut;
 layout(std430, set = 0, binding = 13) readonly buffer SurfaceAtmosphereRecords { vec4 surface_atmospheres[]; };
 
@@ -10,18 +20,21 @@ struct SurfaceAtmosphereSample {
     vec2 radii;
 };
 
-SurfaceAtmosphereSample surface_atmosphere_sample(uint body, vec3 local, vec3 base_chord, vec3 normal) {
+SurfaceAtmosphereSample surface_atmosphere_sample_sag(uint body, vec3 local, float sag_factor, vec3 normal) {
     vec4 record = surface_atmospheres[body];
     BodyInstanceGPU b = bodies[body];
     vec3 pole = body_pole(b);
     float flattening = 1.0/max(1.0-b.pole_oblateness.w, 0.05)-1.0;
     vec3 p = local+pole*dot(local, pole)*flattening;
     float r = length(p)*149597870.7;
-    float sag = (1.0-length(base_chord))*record.z;
-    r += max(sag, 0.0);
+    r += sag_factor*record.z;
     float y = sqrt(clamp((r-record.x)/(record.y-record.x), 0.0, 1.0));
     float scale = 0.5+0.5*max(dot(normal, normalize(local)), 0.0);
     return SurfaceAtmosphereSample(normalize(p), pole, vec3((0.5+y*31.0)/32.0, (record.w-1.0)*3.0, scale), flattening, vec2(record.x, r));
+}
+
+SurfaceAtmosphereSample surface_atmosphere_sample(uint body, vec3 local, vec3 base_chord, vec3 normal) {
+    return surface_atmosphere_sample_sag(body, local, max(1.0-length(base_chord), 0.0), normal);
 }
 
 vec3 surface_atmosphere_coordinates(SurfaceAtmosphereSample lookup, vec3 sun) {
@@ -44,6 +57,7 @@ vec3 surface_small_stellar_light(SurfaceAtmosphereSample lookup, vec3 N, vec3 su
     if (range.y <= range.x) return vec3(0.0);
     vec3 tangent = stellar_tangent(N, sun);
     vec3 direct = vec3(0.0);
+    SF_DONT_UNROLL
     for (int i = 0; i < 4; ++i) {
         vec3 slice = stellar_slice(range, elevation, radius, STELLAR_AZIMUTH[i]);
         float cosine = sin(slice.x);
@@ -60,6 +74,7 @@ vec3 surface_small_skylight(SurfaceAtmosphereSample lookup, vec3 sun, float radi
     float elevation = asin(clamp(dot(up, sun), -1.0, 1.0));
     vec2 range = stellar_elevation_range(elevation, radius, -0.5*STELLAR_PI);
     vec3 diffuse = vec3(0.0);
+    SF_DONT_UNROLL
     for (int i = 0; i < 4; ++i) {
         vec3 slice = stellar_slice(range, elevation, radius, STELLAR_AZIMUTH[i]);
         vec3 light = up*sin(slice.x)+tangent*cos(slice.x);
@@ -205,4 +220,82 @@ vec3 surface_planetshine_light(uint body, vec3 local, vec3 base_chord, vec3 N, v
         ? stellar_lambert_irradiance(mu, s)*material.surface.w
         : surface_hapke_disk_response(N, V, light, s, material, emission_cosine);
     return transmission*response;
+}
+
+vec3 surface_stellar_light_lambert_small(uint body, vec3 local, float sag_factor, vec3 N, vec3 sun,
+                                         float sin_radius, float albedo_scale, bool need_tx,
+                                         out vec3 diffuse, out vec3 atm_transmission) {
+    atm_transmission = vec3(1.0);
+    diffuse = vec3(0.0);
+    if (surface_atmospheres[body].w <= 0.5) {
+        return vec3(stellar_lambert_irradiance(clamp(dot(N, sun), -1.0, 1.0), clamp(sin_radius, 0.0, 1.0)) * albedo_scale);
+    }
+    SurfaceAtmosphereSample lookup = surface_atmosphere_sample_sag(body, local, sag_factor, N);
+    vec3 uv = surface_atmosphere_coordinates(lookup, sun);
+    vec4 sky = textureLod(surface_atmosphere_lut, uv + vec3(0, 0, 1), 0.0);
+    diffuse = sky.rgb * lookup.height_layer_scale.z;
+    float radius = asin(clamp(sin_radius, 0.0, 1.0));
+    float mu = clamp(dot(N, sun), -1.0, 1.0);
+#if SURFACE_ATM_HORIZON_CLEAR
+    if (radius < 1e-5 || abs(mu) > 4.0 * radius) {
+        atm_transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+        return atm_transmission * (max(mu, 0.0) * albedo_scale);
+    }
+    float point_weight = smoothstep(2.0 * radius, 4.0 * radius, abs(mu));
+    vec3 point_direct = vec3(0.0);
+    bool has_tx = false;
+    if (point_weight > 0.0) {
+        atm_transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+        has_tx = true;
+        point_direct = atm_transmission * (max(mu, 0.0) * albedo_scale);
+    }
+    if (need_tx && !has_tx) {
+        atm_transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+    }
+    vec3 direct = surface_small_stellar_light(lookup, N, sun, radius, albedo_scale);
+    return mix(direct, point_direct, point_weight);
+#else
+    float up_mu = dot(normalize(local), sun);
+    if (radius < 1e-5 || (abs(mu) > 4.0 * radius && abs(up_mu) > 4.0 * radius)) {
+        atm_transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+        return atm_transmission * (max(mu, 0.0) * albedo_scale);
+    }
+    float elevation = asin(mu);
+    float point_weight = smoothstep(2.0 * radius, 4.0 * radius, min(abs(mu), abs(up_mu)));
+    vec3 point_direct = vec3(0.0);
+    bool has_tx = false;
+    if (point_weight > 0.0) {
+        atm_transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+        has_tx = true;
+        point_direct = atm_transmission * (max(mu, 0.0) * albedo_scale);
+    }
+    if (need_tx && !has_tx) {
+        atm_transmission = textureLod(surface_atmosphere_lut, uv, 0.0).rgb;
+    }
+    if (lookup.flattening < 0.0101 && mu < 0.98 && surface_stellar_horizon_clear(lookup, sun, radius)) {
+        vec3 direct = surface_small_stellar_light(lookup, N, sun, radius, albedo_scale);
+        return mix(direct, point_direct, point_weight);
+    }
+    vec2 range = stellar_elevation_range(elevation, radius, 0.0);
+    vec3 tangent = stellar_tangent(N, sun), bitangent = cross(N, tangent);
+    vec3 direct = vec3(0.0);
+    if (range.y > range.x) {
+        SF_DONT_UNROLL
+        for (int i = 0; i < 8; ++i) {
+            vec3 slice = stellar_slice(range, elevation, radius, i);
+            float s = sin(slice.x), c = cos(slice.x);
+            float row_w = slice.z * slice.y * max(s, 0.0);
+            vec3 row_sum = vec3(0.0);
+            SF_DONT_UNROLL
+            for (int j = 0; j < 4; ++j) {
+                float phi = slice.y * STELLAR_AZIMUTH[j].x;
+                vec3 light = N * s + c * (tangent * cos(phi) + bitangent * sin(phi));
+                vec3 tx = textureLod(surface_atmosphere_lut, surface_atmosphere_coordinates(lookup, light), 0.0).rgb;
+                row_sum += tx * STELLAR_AZIMUTH[j].y;
+            }
+            direct += row_w * row_sum;
+        }
+    }
+    return mix(direct * albedo_scale, point_direct, point_weight);
+#endif
 }

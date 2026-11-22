@@ -151,6 +151,7 @@ private:
     std::vector<uint32_t> eclipse_words_;
     std::vector<uint32_t> ring_eclipse_candidate_counts_;
     std::vector<uint32_t> surface_ring_candidate_masks_;
+    std::vector<uint32_t> body_shader_keys_;
 
     void prepare_fluids(uint32_t frame, const Camera& cam, const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
                         uint32_t count, float pixel_scale);

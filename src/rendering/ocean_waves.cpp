@@ -98,11 +98,41 @@ void OceanWaves::init(rhi::VkContext& ctx) {
     moments_ = ctx.create_image_2d(n, n, VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         uint32_t(std::bit_width(n)), 2 * OCEAN_CASCADE_COUNT, true);
+    wind_lut_ = ctx.create_cubemap(512, VK_FORMAT_R16_SFLOAT,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+    VkImageViewCreateInfo wind_view_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    wind_view_ci.image = wind_lut_.handle;
+    wind_view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    wind_view_ci.format = VK_FORMAT_R16_SFLOAT;
+    wind_view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+    VkImageView wind_array_view = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateImageView(ctx.device(), &wind_view_ci, nullptr, &wind_array_view));
+    rhi::DescriptorLayoutBinding wind_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+    };
+    rhi::Pipeline wind_pipeline = rhi::ShaderCache::create_compute_pipeline(ctx, "ocean/wind_lut.comp", wind_bindings, 0);
+    mip_summary_ = ctx.create_device_buffer(12 * sizeof(glm::vec4),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     ctx.immediate_submit([&](VkCommandBuffer cmd) {
         ctx.transition_image(cmd, field_, VK_IMAGE_LAYOUT_GENERAL);
         ctx.transition_image(cmd, base_, VK_IMAGE_LAYOUT_GENERAL);
         ctx.transition_image(cmd, moments_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        vkCmdFillBuffer(cmd, mip_summary_.handle, 0, 12 * sizeof(glm::vec4), 0u);
+        ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        ctx.transition_image(cmd, wind_lut_, VK_IMAGE_LAYOUT_GENERAL);
+        rhi::Image wind_storage = wind_lut_;
+        wind_storage.view = wind_array_view;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wind_pipeline.handle);
+        ctx.push_descriptors(cmd, wind_pipeline, {rhi::PushDescriptorWrite::storage_image(0, wind_storage)});
+        vkCmdDispatch(cmd, 512 / 8, 512 / 8, 6);
+        ctx.transition_image(cmd, wind_lut_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     });
+    vkDestroyImageView(ctx.device(), wind_array_view, nullptr);
+    rhi::ShaderCache::destroy_pipeline(ctx, wind_pipeline);
     for (auto& buffer : amplitudes_)
         buffer = ctx.create_host_buffer(size_t(OCEAN_CASCADE_COUNT) * n * n * sizeof(glm::vec4), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
@@ -120,13 +150,21 @@ void OceanWaves::init(rhi::VkContext& ctx) {
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT, 1},
     };
     moments_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "ocean/moments.comp", moment_bindings, sizeof(float));
+    rhi::DescriptorLayoutBinding summary_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT, 1},
+    };
+    mip_summary_pipeline_ = rhi::ShaderCache::create_compute_pipeline(ctx, "ocean/mip_summary.comp", summary_bindings, 0);
 }
 
 void OceanWaves::shutdown(rhi::VkContext& ctx) {
     rhi::ShaderCache::destroy_pipeline(ctx, evolve_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, fft_pipeline_);
     rhi::ShaderCache::destroy_pipeline(ctx, moments_pipeline_);
+    rhi::ShaderCache::destroy_pipeline(ctx, mip_summary_pipeline_);
     for (auto& buffer : amplitudes_) ctx.destroy_buffer(buffer);
+    ctx.destroy_buffer(mip_summary_);
+    ctx.destroy_image(wind_lut_);
     ctx.destroy_image(field_);
     ctx.destroy_image(base_);
     ctx.destroy_image(moments_);
@@ -221,7 +259,15 @@ void OceanWaves::update(VkCommandBuffer cmd, rhi::VkContext& ctx, const OceanSpe
     ctx.push_constants(cmd, moments_pipeline_, float(OCEAN_CHOPPINESS));
     vkCmdDispatch(cmd, n / 8, n / 8, OCEAN_CASCADE_COUNT);
     ctx.build_mip_chain(cmd, base_, moments_, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mip_summary_pipeline_.handle);
+    ctx.push_descriptors(cmd, mip_summary_pipeline_, {
+        rhi::PushDescriptorWrite::sampled_image(0, moments_, ctx.sampler_nearest_clamp()),
+        rhi::PushDescriptorWrite::storage_buffer(1, mip_summary_),
+    });
+    vkCmdDispatch(cmd, 1, 1, 1);
+    ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 }
 
 }

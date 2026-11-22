@@ -92,7 +92,7 @@ void main() {
         base_chord = mix(parent_vertex(first, grid, coarse_edge ? 4u : 2u, true), base_chord, morph);
     }
     TerrainMatrix rotation = TerrainMatrix(TerrainVector(tile.rotation0.xyz), TerrainVector(tile.rotation1.xyz), TerrainVector(tile.rotation2.xyz));
-    TerrainVector eye = (TerrainVector(tile.anchor_high.xyz) + rotation * point * TerrainScalar(tile.anchor_high.w)) + TerrainVector(tile.anchor_low.xyz);
+    TerrainVector eye = TerrainVector(tile.anchor_high.xyz) + (rotation * point * TerrainScalar(tile.anchor_high.w) + TerrainVector(tile.anchor_low.xyz));
     f_world_pos = transpose(mat3(u_scene.view)) * vec3(eye);
     f_body_offset = tile.anchor_offset.xyz + transpose(mat3(u_scene.view)) * vec3(rotation * point * TerrainScalar(tile.anchor_high.w));
     f_local_pos = vertex.direction.xyz;
@@ -114,4 +114,22 @@ void main() {
         + dmat3(rotation) * dvec3(point) * double(tile.anchor_high.w) + dvec3(shift);
     gl_Position = vec4(dmat4(u_scene.projection) * dvec4(precise_eye, 1.0));
 #endif
+    if (grid.x == 0u || grid.x == 16u || grid.y == 0u || grid.y == 16u) {
+        vec3 outward_local = vec3(0.0);
+        if (grid.x == 0u || grid.x == 16u) {
+            uint nx = grid.x == 0u ? 1u : 15u;
+            outward_local += vertex.direction.xyz - vertices[first + grid.y * 17u + nx].direction.xyz;
+        }
+        if (grid.y == 0u || grid.y == 16u) {
+            uint ny = grid.y == 0u ? 1u : 15u;
+            outward_local += vertex.direction.xyz - vertices[first + ny * 17u + grid.x].direction.xyz;
+        }
+        vec3 outward_eye = mat3(rotation) * outward_local * tile.anchor_high.w;
+        vec4 dclip = u_scene.projection * vec4(outward_eye, 0.0);
+        vec2 px_dir = (dclip.xy * gl_Position.w - gl_Position.xy * dclip.w) * u_scene.screen_params.xy;
+        float px_len = length(px_dir);
+        if (px_len > 1e-12 && gl_Position.w > 0.0) {
+            gl_Position.xy += (px_dir / px_len) * (0.02 / u_scene.screen_params.xy) * gl_Position.w;
+        }
+    }
 }

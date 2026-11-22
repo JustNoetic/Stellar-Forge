@@ -82,7 +82,7 @@ void main() {
 
     vec2 center_px = (clip.xy / clip.w * 0.5 + 0.5) * vec2(pc.screen_width, pc.screen_height);
     float normalization = point_profile_sum(center_px, radius);
-    clip.z = 1e-6 * clip.w;
+    clip.z = 0.0;
     vec2 q = POINT_QUAD_VERTS[gl_VertexIndex];
     clip.xy += q * pad_ndc * clip.w;
     gl_Position = clip;

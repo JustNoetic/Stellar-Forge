@@ -111,4 +111,19 @@ void main() {
                   + dvec3(mat3(u_scene.view) * refraction);
         gl_Position = vec4(dmat4(u_scene.projection) * dvec4(eye, 1.0));
     }
+    if (grid.x == 0u || grid.x == 16u || grid.y == 0u || grid.y == 16u) {
+        dvec2 inward_uv = uv;
+        if (grid.x == 0u) inward_uv.x += width / 16.0;
+        else if (grid.x == 16u) inward_uv.x -= width / 16.0;
+        if (grid.y == 0u) inward_uv.y += width / 16.0;
+        else if (grid.y == 16u) inward_uv.y -= width / 16.0;
+        vec3 outward_local = vec3(normalize(cube_vector(tile.address.x, uv)) - normalize(cube_vector(tile.address.x, inward_uv)));
+        vec3 outward_eye = mat3(u_scene.view) * (mat3(rotation) * outward_local * float(tile.anchor_radius.w));
+        vec4 dclip = u_scene.projection * vec4(outward_eye, 0.0);
+        vec2 px_dir = (dclip.xy * gl_Position.w - gl_Position.xy * dclip.w) * u_scene.screen_params.xy;
+        float px_len = length(px_dir);
+        if (px_len > 1e-12 && gl_Position.w > 0.0) {
+            gl_Position.xy += (px_dir / px_len) * (0.02 / u_scene.screen_params.xy) * gl_Position.w;
+        }
+    }
 }

@@ -9,10 +9,26 @@
 #include "terrain/tile_metadata.hpp"
 #include <array>
 #include <span>
+#include <unordered_map>
 
 namespace sf::terrain {
 
 inline constexpr double TERRAIN_MIN_PROJECTED_RADIUS_PX = 2.5;
+
+enum SurfaceShaderBits : uint32_t {
+    SURFACE_BIT_FULL_LIGHTING  = 1u << 0,
+    SURFACE_BIT_ATMOSPHERE     = 1u << 1,
+    SURFACE_BIT_OCEAN          = 1u << 2,
+    SURFACE_BIT_OCEAN_FFT      = 1u << 3,
+    SURFACE_BIT_ALBEDO_MAP     = 1u << 4,
+    SURFACE_BIT_NORMALS        = 1u << 5,
+    SURFACE_BIT_HORIZONS       = 1u << 6,
+    SURFACE_BIT_SHADOW_CASTERS = 1u << 7,
+    SURFACE_BIT_PLANETSHINE        = 1u << 8,
+    SURFACE_BIT_DEBUG              = 1u << 9,
+    SURFACE_BIT_ATM_HORIZON_CLEAR  = 1u << 10,
+    SURFACE_BIT_ALL                = 0x7FFu,
+};
 
 struct TerrainStats {
     double max_error_pixels = 0.0;
@@ -75,6 +91,7 @@ public:
                  const rendering::RenderSettings& settings, VkExtent2D extent, uint32_t body_count,
                  const rendering::RefractionHost* refraction = nullptr);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene,
+                std::span<const uint32_t> body_shader_keys = {},
                 VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT);
     void bake(VkCommandBuffer cmd, rhi::VkContext& ctx) { cache_.bake(cmd, ctx); }
     bool covers(uint32_t body) const noexcept;
@@ -103,11 +120,24 @@ private:
         uint32_t mode;
         uint32_t slot = 0;
     };
-    struct DrawBatch {
-        uint32_t first;
-        uint32_t count;
-        uint32_t mode;
-        uint32_t mask;
+    struct GroupBatch {
+        uint32_t mode = 0;
+        uint32_t shader_key = SURFACE_BIT_ALL;
+        std::array<std::pair<uint32_t, uint32_t>, 16> draws{};
+        uint16_t mask_bits = 0;
+    };
+    struct KeyGroup {
+        uint32_t mode = 0;
+        uint32_t shader_key = SURFACE_BIT_ALL;
+        std::array<uint32_t, 16> counts{};
+        std::array<uint32_t, 16> offsets{};
+    };
+    struct FrameUploadState {
+        uint64_t generation = 0;
+        std::vector<uint32_t> body_keys;
+        std::vector<GroupBatch> batches;
+        uint32_t ref_count = 0;
+        uint32_t cached_count = 0;
     };
     struct SelectionEntry {
         uint64_t identity = 0;
@@ -137,18 +167,16 @@ private:
         std::unique_ptr<HeightStream> stream;
         std::string reported_error;
     };
-    rhi::Pipeline& pipeline_for(rhi::VkContext& ctx, uint32_t mode, VkFormat color_format);
-    rhi::Pipeline pipeline_{};
-    rhi::Pipeline precise_pipeline_{};
-    rhi::Pipeline reference_pipeline_{};
-    rhi::Pipeline cached_fp64_pipeline_{};
-    std::array<rhi::Pipeline, 4> fp32_pipelines_{};
+    rhi::Pipeline& pipeline_for(rhi::VkContext& ctx, uint32_t mode, uint32_t shader_key, VkFormat color_format);
+    std::unordered_map<uint64_t, rhi::Pipeline> pipelines_;
     rhi::Buffer indices_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> patches_{};
     std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> cached_patches_{};
     std::vector<PreparedPatch> prepared_;
-    std::array<DrawBatch, 64> batches_{};
-    uint32_t batch_count_ = 0;
+    std::vector<KeyGroup> groups_;
+    std::vector<uint16_t> patch_group_;
+    std::array<FrameUploadState, rhi::FRAMES_IN_FLIGHT> frame_uploads_{};
+    uint64_t prepared_generation_ = 0;
     std::vector<GeometryKey> retained_keys_;
     std::vector<std::shared_ptr<const HeightGeometry>> retained_heights_;
     std::vector<HeightStream*> retained_streams_;

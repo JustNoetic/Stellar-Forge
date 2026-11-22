@@ -1,6 +1,10 @@
 #pragma once
 
 #include "ephemeris/system_manager.hpp"
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 namespace sf::ephemeris {
 
@@ -49,8 +53,15 @@ struct OrbitPolyline {
     std::vector<float> alphas;
 };
 
+class SpiceEphemeris;
+
 class SpiceTrajectoryCache {
 public:
+    SpiceTrajectoryCache() = default;
+    ~SpiceTrajectoryCache();
+    SpiceTrajectoryCache(const SpiceTrajectoryCache&) = delete;
+    SpiceTrajectoryCache& operator=(const SpiceTrajectoryCache&) = delete;
+
     void evaluate(const SystemSnapshot& snapshot, const EphemerisOrbitConfig& config,
                   std::vector<OrbitPolyline>& out_polylines,
                   std::vector<bool>& out_covered_bodies);
@@ -70,14 +81,56 @@ private:
         int rot_anchor_spice = 0;
         double start_et = 0.0;
         double end_et = 0.0;
+        bool sampling_in_flight = false;
         std::vector<double> ets;
         std::vector<glm::dvec3> coords;
     };
+
+    struct SampleJob {
+        uint64_t epoch = 0;
+        size_t entry_index = 0;
+        std::shared_ptr<SpiceEphemeris> spice;
+        int spice_id = 0;
+        int parent_spice_id = 0;
+        bool rotating = false;
+        int rot_p1_spice = 0;
+        int rot_p2_spice = 0;
+        int rot_anchor_spice = 0;
+        double cov_start = 0.0;
+        double cov_end = 0.0;
+        double ref_et = 0.0;
+        EphemerisOrbitConfig config{};
+        double prev_start_et = 0.0;
+        double prev_end_et = 0.0;
+        std::vector<double> prev_ets;
+        std::vector<glm::dvec3> prev_coords;
+    };
+
+    struct SampleResult {
+        uint64_t epoch = 0;
+        size_t entry_index = 0;
+        double start_et = 0.0;
+        double end_et = 0.0;
+        std::vector<double> ets;
+        std::vector<glm::dvec3> coords;
+    };
+
+    void ensure_worker();
+    void worker_loop();
+    static SampleResult run_sample_job(const SampleJob& job);
 
     uint64_t generation_ = 0;
     uint64_t definition_revision_ = 0;
     EphemerisOrbitConfig config_{};
     std::vector<CachedBody> entries_;
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread worker_;
+    bool stopping_ = false;
+    uint64_t request_epoch_ = 0;
+    std::vector<SampleJob> pending_jobs_;
+    std::vector<SampleResult> completed_results_;
 };
 
 OrbitArc compute_orbit_arc(double eccentricity, double current_angle, double relative_p,

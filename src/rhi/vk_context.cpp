@@ -688,6 +688,42 @@ Image VkContext::create_image_2d(uint32_t width, uint32_t height, VkFormat forma
     return img;
 }
 
+Image VkContext::create_cubemap(uint32_t size, VkFormat format, VkImageUsageFlags usage) {
+    Image img{};
+    img.format = format;
+    img.extent = {size, size, 1};
+    img.mip_levels = 1;
+    img.layers = 6;
+    img.aspect = infer_aspect(format);
+
+    VkImageCreateInfo i_ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    i_ci.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    i_ci.imageType = VK_IMAGE_TYPE_2D;
+    i_ci.format = format;
+    i_ci.extent = img.extent;
+    i_ci.mipLevels = 1;
+    i_ci.arrayLayers = 6;
+    i_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    i_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    i_ci.usage = usage;
+    i_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo a_ci{};
+    a_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VK_CHECK(vmaCreateImage(allocator_, &i_ci, &a_ci, &img.handle, &img.allocation, nullptr));
+
+    VkImageViewCreateInfo iv_ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    iv_ci.image = img.handle;
+    iv_ci.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+    iv_ci.format = format;
+    iv_ci.subresourceRange.aspectMask = img.aspect;
+    iv_ci.subresourceRange.levelCount = 1;
+    iv_ci.subresourceRange.layerCount = 6;
+    VK_CHECK(vkCreateImageView(device_, &iv_ci, nullptr, &img.view));
+
+    return img;
+}
+
 Image VkContext::create_image_3d(uint32_t width, uint32_t height, uint32_t depth, VkFormat format,
                                  VkImageUsageFlags usage, uint32_t mip_levels) {
     Image img{};
