@@ -57,6 +57,8 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(atmosphere_shadows_enabled);
     SF_SETTING(atmosphere_shadow_reference);
     SF_SETTING(atmosphere_shadow_temporal);
+    SF_SETTING(atmosphere_shadow_analytic);
+    SF_SETTING(atmosphere_shadow_closed_form);
     SF_SETTING(atmosphere_shadow_animate_jitter);
     SF_SETTING(atmosphere_shadow_rotation);
     SF_SETTING(atmosphere_shadow_vrs);

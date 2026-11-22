@@ -26,6 +26,10 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
         s.atmosphere_shadow_temporal = true;
         s.atmosphere_shadow_samples = 16;
     }
+    if (variant == "analytic-shadows") s.atmosphere_shadow_analytic = true;
+    if (variant == "jittered-shadows") s.atmosphere_shadow_analytic = false;
+    if (variant == "closed-form-shadows") s.atmosphere_shadow_closed_form = true;
+    if (variant == "sampled-shadows") s.atmosphere_shadow_closed_form = false;
     if (variant == "no-shadow-vrs") s.atmosphere_shadow_vrs = false;
     if (variant == "always-shadow-vrs") s.atmosphere_shadow_vrs_budget = 0.0f;
     if (variant == "no-atmosphere") s.show_atmospheres = false;

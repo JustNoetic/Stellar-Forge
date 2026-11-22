@@ -1,8 +1,9 @@
 # Closed-form atmospheric shadows
 
-**Closed-form shadows** (always enabled in single-frame mode via
-`!atmosphere_shadow_temporal`) evaluate ring and eclipse shadow deficits without
-raymarching. **Progressive atmosphere shadows** keep jittered accumulation.
+**Closed-form shadows** (`RenderSettings::atmosphere_shadow_closed_form`, enabled by
+default in single-frame mode via `!atmosphere_shadow_temporal`) evaluate ring and eclipse
+shadow deficits without raymarching. Unchecking it falls back to deterministic shadow
+strata; **Progressive atmosphere shadows** keep jittered accumulation.
 
 ## Method
 

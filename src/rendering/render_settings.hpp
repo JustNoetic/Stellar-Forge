@@ -56,6 +56,8 @@ struct RenderSettings {
     bool atmosphere_shadows_enabled = true;
     bool atmosphere_shadow_reference = false;
     bool atmosphere_shadow_temporal = false;
+    bool atmosphere_shadow_analytic = true;
+    bool atmosphere_shadow_closed_form = true;
     bool atmosphere_shadow_animate_jitter = true;
     bool atmosphere_shadow_rotation = false;
     bool atmosphere_shadow_vrs = true;

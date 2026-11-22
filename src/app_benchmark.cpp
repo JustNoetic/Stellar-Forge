@@ -256,7 +256,8 @@ void App::run_benchmark() {
                 {"textures", settings.surface_textures_enabled}, {"rings", settings.show_rings}, {"ring_shadows", settings.ring_shadows_enabled},
                 {"direct_sunlight_only", settings.direct_sunlight_only},
                 {"clouds", settings.clouds_enabled}, {"cloud_sheet_inline", settings.cloud_sheet_inline}, {"legacy_transparency", settings.transparency_reference_legacy},
-                {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal}};
+                {"planetshine", settings.planetshine_enabled}, {"ringshine", settings.ringshine_enabled}, {"shadow_temporal", settings.atmosphere_shadow_temporal},
+                {"shadow_analytic", settings.atmosphere_shadow_analytic}, {"shadow_closed_form", settings.atmosphere_shadow_closed_form}};
             if (scene == "nbody") run.fixture["ias15_epsilon"] = simulation_.nbody_epsilon();
             log::info("{}: repetition {}/{}", scene, repetition + 1, options.repeats);
             for (uint32_t index = 0; index < options.warmup + options.frames; ++index) {

@@ -1,7 +1,8 @@
 # Deterministic atmospheric shadow strata
 
-Always enabled in single-frame mode (when `atmosphere_shadow_temporal` is off,
-via `shadow_flags.y & 16`).
+**Deterministic shadow strata** (`RenderSettings::atmosphere_shadow_analytic`, default on
+in single-frame mode when `atmosphere_shadow_temporal` is off, via
+`shadow_flags.y & 16`). Unchecking it falls back to jittered sampling.
 
 ## Single-ring columns
 

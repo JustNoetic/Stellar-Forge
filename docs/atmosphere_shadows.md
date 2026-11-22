@@ -1,6 +1,8 @@
 # Atmospheric shadow deficit
 
-Single-frame ring and eclipse shadows default to the [closed-form path](atmosphere_shadow_closed_form.md),
+Single-frame ring and eclipse shadows default to the [closed-form path](atmosphere_shadow_closed_form.md)
+(`RenderSettings::atmosphere_shadow_closed_form`, default on; unchecking uses
+[deterministic shadow strata](atmosphere_shadow_strata.md)),
 which evaluates casters at light-weighted points of the cached in-scatter instead of
 raymarching. Ineligible atmospheres, progressive mode and the reference use the
 sampled estimator described below.

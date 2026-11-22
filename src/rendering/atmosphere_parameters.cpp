@@ -358,7 +358,7 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
     header.eye_focal = {glm::vec3((eye-origin)*AU_TO_KM), focal};
     header.flags = {settings.atmosphere_shadows_enabled ? 1u : 0u,
                     (settings.aerial_perspective_enabled ? 4u : 0u) |
-                    (!settings.atmosphere_shadow_temporal ? 48u : 0u) |
+                    (!settings.atmosphere_shadow_temporal ? ((settings.atmosphere_shadow_analytic ? 16u : 0u) | (settings.atmosphere_shadow_closed_form ? 32u : 0u)) : 0u) |
                     (uint32_t(std::bit_width(std::clamp(settings.atmosphere_shadow_vrs_scale, 2u, 16u))-1) << 8u),
                     settings.eclipse_reference_smoothstep ? 1u : 0u, settings.atmosphere_shadow_reference ? 1u : 0u};
     uint32_t effective_sequence = !settings.atmosphere_shadow_reference &&
