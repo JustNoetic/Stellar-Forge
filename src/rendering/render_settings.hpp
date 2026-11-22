@@ -52,18 +52,12 @@ struct RenderSettings {
     bool refraction_enabled = true;
     bool eclipse_refraction_enabled = true;
     bool eclipse_refraction_probe = false;
-    bool atmosphere_dual_source = true;
     bool atmosphere_surface_lighting = true;
     bool atmosphere_shadows_enabled = true;
     bool atmosphere_shadow_reference = false;
-    bool atmosphere_shadow_cached_weights = true;
-    bool atmosphere_shadow_fast_rings = true;
-    bool atmosphere_shadow_analytic = true;
-    bool atmosphere_shadow_closed_form = true;
     bool atmosphere_shadow_temporal = false;
     bool atmosphere_shadow_animate_jitter = true;
     bool atmosphere_shadow_rotation = false;
-    bool atmosphere_shadow_adaptive = true;
     bool atmosphere_shadow_vrs = true;
     uint32_t atmosphere_shadow_vrs_scale = 4;
     // Shadow ray budget per atmosphere, in percent of viewport pixels. Each body integrates at the finest rate (native,
@@ -78,17 +72,10 @@ struct RenderSettings {
     bool clouds_enabled = true;
     bool cloud_sheet_inline = true;
     bool cloud_shadows_enabled = false;
-    bool atmosphere_planetshine_reference = false;
     uint32_t ring_planetshine_mode = 0;
     uint32_t ringshine_band_count = 10;
     bool eclipse_reference_smoothstep = false;
-    bool ring_shadow_reference_all_hosts = false;
     float ring_shadow_softness = 1.25f;
-    bool ring_shadow_single_box = false;
-    bool ring_shadow_reference_linear = false;
-    bool ring_reference_full_annulus = false;
-    bool ring_reference_finite_source = false;
-    bool ring_reference_base_level = false;
     bool operator==(const RenderSettings&) const = default;
 };
 

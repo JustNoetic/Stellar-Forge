@@ -53,18 +53,12 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(refraction_enabled);
     SF_SETTING(eclipse_refraction_enabled);
     SF_SETTING(eclipse_refraction_probe);
-    SF_SETTING(atmosphere_dual_source);
     SF_SETTING(atmosphere_surface_lighting);
     SF_SETTING(atmosphere_shadows_enabled);
     SF_SETTING(atmosphere_shadow_reference);
-    SF_SETTING(atmosphere_shadow_cached_weights);
-    SF_SETTING(atmosphere_shadow_fast_rings);
-    SF_SETTING(atmosphere_shadow_analytic);
-    SF_SETTING(atmosphere_shadow_closed_form);
     SF_SETTING(atmosphere_shadow_temporal);
     SF_SETTING(atmosphere_shadow_animate_jitter);
     SF_SETTING(atmosphere_shadow_rotation);
-    SF_SETTING(atmosphere_shadow_adaptive);
     SF_SETTING(atmosphere_shadow_vrs);
     SF_SETTING(atmosphere_shadow_vrs_scale);
     SF_SETTING(atmosphere_shadow_vrs_budget);
@@ -80,13 +74,7 @@ void graphics_fields(Settings& settings, Visitor&& visit) {
     SF_SETTING(ring_planetshine_mode);
     SF_SETTING(ringshine_band_count);
     SF_SETTING(eclipse_reference_smoothstep);
-    SF_SETTING(ring_shadow_reference_all_hosts);
     SF_SETTING(ring_shadow_softness);
-    SF_SETTING(ring_shadow_single_box);
-    SF_SETTING(ring_shadow_reference_linear);
-    SF_SETTING(ring_reference_full_annulus);
-    SF_SETTING(ring_reference_finite_source);
-    SF_SETTING(ring_reference_base_level);
 #undef SF_SETTING
 }
 

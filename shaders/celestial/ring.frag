@@ -79,7 +79,7 @@ RingSample sample_ring_segment(RingSegmentGPU seg, float r, float radial_grad, f
 
     float t = clamp((r - inner_r) / span, 0.0, 1.0);
     float texels = radial_grad / span * float(textureSize(u_ring_gradients, 0).x);
-    float lod = u_push.filter_profiles != 0u ? log2(max(texels, 1.0)) : 0.0;
+    float lod = log2(max(texels, 1.0));
     vec4 tex = textureLod(u_ring_gradients, vec3(t, 0.5, seg.phase_row.w), lod);
 
     s.linear_color = max(tex.rgb / max(tex.a, 1e-20), vec3(0.0));

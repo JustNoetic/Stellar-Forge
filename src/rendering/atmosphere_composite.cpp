@@ -9,11 +9,21 @@ std::array<rhi::PushDescriptorWrite, 2> AtmosphereRenderer::dummy_slot_writes() 
             rhi::PushDescriptorWrite::storage_image(46, dummy_slot_uint_)};
 }
 
+bool AtmosphereRenderer::can_fuse_ring_slot(bool has_draw_point) const noexcept {
+    if (active_.empty()) return false;
+    int last = -1;
+    for (int i = 0; i < int(active_.size()); ++i)
+        if (active_[i]->cached.depth_params.w > 0.0f) last = i;
+    return last >= 0 &&
+        (!has_draw_point || (active_[last]->cached.depth_params.w >= 1.0f && last == int(active_.size()) - 1));
+}
+
 bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                                    std::span<const rhi::PushDescriptorWrite> transparency_writes,
                                    const std::function<void(uint32_t)>& draw_point,
                                    std::span<const rhi::PushDescriptorWrite> cloud_writes,
-                                   std::span<const rhi::PushDescriptorWrite> slot_writes, bool ring_slot) {
+                                   std::span<const rhi::PushDescriptorWrite> slot_writes, bool ring_slot,
+                                   bool has_list_fragments) {
     if (active_.empty()) return false;
     auto clouds = cloud_layer_writes(ctx, cloud_writes);
     // The ring slot travels with the list bindings; placeholders keep the layouts satisfied without one.
@@ -33,8 +43,10 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         if (active_[i]->cached.depth_params.w > 0.0f) last = i;
     bool fused = ring_slot && last >= 0 &&
         (!draw_point || (active_[last]->cached.depth_params.w >= 1.0f && last == int(active_.size())-1));
-    auto ring_mode = [&](int index) { return !ring_slot ? 0u : fused && index == last ? 2u : 1u; };
-    ctx.transition_image(cmd, color, dual_source_ ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL);
+    auto ring_mode = [&](int index) {
+        return !ring_slot ? 0u : fused && index == last ? (has_list_fragments ? 2u : 3u) : 1u;
+    };
+    ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ctx.transition_image(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     bool fp32 = color.format == VK_FORMAT_R32G32B32A32_SFLOAT;
     if (fp32) ensure_fp32_composite_pipelines(ctx);
@@ -49,7 +61,7 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         diagnostics.serial = ctx.recording_serial();
         diagnostics.reset_reasons = stats_.shadow_history_reset_reasons;
     }
-    if (dual_source_ && !transparency_writes.empty()) {
+    if (has_list_fragments && !transparency_writes.empty()) {
         uint32_t transparent_timer = ctx.begin_gpu_timer(cmd, "atmosphere_transparent");
         for (auto* t : active_) {
             if (t->cached.depth_params.w <= 0.0f) continue;
@@ -113,7 +125,7 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         ctx.end_gpu_timer(cmd, transparent_timer);
     }
     uint32_t opaque_timer = ctx.begin_gpu_timer(cmd, "atmosphere_opaque");
-    if (dual_source_) {
+    {
         auto attachment = rhi::RenderingAttachment::load_color(color);
         ctx.begin_rendering(cmd, {color.extent.width, color.extent.height}, {&attachment, 1});
         ctx.set_viewport_and_scissor(cmd, {color.extent.width, color.extent.height});
@@ -127,26 +139,22 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
         CompositePush push{t->secondary_irradiance, glm::uvec4(ring_mode(index), 0u, 0u, 0u)};
         auto point = [&] {
             if (!draw_point || t->cached.depth_params.w >= 1.0f) return;
-            if (!dual_source_) {
-                ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-                auto attachment = rhi::RenderingAttachment::load_color(color);
-                ctx.begin_rendering(cmd, {color.extent.width, color.extent.height}, {&attachment, 1});
-                ctx.set_viewport_and_scissor(cmd, {color.extent.width, color.extent.height});
-            }
             draw_point(t->body_index);
-            if (!dual_source_) {
-                ctx.end_rendering(cmd);
-                ctx.transition_image(cmd, color, VK_IMAGE_LAYOUT_GENERAL);
-            }
         };
         if (t->cached.depth_params.w <= 0.0f) { point(); continue; }
         auto& stbn = stbn_tex_ ? stbn_tex_ : dummy_stbn_;
-        rhi::PushDescriptorWrite writes[] = {
+        auto& pipeline = fp32
+            ? (t->limb_active
+                ? (t->secondary_active ? fp32_composite_.limb_secondary_dual_source : fp32_composite_.limb_dual_source)
+                : (t->secondary_active ? fp32_composite_.secondary_dual_source : fp32_composite_.dual_source))
+            : (t->limb_active
+                ? (t->secondary_active ? limb_secondary_dual_source_pipeline_ : limb_dual_source_pipeline_)
+                : (t->secondary_active ? secondary_dual_source_pipeline_ : dual_source_pipeline_));
+        std::vector<rhi::PushDescriptorWrite> graphics{
             rhi::PushDescriptorWrite::uniform_buffer(0, t->uniforms[ctx.frame_index()]),
             rhi::PushDescriptorWrite::sampled_image(1, t->sky, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(2, t->throughput, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(3, depth, ctx.sampler_nearest_clamp()),
-            rhi::PushDescriptorWrite::storage_image(4, color),
             rhi::PushDescriptorWrite::sampled_image(5, t->aerial_radiance, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(6, t->aerial_optical_depth, ctx.sampler_linear_clamp()),
             rhi::PushDescriptorWrite::sampled_image(7, t->transmittance, ctx.sampler_linear_clamp()),
@@ -159,60 +167,21 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             rhi::PushDescriptorWrite::sampled_image(16, t->shadow_active ? t->shadow_fraction : surface_lut_, ctx.sampler_nearest_clamp()),
             rhi::PushDescriptorWrite::sampled_image(17, t->shadow_active ? t->shadow_depth : surface_lut_, ctx.sampler_nearest_clamp()),
             rhi::PushDescriptorWrite::sampled_image(20, stbn, ctx.sampler_nearest_clamp())};
-        if (dual_source_) {
-            auto& pipeline = fp32
-                ? (t->limb_active
-                    ? (t->secondary_active ? fp32_composite_.limb_secondary_dual_source : fp32_composite_.limb_dual_source)
-                    : (t->secondary_active ? fp32_composite_.secondary_dual_source : fp32_composite_.dual_source))
-                : (t->limb_active
-                    ? (t->secondary_active ? limb_secondary_dual_source_pipeline_ : limb_dual_source_pipeline_)
-                    : (t->secondary_active ? secondary_dual_source_pipeline_ : dual_source_pipeline_));
-            std::vector<rhi::PushDescriptorWrite> graphics;
-            for (const auto& write : writes) if (write.binding != 4) graphics.push_back(write);
-            graphics.insert(graphics.end(), clouds.begin(), clouds.end());
-            graphics.insert(graphics.end(), list.begin(), list.end());
-            graphics.insert(graphics.end(), slots.begin(), slots.end());
-            if (t->secondary_active) {
-                graphics.push_back(rhi::PushDescriptorWrite::sampled_image(28, t->secondary_sky, ctx.sampler_linear_clamp()));
-                graphics.push_back(rhi::PushDescriptorWrite::sampled_image(29, t->secondary_aerial, ctx.sampler_linear_clamp()));
-                graphics.push_back(rhi::PushDescriptorWrite::sampled_image(30, t->secondary_range, ctx.sampler_linear_clamp()));
-            }
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-            ctx.push_descriptors(cmd, pipeline, graphics);
-            ctx.push_constants(cmd, pipeline, push);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-        } else {
-            bool shadow_shader = t->shadow_active || t->shadow_header.flags.w != 0u;
-            auto& pipeline = fp32
-                ? (t->secondary_active
-                    ? (transparency_writes.empty() ? fp32_composite_.secondary_composite :
-                        shadow_shader ? fp32_composite_.secondary_composite_transparency : fp32_composite_.secondary_unshadowed_composite_transparency)
-                    : (transparency_writes.empty() ? fp32_composite_.composite :
-                        shadow_shader ? fp32_composite_.composite_transparency : fp32_composite_.unshadowed_composite_transparency))
-                : (t->secondary_active
-                    ? (transparency_writes.empty() ? secondary_composite_pipeline_ :
-                        shadow_shader ? secondary_composite_transparency_pipeline_ : secondary_unshadowed_composite_transparency_pipeline_)
-                    : (transparency_writes.empty() ? composite_pipeline_ :
-                        shadow_shader ? composite_transparency_pipeline_ : unshadowed_composite_transparency_pipeline_));
-            std::vector<rhi::PushDescriptorWrite> compute(std::begin(writes), std::end(writes));
-            compute.insert(compute.end(), transparency.begin(), transparency.end());
-            compute.insert(compute.end(), clouds.begin(), clouds.end());
-            if (t->secondary_active) {
-                compute.push_back(rhi::PushDescriptorWrite::sampled_image(28, t->secondary_sky, ctx.sampler_linear_clamp()));
-                compute.push_back(rhi::PushDescriptorWrite::sampled_image(29, t->secondary_aerial, ctx.sampler_linear_clamp()));
-                compute.push_back(rhi::PushDescriptorWrite::sampled_image(30, t->secondary_range, ctx.sampler_linear_clamp()));
-            }
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-            ctx.push_descriptors(cmd, pipeline, compute);
-            if (!transparency_writes.empty()) ctx.push_constants(cmd, pipeline, push);
-            else if (t->secondary_active) ctx.push_constants(cmd, pipeline, t->secondary_irradiance);
-            vkCmdDispatch(cmd, (color.extent.width+7)/8, (color.extent.height+7)/8, 1);
-            ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        graphics.insert(graphics.end(), clouds.begin(), clouds.end());
+        graphics.insert(graphics.end(), list.begin(), list.end());
+        graphics.insert(graphics.end(), slots.begin(), slots.end());
+        if (t->secondary_active) {
+            graphics.push_back(rhi::PushDescriptorWrite::sampled_image(28, t->secondary_sky, ctx.sampler_linear_clamp()));
+            graphics.push_back(rhi::PushDescriptorWrite::sampled_image(29, t->secondary_aerial, ctx.sampler_linear_clamp()));
+            graphics.push_back(rhi::PushDescriptorWrite::sampled_image(30, t->secondary_range, ctx.sampler_linear_clamp()));
         }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
+        ctx.push_descriptors(cmd, pipeline, graphics);
+        ctx.push_constants(cmd, pipeline, push);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
         point();
         // Later draws read the ring slot this one transported in place.
-        if (dual_source_ && ring_slot && index < last) {
+        if (ring_slot && index < last) {
             ctx.end_rendering(cmd);
             ctx.memory_barrier(cmd, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
@@ -221,7 +190,7 @@ bool AtmosphereRenderer::composite(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi
             ctx.set_viewport_and_scissor(cmd, {color.extent.width, color.extent.height});
         }
     }
-    if (dual_source_) ctx.end_rendering(cmd);
+    ctx.end_rendering(cmd);
     ctx.end_gpu_timer(cmd, opaque_timer);
     ctx.end_gpu_timer(cmd, timer);
     return fused;

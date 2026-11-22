@@ -51,11 +51,11 @@ show appreciable local colour/brightness differences from finite-disk integratio
 especially around source rise/set and narrow particle halos. Multiple scattering uses
 the centre direction. These are deliberate quality limits of the cheaper prototype.
 
-`RenderSettings::atmosphere_planetshine_reference` retains the previous brightest-source
-path for local comparison. It defaults off and is an internal diagnostic, without a UI
-or persistent preference. Switching either way invalidates the appropriate response.
-Shader variants specialize active counts one through four and the existing medium types;
-they compile lazily and then reuse the shader/pipeline caches.
+The previous single-source prototype (`atmosphere_planetshine_reference`, now
+removed) and its incoming-light field bake have been retired in favor of this
+four-source shader path. Shader variants specialize active counts one through
+four and the existing medium types; they compile lazily and then reuse the
+shader/pipeline caches.
 
 ## Local validation and timings
 

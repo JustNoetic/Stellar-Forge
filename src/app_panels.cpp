@@ -390,20 +390,19 @@ void App::render_viewport_overlays() {
             ui::value_row("GPU Celestial bodies", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_celestial")));
             ui::value_row("GPU Terrain", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_terrain_draw")));
             ui::value_row("GPU Spheres / points", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("gpu_spheres"), vk_.gpu_time_ms("gpu_points")));
-            ui::value_row("GPU Planetary rings", std::format("{:.3f} ms", settings.show_rings ? vk_.gpu_time_ms("rings") : 0.0));
+            ui::value_row("GPU Planetary rings", std::format("{:.3f} ms", celestial_renderer_.rings_drawn(settings) ? vk_.gpu_time_ms("rings") : 0.0));
             ui::value_row("GPU Gaia cull / draw", std::format("{:.3f} / {:.3f} ms", vk_.gpu_time_ms("gpu_gaia_cull"), vk_.gpu_time_ms("gpu_gaia")));
             ui::value_row("GPU Orbit lines", std::format("{:.3f} ms", vk_.gpu_time_ms("gpu_orbits")));
             ui::value_row("GPU Atmosphere composite", std::format("{:.3f} ms", stats.visible ? vk_.gpu_time_ms("atmosphere_composite") : 0.0));
             ui::value_row("GPU Atmo shadows / OIT / opaque", std::format("{:.3f} / {:.3f} / {:.3f} ms",
                 stats.shadow_updates ? vk_.gpu_time_ms("atmosphere_shadows") : 0.0,
-                stats.visible && oit_active ? vk_.gpu_time_ms("atmosphere_transparent") : 0.0,
+                stats.visible && oit_active && celestial_renderer_.transparency_has_list() ? vk_.gpu_time_ms("atmosphere_transparent") : 0.0,
                 stats.visible ? vk_.gpu_time_ms("atmosphere_opaque") : 0.0));
             ui::value_row("GPU OIT clear / resolve", std::format("{:.3f} / {:.3f} ms",
                 oit_active ? vk_.gpu_time_ms("transparency_clear") : 0.0,
-                oit_active ? vk_.gpu_time_ms("transparency_resolve") : 0.0));
+                celestial_renderer_.transparency_resolved_last_frame() ? vk_.gpu_time_ms("transparency_resolve") : 0.0));
             ui::value_row("Sky / aerial LUT updates", std::format("{} / {}", stats.sky_lut_updates, stats.aerial_lut_updates));
             ui::value_row("GPU Planetshine bake", std::format("{:.3f} ms", stats.secondary_lut_updates ? vk_.gpu_time_ms("atmosphere_secondary") : 0.0));
-            ui::value_row("GPU Planetshine source", std::format("{:.3f} ms", stats.secondary_source_lut_updates ? vk_.gpu_time_ms("atmosphere_secondary_source") : 0.0));
             ui::value_row("Planetshine LUT updates", std::format("{}", stats.secondary_lut_updates));
             ui::section("Atmosphere shadow history", "Pixel counts use the latest completed GPU frame.");
             ui::value_row("Auto horizon", !camera_.horizon_align || !camera_.is_near_surface ? "Inactive" :

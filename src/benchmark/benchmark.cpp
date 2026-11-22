@@ -66,7 +66,7 @@ LaunchOptions parse_options(int argc, char** argv) {
         else if (arg == "--benchmark-variant") {
             o.variant = value();
             const std::set<std::string_view> variants{"baseline", "no-atmosphere", "no-aerial", "no-shadows", "no-refraction", "no-secondary",
-                "no-planetshine", "no-ringshine", "high-exposure", "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-terrain-shadows", "no-rings", "no-ring-shadows", "cached-shadow-weights", "native-shadow-weights", "fast-ring-shadows", "analytic-shadows", "jittered-shadows", "reference-shadows", "closed-form-shadows", "sampled-shadows", "progressive-shadows", "no-shadow-vrs", "always-shadow-vrs", "single-box-ring-shadows", "no-clouds", "legacy-clouds", "layered-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
+                "no-planetshine", "no-ringshine", "high-exposure", "no-orbits", "no-gaia", "smooth", "no-textures", "no-normals", "no-terrain-shadows", "no-rings", "no-ring-shadows", "reference-shadows", "progressive-shadows", "no-shadow-vrs", "always-shadow-vrs", "no-clouds", "legacy-clouds", "layered-clouds", "no-bloom", "fast-bloom", "terrain-detail"};
             if (o.variant.empty()) throw std::runtime_error("Unknown benchmark variant: " + o.variant);
             for (size_t start = 0; start <= o.variant.size();) {
                 size_t plus = o.variant.find('+', start);
@@ -133,7 +133,7 @@ std::string_view help() {
                     terrain-navigation|earth-terrain-still|earth-terrain-walk|earth-terrain-fly|earth-terrain-turn
   --benchmark-variant baseline|no-atmosphere|no-aerial|no-shadows|no-refraction|no-secondary|no-orbits
                       no-planetshine|no-ringshine|high-exposure (x10^4, image checks)|no-gaia|smooth|no-textures|no-normals|no-terrain-shadows|no-rings|no-ring-shadows
-                      cached-shadow-weights|native-shadow-weights|fast-ring-shadows|reference-shadows|closed-form-shadows|sampled-shadows|progressive-shadows|no-shadow-vrs|always-shadow-vrs|single-box-ring-shadows|no-clouds|legacy-clouds|layered-clouds|no-bloom|fast-bloom
+                      reference-shadows|progressive-shadows|no-shadow-vrs|always-shadow-vrs|no-clouds|legacy-clouds|layered-clouds|no-bloom|fast-bloom
                       terrain-detail (2-pixel geometry error; other defaults retained)
   --benchmark-width N       Framebuffer width (1920)
   --benchmark-height N      Framebuffer height (1080)

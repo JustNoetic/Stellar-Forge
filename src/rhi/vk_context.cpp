@@ -147,7 +147,9 @@ void VkContext::init(GLFWwindow* window, bool enable_validation) {
     fragment_stores_enabled_ = supported_features.fragmentStoresAndAtomics == VK_TRUE;
     feat2.features.fragmentStoresAndAtomics = fragment_stores_enabled_ ? VK_TRUE : VK_FALSE;
     dual_source_blend_enabled_ = supported_features.dualSrcBlend == VK_TRUE && device_props_.limits.maxFragmentDualSrcAttachments >= 1;
-    feat2.features.dualSrcBlend = dual_source_blend_enabled_ ? VK_TRUE : VK_FALSE;
+    if (!dual_source_blend_enabled_)
+        sf::log::fatal("Vulkan 1.0 dualSrcBlend (maxFragmentDualSrcAttachments >= 1) is required.");
+    feat2.features.dualSrcBlend = VK_TRUE;
 
     std::vector<const char*> dev_exts = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,

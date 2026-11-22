@@ -23,21 +23,14 @@ vec3 cached_stellar_source(vec3 p, vec3 view, vec3 sun, vec3 rayleigh, vec3 medi
     total *= total;
     total *= total;
     float phase = dot(view, sun);
-    vec3 source;
-#ifdef ATMOSPHERE_SECONDARY_BAKE
-    if (stellar_cache_radius() < 0.01) source = rayleigh*rayleigh_phase(phase);
-    else
-#endif
-    {
-        vec3 up = normalize(p);
-        vec3 tangent = stellar_tangent(up, sun), bitangent = cross(up, tangent);
-        vec3 v = vec3(dot(view, up), dot(view, tangent), dot(view, bitangent));
-        vec3 uu = textureLod(stellar_source_lut, vec3(uv, 1.0), 0.0).rgb;
-        vec3 tt = textureLod(stellar_source_lut, vec3(uv, 2.0), 0.0).rgb;
-        vec3 ut = textureLod(stellar_source_lut, vec3(uv, 3.0), 0.0).rgb;
-        vec3 second = v.x*v.x*uu+v.y*v.y*tt+v.z*v.z*max(vec3(1.0)-uu-tt, vec3(0.0))+2.0*v.x*v.y*ut;
-        source = rayleigh*(3.0/(16.0*ATM_PI))*max(vec3(1.0)+second, vec3(0.0));
-    }
+    vec3 up = normalize(p);
+    vec3 tangent = stellar_tangent(up, sun), bitangent = cross(up, tangent);
+    vec3 v = vec3(dot(view, up), dot(view, tangent), dot(view, bitangent));
+    vec3 uu = textureLod(stellar_source_lut, vec3(uv, 1.0), 0.0).rgb;
+    vec3 tt = textureLod(stellar_source_lut, vec3(uv, 2.0), 0.0).rgb;
+    vec3 ut = textureLod(stellar_source_lut, vec3(uv, 3.0), 0.0).rgb;
+    vec3 second = v.x*v.x*uu+v.y*v.y*tt+v.z*v.z*max(vec3(1.0)-uu-tt, vec3(0.0))+2.0*v.x*v.y*ut;
+    vec3 source = rayleigh*(3.0/(16.0*ATM_PI))*max(vec3(1.0)+second, vec3(0.0));
 #ifdef ATMOSPHERE_RAYLEIGH_ONLY
     return total*source;
 #else

@@ -349,13 +349,10 @@ there is no hierarchy or self-host exclusion. Moon-to-ring shadows continue
 through the separate planetary eclipse candidate lists, including offscreen and
 unrelated blockers. Rings and terrain use the same lighting snapshot.
 
-The default penumbra uses a single box filter over the prefix-integral extinction
-LUT, reducing six texture samples to two. It retains finite-star angular size,
-distance-dependent softness, grazing stretch and pixel filtering. Setting
-`ring_shadow_single_box=false` restores the previous three weighted boxes for
-comparisons. `ring_shadow_reference_all_hosts`
-bypasses CPU filtering and supplies every host in the surface shader for HDR and
-timing comparisons. These are diagnostic render settings without UI controls.
+The penumbra uses a three-box filter over the prefix-integral extinction LUT.
+It retains finite-star angular size, distance-dependent softness, grazing stretch
+and pixel filtering. (Legacy `ring_shadow_single_box` and
+`ring_shadow_reference_all_hosts` toggles have been removed.)
 
 CPU contracts compare the host bound against 768,000 randomized surface/interior
 points, including small coordinate scales, grazing light and pixel footprints.

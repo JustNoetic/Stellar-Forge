@@ -1,8 +1,11 @@
 #include "eclipse_optics.glsl"
 
+#ifndef ECLIPSE_CANDIDATE_BUFFER_DEFINED
+#define ECLIPSE_CANDIDATE_BUFFER_DEFINED
 layout(std430, set = 0, binding = 2) readonly buffer EclipseCandidateBuffer {
     uint eclipse_words[];
 };
+#endif
 
 #include "eclipse_lookup.glsl"
 

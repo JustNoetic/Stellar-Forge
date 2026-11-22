@@ -326,8 +326,6 @@ vec3 aerosol_source(vec3 p, float mu) {
 float stellar_cache_radius() {
 #ifdef ATMOSPHERE_SECONDARY_APPROX
     return 0.0;
-#elif defined(ATMOSPHERE_SECONDARY_BAKE)
-    return secondary.cache.x;
 #else
     return atm.sun_irradiance[0].w;
 #endif
@@ -570,10 +568,6 @@ void integrate_atmosphere(sampler2D transmittance_lut, sampler2D multiscatter_lu
             vec3 source = vec3(0.0);
 #ifdef ATMOSPHERE_SECONDARY_APPROX
             source = secondary_source(transmittance_lut, multiscatter_lut, q, r, m);
-#elif defined(ATMOSPHERE_SECONDARY_BAKE)
-            vec3 sun = secondary.direction.xyz;
-            source = stellar_scattering_source(transmittance_lut, q, d, sun, secondary.direction.w, r, m, 0u)
-                   + stellar_multiple_source(multiscatter_lut, q, sun, secondary.direction.w, r+m, 0u);
 #else
             for (uint s = 0u; s < uint(atm.camera.w); ++s) {
                 if (!any(greaterThan(atm.sun_irradiance[s].rgb, vec3(0.0)))) continue;

@@ -138,9 +138,9 @@ bool project_cylinder_ndc(glm::dvec3 a_world, glm::dvec3 b_world, double radius,
     return out_min.x <= out_max.x && out_min.y <= out_max.y;
 }
 
-bool project_ring_ndc(glm::dvec3 atm_center, double outer, double reach,
+bool project_ring_ndc(glm::dvec3 atm_center, double outer, double ground, double reach,
                       glm::dvec3 ring_center, glm::dvec3 pole, double inner, double radius, float support,
-                      glm::dvec3 star, double r_star, const ShadowFrustum& f,
+                      glm::dvec3 star, double r_star, const ShadowFrustum& f, double refraction_pad,
                       glm::dvec2 atm_min, glm::dvec2 atm_max, glm::dvec2& out_min, glm::dvec2& out_max) {
     glm::dvec3 to_star_rc = star - ring_center;
     double star_plane = glm::dot(to_star_rc, pole);
@@ -171,6 +171,9 @@ bool project_ring_ndc(glm::dvec3 atm_center, double outer, double reach,
     double atm_dist = glm::length(atm_center);
     glm::dvec3 atm_hat = atm_dist > 1e-9 ? atm_center / atm_dist : f.forward;
     double sph_ang = atm_dist > outer ? std::asin(std::clamp(outer / atm_dist, 0.0, 1.0)) : PI;
+    double ground_r = ground * 0.999;
+    double ground_ang = (ground_r > 0.0 && ground_r < outer && atm_dist > ground_r)
+        ? std::asin(std::clamp(ground_r / atm_dist, 0.0, 1.0)) : 0.0;
     double reach_cap = std::min(reach, atm_dist + outer);
     double global_d_lo = std::max(1e-4, atm_dist - outer);
 
@@ -195,28 +198,59 @@ bool project_ring_ndc(glm::dvec3 atm_center, double outer, double reach,
             };
             glm::dvec3 mid = glm::normalize(corners[0] + corners[1] + corners[2] + corners[3]);
             double cos_cone = 1.0;
-            double cos_fwd_min = 1.0, cos_fwd_max = 0.0;
+            double cos_fwd_min = 1.0;
             for (const auto& c : corners) {
                 cos_cone = std::min(cos_cone, glm::dot(c, mid));
-                double cf = glm::dot(c, f.forward);
-                cos_fwd_min = std::min(cos_fwd_min, cf);
-                cos_fwd_max = std::max(cos_fwd_max, cf);
+                cos_fwd_min = std::min(cos_fwd_min, glm::dot(c, f.forward));
             }
+            double cx_near = std::clamp(0.0, nx0, nx1) * f.tan_x;
+            double cy_near = std::clamp(0.0, ny0, ny1) * f.tan_y;
+            double cos_fwd_max = 1.0 / std::sqrt(1.0 + cx_near * cx_near + cy_near * cy_near);
             double cone_ang = std::acos(std::clamp(cos_cone, -1.0, 1.0));
+            double eff_cone = cone_ang + refraction_pad;
+            double theta = std::acos(std::clamp(glm::dot(atm_hat, mid), -1.0, 1.0));
+            double cell_d_lo = global_d_lo;
             double d_hi = reach_cap;
             if (atm_dist > outer) {
-                double theta = std::acos(std::clamp(glm::dot(atm_hat, mid), -1.0, 1.0));
-                if (theta > cone_ang + sph_ang) continue;
+                if (theta > eff_cone + sph_ang) continue;
+                double phi_min = std::max(0.0, theta - eff_cone);
+                double sin_lo = std::sin(phi_min);
+                double d_ent = atm_dist * std::cos(phi_min) -
+                    std::sqrt(std::max(outer * outer - atm_dist * atm_dist * sin_lo * sin_lo, 0.0));
+                cell_d_lo = std::max(cell_d_lo, d_ent);
+                if (ground_ang > 0.0 && theta + eff_cone < ground_ang) {
+                    double phi_hi = theta + eff_cone;
+                    double sin_hi = std::sin(phi_hi);
+                    double d_gnd = atm_dist * std::cos(phi_hi) -
+                        std::sqrt(std::max(ground_r * ground_r - atm_dist * atm_dist * sin_hi * sin_hi, 0.0));
+                    d_hi = std::min(d_hi, d_gnd + 1.0);
+                } else {
+                    double phi_ex = std::max(phi_min, ground_ang);
+                    if (phi_ex < sph_ang) {
+                        double sin_ex = std::sin(phi_ex);
+                        double d_ex = atm_dist * std::cos(phi_ex) +
+                            std::sqrt(std::max(outer * outer - atm_dist * atm_dist * sin_ex * sin_ex, 0.0));
+                        d_hi = std::min(d_hi, d_ex + 1.0);
+                    }
+                }
             } else {
-                double theta = std::acos(std::clamp(glm::dot(atm_hat, mid), -1.0, 1.0));
-                double phi_min = std::max(0.0, theta - cone_ang);
-                double sin_phi = std::sin(phi_min);
-                double d_exit = atm_dist * std::cos(phi_min) +
-                                std::sqrt(std::max(outer * outer - atm_dist * atm_dist * sin_phi * sin_phi, 0.0));
-                d_hi = std::min(d_hi, d_exit);
+                double phi_min = std::max(0.0, theta - eff_cone);
+                if (ground_ang > 0.0 && theta + eff_cone < ground_ang) {
+                    double phi_hi = theta + eff_cone;
+                    double sin_hi = std::sin(phi_hi);
+                    double d_gnd = atm_dist * std::cos(phi_hi) -
+                        std::sqrt(std::max(ground_r * ground_r - atm_dist * atm_dist * sin_hi * sin_hi, 0.0));
+                    d_hi = std::min(d_hi, d_gnd + 1.0);
+                } else {
+                    double phi_ex = std::max(phi_min, ground_ang);
+                    double sin_ex = std::sin(phi_ex);
+                    double d_ex = atm_dist * std::cos(phi_ex) +
+                        std::sqrt(std::max(outer * outer - atm_dist * atm_dist * sin_ex * sin_ex, 0.0));
+                    d_hi = std::min(d_hi, d_ex + 1.0);
+                }
             }
-            if (d_hi <= global_d_lo) continue;
-            double cz_lo = std::max(1e-4, global_d_lo * std::max(cos_fwd_min, 0.0));
+            if (d_hi <= cell_d_lo) continue;
+            double cz_lo = std::max(1e-4, cell_d_lo * std::max(cos_fwd_min, 0.0));
             double cz_hi = std::min(d_hi * cos_fwd_max, reach_cap);
             if (cz_hi <= cz_lo) continue;
 
@@ -323,16 +357,14 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
     const auto origin = system.body(receiver).render.position.value;
     header.eye_focal = {glm::vec3((eye-origin)*AU_TO_KM), focal};
     header.flags = {settings.atmosphere_shadows_enabled ? 1u : 0u,
-                    (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u) |
-                    (settings.atmosphere_shadow_cached_weights && settings.aerial_perspective_enabled ? 4u : 0u) |
-                    (settings.atmosphere_shadow_fast_rings ? 8u : 0u) | (settings.atmosphere_shadow_analytic && !settings.atmosphere_shadow_temporal ? 16u : 0u) |
-                    (settings.atmosphere_shadow_closed_form && !settings.atmosphere_shadow_temporal ? 32u : 0u) |
+                    (settings.aerial_perspective_enabled ? 4u : 0u) |
+                    (!settings.atmosphere_shadow_temporal ? 48u : 0u) |
                     (uint32_t(std::bit_width(std::clamp(settings.atmosphere_shadow_vrs_scale, 2u, 16u))-1) << 8u),
                     settings.eclipse_reference_smoothstep ? 1u : 0u, settings.atmosphere_shadow_reference ? 1u : 0u};
     uint32_t effective_sequence = !settings.atmosphere_shadow_reference &&
         (settings.atmosphere_shadow_temporal || settings.atmosphere_shadow_animate_jitter) ? sequence : 0u;
     header.temporal = {effective_sequence, settings.atmosphere_shadow_noise_type,
-                       settings.atmosphere_shadow_samples, settings.atmosphere_shadow_adaptive ? 1u : 0u};
+                       settings.atmosphere_shadow_samples, 1u};
     std::vector<AtmosphereShadowCasterGPU> casters;
     uint32_t star_index = 0;
     double eye_radius = glm::length(eye-origin)*AU_TO_KM;
@@ -451,9 +483,9 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                 }
                 if (view_cull) {
                     glm::dvec2 c_min, c_max;
-                    if (!project_ring_ndc(atm_center, double(outer), reach, atm_center + glm::dvec3(center), glm::dvec3(pole),
+                    if (!project_ring_ndc(atm_center, double(outer), double(ground), reach, atm_center + glm::dvec3(center), glm::dvec3(pole),
                                           double(inner), double(radius), support, atm_center + glm::dvec3(light), double(light.w),
-                                          frustum, atm_min, atm_max, c_min, c_max))
+                                          frustum, refraction_pad, atm_min, atm_max, c_min, c_max))
                         continue;
                     shadow_ndc_min = glm::min(shadow_ndc_min, c_min);
                     shadow_ndc_max = glm::max(shadow_ndc_max, c_max);
@@ -461,8 +493,7 @@ bool prepare_shadows(rhi::VkContext& ctx, rhi::Buffer& buffer, const ephemeris::
                 // Penumbra table slot the ring renderer assigned to this ring and scene star (keyed by the
                 // star's incidence at the ring centre). support.w = slot + 1 + the slot's mu coordinate.
                 float penumbra = 0.0f;
-                if (penumbra_slots && this_scene_star < RING_PENUMBRA_STARS && !settings.atmosphere_shadow_reference &&
-                    !settings.ring_shadow_single_box && !settings.ring_shadow_reference_linear) {
+                if (penumbra_slots && this_scene_star < RING_PENUMBRA_STARS && !settings.atmosphere_shadow_reference) {
                     uint32_t slot = (ring.counts_indices.w >> (4u*this_scene_star)) & 15u;
                     if (slot > 0u && slot <= RING_PENUMBRA_SLOTS && penumbra_slots->slots[slot-1u].key.x == float(ring.counts_indices.y))
                         penumbra = float(slot)+penumbra_slots->slots[slot-1u].key.y;

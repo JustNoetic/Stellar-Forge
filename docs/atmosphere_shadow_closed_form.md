@@ -1,8 +1,8 @@
 # Closed-form atmospheric shadows
 
-**Closed-form shadows** (`RenderSettings::atmosphere_shadow_closed_form`, enabled by
-default) evaluate ring and eclipse shadow deficits without raymarching. They are the
-default single-frame path; **Progressive atmosphere shadows** keep jittered accumulation.
+**Closed-form shadows** (always enabled in single-frame mode via
+`!atmosphere_shadow_temporal`) evaluate ring and eclipse shadow deficits without
+raymarching. **Progressive atmosphere shadows** keep jittered accumulation.
 
 ## Method
 
@@ -43,7 +43,7 @@ smeared band edges (3.1% p99 on `saturn-limb`); 3 pieces halve it.
 
 ## Eligibility
 
-The CPU sets header flag `y & 32` when the setting is on and progressive mode is off.
+The CPU sets header flag `y & 32` whenever progressive mode is off.
 Ring geometry no longer clears it. It used to be cleared whenever a ring was within
 `star radius + 3 × outer radius` of edge-on to the star, which sent every shadowed pixel
 to the sampled march near equinox: `earth-equinox-rings` (Sun 0.15° from the equator,

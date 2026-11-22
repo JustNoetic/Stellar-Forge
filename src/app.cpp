@@ -817,7 +817,7 @@ bool App::render_frame(benchmark::FrameSample* sample) {
             bloom_enabled = false;
         if (bloom_enabled) {
             bloom_renderer_.prepare(vk_, ext);
-            if (celestial_renderer_.transparency().active()) bloom_scene = &bloom_renderer_.physical_scene();
+            if (celestial_renderer_.transparency_needs_resolve()) bloom_scene = &bloom_renderer_.physical_scene();
         }
         {
             ScopedTimer timer(sample ? &sample->cpu["cpu_gaia_cull_ms"] : nullptr);

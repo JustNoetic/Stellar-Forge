@@ -5,13 +5,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 1) uniform sampler2D radiance_lut;
 layout(set = 0, binding = 2) uniform sampler2D throughput_lut;
 layout(set = 0, binding = 3) uniform sampler2D scene_depth;
-#if !defined(ATMOSPHERE_FRAGMENT) && !defined(ATMOSPHERE_TRANSPARENT_ONLY)
-#ifdef HDR_RGBA32F
-layout(rgba32f, set = 0, binding = 4) uniform image2D hdr_color;
-#else
-layout(rgba16f, set = 0, binding = 4) uniform image2D hdr_color;
-#endif
-#elif defined(ATMOSPHERE_FRAGMENT)
+#ifdef ATMOSPHERE_FRAGMENT
 layout(location = 0, index = 0) out vec4 out_scattered;
 layout(location = 0, index = 1) out vec4 out_transmittance;
 #endif
@@ -45,7 +39,7 @@ layout(set = 0, binding = 29) uniform sampler3D secondary_aerial_lut;
 layout(set = 0, binding = 30) uniform sampler2D secondary_range_lut;
 #endif
 #if defined(ATMOSPHERE_SECONDARY) || defined(ATMOSPHERE_RING_SLOT)
-// ring.x: 0 ignores the ring slot, 1 transports it in place, 2 also blends it where no list fragment exists.
+// ring.x: 0 ignores the ring slot, 1 transports it in place, 2 also blends it where no list fragment exists, 3 blends it unconditionally.
 layout(push_constant) uniform CompositePush {
     vec4 irradiance;
 #ifdef ATMOSPHERE_RING_SLOT
@@ -584,7 +578,7 @@ bool composite_atmosphere_pixel(ivec2 pixel, ivec2 size, float depth, out vec3 s
         ringed = (slot & RING_SLOT_CONTENDED) == 0u && ring_depth > 0.0 && ring_depth >= depth;
         if (ringed) {
             ring = load_ring_slot(pixel);
-            blend_ring = secondary.ring.x == 2u && imageLoad(transparency_heads, pixel).x == TRANSPARENCY_END;
+            blend_ring = secondary.ring.x == 3u || (secondary.ring.x == 2u && imageLoad(transparency_heads, pixel).x == TRANSPARENCY_END);
         }
     }
 #endif
@@ -817,18 +811,5 @@ void main() {
     out_scattered = vec4(min(scattered, vec3(65000.0)), 0.0);
 #endif
     out_transmittance = vec4(transmitted, 1.0);
-#elif !defined(ATMOSPHERE_TRANSPARENT_ONLY)
-    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 size = imageSize(hdr_color);
-    if (any(greaterThanEqual(pixel, size))) return;
-    float depth = texelFetch(scene_depth, pixel, 0).r;
-    vec3 scattered, transmitted;
-    if (!composite_atmosphere_pixel(pixel, size, depth, scattered, transmitted)) return;
-    vec4 color = imageLoad(hdr_color, pixel);
-#ifdef HDR_RGBA32F
-    imageStore(hdr_color, pixel, vec4(color.rgb*transmitted+scattered, color.a));
-#else
-    imageStore(hdr_color, pixel, vec4(min(color.rgb*transmitted+scattered, vec3(65000.0)), color.a));
-#endif
 #endif
 }

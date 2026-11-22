@@ -19,6 +19,8 @@
 
 namespace sf::rendering {
 
+struct RefractionHost;
+
 struct alignas(16) RingSegmentGPU {
     glm::vec4 bounds_opacity_scatter{0.0f};
     glm::vec4 phase_row{0.0f};
@@ -84,7 +86,8 @@ public:
     void shutdown(rhi::VkContext& ctx);
 
     void prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                 const ephemeris::SystemSnapshot& sys, uint32_t body_count, int refraction_body = -1);
+                 const ephemeris::SystemSnapshot& sys, uint32_t body_count,
+                 VkExtent2D extent = {}, const RefractionHost* refraction = nullptr);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, const RenderSettings& settings,
                 std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
                 std::span<const rhi::PushDescriptorWrite> transparency_writes = {},
@@ -116,7 +119,8 @@ public:
     }
 
     uint32_t host_count() const noexcept { return active_host_count_; }
-    bool drawn(const RenderSettings& settings) const noexcept { return settings.show_rings && active_host_count_ != 0; }
+    uint32_t visible_host_count() const noexcept { return static_cast<uint32_t>(visible_hosts_.size()); }
+    bool drawn(const RenderSettings& settings) const noexcept { return settings.show_rings && !visible_hosts_.empty(); }
     std::span<const RingHostGPU> hosts() const noexcept { return hosts_gpu_; }
     const rhi::Buffer& host_buffer(uint32_t frame) const noexcept { return host_ssbos_[frame]; }
     const rhi::Image& gradient_atlas() const noexcept { return gradient_atlas_; }
@@ -230,6 +234,7 @@ private:
     rhi::StagingUploads staging_;
 
     std::vector<RingHostGPU> hosts_gpu_;
+    std::vector<uint32_t> visible_hosts_;
     std::vector<std::span<const RingDrawRange>> host_draw_ranges_;
     std::vector<CachedHostMapping> host_mappings_;
     std::unordered_map<std::string, std::vector<glm::vec4>> cached_raw_textures_;

@@ -337,7 +337,7 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
             settings.terrain_imported_enabled && settings.terrain_self_shadows_enabled,
             settings.oceans_enabled);
     });
-    measure("cpu_rings_prepare_ms", [&] { rings_.prepare(cmd, ctx, cam, sys, count, refraction_.host().body); });
+    measure("cpu_rings_prepare_ms", [&] { rings_.prepare(cmd, ctx, cam, sys, count, extent, &refraction_.host()); });
     measure("cpu_ringshine_prepare_ms", [&] {
     uint32_t ringshine_timer = ctx.begin_gpu_timer(cmd, "ringshine_bake");
     rings_.update_ringshine(cmd, ctx, cam, sys, settings, count, extent);
@@ -411,8 +411,11 @@ void CelestialRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const 
         }
     }
     prepare_cloud_layer(cmd, ctx, extent);
+    uint32_t visible_rings = settings.show_rings ? rings_.visible_host_count() : 0u;
+    bool orbits_active = settings.show_orbits && sys.size() > 1;
+    transparency_has_list_ = visible_clouds || orbits_active || visible_rings > 1u;
     transparency_.prepare(cmd, ctx, extent, !settings.transparency_reference_legacy && !sys.empty() &&
-        (visible_clouds || (settings.show_rings && rings_.host_count() > 0) || (settings.show_orbits && sys.size() > 1)));
+        (transparency_has_list_ || visible_rings > 0u));
     });
     measure("cpu_eclipse_refraction_prepare_ms", [&] { eclipse_refraction_.prepare(cmd, ctx, sys, settings); });
     measure("cpu_cloud_volume_prepare_ms", [&] { cloud_volume_.prepare(ctx, cam, sys, settings, cloud_maps_, count); });
@@ -690,11 +693,14 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             for (uint32_t s = 0; s < ubo.num_stars; ++s)
                 if (!sys.illuminates(star_bodies[s], i)) inst_ptr[i].surface_flags.y |= 1u << s;
     }
+    for (uint32_t h = 0; h < rings_.host_count(); ++h) {
+        uint32_t host_body = rings_.hosts()[h].counts_indices.x;
+        if (host_body < count) inst_ptr[host_body].surface_flags.z = h + 1u;
+    }
 
     uint32_t ring_count = settings.show_rings ? rings_.host_count() : 0u;
     static_assert(MAX_RING_HOSTS < 32);
-    surface_ring_candidate_masks_.assign(ubo.num_ring_hosts > 0u && !settings.ring_shadow_reference_all_hosts
-                                       ? count * ubo.num_stars : 0u, 0u);
+    surface_ring_candidate_masks_.assign(ubo.num_ring_hosts > 0u ? count * ubo.num_stars : 0u, 0u);
     ring_eclipse_candidate_counts_.assign(ring_count * ubo.num_stars, 0u);
     eclipse_words_.assign((count + ring_count) * ubo.num_stars * 2, 0u);
     for (uint32_t i = 0; i < count + ring_count; ++i) {
@@ -832,9 +838,7 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
             }
         }
     }
-    ubo.ring_shadow_params = {static_cast<uint32_t>(eclipse_words_.size()),
-                              settings.ring_shadow_reference_all_hosts ? 1u : 0u,
-                              (settings.ring_shadow_single_box ? 1u : 0u) | (settings.ring_shadow_reference_linear ? 2u : 0u),
+    ubo.ring_shadow_params = {static_cast<uint32_t>(eclipse_words_.size()), 0u, 0u,
                               std::bit_cast<uint32_t>(settings.ring_shadow_softness)};
     ubo.eclipse_params.x = settings.eclipse_reference_smoothstep ? 1u : 0u;
     eclipse_words_.insert(eclipse_words_.end(), surface_ring_candidate_masks_.begin(), surface_ring_candidate_masks_.end());
@@ -963,22 +967,18 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         if ((nflags & 2u) != 0u) key |= terrain::SURFACE_BIT_HORIZONS;
         bool has_baked_shine = i < planetshine_layers_.size() && planetshine_layers_[i] > 0u;
         if (has_baked_shine) key |= terrain::SURFACE_BIT_PLANETSHINE;
-        bool shadow_casters = ubo.num_ring_hosts > 0u && settings.ring_shadow_reference_all_hosts;
-        for (uint32_t s = 0; !shadow_casters && s < ubo.num_stars; ++s) {
+        bool has_eclipse = false;
+        bool has_ring_shadow = false;
+        for (uint32_t s = 0; s < ubo.num_stars; ++s) {
             uint32_t range = (i * ubo.num_stars + s) * 2u;
-            if (eclipse_words_[range + 1u] > 0u) shadow_casters = true;
+            if (eclipse_words_[range + 1u] > 0u) has_eclipse = true;
             if (!surface_ring_candidate_masks_.empty() && surface_ring_candidate_masks_[i * ubo.num_stars + s] != 0u)
-                shadow_casters = true;
+                has_ring_shadow = true;
         }
-        if (!shadow_casters && ubo.ringshine_params.x != 0u) {
-            for (uint32_t r = 0; r < ubo.ringshine_params.y; ++r) {
-                if (rings_.hosts()[r].counts_indices.x == i) {
-                    shadow_casters = true;
-                    break;
-                }
-            }
-        }
-        if (shadow_casters) key |= terrain::SURFACE_BIT_SHADOW_CASTERS;
+        bool has_ringshine = ubo.ringshine_params.x != 0u && inst.surface_flags.z != 0u;
+        if (has_eclipse) key |= terrain::SURFACE_BIT_ECLIPSE_SHADOW;
+        if (has_ring_shadow) key |= terrain::SURFACE_BIT_RING_SHADOW;
+        if (has_ringshine) key |= terrain::SURFACE_BIT_RINGSHINE;
         bool has_unbaked_shine = false;
         if (!has_baked_shine) {
             for (int k = 0; k < 4; ++k) {
@@ -1021,8 +1021,65 @@ void CelestialRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const C
         }
         body_shader_keys_[i] = key;
     }
+    size_t patch_count = terrain_.prepared_count();
+    patch_shader_keys_.resize(patch_count);
+    for (size_t p = 0; p < patch_count; ++p) {
+        auto info = terrain_.prepared_patch_info(p);
+        uint32_t bi = info.body_index;
+        uint32_t key = bi < body_shader_keys_.size() ? body_shader_keys_[bi] : 0u;
+        if ((key & terrain::SURFACE_BIT_RING_SHADOW) != 0u) {
+            bool any_ring = false;
+            for (uint32_t s = 0; s < ubo.num_stars && !any_ring; ++s) {
+                uint32_t mask = surface_ring_candidate_masks_[bi * ubo.num_stars + s];
+                while (mask != 0u) {
+                    uint32_t h = uint32_t(std::countr_zero(mask));
+                    mask &= mask - 1u;
+                    const auto& host = rings_.hosts()[h];
+                    if (ring_could_shadow_surface(info.world_bounds, ubo.stars_pos_radius[s],
+                            {glm::vec3(host.center_min_r), host.pole_max_r.w},
+                            {glm::vec3(host.pole_max_r), host.center_min_r.w},
+                            fb_h * fov_factor, settings.ring_shadow_softness)) {
+                        any_ring = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_ring) key &= ~terrain::SURFACE_BIT_RING_SHADOW;
+        }
+        if ((key & terrain::SURFACE_BIT_ECLIPSE_SHADOW) != 0u) {
+            bool any_eclipse = false;
+            for (uint32_t s = 0; s < ubo.num_stars && !any_eclipse; ++s) {
+                uint32_t range = (bi * ubo.num_stars + s) * 2u;
+                uint32_t start = eclipse_words_[range];
+                uint32_t cand_count = eclipse_words_[range + 1u];
+                for (uint32_t k = 0; k < cand_count; ++k) {
+                    uint32_t j = eclipse_words_[start + k];
+                    auto caster = inst_ptr[j].pos_radius;
+                    if (j < eclipse_bounds.size() && eclipse_bounds[j].x > 0) {
+                        double distance = glm::length(glm::dvec3(caster) - glm::dvec3(info.world_bounds)) + info.world_bounds.w;
+                        caster.w = float(eclipse_bounds[j].x + distance * eclipse_bounds[j].y);
+                    }
+                    if (eclipse_could_shadow(info.world_bounds, ubo.stars_pos_radius[s], caster)) {
+                        any_eclipse = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_eclipse) key &= ~terrain::SURFACE_BIT_ECLIPSE_SHADOW;
+        }
+        if ((key & terrain::SURFACE_BIT_RINGSHINE) != 0u) {
+            uint32_t h = inst_ptr[bi].surface_flags.z - 1u;
+            const auto& host = rings_.hosts()[h];
+            float r_outer_ratio = host.pole_max_r.w / std::max(host.tangent_radius.w, 1e-12f);
+            float q = std::clamp(1.0f - float(sys.body(bi).definition.oblateness), 0.05f, 1.0f);
+            float relief_ratio = terrain_.relief_extent_au(bi) / std::max(inst_ptr[bi].pos_radius.w, 1e-12f);
+            if (info.max_cylindrical_ratio / std::max(q - relief_ratio, 0.05f) < (1.0f / std::max(r_outer_ratio, 1.0f)) - 0.05f)
+                key &= ~terrain::SURFACE_BIT_RINGSHINE;
+        }
+        patch_shader_keys_[p] = key;
+    }
     auto terrain_timer = profile_gpu ? ctx.begin_gpu_timer(cmd, "gpu_terrain_draw") : UINT32_MAX;
-    terrain_.render(cmd, ctx, writes, body_shader_keys_, color_format);
+    terrain_.render(cmd, ctx, writes, body_shader_keys_, color_format, patch_shader_keys_);
     ctx.end_gpu_timer(cmd, terrain_timer);
 
     if (!cloud_bodies_.empty()) {
@@ -1261,8 +1318,12 @@ void CelestialRenderer::composite_atmospheres(VkCommandBuffer cmd, rhi::VkContex
     bool blended = atmospheres_.composite(cmd, ctx, color, depth,
         transparency_.active() ? std::span{transparency_writes} : std::span<const rhi::PushDescriptorWrite>{}, draw,
         cloud_layer_active_ ? std::span<const rhi::PushDescriptorWrite>{cloud_layer} : std::span<const rhi::PushDescriptorWrite>{},
-        transparency_.active() ? std::span{slot_writes}.subspan(2) : std::span<const rhi::PushDescriptorWrite>{}, ring_slot);
-    transparency_.resolve(cmd, ctx, color, depth, physical_color, !ring_slot ? 0u : blended ? 1u : 2u);
+        transparency_.active() ? std::span{slot_writes}.subspan(2) : std::span<const rhi::PushDescriptorWrite>{}, ring_slot,
+        transparency_has_list_);
+    bool should_resolve = transparency_.active() && (!blended || transparency_has_list_ || physical_color != nullptr);
+    transparency_resolved_last_frame_ = should_resolve;
+    if (should_resolve)
+        transparency_.resolve(cmd, ctx, color, depth, physical_color, !ring_slot ? 0u : blended ? 1u : 2u);
     ring_slot_active_ = false;
 }
 

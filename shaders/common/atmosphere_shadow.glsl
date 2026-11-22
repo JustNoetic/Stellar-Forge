@@ -23,23 +23,23 @@ layout(set = 0, binding = 38) uniform sampler2DArray atmosphere_ring_penumbra;
 
 // Ring extinction through the per-frame penumbra table when the caster has a slot built at
 // this incidence; the prefix-integral filter otherwise (reference modes, grazing light).
-float atmosphere_ring_filter(AtmosphereShadowCaster caster, vec3 uv, bool single_box, bool reference_linear) {
+float atmosphere_ring_filter(AtmosphereShadowCaster caster, vec3 uv) {
     float slot;
-    if (!single_box && !reference_linear && ring_penumbra_slot(caster.support.w, uv.z, slot)) {
+    if (ring_penumbra_slot(caster.support.w, uv.z, slot)) {
         if (uv.x+1.2*uv.y <= 0.0 || uv.x-1.2*uv.y >= 1.0) return 0.0;  // the continuous kernel reaches 1.172 h
         return ring_penumbra_extinction(atmosphere_ring_penumbra, slot, uv.x, uv.y);
     }
-    return ring_shadow_filter(atmosphere_ring_shadow_lut, int(caster.support.y), uv, single_box, reference_linear);
+    return ring_shadow_filter(atmosphere_ring_shadow_lut, int(caster.support.y), uv);
 }
 
 // Swept box of half-width `sweep` convolved with the penumbra kernel (see ring_penumbra_swept).
-float atmosphere_ring_swept_filter(AtmosphereShadowCaster caster, vec3 uv, float sweep, bool single_box) {
+float atmosphere_ring_swept_filter(AtmosphereShadowCaster caster, vec3 uv, float sweep) {
     float slot;
-    if (!single_box && ring_penumbra_slot(caster.support.w, uv.z, slot)) {
+    if (ring_penumbra_slot(caster.support.w, uv.z, slot)) {
         if (uv.x+1.2*uv.y+sweep <= 0.0 || uv.x-1.2*uv.y-sweep >= 1.0) return 0.0;
         return ring_penumbra_swept(atmosphere_ring_penumbra, slot, uv.x, uv.y, sweep);
     }
-    return ring_swept_filter(atmosphere_ring_shadow_lut, int(caster.support.y), uv, sweep, single_box);
+    return ring_swept_filter(atmosphere_ring_shadow_lut, int(caster.support.y), uv, sweep);
 }
 #ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
 #include "common/atmosphere_shadow_weights.glsl"
@@ -154,9 +154,7 @@ float atmosphere_shadow_visibility(vec3 p, uint star_index, uvec4 range) {
     if (visibility <= 1e-4 || range.w == 0u) return visibility;
     vec3 light = to_star/distance;
     float footprint = length(p-shadow_eye_focal.xyz)/shadow_eye_focal.w;
-    bool single_box = (shadow_flags.y & 1u) != 0u;
-    bool reference_linear = (shadow_flags.y & 2u) != 0u;
-    bool allow_fast = !reference_linear && (shadow_flags.y & 8u) != 0u && shadow_flags.w == 0u && atm.camera.w == 1.0 && range.y == 0u && range.w == 1u;
+    bool allow_fast = shadow_flags.w == 0u && atm.camera.w == 1.0 && range.y == 0u && range.w == 1u;
     for (uint j = 0u; j < range.w; ++j) {
         AtmosphereShadowCaster caster = shadow_casters[range.z+j];
         vec3 receiver_rel = p-caster.position_radius.xyz;
@@ -164,9 +162,9 @@ float atmosphere_shadow_visibility(vec3 p, uint star_index, uvec4 range) {
         vec2 bounds = vec2(caster.pole_inner.w, caster.position_radius.w);
         vec4 coords;
         if (!allow_fast || !ring_receiver_coordinates_fast(receiver_rel, pole, to_star, star.w, distance, bounds, footprint, caster.support.z, coords))
-            coords = ring_receiver_coordinates(receiver_rel, pole, light, bounds, star.w/distance, distance, footprint, caster.support.z, reference_linear);
+            coords = ring_receiver_coordinates(receiver_rel, pole, light, bounds, star.w/distance, distance, footprint, caster.support.z);
         if (coords.w > 0.0)
-            visibility *= 1.0-coords.w*atmosphere_ring_filter(caster, coords.xyz, single_box, reference_linear);
+            visibility *= 1.0-coords.w*atmosphere_ring_filter(caster, coords.xyz);
         if (visibility <= 1e-4) return 0.0;
     }
     return visibility;
@@ -212,7 +210,7 @@ float atmosphere_shadow_step(vec3 p, vec3 direction, vec4 star, uvec4 range, flo
         vec2 bounds = vec2(caster.pole_inner.w, caster.position_radius.w);
         float footprint = length(p-shadow_eye_focal.xyz)/shadow_eye_focal.w;
         vec3 uv = ring_shadow_coordinates(hit_rel, pole, light, abs(denominator)/distance,
-            max(fraction, 0.0)*distance, bounds, star.w/distance, footprint, caster.support.z, (shadow_flags.y & 2u) != 0u);
+            max(fraction, 0.0)*distance, bounds, star.w/distance, footprint, caster.support.z);
         float end_denominator = denominator-dot(direction, pole)*step;
         float minimum_denominator = min(abs(denominator), abs(end_denominator));
         if (denominator*end_denominator <= 0.0) minimum_denominator = 1e-6;
@@ -396,7 +394,7 @@ float atmosphere_ring_stratum_visibility(AtmosphereShadowCaster caster, vec4 sta
                       max(0.75*footprint*radial_stretch, 0.75*span/4096.0));
     vec3 uv = vec3((mean+0.25*softness*curvature-caster.pole_inner.w)/span, width/span,
                    clamp(absolute_denominator/distance, 0.5/64.0, 63.5/64.0));
-    float extinction = atmosphere_ring_swept_filter(caster, uv, sweep/span, (shadow_flags.y & 1u) != 0u);
+    float extinction = atmosphere_ring_swept_filter(caster, uv, sweep/span);
     float visibility = 1.0-portion*extinction;
     return visibility <= 1e-4 ? 0.0 : visibility;
 }
@@ -517,7 +515,6 @@ float closed_form_ring_extinction(AtmosphereShadowCaster caster, vec4 star, vec3
     float centroid_radius = length(atmosphere_ring_plane_hit(m, center, pole, source));
     vec3 uv = closed_form_ring_coordinates(caster, vec4(source, star.w), m, centroid_radius);
     float shift = uv.x-(centroid_radius-caster.pole_inner.w)/span;
-    bool single_box = (shadow_flags.y & 1u) != 0u;
     float extinction = 0.0, share = closed_form_light_share(moments.z, clip.x);
     float radius = length(atmosphere_ring_plane_hit(origin+direction*(t0+clip.x*d), center, pole, source));
     for (int k = 1; k <= CLOSED_FORM_RING_PIECES; ++k) {
@@ -525,7 +522,7 @@ float closed_form_ring_extinction(AtmosphereShadowCaster caster, vec4 star, vec3
         float next_share = closed_form_light_share(moments.z, u);
         float next_radius = length(atmosphere_ring_plane_hit(origin+direction*(t0+u*d), center, pole, source));
         vec3 piece = vec3((0.5*(radius+next_radius)-caster.pole_inner.w)/span+shift, uv.yz);
-        extinction += (next_share-share)*atmosphere_ring_swept_filter(caster, piece, 0.5*abs(next_radius-radius)/span, single_box);
+        extinction += (next_share-share)*atmosphere_ring_swept_filter(caster, piece, 0.5*abs(next_radius-radius)/span);
         share = next_share;
         radius = next_radius;
     }
@@ -635,7 +632,7 @@ float shadow_random(ivec2 pixel, uint star_index, uint sequence) {
 
 float shadow_sample_budget(vec3 entry, vec3 direction, float path, uint maximum, out float contributing_span) {
     contributing_span = path;
-    if (shadow_temporal.w == 0u || maximum <= 4u || atm.camera.w > 1.0) return float(maximum);
+    if (maximum <= 4u || atm.camera.w > 1.0) return float(maximum);
     if (transport_subdivisions(entry, direction, 0.0, path) > 1) return float(maximum);
     float closest = clamp(-dot(entry, direction), 0.0, path);
     vec3 p = entry+direction*closest;
@@ -782,7 +779,7 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
 
 #ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
         // closed_form_ring_extinction handles a star straddling the ring plane, so no ring geometry excludes it.
-        bool closed_form = (shadow_flags.y & 32u) != 0u && cached_weights && (shadow_flags.y & 2u) == 0u;
+        bool closed_form = (shadow_flags.y & 32u) != 0u && cached_weights;
         if (closed_form) {
             total_energy += max(shadow_cached_light(cached_uv, cached_range, path), vec3(0.0));
             vec3 unused_split;
@@ -797,7 +794,7 @@ vec3 atmosphere_shadow_estimate(vec3 direction, vec2 segment, float path, ivec2 
         }
         bool analytic_ring = false;
 #ifdef ATMOSPHERE_SHADOW_CACHED_WEIGHTS
-        if (analytic && cached_weights && has_shadow && range.y == 0u && range.w == 1u && (shadow_flags.y & 2u) == 0u) {
+        if (analytic && cached_weights && has_shadow && range.y == 0u && range.w == 1u) {
             vec3 to_star = star.xyz-origin;
             analytic_ring = abs(dot(to_star, shadow_casters[range.z].pole_inner.xyz)) > max(star.w, 1e-6*length(to_star))+path;
         }

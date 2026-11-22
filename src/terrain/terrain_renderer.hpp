@@ -16,18 +16,20 @@ namespace sf::terrain {
 inline constexpr double TERRAIN_MIN_PROJECTED_RADIUS_PX = 2.5;
 
 enum SurfaceShaderBits : uint32_t {
-    SURFACE_BIT_FULL_LIGHTING  = 1u << 0,
-    SURFACE_BIT_ATMOSPHERE     = 1u << 1,
-    SURFACE_BIT_OCEAN          = 1u << 2,
-    SURFACE_BIT_OCEAN_FFT      = 1u << 3,
-    SURFACE_BIT_ALBEDO_MAP     = 1u << 4,
-    SURFACE_BIT_NORMALS        = 1u << 5,
-    SURFACE_BIT_HORIZONS       = 1u << 6,
-    SURFACE_BIT_SHADOW_CASTERS = 1u << 7,
-    SURFACE_BIT_PLANETSHINE        = 1u << 8,
-    SURFACE_BIT_DEBUG              = 1u << 9,
-    SURFACE_BIT_ATM_HORIZON_CLEAR  = 1u << 10,
-    SURFACE_BIT_ALL                = 0x7FFu,
+    SURFACE_BIT_FULL_LIGHTING     = 1u << 0,
+    SURFACE_BIT_ATMOSPHERE        = 1u << 1,
+    SURFACE_BIT_OCEAN             = 1u << 2,
+    SURFACE_BIT_OCEAN_FFT         = 1u << 3,
+    SURFACE_BIT_ALBEDO_MAP        = 1u << 4,
+    SURFACE_BIT_NORMALS           = 1u << 5,
+    SURFACE_BIT_HORIZONS          = 1u << 6,
+    SURFACE_BIT_ECLIPSE_SHADOW    = 1u << 7,
+    SURFACE_BIT_RING_SHADOW       = 1u << 8,
+    SURFACE_BIT_RINGSHINE         = 1u << 9,
+    SURFACE_BIT_PLANETSHINE       = 1u << 10,
+    SURFACE_BIT_DEBUG             = 1u << 11,
+    SURFACE_BIT_ATM_HORIZON_CLEAR = 1u << 12,
+    SURFACE_BIT_ALL               = 0x1FFFu,
 };
 
 struct TerrainStats {
@@ -85,6 +87,12 @@ struct alignas(16) CachedPatchGPU {
 
 class TerrainRenderer {
 public:
+    struct PreparedPatchInfo {
+        uint32_t body_index = 0;
+        glm::vec4 world_bounds{0.0f};
+        float max_cylindrical_ratio = 1.0f;
+    };
+
     void init(rhi::VkContext& ctx, bool load_config = true);
     void shutdown(rhi::VkContext& ctx);
     void prepare(rhi::VkContext& ctx, const Camera& camera, const ephemeris::SystemSnapshot& system,
@@ -92,7 +100,13 @@ public:
                  const rendering::RefractionHost* refraction = nullptr);
     void render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene,
                 std::span<const uint32_t> body_shader_keys = {},
-                VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT);
+                VkFormat color_format = VK_FORMAT_R16G16B16A16_SFLOAT,
+                std::span<const uint32_t> patch_shader_keys = {});
+    size_t prepared_count() const noexcept { return prepared_.size(); }
+    PreparedPatchInfo prepared_patch_info(size_t index) const noexcept {
+        const auto& patch = prepared_[index];
+        return {patch.draw->reference.metadata.x, patch.draw->world_bounds, patch.draw->max_cylindrical_ratio};
+    }
     void bake(VkCommandBuffer cmd, rhi::VkContext& ctx) { cache_.bake(cmd, ctx); }
     bool covers(uint32_t body) const noexcept;
     const TerrainStats& stats() const noexcept { return stats_; }
@@ -109,9 +123,14 @@ private:
         GeometryKey key;
         GeometryBakeGPU bake;
         uint32_t mode = 0;
+        glm::vec4 world_bounds{0.0f};
+        float max_cylindrical_ratio = 1.0f;
     };
     struct PatchPlacement {
         glm::dvec3 anchor;
+        glm::dvec3 bounds_center{0.0};
+        double bounds_radius = 0.0;
+        float max_cylindrical_ratio = 1.0f;
         GeometryKey key;
         GeometryBakeGPU bake;
     };
@@ -135,6 +154,7 @@ private:
     struct FrameUploadState {
         uint64_t generation = 0;
         std::vector<uint32_t> body_keys;
+        std::vector<uint32_t> patch_keys;
         std::vector<GroupBatch> batches;
         uint32_t ref_count = 0;
         uint32_t cached_count = 0;

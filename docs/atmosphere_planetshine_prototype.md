@@ -1,8 +1,8 @@
 # Atmospheric planetshine prototype
 
-Historical single-source reference. The default now uses the
-[shared approximate four-source bake](atmosphere_secondary_lights.md); set the internal
-`atmosphere_planetshine_reference` diagnostic to reproduce this original path.
+Historical single-source design note. Production rendering now uses the
+[shared approximate four-source bake](atmosphere_secondary_lights.md) (the
+internal `atmosphere_planetshine_reference` fallback has been removed).
 
 26 October 2026. One reflected source, independently cached from sunlight. Existing
 Planetshine controls the prototype; Direct sunlight only suppresses it. No atmospheric

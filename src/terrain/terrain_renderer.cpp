@@ -28,7 +28,9 @@ rhi::GraphicsPipelineDesc make_terrain_pipeline_desc(const rhi::VkContext& ctx, 
         {"SURFACE_ALBEDO_MAP", flag(SURFACE_BIT_ALBEDO_MAP)},
         {"SURFACE_NORMALS", flag(SURFACE_BIT_NORMALS)},
         {"SURFACE_HORIZONS", flag(SURFACE_BIT_HORIZONS)},
-        {"SURFACE_SHADOW_CASTERS", flag(SURFACE_BIT_SHADOW_CASTERS)},
+        {"SURFACE_ECLIPSE_SHADOW", flag(SURFACE_BIT_ECLIPSE_SHADOW)},
+        {"SURFACE_RING_SHADOW", flag(SURFACE_BIT_RING_SHADOW)},
+        {"SURFACE_RINGSHINE", flag(SURFACE_BIT_RINGSHINE)},
         {"SURFACE_PLANETSHINE", flag(SURFACE_BIT_PLANETSHINE)},
         {"SURFACE_DEBUG", flag(SURFACE_BIT_DEBUG)},
         {"SURFACE_ATM_HORIZON_CLEAR", flag(SURFACE_BIT_ATM_HORIZON_CLEAR)},
@@ -393,6 +395,10 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
                 double width = std::ldexp(2.0, -int(patch.tile.level));
                 placement.anchor = ellipsoid_point(patch.tile.face, -1.0+(patch.tile.x+.5)*width,
                     -1.0+(patch.tile.y+.5)*width, view.polar_ratio);
+                TileBounds tb = bounds(patch.tile, view.polar_ratio, view.height_amplitude);
+                placement.bounds_center = tb.center;
+                placement.bounds_radius = tb.radius;
+                placement.max_cylindrical_ratio = float(std::hypot(tb.center.x, tb.center.z) + tb.radius);
                 placement.key = key;
                 placement.bake.anchor_polar_ratio = {glm::vec3(placement.anchor), float(view.polar_ratio)};
                 placement.bake.shape.x = float(view.height_amplitude);
@@ -466,6 +472,9 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
             draw.mode = distant ? 2u : 1u;
             if (settings.terrain_cached_fp64) draw.mode = 3u;
             if (settings.terrain_reference_fp64 && !source) draw.mode = 0;
+            draw.world_bounds = {glm::vec3(center + rotation * (placement.bounds_center * radius)),
+                                 float(placement.bounds_radius * radius)};
+            draw.max_cylindrical_ratio = placement.max_cylindrical_ratio;
             entry.draws.push_back(draw);
         }
         for (const auto& draw : entry.draws) prepared_.push_back({&draw, draw.mode});
@@ -525,34 +534,40 @@ void TerrainRenderer::prepare(rhi::VkContext& ctx, const Camera& camera, const e
 }
 
 rhi::Pipeline& TerrainRenderer::pipeline_for(rhi::VkContext& ctx, uint32_t mode, uint32_t shader_key, VkFormat color_format) {
+    static_assert((SURFACE_BIT_ALL >> 13) == 0u);
     uint32_t masked = shader_key & SURFACE_BIT_ALL;
-    uint64_t key = (uint64_t(static_cast<uint32_t>(color_format)) << 13) | (uint64_t(mode & 3u) << 11) | uint64_t(masked);
+    uint64_t key = (uint64_t(static_cast<uint32_t>(color_format)) << 15) | (uint64_t(mode & 3u) << 13) | uint64_t(masked);
     auto& pipe = pipelines_[key];
     if (!pipe) pipe = rhi::ShaderCache::create_graphics_pipeline(ctx, make_terrain_pipeline_desc(ctx, mode, masked, color_format));
     return pipe;
 }
 
 void TerrainRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, std::span<const rhi::PushDescriptorWrite> scene,
-                             std::span<const uint32_t> body_shader_keys, VkFormat color_format) {
+                             std::span<const uint32_t> body_shader_keys, VkFormat color_format,
+                             std::span<const uint32_t> patch_shader_keys) {
     if (prepared_.empty()) return;
     uint32_t f_idx = ctx.frame_index();
     auto& upload = frame_uploads_[f_idx];
     bool keys_match = upload.body_keys.size() == body_shader_keys.size()
-        && std::equal(upload.body_keys.begin(), upload.body_keys.end(), body_shader_keys.begin());
+        && std::equal(upload.body_keys.begin(), upload.body_keys.end(), body_shader_keys.begin())
+        && upload.patch_keys.size() == patch_shader_keys.size()
+        && std::equal(upload.patch_keys.begin(), upload.patch_keys.end(), patch_shader_keys.begin());
     if (upload.generation != prepared_generation_ || !keys_match) {
         upload.generation = prepared_generation_;
         upload.body_keys.assign(body_shader_keys.begin(), body_shader_keys.end());
+        upload.patch_keys.assign(patch_shader_keys.begin(), patch_shader_keys.end());
         upload.batches.clear();
         upload.ref_count = 0;
         upload.cached_count = 0;
         groups_.clear();
         patch_group_.resize(prepared_.size());
-        auto shader_key_for = [&](uint32_t body_idx) -> uint32_t {
+        auto shader_key_for = [&](size_t patch_idx, uint32_t body_idx) -> uint32_t {
+            if (patch_idx < patch_shader_keys.size()) return patch_shader_keys[patch_idx] & SURFACE_BIT_ALL;
             return body_idx < body_shader_keys.size() ? (body_shader_keys[body_idx] & SURFACE_BIT_ALL) : SURFACE_BIT_ALL;
         };
         for (size_t i = 0; i < prepared_.size(); ++i) {
             const auto& patch = prepared_[i];
-            uint32_t skey = shader_key_for(patch.draw->reference.metadata.x);
+            uint32_t skey = shader_key_for(i, patch.draw->reference.metadata.x);
             uint32_t mask = patch.draw->reference.metadata.y;
             size_t g_idx = groups_.size();
             for (size_t g = 0; g < groups_.size(); ++g) {

@@ -29,10 +29,8 @@ defaulting to 1.25. Rendering settings expose it as **Shadow Softness**, beneath
 **Ring Shadows**. CPU host bounds and atmospheric interval bounds include this
 multiplier and curvature support, so tuning cannot clip their broad penumbrae.
 
-`ring_shadow_reference_linear` restores the original footprint and kernel for
-diagnostics. `ring_shadow_single_box` selects one box instead of the default
-three. `ring_shadow_reference_all_hosts` independently bypasses CPU candidates.
-Atmospheric shadow histories invalidate when softness changes.
+Atmospheric shadow histories invalidate when softness changes. (Legacy single-box,
+linear, and all-host ring shadow diagnostic toggles have been removed.)
 
 ## Verification
 

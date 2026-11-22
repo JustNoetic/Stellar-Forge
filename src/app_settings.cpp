@@ -147,7 +147,7 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
         ImGui::Checkbox("Reuse history while turning", &render_draft.atmosphere_shadow_rotation);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reprojects smooth sky shadows while rotating in place. Depth edges, narrow shadows and transparent endpoints use fresh integration while turning.");
         ImGui::EndDisabled();
-        ui::field(render_draft.atmosphere_shadow_adaptive ? "Maximum shadow samples" : "Shadow samples", [&](const char* id) {
+        ui::field("Maximum shadow samples", [&](const char* id) {
             const char* samples[] = {"4", "8", "16"};
             int quality = render_draft.atmosphere_shadow_samples == 4 ? 0 : render_draft.atmosphere_shadow_samples == 8 ? 1 : 2;
             if (ImGui::Combo(id, &quality, samples, 3)) render_draft.atmosphere_shadow_samples = 4u << quality;
@@ -163,16 +163,6 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
                 int noise = static_cast<int>(render_draft.atmosphere_shadow_noise_type);
                 if (ImGui::Combo(id, &noise, types, 2)) render_draft.atmosphere_shadow_noise_type = static_cast<uint32_t>(noise);
             });
-            ImGui::Checkbox("Adaptive shadow samples", &render_draft.atmosphere_shadow_adaptive);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses fewer samples for short or vertical atmospheric columns. Grazing rays and sharp shadows retain more samples.");
-            ImGui::Checkbox("Cached shadow weights", &render_draft.atmosphere_shadow_cached_weights);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Reuses aerial-perspective light contributions for single-star ring shadows. Unsupported endpoints and atmosphere profiles retain native integration.");
-            ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
-            ImGui::Checkbox("Deterministic shadow strata", &render_draft.atmosphere_shadow_analytic);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Integrates single-ring shadows over each stratum without jitter and samples smooth eclipse penumbrae at stratum midpoints. Progressive shadows keep jittered accumulation.");
-            ImGui::Checkbox("Closed-form shadows", &render_draft.atmosphere_shadow_closed_form);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Evaluates ring and eclipse shadows at light-weighted points of four cached in-scatter slices, without raymarching. Applies to single-star atmospheres without layered aerosols; grazing ring geometry and other cases use sampled integration.");
-            ImGui::EndDisabled();
             ImGui::BeginDisabled(render_draft.atmosphere_shadow_temporal);
             ImGui::Checkbox("Atmospheric shadow VRS", &render_draft.atmosphere_shadow_vrs);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Integrates shadows on a coarse grid and upsamples them, for atmospheres covering more of the screen than the shadow ray budget.");
@@ -320,11 +310,6 @@ void App::render_settings_window(rendering::RenderSettings& render_draft) {
             ui_settings_.ly_threshold_au = std::max(1.0, ui_settings_.ly_threshold_au);
         });
     } else if (page == ui::SettingsSection::Advanced) {
-        ui::section("Experimental rendering");
-        ImGui::Checkbox("Dual-source atmosphere blending", &render_draft.atmosphere_dual_source);
-        ImGui::Checkbox("Fast ring shadow geometry (experimental)", &render_draft.atmosphere_shadow_fast_rings);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Simplifies projection math for single-ring atmospheric shadows while retaining the current ring filter. Grazing stellar horizons use the original calculation.");
-
         ui::section("Terrain diagnostics");
         ImGui::Checkbox("Terrain Tile Colors", &render_draft.terrain_debug_tiles);
         ImGui::Checkbox("FP64 Terrain Reference", &render_draft.terrain_reference_fp64);

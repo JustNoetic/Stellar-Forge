@@ -1,3 +1,5 @@
+#ifndef RING_HOSTS_DEFINED
+#define RING_HOSTS_DEFINED
 struct RingSegmentGPU {
     vec4 bounds_opacity_scatter;
     vec4 phase_row;
@@ -16,3 +18,4 @@ struct RingHostGPU {
 layout(std430, set = 0, binding = 7) readonly buffer RingHostBuffer {
     RingHostGPU ring_hosts[];
 };
+#endif

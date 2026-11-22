@@ -101,7 +101,6 @@ struct AtmosphereStats {
     uint32_t point_lut_updates = 0;
     uint32_t stellar_lut_updates = 0;
     uint32_t secondary_lut_updates = 0;
-    uint32_t secondary_source_lut_updates = 0;
     uint32_t shadow_updates = 0;
     uint32_t shadow_vrs_updates = 0;
     uint32_t shadow_history_resets = 0;
@@ -127,7 +126,9 @@ public:
                    std::span<const rhi::PushDescriptorWrite> transparency_writes = {},
                    const std::function<void(uint32_t)>& draw_point = {},
                    std::span<const rhi::PushDescriptorWrite> cloud_writes = {},
-                   std::span<const rhi::PushDescriptorWrite> slot_writes = {}, bool ring_slot = false);
+                   std::span<const rhi::PushDescriptorWrite> slot_writes = {}, bool ring_slot = false,
+                   bool has_list_fragments = true);
+    bool can_fuse_ring_slot(bool has_draw_point = true) const noexcept;
     // True when this frame's atmosphere composite of `body` blends its 2D cloud sheet from the cloud layer.
     bool composites_clouds(uint32_t body) const noexcept;
     uint32_t inline_cloud_slot(uint32_t body) const noexcept;
@@ -153,15 +154,11 @@ private:
         rhi::Image stellar_source;
         rhi::Image aerial_radiance, aerial_optical_depth, aerial_range;
         rhi::Image secondary_sky, secondary_aerial, secondary_range;
-        rhi::Image secondary_source;
-        glm::vec4 secondary_direction{}, secondary_irradiance{};
+        glm::vec4 secondary_irradiance{};
         std::array<glm::vec4, 4> secondary_directions{}, secondary_weights{};
         std::array<glm::vec4, 17> secondary_ring_key{};
         uint64_t secondary_ring_revision = 0;
-        bool secondary_approximate = false;
         float secondary_altitude = 0.0f;
-        float secondary_source_radius = 0.0f;
-        bool secondary_source_valid = false;
         bool secondary_active = false, secondary_valid = false, secondary_aerial_valid = false;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> uniforms;
         std::array<rhi::Buffer, rhi::FRAMES_IN_FLIGHT> shadows;
@@ -215,7 +212,7 @@ private:
     std::array<Tables*, 32> surface_layers_{};
     std::array<glm::vec2, 32> surface_keys_{};
     uint64_t prepare_serial_ = 0;
-    rhi::Pipeline transmittance_pipeline_, multiscatter_pipeline_, sky_pipeline_, composite_pipeline_;
+    rhi::Pipeline transmittance_pipeline_, multiscatter_pipeline_, sky_pipeline_;
     rhi::Pipeline aerial_pipeline_, point_pipeline_, point_reduce_pipeline_;
     rhi::Pipeline small_sky_pipeline_, small_aerial_pipeline_;
     rhi::Pipeline molecular_sky_pipeline_, molecular_aerial_pipeline_;
@@ -232,22 +229,16 @@ private:
     // deferred passes over the tiles it lists: plain, limb, secondary, limb+secondary.
     std::array<rhi::Pipeline, 4> transparent_lean_pipelines_;
     rhi::Pipeline stellar_source_pipeline_;
-    std::array<rhi::Pipeline, 6> secondary_bake_pipelines_;
     std::array<rhi::Pipeline, 24> secondary_approximate_pipelines_;
-    rhi::Pipeline secondary_composite_pipeline_, secondary_dual_source_pipeline_;
-    rhi::Pipeline secondary_source_pipeline_;
-    rhi::Pipeline secondary_transparent_pipeline_, secondary_composite_transparency_pipeline_;
-    rhi::Pipeline secondary_unshadowed_transparent_pipeline_, secondary_unshadowed_composite_transparency_pipeline_;
+    rhi::Pipeline secondary_dual_source_pipeline_;
+    rhi::Pipeline secondary_transparent_pipeline_, secondary_unshadowed_transparent_pipeline_;
     void init_secondary(rhi::VkContext& ctx);
     struct Fp32CompositePipelines {
-        rhi::Pipeline composite, composite_transparency, unshadowed_composite_transparency;
-        rhi::Pipeline secondary_composite, secondary_composite_transparency, secondary_unshadowed_composite_transparency;
         rhi::Pipeline dual_source, limb_dual_source, secondary_dual_source, limb_secondary_dual_source;
         bool ready = false;
     } fp32_composite_;
     void ensure_fp32_composite_pipelines(rhi::VkContext& ctx);
-    rhi::Pipeline transparent_pipeline_, composite_transparency_pipeline_;
-    rhi::Pipeline unshadowed_transparent_pipeline_, unshadowed_composite_transparency_pipeline_;
+    rhi::Pipeline transparent_pipeline_, unshadowed_transparent_pipeline_;
     rhi::Pipeline shadow_pipeline_, shadow_transparency_pipeline_;
     rhi::Pipeline shadow_accumulate_pipeline_, shadow_accumulate_transparency_pipeline_;
     rhi::Pipeline shadow_reproject_pipeline_, shadow_rotate_pipeline_, shadow_rotate_transparency_pipeline_;
@@ -274,7 +265,6 @@ private:
     std::array<ShadowDiagnosticFrame, rhi::FRAMES_IN_FLIGHT> shadow_diagnostics_;
     ShadowHistoryDiagnostics shadow_last_diagnostics_;
     bool shadow_diagnostics_enabled_ = false;
-    bool dual_source_ = false;
     bool shadow_vrs_enabled_ = true;
     bool shadow_temporal_enabled_ = false;
     const rhi::Image* ring_shadow_lut_ = nullptr;

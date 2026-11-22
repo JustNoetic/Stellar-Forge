@@ -1,8 +1,7 @@
 # Atmospheric ring shadow geometry
 
-Try **Settings → Advanced → Fast ring shadow geometry (experimental)**.
-The option and cached atmospheric weights are on by default.
-Changing either option invalidates shadow history.
+Always enabled in atmospheric shadow evaluation (the experimental toggle in
+**Settings → Advanced** was removed).
 
 This experiment simplifies the geometry around repeated ring-visibility queries.
 Sample count, sample positions, ring profile, three-box penumbra filter, curvature

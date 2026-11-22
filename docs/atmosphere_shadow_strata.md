@@ -1,9 +1,7 @@
 # Deterministic atmospheric shadow strata
 
-Enabled by default. **Settings → Atmosphere → Shadow sampling & performance →
-Deterministic shadow strata** (`RenderSettings::atmosphere_shadow_analytic`,
-shader flag `shadow_flags.y & 16`) restores the jittered estimator for comparison.
-Toggling it invalidates shadow history.
+Always enabled in single-frame mode (when `atmosphere_shadow_temporal` is off,
+via `shadow_flags.y & 16`).
 
 ## Single-ring columns
 
@@ -64,7 +62,7 @@ the interval is conservative, so their visibility is exactly one.
 
 Multiple stars, multiple ring hosts, rings combined with body casters, grazing
 stars, transparent prefixes, thin-layer transport subdivision, disabled aerial
-perspective, single-box/linear diagnostics and dense-reference integration keep
+perspective, and dense-reference integration keep
 the jittered native or cached estimator.
 
 Progressive refinement disables the option (the flag is cleared while

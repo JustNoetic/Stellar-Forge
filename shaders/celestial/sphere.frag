@@ -23,8 +23,14 @@
 #ifndef SURFACE_HORIZONS
 #define SURFACE_HORIZONS 1
 #endif
-#ifndef SURFACE_SHADOW_CASTERS
-#define SURFACE_SHADOW_CASTERS 1
+#ifndef SURFACE_ECLIPSE_SHADOW
+#define SURFACE_ECLIPSE_SHADOW 1
+#endif
+#ifndef SURFACE_RING_SHADOW
+#define SURFACE_RING_SHADOW 1
+#endif
+#ifndef SURFACE_RINGSHINE
+#define SURFACE_RINGSHINE 1
 #endif
 #ifndef SURFACE_PLANETSHINE
 #define SURFACE_PLANETSHINE 1
@@ -54,9 +60,23 @@ layout(location = 6) in vec2 f_tile_uv;
 #include "common/body_surface.glsl"
 #include "common/surface_depth.glsl"
 #include "common/stellar_disk.glsl"
-#if SURFACE_SHADOW_CASTERS
+#if SURFACE_ECLIPSE_SHADOW
 #include "common/eclipse_shadow.glsl"
+#elif SURFACE_RING_SHADOW
+#ifndef ECLIPSE_CANDIDATE_BUFFER_DEFINED
+#define ECLIPSE_CANDIDATE_BUFFER_DEFINED
+layout(std430, set = 0, binding = 2) readonly buffer EclipseCandidateBuffer {
+    uint eclipse_words[];
+};
+#endif
+#endif
+#if SURFACE_RING_SHADOW || SURFACE_RINGSHINE
+#include "common/ring_hosts.glsl"
+#endif
+#if SURFACE_RING_SHADOW
 #include "common/surface_ring_shadow.glsl"
+#endif
+#if SURFACE_RINGSHINE
 #include "common/ringshine_lookup.glsl"
 #endif
 #if SURFACE_ALBEDO_MAP || SURFACE_NORMALS || SURFACE_HORIZONS
@@ -92,7 +112,7 @@ void main() {
         return;
     }
 #endif
-#if defined(TERRAIN_SURFACE) && SURFACE_DEBUG && !SURFACE_FULL_LIGHTING && !SURFACE_ATMOSPHERE && !SURFACE_OCEAN && !SURFACE_ALBEDO_MAP && !SURFACE_NORMALS && !SURFACE_HORIZONS && !SURFACE_SHADOW_CASTERS && !SURFACE_PLANETSHINE
+#if defined(TERRAIN_SURFACE) && SURFACE_DEBUG && !SURFACE_FULL_LIGHTING && !SURFACE_ATMOSPHERE && !SURFACE_OCEAN && !SURFACE_ALBEDO_MAP && !SURFACE_NORMALS && !SURFACE_HORIZONS && !SURFACE_ECLIPSE_SHADOW && !SURFACE_RING_SHADOW && !SURFACE_RINGSHINE && !SURFACE_PLANETSHINE
     out_color = vec4(0.0, 0.0, 0.0, 1.0);
     return;
 #else
@@ -141,7 +161,7 @@ void main() {
 #endif
 
     vec3 N;
-#if !SURFACE_FULL_LIGHTING && !SURFACE_SHADOW_CASTERS
+#if !SURFACE_FULL_LIGHTING
 #if SURFACE_HORIZONS
     vec2 terrain_vis = vec2(1.0);
 #else
@@ -274,9 +294,7 @@ void main() {
         float water_fresnel = 0.0;
         vec3 ocean_up = N;
         if (has_ocean) {
-#if (!SURFACE_NORMALS && !SURFACE_HORIZONS) || !SURFACE_SHADOW_CASTERS
             mat3 rotation = body_surface_rotation(body_pole(b), b.spin_flags.x);
-#endif
             float q = max(1.0 - b.pole_oblateness.w, 0.05);
 #if SURFACE_ALBEDO_MAP || SURFACE_NORMALS || SURFACE_HORIZONS
             vec3 local = surf_dir;
@@ -309,28 +327,20 @@ void main() {
         vec3 direct = vec3(stellar_lambert_irradiance(clamp(dot(N, L), -1.0, 1.0), clamp(sin_r, 0.0, 1.0)) * b.material.surface.w);
 #endif
 
-#if SURFACE_SHADOW_CASTERS
+#if SURFACE_ECLIPSE_SHADOW || SURFACE_RING_SHADOW
         vec3 shadow = vec3(1.0);
         if (any(greaterThan(direct + diffuse, vec3(0.0)))) {
+#if SURFACE_ECLIPSE_SHADOW
             shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, 0u);
+#endif
+#if SURFACE_RING_SHADOW
             if (any(greaterThan(shadow, vec3(0.0))) && u_scene.num_ring_hosts > 0u) {
-                uint candidates = u_scene.ring_shadow_params.y != 0u
-                    ? (1u << u_scene.num_ring_hosts) - 1u
-                    : eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars];
+                uint candidates = eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars];
                 if (candidates != 0u)
                     shadow *= compute_surface_ring_shadow(f_world_pos, L, sin_r, d_au, candidates, 0u);
             }
-        }
-#if SURFACE_HORIZONS
-        vec2 terrain_vis = vec2(1.0);
-        if (any(greaterThan(shadow, vec3(0.0))) && (any(greaterThan(direct, vec3(0.0))) || has_ocean)) {
-            terrain_vis = terrain_self_shadow(normal_lookup, surf_dir,
-                max(1.0 - b.pole_oblateness.w, 0.05), N_local, transpose(rotation) * L,
-                asin(clamp(sin_r, 0.0, 1.0)), has_ocean);
-        }
-#else
-        const vec2 terrain_vis = vec2(1.0);
 #endif
+        }
 #else
         const vec3 shadow = vec3(1.0);
 #endif
@@ -413,17 +423,19 @@ void main() {
 #endif
         float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0;
 
-#if SURFACE_SHADOW_CASTERS
+#if SURFACE_ECLIPSE_SHADOW || SURFACE_RING_SHADOW
         vec3 shadow = vec3(1.0);
         if (any(greaterThan(direct + diffuse, vec3(0.0)))) {
+#if SURFACE_ECLIPSE_SHADOW
             shadow = evaluate_eclipse_shadow(f_world_pos, star_pos, star_r, f_body_idx, s);
+#endif
+#if SURFACE_RING_SHADOW
             if (any(greaterThan(shadow, vec3(0.0))) && u_scene.num_ring_hosts > 0u) {
-                uint candidates = u_scene.ring_shadow_params.y != 0u
-                    ? (1u << u_scene.num_ring_hosts) - 1u
-                    : eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars + s];
+                uint candidates = eclipse_words[u_scene.ring_shadow_params.x + f_body_idx * u_scene.num_stars + s];
                 if (candidates != 0u)
                     shadow *= compute_surface_ring_shadow(f_world_pos, L, sin_r, d_au, candidates, uint(s));
             }
+#endif
         }
 #else
         const vec3 shadow = vec3(1.0);
@@ -470,21 +482,41 @@ void main() {
     }
 #endif
 
-#if SURFACE_SHADOW_CASTERS
-    if (u_scene.ringshine_params.x != 0u) {
-        vec3 ringshine_light = vec3(0.0);
-        for (uint r = 0; r < u_scene.ringshine_params.y; ++r) {
-            if (ring_hosts[r].counts_indices.x != f_body_idx) continue;
-            vec3 pole = ring_hosts[r].pole_max_r.xyz;
-            float host_r = ring_hosts[r].tangent_radius.w;
-            vec3 rel = f_body_offset;
-            float dist2 = dot(rel, rel);
-            if (dist2 > 2.25 * host_r * host_r || dist2 < 1e-12) continue;
-
+#if SURFACE_RINGSHINE
+    uint ring_slot = b.surface_flags.z;
+    if (u_scene.ringshine_params.x != 0u && ring_slot != 0u) {
+        uint r = ring_slot - 1u;
+        vec3 pole = ring_hosts[r].pole_max_r.xyz;
+        float host_r = ring_hosts[r].tangent_radius.w;
+        vec3 rel = f_body_offset;
+        float dist2 = dot(rel, rel);
+        if (dist2 <= 2.25 * host_r * host_r && dist2 >= 1e-12) {
             vec3 P_eq = rel - pole * dot(rel, pole);
             float len_eq = length(P_eq);
             P_eq = len_eq > 1e-5 ? P_eq / len_eq : vec3(1.0, 0.0, 0.0);
-            for (uint s = 0; s < u_scene.num_stars; ++s) {
+            vec3 P_dir = normalize(rel);
+            float slat = dot(P_dir, pole);
+#if !SURFACE_FULL_LIGHTING
+            if (star_lights_body(f_body_idx, 0u)) {
+                vec3 star_pos = u_scene.stars_pos_radius[0].xyz;
+                vec3 star_col = u_scene.stars_color_lum[0].rgb;
+                float star_lum = u_scene.stars_color_lum[0].w;
+                vec3 to_star = star_pos - f_world_pos;
+                float d_au = max(length(to_star), 1e-5);
+                vec3 L = to_star / d_au;
+
+                vec3 antiL_eq = (-L) - pole * dot(-L, pole);
+                float len_anti = length(antiL_eq);
+                antiL_eq = len_anti > 1e-5 ? antiL_eq / len_anti : vec3(1.0, 0.0, 0.0);
+                float phi = atan(dot(cross(antiL_eq, P_eq), pole), dot(P_eq, antiL_eq));
+
+                vec3 irradiance_map = ringshine_sample(phi, slat, int(r), 0);
+                float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0f;
+                total_light += albedo * irradiance_map * star_col * irradiance / 3.14159265358979323846;
+            }
+#else
+            vec3 ringshine_light = vec3(0.0);
+            for (uint s = 0u; s < u_scene.num_stars; ++s) {
                 if (!star_lights_body(f_body_idx, s)) continue;
                 vec3 star_pos = u_scene.stars_pos_radius[s].xyz;
                 vec3 star_col = u_scene.stars_color_lum[s].rgb;
@@ -498,14 +530,13 @@ void main() {
                 antiL_eq = len_anti > 1e-5 ? antiL_eq / len_anti : vec3(1.0, 0.0, 0.0);
                 float phi = atan(dot(cross(antiL_eq, P_eq), pole), dot(P_eq, antiL_eq));
 
-                vec3 P_dir = normalize(rel);
-                float slat = dot(P_dir, pole);
                 vec3 irradiance_map = ringshine_sample(phi, slat, int(r), int(s));
                 float irradiance = (u_scene.hdr_enabled != 0u) ? (star_lum / (d_au * d_au)) : 1.0f;
                 ringshine_light += albedo * irradiance_map * star_col * irradiance / 3.14159265358979323846;
             }
+            total_light += ringshine_light;
+#endif
         }
-        total_light += ringshine_light;
     }
 #endif
 

@@ -1,10 +1,12 @@
 #include "rendering/ring_renderer.hpp"
+#include "rendering/refraction_tables.hpp"
 #include "core/constants.hpp"
 #include "rhi/shader_cache.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace sf::rendering {
 
@@ -49,7 +51,7 @@ static rhi::GraphicsPipelineDesc ring_pipeline_desc(const rhi::VkContext& ctx, u
         desc.bindings.push_back({45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
         desc.bindings.push_back({46, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT});
     }
-    desc.push_constant_size = sizeof(uint32_t) * 4;
+    desc.push_constant_size = sizeof(uint32_t) * 3;
     desc.depth_test = true;
     desc.depth_write = false;
     desc.depth_compare = VK_COMPARE_OP_GREATER_OR_EQUAL;
@@ -384,8 +386,9 @@ void RingRenderer::rebuild_profiles(VkCommandBuffer cmd, rhi::VkContext& ctx, co
 }
 
 void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camera& cam,
-                           const ephemeris::SystemSnapshot& sys, uint32_t body_count, int refraction_body) {
-    refraction_body_ = refraction_body;
+                           const ephemeris::SystemSnapshot& sys, uint32_t body_count,
+                           VkExtent2D extent, const RefractionHost* refraction) {
+    refraction_body_ = refraction ? refraction->body : -1;
     host_keys_.clear();
     for (uint32_t bi = 0; bi < body_count && host_keys_.size() < MAX_RING_HOSTS; ++bi) {
         auto body = sys.body(bi);
@@ -395,6 +398,7 @@ void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camer
 
     hosts_gpu_.clear();
     host_draw_ranges_.clear();
+    visible_hosts_.clear();
     RenderPosition eye_pos = cam.eye_pos_render();
 
     for (const auto& mapping : host_mappings_) {
@@ -448,6 +452,135 @@ void RingRenderer::prepare(VkCommandBuffer cmd, rhi::VkContext& ctx, const Camer
 
     active_host_count_ = static_cast<uint32_t>(hosts_gpu_.size());
     update_penumbra(cmd, ctx, sys, body_count);
+    if (extent.width > 0 && extent.height > 0 && !hosts_gpu_.empty()) {
+        glm::dvec3 cam_f = cam.forward_dir();
+        glm::dvec3 cam_r = cam.right_dir();
+        glm::dvec3 cam_u = cam.up_dir();
+        double tan_y = std::tan(cam.fov_deg * DEG_TO_RAD * 0.5);
+        double tan_x = tan_y * double(extent.width) / double(extent.height);
+        bool refracted = refraction && refraction->refraction;
+        double pad = refracted ? refraction->max_displacement : 0.0;
+        double plane_x = pad > 0.0 ? std::tan(std::min(std::atan(tan_x) + pad, 1.5)) : tan_x;
+        double plane_y = pad > 0.0 ? std::tan(std::min(std::atan(tan_y) + pad, 1.5)) : tan_y;
+        const std::array<glm::dvec3, 5> planes{
+            cam_f,
+            glm::normalize(cam_r + plane_x * cam_f),
+            glm::normalize(-cam_r + plane_x * cam_f),
+            glm::normalize(cam_u + plane_y * cam_f),
+            glm::normalize(-cam_u + plane_y * cam_f)
+        };
+        const std::array<glm::dvec3, 4> unnorm_corners{
+            cam_f - plane_x * cam_r + plane_y * cam_u,
+            cam_f + plane_x * cam_r + plane_y * cam_u,
+            cam_f - plane_x * cam_r - plane_y * cam_u,
+            cam_f + plane_x * cam_r - plane_y * cam_u
+        };
+        std::array<glm::dvec3, 4> corners{};
+        std::array<double, 4> corner_lens{};
+        double max_corner_len = 0.0;
+        for (int k = 0; k < 4; ++k) {
+            corner_lens[k] = glm::length(unnorm_corners[k]);
+            max_corner_len = std::max(max_corner_len, corner_lens[k]);
+            corners[k] = unnorm_corners[k] / corner_lens[k];
+        }
+        bool has_occ = false;
+        double best_occ_tmax = std::numeric_limits<double>::infinity();
+        std::array<glm::dvec3, 5> verts{};
+        double pyr_max_dist = 0.0;
+        for (uint32_t bi = 0; bi < body_count; ++bi) {
+            const auto body = sys.body(bi);
+            const auto& def = body.definition;
+            if (def.is_star) continue;
+            double r_eq = def.radius_au();
+            if (r_eq <= 0.0) continue;
+            double q = std::clamp(1.0 - def.oblateness, 0.05, 1.0);
+            double r_pol = r_eq * q;
+            double neg_h = std::max(0.0, -double(def.height_range_km.x)) * KM_TO_AU;
+            double min_relief = std::min(20.0 * KM_TO_AU, 0.01 * r_eq);
+            double r_occ = (r_pol - neg_h - min_relief) * (1.0 - 1e-4);
+            glm::dvec3 c_occ = camera_relative(body.render.position, eye_pos);
+            double d_occ = glm::length(c_occ);
+            if (r_occ <= 0.0 || d_occ <= r_occ) continue;
+            glm::dvec3 c_hat = c_occ / d_occ;
+            double occ_ang = std::asin(std::clamp(r_occ / d_occ, 0.0, 1.0));
+            double min_ck = 1.0;
+            for (int k = 0; k < 4; ++k) min_ck = std::min(min_ck, glm::dot(corners[k], c_hat));
+            double alpha_max = std::acos(std::clamp(min_ck, -1.0, 1.0)) + pad;
+            if (alpha_max < occ_ang) {
+                double sin_a = std::sin(alpha_max);
+                double disc = std::max(0.0, r_occ * r_occ - d_occ * d_occ * sin_a * sin_a);
+                double t_max = d_occ * std::cos(alpha_max) - std::sqrt(disc);
+                if (t_max > 0.0 && t_max < best_occ_tmax) {
+                    has_occ = true;
+                    best_occ_tmax = t_max;
+                }
+            }
+        }
+        if (has_occ) {
+            double z_max = best_occ_tmax;
+            verts = {
+                glm::dvec3(0.0),
+                z_max * unnorm_corners[0], z_max * unnorm_corners[1],
+                z_max * unnorm_corners[2], z_max * unnorm_corners[3]
+            };
+            pyr_max_dist = z_max * max_corner_len;
+        }
+        for (uint32_t h = 0; h < active_host_count_; ++h) {
+            const auto& host = hosts_gpu_[h];
+            uint32_t bi = host.counts_indices.x;
+            const auto& body = sys.body(bi);
+            glm::dvec3 c = camera_relative(body.render.position, eye_pos);
+            glm::dvec3 p(host.pole_max_r);
+            double r_in = double(host.center_min_r.w);
+            double r_out = double(host.pole_max_r.w);
+            double r_frustum = r_out * 1.025;
+            bool frustum_vis = true;
+            for (const auto& n : planes) {
+                double dp = glm::dot(p, n);
+                double ext_r = r_frustum * std::sqrt(std::max(0.0, 1.0 - dp * dp));
+                if (glm::dot(c, n) + ext_r < -1e-12 * r_frustum) {
+                    frustum_vis = false;
+                    break;
+                }
+            }
+            if (!frustum_vis) continue;
+            if (has_occ) {
+                if (glm::length(c) > pyr_max_dist + r_frustum) continue;
+                std::array<double, 5> sd{};
+                int pos = 0, neg = 0;
+                for (int m = 0; m < 5; ++m) {
+                    sd[m] = glm::dot(verts[m] - c, p);
+                    if (sd[m] > 0.0) ++pos;
+                    else if (sd[m] < 0.0) ++neg;
+                }
+                if (pos == 5 || neg == 5) continue;
+                constexpr int pyramid_edges[8][2] = {
+                    {0, 1}, {0, 2}, {0, 3}, {0, 4},
+                    {1, 2}, {2, 4}, {4, 3}, {3, 1}
+                };
+                double r_in_mesh = std::max(0.0, r_in - 0.02 * r_out);
+                double r_in_lim = r_in_mesh * (1.0 - 1e-5);
+                bool all_inside_inner = true;
+                for (int m = 0; m < 5 && all_inside_inner; ++m) {
+                    if (sd[m] == 0.0 && glm::length(verts[m] - c) >= r_in_lim)
+                        all_inside_inner = false;
+                }
+                for (const auto& e : pyramid_edges) {
+                    if (!all_inside_inner) break;
+                    double s0 = sd[e[0]], s1 = sd[e[1]];
+                    if ((s0 > 0.0 && s1 < 0.0) || (s0 < 0.0 && s1 > 0.0)) {
+                        double t = s0 / (s0 - s1);
+                        glm::dvec3 x = glm::mix(verts[e[0]], verts[e[1]], t);
+                        if (glm::length(x - c) >= r_in_lim) all_inside_inner = false;
+                    }
+                }
+                if (all_inside_inner) continue;
+            }
+            visible_hosts_.push_back(h);
+        }
+    } else {
+        for (uint32_t h = 0; h < active_host_count_; ++h) visible_hosts_.push_back(h);
+    }
     uint32_t f_idx = ctx.frame_index();
     if (!hosts_gpu_.empty()) {
         std::memcpy(host_ssbos_[f_idx].mapped, hosts_gpu_.data(), hosts_gpu_.size() * sizeof(RingHostGPU));
@@ -527,7 +660,7 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
                           std::span<const rhi::PushDescriptorWrite> scene_writes, std::span<const glm::vec4> stars,
                           std::span<const rhi::PushDescriptorWrite> transparency_writes,
                           VkFormat color_format) {
-    if (!settings.show_rings || active_host_count_ == 0) return;
+    if (!settings.show_rings || visible_hosts_.empty()) return;
 
     auto timer = ctx.begin_gpu_timer(cmd, "rings");
     uint32_t f_idx = ctx.frame_index();
@@ -549,9 +682,9 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
     const rhi::Pipeline& layout_ref = select_pipeline(ctx, 0, transparency, planetshine, numerical, refracted, color_format);
     ctx.push_descriptors(cmd, layout_ref, render_writes_);
 
-    uint32_t draw_count = std::min(active_host_count_, MAX_RING_HOSTS);
+    uint32_t draw_count = static_cast<uint32_t>(visible_hosts_.size());
     std::array<uint32_t, MAX_RING_HOSTS> order{};
-    for (uint32_t i = 0; i < draw_count; ++i) order[i] = i;
+    std::copy_n(visible_hosts_.begin(), draw_count, order.begin());
     std::sort(order.begin(), order.begin() + draw_count, [&](uint32_t a, uint32_t b) {
         float da = glm::dot(glm::vec3(hosts_gpu_[a].center_min_r), glm::vec3(hosts_gpu_[a].center_min_r));
         float db = glm::dot(glm::vec3(hosts_gpu_[b].center_min_r), glm::vec3(hosts_gpu_[b].center_min_r));
@@ -566,22 +699,22 @@ void RingRenderer::render(VkCommandBuffer cmd, rhi::VkContext& ctx, const Render
     uint32_t bound_pipeline = UINT32_MAX;
     for (uint32_t idx = 0; idx < draw_count; ++idx) {
         uint32_t host_idx = order[idx];
-        struct Push { uint32_t host_index, packed_segments, segment_count, filter_profiles; };
+        struct Push { uint32_t host_index, packed_segments, segment_count; };
         auto draw = [&](uint32_t first, uint32_t count, uint32_t packed, uint32_t segments, uint32_t pipeline_index) {
             if (bound_pipeline != pipeline_index) {
                 bound_pipeline = pipeline_index;
                 const rhi::Pipeline& pipe = select_pipeline(ctx, bound_pipeline, transparency, planetshine, numerical, refracted, color_format);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.handle);
             }
-            ctx.push_constants(cmd, layout_ref, Push{host_idx, packed, segments, settings.ring_reference_base_level ? 0u : 1u});
+            ctx.push_constants(cmd, layout_ref, Push{host_idx, packed, segments});
             vkCmdDrawIndexed(cmd, count, 1, first, 0, 0);
         };
         const auto& host = hosts_gpu_[host_idx];
         auto classification = classify_ring_draw(glm::vec3(host.center_min_r), glm::vec3(host.pole_max_r), host.pole_max_r.w, stars);
         if (stars.size() != 1 && classification.lighting != RingLightingMode::FiniteSource)
             classification.lighting = RingLightingMode::Point;
-        uint32_t pipeline_base = settings.ring_reference_finite_source ? 4u : uint32_t(classification.lighting) * 4u;
-        if (refracted || settings.ring_reference_full_annulus || !classification.radial_ranges) {
+        uint32_t pipeline_base = uint32_t(classification.lighting) * 4u;
+        if (refracted || !classification.radial_ranges) {
             uint32_t packed = 0;
             for (uint32_t s = 0; s < host.counts_indices.z; ++s) packed |= s << (s * 3u);
             // Capacity only needs to cover the host's segments; a larger sample array just costs registers.

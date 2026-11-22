@@ -94,11 +94,19 @@ public:
     const AtmosphereStats& atmosphere_stats() const noexcept { return atmospheres_.stats(); }
     ShadowHistoryDiagnostics shadow_history_diagnostics(rhi::VkContext& ctx) const { return atmospheres_.shadow_history_diagnostics(ctx); }
     void resolve_transparency(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth) {
-        transparency_.resolve(cmd, ctx, color, depth);
+        transparency_.resolve(cmd, ctx, color, depth, nullptr, ring_slot_active_ ? 2u : 0u);
+        ring_slot_active_ = false;
     }
     void composite_atmospheres(VkCommandBuffer cmd, rhi::VkContext& ctx, rhi::Image& color, rhi::Image& depth,
                               rhi::Image* physical_color = nullptr);
     const TransparencyRenderer& transparency() const noexcept { return transparency_; }
+    bool transparency_has_list() const noexcept { return transparency_has_list_; }
+    bool transparency_needs_resolve() const noexcept {
+        return transparency_.active() && (transparency_has_list_ || !atmospheres_.can_fuse_ring_slot(true));
+    }
+    bool transparency_resolved_last_frame() const noexcept { return transparency_resolved_last_frame_; }
+    bool rings_drawn(const RenderSettings& settings) const noexcept { return rings_.drawn(settings); }
+    uint32_t visible_ring_host_count() const noexcept { return rings_.visible_host_count(); }
     const CloudMaps& cloud_maps() const noexcept { return cloud_maps_; }
     const CloudVolumeRenderer& cloud_volume() const noexcept { return cloud_volume_; }
     std::array<rhi::PushDescriptorWrite, 2> refraction_writes(rhi::VkContext& ctx) const { return refraction_.writes(ctx); }
@@ -109,6 +117,7 @@ public:
     double eclipse_refraction_bake_ms() const { return eclipse_refraction_.last_bake_ms(); }
     std::span<const uint32_t> ring_eclipse_candidate_counts() const noexcept { return ring_eclipse_candidate_counts_; }
      std::span<const uint32_t> surface_ring_candidate_masks() const noexcept { return surface_ring_candidate_masks_; }
+    std::span<const uint32_t> patch_shader_keys() const noexcept { return patch_shader_keys_; }
     uint32_t ringshine_bake_count() const noexcept { return rings_.ringshine_bake_count(); }
     uint64_t ring_profile_revision() const noexcept { return rings_.shadow_revision(); }
     uint32_t ringshine_frame_bake_count() const noexcept { return rings_.ringshine_frame_bake_count(); }
@@ -152,6 +161,7 @@ private:
     std::vector<uint32_t> ring_eclipse_candidate_counts_;
     std::vector<uint32_t> surface_ring_candidate_masks_;
     std::vector<uint32_t> body_shader_keys_;
+    std::vector<uint32_t> patch_shader_keys_;
 
     void prepare_fluids(uint32_t frame, const Camera& cam, const ephemeris::SystemSnapshot& sys, const RenderSettings& settings,
                         uint32_t count, float pixel_scale);
@@ -185,6 +195,8 @@ private:
     AtmosphereRenderer atmospheres_;
     TransparencyRenderer transparency_;
     bool ring_slot_active_ = false;
+    bool transparency_has_list_ = false;
+    bool transparency_resolved_last_frame_ = false;
     RefractionRenderer refraction_;
     EclipseRefractionRenderer eclipse_refraction_;
     std::vector<float> atmosphere_minima_;

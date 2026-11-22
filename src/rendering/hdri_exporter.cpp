@@ -190,7 +190,6 @@ void HdriExporter::begin(const HdriExportOptions& options, const Camera& camera,
     export_settings_.atmosphere_shadow_temporal = false;
     export_settings_.atmosphere_shadow_rotation = false;
     export_settings_.atmosphere_shadow_animate_jitter = false;
-    export_settings_.atmosphere_shadow_analytic = true;
 
     if (options_.orientation == HdriOrientation::CameraHorizon) {
         basis_x_ = glm::normalize(camera.forward_dir());

@@ -21,18 +21,10 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "no-clouds") s.clouds_enabled = false;
     if (variant == "legacy-clouds") s.transparency_reference_legacy = true;
     if (variant == "layered-clouds") s.cloud_sheet_inline = false;
-    if (variant == "cached-shadow-weights") s.atmosphere_shadow_cached_weights = true;
-    if (variant == "native-shadow-weights") s.atmosphere_shadow_cached_weights = false;
-    if (variant == "fast-ring-shadows") s.atmosphere_shadow_fast_rings = true;
-    if (variant == "analytic-shadows") s.atmosphere_shadow_analytic = true;
-    if (variant == "jittered-shadows") s.atmosphere_shadow_analytic = false;
     if (variant == "reference-shadows") s.atmosphere_shadow_reference = true;
-    if (variant == "closed-form-shadows") s.atmosphere_shadow_closed_form = true;
-    if (variant == "sampled-shadows") s.atmosphere_shadow_closed_form = false;
     if (variant == "progressive-shadows") {
         s.atmosphere_shadow_temporal = true;
         s.atmosphere_shadow_samples = 16;
-        s.atmosphere_shadow_adaptive = false;
     }
     if (variant == "no-shadow-vrs") s.atmosphere_shadow_vrs = false;
     if (variant == "always-shadow-vrs") s.atmosphere_shadow_vrs_budget = 0.0f;
@@ -43,7 +35,6 @@ inline void apply_audit_variant(rendering::RenderSettings& s, std::string_view v
     if (variant == "no-secondary") s.planetshine_enabled = s.ringshine_enabled = false;
     if (variant == "no-planetshine") s.planetshine_enabled = false;
     if (variant == "no-ringshine") s.ringshine_enabled = false;
-    if (variant == "single-box-ring-shadows") s.ring_shadow_single_box = true;
     if (variant == "high-exposure") s.exposure = 1e4f;
     if (variant == "no-orbits") s.show_orbits = false;
     if (variant == "no-gaia") s.show_gaia_stars = false;

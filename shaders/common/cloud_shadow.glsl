@@ -10,9 +10,7 @@ vec3 cloud_star_shadow(uint body, vec3 world_pos, uint s) {
     if (any(greaterThan(shadow, vec3(0.0))) && u_scene.num_ring_hosts > 0u) {
         vec3 to_star = star_pos-world_pos;
         float distance = max(length(to_star), 1e-5);
-        uint candidates = u_scene.ring_shadow_params.y != 0u
-            ? (1u << u_scene.num_ring_hosts)-1u
-            : eclipse_words[u_scene.ring_shadow_params.x+body*u_scene.num_stars+s];
+        uint candidates = eclipse_words[u_scene.ring_shadow_params.x + body * u_scene.num_stars + s];
         if (candidates != 0u)
             shadow *= compute_surface_ring_shadow(world_pos, to_star/distance, star_radius/distance, distance, candidates, s);
     }

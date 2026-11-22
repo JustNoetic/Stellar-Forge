@@ -1,8 +1,8 @@
 # Cached atmospheric shadow weights
 
-Enabled by default for eligible columns. **Settings → Atmosphere → Shadow sampling & performance → Cached shadow
-weights** can restore native integration for comparison. Toggling the option
-invalidates shadow history. Default procedural rings use seed 42.
+Always enabled for eligible single-frame columns when aerial perspective is
+active (the legacy toggle checkbox was removed). Default procedural rings use
+seed 42.
 
 ## Calculation
 

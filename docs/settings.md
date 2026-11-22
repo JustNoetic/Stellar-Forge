@@ -56,10 +56,10 @@ renders each settings page in its hidden window.
 
 Defaults remain in `RenderSettings`, `WorkspaceSettings` and
 `NavigationSettings`. The built-in defaults match the saved preference baseline
-chosen on 26 October 2026, with orbit lines enabled. This includes 1,030 orbit
-segments, 16-pixel terrain error, four atmospheric shadow samples, fast ring
-shadows and dual-source blending enabled, and progressive shadows, rotation
-history reuse, VRS and direct-sunlight-only rendering disabled. Default flight
+chosen on 26 October 2026, with orbit lines enabled. including 1,030 orbit segments and 16-pixel terrain error, four atmospheric
+shadow samples, and progressive shadows, rotation history reuse, VRS and
+direct-sunlight-only rendering disabled. (Hardware dual-source blending and fast
+ring shadows are now always active.) Default flight
 speed is `9.59133562721224e-05` AU/s; workspace defaults are unchanged.
 Existing saved values take precedence over later default edits; new fields use
 their code defaults. **Restore all defaults** immediately reapplies those three

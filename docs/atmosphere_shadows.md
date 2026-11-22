@@ -5,10 +5,10 @@ which evaluates casters at light-weighted points of the cached in-scatter instea
 raymarching. Ineligible atmospheres, progressive mode and the reference use the
 sampled estimator described below.
 
-The default [cached atmospheric weights path](atmosphere_shadow_cached_weights.md)
-reuses aerial-perspective lighting for eligible single-star ring-shadow samples.
+The [cached atmospheric weights path](atmosphere_shadow_cached_weights.md)
+always reuses aerial-perspective lighting for eligible single-star ring-shadow samples.
 Ring visibility and filtering retain the existing calculation; unsupported columns
-use native weights. The settings checkbox can restore native weights for comparison.
+use native weights.
 
 The separate [ring geometry experiment](atmosphere_ring_shadow_geometry.md) simplifies
 repeated visibility projection math while retaining the existing filter and samples.
@@ -88,7 +88,7 @@ Auto horizon uses exponential roll correction at 8..12 inverse seconds throughou
 
 ## Adaptive sample allocation
 
-`atmosphere_shadow_adaptive` defaults to true and is exposed as Adaptive shadow samples. The selected count becomes Maximum shadow samples; disabling adaptation restores the fixed-count estimator for comparison. The dense diagnostic reference is unchanged.
+Adaptive sample allocation is always active; `atmosphere_shadow_samples` selects the 4/8/16 maximum sample ceiling per evaluated ray/star. The dense diagnostic reference is unchanged.
 
 The allocator estimates a local extinction-weighted scale height near the closest point of the visible column. It combines the finite path length with the radial view cosine and a curvature term to estimate slant complexity. Vertical sky rays, nearby ground and short finite segments can use four samples; long grazing columns retain the selected ceiling. Sample locations keep the existing rational observer-extinction or tangent-focused distance proposal and its distance weights. Allocation changes the number of strata, not the transport equation or the normalized loss/energy ratio.
 

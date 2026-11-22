@@ -33,10 +33,8 @@ float compute_surface_ring_shadow(vec3 frag_pos, vec3 L, float sun_ang_rad, floa
     float ring_atten = 1.0;
     float focal_px = max(u_scene.screen_params.y * u_scene.screen_params.z, 1.0);
     float px_world_size = length(frag_pos) / focal_px;
-    bool single_box = (u_scene.ring_shadow_params.z & 1u) != 0u;
-    bool reference_linear = (u_scene.ring_shadow_params.z & 2u) != 0u;
     float softness = uintBitsToFloat(u_scene.ring_shadow_params.w);
-    vec3 weights = single_box ? vec3(0.0, 0.0, 1.0) : reference_linear ? vec3(0.24, 0.46, 0.30) : vec3(0.08, 0.42, 0.50);
+    const vec3 weights = vec3(0.08, 0.42, 0.50);
 
     while (candidates != 0u) {
         uint r = uint(findLSB(candidates));
@@ -47,10 +45,10 @@ float compute_surface_ring_shadow(vec3 frag_pos, vec3 L, float sun_ang_rad, floa
         int layer = int(ring_hosts[r].counts_indices.y);
 
         vec4 coords = ring_receiver_coordinates(frag_pos - r_center, r_pole, L, r_bounds, sun_ang_rad,
-            star_distance, px_world_size, softness, reference_linear);
+            star_distance, px_world_size, softness);
         // 1.2: the continuous kernel reaches 1.172 h.
         if (coords.w <= 0.0 || coords.x+1.2*coords.y <= 0.0 || coords.x-1.2*coords.y >= 1.0) continue;
-        uint slot = star < 8u && !single_box && !reference_linear ? (ring_hosts[r].counts_indices.w >> (4u*star)) & 15u : 0u;
+        uint slot = star < 8u ? (ring_hosts[r].counts_indices.w >> (4u*star)) & 15u : 0u;
         bool table = false;
         if (slot != 0u) {
             vec3 star_rel = frag_pos + L*star_distance - r_center;
@@ -60,7 +58,7 @@ float compute_surface_ring_shadow(vec3 frag_pos, vec3 L, float sun_ang_rad, floa
         // Up to five boxes (texture row, half-width, weight): ring_shadow_filter's three on the raw
         // prefix, and for wide penumbrae the continuous kernel's box on the two kernel rows bracketing
         // its width (ring_penumbra_extinction), blended in over the same range.
-        float blend = table && !single_box ? ring_penumbra_smooth_blend(coords.y) : 0.0;
+        float blend = table ? ring_penumbra_smooth_blend(coords.y) : 0.0;
         vec3 sharp = weights*(1.0-blend);
         vec2 smooth_rows = vec2(0.0), smooth_weights = vec2(0.0);
         if (blend > 0.0) {
